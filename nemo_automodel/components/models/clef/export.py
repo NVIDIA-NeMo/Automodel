@@ -96,7 +96,7 @@ def export_release(base: str | Path, *, revision: str, stage: Path, out: Path) -
     model.save_pretrained(out)
     head = manifest.head_config.build()
     head_state = head.state_dict()
-    dcp.load(head_state, checkpoint_id=str(stage / "head"))
+    dcp.load(head_state, checkpoint_id=str(stage / ClefStageManifest.HEAD_STATE_NAME))
     head.load_state_dict(head_state, strict=True)
     save_joint_head(head, out, dtype=torch.float32)
     # Tokenizer / processor files and Cloudflare's loader are copied verbatim from the base release.

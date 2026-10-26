@@ -17,18 +17,20 @@
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import ClassVar
 
 from nemo_automodel.components.models.clef.joint_schema_head import ClefHeadConfig
 
 
 @dataclass(frozen=True)
 class ClefStageManifest:
-    """Describe head architecture and adapter presence without owning checkpoint I/O."""
+    """Define head architecture, state namespace, and adapter presence for native stages."""
 
     backbone_adapter: bool
     head_config: ClefHeadConfig
     stage: str
     format: str = "clef-native-stage-v1"
+    HEAD_STATE_NAME: ClassVar[str] = "head"
 
     def __post_init__(self) -> None:
         if self.format != "clef-native-stage-v1":

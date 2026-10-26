@@ -94,7 +94,7 @@ class CLMEmbeddingCacheConfig:
             Cache path identified by all embedding-producing settings and exact texts.
         """
         identity = (
-            1,
+            2,  # Invalidate features cached before encoder defaults matched this contract.
             self.encoder_name,
             self.encoder_revision,
             self.tokenizer_name,

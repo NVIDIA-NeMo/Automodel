@@ -40,7 +40,7 @@ These artifacts initialize readout weights and do not resume optimizer or schedu
 | D1-3B checkpoint | [`LiquidAI/d1-3B`](https://huggingface.co/LiquidAI/d1-3B/tree/051bcc464b01b9f92942b364d9586b0ef5912432) |
 | D1 Omni checkpoint | [`LiquidAI/d1-omni-600M`](https://huggingface.co/LiquidAI/d1-omni-600M/tree/02b55d7076f15129e59ab3f94783f32c4b088674) |
 | Training scope | Single-device, frozen-backbone text decision readout adaptation |
-| Parallelism | TP, CP, PP, and EP support is undeclared for these native model classes |
+| Parallelism | These native model classes declare TP, CP, PP, and EP unsupported |
 
 Ordinary LFM2-VL checkpoints retain Hugging Face's implementation. The publisher's explicit D1
 configuration mapping selects the D1-specific arithmetic. Omni construction resolves pinned

@@ -74,6 +74,24 @@ def test_clef_reward_only_validation_does_not_require_accuracy():
         recipe._val_score("accuracy")
 
 
+@pytest.mark.parametrize("metric", ["brier", "nll", "ece", "records", "n"])
+def test_native_recipes_reject_metrics_that_cannot_be_maximized(metric):
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.loss.decision import DecisionLossConfig
+    from nemo_automodel.components.models.clm.heads import CLMHeadConfig
+    from nemo_automodel.recipes.decision.train_clef import TrainClefDecisionRecipe
+    from nemo_automodel.recipes.decision.train_clm_heads import TrainCLMHeadsRecipe
+
+    clef = TrainClefDecisionRecipe.__new__(TrainClefDecisionRecipe)
+    with pytest.raises(ValueError, match="train.eval_metric"):
+        clef._val_score(metric)
+    clm = TrainCLMHeadsRecipe(ConfigNode({"train": {"eval_metric": metric}}))
+    clm.loss_config = DecisionLossConfig()
+    heads = CLMHeadConfig(4, 4, 2, 2, "gelu", False, False).build()
+    with pytest.raises(ValueError, match="train.eval_metric"):
+        clm._train(heads)
+
+
 def test_clm_reward_only_training_and_validation_use_explicit_utilities(tmp_path):
     import torch
 
@@ -215,3 +233,21 @@ def test_clm_configured_sgd_update_matches_unpadded_ce_reference(tmp_path):
     trained = recipe._train(head)
     for name, parameter in reference.named_parameters():
         torch.testing.assert_close(dict(trained.named_parameters())[name], parameter, atol=1e-7, rtol=1e-6)
+
+
+def test_clm_setup_rejects_empty_split_before_loading_encoder(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import torch
+
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.recipes.decision import train_clm_heads
+
+    empty = tmp_path / "empty.jsonl"
+    empty.touch()
+    monkeypatch.setattr(
+        train_clm_heads, "initialize_distributed", lambda **kwargs: SimpleNamespace(device=torch.device("cpu"))
+    )
+    recipe = train_clm_heads.TrainCLMHeadsRecipe(ConfigNode({"data": {"train": str(empty)}}))
+    with pytest.raises(ValueError, match="data.train must contain at least one record"):
+        recipe.setup()

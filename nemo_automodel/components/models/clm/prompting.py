@@ -24,9 +24,33 @@ were trained on this layout: the state head sees ``context + question``, the act
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 CLM_NOUL_KEYS = ("false", "true")
+
+
+def prepare_tokenizer(*, name_or_path: str, revision: str | None) -> PreTrainedTokenizerBase:
+    """Load the tokenizer with the publisher's CLM serving input contract.
+
+    Args:
+        name_or_path: Tokenizer repository ID or local directory.
+        revision: Tokenizer revision recorded in the frozen-feature cache identity.
+
+    Returns:
+        Tokenizer using right padding and left truncation, retaining the final
+        prompt tokens as in clm-serve. Missing padding uses the EOS token.
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(name_or_path, revision=revision)
+    tokenizer.padding_side = "right"
+    tokenizer.truncation_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
 
 
 def to_text(x: Any, indent: int = 0) -> str:

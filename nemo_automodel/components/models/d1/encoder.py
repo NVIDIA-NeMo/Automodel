@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import Lfm2Config
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.lfm2.modeling_lfm2 import Lfm2Attention, Lfm2MLP, Lfm2RMSNorm, Lfm2RotaryEmbedding
 
 
@@ -134,8 +135,11 @@ class D1OmniEncoder(nn.Module):
         # Restore exact frequencies after dtype/device moves rather than widening
         # already-rounded bfloat16 buffers from nn.Module.to().
         super()._apply(fn, recurse=recurse)
+        initializer = self.rotary_emb.compute_default_rope_parameters
+        if self.rotary_emb.rope_type != "default":
+            initializer = ROPE_INIT_FUNCTIONS[self.rotary_emb.rope_type]
         with torch.device("cpu"):
-            frequencies, scaling = self.rotary_emb.compute_default_rope_parameters(self.config)
+            frequencies, scaling = initializer(self.config, device=torch.device("cpu"))
         frequencies = frequencies.to(self.rotary_emb.inv_freq.device)
         self.rotary_emb.inv_freq = frequencies
         self.rotary_emb.original_inv_freq = frequencies.clone()

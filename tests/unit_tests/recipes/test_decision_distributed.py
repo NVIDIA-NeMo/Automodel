@@ -18,6 +18,7 @@ These exercise replicated-head DP collectives. FSDP sharded-backbone acceptance
 still requires the separate supported GPU test environment.
 """
 
+import json
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,7 +92,7 @@ def _items(accumulation, empty_rank, all_empty=False):
     return items
 
 
-def _recipe(items, output, rank, world, accumulation, max_norm):
+def _recipe(items, output, rank, world, accumulation, max_norm, epochs=1):
     torch.manual_seed(7)
     recipe = TrainClefDecisionRecipe.__new__(TrainClefDecisionRecipe)
     recipe.model = TinyFrozenBackbone()
@@ -110,7 +111,7 @@ def _recipe(items, output, rank, world, accumulation, max_norm):
         ConfigNode(
             {
                 "train": {
-                    "epochs": 1,
+                    "epochs": epochs,
                     "local_batch_size": 1,
                     "global_batch_size": world * accumulation,
                     "max_grad_norm": max_norm,
@@ -193,3 +194,77 @@ def test_all_feedback_free_ranks_fail_together_before_backward(tmp_path):
     mp.spawn(_worker, args=(str(tmp_path / "rendezvous"), str(output), 1, True, 1e6, True), nprocs=2, join=True)
     assert not (output / "step_00000001").exists()
     assert not (output / "actual.pt").exists()
+
+
+def _rl_recipe(output, rank, world):
+    items = _items(2, False)
+    for record, encoded in items:
+        record["rewards"] = {question.question_id: {"a": 0.0, "b": 1.0} for question in encoded.questions}
+    recipe = _recipe(items, output, rank, world, 4 // world, 1.0, epochs=2)
+    recipe.loss_config = DecisionLossConfig(mode="rl", kl_coef=0.2, anchor_weight=0.0)
+    recipe.mode = "train"
+    recipe.slice_keys = []
+    # Three records force evaluation padding on two ranks. Give step zero perfect
+    # validation labels so later updates cannot win and the main loop must restore it.
+    validation = _items(2, False)[:3]
+    with torch.no_grad():
+        initial = recipe._forward(validation)
+    for (record, encoded), logits in zip(validation, initial, strict=True):
+        record["answers"] = {
+            question.question_id: question.option_ids[int(row.argmax())]
+            for question, row in zip(encoded.questions, logits, strict=True)
+        }
+    recipe.splits["validation"] = validation
+    train = recipe._train
+
+    def capture_trained_weights():
+        train()
+        if rank == 0:
+            torch.save(recipe.head.state_dict(), output / "trained.pt")
+
+    recipe._train = capture_trained_weights
+    return recipe
+
+
+def _rl_worker(rank, rendezvous, output):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    recipe = None
+    try:
+        recipe = _rl_recipe(Path(output), rank, 2)
+        recipe.run_train_validation_loop()
+        summary = recipe.evaluate("validation")
+        assert summary["overall"]["records"] == 3
+        assert summary["overall"]["accuracy"] == 1.0
+        if rank == 0:
+            torch.save(recipe.head.state_dict(), Path(output) / "selected.pt")
+    finally:
+        if recipe is not None:
+            recipe.checkpointer.close()
+        dist.destroy_process_group()
+
+
+def test_rl_reference_padded_evaluation_and_best_stage_match_single_process(tmp_path):
+    distributed = tmp_path / "distributed"
+    distributed.mkdir()
+    mp.spawn(_rl_worker, args=(str(tmp_path / "rendezvous"), str(distributed)), nprocs=2, join=True)
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+    reference = _rl_recipe(reference_dir, 0, 1)
+    try:
+        reference.run_train_validation_loop()
+        trained = torch.load(distributed / "trained.pt", weights_only=True)
+        selected = torch.load(distributed / "selected.pt", weights_only=True)
+        expected_trained = torch.load(reference_dir / "trained.pt", weights_only=True)
+        assert any(not torch.equal(trained[name], selected[name]) for name in trained)
+        for name, parameter in reference.head.state_dict().items():
+            torch.testing.assert_close(trained[name], expected_trained[name], atol=3e-6, rtol=3e-5)
+            torch.testing.assert_close(selected[name], parameter, atol=3e-6, rtol=3e-5)
+        actual_summary = json.loads((distributed / "metrics_validation.json").read_text())
+        expected_summary = json.loads((reference_dir / "metrics_validation.json").read_text())
+        assert actual_summary == expected_summary
+        rows = [json.loads(line) for line in (distributed / "training_log.jsonl").read_text().splitlines()]
+        assert max(row.get("kl", 0.0) for row in rows) > 0
+    finally:
+        reference.checkpointer.close()

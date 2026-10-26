@@ -14,8 +14,10 @@
 
 """Bidirectional context and media-prefix isolation in the Omni encoder."""
 
+import pytest
 import torch
 from transformers import Lfm2Config
+from transformers.models.lfm2.modeling_lfm2 import Lfm2RotaryEmbedding
 
 from nemo_automodel.components.models.d1.encoder import D1OmniEncoder
 
@@ -87,3 +89,34 @@ def test_encoder_keeps_a_private_typed_configuration() -> None:
     assert encoder.config is not config
     assert encoder.config._attn_implementation == "sdpa"
     assert config._attn_implementation == "eager"
+
+
+@pytest.mark.parametrize("rope_type", ["linear", "yarn"])
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"))],
+)
+def test_omni_scaled_rotary_preserves_hf_factors_after_dtype_moves(rope_type: str, device: str) -> None:
+    config = tiny_config()
+    config.rope_parameters = {
+        "rope_type": rope_type,
+        "rope_theta": 1000000.0,
+        "factor": 4.0,
+        **({"attention_factor": 1.5} if rope_type == "yarn" else {}),
+    }
+    encoder = D1OmniEncoder(config)
+    # Omni's publisher builds frequencies on CPU before moving them to the execution device.
+    reference = Lfm2RotaryEmbedding(config, device="cpu").to(device)
+    positions = torch.tensor([[0, 17, 4095]], device=device)
+    for dtype in (torch.float32, torch.bfloat16, torch.float32):
+        encoder.to(device=device, dtype=dtype)
+        rotary = encoder.rotary_emb
+        assert rotary.inv_freq.dtype == torch.float32
+        assert rotary.attention_scaling == reference.attention_scaling
+        torch.testing.assert_close(rotary.inv_freq, reference.inv_freq, rtol=0, atol=0)
+        torch.testing.assert_close(rotary.original_inv_freq, reference.inv_freq, rtol=0, atol=0)
+        values = torch.empty(1, 3, config.hidden_size, device=device, dtype=dtype)
+        actual = rotary(values, positions)
+        expected = reference(values, positions)
+        for factors, expected_factors in zip(actual, expected, strict=True):
+            torch.testing.assert_close(factors, expected_factors, rtol=0, atol=0)

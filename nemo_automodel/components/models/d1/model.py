@@ -35,10 +35,10 @@ from nemo_automodel.components.models.d1.config import D1OmniConfig
 from nemo_automodel.components.models.d1.decision_head import D1OmniHeadConfig
 from nemo_automodel.components.models.d1.encoder import D1OmniEncoder
 from nemo_automodel.components.models.d1.records import D1TextExample
+from nemo_automodel.components.models.d1.releases import RELEASES
 from nemo_automodel.components.models.d1.text_readout import D1OmniTextReadout
 
-OMNI_REPOSITORY = "LiquidAI/d1-omni-600M"
-OMNI_REVISION = "02b55d7076f15129e59ab3f94783f32c4b088674"
+OMNI_REPOSITORY, OMNI_REVISION = RELEASES["d1-omni"][:2]
 
 
 class D1OmniModel(HFCheckpointingMixin, PreTrainedModel):

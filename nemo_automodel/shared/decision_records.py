@@ -126,8 +126,11 @@ def validate_record(record: dict[str, Any]) -> None:
         qtype = question.get("type")
         if qtype not in QUESTION_TYPES:
             raise ValueError(f"{qid}: type must be one of {QUESTION_TYPES}, got {qtype!r}")
-        if qtype != "noul" and not question.get("criteria"):
-            raise ValueError(f"{qid}: criteria must not be empty")
+        criteria = question.get("criteria")
+        if qtype == "choice" and (not isinstance(criteria, dict) or not criteria):
+            raise ValueError(f"{qid}: choice criteria must be a nonempty option mapping")
+        if qtype == "score" and (not isinstance(criteria, list) or len(criteria) < 2):
+            raise ValueError(f"{qid}: score criteria must be a list with at least two levels")
     for qid, answer in (record.get("answers") or {}).items():
         if qid not in questions:
             raise ValueError(f"answer for unknown question {qid!r}")

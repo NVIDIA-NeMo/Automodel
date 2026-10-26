@@ -69,6 +69,7 @@ from nemo_automodel.components.models.clm.heads import (
     load_clm_heads,
     save_clm_heads,
 )
+from nemo_automodel.components.models.clm.prompting import prepare_tokenizer
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -110,6 +111,8 @@ class TrainCLMHeadsRecipe(BaseRecipe):
             path = self.cfg.get(f"data.{split}", None)
             if path:
                 records = load_records(path, limit=self.cfg.get(f"data.limit_{split}", None))
+                if not records:
+                    raise ValueError(f"data.{split} must contain at least one record")
                 for record in records:
                     validate_record(record)
                 self.splits[split] = records
@@ -120,7 +123,7 @@ class TrainCLMHeadsRecipe(BaseRecipe):
         texts = sorted({t for records in self.splits.values() for t in collect_clm_texts(records)})
         self.table = self._embed_all(texts)
 
-    def _cache_path(self, texts: list[str]) -> Path:
+    def _embedding_config(self) -> CLMEmbeddingCacheConfig:
         from transformers import __version__ as transformers_version
 
         encoder_name = self.cfg.get("encoder.pretrained_model_name_or_path")
@@ -129,7 +132,7 @@ class TrainCLMHeadsRecipe(BaseRecipe):
         tokenizer_revision = self.cfg.get(
             "encode.tokenizer_revision", revision if tokenizer_name == encoder_name else ""
         )
-        config = CLMEmbeddingCacheConfig(
+        return CLMEmbeddingCacheConfig(
             encoder_name=encoder_name,
             encoder_revision=revision,
             tokenizer_name=tokenizer_name,
@@ -142,13 +145,18 @@ class TrainCLMHeadsRecipe(BaseRecipe):
             attention_implementation=self.cfg.get("encoder.attn_implementation", "sdpa"),
             transformers_version=transformers_version,
         )
-        return config.build(
+
+    def _cache_path(self, texts: list[str]) -> Path:
+        return self._embedding_config().build(
             cache_dir=Path(self.cfg.get("encode.cache_dir", self.output_dir / "embedding_cache")), texts=texts
         )
 
     @torch.no_grad()
     def _embed_all(self, texts: list[str]) -> EmbeddingTable:
         """Embed ``texts`` with the frozen encoder, sharded over all ranks, and cache the result."""
+        if not texts:
+            raise ValueError("CLM embedding input must contain at least one text")
+        config = self._embedding_config()
         cache = self._cache_path(texts)
         cache_exists = cache.exists()
         if dist.is_initialized():
@@ -161,26 +169,25 @@ class TrainCLMHeadsRecipe(BaseRecipe):
                 logger.info("Loading %d cached embeddings from %s", len(texts), cache)
             return EmbeddingTable.load(cache)
 
-        from transformers import AutoTokenizer
-
-        encoder_name = self.cfg.get("encoder.pretrained_model_name_or_path")
-        tokenizer_name = self.cfg.get("encode.tokenizer", encoder_name)
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name,
-            revision=self.cfg.get(
-                "encode.tokenizer_revision",
-                self.cfg.get("encoder.revision") if tokenizer_name == encoder_name else None,
-            ),
+        tokenizer = prepare_tokenizer(
+            name_or_path=config.tokenizer_name,
+            revision=config.tokenizer_revision,
         )
-        tokenizer.padding_side = "right"
-        # vLLM's ``truncate_prompt_tokens`` keeps the *last* tokens; match it the input contract used by clm-serve.
-        tokenizer.truncation_side = "left"
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        max_length = int(self.cfg.get("encode.max_length", CLM_MAX_TOKENS))
+        max_length = config.max_length
         batch_size = int(self.cfg.get("encode.batch_size", 16))
 
-        encoder = self.cfg.encoder.instantiate().to(self.device).eval()
+        encoder = (
+            self.cfg.encoder.instantiate(
+                revision=config.encoder_revision,
+                pooling=config.pooling,
+                l2_normalize=config.l2_normalize,
+                is_causal=config.is_causal,
+                dtype=config.dtype,
+                attn_implementation=config.attention_implementation,
+            )
+            .to(self.device)
+            .eval()
+        )
         rank, world = self.dist_env.rank, self.dist_env.world_size
         # Sort by length so batches are dense, then deal texts round-robin to ranks.
         order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
@@ -202,26 +209,42 @@ class TrainCLMHeadsRecipe(BaseRecipe):
         del encoder
         torch.cuda.empty_cache()
 
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"indices": mine, "embeddings": shard}, cache.with_suffix(f".rank{rank}"))
-        if dist.is_initialized():
-            dist.barrier()
+        failure = None
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"indices": mine, "embeddings": shard}, cache.with_suffix(f".rank{rank}"))
+        except Exception as error:
+            logger.exception("Failed to write embedding cache shard on rank %d", rank)
+            failure = error
+        self._raise_cache_failure(failure, phase="write embedding cache shards")
+        failure = None
         if self.dist_env.is_main:
-            hidden = None
-            embeddings = None
-            for r in range(world):
-                part = torch.load(cache.with_suffix(f".rank{r}"), weights_only=True)
-                if part["embeddings"].numel():
-                    hidden = part["embeddings"].shape[1]
-                    if embeddings is None:
-                        embeddings = torch.empty((len(texts), hidden))
-                    embeddings[torch.tensor(part["indices"])] = part["embeddings"]
-                cache.with_suffix(f".rank{r}").unlink()
-            EmbeddingTable(texts, embeddings).save(cache)
-            logger.info("Cached %d embeddings (dim %d) at %s", len(texts), hidden, cache)
-        if dist.is_initialized():
-            dist.barrier()
+            try:
+                hidden = None
+                embeddings = None
+                for r in range(world):
+                    part = torch.load(cache.with_suffix(f".rank{r}"), weights_only=True)
+                    if part["embeddings"].numel():
+                        hidden = part["embeddings"].shape[1]
+                        if embeddings is None:
+                            embeddings = torch.empty((len(texts), hidden))
+                        embeddings[torch.tensor(part["indices"])] = part["embeddings"]
+                    cache.with_suffix(f".rank{r}").unlink()
+                EmbeddingTable(texts, embeddings).save(cache)
+                logger.info("Cached %d embeddings (dim %d) at %s", len(texts), hidden, cache)
+            except Exception as error:
+                logger.exception("Failed to assemble embedding cache on rank zero")
+                failure = error
+        self._raise_cache_failure(failure, phase="assemble embedding cache")
         return EmbeddingTable.load(cache)
+
+    def _raise_cache_failure(self, failure: Exception | None, *, phase: str) -> None:
+        """Propagate cache filesystem failures before any rank enters the next phase."""
+        failed = torch.tensor(int(failure is not None), device=self.device)
+        if dist.is_initialized():
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if bool(failed.item()):
+            raise RuntimeError(f"Failed to {phase}; see the failing rank's log") from failure
 
     # ------------------------------------------------------------------ forward / eval
     def _forward(
@@ -332,6 +355,8 @@ class TrainCLMHeadsRecipe(BaseRecipe):
         batch_size = int(tget("batch_size", 64))
         patience = int(tget("patience", 5))
         metric = tget("eval_metric", "accuracy")
+        if metric not in {"accuracy", "exact_match", "reward", "expected_reward"}:
+            raise ValueError("train.eval_metric must be accuracy, exact_match, reward, or expected_reward (maximized)")
         train_records = list(self.splits["train"])
         val_records = self.splits.get("validation")
 

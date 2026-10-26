@@ -44,16 +44,13 @@ from nemo_automodel.components.loss.decision import DecisionLossConfig
 from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
 from nemo_automodel.components.models.d1.model import D1OmniModel
 from nemo_automodel.components.models.d1.records import encode_d1_record
+from nemo_automodel.components.models.d1.releases import RELEASE_DTYPES, RELEASES
 from nemo_automodel.components.models.d1.text_readout import D1TextReadout
 from nemo_automodel.components.models.d1.vl_model import Lfm2VlForConditionalGeneration
 from nemo_automodel.shared.decision_records import load_records
 
 LOGGER = logging.getLogger(__name__)
 FRAMEWORK = "automodel"
-RELEASES = {
-    "d1-3b": ("LiquidAI/d1-3B", "051bcc464b01b9f92942b364d9586b0ef5912432", "modeling_d1.D1Model"),
-    "d1-omni": ("LiquidAI/d1-omni-600M", "02b55d7076f15129e59ab3f94783f32c4b088674", "modeling_d1.D1OmniModel"),
-}
 
 
 @dataclass(frozen=True)
@@ -72,8 +69,7 @@ class NativeD1Config:
                 revision=revision,
                 code_revision=revision,
                 trust_remote_code=True,
-                # Omni's pinned model card recommends float32 or float16 and warns against bfloat16.
-                dtype=torch.float32 if self.model == "d1-omni" else torch.bfloat16,
+                dtype=RELEASE_DTYPES[self.model],
                 attn_implementation="sdpa",
             )
             .cuda()

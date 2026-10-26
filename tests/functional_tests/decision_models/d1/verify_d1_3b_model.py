@@ -19,9 +19,11 @@ import json
 
 import torch
 from d1_publisher_fixtures import initialize_nonunit_rmsnorm
-from nemo_automodel.components.models.d1.vl_model import Lfm2VlForConditionalGeneration
 from transformers import Lfm2VlConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+from nemo_automodel.components.models.d1.releases import RELEASES
+from nemo_automodel.components.models.d1.vl_model import Lfm2VlForConditionalGeneration
 
 
 def tiny_config() -> Lfm2VlConfig:
@@ -66,9 +68,9 @@ def main() -> None:
     device = torch.device(args.device)
     torch.set_num_threads(1)
     torch.manual_seed(7)
-    revision = "051bcc464b01b9f92942b364d9586b0ef5912432"
+    repository, revision, _ = RELEASES["d1-3b"]
     reference_class = get_class_from_dynamic_module(
-        "lfm2_vl.Lfm2VlForConditionalGeneration", "LiquidAI/d1-3B", revision=revision, code_revision=revision
+        "lfm2_vl.Lfm2VlForConditionalGeneration", repository, revision=revision, code_revision=revision
     )
     config = tiny_config()
     reference = reference_class(config).eval().to(device)

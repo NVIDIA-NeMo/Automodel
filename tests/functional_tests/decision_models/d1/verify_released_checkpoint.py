@@ -31,11 +31,8 @@ from pathlib import Path
 import torch
 from torch import nn
 
-RELEASES = {
-    "d1-3b": ("LiquidAI/d1-3B", "051bcc464b01b9f92942b364d9586b0ef5912432", "modeling_d1.D1Model"),
-    "d1-omni": ("LiquidAI/d1-omni-600M", "02b55d7076f15129e59ab3f94783f32c4b088674", "modeling_d1.D1OmniModel"),
-}
-RELEASE_DTYPES = {"d1-3b": torch.bfloat16, "d1-omni": torch.float32}
+from nemo_automodel.components.models.d1.releases import RELEASE_DTYPES, RELEASES
+
 PROBABILITY_ATOL = 0.02
 QUESTION_IDS = {"action", "attack_tactic", "needs_human", "severity", "verdict"}
 TIED_ALIAS = ("lm_head.weight", "model.language_model.embed_tokens.weight")

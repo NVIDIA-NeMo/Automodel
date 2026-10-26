@@ -226,9 +226,21 @@ def collate_records(
 ) -> dict[str, Any]:
     """Right-pad encoded records into a batch.
 
+    Args:
+        records: Batch-aligned token spans. Optional media contains pixel_values of shape
+            [patches, patch_features], where patch_features flattens each pixel patch;
+            image_grid_thw of shape [images, 3] (temporal, height, width patch counts);
+            pixel_values_videos and video_grid_thw with corresponding video layouts;
+            and mm_token_type_ids, a list of media-token types starting at token_offset.
+        pad_token_id: Token used to fill right-padded positions.
+        device: Device for input IDs, attention masks, and media token-type tensors.
+
     Returns:
-        ``{"input_ids": long tensor of shape [batch, sequence], "attention_mask": long tensor of shape
-        [batch, sequence] (1 = real token), "records": the encoded records, "media": concatenated media tensors}``.
+        Mapping with input_ids and attention_mask, long Tensors of shape [batch, sequence]
+        (mask one means a real token); records, the original encoded records; and media.
+        Media pixel/patch and grid tensors concatenate along axis zero, preserving their
+        source dtype/device. Media mm_token_type_ids is a long Tensor of shape [batch, sequence],
+        zero outside media spans. Other input tensors are created on ``device``.
     """
     maximum_length = max(len(record.input_ids) for record in records)
     input_ids = torch.full(
@@ -399,6 +411,42 @@ class JointSchemaHead(nn.Module):
         self.prior_logit_scale = nn.Parameter(torch.zeros(()))
         self.joint_logit_scale = nn.Parameter(torch.zeros(()))
         self.residual_gate = nn.Parameter(torch.zeros(()))
+
+    def score_records(
+        self,
+        backbone: nn.Module,
+        records: list[EncodedRecord],
+        lexical: LexicalTable,
+        *,
+        pad_token_id: int,
+        device: torch.device,
+    ) -> list[list[torch.Tensor]]:
+        """Run CLEF's backbone-to-head composition through the public hidden-state interface.
+
+        Args:
+            backbone: Language model returning hidden states of shape [batch, sequence, hidden].
+            records: Publisher-ordered token spans. Optional media contains pixel_values
+                of shape [patches, features], pixel_values_videos of shape [video_patches, features],
+                and image/video_grid_thw of shape [items, 3] (temporal, height, width).
+            lexical: Frozen token-row lookup returning tensors of shape [tokens, hidden].
+            pad_token_id: Token used for right padding.
+            device: Execution device for collated input tensors.
+
+        Returns:
+            Batch/question lists of fp32 logit tensors of shape [options].
+        """
+        collated = collate_records(records, pad_token_id, device)
+        output = backbone(
+            input_ids=collated["input_ids"],
+            attention_mask=collated["attention_mask"],
+            use_cache=False,
+            logits_to_keep=1,
+            output_hidden_states=True,
+            **collated["media"],
+        )
+        if output.hidden_states is None:
+            raise RuntimeError("the backbone must return final hidden states for CLEF training")
+        return self(output.hidden_states[-1], collated["input_ids"], collated["attention_mask"], records, lexical)
 
     @staticmethod
     def _mean_span(values: torch.Tensor, span: tuple[int, int]) -> torch.Tensor:

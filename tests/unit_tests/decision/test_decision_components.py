@@ -420,3 +420,13 @@ def test_invalid_option_masks_fail_before_softmax(mask):
     with pytest.raises(ValueError, match="option"):
         losses.DecisionLossConfig().build()(logits, targets)
     assert logits.grad is None
+
+
+@pytest.mark.parametrize(
+    "kind,criteria",
+    [("choice", ["A", "B"]), ("choice", {}), ("score", {"0": "Low", "1": "High"}), ("score", ["Only"])],
+)
+def test_malformed_criteria_fail_before_model_specific_encoding(kind, criteria):
+    record = {"id": "invalid", "state": "text", "questions": {"pick": {"type": kind, "criteria": criteria}}}
+    with pytest.raises(ValueError, match="criteria"):
+        schema.validate_record(record)

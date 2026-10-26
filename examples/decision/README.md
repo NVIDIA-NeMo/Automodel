@@ -19,7 +19,7 @@ The generator rejects an existing directory. It needs no model, API key or GPU. 
 come from a fictional policy and do not measure operational security performance. Use the framework's supported
 Linux GPU environment for the training commands, and choose the process count for your available hardware.
 
-Every run takes `--mode eval|train` and `--loss.mode sft|rl`, and writes `metrics_{validation,test}.json` to
+CLM and CLEF runs take `--mode eval|train` and `--loss.mode sft|rl`, and write `metrics_{validation,test}.json` to
 `output_dir`. Running `eval` on the released checkpoint gives the *before* numbers to compare stages against:
 
 ```bash
@@ -40,6 +40,8 @@ must be shared by all ranks, including across nodes, for shard assembly and cach
 visibility fails on every rank. The encoding process group is released before rank-zero head training so
 idle ranks do not wait in a collective for the duration of training.
 CLM/CLEF example configurations pin the public model versions whose prompt and checkpoint contracts they use.
+Set `train.eval_metric` to `accuracy`, `exact_match`, `reward`, or `expected_reward`; native stage selection
+maximizes that metric.
 The CLEF frozen-backbone configuration installs no adapters and optimizes only the external joint head.
 CLEF stages use native AutoModel PEFT checkpoints under `model/` and DCP joint-head state under `head/`.
 Immutable `step_00000000`, `step_00000025`, etc. directories are published through the existing checkpoint lifecycle;

@@ -65,7 +65,6 @@ from nemo_automodel.components.models.clef.joint_schema_head import (
     JointSchemaHead,
     build_lexical_table,
     clef_option_orders,
-    collate_records,
     encode_record,
     load_joint_head,
 )
@@ -211,7 +210,7 @@ class TrainClefDecisionRecipe(BaseRecipe):
         self.checkpointer.lifecycle.reserve(str(path))
         if has_adapter:
             self.checkpointer.save_model(self.model, str(path), peft_config=self.peft_config)
-        self.checkpointer.save_distributed_state(self.head, "head", str(path))
+        self.checkpointer.save_distributed_state(self.head, ClefStageManifest.HEAD_STATE_NAME, str(path))
         manifest = ClefStageManifest(has_adapter, self.head.config, self.tag)
         metric_key = f"negative_{self.cfg.get('train.eval_metric', 'accuracy')}"
 
@@ -250,7 +249,7 @@ class TrainClefDecisionRecipe(BaseRecipe):
             if self.peft_config is None:
                 raise ValueError("initializing a backbone adapter requires the matching peft configuration")
             self.checkpointer.load_model(self.model, str(path / "model"))
-        self.checkpointer.load_distributed_state(self.head, "head", str(path))
+        self.checkpointer.load_distributed_state(self.head, ClefStageManifest.HEAD_STATE_NAME, str(path))
         if self.dist_env.is_main:
             logger.info("Initialized stage weights from %s; optimizer/scheduler state is fresh", path)
 
@@ -264,19 +263,13 @@ class TrainClefDecisionRecipe(BaseRecipe):
         Returns:
             For each record, a list with one tensor of shape [options_i] (fp32 logits) per question, in Clef order.
         """
-        collated = collate_records([e for _, e in batch], self.pad_token_id, self.device)
-        output = self.model(
-            input_ids=collated["input_ids"],
-            attention_mask=collated["attention_mask"],
-            use_cache=False,
-            logits_to_keep=1,
-            output_hidden_states=True,
-            **collated["media"],
+        return self.head.score_records(
+            self.model,
+            [encoded for _, encoded in batch],
+            self.lexical,
+            pad_token_id=self.pad_token_id,
+            device=self.device,
         )
-        if output.hidden_states is None:
-            raise RuntimeError("the backbone must return final hidden states for CLEF training")
-        hidden = output.hidden_states[-1]
-        return self.head(hidden, collated["input_ids"], collated["attention_mask"], collated["records"], self.lexical)
 
     def _shard(self, items: list, shuffle: bool, epoch: int = 0) -> list:
         """Equal-length per-rank shard (FSDP needs every rank to run the same number of forwards)."""
@@ -355,6 +348,8 @@ class TrainClefDecisionRecipe(BaseRecipe):
             )
 
     def _val_score(self, metric: str) -> float | None:
+        if metric not in {"accuracy", "exact_match", "reward", "expected_reward"}:
+            raise ValueError("train.eval_metric must be accuracy, exact_match, reward, or expected_reward (maximized)")
         if "validation" not in self.splits:
             return None
         overall = self.evaluate("validation")["overall"]

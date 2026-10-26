@@ -127,3 +127,20 @@ def test_recipe_cache_respects_encoder_dtype_alias(tmp_path):
     assert cache_path(torch_dtype="bfloat16", dtype="float32") != original
     assert cache_path(torch_dtype="bfloat16", dtype="float32") == cache_path(torch_dtype="float32")
     assert not (tmp_path / "cache").exists()
+
+
+@pytest.mark.parametrize("pad_token", [None, "existing-pad"])
+def test_model_owned_tokenizer_preserves_clm_serving_contract(pad_token):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from nemo_automodel.components.models.clm.prompting import prepare_tokenizer
+
+    tokenizer = SimpleNamespace(pad_token=pad_token, eos_token="eos")
+    with patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer) as load:
+        actual = prepare_tokenizer(name_or_path="org/tokenizer", revision="pinned-revision")
+    load.assert_called_once_with("org/tokenizer", revision="pinned-revision")
+    assert actual is tokenizer
+    assert actual.padding_side == "right"
+    assert actual.truncation_side == "left"
+    assert actual.pad_token == ("eos" if pad_token is None else pad_token)
