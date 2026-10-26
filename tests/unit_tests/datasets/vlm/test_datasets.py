@@ -2236,3 +2236,37 @@ def test_make_spider_dataset_joins_schema_and_collapses_query_whitespace(monkeyp
     )
     assert "How many perpetrators?" in user_turn["content"][0]["text"]
     assert assistant_turn["content"][0]["text"] == "SELECT count(*) FROM perpetrator"
+class TestPreTokenizedDatasetWrapperPretokenizedInput:
+    def test_passes_through_pretokenized_chat_sample(self):
+        sample = {
+            "input_ids": [10, 11, 12, 13],
+            "attention_mask": [1, 1, 1, 1],
+            "labels": [-100, -100, 12, 13],
+        }
+        wrapper = ds.PreTokenizedDatasetWrapper([sample], _FakeProcessor(), inject_fake_images=False)
+
+        result = wrapper[0]
+
+        assert result["input_ids"].tolist() == [10, 11, 12, 13]
+        assert result["attention_mask"].tolist() == [1, 1, 1, 1]
+        assert result["labels"].tolist() == [-100, -100, 12, 13]
+
+    def test_truncates_pretokenized_chat_sample(self):
+        sample = {
+            "input_ids": [10, 11, 12, 13],
+            "attention_mask": [1, 1, 1, 1],
+            "labels": [-100, -100, 12, 13],
+        }
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            [sample],
+            _FakeProcessor(),
+            max_length=3,
+            truncate=True,
+            inject_fake_images=False,
+        )
+
+        result = wrapper[0]
+
+        assert result["input_ids"].tolist() == [10, 11, 12]
+        assert result["attention_mask"].tolist() == [1, 1, 1]
+        assert result["labels"].tolist() == [-100, -100, 12]
