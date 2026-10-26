@@ -418,6 +418,7 @@ def test_hybridep_preprocess_records_cuda_graph_sample(hybrid_ep_manager, monkey
         ("moe_hybridep_num_blocks_unpermute", 16),
         ("moe_hybridep_capacity_factor", 1.5),
         ("moe_hybridep_equal_token_counts", True),
+        ("moe_hybridep_recompute_cache", "combine"),
     ],
 )
 def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, setting, value):
