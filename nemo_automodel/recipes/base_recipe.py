@@ -836,7 +836,9 @@ class BaseRecipe:
             return tensor
         if dp_group is not None or dist.is_initialized():
             if not tensor.is_cuda and torch.cuda.is_available():
-                tensor = tensor.cuda()
+                tensor = tensor.pin_memory().to(
+                    device=torch.device("cuda", torch.cuda.current_device()), non_blocking=True
+                )
             dist.all_reduce(tensor, op=op, group=dp_group)
             tensor = tensor.cpu()
         return tensor
