@@ -654,6 +654,8 @@ def _build_packed_ring_segments(q_ids: torch.Tensor, k_ids: torch.Tensor) -> dic
         "k_index": torch.tensor(k_index, dtype=torch.long, device=device),
         "cu_q": torch.tensor(cu_q, dtype=torch.int32, device=device),
         "cu_k": torch.tensor(cu_k, dtype=torch.int32, device=device),
+        "cu_q_host": cu_q,
+        "cu_k_host": cu_k,
         "max_q": max_q,
         "max_k": max_k,
         "dense_local": q_single_doc,
@@ -857,6 +859,8 @@ def _ffpa_varlen_backward_chunk(
         seg["max_k"],
         scale=scale,
         causal=causal,
+        cu_q_host=seg["cu_q_host"],
+        cu_k_host=seg["cu_k_host"],
     )
 
 
