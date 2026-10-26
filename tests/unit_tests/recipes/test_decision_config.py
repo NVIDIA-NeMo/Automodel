@@ -316,3 +316,34 @@ def test_clef_setup_preserves_normalized_checkpoint_config(tmp_path, monkeypatch
     finally:
         if hasattr(recipe, "checkpointer"):
             recipe.checkpointer.close()
+
+
+@pytest.mark.parametrize("entrypoint", ["setup", "run_train_validation_loop"])
+@pytest.mark.parametrize("stale_pointer", [False, True])
+def test_clef_training_rejects_disabled_checkpoints_before_training_or_loading_old_stage(
+    tmp_path, monkeypatch, entrypoint, stale_pointer
+):
+    from types import SimpleNamespace
+
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.recipes.decision import train_clef
+
+    output = tmp_path / "run"
+    if stale_pointer:
+        old_stage = output / "old-stage"
+        old_stage.mkdir(parents=True)
+        (output / "LOWEST_VAL").symlink_to(old_stage.name)
+    recipe = train_clef.TrainClefDecisionRecipe(ConfigNode({"mode": "train", "checkpoint": {"enabled": False}}))
+    recipe.mode = "train"
+    recipe.output_dir = output
+    recipe.splits = {}
+    observed = []
+    recipe._train = lambda: observed.append("train")
+    recipe._load_stage = lambda path: observed.append(path)
+    recipe.checkpointer = SimpleNamespace(finalize=lambda: None)
+    monkeypatch.setattr(train_clef, "initialize_distributed", lambda **kwargs: SimpleNamespace(world_size=1))
+    with pytest.raises(ValueError, match="checkpoint.enabled=true"):
+        getattr(recipe, entrypoint)()
+    assert observed == []
+    assert not (output / "metrics_test.json").exists()
+    assert (output / "LOWEST_VAL").is_symlink() == stale_pointer

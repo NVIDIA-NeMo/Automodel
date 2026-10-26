@@ -42,6 +42,7 @@ idle ranks do not wait in a collective for the duration of training.
 CLM/CLEF example configurations pin the public model versions whose prompt and checkpoint contracts they use.
 Set `train.eval_metric` to `accuracy`, `exact_match`, `reward`, or `expected_reward`; native stage selection
 maximizes that metric.
+CLEF training requires `checkpoint.enabled: true` so final reports use the validation-selected saved stage.
 The CLEF frozen-backbone configuration installs no adapters and optimizes only the external joint head.
 CLEF stages use native AutoModel PEFT checkpoints under `model/` and DCP joint-head state under `head/`.
 Immutable `step_00000000`, `step_00000025`, etc. directories are published through the existing checkpoint lifecycle;

@@ -104,6 +104,7 @@ class TrainClefDecisionRecipe(BaseRecipe):
         self.mode = self.cfg.get("mode", "train")
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
+        self._require_stage_checkpoints()
         self.loss_config: DecisionLossConfig = (
             self.cfg.loss.instantiate() if self.cfg.get("loss", None) is not None else DecisionLossConfig()
         )
@@ -317,8 +318,14 @@ class TrainClefDecisionRecipe(BaseRecipe):
         return evaluator.summary()
 
     # ------------------------------------------------------------------ main loop
+    def _require_stage_checkpoints(self) -> None:
+        """Keep training, validation selection, and final reporting on the same saved stage."""
+        if self.mode == "train" and not self.cfg.checkpoint.enabled:
+            raise ValueError("CLEF training requires checkpoint.enabled=true for validation-selected stages")
+
     def run_train_validation_loop(self) -> None:
         """Evaluate (``mode: eval``) or train (``mode: train``), then report validation/test metrics."""
+        self._require_stage_checkpoints()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if self.mode == "train":
             self._train()

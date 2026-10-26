@@ -610,6 +610,7 @@ jobs:
           # Each parity test in `parallelism` runs the proxy twice (1-rank baseline +
           # 2-rank parallel), so the budget is roughly double a single smoke test.
           # A 30-minute timeout leaves more than 2x measured-runtime headroom.
+          # CLEF adds two-GPU optimizer/reload and native YAML-setup acceptance checks.
           - test-name: L2_Distributed
             test-folder: moe,parallelism,decision_models/clef
             timeout: 30
@@ -693,6 +694,7 @@ jobs:
             test-folder: retrieval
             timeout: 20
           # moe + parallelism merged (2.1 + 4.1 = 6.2 min median), mirroring cicd-e2e-tests.
+          # Include the same two-GPU CLEF optimizer/reload and native YAML-setup coverage.
           - test-name: L2_Distributed
             test-folder: moe,parallelism,decision_models/clef
             timeout: 30
