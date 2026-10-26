@@ -58,8 +58,11 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
 
+# Fused linear CE: at 8K tokens per rank the materialized 262K-vocab logits alone need 4 GiB in bf16 plus
+# 8 GiB for the fp32 upcast, which does not fit next to the activations on an 80 GB GPU.
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  logit_softcapping: 30.0  # Gemma4's final_logit_softcapping
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
