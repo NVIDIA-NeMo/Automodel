@@ -40,8 +40,7 @@ def test_float32_rms_norm_forward_and_gradients(shape, dtype, trainable):
     ref_x = x.detach().clone().requires_grad_(x.requires_grad)
     ref_weight = module.weight.detach().clone().requires_grad_(module.weight.requires_grad)
 
-    with torch.compiler.set_stance("force_eager"):
-        actual = module(x)
+    actual = module(x)
     expected = torch.nn.functional.rms_norm(ref_x.float(), (7,), ref_weight.float(), module.eps).to(dtype)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     upstream = torch.randn_like(actual)
@@ -96,8 +95,7 @@ for _ in range(2):
     for module in (original, current):
         x = torch.randn(7, requires_grad=True)
         norm = module.Float32RMSNorm(7, dtype=torch.float32)
-        with torch.compiler.set_stance("force_eager"):
-            norm(x).sum().backward()
+        norm(x).sum().backward()
         assert norm.weight.grad.shape == (7,)
         assert torch.isfinite(x.grad).all()
 """
@@ -126,8 +124,10 @@ def _dtensor_worker(rank: int, world_size: int, init_file: str) -> None:
             expected.backward(upstream)
 
             x = distribute_tensor(values.clone(), mesh, [placement]).requires_grad_()
-            weight = distribute_tensor(weights.clone(), mesh, [Replicate()]).requires_grad_()
-            actual = torch.ops.nemo_automodel.float32_rms_norm(x, weight, 1e-5)
+            module = Float32RMSNorm(8, dtype=torch.float32)
+            module.weight = torch.nn.Parameter(distribute_tensor(weights.clone(), mesh, [Replicate()]))
+            weight = module.weight
+            actual = module(x)
             expected_placement = Replicate() if placement == Shard(2) else placement
             assert actual.placements == (expected_placement,)
             torch.testing.assert_close(actual.full_tensor(), expected, rtol=1e-5, atol=1e-6)
@@ -159,9 +159,10 @@ def test_float32_rms_norm_dtensor(world_size, tmp_path):
     not torch.cuda.is_available(), reason="CUDA is required to reproduce the compiled grad/no_grad regression"
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("surrounding_ops", [False, True])
 # This checks actual Inductor compilation, including activation recomputation.
 @pytest.mark.runtime_budget(60, hard_timeout=70, reason="runs Inductor compilation and activation recomputation")
-def test_float32_rms_norm_compiled_determinism(dtype, monkeypatch):
+def test_float32_rms_norm_stays_eager_inside_compiled_code(dtype, surrounding_ops, monkeypatch):
     from torch._dynamo.testing import CompileCounterWithBackend
 
     monkeypatch.delenv("TORCH_COMPILE_DISABLE", raising=False)
@@ -169,8 +170,22 @@ def test_float32_rms_norm_compiled_determinism(dtype, monkeypatch):
     module = Float32RMSNorm(257, device="cuda", dtype=dtype)
     with torch.no_grad():
         module.weight.normal_()
+
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        """Optionally place compiled operations around the eager normalization.
+
+        Args:
+            x: CUDA tensor of shape [batch, sequence, hidden].
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden] in x's dtype.
+        """
+        if surrounding_ops:
+            return module(x * 1.25).square()
+        return module(x)
+
     counter = CompileCounterWithBackend("inductor")
-    compiled = torch.compile(module, backend=counter, fullgraph=True, dynamic=True)
+    compiled = torch.compile(forward, backend=counter, fullgraph=False, dynamic=True)
     for shape, recompute in [((2, 7, 257), False), ((3, 5, 257), True)]:
         x = torch.randn(shape, device="cuda", dtype=dtype, requires_grad=True)
         ref_x = x.detach().clone().requires_grad_()
@@ -179,7 +194,10 @@ def test_float32_rms_norm_compiled_determinism(dtype, monkeypatch):
         with torch.no_grad():
             no_grad_output = compiled(x)
         torch.testing.assert_close(actual, no_grad_output, rtol=0, atol=0)
-        expected = torch.nn.functional.rms_norm(ref_x.float(), (257,), ref_weight.float(), module.eps).to(dtype)
+        norm_input = ref_x * 1.25 if surrounding_ops else ref_x
+        expected = torch.nn.functional.rms_norm(norm_input.float(), (257,), ref_weight.float(), module.eps).to(dtype)
+        if surrounding_ops:
+            expected = expected.square()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         upstream = torch.randn_like(actual)
         actual.backward(upstream)
@@ -188,4 +206,8 @@ def test_float32_rms_norm_compiled_determinism(dtype, monkeypatch):
         torch.testing.assert_close(x.grad, ref_x.grad, rtol=rtol, atol=atol)
         torch.testing.assert_close(module.weight.grad, ref_weight.grad, rtol=rtol, atol=atol)
         module.zero_grad()
-    assert counter.frame_count > 0
+    # Dynamic module dispatch can emit empty graphs; only surrounding arithmetic
+    # should contribute compiled operations.
+    assert (counter.op_count > 0) is surrounding_ops
+    for graph in counter.graphs:
+        assert all(node.target != torch.ops.nemo_automodel.float32_rms_norm.default for node in graph.graph.nodes)

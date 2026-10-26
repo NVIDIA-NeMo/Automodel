@@ -848,8 +848,9 @@ def _float32_rms_norm_setup_context(ctx, inputs, output):
     ctx.eps = eps
 
 
+@torch.compiler.disable
 def _float32_rms_norm_backward(ctx, grad_output):
-    """Differentiate the fp32 RMSNorm computation.
+    """Differentiate the fp32 RMSNorm computation without Dynamo compilation.
 
     Args:
         ctx: Autograd context containing x [..., hidden] and weight [hidden].
@@ -885,11 +886,12 @@ _float32_rms_norm_impl.register_autograd(
 )
 
 
-@torch.compile(dynamic=True)
+@torch.compiler.disable
 def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards.
+    """Run fp32 RMSNorm without Dynamo compilation.
 
-    The opaque forward keeps the same computation in grad and no_grad contexts.
+    The opaque forward keeps the same computation in grad and no_grad contexts;
+    the disabled wrapper prevents an enclosing compiled model from tracing it.
 
     Args:
         x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
