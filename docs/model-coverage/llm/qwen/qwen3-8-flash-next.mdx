@@ -173,7 +173,7 @@ setup.
   decoder layer 2 must be the first stage because Engram hashes the raw token
   IDs that only the first stage receives. The Engram layer requires
   `ep_size > 1`, with or without pipeline parallelism: only the MoE
-  parallelizer binds the table's owner group, so an EP1 run with PLE layers is
+  parallelizer binds the table's owner group, so an EP1 FSDP2 run with PLE layers is
   rejected on every rank before training starts. Pipeline stages use static shape metadata, so micro-batches
   need one fixed sequence length (`pad_to_max_length`, packing to a fixed
   size, or a fixed-length loader).

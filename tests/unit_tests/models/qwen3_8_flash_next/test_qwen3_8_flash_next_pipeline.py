@@ -233,20 +233,18 @@ def test_last_stage_backward_reaches_incoming_state() -> None:
     assert torch.isfinite(incoming.grad).all()
 
 
-@pytest.mark.parametrize(
-    ("ple_layer_ids", "ep_size", "rejected"),
-    [([2], 1, True), ([2], 2, False), ([], 1, False)],
-)
-def test_parallelizer_rejects_ple_without_expert_parallelism(monkeypatch, ple_layer_ids, ep_size, rejected) -> None:
-    """Every stage reads the config, so a stage without the PLE layer rejects EP1 too."""
+@pytest.mark.parametrize(("ple_layer_ids", "rejected"), [([2], True), ([], False)])
+def test_parallelizer_rejects_ple_on_dense_fsdp2(monkeypatch, ple_layer_ids, rejected) -> None:
+    """Every stage reads the config, so a stage without the PLE layer rejects dense FSDP2 too."""
     parallelized = object()
-    monkeypatch.setattr(ModelParallelizer, "parallelize", lambda self, model, mesh_context: parallelized)
+    monkeypatch.setattr(ModelParallelizer, "_apply", lambda self, model, device_mesh, **kwargs: parallelized)
     stage = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(ple_layer_ids=ple_layer_ids)))
-    mesh_context = SimpleNamespace(ep_size=ep_size)
 
     assert Qwen3_8_FlashNextForConditionalGeneration.parallelizer is PARALLELIZER
+    # The MoE (ep_size > 1) dispatch only calls sidecars that customize MoE FSDP, so it never reaches _apply.
+    assert PARALLELIZER._customizes_moe_fsdp is False
     if rejected:
         with pytest.raises(ValueError, match="requires distributed.ep_size > 1"):
-            PARALLELIZER.parallelize(stage, mesh_context)
+            PARALLELIZER._apply(stage, device_mesh=None)
     else:
-        assert PARALLELIZER.parallelize(stage, mesh_context) is parallelized
+        assert PARALLELIZER._apply(stage, device_mesh=None) is parallelized

@@ -15,21 +15,17 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed import ModelParallelizer
 
-if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.mesh import MeshContext
-
 
 class Qwen3_8_FlashNextModelParallelizer(ModelParallelizer):
-    """Reject topologies that never bind the PLE owner group, then apply the shared dispatch."""
+    """Reject dense FSDP2 for PLE checkpoints, which never binds the PLE owner group."""
 
-    def parallelize(self, model: nn.Module, mesh_context: MeshContext, /) -> nn.Module:
-        """Parallelize one model or pipeline stage.
+    def _apply(self, model: nn.Module, device_mesh: DeviceMesh, **kwargs) -> nn.Module:
+        """Apply dense FSDP2, which the shared dispatch selects only for ``ep_size == 1``.
 
         Only the MoE parallelizer (``ep_size > 1``) binds the PLE table's owner
         group to the stage's data/context shard mesh. The check reads the
@@ -38,17 +34,18 @@ class Qwen3_8_FlashNextModelParallelizer(ModelParallelizer):
 
         Args:
             model: Qwen3.8-Flash-Next model or pipeline stage.
-            mesh_context: Requested parallel sizes and device mesh.
+            device_mesh: Device mesh of the dense FSDP2 path.
+            **kwargs: Remaining arguments of ``ModelParallelizer._apply``.
 
         Returns:
             The parallelized model.
         """
-        if mesh_context.ep_size == 1 and model.config.text_config.ple_layer_ids:
+        if model.config.text_config.ple_layer_ids:
             raise ValueError(
                 "Qwen3.8-Flash-Next with PLE layers requires distributed.ep_size > 1: "
                 "only the MoE parallelizer binds the owner-sharded PLE table."
             )
-        return super().parallelize(model, mesh_context)
+        return super()._apply(model, device_mesh, **kwargs)
 
 
 PARALLELIZER = Qwen3_8_FlashNextModelParallelizer()
