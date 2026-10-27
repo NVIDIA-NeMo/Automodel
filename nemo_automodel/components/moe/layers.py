@@ -1008,7 +1008,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
 
     with torch.device(buffer_device):
         if isinstance(module, Gate):
-            to_local(module.weight).normal_(mean=0.0, std=init_std)
+            # Preserve DTensor RNG offsets so FSDP shards do not repeat router rows.
+            nn.init.normal_(module.weight, mean=0.0, std=init_std)
             if module.e_score_correction_bias is not None:
                 to_local(module.e_score_correction_bias).zero_()
             if module.bias is not None:
