@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Published D1 text prompts with explicit supervision and option identities."""
+"""Published D1 text prompts with explicit question and option identities."""
 
 import math
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
-
-from nemo_automodel.shared.decision_records import QuestionTarget, question_targets, validate_record
 
 
 @dataclass(frozen=True)
@@ -28,11 +26,13 @@ class D1TextExample:
 
     Marker positions and alias groups are mutually exclusive model readouts.
     Temperature applies to Omni text logits before training and evaluation.
+    Recipes align labels and rewards separately using the question and option IDs.
     """
 
     record_id: str
     input_ids: tuple[int, ...]
-    target: QuestionTarget
+    question_id: str
+    option_ids: tuple[str, ...]
     marker_positions: tuple[int, ...]
     alias_token_ids: tuple[tuple[int, ...], ...]
     head_question_type: int
@@ -51,7 +51,7 @@ def encode_d1_record(
     """Encode unchanged SOC records using reviewed pinned publisher prompt code.
 
     Args:
-        record: Typed state/questions/answers/rewards record.
+        record: Validated state/questions record. Supervision is not consumed.
         tokenizer: Tokenizer from the same immutable release as the prompt code.
         prompt: Imported publisher prompt module, pinned by the recipe.
         omni: Select the marker encoder instead of the causal token-alias prompt.
@@ -59,9 +59,9 @@ def encode_d1_record(
         temperatures: Released Omni text calibration, unchanged across stages.
 
     Returns:
-        Independent questions with aligned labels and per-option rewards.
+        Encoded questions with their model-output option identities. The caller
+        aligns supervision with these identities separately.
     """
-    validate_record(record)
     result = []
     for qid, schema in record["questions"].items():
         question = prompt.as_question(schema)
@@ -71,7 +71,6 @@ def encode_d1_record(
             order = tuple(str(key) for key in schema["criteria"])
         else:
             order = tuple(str(index) for index in range(len(schema["criteria"])))
-        (target,) = question_targets(record, {qid: order})
         if omni:
             ids, markers = prompt.encode(tokenizer, record["state"], question, max_length)
             aliases = ()
@@ -85,13 +84,13 @@ def encode_d1_record(
                 raise ValueError(f"{record['id']}/{qid}: causal prompt exceeds max_length")
             markers = ()
             aliases = tuple(tuple(group) for group in prompt.readout_ids(tokenizer, question))
-            head_type = target.question_type
+            head_type = ("noul", "choice", "score").index(schema["type"])
             temperature = 1.0
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("Released calibration temperatures must be finite and positive")
         if len(markers if omni else aliases) != len(order):
-            raise ValueError("Published readout and supervision have different option counts")
+            raise ValueError("Published readout and question schema have different option counts")
         result.append(
-            D1TextExample(str(record["id"]), tuple(ids), target, tuple(markers), aliases, head_type, temperature)
+            D1TextExample(str(record["id"]), tuple(ids), qid, order, tuple(markers), aliases, head_type, temperature)
         )
     return result

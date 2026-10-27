@@ -21,13 +21,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from nemo_automodel.components.decision import metrics
+from nemo_automodel.components.datasets.decision import records as schema
+from nemo_automodel.components.eval.decision import metrics
 from nemo_automodel.components.loss import decision as losses
 from nemo_automodel.components.loss import decision_batch as batching
 from nemo_automodel.components.models.clef import joint_schema_head as clef
 from nemo_automodel.components.models.clm import heads as clm
 from nemo_automodel.components.models.clm import prompting as clm_prompting
-from nemo_automodel.shared import decision_records as schema
 
 QUESTIONS = {
     "verdict": {

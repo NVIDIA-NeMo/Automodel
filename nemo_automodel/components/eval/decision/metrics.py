@@ -20,9 +20,31 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence
 
-from nemo_automodel.shared.decision_records import QuestionTarget
+
+class EvaluationTargetProtocol(Protocol):
+    """Read-only supervision required by this component."""
+
+    @property
+    def question_id(self) -> str:
+        """Question identity within its record."""
+        ...
+
+    @property
+    def option_ids(self) -> tuple[str, ...]:
+        """Option identities in model-output order."""
+        ...
+
+    @property
+    def label(self) -> int:
+        """Gold option index, or -100 when unlabelled."""
+        ...
+
+    @property
+    def rewards(self) -> tuple[float, ...] | None:
+        """Optional utilities aligned with the option identities."""
+        ...
 
 
 class DecisionEvaluator:
@@ -86,10 +108,17 @@ class DecisionEvaluator:
     def add_batch(
         self,
         records: Sequence[dict[str, Any]],
-        targets_per_record: Sequence[Sequence[QuestionTarget]],
+        targets_per_record: Sequence[Sequence[EvaluationTargetProtocol]],
         probs_per_record: Sequence[Sequence[Sequence[float]]],
     ) -> None:
-        """Add a batch: ``targets_per_record[i]`` are :class:`QuestionTarget`, ``probs_per_record[i][j]`` a 1-D list."""
+        """Accumulate records with structurally typed targets and aligned probabilities.
+
+        Args:
+            records: Input records with IDs and optional slicing metadata.
+            targets_per_record: Targets grouped by record, in model-output order.
+            probs_per_record: Option probabilities grouped by record and question,
+                in each target's option order.
+        """
         for record, targets, probs in zip(records, targets_per_record, probs_per_record, strict=True):
             for target, p in zip(targets, probs, strict=True):
                 self.add(

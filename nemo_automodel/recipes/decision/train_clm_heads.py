@@ -54,8 +54,14 @@ import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.decision.metrics import DecisionEvaluator, save_summary
+from nemo_automodel.components.datasets.decision.records import (
+    QuestionTarget,
+    load_records,
+    question_targets,
+    validate_record,
+)
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.eval.decision.metrics import DecisionEvaluator, save_summary
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loss.decision import DecisionLossConfig
 from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
@@ -73,7 +79,6 @@ from nemo_automodel.components.models.clm.prompting import prepare_tokenizer
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.shared.decision_records import QuestionTarget, load_records, question_targets, validate_record
 
 logger = logging.getLogger(__name__)
 

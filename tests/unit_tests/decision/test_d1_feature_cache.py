@@ -115,3 +115,42 @@ def test_checkpoint_provenance_rejects_changed_library(training, tmp_path, libra
     training.args.input_dir = source
     with pytest.raises(ValueError, match=f"Checkpoint provenance mismatch: {library}"):
         training.run()
+
+
+def test_recipe_validates_supervision_before_model_encoding(training, monkeypatch):
+    record = {
+        "id": "bad",
+        "state": "observation",
+        "questions": {"flag": {"type": "noul"}},
+        "rewards": {"flag": {"true": float("inf"), "false": 0.0}},
+    }
+    monkeypatch.setattr(recipe, "load_records", lambda _: [record])
+
+    def unexpected_encoding(*args, **kwargs):
+        raise AssertionError("Invalid supervision reached model encoding")
+
+    monkeypatch.setattr(recipe, "encode_d1_record", unexpected_encoding)
+    with pytest.raises(ValueError, match="finite numbers"):
+        recipe.D1PostTraining(training.args)
+
+
+def test_recipe_aligns_separate_targets_in_encoded_question_order(training, monkeypatch):
+    record = {
+        "id": "r",
+        "state": "observation",
+        "questions": {"first": {"type": "noul"}, "second": {"type": "noul"}},
+        "answers": {"first": "true", "second": "false"},
+        "rewards": {"first": {"true": 0.75, "false": -0.5}},
+    }
+    encoded = [
+        recipe.D1TextExample("r", (1, 2), "second", ("true", "false"), (), ((1,), (2,)), 0, 1.0),
+        recipe.D1TextExample("r", (3, 4), "first", ("false", "true"), (), ((4,), (3,)), 0, 1.0),
+    ]
+    monkeypatch.setattr(recipe, "load_records", lambda _: [record])
+    monkeypatch.setattr(recipe, "encode_d1_record", lambda *args, **kwargs: encoded)
+    run = recipe.D1PostTraining(training.args)
+    for split in ("train", "validation", "test"):
+        assert run.examples[split] == encoded
+        assert [(target.question_id, target.label) for target in run.targets[split]] == [("second", 1), ("first", 1)]
+        assert run.targets[split][0].rewards is None
+        assert run.targets[split][1].rewards == (-0.5, 0.75)

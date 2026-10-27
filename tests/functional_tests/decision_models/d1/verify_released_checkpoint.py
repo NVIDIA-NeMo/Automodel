@@ -31,6 +31,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
+from nemo_automodel.components.datasets.decision.records import QuestionTarget, question_targets, validate_record
 from nemo_automodel.components.models.d1.releases import RELEASE_DTYPES, RELEASES
 
 PROBABILITY_ATOL = 0.02
@@ -271,7 +272,7 @@ def _check_media(native, publisher, tokenizer, prompt, record: dict, examples: l
             repository, revision=revision, code_revision=revision, trust_remote_code=True
         )
         for example in examples:
-            question = prompt.as_question(record["questions"][example.target.question_id])
+            question = prompt.as_question(record["questions"][example.question_id])
             engine = publisher.engine
             prefix = prompt.prefix_text(
                 tokenizer, record["state"], engine.bos, engine.state_style, engine.system, engine._image_markup(1)
@@ -291,7 +292,7 @@ def _check_media(native, publisher, tokenizer, prompt, record: dict, examples: l
             checks.append(
                 {
                     "modality": "image",
-                    "question": example.target.question_id,
+                    "question": example.question_id,
                     "full_vocabulary_max_abs_error": float((actual - expected).abs().max()),
                     "full_vocabulary_cosine": cosine,
                     "probability_max_abs_error": float((actual_probabilities - expected_probabilities).abs().max()),
@@ -318,7 +319,7 @@ def _check_media(native, publisher, tokenizer, prompt, record: dict, examples: l
         )
         limit = min(configured_limit, publisher.config.max_length - prefix.shape[1])
         for example in examples:
-            question = prompt.as_question(record["questions"][example.target.question_id])
+            question = prompt.as_question(record["questions"][example.question_id])
             ids, markers = prompt.encode(
                 tokenizer, record["state"], question, limit, {"false": "no", "true": "yes"}, modality == "audio"
             )
@@ -343,7 +344,7 @@ def _check_media(native, publisher, tokenizer, prompt, record: dict, examples: l
             checks.append(
                 {
                     "modality": modality,
-                    "question": example.target.question_id,
+                    "question": example.question_id,
                     "prefix_length": prefix.shape[1],
                     "exact_prefix": True,
                     "probability_max_abs_error": float((actual - expected).abs().max()),
@@ -359,7 +360,9 @@ def _check_media(native, publisher, tokenizer, prompt, record: dict, examples: l
     }
 
 
-def _train_and_save(native, publisher, examples: list, output_dir: Path, *, omni: bool) -> tuple[dict, list]:
+def _train_and_save(
+    native, publisher, examples: list, output_dir: Path, *, omni: bool, questions: list[QuestionTarget]
+) -> tuple[dict, list]:
     """Run one real supervised head update and prove every backbone tensor stayed frozen."""
     from nemo_automodel.components.loss.decision import DecisionLossConfig
     from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
@@ -374,12 +377,12 @@ def _train_and_save(native, publisher, examples: list, output_dir: Path, *, omni
     values = readout.score(features, examples, head=head)
     targets = DecisionTargets.from_questions(
         record_ids=[example.record_id for example in examples],
-        questions=[[example.target] for example in examples],
+        questions=[[question] for question in questions],
         device=values[0].device,
     )
     batch = assemble_decision_batch(
         logits=[
-            [QuestionLogits(example.record_id, example.target.question_id, example.target.option_ids, row)]
+            [QuestionLogits(example.record_id, example.question_id, example.option_ids, row)]
             for example, row in zip(examples, values, strict=True)
         ],
         targets=targets,
@@ -428,8 +431,8 @@ def _run(args: argparse.Namespace, result: dict) -> None:
     from transformers import AutoConfig, AutoTokenizer
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
+    from nemo_automodel.components.datasets.decision.records import load_records
     from nemo_automodel.components.models.d1.records import encode_d1_record
-    from nemo_automodel.shared.decision_records import load_records
 
     repository, revision, class_name = RELEASES[args.model]
     omni = args.model == "d1-omni"
@@ -466,6 +469,8 @@ def _run(args: argparse.Namespace, result: dict) -> None:
     records = load_records(args.data_dir / "validation.jsonl")[:3]
     if len(records) != 3 or any(set(record["questions"]) != QUESTION_IDS for record in records):
         raise ValueError("Acceptance requires three validation records with all five declared questions")
+    for record in records:
+        validate_record(record)
     examples = [
         example
         for record in records
@@ -489,7 +494,7 @@ def _run(args: argparse.Namespace, result: dict) -> None:
     checks, failures = [], []
     for example, logits in zip(examples, values, strict=True):
         record = records_by_id[example.record_id]
-        qid = example.target.question_id
+        qid = example.question_id
         schema = record["questions"][qid]
         question = prompt.as_question(schema)
         if not omni:
@@ -502,15 +507,15 @@ def _run(args: argparse.Namespace, result: dict) -> None:
             if schema["type"] == "noul"
             else answer["probabilities"]
         )
-        if set(probabilities) != set(example.target.option_ids):
+        if set(probabilities) != set(example.option_ids):
             raise ValueError("Publisher and native option identities differ")
-        expected = torch.tensor([probabilities[key] for key in example.target.option_ids], device=logits.device)
+        expected = torch.tensor([probabilities[key] for key in example.option_ids], device=logits.device)
         actual = logits.softmax(-1)
         maximum = float((actual - expected).abs().max())
         row = {
             "record_id": example.record_id,
             "question": qid,
-            "option_ids": list(example.target.option_ids),
+            "option_ids": list(example.option_ids),
             "max_probability_error": maximum,
         }
         checks.append(row)
@@ -536,7 +541,15 @@ def _run(args: argparse.Namespace, result: dict) -> None:
     del readout, features, values
     training_examples = examples[:5]
     result["training"], trained_logits = _train_and_save(
-        native, publisher, training_examples, args.output_dir, omni=omni
+        native,
+        publisher,
+        training_examples,
+        args.output_dir,
+        omni=omni,
+        questions=[
+            question_targets(records_by_id[example.record_id], {example.question_id: example.option_ids})[0]
+            for example in training_examples
+        ],
     )
     del native, publisher
     gc.collect()

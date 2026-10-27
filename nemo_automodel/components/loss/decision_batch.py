@@ -24,11 +24,39 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import Protocol
 
 import torch
 from torch.nn import functional
 
-from nemo_automodel.shared.decision_records import QuestionTarget
+
+class DecisionTargetProtocol(Protocol):
+    """Read-only supervision required by this component."""
+
+    @property
+    def question_id(self) -> str:
+        """Question identity within its record."""
+        ...
+
+    @property
+    def option_ids(self) -> tuple[str, ...]:
+        """Option identities in model-output order."""
+        ...
+
+    @property
+    def label(self) -> int:
+        """Gold option index, or -100 when unlabelled."""
+        ...
+
+    @property
+    def rewards(self) -> tuple[float, ...] | None:
+        """Optional utilities aligned with the option identities."""
+        ...
+
+    @property
+    def question_type(self) -> int:
+        """Loss question type: 0=noul, 1=choice, 2=score."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -77,14 +105,14 @@ class DecisionTargets:
     ref_logprobs: torch.Tensor | None = None
     weights: torch.Tensor | None = None
     record_ids: tuple[str, ...] = ()
-    questions: tuple[tuple[QuestionTarget, ...], ...] = ()
+    questions: tuple[tuple[DecisionTargetProtocol, ...], ...] = ()
 
     @classmethod
     def from_questions(
         cls,
         *,
         record_ids: Sequence[str],
-        questions: Sequence[Sequence[QuestionTarget]],
+        questions: Sequence[Sequence[DecisionTargetProtocol]],
         question_weights: Mapping[str, float] | None = None,
         reference_logprobs: Sequence[Sequence[QuestionLogits]] | None = None,
         device: torch.device | str | None = None,

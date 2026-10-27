@@ -48,6 +48,7 @@ from transformers import Qwen3_5Config
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.decision.records import question_targets
 from nemo_automodel.components.loss.decision import DecisionLossConfig
 from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
 from nemo_automodel.components.models.clef.joint_schema_head import (
@@ -61,7 +62,6 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.decision.train_clef import TrainClefDecisionRecipe
-from nemo_automodel.shared.decision_records import question_targets
 
 _RESULT_PREFIX = "CLEF_FSDP_ACCEPTANCE "
 

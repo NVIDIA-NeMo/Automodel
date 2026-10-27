@@ -31,6 +31,7 @@ from torch import nn
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.decision.records import question_targets
 from nemo_automodel.components.loss.decision import DecisionLossConfig
 from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
 from nemo_automodel.components.models.clef.joint_schema_head import (
@@ -42,7 +43,6 @@ from nemo_automodel.components.models.clef.joint_schema_head import (
 )
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.decision.train_clef import TrainClefDecisionRecipe
-from nemo_automodel.shared.decision_records import question_targets
 
 
 class TinyFrozenBackbone(nn.Module):

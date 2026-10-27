@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from nemo_automodel.shared.decision_records import load_records, pad_and_shard_records
+from nemo_automodel.components.datasets.decision.records import load_records, pad_and_shard_records
 
 
 @pytest.mark.parametrize("record_ids", [["same", "same"], [1, "1"]])

@@ -27,7 +27,6 @@ from nemo_automodel.components.models.d1 import model as model_module
 from nemo_automodel.components.models.d1.config import D1OmniConfig
 from nemo_automodel.components.models.d1.model import D1OmniModel
 from nemo_automodel.components.models.d1.records import D1TextExample
-from nemo_automodel.shared.decision_records import QuestionTarget
 
 
 class StubPerception(nn.Module):
@@ -164,10 +163,8 @@ def test_checkpoint_config_resolves_through_shared_automodel_path(config, tmp_pa
 def test_omni_text_readout_preserves_full_model_scores_calibration_and_gradients(model):
     model.requires_grad_(False)
     examples = [
-        D1TextExample(
-            "record-a", (1, 2, 3, 4), QuestionTarget("flag", 0, ("false", "true"), 1, None), (1, 3), (), 2, 1.7
-        ),
-        D1TextExample("record-b", (5, 6, 7), QuestionTarget("flag", 0, ("false", "true"), 0, None), (0, 2), (), 2, 0.8),
+        D1TextExample("record-a", (1, 2, 3, 4), "flag", ("false", "true"), (1, 3), (), 2, 1.7),
+        D1TextExample("record-b", (5, 6, 7), "flag", ("false", "true"), (0, 2), (), 2, 0.8),
     ]
     readout = model.prepare_text_readout(examples)
     readout.head.requires_grad_(True)

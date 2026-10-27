@@ -33,7 +33,6 @@ from nemo_automodel.components.models.d1.causal import D1CausalRotaryEmbedding
 from nemo_automodel.components.models.d1.decision_head import D1TokenReadoutConfig
 from nemo_automodel.components.models.d1.records import D1TextExample
 from nemo_automodel.components.models.d1.vl_model import Lfm2VlForConditionalGeneration
-from nemo_automodel.shared.decision_records import QuestionTarget
 
 
 def tiny_config():
@@ -202,12 +201,8 @@ def test_causal_text_readout_preserves_full_model_alias_scores_and_head_gradient
     torch.manual_seed(145)
     model = Lfm2VlForConditionalGeneration(tiny_config()).eval().requires_grad_(False)
     examples = [
-        D1TextExample(
-            "record-a", (1, 2, 3), QuestionTarget("flag", 0, ("true", "false"), 0, None), (), ((7, 4), (9,)), 0, 1.0
-        ),
-        D1TextExample(
-            "record-b", (5, 6), QuestionTarget("flag", 0, ("false", "true"), 1, None), (), ((9,), (4, 7)), 0, 1.0
-        ),
+        D1TextExample("record-a", (1, 2, 3), "flag", ("true", "false"), (), ((7, 4), (9,)), 0, 1.0),
+        D1TextExample("record-b", (5, 6), "flag", ("false", "true"), (), ((9,), (4, 7)), 0, 1.0),
     ]
     readout = model.prepare_text_readout(examples)
     features, expected = [], []

@@ -89,11 +89,11 @@ if RUN_TRAINING:
 
     import torch
 
-    from nemo_automodel.components.decision.metrics import DecisionEvaluator
+    from nemo_automodel.components.datasets.decision.records import load_records, question_targets
+    from nemo_automodel.components.eval.decision.metrics import DecisionEvaluator
     from nemo_automodel.components.loss.decision import group_masked_bidirectional_infonce
     from nemo_automodel.components.models.clm.heads import EmbeddingTable, clm_batch, load_clm_heads, save_clm_heads
     from nemo_automodel.components.models.clm.prompting import clm_pairs
-    from nemo_automodel.shared.decision_records import load_records, question_targets
 
     caches = list(CACHE.glob("embeddings_*.pt"))
     if len(caches) != 1:

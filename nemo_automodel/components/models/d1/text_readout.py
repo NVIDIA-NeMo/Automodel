@@ -75,7 +75,7 @@ class D1TextReadout(Protocol):
 
         Returns:
             List of float32 Tensors of shape [options], one per example in its
-            declared target option order, retaining gradients to the head.
+            declared example option order, retaining gradients to the head.
         """
         ...
 
@@ -149,7 +149,7 @@ class D1CausalTextReadout:
             head: The additive answer-row adapter or a frozen reference copy.
 
         Returns:
-            List of float32 Tensors of shape [options], in each target's order.
+            List of float32 Tensors of shape [options], in each example's option order.
         """
         _validate_feature_pairs(features, examples)
         result = []
@@ -200,7 +200,7 @@ class D1OmniTextReadout:
             head: The released Omni marker head or a frozen reference copy.
 
         Returns:
-            List of float32 Tensors of shape [options], in each target's order,
+            List of float32 Tensors of shape [options], in each example's option order,
             divided by that question's released text temperature.
         """
         _validate_feature_pairs(features, examples)
@@ -210,9 +210,9 @@ class D1OmniTextReadout:
             if (
                 not math.isfinite(ex.temperature)
                 or ex.temperature <= 0
-                or len(ex.marker_positions) != len(ex.target.option_ids)
+                or len(ex.marker_positions) != len(ex.option_ids)
             ):
-                raise ValueError("D1 Omni requires positive temperatures and one marker per target option")
+                raise ValueError("D1 Omni requires positive temperatures and one marker per encoded option")
             if min(ex.marker_positions) < 0 or max(ex.marker_positions) >= feature.shape[0]:
                 raise ValueError("D1 Omni marker positions must index their unpadded text features")
         states = nn.utils.rnn.pad_sequence(features, batch_first=True).float()
@@ -227,4 +227,4 @@ class D1OmniTextReadout:
             markers[index, : len(ex.marker_positions)] = True
         types = torch.tensor([ex.head_question_type for ex in examples], device=device)
         values = head(states, valid, positions, markers, types)
-        return [row[: len(ex.target.option_ids)] / ex.temperature for row, ex in zip(values, examples)]
+        return [row[: len(ex.option_ids)] / ex.temperature for row, ex in zip(values, examples)]

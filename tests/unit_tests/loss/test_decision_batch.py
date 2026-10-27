@@ -20,9 +20,9 @@ import pytest
 import torch
 from torch.nn import functional
 
+from nemo_automodel.components.datasets.decision.records import QuestionTarget
 from nemo_automodel.components.loss.decision import DecisionLossConfig
 from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
-from nemo_automodel.shared.decision_records import QuestionTarget
 
 
 def _questions():

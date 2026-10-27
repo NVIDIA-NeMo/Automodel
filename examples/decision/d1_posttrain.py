@@ -41,15 +41,20 @@ from transformers import __version__ as transformers_version
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from nemo_automodel import NeMoAutoModelForImageTextToText
-from nemo_automodel.components.decision.metrics import DecisionEvaluator, save_summary
+from nemo_automodel.components.datasets.decision.records import (
+    QuestionTarget,
+    load_records,
+    question_targets,
+    validate_record,
+)
+from nemo_automodel.components.eval.decision.metrics import DecisionEvaluator, save_summary
 from nemo_automodel.components.loss.decision import DecisionLossConfig
 from nemo_automodel.components.loss.decision_batch import DecisionTargets, QuestionLogits, assemble_decision_batch
 from nemo_automodel.components.models.d1.model import D1OmniModel
-from nemo_automodel.components.models.d1.records import encode_d1_record
+from nemo_automodel.components.models.d1.records import D1TextExample, encode_d1_record
 from nemo_automodel.components.models.d1.releases import RELEASE_DTYPES, RELEASES
 from nemo_automodel.components.models.d1.text_readout import D1TextReadout
 from nemo_automodel.components.models.d1.vl_model import Lfm2VlForConditionalGeneration
-from nemo_automodel.shared.decision_records import load_records
 
 LOGGER = logging.getLogger(__name__)
 FRAMEWORK = "automodel"
@@ -105,11 +110,14 @@ class D1PostTraining:
         config = AutoConfig.from_pretrained(
             self.repository, revision=self.revision, code_revision=self.revision, trust_remote_code=True
         )
-        self.examples = {
-            split: [
-                example
-                for record in records
-                for example in encode_d1_record(
+        self.examples: dict[str, list[D1TextExample]] = {}
+        self.targets: dict[str, list[QuestionTarget]] = {}
+        for split, records in self.records.items():
+            self.examples[split] = []
+            self.targets[split] = []
+            for record in records:
+                validate_record(record)
+                encoded = encode_d1_record(
                     record,
                     tokenizer=self.tokenizer,
                     prompt=self.prompt,
@@ -117,9 +125,10 @@ class D1PostTraining:
                     max_length=config.max_length if self.omni else config.text_config.max_position_embeddings,
                     temperatures=getattr(config, "temperatures", {}),
                 )
-            ]
-            for split, records in self.records.items()
-        }
+                self.examples[split].extend(encoded)
+                self.targets[split].extend(
+                    question_targets(record, {example.question_id: example.option_ids for example in encoded})
+                )
         self.meta_by_id = {
             str(record["id"]): record.get("meta", {}) for records in self.records.values() for record in records
         }
@@ -222,7 +231,7 @@ class D1PostTraining:
                 indices = list(range(start, min(start + self.args.batch_size, len(self.examples[split]))))
                 for index, logits in zip(indices, self.logits(split, indices)):
                     ex = self.examples[split][index]
-                    target = ex.target
+                    target = self.targets[split][index]
                     evaluator.add(
                         ex.record_id,
                         target.question_id,
@@ -263,22 +272,18 @@ class D1PostTraining:
                     if reference is not None:
                         with torch.no_grad():
                             ref = [
-                                [
-                                    QuestionLogits(
-                                        ex.record_id, ex.target.question_id, ex.target.option_ids, row.log_softmax(-1)
-                                    )
-                                ]
+                                [QuestionLogits(ex.record_id, ex.question_id, ex.option_ids, row.log_softmax(-1))]
                                 for ex, row in zip(examples, self.logits("train", batch, reference), strict=True)
                             ]
                     targets = DecisionTargets.from_questions(
                         record_ids=[ex.record_id for ex in examples],
-                        questions=[[ex.target] for ex in examples],
+                        questions=[[self.targets["train"][index]] for index in batch],
                         reference_logprobs=ref,
                         device=values[0].device,
                     )
                     decision_batch = assemble_decision_batch(
                         logits=[
-                            [QuestionLogits(ex.record_id, ex.target.question_id, ex.target.option_ids, row)]
+                            [QuestionLogits(ex.record_id, ex.question_id, ex.option_ids, row)]
                             for ex, row in zip(examples, values, strict=True)
                         ],
                         targets=targets,
@@ -346,7 +351,7 @@ class D1PostTraining:
                     values = self.logits("validation", indices)
                 for index, logits in zip(indices, values):
                     ex = self.examples["validation"][index]
-                    qid = ex.target.question_id
+                    qid = ex.question_id
                     question = record["questions"][qid]
                     if not self.omni:
                         rendered = reference.engine.render(record["state"], self.prompt.as_question(question))
@@ -354,11 +359,11 @@ class D1PostTraining:
                         if tuple(published_ids) != ex.input_ids:
                             raise ValueError("Native and publisher single-question prompts differ")
                     answer = reference.system_one(record["state"], {qid: question})["answers"][qid]
-                    if record["questions"][ex.target.question_id]["type"] == "noul":
+                    if record["questions"][ex.question_id]["type"] == "noul":
                         probabilities = {"true": answer["noul"], "false": 1 - answer["noul"]}
                     else:
                         probabilities = answer["probabilities"]
-                    expected = torch.tensor([probabilities[key] for key in ex.target.option_ids], device="cuda")
+                    expected = torch.tensor([probabilities[key] for key in ex.option_ids], device="cuda")
                     actual = logits.softmax(-1)
                     try:
                         torch.testing.assert_close(actual, expected, atol=0.02, rtol=0)
@@ -401,8 +406,8 @@ class D1PostTraining:
                     checks.append(
                         {
                             "record_id": ex.record_id,
-                            "question": ex.target.question_id,
-                            "option_ids": list(ex.target.option_ids),
+                            "question": ex.question_id,
+                            "option_ids": list(ex.option_ids),
                             "max_probability_error": float((actual - expected).abs().max()),
                         }
                     )

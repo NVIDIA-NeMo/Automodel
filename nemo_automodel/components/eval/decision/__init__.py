@@ -12,16 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-agnostic post-training components for System One / Jev-style decision models.
+"""Evaluation metrics for typed decision predictions."""
 
-Decision models read a ``state`` plus a schema of typed questions (``noul`` / ``choice`` / ``score``) and return a
-probability for every allowed option in a single forward pass. This package holds
-evaluation metrics. Objectives and their validated batch contract live in
-``components.loss.decision`` and ``components.loss.decision_batch``.
-"""
+from nemo_automodel.components.eval.decision.metrics import DecisionEvaluator
 
-from nemo_automodel.components.decision.metrics import DecisionEvaluator
-
-__all__ = [
-    "DecisionEvaluator",
-]
+__all__ = ["DecisionEvaluator"]

@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from nemo_automodel.components.datasets.decision.records import question_targets, validate_record
 from nemo_automodel.components.models.d1.records import encode_d1_record
 
 
@@ -33,6 +34,7 @@ def inputs():
 
 def test_omni_marker_order_preserves_gold_reward_and_temperature():
     record, prompt, tokenizer = inputs()
+    validate_record(record)
     (example,) = encode_d1_record(
         record,
         tokenizer=tokenizer,
@@ -41,10 +43,11 @@ def test_omni_marker_order_preserves_gold_reward_and_temperature():
         max_length=64,
         temperatures={"noul": 1.1, "noul:2": 1.666},
     )
-    assert example.target.option_ids == ("false", "true")
-    assert example.target.option_ids[example.target.label] == record["answers"]["review"]
-    assert example.target.rewards == (-0.5, 0.75)
-    assert example.target.question_type == 0  # Existing loss contract: noul=0.
+    (target,) = question_targets(record, {example.question_id: example.option_ids})
+    assert example.option_ids == ("false", "true")
+    assert target.option_ids[target.label] == record["answers"]["review"]
+    assert target.rewards == (-0.5, 0.75)
+    assert target.question_type == 0  # Existing loss contract: noul=0.
     assert example.head_question_type == 2  # Published Omni head: noul=2.
     assert example.marker_positions == (2, 3)
     assert example.alias_token_ids == ()
@@ -53,10 +56,12 @@ def test_omni_marker_order_preserves_gold_reward_and_temperature():
 
 def test_causal_alias_order_preserves_gold_and_rewards():
     record, prompt, tokenizer = inputs()
+    validate_record(record)
     (example,) = encode_d1_record(record, tokenizer=tokenizer, prompt=prompt, omni=False, max_length=64)
-    assert example.target.option_ids == ("true", "false")
-    assert example.target.label == 0
-    assert example.target.rewards == (0.75, -0.5)
+    (target,) = question_targets(record, {example.question_id: example.option_ids})
+    assert example.option_ids == ("true", "false")
+    assert target.label == 0
+    assert target.rewards == (0.75, -0.5)
     assert example.alias_token_ids == ((42, 43), (50,))
     assert example.marker_positions == ()
     assert example.temperature == 1.0
@@ -74,3 +79,14 @@ def test_omni_rejects_invalid_calibration_and_missing_markers():
     prompt.encode = lambda *args: ([1, 2, 3], [2])
     with pytest.raises(ValueError, match="option counts"):
         encode_d1_record(record, tokenizer=tokenizer, prompt=prompt, omni=True, max_length=64)
+
+
+@pytest.mark.parametrize("omni", [False, True])
+def test_encoding_is_independent_of_supervision(omni):
+    record, prompt, tokenizer = inputs()
+    validate_record(record)
+    labelled = encode_d1_record(record, tokenizer=tokenizer, prompt=prompt, omni=omni, max_length=64)
+    del record["answers"]
+    del record["rewards"]
+    unlabelled = encode_d1_record(record, tokenizer=tokenizer, prompt=prompt, omni=omni, max_length=64)
+    assert unlabelled == labelled
