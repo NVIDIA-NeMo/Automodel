@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Gemma4 Unified 12B with 64K-token sequences under context parallelism (cp_size=8) on one 8-GPU node.
-# Each rank keeps a contiguous 8K-token slice; the sliding-window layers run Flex and the head_dim=512
-# full-attention ring chunks run the FFPA kernel (install the `ffpa` extra: uv sync --extra ffpa).
-# The data is the built-in synthetic LLM mock (one 64K-token sample per row), so the recipe is
-# self-contained and measures memory and throughput, not convergence.
+# Gemma4 Unified 12B SFT on Tulu-3 with 128K-token packed sequences under context parallelism (cp_size=16)
+# on two 8-GPU nodes.
+# Each rank keeps a contiguous 8K-token slice, the same shard length as the single-node 64K recipe (a 16K
+# shard per rank exceeds 80 GB per GPU); the sliding-window layers run FlashAttention (the `fa`
+# extra) and the head_dim=512 full-attention ring chunks run the FFPA kernel (uv sync --extra ffpa).
 #
-# To run:
-#   automodel examples/llm_finetune/gemma/gemma_4_12b_mock_cp8_64k.yaml --nproc-per-node 8
+# To run, on each of the two nodes (node 0 is the rendezvous master):
+#   torchrun --nnodes 2 --node-rank <0|1> --master-addr <node-0 address> --master-port 29500 --nproc-per-node 8 \
+#     examples/llm_finetune/finetune.py --config examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp16_128k.yaml
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -54,7 +55,7 @@ distributed:
   strategy: fsdp2
   dp_size: none
   tp_size: 1
-  cp_size: 8  # 65536 / 8 = 8192 tokens per rank
+  cp_size: 16  # 131072 / 16 = 8192 tokens per rank, over two nodes
   pp_size: 1
   sequence_parallel: false
   activation_checkpointing: true
@@ -67,23 +68,32 @@ loss_fn:
   logit_softcapping: 30.0  # Gemma4's final_logit_softcapping
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
-  num_sentences: 64
-  mean_len: 65535  # plus the trailing EOS: 65536 tokens, divisible by 2 * cp_size
-  std_len: 0
-  vocab_size: 100
-  max_sentence_len: 65535
-  seed: 0
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 1234
+  seq_length: 131072
+  truncation: true
+  padding: false
+  # The base checkpoint ships no chat template; gemma-4-12B-it has the same vocabulary and one.
+  tokenizer:
+    pretrained_model_name_or_path: google/gemma-4-12B-it
 
 packed_sequence:
-  packed_sequence_size: 0
+  packing_strategy: thd
+  packed_sequence_size: 131072
+  max_packs: 40  # max_steps * global_batch_size
+  num_proc: 1
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 16
+    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  drop_last: true
   shuffle: false
+
+validation_dataset: none
+validation_dataloader: none
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
@@ -103,5 +113,6 @@ ci:
   cluster_tag: h100
   recipe_owner: khazic
   time: "00:40:00"
-  nodes: 1
+  # cp_size(16) = 16 GPUs => 2 nodes (8 GPUs/node).
+  nodes: 2
   nproc_per_node: 8
