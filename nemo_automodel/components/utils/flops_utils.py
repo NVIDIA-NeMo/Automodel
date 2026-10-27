@@ -1983,8 +1983,18 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         composite config. Pass its text config explicitly when only text-backbone
         FLOPs are intended.
     """
+    # Config classes can supply a model-owned formula without shared utilities
+    # importing the implementation or encoding its architecture.
+    formula = getattr(type(config), "flops_formula", None)
+    if callable(formula):
+        return formula
+
     # Get config class name
     config_class_name = config.__class__.__name__
+    if config_class_name == "Step5Config":
+        from nemo_automodel.components.models.step5.flops import step5_flops
+
+        return step5_flops
 
     # Map config class names to FLOPs formulas
     class_name_to_formula = {

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from transformers import PretrainedConfig
 
+from nemo_automodel.components.models.deepseek_v4.flops import model_flops
+
 
 class DeepseekV4Config(PretrainedConfig):
     """Configuration class for DeepSeek V4.
@@ -32,6 +34,7 @@ class DeepseekV4Config(PretrainedConfig):
 
     model_type = "deepseek_v4"
     keys_to_ignore_at_inference = ["past_key_values"]
+    flops_formula = staticmethod(model_flops)
 
     def __init__(
         self,

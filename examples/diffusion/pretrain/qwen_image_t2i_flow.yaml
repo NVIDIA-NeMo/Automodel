@@ -88,3 +88,6 @@ dist_env:
   init_method: "env://"
 
 seed: 42
+
+ci:
+  cluster_tag: h100

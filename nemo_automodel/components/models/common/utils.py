@@ -444,6 +444,10 @@ class BackendConfig:
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
+        te_grouped_tensor: Prefer TE 2.19 native grouped-tensor GEMMs for ``experts="te"``.
+            Requires ``dispatcher="deepep"``, ``"hybridep"``, or ``"uccl_ep"``.
+            Device and precision support follows TE's ``GroupedLinear`` contract.
+            Parameters and checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
@@ -463,6 +467,30 @@ class BackendConfig:
             blocks. ``None`` preserves HybridEP's default.
         dispatcher_hybridep_num_blocks_unpermute: Optional number of combine
             unpermutation blocks. ``None`` preserves HybridEP's default.
+        dispatcher_capacity_factor: HybridEP only, dynamic routing. Run HybridEP dispatch in its
+            non-blocking mode with output buffers sized to the first microbatch's permuted row
+            count times this factor (EP-group max, 4-token aligned) instead of letting every
+            dispatch drain the compute stream to read the exact count. Overflow trips a
+            device-side assert. None (default) keeps the blocking reference path. The capacity is
+            calibrated once per communication manager from its first real batch and kept for the
+            run; with ``dispatcher_share_token_dispatcher=True`` (default) that is one calibration,
+            taken on the first local MoE layer's first microbatch, for every layer, so choose a factor
+            that covers the largest routing skew expected across layers and batches. Not supported
+            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination).
+        dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
+            same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
+            that derives the pad size is skipped and the count is only aligned. Default False;
+            keep it False for variable-length or in-batch-packed inputs.
+        dispatcher_recompute_cache: HybridEP only; effective under full-block activation checkpointing (not
+            installed for ``checkpoint_moe_only`` regions, which end at the combine the recompute never re-runs).
+            ``"none"`` (default) recomputes the whole MoE layer in the backward. ``"combine"`` keeps
+            a clone of every MoE layer's combine output ([tokens, hidden] in the activation dtype)
+            from the checkpoint forward and returns it in the recompute instead of re-running the
+            unpermute, the EP-group barrier and the combine all-to-all. ``"moe_tail"`` additionally
+            builds the down projection's autograd node in the recompute without running its GEMM
+            (its output only fed the skipped combine; torch_mm experts without expert bias and with
+            the router weight applied inside the activation) (a post-expert callback that reads the output keeps the GEMM). Costs one [tokens, hidden] activation
+            per MoE layer per in-flight microbatch; gradients are unchanged.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -494,11 +522,11 @@ class BackendConfig:
             one fused kernel each, static shapes (a new sequence length compiles them again; past
             dynamo's recompile limit a core runs eager). Same lazy once-per-process pattern as
             ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
-        shared_expert_overlap: run the shared experts of opted-in MoE models (currently Kimi K3)
+        shared_expert_overlap: run the shared experts of MoE models (the shared ``MoE`` class, e.g. DeepSeek V4 / V4.1, and Kimi K3)
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
         compile_router_weight: torch.compile the fp32 router-weight multiply applied to
-            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP``, all MoE models),
+            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP`` / ``GroupedExpertsTE``, all MoE models),
             so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
             cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
             numerics are allclose to eager but not bitwise-identical.
@@ -529,9 +557,28 @@ class BackendConfig:
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
+    te_grouped_tensor: bool = False
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
+    # HybridEP only, dynamic routing: after one blocking calibration dispatch per communication manager (one
+    # for all layers when the dispatcher is shared, the default), size every later dispatch's output buffers
+    # to ceil(calibrated rows x factor) (EP-group max, aligned) and run HybridEP in its non-blocking mode.
+    # Removes the per-dispatch compute-stream drain that HybridEP's blocking mode needs to learn the permuted
+    # row count (and the per-layer barrier it implies); an overflow of the capacity trips a device-side assert
+    # instead of silently truncating. None = blocking.
+    # Rejected by GroupedExpertsDeepEP for expert_bias experts (the bias add sizes itself from the buffer rows).
+    dispatcher_capacity_factor: float | None = None
+    # HybridEP only: every EP rank dispatches the same number of rows (fixed-shape batches, which is
+    # every batch that is not variable-length / in-batch packed), so the per-dispatch EP-group MAX
+    # all-reduce + int() host sync that derives the pad size is skipped and the local count is only
+    # aligned. Leave False for variable-length inputs: with genuinely unequal aligned counts the
+    # HybridEP collective hangs silently (no exception; the job sits until its time limit).
+    dispatcher_equal_token_counts: bool = False
+    # HybridEP only, under block activation checkpointing: "none" | "combine" (serve each MoE layer's combine
+    # output from the checkpoint forward in the recompute) | "moe_tail" (also skip the down projection's GEMM
+    # in the recompute). One [tokens, hidden] activation per MoE layer per in-flight microbatch.
+    dispatcher_recompute_cache: str = "none"
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     dispatcher_hybridep_permute_fusion: bool = False
     dispatcher_hybridep_compact_routing: bool = False
@@ -566,7 +613,10 @@ class BackendConfig:
     # (currently DeepSeek V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
     # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_hc: bool = False
-    # When True, models that opt in (currently Kimi K3) run their shared experts on a side CUDA
+    # When True, torch.compile DeepSeek V4.1's cache quantize/dequantize core (fp8 SWA KV, mxfp4 index
+    # Q/K, nvfp4 compressed KV): the per-tensor chain of a dozen elementwise kernels becomes one or two,
+    # same lazy once-per-process pattern as compile_hc. Numerics match eager (elementwise ops only). Default False.
+    # When True, MoE models with shared experts (the shared MoE class and Kimi K3) run them on a side CUDA
     # stream, launched before the routed-expert path and joined after it, so the shared-expert
     # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's
     # moe_shared_expert_overlap). Same math, only the execution order changes. Default False.
@@ -648,6 +698,15 @@ class BackendConfig:
                 )
             self.enable_deepep = None
 
+        if self.te_grouped_tensor:
+            if self.experts != "te":
+                raise ValueError("te_grouped_tensor=True requires experts='te'.")
+            if self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+                raise ValueError(
+                    "te_grouped_tensor=True requires dispatcher='deepep', 'hybridep', or 'uccl_ep'; "
+                    f"got dispatcher='{self.dispatcher}'."
+                )
+
         # TE grouped experts require a flex dispatcher. Keep the existing standard-
         # dispatcher fallback for the deprecated gmm alias as well.
         if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
@@ -688,6 +747,41 @@ class BackendConfig:
             raise ValueError(
                 "te_fp8 requires at least one TE backend "
                 f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
+            )
+        # The sync-free knobs only mean something to the HybridEP dispatcher; elsewhere the capacity factor
+        # would silently switch off the empty-expert fallback the other dispatchers can hit.
+        sync_free_requested = self.dispatcher_capacity_factor is not None or self.dispatcher_equal_token_counts
+        if sync_free_requested and self.dispatcher != "hybridep":
+            raise ValueError(
+                "dispatcher_capacity_factor and dispatcher_equal_token_counts require dispatcher='hybridep', "
+                f"got dispatcher='{self.dispatcher}'"
+            )
+        if self.dispatcher_capacity_factor is not None and not self.dispatcher_capacity_factor >= 1.0:
+            raise ValueError(
+                f"dispatcher_capacity_factor must be >= 1.0 (a smaller buffer overflows on the first skewed batch), "
+                f"got {self.dispatcher_capacity_factor!r}"
+            )
+        if self.dispatcher_recompute_cache not in ("none", "combine", "moe_tail"):
+            raise ValueError(
+                "dispatcher_recompute_cache must be one of 'none', 'combine', 'moe_tail', "
+                f"got {self.dispatcher_recompute_cache!r}"
+            )
+        if self.dispatcher_recompute_cache != "none" and self.dispatcher != "hybridep":
+            raise ValueError(
+                "dispatcher_recompute_cache requires dispatcher='hybridep' (the cache is served by the HybridEP "
+                f"combine), got dispatcher='{self.dispatcher}'"
+            )
+        if self.dispatcher_recompute_cache == "moe_tail" and self.experts not in ("torch_mm", "gmm"):
+            raise ValueError(
+                "dispatcher_recompute_cache='moe_tail' requires experts='torch_mm' (the deferred down projection "
+                f"is the torch grouped-GEMM path), got experts='{self.experts}'"
+            )
+        if self.dispatcher_capacity_factor is not None and self.benchmark_static_routing:
+            # Static routing already pins the dispatched count after the first dispatch, so the capacity
+            # buffers would never be used; refuse instead of ignoring the factor at run time.
+            raise ValueError(
+                "dispatcher_capacity_factor has no effect under benchmark_static_routing (the pinned count already "
+                "keeps the dispatch non-blocking); unset one of them"
             )
 
 
@@ -1001,12 +1095,21 @@ def get_rope_config(config) -> tuple[float, dict, float]:
 
 
 def cast_model_to_dtype(
-    model: nn.Module, dtype: torch.dtype = torch.bfloat16, skip_modules: tuple[str, ...] = ()
+    model: nn.Module,
+    dtype: torch.dtype = torch.bfloat16,
+    skip_modules: tuple[str, ...] = (),
+    *,
+    ignore_preserved_dtypes: bool = False,
 ) -> None:
     """Cast model parameters to the target dtype, keeping fp32 modules in full precision.
 
     Respects ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` on
     the model (the same attributes HuggingFace transformers uses).
+
+    Parameters listed in a module's ``_preserve_parameter_dtypes`` keep their
+    storage dtype selected before sharding, including frozen bases and adapters.
+    The storage policy is installed by ``prepare_frozen_parameters_for_sharding``
+    and remains active for the model lifetime unless ``ignore_preserved_dtypes`` is set.
 
     Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
     (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
@@ -1018,6 +1121,8 @@ def cast_model_to_dtype(
     Args:
         model: The model whose parameters should be cast.
         dtype: Target dtype (e.g. ``torch.bfloat16``).
+        ignore_preserved_dtypes: Temporarily ignore the per-parameter storage policy;
+            used when an initializer needs a uniform FP32 view before restoring storage.
         skip_modules: Names of immediate submodules to leave entirely untouched
             (kept at their current dtype). Unlike the ``_keep_in_fp32_modules``
             restore path, these are *detached* during the cast so ``model.to()``
@@ -1055,8 +1160,42 @@ def cast_model_to_dtype(
                     detached.append((parent, child_name, child))
                     parent._modules[child_name] = None
 
+    preserved_dtypes = (
+        {
+            id(parameter): storage_dtype
+            for module in model.modules()
+            for name, storage_dtype in getattr(module, "_preserve_parameter_dtypes", {}).items()
+            if (parameter := module._parameters.get(name)) is not None
+        }
+        if not ignore_preserved_dtypes
+        else {}
+    )
+    preserved_dtypes.update(
+        (id(parameter.grad), preserved_dtypes[id(parameter)])
+        for parameter in model.parameters()
+        if id(parameter) in preserved_dtypes and parameter.grad is not None
+    )
+
+    def convert(tensor: torch.Tensor) -> torch.Tensor:
+        """Cast an arbitrary-rank parameter/buffer unless its storage is preserved.
+
+        Args:
+            tensor: Parameter or buffer of arbitrary shape, including a DTensor
+                whose global shape and mesh placements must remain unchanged.
+
+        Returns:
+            Same-shaped tensor on the same device, aliasing the input if its dtype is unchanged.
+        """
+        if not (tensor.is_floating_point() or tensor.is_complex()):
+            return tensor
+        return tensor.to(dtype=preserved_dtypes.get(id(tensor), dtype))
+
     try:
-        model.to(dtype)
+        if preserved_dtypes:
+            # Keep parameters registered so FSDP's _apply refreshes its shard views.
+            model._apply(convert)
+        else:
+            model.to(dtype)
     finally:
         for parent, child_name, child in detached:
             parent._modules[child_name] = child
@@ -1109,9 +1248,9 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
     per-element perturbation that preserves the init statistics. Wrap the body of a model's
     ``initialize_weights`` to keep that round-trip in one place.
 
-    Works whether or not the model is already FSDP2-sharded: both casts are *uniform* whole-model
-    casts, so FSDP2's invariant that every parameter in a group shares one dtype is preserved. In
-    the AutoModel pipeline ``initialize_weights`` actually runs after sharding (via
+    Works whether or not the model is already FSDP2-sharded. A mixed frozen/trainable
+    storage policy is temporarily suspended for initialization and restored on exit.
+    In the AutoModel pipeline ``initialize_weights`` runs after sharding (via
     ``checkpointer.initialize_model_weights``), i.e. on DTensor params, which is supported.
 
     ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` handling is delegated to
@@ -1133,7 +1272,9 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
     """
     if restore_dtype is None:
         restore_dtype = next((p.dtype for p in model.parameters() if p.is_floating_point()), torch.float32)
-    cast_model_to_dtype(model, torch.float32)
+    # Initialization temporarily needs FP32 even when persistent frozen storage
+    # is reduced precision. Keep the policy metadata intact while bypassing it.
+    cast_model_to_dtype(model, torch.float32, ignore_preserved_dtypes=True)
     try:
         yield model
     finally:
@@ -1383,6 +1524,69 @@ def compute_lm_head_logits(
     return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
 
 
+def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
+    """Drop FP32 master storage for frozen parameters before distributed wrapping.
+
+    Trainable parameters retain their configured storage. Model-declared FP32
+    precision requirements and checkpoint FP32 compute hints remain authoritative.
+    Record the resulting parameter dtypes so model initialization does not undo
+    this split with a whole-model cast after FSDP has captured the storage layout.
+
+    Args:
+        model: Unsharded model after its final trainability policy is applied;
+            parameters may be on the meta device. Call before optimizer creation.
+        compute_dtype: Reduced compute dtype, or None to retain existing storage.
+    """
+    has_frozen_parameters = any(not parameter.requires_grad for parameter in model.parameters())
+    has_trainable_parameters = any(parameter.requires_grad for parameter in model.parameters())
+
+    def preserve_trainable_storage() -> None:
+        """Retain adapter dtypes when a mixed-trainability model is not reduced."""
+        if not (has_frozen_parameters and has_trainable_parameters):
+            return
+        for module in model.modules():
+            trainable_dtypes = {
+                name: parameter.dtype
+                for name, parameter in module.named_parameters(recurse=False)
+                if parameter.requires_grad
+            }
+            if trainable_dtypes:
+                module._preserve_parameter_dtypes = trainable_dtypes
+
+    if compute_dtype not in (torch.bfloat16, torch.float16):
+        # A model-wide storage reduction may be unsafe when submodules use
+        # different compute policies. Still retain configured trainable storage
+        # (for example FP32 LoRA adapters) across later model-wide initializer
+        # casts. Frozen parameters remain unrecorded and follow those casts.
+        preserve_trainable_storage()
+        return
+    fp32_keywords = _get_fp32_module_keywords(model)
+    pinned_ids = {
+        id(parameter)
+        for name, parameter in model.named_parameters(remove_duplicate=False)
+        if any(keyword in name for keyword in fp32_keywords)
+    }
+    preserve_storage = False
+    for parameter in model.parameters():
+        if parameter.requires_grad or parameter.dtype not in (torch.float32, compute_dtype):
+            continue
+        if id(parameter) in pinned_ids or getattr(parameter, "_hf_compute_dtype", None) == torch.float32:
+            continue
+        # Initialization-only storage change: no autograd graph, optimizer, or
+        # distributed wrapper owns these plain parameters yet. Preserve identity.
+        parameter.data = parameter.data.to(compute_dtype)
+        preserve_storage = True
+    if preserve_storage:
+        for module in model.modules():
+            module._preserve_parameter_dtypes = {
+                name: parameter.dtype for name, parameter in module.named_parameters(recurse=False)
+            }
+    else:
+        # No frozen parameter needed a storage cast, but adapters can still use
+        # a distinct configured dtype that later whole-model init casts must keep.
+        preserve_trainable_storage()
+
+
 def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
     """Cast frozen floating-point tensors to ``compute_dtype``.
 
@@ -1505,6 +1709,7 @@ __all__ = [
     "get_rope_config",
     "initialize_linear_module",
     "initialize_rms_norm_module",
+    "prepare_frozen_parameters_for_sharding",
     "set_is_first_microbatch",
     "set_is_optim_step",
 ]

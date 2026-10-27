@@ -56,7 +56,6 @@ COMMON_ARGS=(
     --validation_dataset.path_or_dataset $HF_CACHE/mini_cord_v2/
     --validation_dataset.split validation
     --validation_dataset.limit_dataset_samples 8
-    --step_scheduler.max_steps 6
     --step_scheduler.global_batch_size 2
     --step_scheduler.local_batch_size 2
     --distributed.pp_size 1

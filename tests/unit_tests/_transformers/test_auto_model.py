@@ -1673,9 +1673,11 @@ class TestBuildModelRetryDepth:
                 _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert mock_init.call_count == 1
 
-    def test_retry_succeeds_within_limit(self):
+    @pytest.mark.parametrize("load_metadata_with_gloo", [False, True])
+    def test_retry_succeeds_within_limit(self, load_metadata_with_gloo: bool) -> None:
         """When the retried call succeeds, the model is returned normally."""
         build_kwargs, mock_config = self._make_build_kwargs()
+        build_kwargs["load_metadata_with_gloo"] = load_metadata_with_gloo
         sentinel_model = MagicMock()
         with (
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
@@ -1686,7 +1688,9 @@ class TestBuildModelRetryDepth:
                 "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
                 return_value=sentinel_model,
             ),
-            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model
+            ) as apply_infrastructure,
             patch("torch.cuda.current_device", return_value=0),
         ):
             mock_init.side_effect = [
@@ -1696,6 +1700,8 @@ class TestBuildModelRetryDepth:
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert result is sentinel_model
             assert mock_init.call_count == 2
+            assert apply_infrastructure.call_args.kwargs["load_metadata_with_gloo"] is load_metadata_with_gloo
+            assert all("load_metadata_with_gloo" not in call.kwargs for call in mock_init.call_args_list)
 
     def test_build_model_applies_runtime_patches_before_infrastructure(self):
         """Model runtime hooks run after construction and before sharding/checkpoint infra."""

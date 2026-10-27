@@ -55,6 +55,8 @@ def _normalize_activation_checkpointing(value: Any) -> bool | str:
 
     ``True`` keeps the existing full checkpointing behavior. ``"selective"``
     enables PyTorch selective activation checkpointing for supported paths.
+    ``"moe"`` checkpoints only the MoE sub-block of each decoder layer
+    (expert-parallel models).
     """
     if value is None:
         return False
@@ -66,9 +68,11 @@ def _normalize_activation_checkpointing(value: Any) -> bool | str:
             return False
         if normalized in {"true", "on", "full", "enabled", "yes"}:
             return True
-        if normalized == "selective":
-            return "selective"
-    raise ValueError("distributed.activation_checkpointing must be a boolean or one of 'full', 'selective', 'false'.")
+        if normalized in {"selective", "moe"}:
+            return normalized
+    raise ValueError(
+        "distributed.activation_checkpointing must be a boolean or one of 'full', 'selective', 'moe', 'false'."
+    )
 
 
 def parse_distributed_section(cfg_dict: dict) -> dict:
@@ -183,6 +187,11 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     ep_size: int = parallelism.get("ep_size") or 1
     if activation_checkpointing == "selective" and strategy_name not in {"fsdp2", "ddp"}:
         raise ValueError("selective activation checkpointing is supported only for FSDP2 and DDP configs.")
+    if activation_checkpointing == "moe" and (strategy_name != "fsdp2" or ep_size <= 1):
+        raise ValueError(
+            "activation_checkpointing='moe' checkpoints only the MoE sub-blocks and requires the "
+            "expert-parallel FSDP2 path (strategy fsdp2 with ep_size > 1)."
+        )
 
     # `distributed.pipeline` and `pp_size` are validated asymmetrically:
     #   * pipeline block with pp_size<=1 -> WARN (inert; block ignored). This is

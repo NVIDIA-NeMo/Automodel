@@ -57,6 +57,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
@@ -98,11 +99,13 @@ def _build_kd_loss_fn(cfg_kd):
 
 
 def _build_teacher_model(
-    cfg_teacher,
-    cfg_freeze,
+    cfg_teacher: ConfigNode,
+    cfg_freeze: ConfigNode | None,
     seed: int,
     distributed_setup: DistributedSetup | None = None,
-    device=None,
+    device: torch.device | str | None = None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> torch.nn.Module:
     """Build and initialize the teacher VLM for knowledge distillation.
 
@@ -115,6 +118,7 @@ def _build_teacher_model(
         seed: Random seed for reproducibility.
         distributed_setup: Resolved distributed topology and policy object.
         device: Device to place the teacher model on.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
 
     Returns:
         The frozen teacher model ready for inference.
@@ -130,6 +134,7 @@ def _build_teacher_model(
         cfg_fp8=None,
         cfg_compile=None,
         distributed_setup=distributed_setup,
+        load_metadata_with_gloo=load_metadata_with_gloo,
     )
 
     if device is not None:
@@ -225,6 +230,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                     seed=self.cfg.get("seed", 42),
                     distributed_setup=self.distributed_setup,
                     device=self.dist_env.device,
+                    load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
                 )
             else:
                 self.teacher_model = None
@@ -240,6 +246,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             seed=self.cfg.get("seed", 42),
             distributed_setup=getattr(self, "distributed_setup", None),
             device=teacher_device,
+            load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
         )
 
         self._configure_teacher_packing()
@@ -622,6 +629,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_valid.log(log_data)
 
@@ -656,6 +666,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_train.log(log_data)
 

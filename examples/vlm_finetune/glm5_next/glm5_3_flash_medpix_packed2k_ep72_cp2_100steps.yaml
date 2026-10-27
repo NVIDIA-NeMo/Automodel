@@ -103,6 +103,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
   split: train
+  chat_template: examples/llm_finetune/glm5_next/glm5_3_flash_training_chat_template.jinja
 
 packed_sequence:
   pretokenize: true
@@ -147,6 +148,7 @@ wandb:
   dir: logs/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 9
   time: "01:00:00"

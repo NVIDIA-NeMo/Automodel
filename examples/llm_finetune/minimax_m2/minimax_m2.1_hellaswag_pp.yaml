@@ -118,6 +118,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  cluster_tag: h100
   recipe_owner: hemildesai
   nodes: 8
   time: "01:00:00"

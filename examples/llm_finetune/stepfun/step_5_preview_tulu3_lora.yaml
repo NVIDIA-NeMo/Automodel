@@ -1,0 +1,143 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LoRA fine-tuning of the Step 5 Preview language backbone on Tulu3.
+# 2 GB200 nodes x 4 GPUs: EP8 / DP8, one 4,096-token sequence per GPU.
+# Rank-32 adapters cover attention, dense and shared-expert projections, and
+# the routed experts; the base weights stay frozen.
+#
+# To run this recipe:
+#   automodel examples/llm_finetune/stepfun/step_5_preview_tulu3_lora.yaml --nproc-per-node 4
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 42
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: fa4
+    linear: te
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: hybridep
+    compile_router_weight: true
+    gate_precision: float32
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/step_5_preview_tulu3_lora
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    wrap_outer_model: true
+    reshard_after_forward: true
+    ignore_router_for_ac: true
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      param_dtype: bfloat16
+      reduce_dtype: float32
+      output_dtype: null
+      cast_forward_inputs: false
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*.self_attn.qkv_proj"
+    - "*.self_attn.o_proj"
+    - "*.self_attn.g_proj"
+    - "*.mlp.*_proj"
+    - "*.share_expert.*_proj"
+    - "*.moe.experts"
+  dim: 32
+  alpha: 32
+  dropout: 0.0
+  moe_rank_scaling: true
+  lora_dtype: bfloat16
+  use_memory_efficient_lora: true
+  use_triton: false
+  expert_weight_format: unquantized
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 42
+  seq_length: 4096
+  truncation: true
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 4096
+  shuffle: false
+  drop_last: true
+  num_workers: 2
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 2
+  cluster_tag: gb200
+  time: "01:00:00"

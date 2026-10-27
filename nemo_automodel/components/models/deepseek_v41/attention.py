@@ -26,6 +26,8 @@ gradient and the inference release does not implement indexer distillation.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 
@@ -34,16 +36,22 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
+from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.common.rope_triton import apply_rope_triton
 from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4FP32Parameter, DeepseekV4GroupedLinear
-from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sparse_attention
+from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
+    SparseIndexPlan,
+    dsv4_sparse_attention,
+    plan_dsv4_sparse_indices,
+)
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
 from nemo_automodel.components.models.deepseek_v41.indexer import indexer_scores
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41RMSNorm
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
-from nemo_automodel.components.models.deepseek_v41.rope_triton import apply_rope_triton
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str
 
 
@@ -60,6 +68,9 @@ class DeepseekV41AttentionState:
         compressed_valid: Optional valid-group mask of shape [batch, compressed].
         compressed_seq_ids: Optional document IDs [batch, compressed], zero for padding.
         compression_ratio: Number of tokens represented by a compressed position.
+        sparse_plan: Optional :class:`SparseIndexPlan` of the current selection for the TileLang /
+            cuDNN backends, built by the first layer that consumes the selection and reused by every
+            later layer of the same lineage; value-only, dropped whenever the selection changes.
 
     Under CP, compressed and index-key axes span the global sequence while
     sequence axes in topk_indices and candidates contain only local queries.
@@ -75,6 +86,7 @@ class DeepseekV41AttentionState:
     compressed_valid: torch.Tensor | None = None
     compression_ratio: int = 0
     compressed_seq_ids: torch.Tensor | None = None
+    sparse_plan: SparseIndexPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +100,47 @@ class DeepseekV41AttentionOutput:
 
     hidden_states: torch.Tensor
     state: DeepseekV41AttentionState
+
+
+@dataclass(frozen=True)
+class _SelectionRecord:
+    """The value-only state fields one layer produced, replayed to its activation-checkpoint recompute.
+
+    Attributes:
+        index_keys: Rotated index keys of shape [batch, compressed, index_head_dim], or ``None``.
+        topk_indices: Compressed-relative selection of shape [batch, sequence, topk], ``-1`` absent, or ``None``.
+        candidates: Optional candidate mask of shape [batch, sequence, compressed].
+        sparse_plan: The lineage's :class:`SparseIndexPlan`, or ``None`` for the dense backends.
+    """
+
+    index_keys: torch.Tensor | None
+    topk_indices: torch.Tensor | None
+    candidates: torch.Tensor | None
+    sparse_plan: SparseIndexPlan | None
+
+
+csa2_selection_replay: RecomputeReplay[_SelectionRecord] = RecomputeReplay("CSA2 selection")
+"""Record/replay channel for the frozen indexer's selection and the sparse-index plan across AC recompute.
+
+``DeepseekV41Block.nemo_checkpoint_context_fn`` binds it around each checkpointed block call when
+``DeepseekV41TextConfig.reuse_sparse_selection_on_recompute`` is set: the checkpoint forward records what a
+layer adds to the state, the recompute takes it back instead of re-running the indexer and the index
+prologue. Both are integer / frozen-score work autograd never reads, so gradients are unchanged.
+"""
+
+
+@contextmanager
+def csa2_selection_region() -> Iterator[None]:
+    """Run the frozen indexer and the sparse-index planning outside any active TorchDispatch mode.
+
+    Selective activation checkpointing records every op of the checkpoint forward through a TorchDispatch
+    mode and indexes the recompute against that record. Replaying the recorded selection skips these ops
+    in the recompute, so they must be invisible to the mode in the forward as well (as Qwen3.8-Flash-Next's
+    ``qsa_route_selection_region`` does). Everything inside runs under ``torch.no_grad``; hiding the
+    region only affects checkpoint bookkeeping.
+    """
+    with _disable_current_modes():
+        yield
 
 
 class _RotaryEmbedding(nn.Module):
@@ -328,7 +381,8 @@ class _Indexer(nn.Module):
         Returns:
             New state with index_keys [batch, compressed, index_head_dim],
             topk_indices [batch, sequence, topk], and optional candidates
-            [batch, sequence, compressed]. Compressed KV storage is preserved.
+            [batch, sequence, compressed]. Compressed KV storage is preserved;
+            the sparse-index plan is dropped because a new selection needs a new plan.
         """
         keys = state.index_keys
         if self.owns_keys:
@@ -352,6 +406,7 @@ class _Indexer(nn.Module):
                     if self.is_candidate_source
                     else state.candidates
                 ),
+                sparse_plan=None,
             )
         queries = self.wq_b(query_latent).unflatten(-1, (self.num_heads, self.head_dim))
         queries = quantize_cache(_apply_rope(queries, angles), format="mxfp4", block_size=32)
@@ -398,7 +453,7 @@ class _Indexer(nn.Module):
         # Invalid entries remain -1 even when fewer candidates than top-k exist.
         valid = torch.isfinite(scores.gather(-1, indices))
         indices = torch.where(valid, indices, -1)
-        return replace(state, index_keys=keys, topk_indices=indices, candidates=candidates)
+        return replace(state, index_keys=keys, topk_indices=indices, candidates=candidates, sparse_plan=None)
 
     def _select_packed(
         self, scores: torch.Tensor, sequence_ids: torch.Tensor, state: DeepseekV41AttentionState
@@ -451,7 +506,39 @@ class _Indexer(nn.Module):
                 ordered = selected.indices.sort(-1).values
                 valid = torch.isfinite(document_scores.gather(-1, ordered))
                 indices[row, queries, : ordered.shape[-1]] = torch.where(valid, keys[ordered], -1)
-        return replace(state, topk_indices=indices, candidates=candidates)
+        return replace(state, topk_indices=indices, candidates=candidates, sparse_plan=None)
+
+
+def validate_attention_inputs(
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    packed_seq_ids: torch.Tensor | None,
+    *,
+    sequence: int,
+    cp_group: dist.ProcessGroup | None = None,
+) -> None:
+    """Run the host-synchronising checks on the per-forward inputs once.
+
+    Each check reads a device tensor on the host (``torch.equal`` / ``torch.all`` / ``torch.any``), which drains the
+    CUDA launch queue. The model calls this once per forward and passes ``inputs_validated=True`` to every layer;
+    a layer called directly (``inputs_validated=False``) still validates its own inputs. Shape checks stay in the
+    layer because they cost nothing.
+    """
+    cp_size = 1 if cp_group is None else dist.get_world_size(cp_group)
+    cp_rank = 0 if cp_group is None else dist.get_rank(cp_group)
+    positions = torch.arange(sequence, device=position_ids.device) + cp_rank * sequence
+    if packed_seq_ids is None and not torch.equal(position_ids, positions.expand_as(position_ids)):
+        raise ValueError("DeepSeek V4.1 attention supports only contiguous zero-based full-sequence position_ids")
+    if attention_mask is not None:
+        if not torch.all((attention_mask == 0) | (attention_mask == 1)):
+            raise ValueError("DeepSeek V4.1 attention_mask must contain only zero and one")
+        valid_tokens = attention_mask.bool()
+        if packed_seq_ids is None and torch.any(valid_tokens[:, 1:] & ~valid_tokens[:, :-1]):
+            raise ValueError("DeepSeek V4.1 compression supports right padding only")
+        if packed_seq_ids is None and cp_size > 1:
+            global_valid = gather_sequence(valid_tokens, cp_group)
+            if torch.any(global_valid[:, 1:] & ~global_valid[:, :-1]):
+                raise ValueError("DeepSeek V4.1 compression supports right padding only across CP ranks")
 
 
 class DeepseekV41Attention(nn.Module):
@@ -483,6 +570,7 @@ class DeepseekV41Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_kv_source = layer_idx in config.kv_source_layer_ids
         self.is_index_source = layer_idx in config.index_source_layer_ids
+        self.reuse_selection_on_recompute = bool(config.reuse_sparse_selection_on_recompute)
         dtype = dtype_from_str(config.torch_dtype, torch.bfloat16)
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False, dtype=dtype)
         # TE defaults to CUDA when device is omitted, including under a meta
@@ -553,6 +641,64 @@ class DeepseekV41Attention(nn.Module):
         output = self.wo_b(self.wo_a(grouped).flatten(2))
         return output.masked_fill(~valid_tokens.unsqueeze(-1), 0)
 
+    def _plan_sparse_indices(
+        self,
+        next_state: DeepseekV41AttentionState,
+        kv_sequence: int,
+        *,
+        positions: torch.Tensor,
+        position_ids: torch.Tensor,
+        valid_tokens: torch.Tensor,
+        global_valid: torch.Tensor,
+        global_seq_ids: torch.Tensor | None,
+        packed_seq_ids: torch.Tensor | None,
+        global_sequence: int,
+        all_rows_nonempty: bool,
+    ) -> SparseIndexPlan:
+        """Build the sparse slot indices of one selection lineage and prepare them for the backend.
+
+        Slots keep the released order: the sliding window first, then the selected compressed positions
+        offset past the window keys. The result depends only on per-forward constants and on the current
+        selection, so every layer that consumes the same selection shares it.
+
+        Args:
+            next_state: State after this layer's compressor and indexer; ``topk_indices`` is read on
+                compressed layers.
+            kv_sequence: Number of key positions per batch row of the K/V this plan is for.
+            positions: Integer tensor of shape [sequence] with this rank's global query positions.
+            position_ids: Integer tensor of shape [batch, sequence] or [1, sequence], document-local when packed.
+            valid_tokens: Boolean tensor of shape [batch, sequence]; padded queries get no slots.
+            global_valid: Boolean tensor of shape [batch, global_sequence] over the window keys.
+            global_seq_ids: Optional document IDs [batch, global_sequence], zero for padding.
+            packed_seq_ids: Optional document IDs [batch, sequence], zero for padding.
+            global_sequence: Number of window key positions per batch row.
+            all_rows_nonempty: Whether every query has at least one valid slot.
+
+        Returns:
+            The backend plan built from slot indices [batch, sequence, padded_slots] (window slots, then
+            compressed slots offset by ``global_sequence``, ``-1`` masked, padded to a multiple of 64).
+        """
+        batch = valid_tokens.shape[0]
+        starts = (positions - self.window_size + 1).clamp_min(0).expand(batch, -1)
+        if packed_seq_ids is not None:
+            starts = torch.maximum(starts, positions.unsqueeze(0) - position_ids)
+        slots = starts.unsqueeze(-1) + torch.arange(min(global_sequence, self.window_size), device=positions.device)
+        visible = (slots <= positions.view(1, -1, 1)) & (slots < global_sequence)
+        safe_slots = slots.clamp_max(global_sequence - 1)
+        visible = visible & global_valid.gather(1, safe_slots.flatten(1)).view_as(slots)
+        if packed_seq_ids is not None:
+            key_seq_ids = global_seq_ids.gather(1, safe_slots.flatten(1)).view_as(slots)
+            visible = visible & (key_seq_ids == packed_seq_ids.unsqueeze(-1))
+        indices = torch.where(visible, slots, -1)
+        if self.compress_ratio:
+            selected = next_state.topk_indices
+            indices = torch.cat((indices, torch.where(selected >= 0, selected + global_sequence, -1)), dim=-1)
+        indices = indices.masked_fill(~valid_tokens.unsqueeze(-1), -1)
+        indices = F.pad(indices, (0, -indices.shape[-1] % 64), value=-1)
+        return plan_dsv4_sparse_indices(
+            indices, kv_sequence, backend=self.backend.attn, all_rows_nonempty=all_rows_nonempty
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -562,6 +708,7 @@ class DeepseekV41Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
+        inputs_validated: bool = False,
     ) -> DeepseekV41AttentionOutput:
         """Apply attention and publish immutable state for the next layer.
 
@@ -578,6 +725,9 @@ class DeepseekV41Attention(nn.Module):
                 [batch, local_sequence], with one for tokens and zero for padding.
             cp_group: Optional CP group, overriding setup_cp_attention. Hidden
                 states and positions are local shards; shared KV state is global.
+            inputs_validated: True when the caller already ran validate_attention_inputs
+                on these position_ids / attention_mask / packed_seq_ids (the model does, once per
+                forward); the layer then skips its own host-synchronising checks.
 
         Returns:
             Output with hidden_states [batch, sequence, hidden] and the new state,
@@ -596,28 +746,30 @@ class DeepseekV41Attention(nn.Module):
         positions = torch.arange(sequence, device=hidden_states.device) + cp_rank * sequence
         if position_ids.shape not in ((1, sequence), (batch, sequence)):
             raise ValueError("DeepSeek V4.1 position_ids must have shape [batch, sequence] or [1, sequence]")
-        if packed_seq_ids is None and not torch.equal(position_ids, positions.expand_as(position_ids)):
-            raise ValueError("DeepSeek V4.1 attention supports only contiguous zero-based full-sequence position_ids")
         if packed_seq_ids is not None and packed_seq_ids.shape != (batch, sequence):
             raise ValueError("packed_seq_ids must have shape [batch, local_sequence]")
-        valid_tokens = torch.ones(batch, sequence, dtype=torch.bool, device=hidden_states.device)
-        if attention_mask is not None:
-            if attention_mask.shape != (batch, sequence):
-                raise ValueError("DeepSeek V4.1 attention_mask must have shape [batch, sequence]")
-            if not torch.all((attention_mask == 0) | (attention_mask == 1)):
-                raise ValueError("DeepSeek V4.1 attention_mask must contain only zero and one")
-            valid_tokens = attention_mask.bool()
-            if packed_seq_ids is None and torch.any(valid_tokens[:, 1:] & ~valid_tokens[:, :-1]):
-                raise ValueError("DeepSeek V4.1 compression supports right padding only")
+        if attention_mask is not None and attention_mask.shape != (batch, sequence):
+            raise ValueError("DeepSeek V4.1 attention_mask must have shape [batch, sequence]")
+        if not inputs_validated:
+            # Host-synchronising checks; the model runs them once per forward for all layers.
+            validate_attention_inputs(
+                position_ids, attention_mask, packed_seq_ids, sequence=sequence, cp_group=cp_group
+            )
+        valid_tokens = (
+            torch.ones(batch, sequence, dtype=torch.bool, device=hidden_states.device)
+            if attention_mask is None
+            else attention_mask.bool()
+        )
         global_valid = gather_sequence(valid_tokens, cp_group)
-        if packed_seq_ids is None and torch.any(global_valid[:, 1:] & ~global_valid[:, :-1]):
-            raise ValueError("DeepSeek V4.1 compression supports right padding only across CP ranks")
         global_seq_ids = None if packed_seq_ids is None else gather_sequence(packed_seq_ids, cp_group)
         angles = self.rotary_emb(position_ids)
         query_latent = self.q_norm(self.wq_a(hidden_states))
         query = _apply_rope(self.wq_b(query_latent).unflatten(-1, (self.num_heads, self.head_dim)), angles)
         kv = quantize_cache(_apply_rope(self.kv_norm(self.wkv(hidden_states)), angles), format="fp8", block_size=32)
         kv = gather_sequence(kv, cp_group)
+        replay = csa2_selection_replay.current() if self.reuse_selection_on_recompute else None
+        record: _SelectionRecord | None = None
+        produces = False  # this layer adds a selection or a sparse-index plan to the state
         next_state = state
         if self.compress_ratio:
             width = global_sequence // self.compress_ratio
@@ -648,17 +800,32 @@ class DeepseekV41Attention(nn.Module):
             elif next_state.compressed_kv is None or next_state.compression_ratio != self.compress_ratio:
                 raise ValueError("A CSA2 consumer requires a preceding Full layer with the same compression ratio")
             if self.indexer is not None:
-                next_state = self.indexer(
-                    hidden_states,
-                    query_latent=query_latent,
-                    latent=latent,
-                    angles=angles,
-                    compressed_angles=compressed_angles,
-                    state=next_state,
-                    position_ids=positions.unsqueeze(0).expand(batch, -1),
-                    cp_group=cp_group,
-                    packed_seq_ids=packed_seq_ids,
-                )
+                produces = True
+                if replay is not None and replay[1] == "replay":
+                    record = replay[0].take()
+                if record is not None:
+                    # The checkpoint forward's selection; the compressed KV stays the recomputed tensor so
+                    # the compressor's gradient path belongs to the recompute.
+                    next_state = replace(
+                        next_state,
+                        index_keys=record.index_keys,
+                        topk_indices=record.topk_indices,
+                        candidates=record.candidates,
+                        sparse_plan=None,
+                    )
+                else:
+                    with csa2_selection_region():
+                        next_state = self.indexer(
+                            hidden_states,
+                            query_latent=query_latent,
+                            latent=latent,
+                            angles=angles,
+                            compressed_angles=compressed_angles,
+                            state=next_state,
+                            position_ids=positions.unsqueeze(0).expand(batch, -1),
+                            cp_group=cp_group,
+                            packed_seq_ids=packed_seq_ids,
+                        )
             if next_state.topk_indices is None or next_state.compressed_kv is None:
                 raise ValueError("A Reuse CSA2 layer requires compressed KV and indices from its source")
             if next_state.compressed_kv.shape[:2] != (batch, width) or next_state.topk_indices.shape[:2] != (
@@ -670,70 +837,90 @@ class DeepseekV41Attention(nn.Module):
         if self.backend.attn in ("tilelang", "cudnn"):
             # Preserve the released sparse slot order and reuse V4's trainable
             # online-softmax kernel (TileLang), or the cuDNN Frontend DSA kernels
-            # with the same indices, sink and scale (backend.attn="cudnn").
-            starts = (positions - self.window_size + 1).clamp_min(0).expand(batch, -1)
-            if packed_seq_ids is not None:
-                starts = torch.maximum(starts, positions.unsqueeze(0) - position_ids)
-            slots = starts.unsqueeze(-1) + torch.arange(min(global_sequence, self.window_size), device=positions.device)
-            visible = (slots <= positions.view(1, -1, 1)) & (slots < global_sequence)
-            safe_slots = slots.clamp_max(global_sequence - 1)
-            visible = visible & global_valid.gather(1, safe_slots.flatten(1)).view_as(slots)
-            if packed_seq_ids is not None:
-                key_seq_ids = global_seq_ids.gather(1, safe_slots.flatten(1)).view_as(slots)
-                visible = visible & (key_seq_ids == packed_seq_ids.unsqueeze(-1))
-            indices = torch.where(visible, slots, -1)
-            if self.compress_ratio:
-                selected = next_state.topk_indices
-                indices = torch.cat((indices, torch.where(selected >= 0, selected + global_sequence, -1)), dim=-1)
-            indices = indices.masked_fill(~valid_tokens.unsqueeze(-1), -1)
-            indices = F.pad(indices, (0, -indices.shape[-1] % 64), value=-1)
+            # with the same indices, sink and scale (backend.attn="cudnn"). The slot
+            # indices are identical for every layer that consumes one selection, so
+            # the first consumer plans them once and the state carries the plan.
+            plan = next_state.sparse_plan
+            if plan is not None and (plan.backend != self.backend.attn or plan.kv_sequence != kv.shape[1]):
+                plan = None  # another lineage's plan (a window-only layer after a compressed one)
+            if plan is None:
+                if not produces:
+                    produces = True
+                    if replay is not None and replay[1] == "replay":
+                        record = replay[0].take()
+                if record is not None and record.sparse_plan is not None:
+                    plan = record.sparse_plan
+                else:
+                    with csa2_selection_region(), torch.no_grad():
+                        plan = self._plan_sparse_indices(
+                            next_state,
+                            kv.shape[1],
+                            positions=positions,
+                            position_ids=position_ids,
+                            valid_tokens=valid_tokens,
+                            global_valid=global_valid,
+                            global_seq_ids=global_seq_ids,
+                            packed_seq_ids=packed_seq_ids,
+                            global_sequence=global_sequence,
+                            # Without a padding mask every query sees at least its own slot; the cuDNN backward
+                            # then skips its empty-row scan (a torch.nonzero host synchronisation).
+                            all_rows_nonempty=attention_mask is None,
+                        )
+                next_state = replace(next_state, sparse_plan=plan)
             attended = dsv4_sparse_attention(
                 query,
                 kv,
                 self.sinks_param(query),
-                indices,
+                None,
                 self.head_dim**-0.5,
                 backend=self.backend.attn,
                 reference_rounding=True,
-                # Without a padding mask every query sees at least its own slot; the cuDNN backward then skips
-                # its empty-row scan (a torch.nonzero, one host synchronisation per layer per step).
                 all_rows_nonempty=attention_mask is None,
+                plan=plan,
             )
-            return DeepseekV41AttentionOutput(self._project_output(attended, angles, valid_tokens), next_state)
-        # Dense masks are needed only by the eager/SDPA fallback; TileLang uses sparse indices.
-        key_positions = torch.arange(global_sequence, device=positions.device)
-        local_allowed = (key_positions.unsqueeze(0) <= positions.unsqueeze(1)) & (
-            key_positions.unsqueeze(0) > positions.unsqueeze(1) - self.window_size
-        )
-        allowed = local_allowed.unsqueeze(0) & global_valid.unsqueeze(1)
-        if packed_seq_ids is not None:
-            allowed = allowed & (packed_seq_ids.unsqueeze(-1) == global_seq_ids.unsqueeze(1))
-        if self.compress_ratio:
-            # A separate sentinel column makes -1 masking safe when valid index 0
-            # also occurs in the row; boolean scatter must never overwrite it.
-            compressed_allowed = torch.zeros(batch, sequence, width + 1, dtype=torch.bool, device=hidden_states.device)
-            indices = next_state.topk_indices
-            compressed_allowed = compressed_allowed.scatter(-1, torch.where(indices >= 0, indices, width), True)
-            allowed = torch.cat((allowed, compressed_allowed[..., :width]), dim=-1)
-        # A zero-valued extra key contributes exp(attn_sink) only to the softmax
-        # denominator. It keeps fully padded query rows numerically well-defined.
-        kv = torch.cat((kv, kv.new_zeros(batch, 1, self.head_dim)), dim=1)
-        bias = torch.zeros(batch, 1, sequence, allowed.shape[-1], device=hidden_states.device, dtype=torch.float32)
-        bias = bias.masked_fill(~allowed.unsqueeze(1), -torch.inf).expand(-1, self.num_heads, -1, -1)
-        sink = self.sinks_param(query).view(1, self.num_heads, 1, 1).expand(batch, -1, sequence, -1)
-        bias = torch.cat((bias, sink), dim=-1)
-        if self.backend.attn == "sdpa":
-            attended = F.scaled_dot_product_attention(
-                query.transpose(1, 2),
-                kv.unsqueeze(1),
-                kv.unsqueeze(1),
-                attn_mask=bias,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                scale=self.head_dim**-0.5,
-            ).transpose(1, 2)
         else:
-            logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
-            probabilities = (logits + bias).softmax(dim=-1)
-            probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
-            attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
+            # Dense masks are needed only by the eager/SDPA fallback; TileLang uses sparse indices.
+            key_positions = torch.arange(global_sequence, device=positions.device)
+            local_allowed = (key_positions.unsqueeze(0) <= positions.unsqueeze(1)) & (
+                key_positions.unsqueeze(0) > positions.unsqueeze(1) - self.window_size
+            )
+            allowed = local_allowed.unsqueeze(0) & global_valid.unsqueeze(1)
+            if packed_seq_ids is not None:
+                allowed = allowed & (packed_seq_ids.unsqueeze(-1) == global_seq_ids.unsqueeze(1))
+            if self.compress_ratio:
+                # A separate sentinel column makes -1 masking safe when valid index 0
+                # also occurs in the row; boolean scatter must never overwrite it.
+                compressed_allowed = torch.zeros(
+                    batch, sequence, width + 1, dtype=torch.bool, device=hidden_states.device
+                )
+                indices = next_state.topk_indices
+                compressed_allowed = compressed_allowed.scatter(-1, torch.where(indices >= 0, indices, width), True)
+                allowed = torch.cat((allowed, compressed_allowed[..., :width]), dim=-1)
+            # A zero-valued extra key contributes exp(attn_sink) only to the softmax
+            # denominator. It keeps fully padded query rows numerically well-defined.
+            kv = torch.cat((kv, kv.new_zeros(batch, 1, self.head_dim)), dim=1)
+            bias = torch.zeros(batch, 1, sequence, allowed.shape[-1], device=hidden_states.device, dtype=torch.float32)
+            bias = bias.masked_fill(~allowed.unsqueeze(1), -torch.inf).expand(-1, self.num_heads, -1, -1)
+            sink = self.sinks_param(query).view(1, self.num_heads, 1, 1).expand(batch, -1, sequence, -1)
+            bias = torch.cat((bias, sink), dim=-1)
+            if self.backend.attn == "sdpa":
+                attended = F.scaled_dot_product_attention(
+                    query.transpose(1, 2),
+                    kv.unsqueeze(1),
+                    kv.unsqueeze(1),
+                    attn_mask=bias,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    scale=self.head_dim**-0.5,
+                ).transpose(1, 2)
+            else:
+                logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
+                probabilities = (logits + bias).softmax(dim=-1)
+                probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
+                attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
+        if produces and replay is not None and replay[1] == "record":
+            replay[0].record(
+                _SelectionRecord(
+                    next_state.index_keys, next_state.topk_indices, next_state.candidates, next_state.sparse_plan
+                )
+            )
         return DeepseekV41AttentionOutput(self._project_output(attended, angles, valid_tokens), next_state)

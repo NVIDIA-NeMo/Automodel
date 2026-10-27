@@ -109,6 +109,7 @@ wandb:
   dir: logs/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: akoumpa
   node_multiplier: true
   time: "00:15:00"

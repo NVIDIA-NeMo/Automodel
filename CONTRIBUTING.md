@@ -1,5 +1,11 @@
 # Contributing To NeMo-Automodel
 
+## Coding guidelines
+
+Follow the [coding guidelines](CODING_GUIDELINES.md) when adding or modifying code.
+Existing code is being refactored incrementally and may not yet comply. Agents
+must also follow [AGENTS.md](AGENTS.md) and applicable contributor skills.
+
 ## Environment setup for Automodel
 
 Common workflows used for setting up Automodel environment:
@@ -189,6 +195,68 @@ The check covers the same paths as Bandit (`app.py`, `nemo_automodel/`, `example
 ```bash
 python tools/lint_no_globals.py
 ```
+
+## Python annotation coverage
+
+Every pull request, including documentation-only changes, runs the **Python type
+coverage** workflow. Open its **Python annotation coverage** job summary for
+package-wide and per-area coverage, plus changes from the PR's merge-base.
+The same report is printed in the **Report annotation coverage** step's log.
+The `type-coverage` artifact contains the summary and JSON with per-function
+annotations and exclusion reasons.
+
+Raw coverage counts signatures with all parameters and the return annotated.
+Strict coverage also excludes `Any`, `object`, nullable unions (`T | None` and
+`Optional[T]`), `None` parameter defaults, bare generics, `Callable[..., T]`,
+casts, type-checker suppressions, and `no_type_check`. A return of `-> None`
+counts as typed. These conservative exclusions can include valid contracts;
+the metric measures annotation syntax, not type soundness. Signature and local
+variable annotations, module-local aliases, and quoted annotations are inspected;
+cross-module aliases and inferred types are not resolved.
+
+The report includes tracked Python source under `nemo_automodel/`, including
+nested functions, kernels, and vendored code. It excludes tests and examples.
+It reports coverage without enforcing a minimum. Run it locally with Python
+3.11 or newer; no package dependencies are needed:
+
+```bash
+python tools/type_coverage.py --head HEAD --base origin/main --output-dir /tmp/type-coverage
+```
+
+Both revisions use the same reporter. Only committed source is measured;
+working-tree changes are excluded.
+
+## Unit-test runtime
+
+Unit-test time limits are enforced at **three times the configured value** to
+allow for CI load. The configured default runtime budget is 30 seconds, so new
+and modified tests have an effective 90-second budget, including setup, the test
+body, and teardown. A configured 15-second marker allows 45 seconds. If every
+phase passes but the test exceeds its effective budget, pytest runs it once more
+in the same worker with fresh function-scoped
+fixtures. Shared fixtures and compiler caches can remain warm. Both attempts
+must exceed the budget to fail the runtime gate; assertion failures, fixture
+errors, and hard timeouts are never retried. A warning records every confirmation.
+
+Keep model shapes small and avoid downloads or unnecessary compilation. Tests
+that consistently need more than the effective budget should be optimized or moved to
+functional tests. An exact `@pytest.mark.runtime_budget(...)` may tighten the
+limit, but cannot raise it for a new or modified test. A changed test with a
+marker above 30 seconds stops collection with a usage error; update its marker
+and optimize the test, or move it to functional coverage. Existing larger allowances
+retain their hard watchdog on unrelated changes; they do not impose a runtime
+gate on those changes. The configured default hard watchdog is 70 seconds,
+enforced at 210 seconds. The same multiplier applies once to resolved pytest
+timeout markers and CLI, environment, or ini timeout settings, preserving their
+usual precedence, timeout method, and function-only scope. A zero timeout stays
+disabled. Global pytest timeout options still bypass the soft runtime policy.
+Diagnostics show both configured and effective soft budgets. These rules apply
+only under `tests/unit_tests`; workflow and subprocess timeouts are unchanged.
+
+Changed tests are identified relative to the PR merge base (or `origin/main`
+locally). Set `AUTOMODEL_RUNTIME_BUDGET_BASE=<commit>` to explicitly select a base
+when reproducing a CI result. CPU and GPU unit-test jobs both limit host math
+libraries to one thread per process to avoid oversubscription by spawned ranks.
 
 ## Pre-commit
 

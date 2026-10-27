@@ -21,6 +21,8 @@ from typing import Literal
 import torch
 from torch.nn import functional as F
 
+_fp4_table_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+
 
 def _power_of_two_ceiling(value: torch.Tensor) -> torch.Tensor:
     """Round positive normal FP32 values up to an exactly represented power of two.
@@ -36,6 +38,61 @@ def _power_of_two_ceiling(value: torch.Tensor) -> torch.Tensor:
     exponent = (bits >> 23) & 255
     increment = (bits & ((1 << 23) - 1)) != 0
     return ((exponent + increment.to(torch.int32)) << 23).view(torch.float32)
+
+
+def _cache_quantization_core(values: torch.Tensor, block_size: int, format: str) -> torch.Tensor:
+    """Round independent channel groups of ``values``; the math behind ``quantize_cache``.
+
+    Kept as a plain function so ``compile_cache_quantization`` can wrap it with ``torch.compile``:
+    eager, the fp8 path is five elementwise kernels and the FP4 paths about a dozen (pad, cast,
+    amax, scale, clamp, bucketize, gather, copysign, two casts) per cache tensor.
+
+    Args:
+        values: Tensor of shape [..., channels] with channels a multiple of block_size.
+        block_size: Consecutive channels sharing a quantization scale.
+        format: fp8, mxfp4 (E8M0 scale), or nvfp4 (E4M3 scale).
+
+    Returns:
+        Independently stored tensor of shape [..., channels] with the input dtype.
+    """
+    grouped = values.float().unflatten(-1, (-1, block_size))
+    maximum = grouped.abs().amax(-1, keepdim=True)
+    if format == "fp8":
+        scale = _power_of_two_ceiling(maximum.clamp_min(1e-4) * (1 / 448))
+        rounded = (grouped / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float()
+    else:
+        if format == "nvfp4":
+            scale = (maximum.clamp_min(6 * 2**-9) / 6).to(torch.float8_e4m3fn).float()
+        else:
+            scale = _power_of_two_ceiling(maximum.clamp_min(6 * 2**-126) * (1 / 6))
+        normalized = (grouped / scale).clamp(-6, 6)
+        magnitude = normalized.abs().contiguous()
+        midpoints = magnitude.new_tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+        levels = magnitude.new_tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+        lower = torch.bucketize(magnitude, midpoints)
+        tie = magnitude == midpoints[lower.clamp_max(6)]
+        selected = lower + (tie & (lower % 2 == 1)).to(lower.dtype)
+        rounded = torch.copysign(levels[selected], normalized)
+    return (rounded * scale).flatten(-2).to(values.dtype)
+
+
+_quantize = _cache_quantization_core
+_QUANT_COMPILED = False
+
+
+def compile_cache_quantization() -> None:
+    """Wrap the cache-quantization core with ``torch.compile`` (``DeepseekV41TextConfig.compile_cache_quant``).
+
+    Runs once per process; static shapes (``dynamic=False``): one specialization per call site shape and
+    format (SWA KV fp8, index Q/K mxfp4, compressed KV nvfp4). No ``fullgraph``: past dynamo's recompile
+    limit a shape runs eager instead of raising. Numerics: the same operations fused, so results match
+    eager up to summation order (there is none: every step is elementwise or a per-group max).
+    """
+    global _quantize, _QUANT_COMPILED
+    if _QUANT_COMPILED:
+        return
+    _quantize = torch.compile(_cache_quantization_core, dynamic=False)
+    _QUANT_COMPILED = True
 
 
 class _CacheQuantization(torch.autograd.Function):
@@ -55,25 +112,12 @@ class _CacheQuantization(torch.autograd.Function):
             Independently stored tensor of shape [..., channels] with input dtype.
         """
         channels = values.shape[-1]
-        grouped = F.pad(values.float(), (0, -channels % block_size)).unflatten(-1, (-1, block_size))
-        maximum = grouped.abs().amax(-1, keepdim=True)
-        if format == "fp8":
-            scale = _power_of_two_ceiling(maximum.clamp_min(1e-4) * (1 / 448))
-            rounded = (grouped / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float()
-        else:
-            if format == "nvfp4":
-                scale = (maximum.clamp_min(6 * 2**-9) / 6).to(torch.float8_e4m3fn).float()
-            else:
-                scale = _power_of_two_ceiling(maximum.clamp_min(6 * 2**-126) * (1 / 6))
-            normalized = (grouped / scale).clamp(-6, 6)
-            magnitude = normalized.abs().contiguous()
-            midpoints = magnitude.new_tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
-            levels = magnitude.new_tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-            lower = torch.bucketize(magnitude, midpoints)
-            tie = magnitude == midpoints[lower.clamp_max(6)]
-            selected = lower + (tie & (lower % 2 == 1)).to(lower.dtype)
-            rounded = torch.copysign(levels[selected], normalized)
-        return (rounded * scale).flatten(-2)[..., :channels].to(values.dtype)
+        padding = -channels % block_size
+        if padding:
+            # Scaled unit-test configurations only (the released shapes are multiples of the block
+            # size); kept out of the compiled core, which then sees whole groups.
+            return _quantize(F.pad(values, (0, padding)), block_size, format)[..., :channels]
+        return _quantize(values, block_size, format)
 
     @staticmethod
     def backward(ctx: object, gradient: torch.Tensor) -> tuple[torch.Tensor, None, None]:

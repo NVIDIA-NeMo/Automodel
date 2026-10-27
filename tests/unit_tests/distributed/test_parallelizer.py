@@ -2675,6 +2675,7 @@ class TestSingleGpuActivationCheckpointing:
         config = FSDP2Config(activation_checkpointing=activation_checkpointing)
         context = SimpleNamespace(
             device_mesh=MagicMock(),
+            cp_size=1,
             ep_size=1,
             strategy_config=config,
             activation_checkpointing=activation_checkpointing,

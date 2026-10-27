@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests verifying that mlflow and wandb are optional extras.
+"""Tests verifying that mlflow, wandb and trackio are optional extras.
 
 Confirms:
 1. WandbConfig / MLflowConfig can be *instantiated* without the extras installed.
@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from nemo_automodel.components.loggers.loggers import MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.shared.import_utils import UnavailableError
 
 # ---------------------------------------------------------------------------
@@ -66,6 +66,24 @@ class TestWandbConfigOptional:
         run = cfg.build(run_config={"lr": 0.001}, model_name="nvidia/llama-3")
         assert run == "run"
         assert captured["project"] == "p"
+
+
+# ---------------------------------------------------------------------------
+# TrackioConfig
+# ---------------------------------------------------------------------------
+
+
+class TestTrackioConfigOptional:
+    def test_instantiation_does_not_require_trackio(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "trackio", None)
+        cfg = TrackioConfig(project="test")
+        assert cfg.project == "test"
+
+    def test_build_raises_when_trackio_absent(self, monkeypatch):
+        """build() propagates UnavailableError when trackio is not installed."""
+        monkeypatch.setitem(sys.modules, "trackio", None)
+        with pytest.raises(UnavailableError, match="trackio is not installed"):
+            TrackioConfig().build()
 
 
 # ---------------------------------------------------------------------------
@@ -123,18 +141,26 @@ class TestPyprojectExtras:
         assert "wandb" in opt, "Missing [wandb] extra"
         assert any("wandb" in d for d in opt["wandb"])
 
+    def test_trackio_extra_declared(self):
+        proj = self._load_optional_deps()
+        opt = proj["optional-dependencies"]
+        assert "trackio" in opt, "Missing [trackio] extra"
+        assert any(d.startswith("trackio") for d in opt["trackio"])
+
     def test_tracking_meta_extra(self):
         proj = self._load_optional_deps()
         opt = proj["optional-dependencies"]
         assert "tracking" in opt, "Missing [tracking] meta-extra"
         assert any("mlflow" in d for d in opt["tracking"])
         assert any("wandb" in d for d in opt["tracking"])
+        assert any("trackio" in d for d in opt["tracking"])
 
     def test_mlflow_and_wandb_absent_from_core_deps(self):
         proj = self._load_optional_deps()
         core = proj["dependencies"]
         assert not any(d.startswith("mlflow") for d in core), "mlflow must not be a core dep"
         assert not any(d.startswith("wandb") for d in core), "wandb must not be a core dep"
+        assert not any(d.startswith("trackio") for d in core), "trackio must not be a core dep"
 
 
 # ---------------------------------------------------------------------------

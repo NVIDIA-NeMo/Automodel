@@ -238,7 +238,7 @@ _HF_ORG_TO_DOC_SLUG = {
     "diffusers": "lightricks",  # LTX-2.3 conversion shares the Lightricks family page
     "ibm-granite": "ibm",
     "meta-llama": "meta",
-    "MiniMaxAI": "minimax",
+    "MiniMaxAI": "MiniMaxAI",  # Keep the publisher's exact case in directories and routes.
     "zai-org": "thudm",  # zai-org (née THUDM) publishes GLM-4+
 }
 

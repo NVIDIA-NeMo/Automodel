@@ -48,6 +48,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.8.22
+
+      # docs-only skips the training container and its CPU unit tests. Run the
+      # documentation contracts here, before generation changes the source files.
+      # These source checks use built-in pytest fixtures, not training conftests.
+      - name: Test model coverage documentation
+        run: |
+          uv run --no-project --isolated --python 3.12 \
+            --with pytest --with pytest-timeout --with pyyaml --with pillow \
+            python -m pytest -q --noconftest \
+            tests/unit_tests/ci_tests/test_docs_workflows.py \
+            tests/unit_tests/tools/test_sync_model_coverage_tables.py \
+            tests/unit_tests/_transformers/test_doc_coverage.py::test_every_model_card_has_architecture_reference_table
+
       # `fern check` validates that every path: referenced by docs.yml / the
       # version YAMLs exists on disk. The frozen v0.4 pages are archived off main,
       # so restore them before checking or the validation fatals on missing paths.
@@ -57,6 +74,7 @@ jobs:
           archived-versions: |
             v0.4=docs-archive
             v0.5=docs-archive
+            v0.7=docs-archive
 
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

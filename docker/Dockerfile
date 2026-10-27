@@ -242,7 +242,8 @@ RUN git clone --filter=blob:none --no-checkout \
 # Pin >= #2762/#2507: older refs rebuilt the CuTe compile key every call when max_seqlen
 # is a tensor (varlen/packed), so HF models recompiled each step. Also picks up #2745
 # (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
-ARG FLASH_ATTN_REF=ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820
+# Includes #2888: native head_dim=192 SM90 GQA backward postprocessing.
+ARG FLASH_ATTN_REF=3c2c6b31e730fd13e7d6f0d384af22684b24c532
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=true
 ARG TARGETARCH
@@ -265,7 +266,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     fi && \
     rm -rf /tmp/fa
 
-FROM automodel_dep AS automodel_final
+FROM automodel_dep AS automodel_dependencies
 
 WORKDIR /opt/Automodel
 
@@ -288,13 +289,13 @@ RUN pip install "aiohttp>=3.14.3" \
         "black>=26.3.1" \
         "GitPython>=3.1.59" \
         "jaraco-context>=6.1.0" \
-        "jupyter-server>=2.20.0" \
+        "jupyter-server>=2.21.1" \
         "jupyterlab>=4.5.10" \
         "mistune>=3.3.0" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
         "onnx>=1.22.0" \
-        "pillow>=12.3.0" \
+        "pillow>=13.0.0" \
         "protobuf>=6.33.5" \
         "setuptools>=83.0.0" \
         "tornado>=6.5.5" \
@@ -343,6 +344,13 @@ RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
     rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/_private/runtime_env/agent/thirdparty_files && \
     chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
+
+# CI can supply this stage as a digest-pinned named build context, skipping all
+# dependency compilation. Ordinary Docker builds still build the stage above.
+FROM automodel_dependencies AS automodel_final
+ARG BASE_IMAGE=cuda
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1

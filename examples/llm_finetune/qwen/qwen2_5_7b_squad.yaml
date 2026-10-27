@@ -101,6 +101,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir> 
 
 ci:
+  cluster_tag: h100
   time: "00:45:00"
   vllm_deploy: true
   recipe_owner: HuiyingLi

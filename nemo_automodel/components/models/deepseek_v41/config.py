@@ -121,6 +121,11 @@ class DeepseekV41TextConfig(PretrainedConfig):
         dspark_n_routed_experts: int = 128,
         dspark_num_experts_per_tok: int = 3,
         dtype: str = "bfloat16",
+        compile_cache_quant: bool = False,
+        engram_strict_validation: bool = False,
+        engram_capacity_mode: bool = False,
+        compile_engram: bool = False,
+        reuse_sparse_selection_on_recompute: bool = True,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
@@ -212,6 +217,25 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # Serialized Transformers configs can contain rope_parameters in
         # addition to rope_scaling. Its YaRN validator reads the model's
         # dimensions during base initialization, so establish them first.
+        # torch.compile the cache quantize/dequantize core (fp8 / mxfp4 / nvfp4 rounding of the sliding-window and
+        # compressed caches); a DeepSeek-V4.1 knob, so it lives here rather than on the shared BackendConfig
+        self.compile_cache_quant = compile_cache_quant
+        # Validate every Engram lookup on the host with cross-rank agreement (the original behaviour, about twenty
+        # device-to-host synchronisations and seven small collectives per lookup); False keeps the same invariants as
+        # device-side asserts. See Qwen3_8_FlashNextEngramTableConfig.strict_validation.
+        self.engram_strict_validation = engram_strict_validation
+        # Engram capacity mode (Qwen3_8_FlashNextEngramTableConfig.capacity_mode): the owner exchange is sized once by
+        # the first lookup and never read back again. An opt-in for bounded workloads only (fixed-shape benchmark
+        # batches); fine-tuning with variable sequence lengths or local-batch padding keeps the exact-count path.
+        self.engram_capacity_mode = engram_capacity_mode
+        # torch.compile the Engram gate core (fp32 casts, the stream / key RMS reductions, the signed-square-root sigmoid
+        # gate and the gated residual add) once per process (engram.compile_engram_gate): allclose to eager, not
+        # bitwise. A DeepSeek-V4.1 knob like compile_cache_quant, so it lives here rather than on the shared BackendConfig.
+        self.compile_engram = compile_engram
+        # Under activation checkpointing, serve the frozen CSA2 indexer's selection and the sparse-index plan of
+        # the checkpoint forward to the recompute instead of recomputing them (attention.csa2_selection_replay);
+        # a DeepSeek-V4.1 knob like compile_cache_quant. Numerics are unchanged; False recomputes them.
+        self.reuse_sparse_selection_on_recompute = bool(reuse_sparse_selection_on_recompute)
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,

@@ -130,3 +130,6 @@ checkpoint:
   save_consolidated: final
   dequantize_base_checkpoint: true    # GLM-5.2 ships FP8 base weights; dequantize on load
   # restore_from: LATEST
+
+ci:
+  cluster_tag: h100

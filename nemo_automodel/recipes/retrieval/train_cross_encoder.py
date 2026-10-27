@@ -97,6 +97,9 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
 
         self.metric_logger_train.log(log_data)
 

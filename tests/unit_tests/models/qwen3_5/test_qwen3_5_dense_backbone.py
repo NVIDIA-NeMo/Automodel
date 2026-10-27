@@ -49,10 +49,6 @@ from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
     install_ssm_gate,
 )
 
-# Over the default 5s budget on purpose: CUDA gated-delta kernels take about 70s to compile on a cold worker.
-# Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(120)
-
 
 def _backend():
     return BackendConfig(
@@ -273,6 +269,69 @@ class TestDenseTextBackbone:
         assert metadata.document_ids is attention_mask
         assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_metadata_uses_host_mirror_without_cuda_readback(self, monkeypatch):
+        host_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+        device_ids = host_ids.to("cuda")
+        packed_metadata = build_packed_sequence_metadata(host_ids)
+        original_to = torch.Tensor.to
+
+        def reject_document_readback(tensor, *args, **kwargs):
+            if tensor.is_cuda and tensor.data_ptr() == device_ids.data_ptr() and kwargs.get("device") == "cpu":
+                raise AssertionError("packed document IDs were copied back to the host")
+            return original_to(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "to", reject_document_readback)
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            None,
+            device_ids,
+            packed_token_indices=packed_metadata["packed_token_indices"].to("cuda"),
+            cu_seqlens=packed_metadata["cu_seqlens"].to("cuda"),
+            compute_device=device_ids.device,
+            host_packed_seq_ids=qwen3_5_packing.HostTensor(host_ids),
+        )
+
+        assert metadata is not None
+        assert metadata.document_ids is device_ids
+        assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_metadata_accepts_host_ids_for_cuda_decoder(self):
+        packed_seq_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+        packed_metadata = build_packed_sequence_metadata(packed_seq_ids)
+
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            None,
+            packed_seq_ids,
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
+            compute_device=torch.device("cuda"),
+        )
+
+        assert metadata is not None
+        assert metadata.document_ids.is_cuda
+        assert metadata.indices.is_cuda
+        assert metadata.cu_seqlens.is_cuda
+        torch.testing.assert_close(metadata.document_ids.cpu(), packed_seq_ids)
+        assert metadata.indices.tolist() == [0, 1, 2, 3]
+        assert metadata.cu_seqlens.tolist() == [0, 2, 4]
+        assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
+
+    @pytest.mark.parametrize("missing_key", ["packed_token_indices", "cu_seqlens"])
+    def test_host_mirror_still_requires_dataset_metadata(self, missing_key):
+        packed_seq_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+        packed_metadata = build_packed_sequence_metadata(packed_seq_ids)
+        packed_metadata[missing_key] = None
+
+        with pytest.raises(ValueError, match="dataset-provided packed_token_indices and cu_seqlens"):
+            qwen3_5_packing.prepare_gated_delta_packed_metadata(
+                None,
+                packed_seq_ids,
+                packed_token_indices=packed_metadata["packed_token_indices"],
+                cu_seqlens=packed_metadata["cu_seqlens"],
+                host_packed_seq_ids=qwen3_5_packing.HostTensor(packed_seq_ids),
+            )
+
     def test_builds_expected_layer_types(self):
         cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
         backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
@@ -291,16 +350,28 @@ class TestDenseTextBackbone:
         assert out.past_key_values is None
 
     def test_forward_shape_mixed_layers(self):
-        # The linear_attention block runs FLA's gated-delta-rule / causal_conv1d
-        # kernels, which are CUDA-only (no CPU fallback when CUDA is present), so
-        # build the backbone and inputs on the GPU. Skip when no GPU is available.
-        if not torch.cuda.is_available():
-            pytest.skip("linear_attention forward requires CUDA (FLA kernels)")
-        device = torch.device("cuda")
-        cfg = _tiny_config(layer_types=("full_attention", "linear_attention"))
-        backbone = Qwen3_5DenseTextBackbone(cfg, _backend()).to(device)
-        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=device))
+        import inspect
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_modeling
+
+        cfg = _tiny_config(
+            layer_types=("full_attention", "linear_attention"),
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
+        linear_attn = backbone.layers["1"].linear_attn
+        # Shape coverage uses the real CPU math even when FLA is installed.
+        linear_attn.causal_conv1d_fn = None
+        linear_attn.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
+        with torch.no_grad():
+            linear_attn._fp32_params.A_log.zero_()
+            linear_attn._fp32_params.dt_bias.zero_()
+        out = backbone(input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long))
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
+        assert torch.isfinite(out.last_hidden_state).all()
 
     def test_linear_attention_torch_convolution_fallback_forward_backward(self):
         """HF's convolution fallback matches the local grouped-convolution path."""

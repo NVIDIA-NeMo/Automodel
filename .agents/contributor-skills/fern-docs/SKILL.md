@@ -1,7 +1,6 @@
 ---
 name: fern-docs
-description: Maintain the NeMo AutoModel Fern docs site under docs/ (MDX content) + docs/fern/ (infra) — add, update, move, or remove pages; manage redirects, slugs, navigation, and version aliases; run validation and previews.
-when_to_use: Editing or adding documentation pages, fixing broken links, renaming a slug, updating the sidebar, adding a redirect, regenerating the API library reference, debugging fern check / broken-link errors, cutting a new version train, 'edit docs', 'add doc page', 'fern check failing', 'preview fails locally'.
+description: Maintain the NeMo AutoModel Fern docs site under docs/ (MDX content) + docs/fern/ (infra) — add, update, move, or remove pages; manage redirects, slugs, navigation, and version aliases; run validation and previews. Use when editing or adding documentation pages, fixing broken links, renaming a slug, updating the sidebar, adding a redirect, regenerating the API library reference, debugging fern check / broken-link errors, cutting a new version train, 'edit docs', 'add doc page', 'fern check failing', 'preview fails locally'.
 ---
 
 # Fern Docs Maintenance — NeMo AutoModel

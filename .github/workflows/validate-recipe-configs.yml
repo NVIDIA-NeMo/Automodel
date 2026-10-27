@@ -19,11 +19,14 @@ on:
     paths:
       - 'tests/ci_tests/configs/**'
       - 'examples/**/*.yaml'
+      - 'examples/**/*.yml'
+      - '.github/workflows/validate-recipe-configs.yml'
       - 'tests/ci_tests/utils/validate_nightly_recipes.py'
       - 'tests/ci_tests/utils/validate_generate_ci.py'
       - 'tests/ci_tests/utils/validate_new_recipe_ci.py'
       - 'tests/ci_tests/utils/generate_ci_tests.py'
       - 'tools/lint_example_yamls.py'
+      - 'tests/unit_tests/config/test_example_yaml_linter.py'
 
 jobs:
   validate-nightly-recipes:

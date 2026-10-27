@@ -145,6 +145,7 @@ wandb:
   mode: online
 
 ci:
+  cluster_tag: h100
   recipe_owner: Simar-malhotra09
   # pp_size(18) * ep_size(8) = 144 GPUs => 18 nodes (8 H100/node).
   nodes: 18

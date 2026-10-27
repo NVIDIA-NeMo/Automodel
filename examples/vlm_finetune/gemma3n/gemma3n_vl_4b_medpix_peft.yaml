@@ -115,5 +115,6 @@ freeze_config:
 #   wandb_save_dir:
 
 ci:
+  cluster_tag: h100
   recipe_owner: akoumpa
   time: "00:15:00"

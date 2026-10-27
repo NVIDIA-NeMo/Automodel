@@ -1,7 +1,6 @@
 ---
 name: build-and-dependency
-description: Dev environment setup for NeMo AutoModel — container-based development, uv package management, installation options, environment variables, and common build pitfalls.
-when_to_use: Setting up a dev environment, adding or removing dependencies, switching container images, configuring environment variables, 'uv sync fails', 'ModuleNotFoundError', 'TransformerEngine version mismatch', stale .venv issues.
+description: Dev environment setup for NeMo AutoModel — container-based development, uv package management, installation options, environment variables, and common build pitfalls. Use when setting up a dev environment, adding or removing dependencies, switching container images, configuring environment variables, 'uv sync fails', 'ModuleNotFoundError', 'TransformerEngine version mismatch', stale .venv issues.
 ---
 
 # Build and Dependency
