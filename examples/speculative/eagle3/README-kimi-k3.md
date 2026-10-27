@@ -42,5 +42,5 @@ Run the same command on every node, varying only `--node-rank`. Node 0 provides
 the rendezvous address.
 
 ```bash
-torchrun --nnodes=8 --node-rank=<RANK> --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.llm.train_eagle3 -c examples/speculative/eagle3/kimi_k3_eagle3.yaml
+torchrun --nnodes=8 --node-rank=<RANK> --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.speculative_decoding.train_eagle3 -c examples/speculative/eagle3/kimi_k3_eagle3.yaml
 ```

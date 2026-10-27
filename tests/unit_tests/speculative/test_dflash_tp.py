@@ -29,12 +29,12 @@ import torch
 import torch.nn as nn
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
-import nemo_automodel.recipes.llm.train_dflash as train_dflash
+import nemo_automodel.recipes.speculative_decoding.train_dflash as train_dflash
 from nemo_automodel.components.speculative.dflash.core import DFlashStepMetrics, DFlashTrainerModule, _to_full_tensor
 from nemo_automodel.components.speculative.dflash.domino_core import DominoStepMetrics, DominoTrainerModule
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
-from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
 
 VOCAB = 64
 HIDDEN = 32

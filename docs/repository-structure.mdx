@@ -69,17 +69,7 @@ $ tree -L 2 nemo_automodel/recipes/
 ├── llm/
 │   ├── benchmark.py             - LLM benchmarking.
 │   ├── kd.py                    - LLM knowledge distillation.
-│   ├── peagle_recipe.py         - Shared PEAGLE recipe behavior.
-│   ├── precompute_dspark_dist.py - DSpark distance precomputation.
-│   ├── train_dflash.py          - DFlash speculative training.
-│   ├── train_dflash2.py         - DFlash 2 speculative training.
-│   ├── train_domino.py          - Domino speculative training.
-│   ├── train_dspark.py          - DSpark speculative training.
-│   ├── train_eagle1.py          - EAGLE-1 speculative training.
-│   ├── train_eagle2.py          - EAGLE-2 speculative training.
-│   ├── train_eagle3.py          - EAGLE-3 speculative training.
 │   ├── train_ft.py              - LLM pretraining and fine-tuning.
-│   ├── train_jetspec.py         - JetSpec speculative training.
 │   └── train_seq_cls.py         - Sequence-classification fine-tuning.
 ├── multimodal/
 │   ├── finetune.py              - Multimodal fine-tuning.
@@ -88,6 +78,19 @@ $ tree -L 2 nemo_automodel/recipes/
 │   ├── mine_hard_negatives.py   - Hard-negative mining.
 │   ├── train_bi_encoder.py      - Bi-encoder training.
 │   └── train_cross_encoder.py   - Cross-encoder training.
+├── speculative_decoding/
+│   ├── peagle_recipe.py         - Shared PEAGLE recipe behavior.
+│   ├── precompute_dspark_dist.py - Distributed offline DSpark target precompute.
+│   ├── serve_dspark_target.py   - DSpark remote target server.
+│   ├── train_dflash.py          - DFlash speculative training.
+│   ├── train_dflash2.py         - DFlash 2 speculative training.
+│   ├── train_domino.py          - Domino speculative training.
+│   ├── train_dspark.py          - DSpark speculative training.
+│   ├── train_eagle1.py          - EAGLE-1 speculative training.
+│   ├── train_eagle2.py          - EAGLE-2 speculative training.
+│   ├── train_eagle3.py          - EAGLE-3 speculative training.
+│   ├── train_jetspec.py         - JetSpec speculative training.
+│   └── train_vispec.py          - ViSpec speculative training.
 └── vlm/
     ├── finetune.py              - VLM fine-tuning.
     └── kd.py                    - VLM knowledge distillation.

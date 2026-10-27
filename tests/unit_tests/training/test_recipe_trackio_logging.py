@@ -138,10 +138,10 @@ def test_dllm_log_train_metrics_sends_the_window_mean_to_trackio():
 @pytest.mark.parametrize("recipe_name", ["eagle1", "eagle3", "dflash", "dspark"])
 @pytest.mark.parametrize("wandb_active,trackio_active", [(False, False), (False, True), (True, False), (True, True)])
 def test_speculative_trainer_log_helper_calls_trackio(recipe_name, wandb_active, trackio_active):
-    from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
-    from nemo_automodel.recipes.llm.train_dspark import TrainDSparkRecipe
-    from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
-    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
+    from nemo_automodel.recipes.speculative_decoding.train_dspark import TrainDSparkRecipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
     recipe_cls = {
         "eagle1": TrainEagle1Recipe,

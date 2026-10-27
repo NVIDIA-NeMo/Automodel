@@ -24,7 +24,7 @@
 # Launch the same command on every node and vary --node-rank:
 #   torchrun --nnodes=16 --node-rank=0 --nproc_per_node=4 \
 #     --master-addr=<NODE0_IP> --master-port=29500 \
-#     -m nemo_automodel.recipes.llm.train_dspark \
+#     -m nemo_automodel.recipes.speculative_decoding.train_dspark \
 #     -c examples/speculative/dspark/deepseek_v41_flash_dspark.yaml
 
 recipe: TrainDSparkRecipe

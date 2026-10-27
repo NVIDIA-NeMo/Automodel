@@ -28,8 +28,8 @@ from nemo_automodel.components.speculative.dflash.draft_kimi_k3 import (
     build_kimi_k3_dflash_target_kwargs,
 )
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
-from nemo_automodel.recipes.llm import train_dflash
-from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding import train_dflash
+from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
 
 VOCAB = 64
 HIDDEN = 32

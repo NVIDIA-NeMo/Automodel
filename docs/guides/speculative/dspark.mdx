@@ -50,7 +50,7 @@ parallelism.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 \
-  -m nemo_automodel.recipes.llm.train_dspark \
+  -m nemo_automodel.recipes.speculative_decoding.train_dspark \
   -c examples/speculative/dspark/qwen3_0.6b_dspark.yaml
 ```
 

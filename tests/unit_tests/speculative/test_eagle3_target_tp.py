@@ -25,7 +25,7 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel, _to_full_tensor
-from nemo_automodel.recipes.llm.train_eagle3 import _validate_tp_gates
+from nemo_automodel.recipes.speculative_decoding.train_eagle3 import _validate_tp_gates
 
 
 def _tiny_target(num_hidden_layers: int = 4) -> LlamaForCausalLM:

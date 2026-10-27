@@ -30,10 +30,10 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 import nemo_automodel.components.speculative.eagle.ring_attention as ring_attention
 import nemo_automodel.components.speculative.target_cp as target_cp
-import nemo_automodel.recipes.llm.train_eagle3 as train_eagle3
+import nemo_automodel.recipes.speculative_decoding.train_eagle3 as train_eagle3
 from nemo_automodel.components.speculative.eagle.draft_llama import Eagle3LlamaAttention, attach_eagle3_cp_attention
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
-from nemo_automodel.recipes.llm.train_eagle3 import _validate_cp_gates
+from nemo_automodel.recipes.speculative_decoding.train_eagle3 import _validate_cp_gates
 
 
 @pytest.fixture(autouse=True)

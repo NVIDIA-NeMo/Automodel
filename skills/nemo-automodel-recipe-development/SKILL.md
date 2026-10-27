@@ -237,6 +237,13 @@ restore_from:
 - `nemo_automodel/recipes/llm/kd.py` implements knowledge distillation with a teacher and student model.
 - `nemo_automodel/recipes/llm/benchmark.py` runs throughput and latency benchmarks.
 
+### Speculative Decoding
+
+- Draft-model training recipes live in `nemo_automodel/recipes/speculative_decoding/`, grouped by type rather than by target model: `train_eagle1.py`, `train_eagle2.py`, `train_eagle3.py` (which also covers EAGLE-3.1 and EAGLE-4; P-EAGLE is layered on it through `peagle_recipe.py`), `train_dflash.py`, `train_dflash2.py`, `train_domino.py`, `train_jetspec.py`, `train_dspark.py` and `train_vispec.py`.
+- All of them derive from `SpecDecodeRecipeBase` in `_spec_recipe_base.py`, which owns the draft-only checkpoint save/load, checkpoint cadence, LR schedule, metadata and W&B lifecycle; per-method behavior stays in the concrete recipe. Shared helpers are in `_spec_train_utils.py`.
+- DSpark has two extra entry points: `precompute_dspark_dist.py` (offline distributed target precompute) and `serve_dspark_target.py` (remote target server). Their shared target construction is in `_dspark_target_build.py`.
+- Example configs live under `examples/speculative/<method>/`; the model-side code is in `nemo_automodel/components/speculative/`.
+
 ### VLM
 
 - Uses `NeMoAutoModelForImageTextToText` instead of causal LM classes.

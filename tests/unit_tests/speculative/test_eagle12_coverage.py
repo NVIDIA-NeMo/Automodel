@@ -35,11 +35,11 @@ from nemo_automodel.components.speculative.eagle.target_v12 import (
     HFEagleTargetModel,
     _shift_left_with_zero,
 )
-from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
-from nemo_automodel.recipes.llm.train_eagle1 import main as eagle1_main
-from nemo_automodel.recipes.llm.train_eagle2 import TrainEagle2Recipe
-from nemo_automodel.recipes.llm.train_eagle2 import main as eagle2_main
-from nemo_automodel.recipes.llm.train_eagle3 import main as eagle3_main
+from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
+from nemo_automodel.recipes.speculative_decoding.train_eagle1 import main as eagle1_main
+from nemo_automodel.recipes.speculative_decoding.train_eagle2 import TrainEagle2Recipe
+from nemo_automodel.recipes.speculative_decoding.train_eagle2 import main as eagle2_main
+from nemo_automodel.recipes.speculative_decoding.train_eagle3 import main as eagle3_main
 
 # ---------------------------------------------------------------------------
 # Helpers

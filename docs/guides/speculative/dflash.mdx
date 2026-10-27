@@ -85,12 +85,12 @@ Example configs live under `examples/speculative/dflash/`.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 \
-  -m nemo_automodel.recipes.llm.train_dflash \
+  -m nemo_automodel.recipes.speculative_decoding.train_dflash \
   -c examples/speculative/dflash/qwen3_dflash.yaml
 ```
 
 Swap the module and config to train a variant. For example,
-`-m nemo_automodel.recipes.llm.train_dflash2 -c examples/speculative/dflash/qwen3_dflash2.yaml`.
+`-m nemo_automodel.recipes.speculative_decoding.train_dflash2 -c examples/speculative/dflash/qwen3_dflash2.yaml`.
 
 Multi-GPU wraps the draft in DDP and replicates the frozen target. Set
 `distributed.tp_size` to shard a large target across ranks
