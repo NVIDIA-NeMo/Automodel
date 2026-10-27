@@ -44,9 +44,11 @@ torchrun --nnodes 2 --node-rank <0|1> --master-addr <node-0 address> --master-po
 Context parallelism needs `attn_implementation: sdpa`, which the ring attention replaces. The CP recipes
 set `text_config.cp_full_attn_backend: ffpa`, which runs the head_dim=512 full-attention ring chunks
 through the FFPA kernel and needs the `ffpa` extra (`uv sync --extra ffpa`); remove the key to use Flex
-there instead. The sliding-window layers use Flex. Context parallelism covers text and image inputs;
-video and audio inputs are rejected under CP. Image tokens marked by `mm_token_type_ids` attend
-bidirectionally on the sliding-window layers only, with and without CP.
+there instead. The 64K and 128K recipes also set `text_config.cp_sliding_attn_backend: fa`, which runs
+the sliding-window layers through FlashAttention and needs the `fa` extra; without it they use Flex.
+Context parallelism covers text and image inputs; video and audio inputs are rejected under CP. Image
+tokens marked by `mm_token_type_ids` attend bidirectionally on the sliding-window layers only, with and
+without CP.
 
 ## Choose a Workflow
 
