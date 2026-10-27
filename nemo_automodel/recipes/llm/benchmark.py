@@ -166,7 +166,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
 
         super().__init__(cfg)
-        self._qwen_stage_events: list[tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]] = []
+        self._stage_timing_events: list[tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]] = []
         self.timers = Timers(log_level=2, log_option="minmax")
 
     @staticmethod
@@ -199,8 +199,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         torch.distributed.barrier()
         capture_stream = torch.cuda.current_stream() if self._bench_graph_use_current_stream else torch.cuda.Stream()
         capture_stream.wait_stream(torch.cuda.current_stream())
-        events = self._qwen_stage_events
-        self._qwen_stage_events = None
+        events = self._stage_timing_events
+        self._stage_timing_events = None
         # FSDP retains AccumulateGrad nodes created during eager warmup.
         torch.autograd.graph.set_override_stale_capture_stream(True)
         try:
@@ -258,7 +258,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 torch.cuda.memory_reserved() / 1024**3,
             )
         finally:
-            self._qwen_stage_events = events
+            self._stage_timing_events = events
 
     def _replay_training_graph(self, batch: dict[str, torch.Tensor], loss_buffer: list[torch.Tensor]) -> None:
         """Copy the next batch and overwrite the optimizer's bound gradients.
@@ -309,8 +309,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             self._training_graph_losses.clear()
             self._training_graph.reset()
             self._training_graph = None
-        events = self._qwen_stage_events
-        self._qwen_stage_events = None
+        events = self._stage_timing_events
+        self._stage_timing_events = None
         try:
             for opt in self.optimizer:
                 opt.zero_grad(set_to_none=True)
@@ -416,7 +416,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if not release_graph:
                 for name, parameter in self.model_parts[0].named_parameters():
                     parameter.grad = self._training_graph_grads.get(name)
-            self._qwen_stage_events = events
+            self._stage_timing_events = events
 
     def setup(self):
         """Setup the benchmarking environment.
@@ -770,7 +770,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         pathlib.Path(f"memory_summary_rank{rank}.json").write_text(json.dumps(memory_result, indent=2))
         stage_rows = [
             {"step": step, "forward_and_loss_ms": start.elapsed_time(bwd), "backward_ms": bwd.elapsed_time(end)}
-            for step, (start, bwd, end) in enumerate(self._qwen_stage_events)
+            for step, (start, bwd, end) in enumerate(self._stage_timing_events)
         ]
         pathlib.Path(f"stage_timings_rank{rank}.json").write_text(json.dumps(stage_rows, indent=2))
         if self._training_graph_events:
