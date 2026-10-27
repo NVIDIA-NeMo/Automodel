@@ -21,6 +21,8 @@
 # 20 iterations, 6 warmup; external Nsight capture at iteration 2.
 # MFU denominator: 989 BF16 dense TFLOP/s per GPU; exclude AC recomputation.
 
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
 benchmark:
   json_output_path: training_logs/deepseek_v4_flash_h100_optimized.json
   nsys_end: 2
@@ -39,12 +41,6 @@ benchmark:
   warmup_steps: 6
 checkpoint:
   enabled: false
-ci:
-  cluster_tag: h100
-  nodes: 8
-  nproc_per_node: 8
-  recipe_owner: HuiyingLi
-  time: 01:00:00
 dataloader:
   _target_: torch.utils.data.DataLoader
   batch_size: null
@@ -119,7 +115,7 @@ model:
     # Load architecture from the official checkpoint; keep mock BF16 weights.
     _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
-    revision: 60d8d70770c6776ff598c94bb586a859a38244f1
+    revision: 60d8d70770c6776ff598c94bb586a859a38244f1  # pragma: allowlist secret (public model commit SHA)
     # Checkpoint quantization describes stored weights, not this BF16 benchmark.
     quantization_config: null
     num_nextn_predict_layers: 0
@@ -146,7 +142,6 @@ optimizer:
 # Initialize PP and parameter communication groups through the existing prewarm.
 prewarm:
   comm_groups: true
-recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 step_scheduler:
   ckpt_every_steps: 1000
@@ -159,3 +154,9 @@ step_scheduler:
   val_every_steps: 1000
 wandb:
   enable: false
+ci:
+  cluster_tag: h100
+  nodes: 8
+  nproc_per_node: 8
+  recipe_owner: HuiyingLi
+  time: 01:00:00
