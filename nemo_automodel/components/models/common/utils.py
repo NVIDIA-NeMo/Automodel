@@ -437,7 +437,7 @@ class BackendConfig:
         rope: Rotary embedding backend ("torch", "quack" or "triton"). QuACK is currently
             integrated for Llama-family rotary embeddings; "triton" selects the fused
             Triton rotation of DeepSeek-V4.1 (other models keep the torch path).
-        rope_fusion: Whether to use fused RoPE (requires TE).
+        rope_fusion: Whether to use TE fused RoPE with rope="torch" (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "torch_mm" uses torch._grouped_mm,
             "gmm" is a deprecated compatibility alias for "torch_mm", and "torch_mm_mxfp8" uses torch._grouped_mm
@@ -649,17 +649,10 @@ class BackendConfig:
         # instead assumes contiguous [0, seq_len) positions, so combining the two
         # silently produces incorrect phases for packed, offset, or per-example
         # position IDs.
-        if self.rope == "quack" and self.rope_fusion:
-            logger.warning("rope='quack' is incompatible with rope_fusion=True; disabling rope_fusion.")
+        # Explicit non-TE backends take precedence over the TE fusion default.
+        if self.rope in ("quack", "triton") and self.rope_fusion:
+            logger.warning("rope=%r is incompatible with rope_fusion=True; disabling rope_fusion.", self.rope)
             self.rope_fusion = False
-
-        # TEMPORARY: force TE fused RoPE off globally. The fused kernel computes cos/sin
-        # in fp32 in-kernel while HF/vLLM rotate with bf16 tables, breaking logprob parity
-        # in some models. See #3027. This is the one chokepoint every BackendConfig passes
-        # through, so it also overrides an explicit rope_fusion=True from a recipe/config.
-        if self.rope_fusion:
-            logger.warning("rope_fusion is temporarily force-disabled globally (see #3027).")
-        self.rope_fusion = False
 
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
