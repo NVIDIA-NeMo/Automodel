@@ -19,9 +19,10 @@ from __future__ import annotations
 import copy
 import inspect
 import math
+import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -80,11 +81,15 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 _FLA_MSG = "Kimi K3 requires the flash-linear-attention/fla extra. Install with `uv sync --extra fla`."
 _SHORT_CONV_OK, ShortConvolution = safe_import_from("fla.modules", "ShortConvolution", msg=_FLA_MSG)
+_CAUSAL_CONV_OK, causal_conv1d = safe_import_from("fla.modules.conv.causal_conv1d", "causal_conv1d", msg=_FLA_MSG)
 _FUSED_RMSNORM_GATED_OK, FusedRMSNormGated = safe_import_from(
     "fla.modules",
     "FusedRMSNormGated",
     msg=_FLA_MSG,
 )
+if TYPE_CHECKING:
+    from fla.ops.cp import FLACPContext
+
 _CHUNK_KDA_OK, chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
 _RECURRENT_KDA_OK, fused_recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
 _CHUNK_KDA_HAS_DISABLE_RECOMPUTE = _CHUNK_KDA_OK and "disable_recompute" in inspect.signature(chunk_kda).parameters
@@ -113,7 +118,9 @@ except (TypeError, ValueError):
 
 
 def _require_fla() -> None:
-    if not all((_SHORT_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, _KDA_GATE_OK)):
+    if not all(
+        (_SHORT_CONV_OK, _CAUSAL_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, _KDA_GATE_OK)
+    ):
         raise UnavailableError(_FLA_MSG)
 
 
@@ -643,8 +650,7 @@ class KimiMLAAttention(nn.Module):
             key_states,
             value_states,
             q_doc_ids=packed_context.local_doc_ids,
-            kv_doc_ids=packed_context.doc_ids,
-            q_global_start=packed_context.seq_start,
+            block_mask=packed_context.mla_block_mask,
             scale=self.scaling,
         )
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, local_seq_length, -1)
@@ -687,6 +693,109 @@ class _KimiKDAFp32Param:
         if param is not None:
             return param
         raise AttributeError(f"{type(obj).__name__} has no KDA fp32 parameter {self.name!r}.")
+
+
+class _ContiguousConvolutionGradient(torch.autograd.Function):
+    """Normalize cotangent layout before FLA kernels that assume dense storage."""
+
+    @staticmethod
+    def forward(ctx: torch.autograd.function.FunctionCtx, value: torch.Tensor) -> torch.Tensor:
+        """Preserve convolution values while controlling their backward layout.
+
+        Args:
+            ctx: Autograd context.
+            value: Tensor of shape [batch, sequence, channels].
+
+        Returns:
+            Tensor of shape [batch, sequence, channels], aliasing value.
+        """
+        return value
+
+    @staticmethod
+    def backward(ctx: torch.autograd.function.FunctionCtx, gradient: torch.Tensor) -> torch.Tensor:
+        """Materialize strided or broadcast convolution cotangents.
+
+        Args:
+            ctx: Autograd context.
+            gradient: Tensor of shape [batch, sequence, channels], with arbitrary strides.
+
+        Returns:
+            Contiguous tensor of shape [batch, sequence, channels].
+        """
+        return gradient.contiguous()
+
+
+class KimiTrainingShortConvolution(nn.Conv1d):
+    """Differentiable FLA convolution, including one-token training documents.
+
+    FLA ShortConvolution dispatches all-singleton batches to its inference-only
+    update kernel. With no cache and output_final_state=False that path returns
+    zero, and it cannot train the convolution. Use the functional training path
+    for every length while retaining the checkpoint's [channels, 1, width] weight.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int,
+        activation: str = "silu",
+        bias: bool = False,
+        dtype: torch.dtype = torch.float32,
+        backend: str = "triton",
+    ) -> None:
+        super().__init__(
+            hidden_size, hidden_size, kernel_size, groups=hidden_size, padding=kernel_size - 1, bias=bias, dtype=dtype
+        )
+        if activation != "silu":
+            raise ValueError(f"K3 short convolution requires silu activation, got {activation!r}.")
+        if backend not in ("triton", "cuda"):
+            raise ValueError(f"Unsupported K3 short-convolution backend: {backend!r}.")
+        self.activation = activation
+        self.backend = backend
+        if backend == "cuda":
+            cuda_available, _ = safe_import_from("causal_conv1d", "causal_conv1d_fn")
+            if not cuda_available:
+                warnings.warn("causal_conv1d is unavailable; using the FLA Triton convolution backend.", stacklevel=2)
+                self.backend = "triton"
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        cache: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        cp_context: FLACPContext | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Convolve token features without crossing document or CP boundaries.
+
+        Args:
+            x: Features with shape [batch, sequence, channels].
+            cache: Optional preceding state of shape [documents, channels, kernel_size].
+            output_final_state: Whether to return the final convolution state.
+            cu_seqlens: Cumulative packed document offsets of shape [documents + 1].
+            cp_context: FLA metadata for the context-parallel partition.
+
+        Returns:
+            Convolved features of shape [batch, sequence, channels] and optional
+            final state of shape [documents, channels, kernel_size]. The output
+            keeps the input dtype; weights retain the checkpoint's FP32 storage.
+        """
+        output, final_state = causal_conv1d(
+            x=x,
+            weight=self.weight.squeeze(1),
+            bias=self.bias,
+            initial_state=cache,
+            output_final_state=output_final_state,
+            activation=self.activation,
+            backend=self.backend,
+            cu_seqlens=cu_seqlens,
+            cp_context=cp_context,
+        )
+        # FLA's convolution backward does not handle expanded/strided dy.
+        # An identity autograd node preserves forward values while materializing
+        # such cotangents (e.g. from sum()) before the external kernel reads them.
+        return _ContiguousConvolutionGradient.apply(output), final_state
 
 
 class _KimiFp32Module(nn.Module):
@@ -775,7 +884,7 @@ class KimiDeltaAttention(nn.Module):
         # causal-conv1d CUDA kernels when that package is installed (FLA falls back to Triton otherwise).
         conv_kwargs = _short_conv_backend_kwargs(getattr(config, "kda_conv_backend", "triton"))
         self.q_conv1d = _KimiFp32Module(
-            ShortConvolution(
+            KimiTrainingShortConvolution(
                 hidden_size=projection_k_size,
                 kernel_size=self.conv_size,
                 activation="silu",
@@ -784,7 +893,7 @@ class KimiDeltaAttention(nn.Module):
             )
         )
         self.k_conv1d = _KimiFp32Module(
-            ShortConvolution(
+            KimiTrainingShortConvolution(
                 hidden_size=projection_k_size,
                 kernel_size=self.conv_size,
                 activation="silu",
@@ -793,7 +902,7 @@ class KimiDeltaAttention(nn.Module):
             )
         )
         self.v_conv1d = _KimiFp32Module(
-            ShortConvolution(
+            KimiTrainingShortConvolution(
                 hidden_size=projection_size,
                 kernel_size=self.conv_size,
                 activation="silu",
@@ -1705,6 +1814,23 @@ class KimiK3TextModel(nn.Module):
         )
         # Packed attention consumes document metadata, but MoE routing still
         # needs a separate mask for padding tokens, including in full-attention layers.
+        if packed_context is not None and packed_context.cp_enabled:
+            # FLA uses a process-global tensor cache. PP interleaves microbatches,
+            # so a cache hit in forward can become a miss during selective AC
+            # recomputation. Build metadata outside checkpointed decoder layers
+            # and retain it on this microbatch's context for the entire backward.
+            for layer in self.layers.values():
+                attention = layer.self_attn
+                if isinstance(attention, KimiDeltaAttention):
+                    if attention._cp_mesh is None:
+                        raise RuntimeError("Kimi KDA CP requires a configured process group.")
+                    for row in range(packed_context.doc_ids.shape[0]):
+                        build_fla_cp_context(packed_context, row, attention._cp_mesh.get_group(), attention.conv_size)
+                elif isinstance(attention, KimiMLAAttention):
+                    # Pipeline microbatches must not evict another microbatch's
+                    # mask between forward and selective-AC recomputation.
+                    _ = packed_context.mla_block_mask
+
         if padding_mask is None and packed_context is not None:
             padding_mask = packed_context.local_doc_ids == 0
         linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
@@ -1808,6 +1934,9 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.
     requires_packed_sequence_metadata = True
+    # Batch callback of the CP sharder built by prepare_model_inputs_for_cp; the
+    # VLM overrides it to keep media token streams whole until embedding.
+    _cp_batch_sharder = staticmethod(shard_batch_for_kimi_cp)
     packed_mask_type = "document_ids"
     _owns_cp_attention = True
     # Packed documents are masked by the model itself: MLA gets a document-blocked
@@ -2132,7 +2261,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         del batch, num_chunks
         return {
             "cp_sharder": ContextParallelSharder(
-                shard_batch=shard_batch_for_kimi_cp,
+                shard_batch=self._cp_batch_sharder,
                 local_token_global_indices=contiguous_local_indices,
             )
         }
