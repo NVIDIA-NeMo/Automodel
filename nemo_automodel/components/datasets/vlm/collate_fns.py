@@ -65,7 +65,7 @@ from nemo_automodel.components.datasets.vlm.fake_image import (  # noqa: F401
     mask_fake_vision_tokens_batch,
 )
 from nemo_automodel.components.datasets.vlm.samplers import _smart_resize_image
-from nemo_automodel.components.datasets.vlm.utils import default_stop_tokens
+from nemo_automodel.components.datasets.vlm.utils import ALREADY_SHIFTED_KEY, default_stop_tokens
 
 # ---------------------------------------------------------------------------
 # Patch BaseVideoProcessor.fetch_videos to use decord (decord2) instead of
@@ -1484,14 +1484,21 @@ def pad_collate_fn(
 
     # ------------------------------------------------------------------
     # Autoregressive shift: labels[t] predicts input_ids[t+1]
+    #
+    # Pre-tokenized samples flagged with ``_already_shifted`` (e.g. ChatDataset
+    # output from PreTokenizedDatasetWrapper's passthrough) already carry the
+    # next-token shift; shifting again would supervise token t+2. Raw VLM
+    # samples keep the shift applied here (their existing single shift).
     # ------------------------------------------------------------------
+    already_shifted = any(ex.get(ALREADY_SHIFTED_KEY, False) for ex in examples)
     labels_tensor = torch.stack(padded_labels)
-    batch["labels"] = labels_tensor[:, 1:]
+    batch["labels"] = labels_tensor[:, 1:] if not already_shifted else labels_tensor
 
-    input_shape = batch["input_ids"].shape
-    for key, value in list(batch.items()):
-        if isinstance(value, torch.Tensor) and value.shape == input_shape:
-            batch[key] = value[:, :-1]
+    if not already_shifted:
+        input_shape = batch["input_ids"].shape
+        for key, value in list(batch.items()):
+            if isinstance(value, torch.Tensor) and value.shape == input_shape:
+                batch[key] = value[:, :-1]
 
     # ------------------------------------------------------------------
     # Concatenate media tensors across samples & compute per-sample counts
