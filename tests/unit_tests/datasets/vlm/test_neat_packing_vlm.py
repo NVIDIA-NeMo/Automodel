@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+import logging
+from types import SimpleNamespace
+
 import pytest
 import torch
+from PIL import Image
 
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     NeatPackConfig,
     _build_packed_vlm_sample,
     _compute_mrope_position_ids,
+    _estimate_sample_length,
     _shift_sample,
     neat_pack_dataset_vlm,
 )
@@ -640,3 +646,110 @@ class TestVariableResolutionImagePacking:
         result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
         assert isinstance(result["pixel_values"], torch.Tensor)
         assert tuple(result["pixel_values"].shape) == (3, 3, 8, 8)
+
+
+# Qwen2-VL-style processor geometry: 14px patches merged 2x2, i.e. 28px per token side.
+_QWEN_STYLE_IMAGE_CFG = {
+    "patch_size": 14,
+    "merge_size": 2,
+    "factor": 28,
+    "min_pixels": 56 * 56,
+    "max_pixels": 28 * 28 * 1280,
+}
+_QWEN_STYLE_PROCESSOR = SimpleNamespace(
+    image_processor=SimpleNamespace(patch_size=14, merge_size=2, min_pixels=56 * 56, max_pixels=28 * 28 * 1280)
+)
+
+
+def _png_bytes(height, width):
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _image_example(image, text="abcdef"):
+    """Raw conversation with one image; ``"abcdef"`` estimates to 6 // 3 = 2 text tokens."""
+    content = [{"type": "image", "image": image}, {"type": "text", "text": text}]
+    return {"conversation": [{"role": "user", "content": content}]}
+
+
+class TestEstimateSampleLength:
+    @pytest.mark.parametrize("form", ["pil", "lazy_bytes", "decode_false_dict", "path"])
+    def test_image_tokens_come_from_image_size(self, form, tmp_path):
+        # 280x560 resizes to itself (multiples of 28): (280 / 14) * (560 / 14) / 2**2 = 200 tokens.
+        data = _png_bytes(280, 560)
+        if form == "pil":
+            image = Image.new("RGB", (560, 280))
+        elif form == "lazy_bytes":
+            image = Image.open(io.BytesIO(data))
+        elif form == "decode_false_dict":
+            image = {"bytes": data, "path": None}
+        else:
+            path = tmp_path / "image.png"
+            path.write_bytes(data)
+            image = str(path)
+
+        estimate = _estimate_sample_length(_image_example(image), image_cfg=_QWEN_STYLE_IMAGE_CFG)
+
+        assert estimate.media_tokens == 200
+        assert estimate.total_tokens == 202
+        assert estimate.unsized_media == 0
+
+    def test_unreadable_image_falls_back(self):
+        estimate = _estimate_sample_length(
+            _image_example("https://example.com/image.png"), image_cfg=_QWEN_STYLE_IMAGE_CFG
+        )
+
+        assert estimate.media_tokens == 500
+        assert estimate.unsized_media == 1
+
+    def test_missing_image_config_falls_back(self):
+        estimate = _estimate_sample_length(_image_example(Image.new("RGB", (560, 280))))
+
+        assert estimate.media_tokens == 500
+        assert estimate.unsized_media == 1
+
+    def test_mm_inputs_meta_takes_precedence(self):
+        example = _image_example(Image.new("RGB", (560, 280)))
+        example["mm_inputs_meta"] = {"images_meta": [[560, 560]]}  # (40 * 40) / 4 = 400 tokens
+
+        estimate = _estimate_sample_length(example, image_cfg=_QWEN_STYLE_IMAGE_CFG)
+
+        assert estimate.media_tokens == 400
+        assert estimate.unsized_media == 0
+
+
+class TestNeatPackingFill:
+    def test_packs_use_real_image_sizes(self):
+        # Each sample estimates to 100 image + 2 text tokens, so four fit one 1024-token pack.
+        # The 500-token fallback would need two packs.
+        ds_raw = [_image_example(Image.new("RGB", (280, 280))) for _ in range(4)]
+        dataset = _FakeDataset([_make_vlm_sample(102) for _ in range(4)])
+
+        packed = neat_pack_dataset_vlm(dataset, pack_size=1024, ds_raw=ds_raw, processor=_QWEN_STYLE_PROCESSOR)
+
+        assert len(packed) == 1
+        assert sorted(packed.bins[0]) == [0, 1, 2, 3]
+
+    def test_warns_when_media_size_unknown(self, caplog):
+        ds_raw = [_image_example("https://example.com/image.png") for _ in range(2)]
+        dataset = _FakeDataset([_make_vlm_sample(4) for _ in range(2)])
+
+        with caplog.at_level(logging.WARNING):
+            neat_pack_dataset_vlm(dataset, pack_size=2048, ds_raw=ds_raw, processor=_QWEN_STYLE_PROCESSOR)
+
+        assert "2 media items have no mm_inputs_meta or readable image size" in caplog.text
+
+    def test_warns_when_overflow_drops_samples(self, caplog):
+        # Text-only estimates of 1 token put both samples in one bin, but each really
+        # shifts to 4 tokens, so the second cannot fit the 6-token pack.
+        ds_raw = [{"conversation": [{"role": "user", "content": "abcdef"}]} for _ in range(2)]
+        dataset = _FakeDataset([_make_vlm_sample(5) for _ in range(2)])
+        packed = neat_pack_dataset_vlm(dataset, pack_size=6, ds_raw=ds_raw)
+        assert len(packed) == 1
+
+        with caplog.at_level(logging.WARNING):
+            pack = packed[0]
+
+        assert len(pack["input_ids"]) == 4
+        assert "Pack 0: dropped 1 of 2 samples that did not fit pack_size 6" in caplog.text
