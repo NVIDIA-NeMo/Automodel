@@ -1250,6 +1250,24 @@ class TestApplyFsdpShardingRecursively:
             expected_reshard = i < len(mock_module_list) - 1
             assert kwargs["reshard_after_forward"] == expected_reshard
 
+    @patch("nemo_automodel.components.distributed.parallelizer.parallelizer_utils.configure_fsdp_prefetch")
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    def test_apply_fsdp_sharding_module_list_forwards_prefetch_depths(
+        self, mock_fully_shard, mock_configure_prefetch, mock_module_list, mock_mesh, mock_mp_policy
+    ):
+        """The dense layer list and both prefetch depths reach the shared helper unchanged."""
+        mock_fully_shard.side_effect = lambda module, **kwargs: module
+
+        apply_fsdp2_sharding_recursively(
+            module=mock_module_list,
+            mesh=mock_mesh,
+            mp_policy=mock_mp_policy,
+            fsdp2_forward_prefetch_depth=2,
+            fsdp2_backward_prefetch_depth=3,
+        )
+
+        mock_configure_prefetch.assert_called_once_with(list(mock_module_list), forward_depth=2, backward_depth=3)
+
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_module_list_without_offload_policy(
         self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy

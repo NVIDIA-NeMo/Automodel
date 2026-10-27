@@ -758,20 +758,11 @@ def apply_fsdp2_sharding_recursively(
             should_prefetch = not pp_enabled and enable_fsdp2_prefetch
         if should_prefetch:
             fsdp_units = [c for _, c in flat_layer_items if not _is_container(c)]
-            if fsdp2_forward_prefetch_depth > 0:
-                for i in range(len(fsdp_units) - 1):
-                    targets = [
-                        fsdp_units[i + j] for j in range(1, fsdp2_forward_prefetch_depth + 1) if i + j < len(fsdp_units)
-                    ]
-                    if targets:
-                        fsdp_units[i].set_modules_to_forward_prefetch(targets)
-            for i in range(1, len(fsdp_units)):
-                targets = []
-                for d in range(1, fsdp2_backward_prefetch_depth + 1):
-                    if i - d >= 0:
-                        targets.append(fsdp_units[i - d])
-                if targets:
-                    fsdp_units[i].set_modules_to_backward_prefetch(targets)
+            parallelizer_utils.configure_fsdp_prefetch(
+                fsdp_units,
+                forward_depth=fsdp2_forward_prefetch_depth,
+                backward_depth=fsdp2_backward_prefetch_depth,
+            )
     else:
         for name, sub_module in module.named_children():
             if is_multimodal_module_name(name) and module_is_fully_frozen(sub_module):

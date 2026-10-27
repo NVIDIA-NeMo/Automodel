@@ -360,6 +360,34 @@ def _make_compute_dtype_fn(
     return compute_dtype_of
 
 
+def configure_fsdp_prefetch(
+    modules: Sequence[nn.Module],
+    *,
+    forward_depth: int,
+    backward_depth: int,
+) -> None:
+    """Configure explicit prefetch for an ordered sequence of FSDP blocks.
+
+    Args:
+        modules: Decoder blocks in forward execution order.
+        forward_depth: Number of subsequent blocks to prefetch, or zero to disable.
+        backward_depth: Number of preceding blocks to prefetch, or zero to disable.
+
+    Raises:
+        ValueError: If either depth is negative.
+    """
+    if forward_depth < 0 or backward_depth < 0:
+        raise ValueError("FSDP prefetch depths must be nonnegative")
+    units = [module for module in modules if isinstance(module, FSDPModule)]
+    for index, module in enumerate(units):
+        forward = units[index + 1 : index + 1 + forward_depth]
+        backward = [units[index - delta] for delta in range(1, backward_depth + 1) if index >= delta]
+        if forward:
+            module.set_modules_to_forward_prefetch(forward)
+        if backward:
+            module.set_modules_to_backward_prefetch(backward)
+
+
 def fully_shard_across_blocks(
     blocks: Sequence[nn.Module],
     module_names: Sequence[str],
