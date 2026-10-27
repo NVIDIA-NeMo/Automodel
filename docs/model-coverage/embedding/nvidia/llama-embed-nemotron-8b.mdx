@@ -1,0 +1,50 @@
+---
+title: "llama-embed-nemotron-8b"
+description: "Explore llama-embed-nemotron-8b in NeMo AutoModel, including its embedding architecture and the training example initialized from Llama 3.1 8B."
+slug: model-coverage/embedding-models/nvidia/llama-embed-nemotron-8b
+---
+
+[`nvidia/llama-embed-nemotron-8b`](https://huggingface.co/nvidia/llama-embed-nemotron-8b)
+is NVIDIA's text embedding model for dense retrieval. It uses a Llama backbone
+with bidirectional attention. NeMo AutoModel loads the embedding model through
+`NeMoAutoModelBiEncoder`.
+
+## Training Workflow
+
+The [Llama Embed Nemotron 8B training example](/recipes-e2e-examples/retrieval-base-models#llama-embed-nemotron-8b-training-example)
+initializes from `meta-llama/Llama-3.1-8B` and trains on the configured Nemotron
+retrieval dataset subsets. The guide includes data preparation and the launch
+command. This example trains from base weights; it does not load the released
+NVIDIA embedding checkpoint.
+
+For continued training, preserve the released checkpoint's tokenizer, pooling,
+normalization, and query and passage formatting. Refer to the
+[retrieval fine-tuning guide](/recipes-e2e-examples/retrieval-finetune) for the
+training and export workflow.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text embedding and dense retrieval |
+| **Architecture** | `LlamaBidirectionalModel` |
+| Parameters | 8B |
+| Publisher | NVIDIA |
+| Backbone | Llama 3.1 |
+| AutoModel Wrapper | `NeMoAutoModelBiEncoder` |
+
+### Checkpoint Roles
+
+| Role | Checkpoint |
+| --- | --- |
+| Released embedding model | `nvidia/llama-embed-nemotron-8b` |
+| Training example initialization | `meta-llama/Llama-3.1-8B` |
+
+## Related Resources
+
+- [Model card and inference instructions](https://huggingface.co/nvidia/llama-embed-nemotron-8b)
+- [Llama Nemotron Embed 1B model card](https://huggingface.co/nvidia/llama-nemotron-embed-1b-v2)
+- [Llama Nemotron VL embeddings](/model-coverage/embedding-models/nvidia/llama-nemotron-embed-vl-1b-v2)
+- [Llama Nemotron reranking](/model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2)

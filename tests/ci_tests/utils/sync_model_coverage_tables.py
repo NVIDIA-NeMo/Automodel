@@ -618,7 +618,7 @@ def _resolve_model_card_routes(
     model_docs: dict[str, list[_ModelDoc]],
     documented_models: list[_ModelDoc],
 ) -> dict[tuple[str, str], str]:
-    """Resolve every recipe model ID and model type to exactly one model card."""
+    """Resolve recipe checkpoints to model cards or explicit retrieval training guides."""
     docs_config_path = repo_root / "docs" / "fern" / "docs.yml"
     try:
         docs_config = yaml.safe_load(docs_config_path.read_text(encoding="utf-8"))
@@ -665,6 +665,18 @@ def _resolve_model_card_routes(
         for model_doc in docs:
             provider_routes_by_owner.setdefault(owner, set()).add(model_doc.docs_page.rsplit("/", 1)[0])
 
+    # Base checkpoints used to train retrieval models need not own retrieval
+    # model cards. A redirect can point to a guide that documents that exact ID.
+    guide_routes_by_model: dict[str, dict[str, str]] = {}
+    for path in (repo_root / "docs" / "guides").rglob("*.mdx"):
+        document = path.read_text(encoding="utf-8")
+        slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
+        if slug_match is None:
+            continue
+        route = f"/{slug_match.group(1)}"
+        for model_id in re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document):
+            guide_routes_by_model.setdefault(model_id.casefold(), {})[route.casefold()] = route
+
     resolved: dict[tuple[str, str], str] = {}
     missing: list[tuple[str, str]] = []
     ambiguous: list[tuple[str, str, list[str]]] = []
@@ -684,6 +696,15 @@ def _resolve_model_card_routes(
             }
 
         destinations = card_destinations(preferred_routes)
+        if release.model_type in {"Embedding", "Reranking"}:
+            guide_routes = guide_routes_by_model.get(release.hf_model_id.casefold(), {})
+            for source in redirects:
+                if source.startswith(f"/nemo/automodel/model-coverage/{category}/") and source.endswith(
+                    f"/{model_name.casefold()}"
+                ):
+                    destination = _resolve_redirect(_strip_automodel_route_prefix(source), redirects)
+                    if destination.casefold() in guide_routes:
+                        destinations.add(guide_routes[destination.casefold()])
         if not destinations:
             # Some checkpoints are reused by a workflow classified differently
             # from the card, for example an Omni checkpoint in an LLM recipe.
@@ -707,9 +728,9 @@ def _resolve_model_card_routes(
                 for hf_model_id, model_type, destinations in ambiguous
             )
         raise ValueError(
-            "Every recipe model ID must resolve to exactly one model card.\n"
+            "Every recipe model ID must resolve to exactly one model card or retrieval training guide.\n"
             + "\n".join(details)
-            + "\nAdd an exact model-card route or one Fern redirect to the intended card."
+            + "\nAdd an exact model-card route or one Fern redirect to a page documenting that checkpoint."
         )
     return resolved
 

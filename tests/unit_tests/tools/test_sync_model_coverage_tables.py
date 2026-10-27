@@ -342,6 +342,40 @@ def test_recipe_model_redirects_are_case_insensitive(tmp_path):
     assert routes == {("org/Model", "LLM"): model_doc.docs_page}
 
 
+@pytest.mark.parametrize("model_type", ["Embedding", "Reranking"])
+@pytest.mark.parametrize("guide_checkpoint", ["org/Base-1B", "other/Base-1B", None])
+def test_retrieval_base_checkpoint_redirect_requires_matching_guide(tmp_path, model_type, guide_checkpoint):
+    category = "embedding-models" if model_type == "Embedding" else "reranking-models"
+    route = "/recipes-e2e-examples/retrieval-base-models"
+    docs_config = tmp_path / "docs/fern/docs.yml"
+    docs_config.parent.mkdir(parents=True)
+    docs_config.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": f"/nemo/automodel/model-coverage/{category}/org/Base-1B",
+                        "destination": f"/nemo/automodel/nightly{route}",
+                    }
+                ]
+            }
+        )
+    )
+    if guide_checkpoint is not None:
+        guide = tmp_path / "docs/guides/retrieval-base-models.mdx"
+        guide.parent.mkdir(parents=True)
+        guide.write_text(
+            f'---\ntitle: "Train from a Base Checkpoint"\nslug: {route.lstrip("/")}\n---\n'
+            f"[Starting checkpoint](https://huggingface.co/{guide_checkpoint})\n"
+        )
+    release = _ModelRelease("2026-01-01", "org/Base-1B", "", model_type, "recipe.yaml")
+    if guide_checkpoint == "org/Base-1B":
+        assert _resolve_model_card_routes(tmp_path, [release], {}, []) == {("org/Base-1B", model_type): route}
+    else:
+        with pytest.raises(ValueError, match="missing:"):
+            _resolve_model_card_routes(tmp_path, [release], {}, [])
+
+
 def test_case_insensitive_redirect_cannot_shadow_a_canonical_card(tmp_path):
     docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
     docs_config_path.parent.mkdir(parents=True)
@@ -966,12 +1000,19 @@ def test_recipe_backed_model_sizes_have_exact_index_routes_and_one_card():
 
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
     redirects = {redirect["source"]: redirect["destination"] for redirect in docs_config["redirects"]}
+    config_path = repo_root / "docs/fern/versions/nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    navigated_routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
 
     destinations_by_group: dict[tuple[str, tuple[str, str]], set[str]] = {}
     destination_groups: dict[tuple[str, str], set[tuple[str, str]]] = {}
     missing = []
     for release in releases:
         destination = model_card_routes[(release.hf_model_id, release.model_type)]
+        if not destination.startswith("/model-coverage/"):
+            assert release.model_type in {"Embedding", "Reranking"}
+            assert destination in navigated_routes, f"Retrieval training guide is not navigable: {destination}"
+            continue
         provider_href = destination.rsplit("/", 1)[0]
         if destination not in index_routes.get(provider_href, set()):
             missing.append((release.model_type, release.hf_model_id, f"provider index card {destination}"))

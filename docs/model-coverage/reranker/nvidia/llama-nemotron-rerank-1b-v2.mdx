@@ -1,0 +1,47 @@
+---
+title: "llama-nemotron-rerank-1b-v2"
+description: "Explore llama-nemotron-rerank-1b-v2 in NeMo AutoModel, with its released checkpoint, reranking architecture, and separate base-model training guidance."
+slug: model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2
+---
+
+[`nvidia/llama-nemotron-rerank-1b-v2`](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2)
+is NVIDIA's text reranker for scoring query-document pairs. It uses a Llama
+backbone with bidirectional attention and a relevance scoring head. NeMo AutoModel
+loads this model through `NeMoAutoModelCrossEncoder`.
+
+## Training Resources
+
+Refer to the [retrieval fine-tuning guide](/recipes-e2e-examples/retrieval-finetune)
+for cross-encoder training, checkpointing, and export. Continuing training from
+the released model requires its checkpoint and matching tokenizer and input
+formatting.
+
+The [Llama base-model example](/recipes-e2e-examples/retrieval-base-models#train-from-llama)
+initializes from `meta-llama/Llama-3.2-1B` to train a custom reranker. It does not
+load `nvidia/llama-nemotron-rerank-1b-v2` and is not a reproduction recipe for
+that released model.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text reranking |
+| **Architecture** | `LlamaBidirectionalForSequenceClassification` |
+| Parameters | 1B |
+| Publisher | NVIDIA |
+| Backbone | Llama 3.2 |
+| AutoModel Wrapper | `NeMoAutoModelCrossEncoder` |
+
+### Checkpoint Roles
+
+| Role | Checkpoint |
+| --- | --- |
+| Released reranker | `nvidia/llama-nemotron-rerank-1b-v2` |
+| Generic training example initialization | `meta-llama/Llama-3.2-1B` |
+
+## Related Resources
+
+- [Model card and inference instructions](https://huggingface.co/nvidia/llama-nemotron-rerank-1b-v2)
+- [Llama Embed Nemotron embeddings](/model-coverage/embedding-models/nvidia/llama-embed-nemotron-8b)
