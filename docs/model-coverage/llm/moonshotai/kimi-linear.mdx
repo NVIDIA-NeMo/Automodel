@@ -16,6 +16,16 @@ From the repository root, run:
 uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml
 ```
 
+The recipe selects `model.backend.attn: fa4` for non-CP MLA and requires a container
+built with `INSTALL_FA4=true`, CUDA FP16 or BF16 inputs, and zero attention dropout.
+The `fa` extra installs FlashAttention-2 and does not supply `flash_attn.cute`.
+The shared native FA4 path forwards PyTorch's deterministic-algorithms setting to
+FlashAttention. For an environment without FA4, select eager MLA:
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml --model.backend.attn eager
+```
+
 ## Choose a Workflow
 
 | Goal | Start Here |
@@ -53,7 +63,12 @@ NeMo AutoModel already carry the distinct identity and load without that overrid
 | FSDP2 | Default sharding strategy for the recipes below |
 | Expert parallelism (EP) | Shards the MoE experts across ranks |
 | Context parallelism (CP) | Contiguous per-rank sequence shards. KDA passes its recurrent state from rank to rank, and MLA gathers the compressed KV latent |
-| Packed sequences | Document boundaries from the THD collater are honored by both layer types, including under CP |
+| Packed sequences | The HellaSwag recipe uses NEAT packing: document-ID masks and dataset-provided cumulative lengths and token indices isolate documents in both KDA and MLA. CP retains its compressed-KV/FlexAttention path. |
+
+Non-CP MLA uses the shared native FA4 backend with the checkpoint's QK=192 and
+V=128 head widths. Packed FA4 inputs require NEAT BSHD metadata:
+`cu_seqlens`, `max_seqlen`, and `packed_token_indices`. Pre-packed THD inputs and
+physical `cu_seqlens_padded` are unsupported; use NEAT packing.
 
 ### Available Models
 

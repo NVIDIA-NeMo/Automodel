@@ -45,6 +45,11 @@ from nemo_automodel.components.distributed.thd_utils import process_input_for_th
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
+@pytest.fixture(autouse=True)
+def one_visible_gpu(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+
 class DummyProcessor:
     def __init__(self):
         self.tokenizer = SimpleNamespace(pad_token_id=0)
@@ -180,17 +185,23 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
 
 
 @pytest.mark.parametrize(
-    ("affinity", "cpu_count", "expected"),
+    ("affinity", "cpu_count", "num_gpus", "expected"),
     [
-        ({4, 5}, 128, 2),
-        (OSError("unavailable"), 3, 3),
-        (AttributeError("unavailable"), 4, 4),
-        (NotImplementedError(), None, 1),
-        (set(), 2, 2),
+        ({4, 5}, 128, 1, 2),
+        (set(range(24)), 128, 2, 8),
+        (set(range(64)), 128, 8, 32),
+        (set(range(6)), 128, 2, 6),
+        (OSError("unavailable"), 64, 2, 8),
+        (AttributeError("unavailable"), 4, 2, 4),
+        (NotImplementedError(), None, 1, 1),
+        (set(), 2, 1, 2),
+        (set(range(24)), 128, 0, 24),
+        (OSError("unavailable"), 3, 0, 3),
+        (NotImplementedError(), None, 0, 1),
     ],
 )
-def test_zero_vlm_workers_uses_available_cpus_without_mutating_config(
-    monkeypatch, caplog, affinity, cpu_count, expected
+def test_zero_vlm_workers_caps_by_gpus_and_available_cpus_without_mutating_config(
+    monkeypatch, caplog, affinity, cpu_count, num_gpus, expected
 ):
     def get_affinity(_):
         if isinstance(affinity, Exception):
@@ -198,6 +209,7 @@ def test_zero_vlm_workers_uses_available_cpus_without_mutating_config(
         return affinity
 
     monkeypatch.setattr(vlm_loader, "os", SimpleNamespace(sched_getaffinity=get_affinity, cpu_count=lambda: cpu_count))
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: num_gpus)
     config = VlmDataloaderConfig(
         dataset_config=StaticDatasetConfig([]),
         processor_config=VlmProcessorConfig(factory=DummyProcessor),
@@ -210,8 +222,8 @@ def test_zero_vlm_workers_uses_available_cpus_without_mutating_config(
         for _ in range(2):
             result = config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
             assert result.dataloader.num_workers == expected
-            assert result.dataloader.persistent_workers is True
-            assert result.dataloader.prefetch_factor == 3
+            assert result.dataloader.persistent_workers is (expected > 0)
+            assert result.dataloader.prefetch_factor == (3 if expected > 0 else None)
 
     assert config.num_workers == 0
     messages = [record.getMessage() for record in caplog.records if record.name == vlm_loader.__name__]
@@ -366,8 +378,13 @@ def test_vlm_workers_resume_legacy_synchronous_checkpoint(
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.parametrize("num_gpus", [0, 1])
+@pytest.mark.parametrize("consumed", [0, 1])
 @pytest.mark.parametrize(("available_cpus", "configured_workers"), [(2, 0), (1, 0), (3, 0), (3, 3)])
-def test_vlm_workers_roundtrip_native_checkpoint(monkeypatch, tmp_path, available_cpus, configured_workers):
+def test_vlm_workers_roundtrip_native_checkpoint(
+    monkeypatch, tmp_path, num_gpus, consumed, available_cpus, configured_workers
+):
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: num_gpus)
     monkeypatch.setattr(vlm_loader.os, "sched_getaffinity", lambda _: {0, 1})
     config = VlmDataloaderConfig(
         dataset_config=_ResumeDatasetConfig(_IndexDataset, offset=200),
@@ -380,9 +397,14 @@ def test_vlm_workers_roundtrip_native_checkpoint(monkeypatch, tmp_path, availabl
     original.snapshot_every_n_steps = 3
     original.load_state_dict({})
     iterator = iter(original)
-    next(iterator)
-    path = tmp_path / "native.pt"
-    torch.save(original.state_dict(), path)
+    for _ in range(consumed):
+        next(iterator)
+    checkpointer = Checkpointer.__new__(Checkpointer)
+    checkpointer.dp_rank = checkpointer.tp_rank = checkpointer.pp_rank = 0
+    checkpointer.process_group = None
+    checkpointer.config = SimpleNamespace(allow_legacy_pickle_restore=False)
+    checkpointer.save_on_dp_ranks(original, "dataloader", str(tmp_path))
+    path = tmp_path / "dataloader" / "dataloader_dp_rank_0.pt"
     expected = list(iterator)
 
     monkeypatch.setattr(vlm_loader.os, "sched_getaffinity", lambda _: set(range(available_cpus)))
@@ -393,9 +415,9 @@ def test_vlm_workers_roundtrip_native_checkpoint(monkeypatch, tmp_path, availabl
     assert resumed.num_workers == (configured_workers or available_cpus)
     resumed.sampler.set_epoch(7)
     state = torch.load(path, weights_only=True)
-    assert state["_steps_since_snapshot"] > 0
+    assert state["_steps_since_snapshot"] == consumed
     rng_before = torch.get_rng_state().clone()
-    resumed.load_state_dict(state)
+    checkpointer.load_on_dp_ranks(resumed, "dataloader", str(tmp_path))
     assert torch.equal(torch.get_rng_state(), rng_before)
 
     actual = list(resumed)
