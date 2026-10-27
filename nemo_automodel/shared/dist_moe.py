@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 class DistMoEConfig:
     """Configure a shared, sequential Dist-MoE context for one model.
 
-    The initial integration supports plain SwiGLU, BF16 or MXFP8 computation,
+    The integration supports plain or pre-activation-clamped SwiGLU, BF16 or MXFP8,
     and one forward/backward schedule at a time. Pipeline parallelism requires
     an activation-slot assignment and is not supported by this integration.
     """
@@ -112,6 +112,7 @@ class DistMoEConfig:
         num_experts: int,
         top_k: int,
         num_layers: int,
+        swiglu_limit: float = 0.0,
     ) -> Context:
         """Build the context collectively after selecting each rank's GPU.
 
@@ -123,11 +124,15 @@ class DistMoEConfig:
             num_experts: Global expert count, divisible by the group size.
             top_k: Route slots per physical token row.
             num_layers: Local layers sharing one activation stack and scratch area.
+            swiglu_limit: Model-owned pre-activation clamp; zero selects plain SwiGLU.
+                Positive values require the experimental swiglu_deepseek backend.
 
         Returns:
             Context shared sequentially across local expert modules. Its owner
             must call close after all pending forward/backward work finishes.
         """
+        if not math.isfinite(swiglu_limit) or swiglu_limit < 0:
+            raise ValueError("swiglu_limit must be finite and nonnegative")
         available, package = safe_import("dist_moe", msg="Install the optional dist-moe package for this backend.")
         if not available:
             raise ImportError("dispatcher='dist_moe' requires the dist-moe package")
@@ -160,5 +165,8 @@ class DistMoEConfig:
             bf16_grouped_gemm_preset=self.bf16_grouped_gemm_preset,
             block_scaled=policy,
             wgrad_dtype=torch.bfloat16,
+            activation="swiglu_deepseek" if swiglu_limit > 0 else "swiglu",
+            swiglu_alpha=1.0,
+            swiglu_limit=swiglu_limit,
         )
         return package.create_context(group=group, config=config, device=device)

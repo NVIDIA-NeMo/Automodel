@@ -15,8 +15,10 @@
 """Configuration guards for the fused expert backend."""
 
 import dataclasses
+from unittest.mock import Mock
 
 import pytest
+import torch
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
@@ -50,8 +52,9 @@ def test_backend_resolves_typed_configuration() -> None:
     assert selected.dist_moe.max_tokens_per_rank == 32
 
 
-def test_rejects_different_clamped_swiglu_semantics() -> None:
-    """The upstream plus-one clamped activation cannot implement this clamp."""
+@pytest.mark.parametrize("limit", [0.0, 0.0625, 10.0])
+def test_accepts_pre_activation_clamp(limit: float) -> None:
+    """Construct clamped experts without changing canonical parameter ownership."""
     config = MoEConfig(
         n_routed_experts=4,
         n_shared_experts=0,
@@ -67,11 +70,16 @@ def test_rejects_different_clamped_swiglu_semantics() -> None:
         inter_dim=256,
         moe_inter_dim=256,
         norm_topk_prob=False,
-        swiglu_limit=7.0,
+        swiglu_limit=limit,
     )
     backend = BackendConfig(dispatcher="dist_moe", experts="torch_mm", dist_moe={"max_tokens_per_rank": 32})
-    with pytest.raises(ValueError, match="clamped formula"):
-        GroupedExpertsDistMoE(config, backend)
+    module = GroupedExpertsDistMoE(config, backend)
+    assert module.gate_and_up_projs.shape == (4, 256, 512)
+    assert module.down_projs.shape == (4, 256, 256)
+    with pytest.raises(ValueError, match="after the activation"):
+        GroupedExpertsDistMoE(dataclasses.replace(config, swiglu_clamp_after_activation=True), backend)
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        GroupedExpertsDistMoE(dataclasses.replace(config, swiglu_limit=-1.0), backend)
     with pytest.raises(ValueError, match="biased experts"):
         GroupedExpertsDistMoE(dataclasses.replace(config, swiglu_limit=0.0, expert_bias=True), backend)
 
@@ -107,3 +115,27 @@ def test_invalid_host_capacity(capacity: float) -> None:
     """Host plus device capacity must cover the device allocation."""
     with pytest.raises(ValueError, match="host_scratch_capacity_factor"):
         DistMoEConfig(device_scratch_capacity_factor=2.0, host_scratch_capacity_factor=capacity)
+
+
+@pytest.mark.parametrize("limit, activation", [(0.0, "swiglu"), (0.0625, "swiglu_deepseek"), (10.0, "swiglu_deepseek")])
+def test_context_receives_model_activation(monkeypatch: pytest.MonkeyPatch, limit: float, activation: str) -> None:
+    """The optional backend receives the model's clamp with ordinary SiLU slope."""
+    package = Mock()
+    monkeypatch.setattr("nemo_automodel.shared.dist_moe.safe_import", lambda *args, **kwargs: (True, package))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+    settings = DistMoEConfig(max_tokens_per_rank=32)
+    settings.build(
+        group=Mock(spec=torch.distributed.ProcessGroup),
+        device=torch.device("cuda", 0),
+        hidden_dim=256,
+        intermediate_dim=256,
+        num_experts=4,
+        top_k=2,
+        num_layers=4,
+        swiglu_limit=limit,
+    )
+    kwargs = package.Config.call_args.kwargs
+    assert kwargs["activation"] == activation
+    assert kwargs["swiglu_alpha"] == 1.0
+    assert kwargs["swiglu_limit"] == limit
+    assert kwargs["max_moe_layers_per_activation_slot"] == 4

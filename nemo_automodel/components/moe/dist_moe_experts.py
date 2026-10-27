@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -44,11 +45,12 @@ class GroupedExpertsDistMoE(GroupedExperts):
 
     def __init__(self, config: MoEConfig, backend: BackendConfig) -> None:
         """Validate supported expert semantics and allocate canonical parameters."""
-        if config.expert_activation != "swiglu" or config.swiglu_limit != 0:
-            raise ValueError(
-                "Dist-MoE integration currently supports plain SwiGLU only; "
-                "its clamped formula differs from the AutoModel clamp"
-            )
+        if config.expert_activation != "swiglu":
+            raise ValueError("Dist-MoE integration requires SwiGLU")
+        if config.swiglu_clamp_after_activation:
+            raise ValueError("Dist-MoE does not support clamping after the activation")
+        if not math.isfinite(config.swiglu_limit) or config.swiglu_limit < 0:
+            raise ValueError("swiglu_limit must be finite and nonnegative")
         if config.expert_bias:
             raise ValueError("Dist-MoE does not support biased experts")
         super().__init__(config, backend)
@@ -77,7 +79,11 @@ class GroupedExpertsDistMoE(GroupedExperts):
                 module.config.n_routed_experts,
                 module.config.n_activated_experts,
             )
-            if other != shape or module.dist_moe_config != self.dist_moe_config:
+            if (
+                other != shape
+                or module.dist_moe_config != self.dist_moe_config
+                or module.config.swiglu_limit != self.config.swiglu_limit
+            ):
                 raise ValueError("One Dist-MoE context requires homogeneous local expert shapes and configuration")
             if module.context is not None:
                 raise RuntimeError("Dist-MoE context is already initialized")
@@ -89,6 +95,7 @@ class GroupedExpertsDistMoE(GroupedExperts):
             num_experts=shape[2],
             top_k=shape[3],
             num_layers=len(modules),
+            swiglu_limit=self.config.swiglu_limit,
         )
         for module in modules:
             module.context = context
