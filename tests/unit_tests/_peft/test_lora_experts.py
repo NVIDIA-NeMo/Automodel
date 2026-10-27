@@ -264,6 +264,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
         dispatcher_hybridep_num_blocks_unpermute=112,
         dispatcher_capacity_factor=1.5,
         dispatcher_equal_token_counts=True,
+        dispatcher_recompute_cache="combine",
     )
     orig_experts = GroupedExpertsDeepEP(
         moe_config,
@@ -289,6 +290,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     assert lora_experts.dispatcher_capacity_factor == 1.5
     assert lora_experts.dispatcher_equal_token_counts is True
     assert lora_experts.dispatch_rows_never_empty is True
+    assert lora_experts.dispatcher_recompute_cache == "combine"
     assert lora_experts.use_mxfp8 is True
 
 
@@ -350,6 +352,35 @@ def test_apply_lora_patching_logic(moe_config, device):
     assert count == 1
     assert isinstance(model.experts, GroupedExpertsLoRA)
     assert isinstance(model.linear, nn.Linear)  # Should not be patched
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_apply_lora_preserves_expert_registration(moe_config: MoEConfig, nested: bool) -> None:
+    """Replacing direct and ModuleList-nested experts must preserve checkpoint keys and base storage."""
+    model = nn.Module()
+    original = GroupedExperts(moe_config)
+    if nested:
+        model.layers = nn.ModuleList([nn.Module()])
+        model.layers[0].experts = original
+        path = "layers.0.experts"
+    else:
+        model.experts = original
+        path = "experts"
+
+    count = apply_lora_to_linear_modules(
+        model, PeftConfig(target_modules=[path], dim=4, use_memory_efficient_lora=False)
+    )
+
+    assert count == 1
+    adapter = model.get_submodule(path)
+    assert isinstance(adapter, GroupedExpertsLoRA)
+    assert adapter.gate_and_up_projs is original.gate_and_up_projs
+    assert adapter.down_projs is original.down_projs
+    state = model.state_dict()
+    assert state[f"{path}.gate_and_up_projs"].data_ptr() == original.gate_and_up_projs.data_ptr()
+    assert state[f"{path}.down_projs"].data_ptr() == original.down_projs.data_ptr()
+    assert f"{path}.lora_gate_and_up_A" in state
+    assert f"{path}.lora_down_B" in state
 
 
 class MockDeepEPDispatcher:

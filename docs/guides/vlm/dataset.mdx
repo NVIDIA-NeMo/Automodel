@@ -135,6 +135,42 @@ dataset:
 ```
 This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
 
+## DataLoader Workers
+
+For VLM training and validation, `num_workers: 0` automatically selects one worker
+per CPU available to the training process and logs a warning with the resolved
+count. Zero is also the default when omitted. This enables background preprocessing and batch prefetching. The count
+respects CPU affinity when available, falls back to the system CPU count, and
+uses one worker if neither count is available.
+The selection does not inspect container CPU-time quotas.
+
+The count applies to each dataloader independently. When several training ranks
+share CPUs, set an explicit positive worker count to limit CPU and host-memory
+use. For example:
+
+```yaml
+dataloader:
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+
+validation_dataloader:
+  num_workers: 2
+```
+
+Custom datasets and collators run in worker processes and must prepare data on
+the CPU. Move batches to the GPU in the training process. All VLM loaders use
+worker processes; `num_workers: 1` selects one worker. Prefetched tensor batches
+use shared memory, so size container shared memory for your batches and worker count.
+
+Automatic and explicit positive worker counts can resume checkpoints saved by
+older VLM recipes with zero workers. The loader migrates the map-style dataset state and sampler position
+to worker processes. Sampler position and order are preserved. Preprocessing that
+depends on worker-local state, including random transforms, can differ when moving
+to workers or changing their count. Worker checkpoints can change count when no
+per-worker dataset or iterator state was saved. Otherwise, restore with the saved
+worker count; changing it raises an error during checkpoint loading.
+
 ## Custom Chat Template
 
 By default, VLM fine-tuning uses the chat template built into the model's `AutoProcessor`. To use a custom template, add `chat_template` under `dataset:` in your YAML config:

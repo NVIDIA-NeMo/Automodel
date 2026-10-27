@@ -1,5 +1,11 @@
 # Contributing To NeMo-Automodel
 
+## Coding guidelines
+
+Follow the [coding guidelines](CODING_GUIDELINES.md) when adding or modifying code.
+Existing code is being refactored incrementally and may not yet comply. Agents
+must also follow [AGENTS.md](AGENTS.md) and applicable contributor skills.
+
 ## Environment setup for Automodel
 
 Common workflows used for setting up Automodel environment:

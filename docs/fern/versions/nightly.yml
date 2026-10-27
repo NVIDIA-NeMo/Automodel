@@ -293,9 +293,16 @@ navigation:
               - page: "Kimi-K3"
                 path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
               - page: "Kimi-Linear-48B-A3B-Instruct"
-                path: ../../model-coverage/llm/moonshotai/kimi-linear.mdx
+                path: ../../model-coverage/llm/moonshotai/kimi-linear-48b-a3b-instruct.mdx
               - page: "Moonlight-16B-A3B"
                 path: ../../model-coverage/llm/moonshotai/moonlight.mdx
+          - section: "Nanbeige"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRmICAABXRUJQVlA4TFYCAAAvE8AEAPflto0kR6pV1uXvfYyPN09N16sg3EaSJEU1EPhvBV6hn3ga70wX00aSHPUZ9MF/oA+fndnp+a+Dx0qAgSACMUEKAkSBFiXegkFEQpRAQ4GhELVCBiABAmQB1Ktb6/D8/6I0UAEqVXWYCCASIBQsSAdEbEyAKNQ25VwgIhqNKYIDtGpqgu9qSpUpMWpCcHdBOUqBSJARhoWGqKY6BCAVKqISSSFSVJS5ShDduYzO99ivReL8rv3err5IRGlTfezPdveV4PoOCUQihCgqE4JMUWhI00SpRiRSCZoQCVRGiUCIKARIgE2lqEAgBTSCJhoIQgkQlAQIAQjRADQCEQgkgAZCAI0IJAAJKKhAf8G2Prp67K/X72OAIACAwcR2Q7ZdQ27ZLds2ll3LdrNtZX/O9YK7iP4rcNtGGfMOfsH6Db78LzAoAFxACMAV42uKr72+f3wGAD5ca7gfgiHby3kvKK6oqa2uKspPajJQWPBcsOVvYW0JbQC0srQzSr05o4DrW2FPe3N9JbGktLyhtX3oSX/7ME6a3dk/PIInAJyeHB+Qp0ljoy5INwTK1d3TB0IvPzQKiUY4+wYGhUVEx2LwODwuARMTFR4aHBCy+yo5Z6sUQo1OLlIr6FTB5cbqZln24nAikV/31reekr42kNmhUUx52E70msdJ08y6Vpwc5rpN4nmMGW/byV7TSGmyceeyo/18tylWyFoqzFoYITRK2jL6t/NyyYOEFjGLd/sgVt4Z2Po7Be8W8pRAz2ZBGmQxKFeQQWEwKeDjCN/+GwfAPyEE"/></svg>'
+            slug: nanbeige
+            path: ../../model-coverage/llm/nanbeige/index.mdx
+            contents:
+              - page: "Nanbeige4.3-33B"
+                path: ../../model-coverage/llm/nanbeige/nanbeige4-3-33b.mdx
           - section: "NVIDIA"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRiACAABXRUJQVlA4TBQCAAAvE8AEAJfkqI0kScqsnnueQ2QZLH9Ic1QGDceR5MbNLgSAsv10OA7C+Qeim8A6biRJkapheX/rypp9PpxBzHc9VPMfiAVCIJABEUgEAFGRTCEIOnlLIUJUS+dtd19/MxO62rPJDFRIVUaTDgjy/NDNd96lkr4+MjNAJmQWmT+gkRrUUIr+oTOR6IIGgYBChasQGgCpoousYIAhCiAUDZAgAqsBJJC6kgBRRGaVElbSs4iCir7zKg9hWR9PUfZtN+qiZXgKKfkeYAIFCL4L/D+Y3JliW0dl6njP1jEYiylT52chCgPaZrtnbavZ1f+3W8fg+m5MMUdncrdkrwhALNmbwwjKFNvo2czkrkimEM3sZore8Z4t2ZvcmWJyN7mb3JmiTJnCFEv2RPj50YhBuVgsw1Z9nACibdumm/1wYttOldpGUtupbdu29cuNvyCi/xOAVGckEblYGCnilwKmptZgdc2nG1wUGLzZLc39I0OjjZBE4DlXgz8nM9fR1jdYEYmDvddZ780oqrUMh8sjgZO1BwrTB4Jp3b7OUBQexo5AcX5eidXWVRcFAuizCkrLvnrCYyESR/pv/q36+/mu9ICJoJhf0upUa+rVZWiwIAcgxOTm0cH98+H53snVxcr6O0QQ4u12+nh/52P7dHzj7Hp3S8myhJmJuamXx8Wnm8vp14fZuwWwSDBLLJGQJaGQiEgYIVUB"/></svg>'
             slug: nvidia
@@ -578,7 +585,7 @@ navigation:
               - page: "Muse-Glimmer-30B"
                 path: ../../model-coverage/vlm/meta-models/muse_glimmer.mdx
               - page: "Muse-Spark-open-816B-A42B"
-                path: ../../model-coverage/vlm/meta-models/muse_spark_open.mdx
+                path: ../../model-coverage/vlm/meta-models/muse-spark-open-816b-a42b.mdx
           - section: "MiniMax AI"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRtwCAABXRUJQVlA4TNACAAAvE8AEAAEFbdswSvfHn/E0DhH9nwBFdyv0wx40UNQ2khMUW66GP7Z7HxYlkSQ5DQ++f1kRn4JHERJI2vj17/z+xwMwPhKUYSKhKA0ZzIdqdWp+EGJ3Zv/PpJClbZNpO39V9ep1bNs+J/YAsu9iOwM4g8hMNAXrKpe2bRsLvSqYRD1PILWRJEhyZN/z+FM8FDclt7ZtVcvWPp9kuGQUQAuWWkYdtEFKU/Ti7vxyvrt35NDfJYXLElyimrM0fEhNG+7FZdKSZZGGsDwcawD/oMDf+/rRN5Uf+/l+X2SwcDEOCRHAIAawgBg7drpxR2G95o62deYOFh5czAwHYEaVqF91axul9rq23bqN0g577Og5fy0rCQ4zBB04iNLJ3kLGA9dPu6+19Ljrp598Ti7hYiQQAIcGpZBrse/3akG8RdzcmxUlNvcSTtuP2avKT0GgIAAdRB/+v/qWTOqbOEm1BqCRoqNEqxdqfPULLCAkLYT1P/ufVT4XVZaAf6Dv/CUpADO6MH6lZdNKfFWONBmDABgRk4OZmU6mOITLq5NH1aJBSBAmCOPHAegXFTOzguJ0f9qP7CH09aiMU/yhOPlZLXqpPk4at6h8FABwIGnE1IC8JGXVZk9XpTeNUdb0lNkjnDl+Pv0UUoAh6IJDQzRt1F1Pv8nZsvf+Txo3X47c9Mn5ddBMBDEAh66QALch/usc1hV1VWNRvrLxaVWV3cRDAYAgAIRQIJ3rNDdQl9WUP89VT8z4RsQFyxUpAIRElGO2SVX+aETn5OWH1D5asqTq844lXFZdLf7fy/wjAHTRxFQDhm8Svu762U6XN1WFRZHfu12yowO7WN25LwmIQLqCuHS4PNzNCru5/vBe++Zg8bRFvszf/vvd1Fv/1vN7qiAFxEAhnRvxKvSXsx/a/6hFPLuX0B/JvuLl0oMPBYADME8yR8z5v6tF8+AlEhlcZPHQBBg="/></svg>'
             slug: MiniMaxAI
@@ -623,6 +630,8 @@ navigation:
             contents:
               - page: "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16"
                 path: ../../model-coverage/vlm/nvidia/nvidia-nemotron-3-5-bolt-74b-a9b-bf16.mdx
+              - page: "NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16"
+                path: ../../model-coverage/vlm/nvidia/nvidia-nemotron-3-5-bolt-e4b-4gb-bf16.mdx
               - page: "NVIDIA-Nemotron-Parse-v1.1"
                 path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - section: "OpenGVLab"
