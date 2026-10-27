@@ -220,8 +220,10 @@ class MetricLoggerDist(MetricLogger):
 class TensorBoardMetricLogger(MetricLogger):
     """JSONL metric logger that mirrors numeric metrics to TensorBoard."""
 
-    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
-        super().__init__(filepath, flush=flush, append=append)
+    def __init__(
+        self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = DEFAULT_BUFFER_SIZE
+    ) -> None:
+        super().__init__(filepath, flush=flush, append=append, buffer_size=buffer_size)
         from torch.utils.tensorboard import SummaryWriter
 
         log_dir = os.environ.get("TENSORBOARD_LOG_DIR") or os.path.join(os.path.dirname(self.filepath), "tensorboard")
@@ -245,18 +247,33 @@ class TensorBoardMetricLogger(MetricLogger):
 class TensorBoardMetricLoggerDist(TensorBoardMetricLogger):
     """Rank-zero JSONL + TensorBoard logger."""
 
-    def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
+    def __init__(
+        self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = DEFAULT_BUFFER_SIZE
+    ) -> None:
         self.rank = dist.get_rank()
         if self.rank == 0:
-            super().__init__(filepath, flush=flush, append=append)
+            super().__init__(filepath, flush=flush, append=append, buffer_size=buffer_size)
 
     def log(self, record: MetricsSample) -> None:
         if self.rank == 0:
             super().log(record)
 
+    def flush(self) -> None:
+        if self.rank != 0:
+            return
+        super().flush()
+
     def close(self) -> None:
         if self.rank == 0:
             super().close()
+
+    def __enter__(self) -> "TensorBoardMetricLoggerDist":
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any) -> None:
+        if self.rank != 0:
+            return
+        self.close()
 
 
 def build_metric_logger(
