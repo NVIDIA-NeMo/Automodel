@@ -63,8 +63,11 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
 
+# Fused linear CE: the materialized 262K-vocab logits and their fp32 upcast do not fit next to the
+# activations and AdamW state on an 80 GB GPU.
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  logit_softcapping: 30.0  # Gemma4's final_logit_softcapping
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
@@ -73,6 +76,9 @@ dataset:
   seq_length: 4096
   truncation: true
   padding: do_not_pad
+  # The base checkpoint ships no chat template; gemma-4-12B-it has the same vocabulary and one.
+  tokenizer:
+    pretrained_model_name_or_path: google/gemma-4-12B-it
 
 packed_sequence:
   packed_sequence_size: 0
