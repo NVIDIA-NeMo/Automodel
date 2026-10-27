@@ -2358,3 +2358,106 @@ class TestChatDatasetSingleShiftContract:
         assert batch["input_ids"].shape[-1] == 4, "collator must not shift already-shifted input_ids"
         assert batch["input_ids"][0].tolist() == [10, 11, 12, 13]
         assert batch["labels"][0].tolist() == [-100, 12, 13, 14], "collator must not shift labels again"
+
+
+class TestChatDatasetSingleShiftThroughConsumers:
+    """ChatDataset output must keep exactly one shift through the padded and
+    packed VLM consumers (second review finding: the wrapper passthrough fed
+    already-shifted ChatDataset labels to consumers that shift again).
+
+    The oracle uses a real ``PreTrainedTokenizerFast`` with a chat template so
+    the inputs are actual ``ChatDataset.__getitem__`` emissions, not
+    hand-written unshifted samples.
+    """
+
+    @pytest.fixture()
+    def chat_tokenizer(self):
+        from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+        from transformers import PreTrainedTokenizerFast
+
+        special = ["[UNK]", "[PAD]", "<|im_start|>", "<|im_end|>"]
+        backend = Tokenizer(models.BPE(unk_token="[UNK]"))
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        backend.train_from_iterator(
+            ["alpha beta gamma delta epsilon zeta eta theta"],
+            trainers.BpeTrainer(vocab_size=64, special_tokens=special),
+        )
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            eos_token="<|im_end|>",
+        )
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n"
+            "{% endfor %}"
+        )
+        return tokenizer
+
+    @pytest.fixture()
+    def chat_rows(self, tmp_path, chat_tokenizer):
+        rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": "alpha beta"},
+                    {"role": "assistant", "content": "gamma delta epsilon"},
+                ]
+            }
+        ]
+        path = tmp_path / "chat.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows))
+        return str(path)
+
+    def _chat_dataset_sample(self, chat_rows, chat_tokenizer):
+        from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
+
+        chat_ds = ChatDataset(chat_rows, chat_tokenizer)
+        return dict(chat_ds[0])
+
+    def test_wrapper_passthrough_flags_already_shifted(self, chat_rows, chat_tokenizer):
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            [self._chat_dataset_sample(chat_rows, chat_tokenizer)], _FakeProcessor(), inject_fake_images=False
+        )
+        out = wrapper[0]
+        assert out[vlm_utils.ALREADY_SHIFTED_KEY] is True
+
+    def test_pad_collate_fn_single_shift_on_real_chatdataset_output(self, chat_rows, chat_tokenizer):
+        from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
+
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            [self._chat_dataset_sample(chat_rows, chat_tokenizer)], _FakeProcessor(), inject_fake_images=False
+        )
+        direct = dict(wrapper[0])
+        batch = pad_collate_fn([dict(wrapper[0])], _FakeProcessor())
+
+        assert batch["input_ids"][0].tolist() == direct["input_ids"].tolist(), "padded path must not shift again"
+        assert batch["labels"][0].tolist() == direct["labels"].tolist(), "padded path must not shift labels again"
+        assert batch["input_ids"].shape[-1] == batch["labels"].shape[-1]
+
+    def test_packed_wrapper_single_shift_on_real_chatdataset_output(self, chat_rows, chat_tokenizer):
+        from nemo_automodel.components.datasets.vlm.neat_packing_vlm import PackedDatasetWrapper
+
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            [self._chat_dataset_sample(chat_rows, chat_tokenizer)], _FakeProcessor(), inject_fake_images=False
+        )
+        direct = dict(wrapper[0])
+        packed = PackedDatasetWrapper(wrapper, bins=[[0]], pack_size=4096)
+
+        out = packed[0]
+        assert out["input_ids"].tolist()[: len(direct["input_ids"])] == direct["input_ids"].tolist()
+        assert out["labels"].tolist()[: len(direct["labels"])] == direct["labels"].tolist()
+
+    def test_raw_vlm_samples_keep_their_single_shift(self):
+        import torch
+
+        from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _shift_sample
+
+        raw = {
+            "input_ids": torch.tensor([10, 11, 12, 13, 14]),
+            "attention_mask": torch.ones(5, dtype=torch.long),
+            "labels": torch.tensor([-100, 12, 13, 14, 14]),
+        }
+        shifted = _shift_sample(raw)
+        assert shifted["input_ids"].tolist() == [10, 11, 12, 13]
+        assert shifted["labels"].tolist() == [12, 13, 14, 14]

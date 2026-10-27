@@ -36,6 +36,9 @@ from transformers import ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
 from nemo_automodel.components.datasets.vlm.utils import (
+    ALREADY_SHIFTED_KEY as _ALREADY_SHIFTED_KEY,
+)
+from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
     _lmdb_env_cache,
     _preload_media,
@@ -1599,6 +1602,15 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 # exact assistant-only labels.
                 if all(key in example for key in ("input_ids", "attention_mask", "labels")):
                     output = dict(example)
+                    # ChatDataset (unshifted=False, its default) already applies the
+                    # next-token shift in _package_tokenized_example: it emits
+                    # input_ids[:-1] with labels[1:]. Mark the passthrough so the
+                    # downstream padded/packed consumers (pad_collate_fn and
+                    # PackedDatasetWrapper._shift_sample) skip their own shift;
+                    # shifting again would supervise token t+2. Raw VLM samples
+                    # (conversation + processor path below) do not carry this flag
+                    # and keep their existing single shift in those consumers.
+                    output[_ALREADY_SHIFTED_KEY] = True
                     for key in ("input_ids", "attention_mask", "labels"):
                         value = torch.as_tensor(output[key], dtype=torch.long)
                         if value.ndim == 2 and value.shape[0] == 1:
@@ -1608,10 +1620,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         output[key] = value
 
                     seq_len = output["input_ids"].shape[0]
-                    if not (
-                        output["attention_mask"].shape[0] == seq_len
-                        and output["labels"].shape[0] == seq_len
-                    ):
+                    if not (output["attention_mask"].shape[0] == seq_len and output["labels"].shape[0] == seq_len):
                         raise ValueError("Pre-tokenized input_ids, attention_mask, and labels must have equal lengths")
 
                     if self.max_length is not None and seq_len > self.max_length:

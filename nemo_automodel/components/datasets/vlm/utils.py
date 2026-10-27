@@ -21,6 +21,12 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+ALREADY_SHIFTED_KEY = "_already_shifted"
+"""Sample-dict marker set on pre-tokenized samples that already carry the
+next-token shift (e.g. ``ChatDataset`` output passed through
+``PreTokenizedDatasetWrapper``). Padded/packed consumers check this flag and
+skip their own shift so exactly one shift is applied per document."""
+
 try:
     import lmdb
 
