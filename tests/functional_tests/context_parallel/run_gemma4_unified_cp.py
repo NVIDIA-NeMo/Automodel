@@ -268,6 +268,9 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     dtype = torch.float32
+    # The tolerances assume true fp32; TF32, on by default in some containers, moves CP grads ~2e-2 off the reference.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
     from torch.distributed.device_mesh import init_device_mesh
 
