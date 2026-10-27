@@ -983,8 +983,10 @@ class DeepseekV4Model(nn.Module):
             attn_kwargs["packed_seq_ids"] = packed_seq_ids
 
         # An unpacked, unpadded sequence with canonical positions always sees
-        # its diagonal key. Validate once per model/stage, then avoid a dense
-        # mask and cuDNN's per-layer empty-query scan and gradient gathers.
+        # its diagonal key, so it can skip the dense mask and cuDNN's per-layer
+        # empty-query scan and gradient gathers. Only implicit positions
+        # (``position_ids=None``) qualify: proving that explicit positions equal
+        # ``arange`` would need a device-to-host sync on every microbatch.
         unpadded_sparse = (
             self.backend.attn in ("tilelang", "cudnn")
             and attention_mask is None
@@ -994,15 +996,7 @@ class DeepseekV4Model(nn.Module):
             and not cp_active
             and vision_token_types is None
             and shape_ref.shape[1] > 0
-            and (
-                positions_are_canonical
-                or torch.equal(
-                    position_ids,
-                    torch.arange(shape_ref.shape[1], device=position_ids.device)
-                    .unsqueeze(0)
-                    .expand(shape_ref.shape[0], -1),
-                )
-            )
+            and positions_are_canonical
         )
         attn_kwargs["_dsv4_all_queries_nonempty"] = unpadded_sparse
         # Grouped compressor units must all participate in backward. Keep the
@@ -1011,8 +1005,8 @@ class DeepseekV4Model(nn.Module):
         if self.config.group_compressor_fsdp_units:
             if not unpadded_sparse or shape_ref.shape[1] < max(self.config.compress_ratios, default=0):
                 raise ValueError(
-                    "group_compressor_fsdp_units requires canonical unpadded sparse-attention "
-                    "inputs with a complete local window for every compressor"
+                    "group_compressor_fsdp_units requires unpadded sparse-attention inputs with "
+                    "implicit positions (position_ids=None) and a complete local window for every compressor"
                 )
         # This model-level guard applies on every rank and proves all compressor
         # windows participate. HCA need not synchronize the same True decision

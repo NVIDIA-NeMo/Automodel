@@ -18,24 +18,16 @@
 # FakeBalancedGate (noise 0); MTP and indexer auxiliary training disabled.
 # Original chunked CE and PP output collection are used.
 # Selected backend settings validated with the original repository benchmark.
-# 20 iterations, 6 warmup; external Nsight capture at iteration 2.
+# 20 iterations, 6 warmup.
 # MFU denominator: 989 BF16 dense TFLOP/s per GPU; exclude AC recomputation.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
 benchmark:
   json_output_path: training_logs/deepseek_v4_flash_h100_optimized.json
-  nsys_end: 2
-  nsys_ranks:
-  - 0
-  - 8
-  - 16
-  - 24
-  - 32
-  - 40
-  - 48
-  - 56
-  nsys_start: 2
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
   num_nodes: 8
   peak_tflops: 989
   warmup_steps: 6
@@ -47,6 +39,7 @@ dataloader:
   num_workers: 0
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  include_position_ids: false
   num_samples: 100000
   seq_len: 4096
   vocab_size: 129280

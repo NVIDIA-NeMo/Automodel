@@ -926,7 +926,7 @@ def test_pipeline_hidden_output_preserves_logits_and_gradients() -> None:
 
 @pytest.mark.parametrize("case", ["canonical", "implicit", "shifted", "reset", "padding", "packed"])
 def test_unpadded_sparse_mask_fastpath_requires_canonical_unmasked_inputs(case):
-    """Only a proven self-visible SWA diagonal can bypass empty-query filtering."""
+    """Only implicit positions bypass empty-query filtering; explicit ones are never host-checked."""
     config = _tiny_config(num_hidden_layers=0, num_hash_layers=0, compress_ratios=[])
     model = _make_model(config)
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
@@ -965,12 +965,12 @@ def test_unpadded_sparse_mask_fastpath_requires_canonical_unmasked_inputs(case):
         kwargs["packed_seq_ids"] = torch.tensor([[1] * 8 + [2] * 8])
     model.model(input_ids=torch.ones(1, 16, dtype=torch.long), position_ids=positions, **kwargs)
     mask, nonempty = observed[0]
-    expected = case in ("canonical", "implicit")
+    expected = case == "implicit"
     assert nonempty is expected
     assert (mask is None) is expected
 
 
-@pytest.mark.parametrize("case", ["canonical", "short", "shifted", "padding", "packed"])
+@pytest.mark.parametrize("case", ["canonical", "explicit", "short", "shifted", "padding", "packed"])
 def test_grouped_compressor_guard_rejects_inputs_with_optional_parameter_participation(case):
     """Fail before grouped compressor execution when grad=None could become a zero gradient."""
     config = _tiny_config(num_hidden_layers=0, num_hash_layers=0, compress_ratios=[])
@@ -1006,7 +1006,7 @@ def test_grouped_compressor_guard_rejects_inputs_with_optional_parameter_partici
     elif case == "packed":
         kwargs["packed_seq_ids"] = torch.zeros(1, length, dtype=torch.long)
     if case == "canonical":
-        model.model(input_ids=torch.ones(1, length, dtype=torch.long), position_ids=positions, **kwargs)
+        model.model(input_ids=torch.ones(1, length, dtype=torch.long), position_ids=None, **kwargs)
         assert called == [True]
     else:
         with pytest.raises(ValueError, match="complete local window"):
