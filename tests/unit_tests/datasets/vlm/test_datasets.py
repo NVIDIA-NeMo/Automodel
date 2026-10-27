@@ -2292,6 +2292,8 @@ def test_make_spider_dataset_joins_schema_and_collapses_query_whitespace(monkeyp
     )
     assert "How many perpetrators?" in user_turn["content"][0]["text"]
     assert assistant_turn["content"][0]["text"] == "SELECT count(*) FROM perpetrator"
+
+
 class TestPreTokenizedDatasetWrapperPretokenizedInput:
     def test_passes_through_pretokenized_chat_sample(self):
         sample = {
@@ -2380,7 +2382,7 @@ class TestChatDatasetSingleShiftContract:
     def test_chat_dataset_emits_already_shifted_pairs(self):
         """A real-format ChatDataset sample arrives shifted: last input and first
         label removed, prompt positions masked with -100."""
-        from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset, vlm_chat_collater
+        from nemo_automodel.components.datasets.llm.chat_dataset import vlm_chat_collater
 
         class _FixedVocabProcessor:
             """Minimal real-shaped processor producing 5-token sequences with an

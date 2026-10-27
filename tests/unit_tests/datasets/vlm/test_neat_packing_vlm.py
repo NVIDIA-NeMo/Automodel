@@ -42,8 +42,8 @@ def test_estimate_sample_length_uses_exact_pretokenized_length():
         "input_ids": torch.arange(17),
         "messages": [{"role": "user", "content": "character heuristic must not be used"}],
     }
-    assert _estimate_sample_length(sample) == 17
-    assert _estimate_sample_length(sample, return_media_tokens=True) == (17, 0)
+    estimate = _estimate_sample_length(sample)
+    assert (estimate.total_tokens, estimate.media_tokens) == (17, 0)
 
 
 class _FakeDataset:
@@ -209,6 +209,7 @@ class TestBuildPackedVlmSample:
         assert result["seq_lens"] == [3, 2]
         assert result["seq_lens_padded"] == [4, 4]
         assert result["position_ids"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+
     def test_thd_collater_preserves_document_boundaries(self):
         packed = _build_packed_vlm_sample(
             [

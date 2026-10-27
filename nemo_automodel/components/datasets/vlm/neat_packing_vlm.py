@@ -305,9 +305,7 @@ def _estimate_sample_length(
     if tokenized is not None:
         tokenized = torch.as_tensor(tokenized)
         text_tokens = int(tokenized.shape[-1])
-        if return_media_tokens:
-            return text_tokens, 0
-        return text_tokens
+        return _SampleLengthEstimate(text_tokens, 0, 0)
 
     # Text tokens
     precomputed = example.get("_text_tokens")
@@ -982,7 +980,6 @@ def neat_pack_dataset_vlm(
         t0 = time.perf_counter()
 
         for i in range(N):
-<<<<<<< HEAD
             example = ds_raw[i]
             if token_counter is not None:
                 total_tokens, media_tokens = token_counter(example["conversation"])
@@ -1001,21 +998,6 @@ def neat_pack_dataset_vlm(
             else:
                 est_len = estimate.total_tokens
             est_len = _aligned_length(est_len, sequence_alignment)
-=======
-            est_len, media_toks = _estimate_sample_length(
-                ds_raw[i],
-                image_cfg=image_cfg,
-                video_cfg=video_cfg,
-                return_media_tokens=True,
-            )
-            # -1 accounts for the autoregressive shift's dropped token. Samples
-            # flagged with ALREADY_SHIFTED_KEY (ChatDataset passthrough) report
-            # their post-shift length here, so the -1 does not apply — planning
-            # and materialization must consume the same length.
-            if not ds_raw[i].get(ALREADY_SHIFTED_KEY, False):
-                est_len = max(est_len - 1, 0)
-            est_len = _aligned_length(est_len, sequence_alignment)
->>>>>>> c20b538d4 (fix(datasets): preserve single shift through padded/packed consumers)
             if est_len > pack_size:
                 if drop_long_samples:
                     dropped_count += 1
