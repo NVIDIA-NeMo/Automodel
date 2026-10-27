@@ -78,7 +78,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
     _get_lm_head_module,
@@ -977,9 +977,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 "use one-dimensional position_ids or cp_size=1."
             )
         _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
-        pp_n_microbatches = (
-            self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
-        )
+        pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
         cp_sharder = ContextParallelSharder(
             self.model_parts[0],
             self.device_mesh,
@@ -1049,6 +1047,30 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 model_seq_len = model_input.shape[1]
                 self.pp.update_seq_len(model_seq_len, packed_sequence=_use_te_vlm)
                 self._maybe_set_pp_first_stage_embed_input_meta(model_input)
+
+                # Bind this microbatch's physical document boundaries to the
+                # PP MTP loss before the step: without them, the loss treats
+                # the packed sequence as one document and shifts labels across
+                # real document ends. Per-microbatch binding (mirrors
+                # train_ft.py): one shared cu_seqlens only encodes a single
+                # layout, so microbatches with different layouts rely on the
+                # model-provided per-microbatch seq_idx tail instead.
+                pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
+                if isinstance(pp_loss_fn, PipelineCausalLMLoss):
+                    if mtp_seq_idx is not None:
+                        # Batch-major NEAT document IDs travel with the model
+                        # output tail per microbatch; shared cu_seqlens stays
+                        # unset so the tail wins.
+                        pp_loss_fn.cu_seqlens = None
+                        pp_loss_fn.is_packed = True
+                    else:
+                        cu_seqlens_mb = batch.get("cu_seqlens_padded")
+                        if isinstance(cu_seqlens_mb, torch.Tensor) and cu_seqlens_mb.dim() == 2:
+                            cu_seqlens_mb = cu_seqlens_mb.squeeze(0)  # [1, T] -> [T]
+                        if isinstance(cu_seqlens_mb, torch.Tensor) and cu_seqlens_mb.dim() == 1:
+                            cu_seqlens_mb = cu_seqlens_mb[cu_seqlens_mb != -1000]
+                        pp_loss_fn.cu_seqlens = cu_seqlens_mb
+                        pp_loss_fn.is_packed = mtp_is_packed
 
                 with stage_vlm_media_for_pp(self.pp, self.model_parts, batch):
                     self.pp.step(model_input, target=targets, losses=losses, **batch)
