@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import logging
 import pathlib
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
@@ -130,6 +132,15 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_flops_scope = getattr(bench_cfg, "flops_scope", "model")
         if self._bench_flops_scope not in ("model", "text"):
             raise ValueError(f"benchmark.flops_scope must be 'model' or 'text', got {self._bench_flops_scope!r}")
+        self._bench_capture_forward_backward = bool(cfg.get("benchmark.capture_forward_backward", False))
+        self._bench_graph_use_current_stream = bool(cfg.get("benchmark.graph_use_current_stream", False))
+        self._bench_validate_training_graph = bool(cfg.get("benchmark.validate_training_graph", False))
+        self._training_graph: torch.cuda.CUDAGraph | None = None
+        self._training_graph_batch: dict[str, torch.Tensor] = {}
+        self._training_graph_losses: list[torch.Tensor] = []
+        self._training_graph_grads: dict[str, torch.Tensor] = {}
+        self._training_graph_parameter_ptrs: dict[str, int] = {}
+        self._training_graph_events: list[tuple[int, torch.cuda.Event, torch.cuda.Event]] = []
         self._wandb_enabled = cfg.get("wandb", None) is not None
         self._trackio_enabled = cfg.get("trackio", None) is not None
 
@@ -155,7 +166,257 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 logger.info(f"Using batch_size={local_batch_size} from step_scheduler.local_batch_size")
 
         super().__init__(cfg)
+        self._qwen_stage_events: list[tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]] = []
         self.timers = Timers(log_level=2, log_option="minmax")
+
+    @staticmethod
+    def _graph_local(tensor: torch.Tensor) -> torch.Tensor:
+        """Return a parameter or gradient's local storage without a collective.
+
+        Args:
+            tensor: Tensor with arbitrary parameter shape, or DTensor whose mesh
+                and placements already describe the native training shard.
+
+        Returns:
+            Tensor of the local shard shape, aliasing the input storage.
+        """
+        return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+    def _capture_training_graph(self, batch: dict[str, torch.Tensor]) -> None:
+        """Capture native forward/loss/backward, leaving optimizer updates eager.
+
+        Args:
+            batch: Native fixed-shape tensor batch. These experiments use int64
+                input_ids, labels, and position_ids of shape [batch, sequence].
+                Each entry is copied into persistent CUDA storage owned here.
+        """
+        if self.partial_cuda_graph_manager is not None or self.pp_enabled:
+            raise ValueError("Whole forward/backward capture requires no partial graphs or pipeline parallelism")
+        if not all(isinstance(value, torch.Tensor) for value in batch.values()):
+            raise ValueError("This fixed-shape benchmark graph requires a flat tensor batch")
+        self._training_graph_batch = {key: value.to(self.dist_env.device).clone() for key, value in batch.items()}
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        capture_stream = torch.cuda.current_stream() if self._bench_graph_use_current_stream else torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        events = self._qwen_stage_events
+        self._qwen_stage_events = None
+        # FSDP retains AccumulateGrad nodes created during eager warmup.
+        torch.autograd.graph.set_override_stale_capture_stream(True)
+        try:
+            with torch.cuda.stream(capture_stream):
+                for _ in range(2):
+                    for opt in self.optimizer:
+                        opt.zero_grad(set_to_none=True)
+                    prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
+                    prepare_for_final_backward(self.model_parts, pp_enabled=False)
+                    warmup_losses = []
+                    self._forward_backward_step(
+                        0,
+                        self._training_graph_batch,
+                        loss_buffer=warmup_losses,
+                        num_label_tokens=None,
+                        num_batches=1,
+                        is_train=True,
+                    )
+                for opt in self.optimizer:
+                    opt.zero_grad(set_to_none=True)
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            graph = torch.cuda.CUDAGraph()
+            # Own partial captures too, so exceptions release NCCL graph references.
+            self._training_graph = graph
+            self._training_graph_losses = []
+            with torch.cuda.graph(graph, stream=capture_stream):
+                prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
+                prepare_for_final_backward(self.model_parts, pp_enabled=False)
+                self._forward_backward_step(
+                    0,
+                    self._training_graph_batch,
+                    loss_buffer=self._training_graph_losses,
+                    num_label_tokens=None,
+                    num_batches=1,
+                    is_train=True,
+                )
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            torch.cuda.synchronize()
+            self._training_graph = graph
+            self._training_graph_grads = {
+                name: parameter.grad
+                for name, parameter in self.model_parts[0].named_parameters()
+                if parameter.grad is not None
+            }
+            self._training_graph_parameter_ptrs = {
+                name: self._graph_local(parameter).data_ptr()
+                for name, parameter in self.model_parts[0].named_parameters()
+            }
+            logger.info(
+                "Native forward/loss/backward CUDA graph captured: gradients=%d allocated=%.3f GiB reserved=%.3f GiB",
+                len(self._training_graph_grads),
+                torch.cuda.memory_allocated() / 1024**3,
+                torch.cuda.memory_reserved() / 1024**3,
+            )
+        finally:
+            self._qwen_stage_events = events
+
+    def _replay_training_graph(self, batch: dict[str, torch.Tensor], loss_buffer: list[torch.Tensor]) -> None:
+        """Copy the next batch and overwrite the optimizer's bound gradients.
+
+        Args:
+            batch: Tensor batch with the same keys, shapes, and dtypes passed to
+                _capture_training_graph; token fields have shape [batch, sequence].
+            loss_buffer: List extended in place with captured scalar loss tensors
+                that alias graph-owned storage and must be consumed before replay.
+        """
+        if self._training_graph is None:
+            raise RuntimeError("Training graph has not been captured")
+        if batch.keys() != self._training_graph_batch.keys():
+            raise ValueError("Training graph batch keys changed")
+        for key, value in batch.items():
+            target = self._training_graph_batch[key]
+            if value.shape != target.shape or value.dtype != target.dtype:
+                raise ValueError(f"Training graph input metadata changed: {key}")
+            target.copy_(value)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        self._training_graph.replay()
+        end.record()
+        self._training_graph_events.append((self.step_scheduler.step, start, end))
+        loss_buffer.extend(self._training_graph_losses)
+
+    def _validate_training_graph(self, batch: dict[str, torch.Tensor]) -> None:
+        """Compare native parameter gradients with eager on current weights.
+
+        Args:
+            batch: Current fixed-shape native batch, using the tensor contracts in
+                _capture_training_graph. Graph replay must already have consumed
+                these inputs before this validation begins.
+        """
+        # Keep reference copies on the host so validation does not require two
+        # additional full gradient sets in device memory on larger models.
+        graph_grads = {
+            name: self._graph_local(gradient).detach().to("cpu", copy=True)
+            for name, gradient in self._training_graph_grads.items()
+        }
+        graph_loss = torch.stack(self._training_graph_losses).float().clone()
+        release_graph = bool(self.cfg.get("benchmark.release_graph_for_validation", False))
+        if release_graph:
+            for opt in self.optimizer:
+                opt.zero_grad(set_to_none=True)
+            self._training_graph_grads.clear()
+            self._training_graph_losses.clear()
+            self._training_graph.reset()
+            self._training_graph = None
+        events = self._qwen_stage_events
+        self._qwen_stage_events = None
+        try:
+            for opt in self.optimizer:
+                opt.zero_grad(set_to_none=True)
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
+            prepare_for_final_backward(self.model_parts, pp_enabled=False)
+            eager_losses = []
+            self._forward_backward_step(
+                0,
+                batch,
+                loss_buffer=eager_losses,
+                num_label_tokens=None,
+                num_batches=1,
+                is_train=True,
+            )
+            metrics = {}
+            for name, parameter in self.model_parts[0].named_parameters():
+                if name not in graph_grads:
+                    if parameter.grad is not None:
+                        raise AssertionError(f"Graph omitted the gradient for {name}")
+                    continue
+                if parameter.grad is None:
+                    raise AssertionError(f"Eager omitted the gradient for {name}")
+                actual = graph_grads[name].to(self.dist_env.device).float()
+                expected = self._graph_local(parameter.grad).detach().float()
+                if actual.shape != expected.shape:
+                    raise AssertionError(f"Gradient shard shape differs for {name}")
+                difference = actual - expected
+                relative_rmse = 0.0
+                if difference.numel():
+                    relative_rmse = (
+                        difference.square().mean().sqrt() / expected.square().mean().sqrt().clamp_min(1e-20)
+                    ).item()
+                metrics[name] = {
+                    "relative_rmse": relative_rmse,
+                    "max_abs": difference.abs().max().item() if difference.numel() else 0.0,
+                    "finite": bool(torch.isfinite(actual).all() and torch.isfinite(expected).all()),
+                }
+                if self._graph_local(parameter).data_ptr() != self._training_graph_parameter_ptrs[name]:
+                    raise AssertionError(f"Parameter storage changed after capture: {name}")
+            eager_first = {
+                name: self._graph_local(parameter.grad).detach().to("cpu", copy=True)
+                for name, parameter in self.model_parts[0].named_parameters()
+                if parameter.grad is not None
+            }
+            for opt in self.optimizer:
+                opt.zero_grad(set_to_none=True)
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=False)
+            prepare_for_final_backward(self.model_parts, pp_enabled=False)
+            repeat_losses = []
+            self._forward_backward_step(
+                0,
+                batch,
+                loss_buffer=repeat_losses,
+                num_label_tokens=None,
+                num_batches=1,
+                is_train=True,
+            )
+            eager_repeat = {}
+            for name, parameter in self.model_parts[0].named_parameters():
+                if name in eager_first:
+                    expected = eager_first[name].to(self.dist_env.device).float()
+                    actual = self._graph_local(parameter.grad).detach().float()
+                    if actual.shape != expected.shape:
+                        raise AssertionError(f"Repeated eager gradient shard shape differs for {name}")
+                    difference = actual - expected
+                    repeat_rmse = 0.0
+                    if difference.numel():
+                        repeat_rmse = (
+                            difference.square().mean().sqrt() / expected.square().mean().sqrt().clamp_min(1e-20)
+                        ).item()
+                    eager_repeat[name] = {
+                        "relative_rmse": repeat_rmse,
+                        "max_abs": difference.abs().max().item() if difference.numel() else 0.0,
+                    }
+            loss_difference = (graph_loss - torch.stack(eager_losses).float()).abs().max().item()
+            result = {
+                "parameters": metrics,
+                "eager_repeat": eager_repeat,
+                "max_abs_loss_difference": loss_difference,
+                "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+                "same_capture_stream": self._bench_graph_use_current_stream,
+                "graph_released_before_reference": release_graph,
+                "inputs": {
+                    key: {
+                        "shape": list(value.shape),
+                        "dtype": str(value.dtype),
+                        "sha256": hashlib.sha256(value.detach().cpu().contiguous().numpy().tobytes()).hexdigest(),
+                    }
+                    for key, value in batch.items()
+                },
+                "parameter_dtypes": {
+                    name: str(parameter.dtype) for name, parameter in self.model_parts[0].named_parameters()
+                },
+            }
+            rank = torch.distributed.get_rank()
+            pathlib.Path(f"training_graph_validation_rank{rank}.json").write_text(json.dumps(result, indent=2))
+            if not all(value["finite"] and value["relative_rmse"] < 1e-4 for value in metrics.values()):
+                raise AssertionError("Whole training graph differs from native eager gradients; see validation JSON")
+            if loss_difference != 0:
+                raise AssertionError(f"Training graph loss differs from native eager: {loss_difference}")
+            logger.info("Native training graph parity passed for all %d parameter gradients", len(metrics))
+        finally:
+            if not release_graph:
+                for name, parameter in self.model_parts[0].named_parameters():
+                    parameter.grad = self._training_graph_grads.get(name)
+            self._qwen_stage_events = events
 
     def setup(self):
         """Setup the benchmarking environment.
@@ -375,9 +636,10 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if rank == 0:
                 logger.info(f"Rank {rank} | Iteration {i}")
 
-            # Zero gradients
-            for opt in self.optimizer:
-                opt.zero_grad()
+            # Graph replay overwrites the captured fresh-gradient outputs.
+            if self._training_graph is None:
+                for opt in self.optimizer:
+                    opt.zero_grad()
 
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
@@ -399,19 +661,27 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     num_label_tokens += (batch["labels"] != -100).sum().item()
 
                     with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
-                        self._forward_backward_step(
-                            ga_step_idx,
-                            batch,
-                            loss_buffer=loss_buffer,
-                            num_label_tokens=None,
-                            num_batches=ga_steps,
-                            is_train=True,
-                        )
+                        if self._training_graph is not None:
+                            if ga_steps != 1:
+                                raise ValueError("Training graph currently requires one microbatch per optimizer step")
+                            self._replay_training_graph(batch, loss_buffer)
+                        else:
+                            self._forward_backward_step(
+                                ga_step_idx,
+                                batch,
+                                loss_buffer=loss_buffer,
+                                num_label_tokens=None,
+                                num_batches=ga_steps,
+                                is_train=True,
+                            )
 
                     torch.cuda.nvtx.range_pop()
 
                     if ga_step_idx == 0:
                         prepare_after_first_microbatch()
+
+                if self._bench_validate_training_graph and self._training_graph is not None and i == 6:
+                    self._validate_training_graph(batch)
 
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
@@ -419,6 +689,11 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
+
+            if self._bench_capture_forward_backward and i == 4:
+                if ga_steps != 1:
+                    raise ValueError("Training graph requires gradient accumulation steps=1")
+                self._capture_training_graph(batch)
 
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
@@ -479,6 +754,32 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         if self.partial_cuda_graph_manager is not None:
             self.partial_cuda_graph_manager.log_stats("benchmark")
 
+        torch.cuda.synchronize()
+        memory_stats = torch.cuda.memory_stats()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        memory_result = {
+            "peak_allocated_bytes": memory_stats["allocated_bytes.all.peak"],
+            "peak_reserved_bytes": memory_stats["reserved_bytes.all.peak"],
+            "current_allocated_bytes": memory_stats["allocated_bytes.all.current"],
+            "current_reserved_bytes": memory_stats["reserved_bytes.all.current"],
+            "num_alloc_retries": memory_stats["num_alloc_retries"],
+            "num_ooms": memory_stats["num_ooms"],
+            "end_device_free_bytes": free_bytes,
+            "device_total_bytes": total_bytes,
+        }
+        pathlib.Path(f"memory_summary_rank{rank}.json").write_text(json.dumps(memory_result, indent=2))
+        stage_rows = [
+            {"step": step, "forward_and_loss_ms": start.elapsed_time(bwd), "backward_ms": bwd.elapsed_time(end)}
+            for step, (start, bwd, end) in enumerate(self._qwen_stage_events)
+        ]
+        pathlib.Path(f"stage_timings_rank{rank}.json").write_text(json.dumps(stage_rows, indent=2))
+        if self._training_graph_events:
+            graph_rows = [
+                {"step": step, "forward_backward_ms": start.elapsed_time(end)}
+                for step, start, end in self._training_graph_events
+            ]
+            pathlib.Path(f"training_graph_timings_rank{rank}.json").write_text(json.dumps(graph_rows, indent=2))
+            logger.info("Native training graph replays: %d", len(graph_rows))
         # Final summary
         self._log_benchmark_summary(steps, warmup_steps, peak_tflops, rank)
 
@@ -678,8 +979,23 @@ def main(config_path=None):
     recipe = BenchmarkingRecipeForNextTokenPrediction(cfg)
     try:
         recipe.setup()
-        recipe.run_benchmark()
+        if cfg.get("benchmark.deterministic_algorithms", False):
+            torch.use_deterministic_algorithms(True)
+        if recipe._bench_graph_use_current_stream:
+            training_stream = torch.cuda.Stream()
+            training_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(training_stream):
+                recipe.run_benchmark()
+            torch.cuda.current_stream().wait_stream(training_stream)
+        else:
+            recipe.run_benchmark()
     finally:
+        if recipe._training_graph is not None:
+            try:
+                torch.cuda.synchronize()
+            finally:
+                recipe._training_graph.reset()
+                recipe._training_graph = None
         if recipe.partial_cuda_graph_manager is not None:
             recipe.partial_cuda_graph_manager.close()
             recipe.partial_cuda_graph_manager = None

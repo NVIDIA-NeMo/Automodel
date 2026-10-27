@@ -930,9 +930,9 @@ class MoE(nn.Module):
                 x_latent,
                 weights,
                 indices,
-                self.shared_experts.gate_proj.weight,
-                self.shared_experts.up_proj.weight,
-                self.shared_experts.down_proj.weight,
+                self.shared_experts.gate_proj.weight if self.shared_experts is not None else None,
+                self.shared_experts.up_proj.weight if self.shared_experts is not None else None,
+                self.shared_experts.down_proj.weight if self.shared_experts is not None else None,
             )
             z = None
         else:
