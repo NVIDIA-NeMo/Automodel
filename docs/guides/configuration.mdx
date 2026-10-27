@@ -89,6 +89,60 @@ Only load configuration files and `_target_` values from trusted sources. A YAML
 
 </Warning>
 
+## Select Attention Backends
+
+Attention selection follows the implementation that owns each attention path:
+
+| Setting | Scope |
+| --- | --- |
+| `model.backend.attn` | Native AutoModel attention that consumes `BackendConfig`, for example `sdpa`, `te`, or `fa4`. Supported choices depend on the model. |
+| `model.attn_implementation` | Hugging Face attention dispatch. In a VLM with a native text decoder and retained HF vision tower, this can select vision attention independently of native text attention. |
+| `model.force_hf: true` | Selects HF model construction instead of a registered native model. AutoModel still provides training, distributed infrastructure, and applicable runtime patches. |
+
+An explicit native backend remains authoritative for paths it owns. Setting
+`attn_implementation: flash_attention_4` alongside `backend.attn: sdpa` does
+not change native text attention to FlashAttention-4. On native models that
+declare FA4 support, `attn_implementation: flash_attention_4` also supplies
+`backend.attn: fa4` when the entire `backend` setting is absent or `null`.
+If a backend is supplied, select its attention explicitly.
+
+For example, the native Qwen3.5-VL path can combine native FA4 full attention
+with HF FA4 vision attention:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.5-4B
+  attn_implementation: flash_attention_4
+  backend:
+    _target_: nemo_automodel.components.models.common.utils.BackendConfig
+    attn: fa4
+```
+
+Changing `backend.attn` to `te` selects native Transformer Engine full
+attention while retaining HF FA4 vision dispatch. These different selections
+are intentional. Install the selected optional kernels in the training image;
+setting a flag does not install them. Model-specific recurrent, sparse, and
+auxiliary attention paths can have their own implementation constraints. For
+example, Qwen3.5 Gated DeltaNet blocks are separate from full attention, and
+its MTP attention uses a model-owned SDPA path.
+
+To compare against HF model construction, set `model.force_hf: true` and
+remove the native `model.backend` section; use `model.attn_implementation` to
+select the HF attention implementation. This retains the AutoModel training
+recipe and is not a switch to an Accelerate training loop.
+
+Startup logs report `Model construction attention: primary text/BSHD=...`
+from the built model's packing-relevant attention selection. For VLMs with a
+`vision_config`, they also report its HF dispatch key, qualified by whether
+HF vision attention is retained. A warning highlights explicit native SDPA
+or eager selection paired with an HF FlashAttention request. Native TE with
+HF FlashAttention remains a valid mixed selection and does not trigger this
+warning. These messages describe construction-time selection, not every
+executed kernel: later runtime patches, model-owned paths, and the attention
+library's own kernel dispatch can affect execution. Use Nsight Systems to
+verify the kernels in a performance investigation.
+
 ## Distributed Section (Strategy-Based)
 
 The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema. Use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`. You can also configure parallelism sizes, such as `dp_size`, `tp_size`, and `pp_size`, and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. For examples, see the [Pipeline Parallelism with AutoPipeline](/development/pipeline-parallelism) guide and the recipe configs.

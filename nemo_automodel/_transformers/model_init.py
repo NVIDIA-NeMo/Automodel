@@ -69,6 +69,10 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     is_gated_delta_net_fp32_param_key,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packing import (
+    AttentionBackendSelection,
+    get_model_attn_implementation,
+)
 from nemo_automodel.components.models.common.utils import (
     HUB_LOADING_KWARGS,
     BackendConfig,
@@ -1562,6 +1566,36 @@ def _apply_backend_module_overrides(model: torch.nn.Module, backend: BackendConf
                 pending.append(child)
 
 
+def _log_attention_selection(model: torch.nn.Module, *, requested_hf_attention: str, explicit_backend: bool) -> None:
+    """Report construction-time attention selection without claiming kernel coverage."""
+    attention = get_model_attn_implementation(model)
+    logger.info("Model construction attention: primary text/BSHD=%s", attention)
+    config = getattr(model, "config", None)
+    vision_config = getattr(config, "vision_config", None)
+    if vision_config is not None:
+        logger.info(
+            "Model construction attention: HF vision-config dispatch=%s (where HF vision attention is retained)",
+            getattr(vision_config, "_attn_implementation", None),
+        )
+    backend = getattr(model, "backend", None)
+    if (
+        explicit_backend
+        and isinstance(backend, AttentionBackendSelection)
+        and not getattr(model, "_uses_hf_attention", False)
+        and backend.attn == attention
+        and attention in ("sdpa", "eager")
+        and requested_hf_attention in ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+    ):
+        logger.warning(
+            "backend.attn=%r controls this model's primary text/BSHD attention; "
+            "attn_implementation=%r does not override it and applies only to HF-dispatched attention. "
+            "To use native FlashAttention-4 on a supported model, set backend.attn='fa4'. "
+            "Mixed native/HF attention selections can be intentional.",
+            attention,
+            requested_hf_attention,
+        )
+
+
 def _init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -1602,6 +1636,11 @@ def _init_model(
 
     if hasattr(model, "_nemo_tied_weights_keys"):
         _tie_weights_nemo(model)
+    _log_attention_selection(
+        model,
+        requested_hf_attention=attn_implementation,
+        explicit_backend=kwargs.get("backend") is not None,
+    )
     return is_custom_model, model
 
 

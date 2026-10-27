@@ -14,6 +14,7 @@
 
 """Tests for nested config override handling in get_hf_config and _consume_config_overrides."""
 
+import logging
 import os
 import types
 from unittest.mock import MagicMock, patch
@@ -31,6 +32,7 @@ from nemo_automodel._transformers.model_init import (
     _has_safetensors,
     _init_model,
     _load_config_with_layer_types_fix,
+    _log_attention_selection,
     _prepopulate_remote_code_cache,
     _propagate_torch_dtype_to_subconfigs,
     _resolve_model_dir,
@@ -42,6 +44,71 @@ from nemo_automodel._transformers.model_init import (
 )
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.utils import BackendConfig, generation_config_from_model_config
+
+
+class TestAttentionSelectionLogging:
+    def _model(self, *, native=None, hf="flash_attention_4", vision=None, uses_hf=False):
+        model = nn.Module()
+        model.config = PretrainedConfig(attn_implementation=hf)
+        if native is not None:
+            # Do not let CUDA-dependent RoPE setup warnings pollute attention-log assertions.
+            model.backend = BackendConfig(attn=native, rope_fusion=False)
+        if vision is not None:
+            model.config.vision_config = PretrainedConfig(attn_implementation=vision)
+        if uses_hf:
+            model._uses_hf_attention = True
+        return model
+
+    def test_native_sdpa_and_hf_fa4_are_visible_without_changing_selection(self, caplog):
+        model = self._model(native="sdpa", vision="flash_attention_4")
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention="flash_attention_4", explicit_backend=True)
+
+        assert "primary text/BSHD=sdpa" in caplog.text
+        assert "HF vision-config dispatch=flash_attention_4" in caplog.text
+        warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "backend.attn='sdpa'" in warnings[0]
+        assert "does not override it" in warnings[0]
+        assert "backend.attn='fa4'" in warnings[0]
+        assert model.backend.attn == "sdpa"
+        assert model.config._attn_implementation == "flash_attention_4"
+
+    @pytest.mark.parametrize("native", ["te", "fa4"])
+    def test_accelerated_native_with_hf_vision_is_not_warned(self, caplog, native):
+        model = self._model(native=native, vision="flash_attention_4")
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention="flash_attention_4", explicit_backend=True)
+
+        assert f"primary text/BSHD={native}" in caplog.text
+        assert "HF vision-config dispatch=flash_attention_4" in caplog.text
+        assert all(record.levelno < logging.WARNING for record in caplog.records)
+
+    @pytest.mark.parametrize("hf", ["sdpa", "flash_attention_4"])
+    def test_model_owned_hf_attention_wins_even_with_native_backend(self, caplog, hf):
+        model = self._model(native="sdpa", hf=hf, uses_hf=True)
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention="flash_attention_4", explicit_backend=True)
+
+        assert f"primary text/BSHD={hf}" in caplog.text
+        assert all(record.levelno < logging.WARNING for record in caplog.records)
+
+    def test_hf_model_logs_live_fallback_without_native_override_warning(self, caplog):
+        model = self._model(hf="sdpa")
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention="flash_attention_4", explicit_backend=True)
+
+        assert "primary text/BSHD=sdpa" in caplog.text
+        assert "HF vision-config" not in caplog.text
+        assert all(record.levelno < logging.WARNING for record in caplog.records)
+
+    @pytest.mark.parametrize("explicit_backend, requested", [(False, "flash_attention_4"), (True, "sdpa")])
+    def test_warning_requires_explicit_native_backend_and_flash_request(self, caplog, explicit_backend, requested):
+        model = self._model(native="sdpa")
+        with caplog.at_level(logging.INFO):
+            _log_attention_selection(model, requested_hf_attention=requested, explicit_backend=explicit_backend)
+
+        assert all(record.levelno < logging.WARNING for record in caplog.records)
 
 
 class TestBackendModuleOverrides:
@@ -512,7 +579,8 @@ class TestCustomModelGenerationConfig:
     ):
         """The restore is gated on a real GenerationConfig, so a model that cannot generate never touches the hub."""
         GenerationConfig(eos_token_id=[2, 11]).save_pretrained(tmp_path)
-        placeholder = MagicMock()
+        placeholder = nn.Module()
+        placeholder.generation_config = None
         mock_resolve_cls.return_value = lambda config, **kwargs: placeholder
         mock_get_hf_config.return_value = self._make_config()
 
@@ -573,7 +641,11 @@ class TestBackendDictCoercion:
 
         def fake_model_cls(config, **kwargs):
             captured_kwargs.update(kwargs)
-            return MagicMock()
+            model = nn.Module()
+            model.config = config
+            if "backend" in kwargs:
+                model.backend = kwargs["backend"]
+            return model
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
         if uses_native_fa4:
@@ -608,7 +680,7 @@ class TestBackendDictCoercion:
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
-    def test_flash_attention_4_preserves_explicit_native_backend(self, mock_resolve_cls, _mock_download):
+    def test_flash_attention_4_preserves_explicit_native_backend(self, mock_resolve_cls, _mock_download, caplog):
         captured = self._run_init_model(
             mock_resolve_cls,
             attn_implementation="flash_attention_4",
@@ -618,6 +690,8 @@ class TestBackendDictCoercion:
 
         assert isinstance(captured["backend"], BackendConfig)
         assert captured["backend"].attn == "sdpa"
+        assert "backend.attn='sdpa'" in caplog.text
+        assert "does not override it" in caplog.text
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
@@ -950,7 +1024,9 @@ class TestDictConfigOverrideKeepsCustomPath:
         def fake_model_cls(config, **kwargs):
             captured_args["config"] = config
             captured_kwargs.update(kwargs)
-            return MagicMock()
+            model = nn.Module()
+            model.config = config
+            return model
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
         mock_resolve_cls.return_value = fake_model_cls
@@ -986,7 +1062,9 @@ class TestDictConfigOverrideKeepsCustomPath:
 
         def fake_model_cls(config, **kwargs):
             captured_kwargs.update(kwargs)
-            return MagicMock()
+            model = nn.Module()
+            model.config = config
+            return model
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
         mock_resolve_cls.return_value = fake_model_cls

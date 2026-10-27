@@ -719,11 +719,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
                 base model supports this kwarg. Defaults to ``"flash_attention_2"``,
                 if flash attention is not available, defaults to ``"sdpa"``.
+                Explicit native ``backend.attn`` takes precedence on attention paths
+                owned by the native model; retained HF components use HF dispatch.
             quantization_config (optional): BitsAndBytesConfig configuration object that
                 specifies all quantization settings. If provided, quantization
                 will be applied to the model.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
+                AutoModel training infrastructure and applicable runtime patches still apply.
             distributed_setup (DistributedSetup | None, optional): Resolved distributed
                 topology and policy object. Default: None.
             device_mesh (DeviceMesh | None, optional): Pre-created Hugging Face-style
