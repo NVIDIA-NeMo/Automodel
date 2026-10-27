@@ -399,7 +399,7 @@ def test_mok_mxfp8_cache_requires_one_optimizer_per_model_part() -> None:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"n_shared_experts": 0}, "n_shared_experts=0"),
+        ({"n_shared_experts": 2}, "n_shared_experts=2"),
         ({"dim": 384}, "dim=384"),
         ({"moe_inter_dim": 384}, "moe_inter_dim=384"),
         ({"expert_bias": True}, "expert_bias=True"),
