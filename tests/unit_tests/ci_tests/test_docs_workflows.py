@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import json
 import os
 import shutil
@@ -23,6 +24,18 @@ import pytest
 import yaml
 
 _WORKFLOWS = Path(__file__).resolve().parents[3] / ".github/workflows"
+# RecursiveSI's generated 20x20 logo from PR #4461, absent from trusted navigation.
+_PROVIDER_WEBP = (
+    "UklGRg4BAABXRUJQVlA4TAIBAAAvE8AEEHU4biRJkc5/d+97UhwNeVC9GAHHtrVjz2/bZmfbtm3/HWJO"  # pragma: allowlist secret
+    "IaVtjiFtViagWaRN9edV4LaNkvEx/CJJQMEyll82TCpPNjdEqvp5CSsyvNrMyd1LIOLJO024tcgTsB6O"  # pragma: allowlist secret
+    "Af9OsSBlFdA6yR7nFsDp19qNrSkA+Z3UOmdez9PXFSot+tY5BEzA7fkETh+0UDwGKKD1jzkWA4Rdf94o"  # pragma: allowlist secret
+    "EDjtflKwf0wx2HGlOB8QZk0COsYWM8RNGJNcmwGWVxUZtFoniqokDEel2R1ihmRTDANPVRAqoA32Lazv"  # pragma: allowlist secret
+    "xIgS8ujdt3INmILzaPTf9Abl8+NWgnXw9qkg8P7+aP0vkwJPXwI="  # pragma: allowlist secret
+)
+_PROVIDER_ICON = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">'
+    f'<image width="20" height="20" href="data:image/webp;base64,{_PROVIDER_WEBP}"/></svg>'
+)
 
 
 def _run_pr_navigation(workspace: Path) -> subprocess.CompletedProcess[str]:
@@ -141,6 +154,25 @@ def test_preview_drops_legacy_redirects_that_shadow_new_pages(tmp_path: Path) ->
     assert yaml.safe_load((preview / "fern/docs.yml").read_text()) == {**trusted, "redirects": [retained]}
 
 
+@pytest.mark.parametrize("icon", [_PROVIDER_ICON, "fa-solid fa-book"])
+def test_preview_preserves_new_provider_logos_and_trusted_icons(tmp_path: Path, icon: str) -> None:
+    preview = tmp_path / "runner/fern-preview/docs"
+    destination = preview / "fern/versions/nightly.yml"
+    destination.parent.mkdir(parents=True)
+    destination.write_text('navigation:\n  - section: Existing\n    icon: "fa-solid fa-book"\n')
+    (preview / "fern/docs.yml").write_text("trusted site configuration")
+    proposed = {"navigation": [{"section": "RecursiveSI", "slug": "recursivesi", "icon": icon}]}
+    source = tmp_path / "pr-source/docs/fern/versions/nightly.yml"
+    source.parent.mkdir(parents=True)
+    source.write_text(yaml.safe_dump(proposed))
+
+    result = _run_pr_navigation(tmp_path)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert yaml.safe_load(destination.read_text()) == proposed
+    assert (preview / "fern/docs.yml").read_text() == "trusted site configuration"
+
+
 @pytest.mark.parametrize(
     "proposed",
     [
@@ -155,6 +187,33 @@ def test_preview_drops_legacy_redirects_that_shadow_new_pages(tmp_path: Path) ->
         "navigation:\n  - page: Safe\n    path: ../../safe.mdx\n    api: malicious\n",
         "navigation: &cycle\n  - section: Recursive\n    contents: *cycle\n",
         "!!python/object/apply:os.system ['touch injected']",
+    ]
+    + [
+        pytest.param(yaml.safe_dump({"navigation": [{"section": "Unsafe", "icon": icon}]}), id=name)
+        for name, icon in [
+            ("non-string", 123),
+            ("remote-svg", "https://example.com/icon.svg"),
+            ("event-handler", _PROVIDER_ICON.replace('<image width="20"', '<image onload="alert(1)" width="20"')),
+            ("script-element", _PROVIDER_ICON.replace("</svg>", "<script>alert(1)</script></svg>")),
+            ("svg-data-uri", _PROVIDER_ICON.replace("data:image/webp", "data:image/svg+xml")),
+            (
+                "remote-image",
+                _PROVIDER_ICON.replace(f"data:image/webp;base64,{_PROVIDER_WEBP}", "https://example.com/icon.webp"),
+            ),
+            ("invalid-base64", _PROVIDER_ICON.replace(_PROVIDER_WEBP, "a")),
+            ("excess-padding", _PROVIDER_ICON.replace(_PROVIDER_WEBP, _PROVIDER_WEBP + "=")),
+            (
+                "svg-disguised-as-webp",
+                _PROVIDER_ICON.replace(_PROVIDER_WEBP, base64.b64encode(b"<svg onload='alert(1)'/>").decode()),
+            ),
+            (
+                "truncated-webp",
+                _PROVIDER_ICON.replace(
+                    _PROVIDER_WEBP, base64.b64encode(base64.b64decode(_PROVIDER_WEBP)[:-2]).decode()
+                ),
+            ),
+            ("oversized", _PROVIDER_ICON.replace(_PROVIDER_WEBP, "A" * (16 * 1024))),
+        ]
     ],
 )
 def test_preview_rejects_unsafe_navigation(tmp_path: Path, proposed: str) -> None:

@@ -39,6 +39,8 @@ caching and SWA bounded replay remain out of scope.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -71,6 +73,7 @@ from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionG
 from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionState,
+    csa2_selection_replay,
     use_triton_rope,
     validate_attention_inputs,
 )
@@ -160,6 +163,28 @@ class DeepseekV41Block(nn.Module):
     def mlp(self) -> MoE:
         """Expose the shared parallelizer's MoE interface without duplicate registration."""
         return self.ffn
+
+    def nemo_checkpoint_context_fn(
+        self,
+        context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Extend this block's activation-checkpoint contexts with CSA2 selection replay.
+
+        The MoE parallelizer calls this model-owned hook when it wraps the block in a checkpoint
+        wrapper. With ``reuse_sparse_selection_on_recompute`` the attention layer records the frozen
+        indexer's selection and the sparse-index plan during the checkpoint forward and takes them back
+        during the recompute instead of recomputing them; with the knob off the incoming contexts are
+        returned unchanged.
+
+        Args:
+            context_fn: The parallelizer's ``torch.utils.checkpoint`` context factory, or ``None``.
+
+        Returns:
+            The (possibly wrapped) context factory.
+        """
+        if not self.attn.reuse_selection_on_recompute:
+            return context_fn
+        return csa2_selection_replay.checkpoint_context_fn(context_fn)
 
     def forward(
         self,

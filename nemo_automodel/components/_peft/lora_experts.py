@@ -52,6 +52,33 @@ def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) ->
     return F.pad(lora_A, (0, padding)), F.pad(lora_B, (0, 0, 0, padding))
 
 
+@torch.no_grad
+def _init_stacked_lora_A(lora_A: torch.Tensor, init_method: str) -> None:
+    """Initialize a stacked per-expert LoRA A tensor of shape ``[n_experts, in_features, rank]``.
+
+    Every expert's ``[in_features, rank]`` slice is one LoRA A matrix and must be drawn
+    like a 2-D ``nn.Linear(in_features, rank)`` weight. Calling ``xavier_normal_`` or
+    ``kaiming_uniform_`` on the stacked 3-D tensor would read the fans off the stack
+    (``fan_in = in_features * rank``, ``fan_out = n_experts * rank``), which shrinks
+    every expert's init by about ``sqrt(rank + n_experts)`` and ties it to the expert
+    count. The distributions are therefore resolved from the per-expert fans explicitly:
+    xavier -> normal(0, sqrt(2 / (in_features + rank))), kaiming (``a = sqrt(5)``) ->
+    uniform(-1 / sqrt(in_features), 1 / sqrt(in_features)).
+
+    Args:
+        lora_A: The stacked A tensor to initialize in place.
+        init_method: ``"xavier"`` or ``"kaiming"``.
+    """
+    if lora_A.ndim != 3:
+        raise ValueError(f"expected a stacked [n_experts, in_features, rank] tensor, got shape {tuple(lora_A.shape)}")
+    in_features, rank = lora_A.shape[1], lora_A.shape[2]
+    if init_method == "xavier":
+        lora_A.normal_(0.0, math.sqrt(2.0 / (in_features + rank)))
+    else:
+        bound = 1.0 / math.sqrt(in_features)
+        lora_A.uniform_(-bound, bound)
+
+
 class GroupedExpertsLoRA(GroupedExperts):
     """
     GroupedExperts + LoRA.
@@ -141,12 +168,8 @@ class GroupedExpertsLoRA(GroupedExperts):
         Args:
             init_method (str): Initialization method ('xavier' or 'kaiming').
         """
-        if init_method == "xavier":
-            nn.init.xavier_normal_(self.lora_gate_and_up_A)
-            nn.init.xavier_normal_(self.lora_down_A)
-        else:
-            nn.init.kaiming_uniform_(self.lora_gate_and_up_A, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(self.lora_down_A, a=math.sqrt(5))
+        _init_stacked_lora_A(self.lora_gate_and_up_A, init_method)
+        _init_stacked_lora_A(self.lora_down_A, init_method)
 
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)
@@ -358,6 +381,10 @@ class GroupedExpertsLoRA(GroupedExperts):
             if post_expert_output is not None:
                 expert_out = post_expert_output(expert_out)
             if self.config.apply_router_weight_after_down:
+                # Apply the routing weight after the down projection, as the token path and
+                # GroupedExpertsDeepEPLoRA do. This keeps the weights attached: under EP their
+                # all-gather backward is a collective that every rank must enter.
+                expert_out = _apply_router_weight_fp32(expert_out, dummy_weight, torch.float32)
                 y[0, 0] += expert_out[0]
             else:
                 y[0] += expert_out[0]
@@ -458,6 +485,8 @@ class GroupedExpertsLoRA(GroupedExperts):
             if post_expert_output is not None:
                 output2 = post_expert_output(output2)
             if self.config.apply_router_weight_after_down:
+                # Same after-down weighting as the token path; see _forward_loop.
+                output2 = _apply_router_weight_fp32(output2, dummy_weight, torch.float32)
                 y[0, 0] += output2[0]
             else:
                 y[0] += output2[0]
@@ -502,6 +531,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
         self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
         self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
+        # The combine cache (BackendConfig.dispatcher_recompute_cache) is read by the shared dispatcher's config as
+        # well: the replacement must carry it, or the requested mode silently reverts to "none" (review of #4395).
+        self.dispatcher_recompute_cache = orig_module.dispatcher_recompute_cache
 
         self.gate_and_up_projs = orig_module.gate_and_up_projs
         self.down_projs = orig_module.down_projs
@@ -573,12 +605,8 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         Args:
             init_method (str): Initialization method ('xavier' or 'kaiming').
         """
-        if init_method == "xavier":
-            nn.init.xavier_normal_(self.lora_gate_and_up_A)
-            nn.init.xavier_normal_(self.lora_down_A)
-        else:
-            nn.init.kaiming_uniform_(self.lora_gate_and_up_A, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(self.lora_down_A, a=math.sqrt(5))
+        _init_stacked_lora_A(self.lora_gate_and_up_A, init_method)
+        _init_stacked_lora_A(self.lora_down_A, init_method)
 
         nn.init.zeros_(self.lora_gate_and_up_B)
         nn.init.zeros_(self.lora_down_B)

@@ -82,6 +82,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
         ),
         (
+            "FlintForCausalLM",
+            ("nemo_automodel.components.models.flint.model", "FlintForCausalLM"),
+        ),
+        (
             "Glm4MoeForCausalLM",
             ("nemo_automodel.components.models.glm4_moe.model", "Glm4MoeForCausalLM"),
         ),
@@ -409,6 +413,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41Config"),
     "deepseek_v41_text": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41TextConfig"),
     "deepseek_v41_vision": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41VisionConfig"),
+    "flint": ("nemo_automodel.components.models.flint.config", "FlintConfig"),
     "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
     "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),

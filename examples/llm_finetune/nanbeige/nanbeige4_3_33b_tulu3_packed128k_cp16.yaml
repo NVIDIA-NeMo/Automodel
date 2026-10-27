@@ -1,0 +1,141 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nanbeige4.3-33B full-parameter SFT on Tulu-3 packed to 131072 tokens.
+#
+# Nanbeige4.3-33B is a dense LlamaForCausalLM checkpoint (52 layers, GQA 56/8,
+# rope_theta 1.2e8), so it loads through the native Llama implementation.
+# Tulu-3 is shuffled with shuffle_seed before packing; every 128K THD row keeps
+# its document boundaries in cu_seqlens and position_ids restart per document.
+# TE attention runs block-diagonal causal attention over the packed row and
+# CP16 leaves 8192 tokens on each rank. Full-parameter training does not fit
+# 16384 tokens per rank next to the sharded optimizer state on one 80 GB node,
+# so the CP group spans two 8x H100 nodes:
+#
+#   torchrun --nnodes=2 --nproc-per-node=8 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR \
+#     --master-port=29500 examples/llm_finetune/finetune.py \
+#     --config examples/llm_finetune/nanbeige/nanbeige4_3_33b_tulu3_packed128k_cp16.yaml
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 5
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Nanbeige/Nanbeige4.3-33B
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/nanbeige4_3_33b_tulu3_packed128k_cp16/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 16
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 1234
+  seq_length: 131072
+  truncation: true
+  padding: false
+
+packed_sequence:
+  packing_strategy: thd
+  packed_sequence_size: 131072
+  # 100 optimizer steps x 4 packs, plus a small margin, without tokenizing the
+  # whole mixture up front.
+  max_packs: 404
+  num_proc: 1
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 1
+  num_workers: 0
+  drop_last: true
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+lr_scheduler:
+  lr_decay_style: constant
+
+clip_grad_norm:
+  max_norm: 1.0
+
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   dir: <your_wandb_save_dir>
+
+ci:
+  cluster_tag: h100
+  recipe_owner: HuiyingLi
+  nodes: 2
+  time: "02:00:00"
+  max_steps: 2

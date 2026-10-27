@@ -470,6 +470,39 @@ def test_committed_generated_tables_are_rejected(tmp_path):
         _validate_generated_tables_are_not_committed(tmp_path)
 
 
+@pytest.mark.parametrize("canonical_exists", [False, True])
+def test_trusted_catalog_resolves_cards_in_checkouts_before_and_after_a_rename(tmp_path, canonical_exists):
+    alias = "docs/model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx"
+    canonical = MODEL_CARD_PATH_ALIASES[alias]
+    document = (
+        '---\ntitle: "flux-3-image-klein-base"\n'
+        "slug: model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base\n---\n"
+        "[Checkpoint](https://huggingface.co/black-forest-labs/flux-3-image-klein-base)\n"
+    )
+    alias_path = tmp_path / alias
+    alias_path.parent.mkdir(parents=True)
+    alias_path.write_text(document, encoding="utf-8")
+    if canonical_exists:
+        (tmp_path / canonical).write_text(document, encoding="utf-8")
+    config_path = tmp_path / "docs/fern/docs.yml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("redirects: []\n", encoding="utf-8")
+
+    model_docs, _, catalog = _load_model_doc_catalog(tmp_path / "docs")
+    release = _ModelRelease(
+        "2026-10-22", "black-forest-labs/flux-3-image-klein-base", "", "Diffusion", "examples/flux3.yaml"
+    )
+    routes = _resolve_model_card_routes(tmp_path, [release], model_docs, catalog)
+
+    assert routes == {
+        (
+            "black-forest-labs/flux-3-image-klein-base",
+            "Diffusion",
+        ): "/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base"
+    }
+    assert [model.source_path for model in catalog] == [canonical if canonical_exists else alias]
+
+
 def test_model_card_path_aliases_preserve_published_paths():
     repo_root = Path(__file__).parents[3]
     _, _, catalog = _load_model_doc_catalog(repo_root / "docs")

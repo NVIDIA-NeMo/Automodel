@@ -43,7 +43,8 @@ step_scheduler:
   local_batch_size: 2
   ckpt_every_steps: 1000
   val_every_steps: 1000
-  max_steps: 6
+  # Exercise optimizer state across updates without a convergence-length run.
+  max_steps: 3
 
 dist_env:
   backend: nccl
