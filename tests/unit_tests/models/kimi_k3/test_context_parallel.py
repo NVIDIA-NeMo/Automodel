@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
 
@@ -146,6 +147,44 @@ def test_pipeline_microbatches_chunk_kimi_document_map():
     assert [microbatch["kimi_packed_doc_ids"].shape for microbatch in microbatches] == [(1, 8), (1, 8)]
     assert microbatches[0]["kimi_packed_doc_ids"].tolist() == [[1, 1, 1, 1, 1, 1, 0, 0]]
     assert microbatches[1]["kimi_packed_doc_ids"].tolist() == [[1, 1, 1, 1, 0, 0, 0, 0]]
+
+
+def test_packed_context_ignores_masked_gaps_when_checking_document_runs():
+    """A masked hole inside a document is not a repeated document; interleaving still is."""
+    context = KimiPackedContext(torch.tensor([[1, 1, 0, 1, 1, 2, 2]]))
+    assert context.has_multiple_documents
+    with pytest.raises(ValueError, match="one contiguous run"):
+        KimiPackedContext(torch.tensor([[1, 2, 1]]))
+    with pytest.raises(ValueError, match="one contiguous run"):
+        KimiPackedContext(torch.tensor([[1, 1, 2, 2, 0, 1]]))
+
+
+def test_indexed_mask_with_masked_gap_trains_through_the_model():
+    """The direct indexed-mask forward must accept a masked hole inside a document."""
+    from tests.unit_tests.models.kimi_k3.test_multimodal import _tiny_vlm
+
+    torch.manual_seed(0)
+    model = _tiny_vlm()
+    input_ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11]])
+    attention_mask = torch.tensor([[1, 1, 0, 1, 1, 2, 2]])
+    labels = torch.where(attention_mask > 0, input_ids, torch.full_like(input_ids, -100))
+
+    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+    valid = labels != -100
+    loss = torch.nn.functional.cross_entropy(logits[valid], labels[valid])
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    grads = [p.grad for name, p in model.named_parameters() if not name.startswith("vision_tower.")]
+    assert any(grad is not None for grad in grads)
+    assert all(grad is None or torch.isfinite(grad).all() for grad in grads)
+    # Document 2 cannot read document 1: perturbing document 1 leaves its logits unchanged.
+    with torch.no_grad():
+        perturbed_ids = input_ids.clone()
+        perturbed_ids[0, 0] = 12
+        perturbed = model(input_ids=perturbed_ids, attention_mask=attention_mask).logits
+    torch.testing.assert_close(perturbed[0, 5:], logits[0, 5:].detach(), rtol=0, atol=0)
+    assert not torch.allclose(perturbed[0, 3:5], logits[0, 3:5].detach())
 
 
 def test_mla_masks_remain_owned_by_their_microbatch():

@@ -62,7 +62,9 @@ class KimiPackedContext:
     Attributes:
         doc_ids: Global document ids of shape [batch, sequence] covering the full
             (unsharded) sequence, where 0 marks padding. In indexed packed masks,
-            each positive document ID must occupy one contiguous run per row.
+            each positive document ID must occupy one contiguous run per row once
+            masked (0) gaps are ignored: ``[1, 1, 0, 1, 1, 2, 2]`` is one document
+            with a masked hole, ``[1, 2, 1]`` is rejected.
         seq_start: Global sequence offset of the local shard; 0 without CP.
         cp_size: Number of context-parallel shards the global sequence was split into.
     """
@@ -74,8 +76,9 @@ class KimiPackedContext:
     def __post_init__(self) -> None:
         for row in self.doc_ids:
             if bool((row > 1).any()):
-                runs = torch.unique_consecutive(row)
-                documents = runs[runs > 0]
+                # Drop masked positions first: a hole inside a document is not a
+                # document boundary, so it must not make the document look repeated.
+                documents = torch.unique_consecutive(row[row > 0])
                 if documents.unique().numel() != documents.numel():
                     raise ValueError("Indexed packed document IDs must occupy one contiguous run per row.")
         self._cu_seqlens: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}

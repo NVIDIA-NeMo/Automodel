@@ -35,7 +35,7 @@ from transformers.utils import TensorType
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
-from .encoding import is_batched_conversation
+from .encoding import is_batched_conversation, normalize_xtml_tool_result_messages
 
 _, Image = safe_import("PIL.Image")
 _, TikTokenTokenizer = safe_import_from("nemo_automodel.components.models.kimi_k3.tokenization", "TikTokenTokenizer")
@@ -413,6 +413,12 @@ class KimiK3Processor(ProcessorMixin):
         conversations = conversation if batched else [conversation]
         if not conversation:
             raise ValueError("K3 processor requires a nonempty conversation")
+        # The native encoder re-sorts tool results into assistant tool_calls order,
+        # so collect images from that same order; otherwise reordered image-bearing
+        # tool replies would render their text in call order but keep the pixels
+        # in arrival order. The helper is idempotent, so the encoder's own pass
+        # leaves these messages unchanged.
+        conversations = [normalize_xtml_tool_result_messages(messages) for messages in conversations]
         loaded, counts = [], []
         for messages in conversations:
             sources = []

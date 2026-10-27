@@ -236,6 +236,66 @@ def test_tool_call_only_assistant_message_matches_native_tokenizer(processor):
     assert "pixel_values" not in output or output["pixel_values"].numel() == 0
 
 
+def _tool_image_chat(reply_order: tuple[str, str]) -> list[dict[str, object]]:
+    """Build a chat whose two image-bearing tool replies arrive in ``reply_order``.
+
+    Args:
+        reply_order: Tool-call ids in arrival order; call "a" returns a red image,
+            call "b" a blue one of the same size.
+
+    Returns:
+        The conversation with its tool replies in the requested order.
+    """
+    colors = {"a": "red", "b": "blue"}
+    replies = [
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": [
+                {"type": "image", "image": Image.new("RGB", (56, 28), colors[call_id])},
+                {"type": "text", "text": f"result {call_id}"},
+            ],
+        }
+        for call_id in reply_order
+    ]
+    return [
+        {"role": "user", "content": "Look at both."},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": f"capture_{call_id}", "arguments": {}}}
+                for call_id in ("a", "b")
+            ],
+        },
+        *replies,
+        {"role": "assistant", "content": "Red then blue."},
+    ]
+
+
+def test_reordered_tool_result_images_follow_their_tool_calls(processor):
+    """Tool replies render in tool_calls order, so their images must be collected in that order too."""
+    in_order = processor.apply_chat_template(
+        _tool_image_chat(("a", "b")), tokenize=True, return_dict=True, return_tensors="pt"
+    )
+    swapped = processor.apply_chat_template(
+        _tool_image_chat(("b", "a")), tokenize=True, return_dict=True, return_tensors="pt"
+    )
+    assert in_order["image_grid_thw"].tolist() == [[1, 2, 4], [1, 2, 4]]
+    torch.testing.assert_close(swapped["input_ids"], in_order["input_ids"], rtol=0, atol=0)
+    torch.testing.assert_close(swapped["image_grid_thw"], in_order["image_grid_thw"], rtol=0, atol=0)
+    torch.testing.assert_close(swapped["pixel_values"], in_order["pixel_values"], rtol=0, atol=0)
+    # Call "a" is rendered first and returns the red image, so the first patch is
+    # red regardless of arrival order; the two images themselves differ.
+    patches = int(in_order["image_grid_thw"][0].prod())
+    assert not torch.equal(in_order["pixel_values"][:patches], in_order["pixel_values"][patches:])
+    red = processor(processor.image_placeholder, Image.new("RGB", (56, 28), "red"), return_tensors="pt")
+    torch.testing.assert_close(swapped["pixel_values"][:patches], red["pixel_values"], rtol=0, atol=0)
+    # The caller's messages are not mutated by the normalization.
+    chat = _tool_image_chat(("b", "a"))
+    processor.apply_chat_template(chat, tokenize=True, return_dict=True, return_tensors="pt")
+    assert [message["tool_call_id"] for message in chat if message["role"] == "tool"] == ["b", "a"]
+
+
 @pytest.mark.parametrize("side", ["left", "right"])
 def test_chat_truncation_honors_truncation_side(processor, side):
     chat = _chat()
