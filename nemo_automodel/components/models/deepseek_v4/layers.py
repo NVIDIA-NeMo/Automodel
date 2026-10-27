@@ -1075,6 +1075,7 @@ class DeepseekV4Compressor(nn.Module):
             DeepseekV4Indexer(config, backend=self.backend) if compress_ratio == 4 else None
         )
         self._hca_param_sync_group = None
+        self._hca_capture_window_state: tuple[bool, bool] | None = None
 
     @property
     def ape(self) -> torch.Tensor:
@@ -1082,6 +1083,7 @@ class DeepseekV4Compressor(nn.Module):
 
     def _set_hca_param_sync_group(self, process_group) -> None:
         self._hca_param_sync_group = process_group
+        self._hca_capture_window_state = None
 
     def _compute_fsdp_group_has_complete_hca_window(
         self,
@@ -1094,12 +1096,24 @@ class DeepseekV4Compressor(nn.Module):
         if dist.get_world_size(group=process_group) == 1:
             return local_has_complete_hca_window
 
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            # Graph shapes are static. Reuse the group-wide decision from eager
+            # warmup; both the scalar H2D copy and .item() are uncapturable.
+            if self._hca_capture_window_state is None:
+                raise RuntimeError("DeepSeek-V4 HCA CUDA graph capture requires an eager warmup")
+            warmup_local, warmup_group = self._hca_capture_window_state
+            if warmup_local != local_has_complete_hca_window:
+                raise RuntimeError("DeepSeek-V4 HCA window availability changed since graph warmup")
+            return warmup_group
+
         # A single int max-reduce tells short ranks whether any peer in the same
         # HCA parameter sync group has a complete HCA window. It is a small
         # synchronization point, but it avoids using a broader or world group.
         flag = torch.tensor(int(local_has_complete_hca_window), device=device, dtype=torch.int32)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=process_group)
-        return bool(flag.item())
+        group_has_window = bool(flag.item())
+        self._hca_capture_window_state = (local_has_complete_hca_window, group_has_window)
+        return group_has_window
 
     def forward(
         self,

@@ -885,40 +885,56 @@ class DeepseekV4Model(nn.Module):
         if on_first_stage:
             if input_ids is None and inputs_embeds is None:
                 raise ValueError("First PP stage requires input_ids or inputs_embeds")
-            if vision_token_types is None and input_ids is not None:
-                vision_token_types = torch.where(
-                    input_ids >= int(self.config.vocab_size),
-                    input_ids - int(self.config.vocab_size),
-                    torch.full_like(input_ids, -1),
+            capturing_text = (
+                not self.vision_enabled
+                and input_ids is not None
+                and input_ids.is_cuda
+                and torch.cuda.is_current_stream_capturing()
+            )
+            if capturing_text:
+                if vision_token_types is not None or pixel_values is not None or image_grid_hws is not None:
+                    raise ValueError("Text-only CUDA graphs require no visual inputs or pseudo-token metadata")
+                torch._assert_async(
+                    ((input_ids >= 0) & (input_ids < int(self.config.vocab_size))).all(),
+                    "Text-only DeepSeek-V4 CUDA graph input_ids must be within the text vocabulary",
                 )
-            if vision_token_types is not None and vision_token_types.dim() == 1:
-                vision_token_types = vision_token_types.unsqueeze(0)
-            has_visual_tokens = vision_token_types is not None and bool((vision_token_types >= 0).any().item())
-            if not has_visual_tokens:
-                vision_token_types = None
-            if inputs_embeds is None:
-                if (input_ids < 0).any():
-                    raise ValueError("DeepSeek-V4 input_ids cannot be negative")
-                safe_input_ids = torch.where(
-                    input_ids < int(self.config.vocab_size), input_ids, torch.zeros_like(input_ids)
-                )
-                inputs_embeds = self.embed_tokens(safe_input_ids)
-            if has_visual_tokens:
-                if not self.vision_enabled:
-                    raise ValueError("Visual pseudo tokens require a DeepSeek-V4 vision checkpoint")
-                if pixel_values is None or image_grid_hws is None:
-                    raise ValueError("Visual pseudo tokens require pixel_values and image_grid_hws")
-                if inputs_embeds.dim() != 3:
-                    raise ValueError("DeepSeek-V4 visual inputs do not support packed THD embeddings")
-                inputs_embeds = self.merge_image_embeddings(
-                    inputs_embeds,
-                    pixel_values=pixel_values,
-                    image_grid_hws=image_grid_hws,
-                    vision_token_types=vision_token_types,
-                    n_images_per_sample=n_images_per_sample,
-                )
-            elif pixel_values is not None or image_grid_hws is not None:
-                raise ValueError("Image tensors were provided without visual pseudo tokens")
+                if inputs_embeds is None:
+                    inputs_embeds = self.embed_tokens(input_ids)
+            else:
+                if vision_token_types is None and input_ids is not None:
+                    vision_token_types = torch.where(
+                        input_ids >= int(self.config.vocab_size),
+                        input_ids - int(self.config.vocab_size),
+                        torch.full_like(input_ids, -1),
+                    )
+                if vision_token_types is not None and vision_token_types.dim() == 1:
+                    vision_token_types = vision_token_types.unsqueeze(0)
+                has_visual_tokens = vision_token_types is not None and bool((vision_token_types >= 0).any().item())
+                if not has_visual_tokens:
+                    vision_token_types = None
+                if inputs_embeds is None:
+                    if (input_ids < 0).any():
+                        raise ValueError("DeepSeek-V4 input_ids cannot be negative")
+                    safe_input_ids = torch.where(
+                        input_ids < int(self.config.vocab_size), input_ids, torch.zeros_like(input_ids)
+                    )
+                    inputs_embeds = self.embed_tokens(safe_input_ids)
+                if has_visual_tokens:
+                    if not self.vision_enabled:
+                        raise ValueError("Visual pseudo tokens require a DeepSeek-V4 vision checkpoint")
+                    if pixel_values is None or image_grid_hws is None:
+                        raise ValueError("Visual pseudo tokens require pixel_values and image_grid_hws")
+                    if inputs_embeds.dim() != 3:
+                        raise ValueError("DeepSeek-V4 visual inputs do not support packed THD embeddings")
+                    inputs_embeds = self.merge_image_embeddings(
+                        inputs_embeds,
+                        pixel_values=pixel_values,
+                        image_grid_hws=image_grid_hws,
+                        vision_token_types=vision_token_types,
+                        n_images_per_sample=n_images_per_sample,
+                    )
+                elif pixel_values is not None or image_grid_hws is not None:
+                    raise ValueError("Image tensors were provided without visual pseudo tokens")
             # Packed-sequence (THD) inputs arrive with the batch axis collapsed
             # (``process_input_for_thd`` flattens ids to ``[T]`` -> embeds ``[T, dim]``).
             # Restore the leading batch dim so the hc_mult expand below sees the

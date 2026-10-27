@@ -301,3 +301,120 @@ def test_visual_sparse_attention_module_matches_dense_forward_backward(monkeypat
     check_visual_sparse_attention_module_matches_dense_forward_backward(
         monkeypatch, device="cuda", dtype=torch.bfloat16, uses_tilelang=True
     )
+
+
+@pytest.mark.skipif(
+    not _can_run_tilelang_sparse_attn(),
+    reason="Vendored DSV4 sparse-attention CUDA kernel is unavailable",
+)
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+def test_flash_full_shape_sparse_attention_graph(compress_ratio: int) -> None:
+    """Check full Flash attention shapes against a dense FP32 Torch oracle.
+
+    This isolates fixed-key attention arithmetic and graph replay. It does not
+    validate the learned indexer or pretrained checkpoint loading.
+    """
+    import json
+    from pathlib import Path
+
+    from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dense_attention_topk_torch
+
+    torch.manual_seed(1234)
+    bsz, seq, heads, dim = 1, 4096, 64, 512
+    pooled = seq // compress_ratio if compress_ratio else 0
+    q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(bsz, seq + pooled, dim, device="cuda", dtype=torch.bfloat16)
+    sinks = torch.randn(heads, device="cuda")
+    grad = torch.randn_like(q)
+    compressed = None
+    if compress_ratio == 4:
+        # Distinct valid keys, selected from the causal compressed history.
+        # Later queries omit valid keys once history exceeds index_topk=512.
+        history = (torch.arange(seq, device="cuda") + 1) // compress_ratio
+        permutation = torch.rand(seq, pooled, device="cuda")
+        permutation.masked_fill_(torch.arange(pooled, device="cuda")[None] >= history[:, None], -1)
+        values, indices = permutation.topk(512, dim=-1)
+        compressed = torch.where(values >= 0, indices, -1).unsqueeze(0)
+    topk = build_dsv4_sparse_topk_indices(
+        batch_size=bsz,
+        seq_len=seq,
+        key_len=seq + pooled,
+        window_size=128,
+        device=q.device,
+        compress_ratio=compress_ratio,
+        compressed_topk=compressed,
+        n_pooled=pooled,
+    ).to(torch.int32)
+    fn = lambda q_, kv_, sinks_: dsv4_sparse_attention(q_, kv_, sinks_, topk, dim**-0.5, backend="tilelang")
+
+    expected, expected_grads = _run_forward_backward(
+        lambda q_, kv_, sinks_: dense_attention_topk_torch(q_, kv_, sinks_, topk, dim**-0.5),
+        (q.float(), kv.float(), sinks),
+        grad.float(),
+    )
+    reference = (expected, *expected_grads)
+    eager = []
+    for _ in range(3):
+        output, gradients = _run_forward_backward(fn, (q, kv, sinks), grad)
+        eager.append((output, *gradients))
+
+    leaves = [value.detach().clone().requires_grad_(True) for value in (q, kv, sinks)]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            for value in leaves:
+                value.grad = None
+            output = fn(*leaves)
+            output.backward(grad)
+        for value in leaves:
+            value.grad = None
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = fn(*leaves)
+            output.backward(grad)
+        graph_results = []
+        for _ in range(3):
+            graph.replay()
+            graph_results.append(tuple(value.detach().clone() for value in (output, *(v.grad for v in leaves))))
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    def metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+        actual = actual.float()
+        expected = expected.float()
+        difference = actual - expected
+        return {
+            "relative_rmse": (
+                difference.square().mean().sqrt() / expected.square().mean().sqrt().clamp_min(1e-20)
+            ).item(),
+            "max_abs": difference.abs().max().item(),
+            "fraction_changed": (difference != 0).float().mean().item(),
+        }
+
+    labels = ("output", "dq", "dkv", "dsinks")
+    result = {
+        "shape": [bsz, seq, heads, dim],
+        "key_length": seq + pooled,
+        "topk_width": topk.shape[-1],
+        "compress_ratio": compress_ratio,
+        "reference": "independent dense-mask FP32 Torch",
+        "eager_vs_reference": {name: metrics(a, b) for name, a, b in zip(labels, eager[0], reference, strict=True)},
+        "eager_repeats": [
+            {name: metrics(a, b) for name, a, b in zip(labels, row, eager[0], strict=True)} for row in eager[1:]
+        ],
+        "graph_vs_eager": [
+            {name: metrics(a, b) for name, a, b in zip(labels, row, eager[0], strict=True)} for row in graph_results
+        ],
+    }
+    Path(f"flash_attention_graph_ratio{compress_ratio}.json").write_text(json.dumps(result, indent=2))
+    for row in (eager[0], *graph_results):
+        torch.testing.assert_close(row[0].float(), reference[0], rtol=2e-2, atol=2e-2)
+        for actual, expected in zip(row[1:], reference[1:], strict=True):
+            torch.testing.assert_close(actual.float(), expected, rtol=5e-2, atol=5e-2)
+    for row in graph_results:
+        torch.testing.assert_close(row[0], eager[0][0], rtol=0, atol=0)
+    # An independent wrong-gradient control must fail the same oracle gate.
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(-graph_results[0][2].float(), reference[2], rtol=5e-2, atol=5e-2)
+    graph.reset()
