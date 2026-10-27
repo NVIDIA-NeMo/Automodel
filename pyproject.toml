@@ -737,6 +737,7 @@ possibly-missing-attribute = "ignore"
 [[tool.ty.overrides]]
 include = [
     "nemo_automodel/components/attention/**",
+    "nemo_automodel/components/_peft/**",
     "nemo_automodel/components/config/**",
     "nemo_automodel/components/launcher/**",
     "nemo_automodel/components/loggers/**",
