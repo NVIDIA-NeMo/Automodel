@@ -16,13 +16,11 @@
 
 from __future__ import annotations
 
-from functools import partial
 from types import MethodType
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
-from torch.distributed.utils import _apply_to_tensors
 
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
@@ -174,8 +172,6 @@ def _parallelize_unsharded_fsdp2(
                 apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
     if mesh_context.reapply_trainability is not None:
         mesh_context.reapply_trainability(model)
-    if config.mp_policy is not None and config.mp_policy.output_dtype is not None:
-        model.register_forward_hook(partial(_cast_forward_output, dtype=config.mp_policy.output_dtype))
     # No fully_shard hooks run on this path, so its mixed-precision policy
     # cannot provide compute casts. Autocast preserves resident/master weights
     # and precision-sensitive buffers, including during checkpoint recomputation.
@@ -193,26 +189,6 @@ def _parallelize_unsharded_fsdp2(
         else:
             model.forward = autocast(forward)
     return model
-
-
-def _cast_forward_output(
-    module: nn.Module, inputs: tuple[object, ...], output: object, *, dtype: torch.dtype
-) -> object:
-    """Apply FSDP's output policy without changing the output structure.
-
-    Args:
-        module: Module whose forward just completed.
-        inputs: Forward arguments, potentially containing tensors of arbitrary
-            shapes. Unused by this output-only hook.
-        output: Forward result, potentially containing tensors of arbitrary
-            shapes nested in model outputs, dataclasses or containers.
-        dtype: Desired floating-point output dtype.
-
-    Returns:
-        The same output structure and tensor shapes, with floating tensors cast
-        to dtype. Integer tensors and non-tensor metadata are preserved.
-    """
-    return _apply_to_tensors(lambda value: value.to(dtype) if value.is_floating_point() else value, output)
 
 
 def _parallelize_ddp(model: nn.Module, mesh_context: MeshContext) -> nn.Module:

@@ -83,13 +83,13 @@ class _Model(nn.Module):
         return self.layers[0](inputs)
 
 
-def _parallelize(model, *, dtype=torch.bfloat16, autocast_dtype=None, output_dtype=None, checkpointing=False):
+def _parallelize(model, *, dtype=torch.bfloat16, autocast_dtype=None, checkpointing=False):
     context = SimpleNamespace(
         cp_size=1,
         ep_size=1,
         device_mesh=SimpleNamespace(size=lambda: 1, device_type="cpu"),
         strategy_config=FSDP2Config(
-            mp_policy=MixedPrecisionPolicy(param_dtype=dtype, output_dtype=output_dtype),
+            mp_policy=MixedPrecisionPolicy(param_dtype=dtype),
             autocast_dtype=autocast_dtype,
         ),
         activation_checkpointing=checkpointing,
@@ -167,57 +167,3 @@ def test_single_rank_autocast_restores_context_after_exception_and_deepcopy():
         next(cloned.parameters()).zero_()
     assert torch.count_nonzero(cloned(torch.ones(2, 4))) == 0
     assert torch.count_nonzero(model(torch.ones(2, 4))) > 0
-
-
-@pytest.mark.parametrize("dtype", [None, torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("output_dtype", [torch.float32, torch.bfloat16])
-def test_single_rank_output_policy_casts_independently_of_compute(dtype, output_dtype):
-    model = _parallelize(_Model(), dtype=dtype, output_dtype=output_dtype)
-    result = model(torch.randn(2, 4))
-    assert result.dtype == output_dtype
-    # A subsequent consumer must see the dtype requested at the boundary.
-    consumer = nn.Linear(4, 1, dtype=output_dtype)
-    consumer(result).float().sum().backward()
-    assert all(parameter.grad is not None for parameter in model.parameters())
-    assert {parameter.dtype for parameter in model.parameters()} == {torch.float32}
-
-
-class _NestedOutputModel(_Model):
-    def forward(self, inputs: torch.Tensor) -> dict:
-        """Return projections and metadata in nested output containers.
-
-        Args:
-            inputs: Tensor of shape [batch, hidden], where hidden is 4.
-
-        Returns:
-            A mapping containing [batch, hidden] floating outputs, [batch]
-            integer indices, [batch, hidden] boolean masks and None metadata.
-        """
-        from transformers.modeling_outputs import CausalLMOutputWithPast
-
-        projected = super().forward(inputs)
-        return {
-            "model": CausalLMOutputWithPast(logits=projected, hidden_states=(projected,)),
-            "nested": (projected, [torch.arange(inputs.shape[0]), None]),
-            "mask": inputs > 0,
-        }
-
-
-def test_single_rank_output_policy_preserves_nested_outputs_and_deepcopy():
-    from transformers.modeling_outputs import CausalLMOutputWithPast
-
-    model = _parallelize(_NestedOutputModel(), output_dtype=torch.float32)
-    for candidate in (model, copy.deepcopy(model)):
-        result = candidate(torch.randn(2, 4))
-        output = result["model"]
-        assert isinstance(output, CausalLMOutputWithPast)
-        assert output.logits is output["logits"]
-        assert output.logits.dtype == output.hidden_states[0].dtype == torch.float32
-        assert isinstance(result["nested"], tuple)
-        assert isinstance(result["nested"][1], list)
-        assert result["nested"][0].dtype == torch.float32
-        assert result["nested"][1][0].dtype == torch.int64
-        assert result["nested"][1][1] is None
-        assert result["mask"].dtype == torch.bool
-        output.logits.square().sum().backward()
-        assert next(candidate.parameters()).grad is not None

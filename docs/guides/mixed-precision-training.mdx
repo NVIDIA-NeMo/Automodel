@@ -119,8 +119,7 @@ applies to direct model calls. Resident parameters and buffers retain their
 storage precision, and activation-checkpoint recomputation retains autocast.
 An explicit `distributed.autocast_dtype` overrides the policy's compute dtype
 on this unsharded path.
-An explicit `mp_policy.output_dtype` casts floating forward outputs while
-preserving integer outputs and model-output containers. Native AutoModel
+This path does not apply `mp_policy.output_dtype`. Native AutoModel
 implementations protect explicitly FP32 math, including routing, rotary angle
 construction, sparse indexer scores, and hyperconnections, inside the forward
 autocast region. Models loaded with `force_hf=True` or through the Hugging Face
