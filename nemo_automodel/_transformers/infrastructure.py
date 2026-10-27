@@ -817,7 +817,17 @@ def apply_model_infrastructure(
     )
     # When FSDP2 CPU offload is enabled, params must be materialized on CPU —
     # FSDP2 manages GPU placement itself during forward/backward.
-    _has_cpu_offload = isinstance(strategy_config, FSDP2Config) and strategy_config.offload_policy is not None
+    # ``offload_experts_only`` restricts the policy to grouped MoE experts and
+    # outer leftovers: dense blocks keep GPU residency (their FSDP units are
+    # created with offload_policy=None), so they must materialize on the device.
+    # The expert DTensors still offload because their own FSDP units carry the
+    # CPUOffloadPolicy and copy sharded params to CPU during initialization.
+    _moe_offload_experts_only = bool(getattr(getattr(mesh, "moe_parallel_config", None), "offload_experts_only", False))
+    _has_cpu_offload = (
+        isinstance(strategy_config, FSDP2Config)
+        and strategy_config.offload_policy is not None
+        and not _moe_offload_experts_only
+    )
     if need_materialize:
         init_device = torch.device("cpu") if _has_cpu_offload else device
         model_parts = model.parts if hasattr(model, "parts") else [model]
@@ -889,7 +899,12 @@ def apply_model_infrastructure(
 
         has_sharded_params = any(isinstance(p, DTensor) for p in model.parameters())
         # Skip model.to(device) when CPU offload is on — FSDP2 expects params on
-        # CPU and moves them to GPU during forward/backward itself.
+        # CPU and moves them to GPU during forward/backward itself. With
+        # offload_experts_only the dense units stay resident on GPU (materialized
+        # on the device above), so the move still runs: FSDP's own offload units
+        # re-place their expert shards on CPU during wrap, and model.to on an
+        # already-wrapped DTensor param is skipped by the sharded-params guard
+        # when a checkpoint load follows.
         if not _has_cpu_offload and not (should_load_checkpoint and has_sharded_params):
             try:
                 model.to(device, non_blocking=True)

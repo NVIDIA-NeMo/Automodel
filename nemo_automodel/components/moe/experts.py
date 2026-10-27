@@ -1722,9 +1722,21 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(
             device=compute_device, dtype=compute_dtype, non_blocking=True
         )
-        down_projs = self.down_projs.to_local().to(
-            device=compute_device, dtype=compute_dtype, non_blocking=True
-        )
+        down_projs = self.down_projs.to_local().to(device=compute_device, dtype=compute_dtype, non_blocking=True)
+        # Biased experts: the bias DTensors can also be CPU-resident under the
+        # FSDP CPUOffloadPolicy. Apply the same differentiable device/dtype
+        # materialization so _apply_bias never adds a CPU bias into a CUDA GEMM
+        # output (HybridEP with expert_bias=True, e.g. GPT-OSS).
+        if self.expert_bias:
+            gate_up_proj_bias = self.gate_up_proj_bias.to_local().to(
+                device=compute_device, dtype=compute_dtype, non_blocking=True
+            )
+            down_proj_bias = self.down_proj_bias.to_local().to(
+                device=compute_device, dtype=compute_dtype, non_blocking=True
+            )
+        else:
+            gate_up_proj_bias = None
+            down_proj_bias = None
 
         # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read.
         router_weight_already_applied = False
@@ -1745,8 +1757,8 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                     permuted_local_hidden_states,
                     gate_and_up_projs,
                     down_projs,
-                    self.gate_up_proj_bias.to_local(),
-                    self.down_proj_bias.to_local(),
+                    gate_up_proj_bias,
+                    down_proj_bias,
                     tokens_per_expert_gpu,
                     permuted_probs if post_expert_output is None else activation_probs,
                     self.expert_activation,
@@ -1762,7 +1774,6 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                 offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
                 grouped_mm = select_grouped_mm(self.use_mxfp8)
                 output1 = grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs)
-                gate_up_proj_bias = self.gate_up_proj_bias.to_local()
                 # MXFP8: the grouped_mm wrapper clamps its quant input (see
                 # select_grouped_mm) so a bias-shifted value can't overflow the e8m0
                 # block scale -> nan (seen on gpt-oss). The bias-add stays a bf16
@@ -1771,10 +1782,9 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
                 output1 = self.expert_activation(output1, activation_probs)
                 output2 = grouped_mm(output1, down_projs, offs)
-                down_bias = self.down_proj_bias.to_local()
                 output2 = _apply_bias(
                     output2,
-                    down_bias,
+                    down_proj_bias,
                     tokens_per_expert,
                     None if self.config.apply_router_weight_after_down else permuted_probs,
                 )
