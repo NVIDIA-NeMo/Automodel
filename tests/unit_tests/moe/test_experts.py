@@ -4177,3 +4177,75 @@ class TestDispatcherRecomputeCacheKnob:
         experts.dispatcher_recompute_cache = "moe_tail"
         experts(*args[:4])
         assert deferred == [1]  # with no reader of the output the GEMM is skipped as before
+
+
+class TestGroupedExpertsBiasOffloadMaterialization:
+    """Biased experts with CPU-resident bias DTensors (FSDP CPUOffloadPolicy).
+
+    Review finding: the CPU-shard path moved only the two weight matrices to
+    the compute device; ``gate_up_proj_bias``/``down_proj_bias`` stayed on CPU,
+    so the first ``_apply_bias`` added a CPU bias into a CUDA GEMM output
+    (HybridEP with expert_bias=True, e.g. GPT-OSS). The forward must
+    materialize both biases on the compute device, differentiably.
+    """
+
+    def _tiny_config(self):
+        return MoEConfig(
+            n_routed_experts=2,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=4,
+            inter_dim=8,
+            moe_inter_dim=8,
+            norm_topk_prob=False,
+            router_bias=False,
+            expert_bias=True,
+            expert_activation="swiglu",
+            dtype=torch.float32,
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CPU-resident params + CUDA activations")
+    def test_cpu_resident_bias_completes_forward_backward_on_cuda(self):
+        torch.manual_seed(7012)
+        config = self._tiny_config()
+        experts = GroupedExperts(config)
+        experts = experts.to("cuda")
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(0, 0.5)
+            experts.down_projs.normal_(0, 0.5)
+            experts.gate_up_proj_bias.normal_(0, 0.1)
+            experts.down_proj_bias.normal_(0, 0.1)
+
+        # Simulate FSDP CPUOffloadPolicy residency: plain CPU copies stand in
+        # for the offloaded DTensor locals (same device mismatch the production
+        # path must bridge).
+        experts_cpu = GroupedExperts(config)
+        experts_cpu.load_state_dict(experts.state_dict())  # CPU storage
+
+        num_tokens = 6
+        x = torch.randn(num_tokens, config.dim, dtype=torch.float32, device="cuda", requires_grad=True)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device="cuda")
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.float32, device="cuda")
+        indices = torch.stack([torch.arange(num_tokens) % 2] * config.n_activated_experts, dim=-1).to("cuda")
+
+        # Forward against CUDA-resident control.
+        out_gpu = experts(x, token_mask, weights, indices)
+
+        # Forward through the CPU-storage parameters (needs the device copy).
+        out_cpu_resident = experts_cpu(x, token_mask, weights, indices)
+        torch.testing.assert_close(out_cpu_resident, out_gpu, rtol=1e-5, atol=1e-5)
+
+        # Gradient must flow back to the CPU-resident bias parameters.
+        loss = out_cpu_resident.sum()
+        loss.backward()
+        assert experts_cpu.gate_up_proj_bias.grad is not None
+        assert experts_cpu.down_proj_bias.grad is not None
+        assert torch.isfinite(experts_cpu.gate_up_proj_bias.grad).all()
+        assert torch.isfinite(experts_cpu.down_proj_bias.grad).all()
