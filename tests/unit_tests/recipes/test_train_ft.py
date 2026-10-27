@@ -1416,7 +1416,7 @@ def _single_rank_gloo(tmp_path):
 
 
 @pytest.mark.runtime_budget(
-    60, hard_timeout=120, reason="Builds real indexed data and loads the CPU indexing extension."
+    30, hard_timeout=120, reason="Builds real indexed data and loads the CPU indexing extension."
 )
 @pytest.mark.parametrize(
     "route,attention_implementation,eod_mask_loss",
