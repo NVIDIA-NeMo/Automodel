@@ -54,13 +54,14 @@ All layers share the same sliding-window causal mask on the local KV path.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
+from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -74,12 +75,14 @@ from nemo_automodel.components.models.deepseek_v4.cp import (
     dsv4_cp_rank,
     dsv4_cp_size,
 )
+from nemo_automodel.components.models.deepseek_v4.kernels.rope import apply_partial_rope_triton
 from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     build_dsv4_sparse_topk_indices,
     dsv4_indexer_scores,
     dsv4_sinkhorn_normalize,
     dsv4_sparse_attention,
 )
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -91,12 +94,12 @@ def _full_tensor_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
 
 def _dsv4_kernel_backend(backend: BackendConfig) -> str:
     """Use TileLang DSV4 sparse kernels only when the attention backend requests them."""
-    return "tilelang" if backend.attn == "tilelang" else "torch"
+    return "tilelang" if backend.attn in ("tilelang", "cudnn") else "torch"
 
 
 def _dsv4_sinkhorn_backend(backend: BackendConfig) -> str:
     """Use optional TileKernels sinkhorn when available, otherwise torch fallback."""
-    return "auto" if backend.attn == "tilelang" else "torch"
+    return "auto" if backend.attn in ("tilelang", "cudnn") else "torch"
 
 
 def _rms_norm_last_dim(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -266,11 +269,23 @@ class DeepseekV4RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build rotary tables using FP32 position-frequency products.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden], supplying output dtype and device.
+            position_ids: Tensor of shape [batch, sequence] containing absolute token positions.
+
+        Returns:
+            Cosine and sine tensors of shape [batch, sequence, rotary_dim], where
+            rotary_dim is the rotated portion of each attention head. Both use x.dtype.
+        """
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
         # Force fp32 for numerical stability.
         with torch.autocast(device_type=x.device.type if x.device.type != "mps" else "cpu", enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            # The contraction dimension is one: an elementwise outer product avoids
+            # loading PyTorch's batched-matmul Triton kernel during PP communication.
+            freqs = (inv_freq_expanded * position_ids_expanded).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -411,7 +426,14 @@ class DeepseekV4TrainCache:
         return pool
 
 
-def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_head_dim: int) -> torch.Tensor:
+def _apply_partial_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_head_dim: int,
+    *,
+    backend: Literal["torch", "quack", "triton"] = "torch",
+) -> torch.Tensor:
     """Split ``x`` along its last dim into nope (first) and rope (last
     ``rope_head_dim``) slices, rotate only the rope slice with INTERLEAVED
     pair-RoPE (pairs ``(2k, 2k+1)``), concat back.
@@ -425,7 +447,28 @@ def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, r
     Llama-style helper produces wrong activations on the released checkpoint
     (verified empirically: kv_post_rope cosine drops from 0.9999 to 0.866
     after one block under Llama-style; matches at >0.999 under interleaved).
+
+    Args:
+        x: Tensor of shape [..., sequence, channels] rotated on its last
+            ``rope_head_dim`` channels. The eager path accepts any leading
+            dimensions broadcastable with the tables, for example
+            [batch, heads, sequence, channels] or [batch, 1, sequence, channels];
+            the Triton path requires exactly [batch, heads, sequence, channels].
+        cos: Tensor of shape [batch, sequence, rope_head_dim]; the first half
+            holds the unique adjacent-pair frequencies.
+        sin: Tensor with cos's shape and frequency order; negate it for the
+            inverse rotation.
+        rope_head_dim: Even number of trailing channels to rotate.
+        backend: ``"triton"`` uses the fused CUDA kernel when x is on CUDA and
+            the tables do not require gradients; otherwise the eager path runs.
+
+    Returns:
+        Tensor with x's shape and dtype. The leading ``channels - rope_head_dim``
+        channels are unchanged. The Triton result has
+        [batch, sequence, heads, channels] storage, so transpose(1, 2) is contiguous.
     """
+    if backend == "triton" and x.is_cuda and not (cos.requires_grad or sin.requires_grad):
+        return apply_partial_rope_triton(x, cos, sin, rope_head_dim)
     return _apply_partial_rope_interleaved(x, cos, sin, rope_head_dim)
 
 
@@ -761,6 +804,9 @@ class DeepseekV4FP32Parameter(nn.Module):
         return _full_tensor_if_dtensor(self.weight)
 
 
+dsv4_indexer_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("DSV4 frozen indexer selection")
+
+
 class DeepseekV4Indexer(nn.Module):
     """HF PR 45616 port.  Picks the top-k compressed positions per query when
     ``compress_ratio == 4``.  Owns its own pool at ``index_head_dim`` plus a
@@ -780,6 +826,7 @@ class DeepseekV4Indexer(nn.Module):
         self.head_dim = config.index_head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
+        self.reuse_selection_on_recompute = config.reuse_sparse_selection_on_recompute
         self.softmax_scale = self.head_dim**-0.5
         proj_dim = 2 * self.head_dim  # overlap mode
         self.wkv = nn.Linear(config.hidden_size, proj_dim, bias=False, dtype=torch.float32)
@@ -806,8 +853,99 @@ class DeepseekV4Indexer(nn.Module):
         start_pos: int,
         position_ids: torch.Tensor | None = None,
         packed_seq_ids: torch.Tensor | None = None,
-        cp_group=None,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> torch.LongTensor:
+        """Select compressed keys, reusing frozen decisions during checkpoint replay.
+
+        The replay owns only integer indices. The main compressor and attention
+        retain their normal differentiable paths. Trainable indexers keep the
+        existing path; each checkpoint invocation owns an independent record.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden], where
+                local_sequence is this rank's query shard under CP.
+            q_residual: Tensor of shape [batch, local_sequence, q_lora_rank].
+            rotary: Rotary module for compressed keys.
+            position_embeddings: Query cosine and sine, each of shape
+                [batch, local_sequence, rotary_channels] with rotary_channels
+                equal to ``qk_rope_head_dim``.
+            cache: Per-attention-call scratch cache.
+            layer_idx: Index of the current transformer layer.
+            start_pos: First query position.
+            position_ids: Optional tensor of shape [batch, local_sequence] with
+                each token's position inside its document.
+            packed_seq_ids: Optional tensor of shape [batch, local_sequence] with
+                positive document identities; zero marks padding.
+            cp_group: Optional context-parallel process group.
+
+        Returns:
+            Int64 tensor of shape [batch, local_sequence, selected_keys], with
+            selected_keys = min(index_topk, compressed_keys). Indices address
+            the compressed pool, concatenated across CP ranks when CP is active.
+            Packed inputs mark selections outside the query's document or causal
+            range with -1. Unpacked selections are raw top-k positions whose
+            causal filtering the compressor applies.
+        """
+        args = (
+            hidden_states,
+            q_residual,
+            rotary,
+            position_embeddings,
+            cache,
+            layer_idx,
+            start_pos,
+            position_ids,
+            packed_seq_ids,
+            cp_group,
+        )
+        if not self.reuse_selection_on_recompute or any(p.requires_grad for p in self.parameters()):
+            return self._select_keys(*args)
+        replay = dsv4_indexer_replay.current()
+        if replay is not None and replay[1] == "replay":
+            recorded = replay[0].take()
+            if recorded is not None:
+                return recorded
+        # SAC must not record ops that the replay deliberately skips. This
+        # region has no differentiable output and all indexer weights are frozen.
+        with _disable_current_modes(), torch.no_grad():
+            selected = self._select_keys(*args)
+        if replay is not None and replay[1] == "record":
+            replay[0].record(selected)
+        return selected
+
+    def _select_keys(
+        self,
+        hidden_states: torch.Tensor,
+        q_residual: torch.Tensor,
+        rotary: nn.Module,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cache: DeepseekV4TrainCache,
+        layer_idx: int,
+        start_pos: int,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_ids: torch.Tensor | None = None,
+        cp_group: dist.ProcessGroup | None = None,
+    ) -> torch.LongTensor:
+        """Score the compressed pool and select keys; see :meth:`forward` for the contract.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden].
+            q_residual: Tensor of shape [batch, local_sequence, q_lora_rank].
+            rotary: Rotary module for compressed keys.
+            position_embeddings: Query cosine and sine, each of shape
+                [batch, local_sequence, rotary_channels].
+            cache: Per-attention-call scratch cache.
+            layer_idx: Index of the current transformer layer.
+            start_pos: First query position.
+            position_ids: Optional tensor of shape [batch, local_sequence].
+            packed_seq_ids: Optional tensor of shape [batch, local_sequence].
+            cp_group: Optional context-parallel process group.
+
+        Returns:
+            Int64 tensor of shape [batch, local_sequence, selected_keys]
+            indexing the (CP-global) compressed pool, with -1 for packed
+            selections outside the query's document.
+        """
         input_dtype = hidden_states.dtype
         batch, seq_len, _ = hidden_states.shape
         cp_active = dsv4_cp_enabled(cp_group)
@@ -843,7 +981,9 @@ class DeepseekV4Indexer(nn.Module):
                     new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, new_pooled.shape[0]
                 )
             cos, sin = rotary(new_pooled, positions)
-            new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
+            new_pooled = _apply_partial_rope(
+                new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim, backend=self.backend.rope
+            ).squeeze(1)
         pooled_kv = cache.update_pool(new_pooled, layer_idx, "indexer_state")
         if cp_active:
             pooled_kv = dsv4_cp_all_gather(pooled_kv, dim=1, cp_group=cp_group)
@@ -852,7 +992,7 @@ class DeepseekV4Indexer(nn.Module):
 
         cos, sin = position_embeddings
         q = self.wq_b(q_residual).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        q = _apply_partial_rope(q, cos, sin, self.rope_head_dim).transpose(1, 2)
+        q = _apply_partial_rope(q, cos, sin, self.rope_head_dim, backend=self.backend.rope).transpose(1, 2)
         weights = self.weights_proj(hidden_states).float() * (self.n_heads**-0.5)
         query_start = dsv4_cp_rank(cp_group) * seq_len if cp_active else 0
         query_total_len = dsv4_cp_size(cp_group) * seq_len if cp_active else None
@@ -1035,7 +1175,9 @@ class DeepseekV4Compressor(nn.Module):
                 new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch
             )
         cos, sin = rotary(new_pooled, positions)
-        new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
+        new_pooled = _apply_partial_rope(
+            new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim, backend=self.backend.rope
+        ).squeeze(1)
         pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
         if cp_active:
             pooled = dsv4_cp_all_gather(pooled, dim=2, cp_group=cp_group)
@@ -1139,7 +1281,8 @@ class DeepseekV4HyperConnection(nn.Module):
         hc_eps: float,
         rms_norm_eps: float,
         sinkhorn_backend: str = "torch",
-    ):
+        compile_hc: bool = False,
+    ) -> None:
         super().__init__()
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
@@ -1150,6 +1293,12 @@ class DeepseekV4HyperConnection(nn.Module):
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * hidden_size, dtype=torch.float32))
         self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
         self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        if compile_hc:
+            # PP deep-copies modules before materializing their meta parameters.
+            # Compile a pure function: a bound-method closure would retain the source module.
+            self._project = torch.compile(self._project, dynamic=False)
+            self.collapse = torch.compile(self.collapse, dynamic=False)
+            self.expand = torch.compile(self._expand_fused, dynamic=False)
 
     @torch.no_grad()
     def init_weights(self, init_std: float) -> None:
@@ -1162,12 +1311,35 @@ class DeepseekV4HyperConnection(nn.Module):
         nn.init.zeros_(self.base)
         nn.init.ones_(self.scale)
 
-    def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _project(
+        hidden_streams: torch.Tensor,
+        fn: torch.Tensor,
+        base: torch.Tensor,
+        scale: torch.Tensor,
+        hc: int,
+        norm_eps: float,
+        hc_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict mixing coefficients before Sinkhorn normalization.
+
+        Args:
+            hidden_streams: Tensor of shape [batch, sequence, streams, hidden].
+            fn: FP32 projection of shape [mix_components, streams * hidden],
+                where mix_components is streams * (streams + 2).
+            base: FP32 offsets of shape [mix_components], ordered pre, post, combination.
+            scale: FP32 gains of shape [3], ordered pre, post, combination.
+            hc: Number of residual streams.
+            norm_eps: RMS normalization epsilon.
+            hc_eps: Additive epsilon for the pre coefficients.
+
+        Returns:
+            FP32 pre/post coefficients of shape [batch, sequence, streams] and
+            combination logits of shape [batch, sequence, input_streams, output_streams].
+        """
         flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
-        # HC mixer params are kept in fp32 for Sinkhorn stability — cast defensively.
-        mix = torch.nn.functional.linear(_rms_norm_last_dim(flat, self.norm_eps), self.fn.float())  # [B, S, (2+H)*H]
-        pre_scale, post_scale, comb_scale = self.scale.float().unbind(0)
-        hc = self.hc_mult
+        mix = torch.nn.functional.linear(_rms_norm_last_dim(flat, norm_eps), fn.float())
+        pre_scale, post_scale, comb_scale = scale.float().unbind(0)
 
         # ``pre`` and ``post`` have DIFFERENT formulas in the released DSV4-Flash
         # (see ``dsv4flash/inference/kernel.py:hc_split_sinkhorn_kernel`` 391-394):
@@ -1177,8 +1349,8 @@ class DeepseekV4HyperConnection(nn.Module):
         # + eps), which makes ``post`` half the magnitude the released weights
         # were trained against — verified empirically on the parity test
         # (auto post std = 0.5x ref post std before this fix).
-        pre = torch.sigmoid(mix[..., :hc] * pre_scale + self.base[:hc].float()) + self.hc_eps
-        post = 2.0 * torch.sigmoid(mix[..., hc : 2 * hc] * post_scale + self.base[hc : 2 * hc].float())
+        pre = torch.sigmoid(mix[..., :hc] * pre_scale + base[:hc].float()) + hc_eps
+        post = 2.0 * torch.sigmoid(mix[..., hc : 2 * hc] * post_scale + base[hc : 2 * hc].float())
 
         # ``comb`` uses softmax(dim=-1) on raw logits + eps, then sinkhorn.  HF
         # uses sigmoid + eps + sinkhorn — also a divergence from the reference
@@ -1187,8 +1359,21 @@ class DeepseekV4HyperConnection(nn.Module):
         #   2. row_softmax(dim=-1) + eps   (numerically stable, NOT sigmoid)
         #   3. col-norm / sum(dim=-2)
         #   4. for sinkhorn_iters - 1: row-norm / sum(dim=-1) ; col-norm / sum(dim=-2)
-        comb_logit = (
-            mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale + self.base[2 * hc :].view(hc, hc).float()
+        comb_logit = mix[..., 2 * hc :].view(*mix.shape[:-1], hc, hc) * comb_scale + base[2 * hc :].view(hc, hc).float()
+        return pre, post, comb_logit
+
+    def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict and normalize the residual mixing coefficients.
+
+        Args:
+            hidden_streams: Tensor of shape [batch, sequence, streams, hidden].
+
+        Returns:
+            FP32 pre/post tensors of shape [batch, sequence, streams] and
+            combination coefficients of shape [batch, sequence, input_streams, output_streams].
+        """
+        pre, post, comb_logit = self._project(
+            hidden_streams, self.fn, self.base, self.scale, self.hc_mult, self.norm_eps, self.hc_eps
         )
         comb = dsv4_sinkhorn_normalize(
             comb_logit,
@@ -1197,6 +1382,59 @@ class DeepseekV4HyperConnection(nn.Module):
             eps=self.hc_eps,
         )
         return pre, post, comb
+
+    @staticmethod
+    def collapse(hidden_streams: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+        """Collapse residual streams in FP32 before restoring the activation dtype.
+
+        Args:
+            hidden_streams: Tensor of shape [batch, sequence, streams, hidden].
+            pre: FP32 coefficients of shape [batch, sequence, streams].
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden] in the activation dtype.
+        """
+        return (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+
+    @staticmethod
+    def expand(output: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+        """Mix the residual and sublayer output with the existing BF16 rounding boundaries.
+
+        Args:
+            output: Tensor of shape [batch, sequence, hidden].
+            residual: Tensor of shape [batch, sequence, streams, hidden].
+            post: FP32 coefficients of shape [batch, sequence, streams].
+            comb: FP32 coefficients of shape [batch, sequence, input_streams, output_streams].
+
+        Returns:
+            Tensor of shape [batch, sequence, streams, hidden] in the residual dtype.
+        """
+        dtype = residual.dtype
+        return post.to(dtype).unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(
+            comb.transpose(-1, -2).to(dtype), residual
+        )
+
+    @staticmethod
+    def _expand_fused(
+        output: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
+    ) -> torch.Tensor:
+        """Fuse the four-stream reduction without launching tiny batched GEMMs.
+
+        Args:
+            output: Tensor of shape [batch, sequence, hidden].
+            residual: Tensor of shape [batch, sequence, streams, hidden].
+            post: FP32 coefficients of shape [batch, sequence, streams].
+            comb: FP32 coefficients of shape [batch, sequence, input_streams, output_streams].
+
+        Returns:
+            Tensor of shape [batch, sequence, streams, hidden] in the residual
+            dtype. Coefficients round before multiplication and the residual
+            reduction rounds before addition, preserving the eager BF16 boundaries.
+        """
+        dtype = residual.dtype
+        mixed = (comb.to(dtype).float().unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(dim=2).to(dtype)
+        update = post.to(dtype).unsqueeze(-1) * output.unsqueeze(-2)
+        return update + mixed
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.compute_weights(hidden_streams)
@@ -1314,6 +1552,34 @@ class DeepseekV4Attention(nn.Module):
         """
         self._cp_group = cp_mesh.get_group()
 
+    def _project_query(self, q_residual: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Expand, normalize, and partially rotate the low-rank query.
+
+        Args:
+            q_residual: Tensor of shape [batch, sequence, q_lora_rank].
+            cos: Tensor of shape [batch, sequence, rotary_channels], where
+                rotary_channels is ``qk_rope_head_dim`` and the first half
+                contains the unique adjacent-pair frequencies.
+            sin: Tensor of shape [batch, sequence, rotary_channels] with cos's
+                frequency order.
+
+        Returns:
+            Tensor of shape [batch, heads, sequence, channels], where channels
+            is ``head_dim``. The Triton paths use [batch, sequence, heads,
+            channels] storage, so transpose(1, 2) is contiguous. Fused
+            QNorm/RoPE requires CUDA and fixed frequency tables.
+        """
+        batch, seq_len = q_residual.shape[:2]
+        q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.config.fuse_qnorm_rope:
+            if self.backend.rope != "triton":
+                raise ValueError("fuse_qnorm_rope requires rope='triton'")
+            from nemo_automodel.components.models.deepseek_v4.kernels.qnorm_rope import qnorm_rope_triton
+
+            return qnorm_rope_triton(q, cos, sin, self.rope_head_dim, self.config.rms_norm_eps)
+        q = _rms_norm_last_dim(q, self.config.rms_norm_eps)
+        return _apply_partial_rope(q, cos, sin, self.rope_head_dim, backend=self.backend.rope)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1325,6 +1591,34 @@ class DeepseekV4Attention(nn.Module):
         position_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run sliding-window, compressed, and sparse attention for one layer.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden], where
+                local_sequence is this rank's contiguous query shard under CP.
+            position_embeddings: Main-rope cosine and sine, each of shape
+                [batch, local_sequence, rotary_channels].
+            attention_mask: Optional additive mask of shape [batch, 1,
+                local_sequence, keys] over local queries and CP-global keys.
+                None on the canonical unmasked sparse path.
+            position_embeddings_compress: Optional compress-rope cosine and
+                sine with the main tables' shapes; compressed layers use them
+                for queries and keys.
+            rotary_compress: Rotary module for compressed keys.
+            start_pos: First query position.
+            position_ids: Optional tensor of shape [batch, local_sequence] with
+                each token's position inside its document.
+            **kwargs: Optional ``packed_seq_ids`` and ``vision_token_types``
+                tensors of shape [batch, local_sequence], ``_dsv4_cp_group``,
+                and the model-validated flags ``_dsv4_all_queries_nonempty``
+                (every query sees its diagonal key, so sparse kernels may skip
+                empty-row filtering) and ``_dsv4_complete_compressor_windows``.
+
+        Returns:
+            Output of shape [batch, local_sequence, hidden], and eager attention
+            probabilities of shape [batch, heads, local_sequence, keys] or None
+            on the sparse kernel paths.
+        """
         cp_group = kwargs.get("_dsv4_cp_group") or getattr(self, "_cp_group", None)
         cp_active = dsv4_cp_enabled(cp_group)
         packed_seq_ids = kwargs.get("packed_seq_ids")
@@ -1365,15 +1659,9 @@ class DeepseekV4Attention(nn.Module):
             cos, sin = position_embeddings
 
         q_residual = self.q_norm(self.wq_a(hidden_states))
-        q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self._project_query(q_residual, cos, sin)
         kv = self.kv_norm(self.wkv(hidden_states)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
-
-        # Per-head, non-learnable rsqrt on Q before RoPE (matches reference
-        # ``dsv4flash/inference/model.py:498``; missing from HF PR 45616).
-        q = _rms_norm_last_dim(q, self.config.rms_norm_eps)
-
-        q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
-        kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim)
+        kv = _apply_partial_rope(kv, cos, sin, self.rope_head_dim, backend=self.backend.rope)
 
         full_kv = dsv4_cp_all_gather(kv, dim=2, cp_group=cp_group) if cp_active else kv
         vanilla_key_len = full_kv.shape[2]
@@ -1400,7 +1688,10 @@ class DeepseekV4Attention(nn.Module):
                 # original behavior since synthetic windows must be maskable.
                 # The normal DeepSeek-V4 model path builds this mask upstream.
                 enable_hca_fsdp_graph_alignment=(
-                    self.training and attention_mask is not None and self.compress_ratio == 128
+                    self.training
+                    and (attention_mask is not None or kwargs.get("_dsv4_all_queries_nonempty", False))
+                    and self.compress_ratio == 128
+                    and not kwargs.get("_dsv4_complete_compressor_windows", False)
                 ),
                 position_ids=position_ids,
                 packed_seq_ids=packed_seq_ids,
@@ -1467,8 +1758,8 @@ class DeepseekV4Attention(nn.Module):
         if attention_mask is not None and full_kv.shape[2] > attention_mask.shape[-1]:
             attention_mask = F.pad(attention_mask, (0, full_kv.shape[2] - attention_mask.shape[-1]), value=0.0)
 
-        attn_backend = _dsv4_kernel_backend(self.backend)
-        if attn_backend == "tilelang":
+        attn_backend = "cudnn" if self.backend.attn == "cudnn" else _dsv4_kernel_backend(self.backend)
+        if attn_backend in ("tilelang", "cudnn"):
             topk_idxs = build_dsv4_sparse_topk_indices(
                 batch_size=batch,
                 seq_len=seq_len,
@@ -1491,6 +1782,7 @@ class DeepseekV4Attention(nn.Module):
                 topk_idxs,
                 self.scaling,
                 backend=attn_backend,
+                all_rows_nonempty=kwargs.get("_dsv4_all_queries_nonempty", False),
             )
             attn_weights = None
         else:
@@ -1507,7 +1799,9 @@ class DeepseekV4Attention(nn.Module):
 
         # Inverse RoPE on the attention output (same (cos, -sin) conjugate pattern
         # HF uses).  Reference: modular_deepseek_v4.py:607.
-        attn_output = _apply_partial_rope(attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim).transpose(1, 2)
+        attn_output = _apply_partial_rope(
+            attn_output.transpose(1, 2), cos, -sin, self.rope_head_dim, backend=self.backend.rope
+        ).transpose(1, 2)
 
         grouped = attn_output.reshape(batch, seq_len, -1).view(batch, seq_len, self.config.o_groups, -1)
         return self.wo_b(self.wo_a(grouped).flatten(2)), attn_weights
@@ -1523,6 +1817,9 @@ class DeepseekV4Attention(nn.Module):
             for mod in self.compressor.modules():
                 if isinstance(mod, nn.Linear):
                     nn.init.trunc_normal_(mod.weight, mean=0.0, std=init_std)
+            # Constructor initialization is lost when meta parameters are materialized.
+            self.compressor.kv_norm.reset_parameters()
             nn.init.zeros_(self.compressor.ape_param.weight)
             if self.compressor.indexer is not None:
+                self.compressor.indexer.kv_norm.reset_parameters()
                 nn.init.zeros_(self.compressor.indexer.ape_param.weight)
