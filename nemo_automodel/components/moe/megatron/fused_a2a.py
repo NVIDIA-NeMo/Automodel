@@ -178,6 +178,53 @@ class HybridEPDispatchReplayRecorder(RecomputeReplayRecorder[list]):
         self.resolve()
 
 
+class MoERecomputeCache(RecomputeReplayRecorder[torch.Tensor]):
+    """Combine outputs of one checkpointed block forward, served to its recompute in call order.
+
+    ``BackendConfig.dispatcher_recompute_cache``: ``moe/parallelizer._cache_moe_combine_on_recompute`` binds one
+    per checkpointed call through :data:`moe_combine_replay` -- ``record`` around the checkpoint forward, ``replay``
+    around the backward recompute. Independent of the dispatch layout replay, so it also works when the router is
+    recomputed (``ignore_router_for_ac=False``).
+    """
+
+    def record(self, combined_hidden: torch.Tensor) -> None:
+        """Keep one combine output of the checkpoint forward (a detached clone)."""
+        super().record(combined_hidden.detach().clone())
+
+    def has_next(self) -> bool:
+        """Whether the recompute's next combine has a cached forward output."""
+        return self._cursor < len(self._records)
+
+    def take(self) -> torch.Tensor | None:
+        """Return the next cached output (released from the cache), or ``None`` when the recompute diverged."""
+        index = self._cursor
+        cached = super().take()
+        if cached is not None:
+            self._records[index] = None  # the recompute graph owns it from here
+        return cached
+
+
+# Checkpoint-recompute replay of HybridEP combine outputs; see MoERecomputeCache.
+moe_combine_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("MoE combine", recorder_factory=MoERecomputeCache)
+
+
+def moe_recompute_phase() -> str | None:
+    """``"record"`` inside a checkpoint forward with a bound cache, ``"replay"`` inside its recompute, else ``None``."""
+    replay = moe_combine_replay.current()
+    return replay[1] if replay is not None else None
+
+
+def hybridep_combine_output_cached() -> bool:
+    """Whether the current recompute will serve its next HybridEP combine from the forward's cache.
+
+    True only in the recompute of a region whose forward recorded a combine output
+    (``BackendConfig.dispatcher_recompute_cache``); the down projection feeding that combine may then skip
+    its GEMM (``moe/experts._DownProjGroupedMM``).
+    """
+    replay = moe_combine_replay.current()
+    return replay is not None and replay[1] == "replay" and replay[0].has_next()
+
+
 # Checkpoint-recompute replay of HybridEP dispatch layouts; see HybridEPDispatchReplayRecorder.
 hybridep_dispatch_replay: RecomputeReplay[list] = RecomputeReplay(
     "HybridEP dispatch", recorder_factory=HybridEPDispatchReplayRecorder
@@ -897,6 +944,7 @@ class HybridEPCombine(torch.autograd.Function):
         num_permuted_tokens: int | None = None,
         pad_multiple: int | None = None,
         fuse_permute: bool = False,
+        cache_output: bool = False,
     ) -> torch.Tensor:
         """Combine dispatched expert outputs through HybridEP.
 
@@ -907,26 +955,37 @@ class HybridEPCombine(torch.autograd.Function):
             num_permuted_tokens: Optional static dispatched-token capacity.
             pad_multiple: Optional token padding multiple.
             fuse_permute: Whether to fuse output unpermutation into combine.
+            cache_output: ``BackendConfig.dispatcher_recompute_cache``: in a checkpoint forward keep a clone
+                of the output in the block's :class:`MoERecomputeCache`; in the recompute return that clone
+                instead of re-running the unpermute, the EP-group barrier and the combine all-to-all. The
+                backward (the gradient all-to-all through the dispatch handle) is unchanged.
 
         Returns:
             Combined hidden states with shape [tokens, hidden].
         """
+        ctx.handle = handle
+        ctx.pad_multiple = pad_multiple
+        ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.fuse_permute = fuse_permute
+        replay = moe_combine_replay.current() if cache_output else None
+        if replay is not None and replay[1] == "replay":
+            cached = replay[0].take()
+            if cached is not None:
+                return cached
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
             hidden=x,
             handle=handle,
             pad_multiple=pad_multiple,
             fuse_unpermute_combine=fuse_permute,
         )
-        ctx.handle = handle
-        ctx.pad_multiple = pad_multiple
-        ctx.num_permuted_tokens = num_permuted_tokens
-        ctx.fuse_permute = fuse_permute
+        if replay is not None and replay[1] == "record":
+            replay[0].record(combined_hidden)
         return combined_hidden
 
     @staticmethod
     def backward(
         ctx: torch.autograd.function.FunctionCtx, grad_x: torch.Tensor
-    ) -> tuple[torch.Tensor, None, None, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None]:
         """Redispatch combined-output gradients through the saved layout.
 
         Args:
@@ -951,7 +1010,7 @@ class HybridEPCombine(torch.autograd.Function):
             # as before this change, which only moves the capacity path off the drain.
             non_blocking=isinstance(ctx.num_permuted_tokens, int),
         )
-        return dispatched_hidden, None, None, None, None
+        return dispatched_hidden, None, None, None, None, None
 
 
 if HAVE_HYBRIDEP:
@@ -1024,6 +1083,7 @@ if HAVE_HYBRIDEP:
         pad_multiple: int | None = None,
         *,
         fuse_permute: bool = False,
+        cache_output: bool = False,
     ) -> torch.Tensor:
         """Combine expert outputs through HybridEP.
 
@@ -1033,11 +1093,13 @@ if HAVE_HYBRIDEP:
             num_permuted_tokens: Static token capacity used by non-blocking dispatch.
             pad_multiple: Optional token padding multiple.
             fuse_permute: Fuse output unpermutation into the combine kernel.
+            cache_output: Serve the output from the checkpoint forward in the recompute
+                (``BackendConfig.dispatcher_recompute_cache``).
 
         Returns:
             Combined hidden states in the original token order with shape [tokens, hidden].
         """
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fuse_permute)
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fuse_permute, cache_output)
 
 else:
     hybrid_ep_dispatch = None

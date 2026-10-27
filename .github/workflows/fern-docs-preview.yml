@@ -122,7 +122,7 @@ jobs:
         run: |
           set -euo pipefail
           test -z "$(find pr-source/docs -type l -print -quit)"
-          for VERSION in v0.4 v0.5; do
+          for VERSION in v0.4 v0.5 v0.7; do
             ROOT="docs/fern/versions/$VERSION/pages"
             test -d "archived-source/$ROOT"
             rm -rf "pr-source/$ROOT"
