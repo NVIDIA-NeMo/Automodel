@@ -73,6 +73,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.qwen3_5.layers import Qwen3_5FusedRMSNorm, Qwen3_5FusedRMSNormGated
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     HostTensor,
@@ -430,8 +431,17 @@ class Qwen3_5DenseBlock(Block):
 
     def __init__(self, layer_idx, config, moe_config, backend):
         super().__init__(layer_idx, config, moe_config, backend)
+        # Same parameters and math as the inherited norms, fused into one kernel on CUDA.
+        self.input_layernorm = Qwen3_5FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         if self.layer_type == "linear_attention":
             self.linear_attn = CPAwareGatedDeltaNet(config, layer_idx)
+            self.linear_attn.norm = Qwen3_5FusedRMSNormGated(
+                self.linear_attn.head_v_dim, eps=self.linear_attn.layer_norm_epsilon
+            )
+        elif self.layer_type == "full_attention":
+            self.self_attn.q_norm = Qwen3_5FusedRMSNorm(self.self_attn.head_dim, eps=config.rms_norm_eps)
+            self.self_attn.k_norm = Qwen3_5FusedRMSNorm(self.self_attn.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -571,7 +581,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         self.layers = nn.ModuleDict(
             {str(i): Qwen3_5DenseBlock(i, config, moe_config, backend) for i in range(config.num_hidden_layers)}
         )
-        self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Fp32SafeQwen3_5TextRotaryEmbedding(config=config)
 
     def forward(
