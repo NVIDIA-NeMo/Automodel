@@ -23,6 +23,7 @@ import nemo_automodel.components.models.deepseek_v41.attention as attention_mod
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41Attention, DeepseekV41AttentionState
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
+from tests.unit_tests.models.deepseek_v41.test_sparse_index_replay import reference_sparse_kernel
 
 
 def _config(**overrides) -> DeepseekV41TextConfig:
@@ -116,12 +117,13 @@ def test_attention_accepts_cudnn_rejects_dropout_and_matches_eager(monkeypatch: 
     eager.load_state_dict(layer.state_dict())
     calls: list[str] = []
 
-    def reference_kernel(
-        q, kv, sinks, topk_idxs, sm_scale, *, backend, reference_rounding=False, all_rows_nonempty=False
-    ):
+    def reference_kernel(q, kv, sinks, topk_idxs, sm_scale, *, backend, plan=None, **kwargs):
         calls.append(backend)
-        assert all_rows_nonempty is True  # no padding mask: the layer tells the cuDNN backward every row is nonempty
-        return kernels.sparse_attention_torch(q.float(), kv.float(), sinks, topk_idxs.long(), sm_scale).to(q.dtype)
+        assert (
+            kwargs["all_rows_nonempty"] is True
+        )  # no padding mask: the layer tells the backward every row is nonempty
+        assert plan is not None and plan.backend == "cudnn"  # the layer hands the kernel its once-per-lineage plan
+        return reference_sparse_kernel(q, kv, sinks, topk_idxs, sm_scale, backend=backend, plan=plan, **kwargs)
 
     monkeypatch.setattr(attention_mod, "dsv4_sparse_attention", reference_kernel)
     hidden = torch.randn(2, 6, 16)

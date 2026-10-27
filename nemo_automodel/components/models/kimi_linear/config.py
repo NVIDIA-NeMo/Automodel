@@ -20,6 +20,8 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
+from nemo_automodel.components.models.kimi_linear.flops import model_flops
+
 
 class KimiLinear48BConfig(PretrainedConfig):
     """HF-compatible configuration for Kimi Linear 48B A3B causal LM checkpoints.
@@ -36,6 +38,7 @@ class KimiLinear48BConfig(PretrainedConfig):
     model_type = "kimi_linear_48b_a3b"
     architectures = ["KimiLinear48BForCausalLM"]
     keys_to_ignore_at_inference = ["past_key_values"]
+    flops_formula = staticmethod(model_flops)
 
     def __init__(
         self,
