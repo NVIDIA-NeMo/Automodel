@@ -47,6 +47,7 @@ model:
   attn_implementation: sdpa
   text_config:
     cp_full_attn_backend: ffpa
+    cp_sliding_attn_backend: fa
 
 checkpoint:
   enabled: false
