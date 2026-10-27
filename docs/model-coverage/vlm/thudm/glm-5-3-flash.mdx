@@ -54,6 +54,15 @@ parallelism, pipeline parallelism, and video training are not enabled. An EP
 size must evenly divide the model's 288 routed experts and fit the available GPU
 memory; EP72 is the published validated topology, not a model requirement.
 
+The checkpoint's multi-token prediction (MTP) layer, stored as decoder layer 45,
+is built when `text_config.num_nextn_predict_layers` is 1 (the checkpoint
+value). It is a pre-norm KPool-DSA attention and MoE block without mHC that
+predicts the token after next from the backbone output and the next token's
+embedding. It trains with the auxiliary MTP loss (weight
+`mtp_loss_scaling_factor`, default 0.1) and is exported back as layer 45, so a
+fine-tuned checkpoint keeps the draft head used for speculative decoding. The
+published recipe sets `num_nextn_predict_layers: 0`, which skips the layer.
+
 For chat SFT through `ChatDataset`, set the dataset's `chat_template` to
 `examples/llm_finetune/glm5_next/glm5_3_flash_training_chat_template.jinja`.
 GLM ends an assistant turn with the next role token (`<|user|>`,
