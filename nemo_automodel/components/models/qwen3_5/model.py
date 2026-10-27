@@ -73,7 +73,12 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.qwen3_5.layers import Qwen3_5FusedRMSNorm, Qwen3_5FusedRMSNormGated
+from nemo_automodel.components.models.qwen3_5.layers import (
+    Qwen3_5FusedMLP,
+    Qwen3_5FusedRMSNorm,
+    Qwen3_5FusedRMSNormGated,
+    Qwen3_5FusedSSMGate,
+)
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
     HostTensor,
@@ -431,14 +436,25 @@ class Qwen3_5DenseBlock(Block):
 
     def __init__(self, layer_idx, config, moe_config, backend):
         super().__init__(layer_idx, config, moe_config, backend)
-        # Same parameters and math as the inherited norms, fused into one kernel on CUDA.
+        # Same parameters and math as the inherited modules, with elementwise chains fused on CUDA.
         self.input_layernorm = Qwen3_5FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = Qwen3_5FusedMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            backend.linear,
+            dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+        )
         if self.layer_type == "linear_attention":
             self.linear_attn = CPAwareGatedDeltaNet(config, layer_idx)
             self.linear_attn.norm = Qwen3_5FusedRMSNormGated(
                 self.linear_attn.head_v_dim, eps=self.linear_attn.layer_norm_epsilon
             )
+            # Move the fp32 A_log/dt_bias parameters into a gate that fuses the decay computation.
+            gate = self.linear_attn._fp32_params
+            fused_gate = Qwen3_5FusedSSMGate(gate.A_log.shape[0], dtype=gate.A_log.dtype)
+            fused_gate.A_log, fused_gate.dt_bias = gate.A_log, gate.dt_bias
+            self.linear_attn._fp32_params = fused_gate
         elif self.layer_type == "full_attention":
             self.self_attn.q_norm = Qwen3_5FusedRMSNorm(self.self_attn.head_dim, eps=config.rms_norm_eps)
             self.self_attn.k_norm = Qwen3_5FusedRMSNorm(self.self_attn.head_dim, eps=config.rms_norm_eps)
@@ -491,14 +507,16 @@ class Qwen3_5DenseBlock(Block):
                 freqs_cis = freqs_cis.flatten(0, 1)[indices]
                 attention_mask = None
                 padding_mask = None
-            output = super().forward(
-                x,
-                freqs_cis=freqs_cis,
+            # Mirrors the inherited ``Block.forward`` so the residual add can fuse into the MLP norm.
+            if attention_mask is not None and padding_mask is None:
+                padding_mask = attention_mask.bool().logical_not()
+            attn_out = self.self_attn(
+                x=self.input_layernorm(x),
                 attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                position_ids=position_ids,
+                freqs_cis=freqs_cis,
                 **attn_kwargs,
             )
+            output = self._post_attention(x, attn_out, padding_mask)
             if padded_x is not None:
                 output = padded_x.flatten(0, 1).index_copy(0, indices, output).view_as(padded_x)
             return output
@@ -534,9 +552,26 @@ class Qwen3_5DenseBlock(Block):
             cu_seqlens_cpu=packed_gdn_metadata.cu_seqlens_cpu if packed_gdn_metadata is not None else None,
             indices=packed_gdn_metadata.indices if packed_gdn_metadata is not None else None,
         )
-        x = x + attn_out
-        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
-        return x + mlp_out
+        return self._post_attention(x, attn_out, padding_mask)
+
+    def _post_attention(
+        self, x: torch.Tensor, attn_out: torch.Tensor, padding_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Add the attention output to the residual stream, then apply the MLP sub-block.
+
+        The residual add is fused into the post-attention norm.
+
+        Args:
+            x: Residual stream of shape [batch, sequence, hidden], or [tokens, hidden]
+                for the unpadded TE stream.
+            attn_out: Attention or GatedDeltaNet output with x's shape.
+            padding_mask: Optional padding mask of shape [batch, sequence].
+
+        Returns:
+            Hidden states with x's shape.
+        """
+        x, normed = self.post_attention_layernorm(attn_out, residual=x)
+        return x + self._mlp(x=normed, padding_mask=padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
