@@ -159,6 +159,22 @@ _DTYPE_IDS = {
 }
 
 
+def _copy_metadata_to_device(values: list[int], device: torch.device) -> torch.Tensor:
+    """Copy host integer metadata without a blocking CUDA transfer.
+
+    Args:
+        values: Host integer entries.
+        device: Destination device.
+
+    Returns:
+        Int64 tensor of shape [entries] on ``device``.
+    """
+    host = torch.tensor(values, dtype=torch.int64)
+    if device.type == "cuda":
+        host = host.pin_memory()
+    return host.to(device=device, non_blocking=device.type == "cuda")
+
+
 def _build_chunk_ends(tensors: Sequence[torch.Tensor], device: torch.device) -> tuple[torch.Tensor, int]:
     """Build the exclusive upper chunk bound for each input tensor.
 
@@ -172,7 +188,7 @@ def _build_chunk_ends(tensors: Sequence[torch.Tensor], device: torch.device) -> 
     """
     counts = [(t.numel() + _CHUNK - 1) // _CHUNK for t in tensors]
     chunk_ends = list(accumulate(counts))
-    return torch.tensor(chunk_ends, dtype=torch.int64, device=device), chunk_ends[-1]
+    return _copy_metadata_to_device(chunk_ends, device), chunk_ends[-1]
 
 
 def _kernel_eligible(t: torch.Tensor) -> bool:
@@ -190,8 +206,8 @@ def _kernel_eligible(t: torch.Tensor) -> bool:
 
 def _reduce_one_dtype(tensors: Sequence[torch.Tensor], reduce_op: int, device, dtype) -> torch.Tensor:
     """Launch the kernel once for a set of same-dtype, kernel-eligible tensors."""
-    ptrs = torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64, device=device)
-    numels = torch.tensor([t.numel() for t in tensors], dtype=torch.int64, device=device)
+    ptrs = _copy_metadata_to_device([t.data_ptr() for t in tensors], device)
+    numels = _copy_metadata_to_device([t.numel() for t in tensors], device)
     if len(tensors) == 1:
         chunk_ends = numels
         num_chunks = (tensors[0].numel() + _CHUNK - 1) // _CHUNK

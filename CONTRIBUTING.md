@@ -1,5 +1,11 @@
 # Contributing To NeMo-Automodel
 
+## Coding guidelines
+
+Follow the [coding guidelines](CODING_GUIDELINES.md) when adding or modifying code.
+Existing code is being refactored incrementally and may not yet comply. Agents
+must also follow [AGENTS.md](AGENTS.md) and applicable contributor skills.
+
 ## Environment setup for Automodel
 
 Common workflows used for setting up Automodel environment:
@@ -189,6 +195,36 @@ The check covers the same paths as Bandit (`app.py`, `nemo_automodel/`, `example
 ```bash
 python tools/lint_no_globals.py
 ```
+
+## Python annotation coverage
+
+Every pull request, including documentation-only changes, runs the **Python type
+coverage** workflow. Open its **Python annotation coverage** job summary for
+package-wide and per-area coverage, plus changes from the PR's merge-base.
+The same report is printed in the **Report annotation coverage** step's log.
+The `type-coverage` artifact contains the summary and JSON with per-function
+annotations and exclusion reasons.
+
+Raw coverage counts signatures with all parameters and the return annotated.
+Strict coverage also excludes `Any`, `object`, nullable unions (`T | None` and
+`Optional[T]`), `None` parameter defaults, bare generics, `Callable[..., T]`,
+casts, type-checker suppressions, and `no_type_check`. A return of `-> None`
+counts as typed. These conservative exclusions can include valid contracts;
+the metric measures annotation syntax, not type soundness. Signature and local
+variable annotations, module-local aliases, and quoted annotations are inspected;
+cross-module aliases and inferred types are not resolved.
+
+The report includes tracked Python source under `nemo_automodel/`, including
+nested functions, kernels, and vendored code. It excludes tests and examples.
+It reports coverage without enforcing a minimum. Run it locally with Python
+3.11 or newer; no package dependencies are needed:
+
+```bash
+python tools/type_coverage.py --head HEAD --base origin/main --output-dir /tmp/type-coverage
+```
+
+Both revisions use the same reporter. Only committed source is measured;
+working-tree changes are excluded.
 
 ## Unit-test runtime
 

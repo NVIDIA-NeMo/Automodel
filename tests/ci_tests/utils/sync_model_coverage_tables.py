@@ -29,7 +29,19 @@ TABLE_ROW_COUNT = 10
 # Preserve model-card source paths used by marketing and published blog posts.
 # Keep compatibility copies on disk, but catalog only their canonical cards.
 MODEL_CARD_PATH_ALIASES = {
-    "docs/model-coverage/vlm/muse/muse_spark_open.mdx": "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx",
+    "docs/model-coverage/llm/moonshotai/kimi-linear.mdx": (
+        "docs/model-coverage/llm/moonshotai/kimi-linear-48b-a3b-instruct.mdx"
+    ),
+    "docs/model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx": (
+        "docs/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base.mdx"
+    ),
+    "docs/model-coverage/llm/flint/flint.mdx": "docs/model-coverage/llm/recursivesi/flint.mdx",
+    "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx": (
+        "docs/model-coverage/vlm/meta-models/muse-spark-open-816b-a42b.mdx"
+    ),
+    "docs/model-coverage/vlm/muse/muse_spark_open.mdx": (
+        "docs/model-coverage/vlm/meta-models/muse-spark-open-816b-a42b.mdx"
+    ),
     "docs/model-coverage/vlm/stepfun-ai/step-5-preview.mdx": (
         "docs/model-coverage/vlm/stepfun-ai/step-5-preview-bf16.mdx"
     ),
@@ -478,7 +490,9 @@ def _load_model_doc_catalog(
     model_coverage_root = docs_root / "model-coverage"
     for directory, model_type in directory_types.items():
         for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
-            if path.name == "index.mdx" or path.relative_to(docs_root.parent).as_posix() in MODEL_CARD_PATH_ALIASES:
+            canonical = MODEL_CARD_PATH_ALIASES.get(path.relative_to(docs_root.parent).as_posix())
+            # Trusted tooling can run against a PR that predates the canonical copy.
+            if path.name == "index.mdx" or (canonical is not None and (docs_root.parent / canonical).is_file()):
                 continue
             document = path.read_text(encoding="utf-8")
             slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)

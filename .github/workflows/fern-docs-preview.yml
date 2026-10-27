@@ -122,7 +122,7 @@ jobs:
         run: |
           set -euo pipefail
           test -z "$(find pr-source/docs -type l -print -quit)"
-          for VERSION in v0.4 v0.5; do
+          for VERSION in v0.4 v0.5 v0.7; do
             ROOT="docs/fern/versions/$VERSION/pages"
             test -d "archived-source/$ROOT"
             rm -rf "pr-source/$ROOT"
@@ -171,6 +171,8 @@ jobs:
       - name: Use validated PR nightly navigation
         run: |
           uv run --no-project --isolated --python 3.12 --with pyyaml==6.0.3 python -I - <<'PY'
+          import base64
+          import binascii
           import os
           import re
           from pathlib import Path
@@ -189,6 +191,35 @@ jobs:
 
           trusted_folders = {item["folder"] for item in entries(trusted["navigation"]) if "folder" in item}
           trusted_icons = {item["icon"] for item in entries(trusted["navigation"]) if "icon" in item}
+          # New providers use the generator's fixed SVG wrapper around raster data.
+          # Never allow arbitrary PR SVG markup, attributes, paths or remote URLs.
+          provider_icon = re.compile(
+              r'<svg xmlns="http://www\.w3\.org/2000/svg" viewBox="0 0 20 20">'
+              r'<image width="20" height="20" href="data:image/webp;base64,([A-Za-z0-9+/=]+)"/></svg>'
+          )
+
+          def valid_icon(icon: object) -> bool:
+              if not isinstance(icon, str):
+                  return False
+              if icon in trusted_icons:
+                  return True
+              if len(icon) > 16 * 1024:
+                  return False
+              match = provider_icon.fullmatch(icon)
+              if match is None:
+                  return False
+              try:
+                  image = base64.b64decode(match[1], validate=True)
+              except binascii.Error:
+                  return False
+              return (
+                  base64.b64encode(image).decode("ascii") == match[1]
+                  and image[:4] == b"RIFF"
+                  and image[8:12] == b"WEBP"
+                  and image[12:16] in {b"VP8 ", b"VP8L", b"VP8X"}
+                  and int.from_bytes(image[4:8], "little") == len(image) - 8
+              )
+
           allowed_keys = {
               "page": {"page", "path", "slug"},
               "section": {"section", "path", "contents", "slug", "skip-slug", "icon"},
@@ -213,8 +244,8 @@ jobs:
                       raise ValueError("Navigation slugs must be strings")
                   if "skip-slug" in item and not isinstance(item["skip-slug"], bool):
                       raise ValueError("skip-slug must be a boolean")
-                  if "icon" in item and (not isinstance(item["icon"], str) or item["icon"] not in trusted_icons):
-                      raise ValueError("Preview icons must come from trusted navigation")
+                  if "icon" in item and not valid_icon(item["icon"]):
+                      raise ValueError("Preview icons must be trusted or compact embedded WebP provider logos")
                   if kind == "folder" and item["folder"] not in trusted_folders:
                       raise ValueError("Generated folders must come from trusted navigation")
                   if kind == "page" and "path" not in item:

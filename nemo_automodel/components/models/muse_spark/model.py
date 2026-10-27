@@ -322,11 +322,6 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.config = config
         self.backend = backend or BackendConfig()
-        if self.backend.experts == "te":
-            raise ValueError(
-                "Muse Spark Open per-expert post normalization requires experts='torch_mm' or 'gmm'; "
-                "Transformer Engine GroupedLinear cannot place that norm before top-k reduction"
-            )
         self.model = MuseSparkTextModel(config, self.backend, moe_config)
         dtype = next_dtype(config)
         self.vision_model = MuseSparkVisionModel(config)

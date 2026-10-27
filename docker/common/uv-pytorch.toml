@@ -1,4 +1,6 @@
 override-dependencies = [
+    # Override Trackio's Pillow<13 cap to enforce the security update.
+    "pillow==13.0.0",
     # leptonai (via nemo-run) caps anyio<=4.9.0; retain the security floor
     "anyio>=4.14.2",
     "cuda-bindings; sys_platform == 'never'",
