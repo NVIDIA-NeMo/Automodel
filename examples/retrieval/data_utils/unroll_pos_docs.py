@@ -13,10 +13,13 @@
 # limitations under the License.
 
 """
-Unroll training data with multiple positive documents into records with single positive documents.
+Unroll training data with multiple positive documents into records with one supervised positive first.
 
 This script takes training data where each question has multiple positive documents
-and creates a new dataset where each (question, pos_doc) pair becomes its own record.
+and creates a new dataset where each (question, pos_doc[0]) pair becomes its own
+record. The remaining known positives stay in pos_doc after the supervised positive
+so hard-negative mining can exclude the full positive set. AutoModel retrieval
+training uses pos_doc[0] as the supervised positive.
 
 Input Format:
     Expects NeMo Retriever training data format (train.json):
@@ -35,14 +38,18 @@ Input Format:
     }
 
 Output:
-    Same format, but each record has exactly one positive document:
-    {"question_id": "q0_0", "question": "...", "pos_doc": [{"id": "d1"}]}
-    {"question_id": "q0_1", "question": "...", "pos_doc": [{"id": "d2"}]}
+    Same format, but each record starts with a different supervised positive:
+    {"question_id": "q0_0", "original_question_id": "q0", "pos_doc": [{"id": "d1"}, {"id": "d2"}]}
+    {"question_id": "q0_1", "original_question_id": "q0", "pos_doc": [{"id": "d2"}, {"id": "d1"}]}
 
 Usage:
-    python examples/retrieval/data_utils/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json
-    python examples/retrieval/data_utils/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json --output data/nv_pp_dd_sdg_train_eval/train_unrolled.json
-    python examples/retrieval/data_utils/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json --suffix _unrolled
+    uv run python examples/retrieval/data_utils/unroll_pos_docs.py data/nv_pp_dd_sdg_train_eval/train.json
+    uv run python examples/retrieval/data_utils/unroll_pos_docs.py \
+        data/nv_pp_dd_sdg_train_eval/train.json \
+        --output data/nv_pp_dd_sdg_train_eval/train_unrolled.json
+    uv run python examples/retrieval/data_utils/unroll_pos_docs.py \
+        data/nv_pp_dd_sdg_train_eval/train.json \
+        --suffix _unrolled
 """
 
 import argparse
@@ -51,46 +58,67 @@ from pathlib import Path
 from typing import Any
 
 
+def _doc_id(doc: Any) -> str:
+    """Return a document ID from either a raw ID or a {"id": ...} mapping."""
+    raw_id = doc.get("id") if isinstance(doc, dict) else doc
+    if raw_id is None:
+        raise ValueError(f"Document entry is missing an id: {doc!r}")
+    return str(raw_id)
+
+
+def _drop_known_positives_from_negatives(neg_docs: list[Any], pos_docs: list[Any]) -> list[Any]:
+    """Remove any negative whose ID is already known to be positive."""
+    pos_ids = {_doc_id(doc) for doc in pos_docs}
+    return [doc for doc in neg_docs if _doc_id(doc) not in pos_ids]
+
+
 def unroll_training_data(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Unroll training records with multiple positive docs into individual records.
+
+    Each output row keeps one supervised positive first, while retaining sibling
+    positives after it for false-negative filtering in downstream mining.
 
     Args:
         data: List of training records with potentially multiple pos_doc entries
 
     Returns:
-        List of training records where each has exactly one pos_doc
+        List of training records where each row has a different pos_doc[0]
     """
     unrolled = []
 
     for record in data:
         pos_docs = record.get("pos_doc", [])
+        neg_docs = _drop_known_positives_from_negatives(record.get("neg_doc", []), pos_docs)
 
         if len(pos_docs) <= 1:
             # Already has single (or zero) pos_doc, keep as-is
-            unrolled.append(record)
+            new_record = dict(record)
+            new_record["neg_doc"] = neg_docs
+            unrolled.append(new_record)
         else:
             # Unroll into multiple records
             base_question_id = record["question_id"]
 
             for idx, pos_doc in enumerate(pos_docs):
+                ordered_pos_docs = [pos_doc] + [other_pos_doc for j, other_pos_doc in enumerate(pos_docs) if j != idx]
                 new_record = {
                     "question_id": f"{base_question_id}_{idx}",
+                    "original_question_id": record.get("original_question_id", base_question_id),
                     "question": record["question"],
                     "corpus_id": record["corpus_id"],
-                    "pos_doc": [pos_doc],
-                    "neg_doc": record.get("neg_doc", []),
+                    "pos_doc": ordered_pos_docs,
+                    "neg_doc": neg_docs,
                 }
                 unrolled.append(new_record)
 
     return unrolled
 
 
-def main():
-    """Run positive-document unrolling from the command line."""
-
+def main() -> None:
+    """Unroll a retrieval dataset and write one record per positive document."""
     parser = argparse.ArgumentParser(
-        description="Unroll training data with multiple positive docs into single-pos-doc records"
+        description="Unroll training data so each sibling positive is supervised first while preserving all positives"
     )
     parser.add_argument("input_file", type=str, help="Path to input training JSON file")
     parser.add_argument(
