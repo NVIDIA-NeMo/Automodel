@@ -279,7 +279,7 @@ class VlmDataloaderConfig:
     chat_template: str | None = None
     shuffle: bool = True
     num_workers: int = 0
-    """Worker processes per dataloader; zero selects the available CPU count with a warning."""
+    """Worker processes per dataloader; zero selects available CPUs, capped at 4 * visible GPUs when present."""
     pin_memory: bool = False
     persistent_workers: bool = False
     prefetch_factor: int | None = None
@@ -436,13 +436,18 @@ class VlmDataloaderConfig:
                 available_cpus = len(os.sched_getaffinity(0))
             except (AttributeError, OSError, NotImplementedError):
                 available_cpus = None
-            num_workers = available_cpus or os.cpu_count() or 1
+            num_cpus = available_cpus or os.cpu_count() or 1
+            num_gpus = torch.cuda.device_count()
+            num_workers = min(4 * num_gpus, num_cpus) if num_gpus > 0 else num_cpus
             logger.warning(
-                "VLM dataloader num_workers=0 disables background preprocessing and prefetching; "
-                "using num_workers=%d based on the CPUs available to this process. "
+                "VLM dataloader num_workers=0 selects automatic preprocessing and prefetching; "
+                "using num_workers=%d with %d visible GPUs and %d available CPUs "
+                "(capped at 4 workers per visible GPU when GPUs are available). "
                 "This count is per dataloader; set an explicit positive num_workers "
-                "to limit workers when training ranks share CPUs.",
+                "to override the automatic selection.",
                 num_workers,
+                num_gpus,
+                num_cpus,
             )
         dataloader = _VlmStatefulDataloader(
             dataset=dataset,
@@ -451,8 +456,8 @@ class VlmDataloaderConfig:
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            prefetch_factor=self.prefetch_factor,
+            persistent_workers=self.persistent_workers and num_workers > 0,
+            prefetch_factor=self.prefetch_factor if num_workers > 0 else None,
             drop_last=self.drop_last,
         )
         return VlmDataloaderBuild(dataloader=dataloader, processor=processor)
