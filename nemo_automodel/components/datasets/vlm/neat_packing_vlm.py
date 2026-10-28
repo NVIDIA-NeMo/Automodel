@@ -246,18 +246,33 @@ def _estimate_video_tokens(vid_meta, video_cfg: dict) -> int:
     return grid_t * (resized_h // video_cfg["patch_size"]) * (resized_w // video_cfg["patch_size"]) // merge_length
 
 
+def _image_token_counter(processor) -> Callable[[int, int], int] | None:
+    """Return ``(height, width) -> image tokens`` from the processor, or ``None`` when it cannot count them.
+
+    Uses ``_get_num_multimodal_tokens``, the per-image token count that Hugging Face
+    VLM processors expose for serving engines, so each processor applies its own
+    resize, patching and token merging.
+    """
+    get_num_multimodal_tokens = getattr(processor, "_get_num_multimodal_tokens", None)
+    if get_num_multimodal_tokens is None:
+        return None
+    return lambda height, width: get_num_multimodal_tokens(image_sizes=[(height, width)]).num_image_tokens[0]
+
+
 def _estimate_sample_length(
     example: dict,
     image_cfg: dict | None = None,
     video_cfg: dict | None = None,
+    count_image_tokens: Callable[[int, int], int] | None = None,
 ) -> _SampleLengthEstimate:
     """Estimate token count from raw conversation without tokenization.
 
     Uses pre-computed ``_text_tokens`` (from ``precompute_tokens.py``) when
     available, otherwise falls back to ``chars // 3``.  Media tokens are
-    estimated via ``smart_resize`` when processor configs are provided, from
-    ``mm_inputs_meta`` sizes or, without metadata, from the sizes of the
-    conversation's images. Media of unknown size count as ``_FALLBACK_MEDIA_TOKENS``.
+    estimated via ``smart_resize`` from ``mm_inputs_meta`` sizes when processor
+    configs are provided. Without metadata, images are sized from their pixels
+    and ``count_image_tokens(height, width)`` converts each size to tokens.
+    Media of unknown size, or without a counter, count as ``_FALLBACK_MEDIA_TOKENS``.
     """
     # Text tokens
     precomputed = example.get("_text_tokens")
@@ -303,13 +318,13 @@ def _estimate_sample_length(
         media_tokens = 0
         for item in media_items:
             size = None
-            if item["type"] == "image" and image_cfg is not None:
+            if item["type"] == "image" and count_image_tokens is not None:
                 size = _image_height_width(item.get("image"))
             if size is None:
                 media_tokens += _FALLBACK_MEDIA_TOKENS
                 unsized_media += 1
             else:
-                media_tokens += _estimate_image_tokens(size, image_cfg)
+                media_tokens += count_image_tokens(*size)
 
     return _SampleLengthEstimate(text_tokens + media_tokens, media_tokens, unsized_media)
 
@@ -837,6 +852,7 @@ def neat_pack_dataset_vlm(
     # Extract processor configs for accurate media token estimation
     image_cfg = LengthGroupedSampler._extract_image_config(processor) if processor is not None else None
     video_cfg = LengthGroupedSampler._extract_video_config(processor) if processor is not None else None
+    count_image_tokens = _image_token_counter(processor)
     if image_cfg is not None or video_cfg is not None:
         logger.info("Neat packing VLM: using processor configs for media token estimation.")
     else:
@@ -870,7 +886,9 @@ def neat_pack_dataset_vlm(
         t0 = time.perf_counter()
 
         for i in range(N):
-            estimate = _estimate_sample_length(ds_raw[i], image_cfg=image_cfg, video_cfg=video_cfg)
+            estimate = _estimate_sample_length(
+                ds_raw[i], image_cfg=image_cfg, video_cfg=video_cfg, count_image_tokens=count_image_tokens
+            )
             unsized_media += estimate.unsized_media
             est_len = _aligned_length(max(estimate.total_tokens - 1, 0), sequence_alignment)  # -1 for shift
             if est_len > pack_size:
@@ -906,8 +924,8 @@ def neat_pack_dataset_vlm(
         )
         if unsized_media:
             logger.warning(
-                "Neat packing VLM: %d media items have no mm_inputs_meta or readable image size and were "
-                "estimated at %d tokens each, so packs may be over- or under-filled.",
+                "Neat packing VLM: %d media items have no mm_inputs_meta and no readable image size the processor "
+                "can count tokens for, and were estimated at %d tokens each, so packs may be over- or under-filled.",
                 unsized_media,
                 _FALLBACK_MEDIA_TOKENS,
             )
