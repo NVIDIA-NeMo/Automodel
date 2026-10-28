@@ -155,12 +155,17 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
 # instead of forcing C++17 (PyTorch's Rubin builds require C++20).
 # deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
 # Remove the configs.cuh/ibgda_device.cuh hunks when the pinned revision includes that fix.
+# The pinned revision includes https://github.com/deepseek-ai/DeepEP/pull/750,
+# which falls back to DMA-BUF when legacy ibv_reg_mr registration fails.
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
+ARG DEEPEP_COMMIT=96e3d1fc77be942438673e88b07be21d454af8a9
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
-RUN ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
+RUN apt-get update && apt-get install -y --allow-change-held-packages \
+        rdma-core libibverbs-dev && \
+    apt-get clean && \
+    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
     test -f /usr/lib/${ARCH_LIB}/libmlx5.so || \
         ln -sf /usr/lib/${ARCH_LIB}/libmlx5.so.1 /usr/lib/${ARCH_LIB}/libmlx5.so && \
     mkdir -p ${RDMA_CORE_HOME} && \

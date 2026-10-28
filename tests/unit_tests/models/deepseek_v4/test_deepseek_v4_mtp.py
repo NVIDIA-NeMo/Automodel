@@ -203,7 +203,8 @@ class TestMTPForward:
         expected_ids = torch.tensor([[11, 12, 13, 0]])
         torch.testing.assert_close(out[1], model.model.embed_tokens(expected_ids))
 
-    def test_pp_final_stage_uses_propagated_mtp_embeddings(self):
+    @pytest.mark.parametrize("return_hidden", [False, True])
+    def test_pp_final_stage_uses_propagated_mtp_embeddings(self, return_hidden):
         """Final PP stage computes MTP from the carried embeddings, not a local embed table."""
         cfg = _tiny_config(num_nextn_predict_layers=1)
         model = _make_model(cfg)
@@ -226,9 +227,14 @@ class TestMTPForward:
         model.model.forward = types.MethodType(fake_backbone, model.model)
         model.mtp.forward = types.MethodType(fake_mtp, model.mtp)
 
+        model._pp_return_hidden_states = return_hidden
         activation = torch.zeros(1, 4, cfg.hc_mult, cfg.hidden_size)
         mtp_embed = torch.randn(1, 4, cfg.hidden_size)
         out = model(activation, mtp_embed)
+        expected_width = cfg.hidden_size if return_hidden else cfg.vocab_size
+        assert out[0].shape == (1, 4, expected_width)
+        _, metas = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=4, dtype=torch.float32)
+        assert metas[0].shape == out[0].shape
 
         assert isinstance(out, tuple)
         assert len(out) == 2
@@ -388,6 +394,20 @@ class TestPipelineHooks:
         assert final_outputs[0].shape == (2, 16, cfg.vocab_size)
         assert final_outputs[1].shape == (2, 16, cfg.hidden_size)
         assert final_outputs[2].shape == (2, 16, cfg.hidden_size)
+
+    @pytest.mark.parametrize("num_nextn_predict_layers", [0, 1])
+    def test_pp_chunked_ce_requires_mtp_disabled(self, num_nextn_predict_layers):
+        from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+        from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+        model = _make_model(_tiny_config(num_nextn_predict_layers=num_nextn_predict_layers))
+        loss_fn = ChunkedCrossEntropy(compile=False)
+        if num_nextn_predict_layers:
+            # The final stage would return an MTP tuple, which the PP linear loss rejects.
+            with pytest.raises(ValueError, match="pipeline stages that can return hidden states"):
+                _maybe_downgrade_loss_fn(loss_fn, model, True)
+        else:
+            assert _maybe_downgrade_loss_fn(loss_fn, model, True) is loss_fn
 
 
 if __name__ == "__main__":
