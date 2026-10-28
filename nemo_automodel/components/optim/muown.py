@@ -488,11 +488,14 @@ class Muown(_MuonBase):
         states = [self.state[param] for param in params]
         directions, updates, magnitude_gradients, triton_states = [], [], [], []
         for param, state in zip(params, states):
+            gradient = param.grad
+            if gradient is None:
+                raise ValueError("Muown batches only parameters that received a gradient.")
             local_state = None
             if group.get("use_triton", False) and shard_dim != axis % param.ndim:
                 tensors = (
                     param.detach(),
-                    param.grad,
+                    gradient,
                     state["momentum"],
                     state["g"],
                     state["v_norm"],
@@ -522,7 +525,7 @@ class Muown(_MuonBase):
                 magnitude_gradients.append(magnitude_grad)
                 continue
             direction, magnitude_grad, direction_grad = _prepare_direction(
-                param.detach(), _nonzero_magnitude(state["g"], group["epsilon"]), state["v_norm"], param.grad, axis
+                param.detach(), _nonzero_magnitude(state["g"], group["epsilon"]), state["v_norm"], gradient, axis
             )
             directions.append(direction)
             momentum = state["momentum"]
