@@ -42,6 +42,7 @@ class WholeStepGraphValidation:
     Attributes:
         num_gradients: Number of parameter gradients compared.
         max_relative_rmse: Largest per-gradient RMSE divided by the eager gradient RMS.
+        worst_gradient: Parameter name that produced ``max_relative_rmse``.
         max_eager_repeat_relative_rmse: Same statistic between two eager reruns; the
             run-to-run noise floor of the eager path itself.
         max_abs_loss_difference: Largest absolute difference between graph and eager
@@ -51,6 +52,7 @@ class WholeStepGraphValidation:
 
     num_gradients: int
     max_relative_rmse: float
+    worst_gradient: str
     max_eager_repeat_relative_rmse: float
     max_abs_loss_difference: float
     all_finite: bool
@@ -293,6 +295,7 @@ class WholeStepGraph:
             missing = sorted(set(graph_grads) ^ set(eager_grads))
             raise AssertionError(f"Whole-step graph and eager produced gradients for different parameters: {missing}")
         max_rmse = 0.0
+        worst_gradient = ""
         max_repeat_rmse = 0.0
         all_finite = True
         for name, expected in eager_grads.items():
@@ -300,11 +303,14 @@ class WholeStepGraph:
             if actual.shape != expected.shape:
                 raise AssertionError(f"Gradient shard shape differs between graph and eager for {name}")
             all_finite = all_finite and bool(torch.isfinite(actual).all() and torch.isfinite(expected).all())
-            max_rmse = max(max_rmse, _relative_rmse(actual, expected))
+            rmse = _relative_rmse(actual, expected)
+            if rmse >= max_rmse:
+                max_rmse, worst_gradient = rmse, name
             max_repeat_rmse = max(max_repeat_rmse, _relative_rmse(repeat_grads[name], expected))
         return WholeStepGraphValidation(
             num_gradients=len(eager_grads),
             max_relative_rmse=max_rmse,
+            worst_gradient=worst_gradient,
             max_eager_repeat_relative_rmse=max_repeat_rmse,
             max_abs_loss_difference=(graph_losses - eager_losses).abs().max().item(),
             all_finite=all_finite,

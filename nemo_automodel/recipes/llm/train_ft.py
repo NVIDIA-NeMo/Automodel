@@ -1523,7 +1523,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # unused full-vocabulary logits do not overlap its allocations.
                 del out, mtp_per_depth_h, mtp_per_depth_logits
                 if isinstance(num_label_tokens, torch.Tensor):
-                    local_loss = local_loss / num_label_tokens
+                    # Mirror the loss functions' integer division: divide in fp32 and
+                    # round back to the loss dtype, so both paths report the same value.
+                    local_loss = (local_loss.float() / num_label_tokens).to(local_loss.dtype)
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1582,11 +1584,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """
         report = self.whole_step_graph.validate(batches)
         logger.info(
-            "Whole-step graph validation at step %d: gradients=%d max_relative_rmse=%.3e "
+            "Whole-step graph validation at step %d: gradients=%d max_relative_rmse=%.3e (%s) "
             "eager_repeat_relative_rmse=%.3e max_abs_loss_difference=%.3e finite=%s",
             self.step_scheduler.step,
             report.num_gradients,
             report.max_relative_rmse,
+            report.worst_gradient,
             report.max_eager_repeat_relative_rmse,
             report.max_abs_loss_difference,
             report.all_finite,

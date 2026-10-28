@@ -168,6 +168,7 @@ class TestWholeStepGraphCuda:
             assert report.num_gradients == 2
             assert report.all_finite
             assert report.max_relative_rmse < 1e-5
+            assert report.worst_gradient in ("weight", "bias")
             assert report.max_eager_repeat_relative_rmse < 1e-5
             assert report.max_abs_loss_difference < 1e-5
             for name, parameter in model.named_parameters():
