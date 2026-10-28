@@ -19,12 +19,40 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, Tuple, Type, Union
+from typing import TYPE_CHECKING, Dict, Tuple, Type, Union
 
 import torch.nn as nn
 from transformers.configuration_utils import PretrainedConfig
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.datasets.vlm.loader import ImagePositionState
+
+
+_IMAGE_POSITION_STATE_FACTORIES = {
+    "gemma4": ("nemo_automodel.components.models.gemma4_moe.preprocessing", "Gemma4PositionState"),
+    "mistral3": ("nemo_automodel.components.models.mistral3.preprocessing", "Mistral3PositionState"),
+    "qwen2_5_vl": ("nemo_automodel.components.models.qwen2_5_vl.preprocessing", "Qwen2_5_VLPositionState"),
+    "qwen3_vl": ("nemo_automodel.components.models.qwen3_vl.preprocessing", "Qwen3VLPositionState"),
+}
+
+
+def resolve_image_position_state(model: nn.Module) -> "ImagePositionState":
+    """Build model-owned, configuration-only image preprocessing state.
+
+    The registry selects a certified factory from the actual built model config.
+    Only that configuration enters workers; no bound model method is serialized.
+    """
+    model = getattr(model, "module", model)
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    factory = _IMAGE_POSITION_STATE_FACTORIES.get(model_type)
+    if factory is None:
+        raise ValueError(f"Zephon image preprocessing has no certified position-state factory for {model_type!r}")
+    module_name, factory_name = factory
+    return getattr(importlib.import_module(module_name), factory_name)(config)
+
 
 # Static mapping: architecture name → (module_path, class_name[, tags]).
 # Analogous to HuggingFace transformers' MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.

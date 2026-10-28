@@ -3606,11 +3606,11 @@ def test_thd_vlm_collater_preserves_multi_media_pack_counts_for_pp():
 
 
 def test_merge_media_values_flattens_mixed_tensor_and_list_packs():
-    from nemo_automodel.components.datasets.vlm.collate_fns import _merge_media_values
+    from nemo_automodel.components.datasets.vlm.preprocessing import merge_media_values
 
     stacked = torch.randn(2, 3, 8, 8)  # one pack with uniform images
     ragged = [torch.randn(3, 12, 4), torch.randn(3, 6, 6)]  # another pack with variable resolution
-    merged = _merge_media_values([stacked, ragged])
+    merged = merge_media_values([stacked, ragged], dtype=torch.bfloat16)
 
     assert isinstance(merged, list)
     assert [tuple(v.shape) for v in merged] == [(3, 8, 8), (3, 8, 8), (3, 12, 4), (3, 6, 6)]

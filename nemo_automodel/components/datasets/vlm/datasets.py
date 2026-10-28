@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, NotRequired, TypedDict
 
 import torch
 import torch.utils.data
@@ -34,7 +34,7 @@ from datasets import Image as HfImage
 from PIL import Image
 from transformers import ProcessorMixin
 
-from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
+from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX, resolve_chat_template_string
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
     _lmdb_env_cache,
@@ -1492,6 +1492,213 @@ def _media_token_mismatch(input_ids, result, processor) -> str | None:
     return None
 
 
+class VlmMediaDecodeError(OSError):
+    """An image could not be decoded before processor/template execution."""
+
+
+class VlmMediaTokenMismatchError(ValueError):
+    """Expanded media tokens disagree with the processor's media metadata."""
+
+
+class EncodedVlmDocument(TypedDict):
+    """Unshifted processor result for one conversation.
+
+    ``input_ids``, ``labels`` and ``attention_mask`` have shape [sequence]. Pixel
+    tensors retain processor layouts [patches, features] or [images, channels,
+    height, width]; video pixels likewise retain their leading media/patch axis.
+    Grids have shape [media, 3] in temporal/height/width order, timestamps [videos],
+    image positions [patches, coordinate_axes], original image sizes [images, 2],
+    and token types [sequence].
+    """
+
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    labels: torch.Tensor
+    pixel_values: NotRequired[torch.Tensor]
+    pixel_values_videos: NotRequired[torch.Tensor]
+    image_grid_thw: NotRequired[torch.Tensor]
+    video_grid_thw: NotRequired[torch.Tensor]
+    second_per_grid_ts: NotRequired[torch.Tensor]
+    image_position_ids: NotRequired[torch.Tensor]
+    image_sizes: NotRequired[torch.Tensor]
+    mm_token_type_ids: NotRequired[torch.Tensor]
+
+
+def encode_vlm_document(
+    example: dict[str, object],
+    processor: ProcessorMixin,
+    *,
+    max_length: int | None = None,
+    truncate: bool = False,
+    inject_fake_images: bool = True,
+    post_tokenize_hook: Callable[[dict[str, object], ProcessorMixin], dict[str, object]] | None = None,
+) -> EncodedVlmDocument:
+    """Encode one conversation without shifting, packing, retrying or choosing another document.
+
+    Args:
+        example: Native conversation document, with messages under ``conversation``.
+            Media may be paths or in-memory images/frames. The conversation structure
+            is copied before media loading; the caller's document is not modified.
+        processor: Effective processor with its selected tokenizer and chat template.
+        max_length: Optional expanded-token limit. Omit when a downstream packer
+            owns oversized-document policy.
+        truncate: Whether to truncate at the limit after constructing supervision.
+        inject_fake_images: Whether to keep vision participation for text-only input.
+        post_tokenize_hook: Optional native processor-result transformation. Input and
+            output use processor layouts: token tensors [1, sequence], pixel tensors
+            [patches, features] or [images, channels, height, width], media grids
+            [media, 3], and image positions [patches, coordinate_axes].
+
+    Returns:
+        Unshifted input IDs, labels and attention mask of shape [sequence], plus
+        processor-owned media fields with their original layouts. Token types use
+        [sequence] when supplied by the processor. Fake vision slots remain in IDs
+        and media but are excluded by the attention mask and labels.
+
+    Raises:
+        VlmMediaDecodeError: Image loading or RGB conversion fails before processing.
+        VlmMediaTokenMismatchError: Expanded token slots and media grids disagree.
+        ValueError: Expanded tokens exceed the configured limit. Other processor or
+            template errors propagate without being classified as corrupt media.
+    """
+    from nemo_automodel.components.datasets.vlm.collate_fns import (
+        _extract_media_from_conversations,
+        build_labels_from_template,
+    )
+    from nemo_automodel.components.datasets.vlm.fake_image import (
+        _conversation_has_media,
+        inject_fake_image_into_conversation,
+        mask_fake_vision_tokens_single,
+    )
+
+    example = dict(example)
+    example["conversation"] = [
+        {
+            **message,
+            "content": [dict(item) if isinstance(item, dict) else item for item in message["content"]]
+            if isinstance(message.get("content"), list)
+            else message.get("content"),
+        }
+        for message in example["conversation"]
+    ]
+    # preserve_video_metadata=True: store _video_fps and
+    # _frame_indices on each video item so we can fix timestamps.
+    try:
+        example = _preload_media(example, processor, preserve_video_metadata=True)
+    except (OSError, Image.DecompressionBombError) as exc:
+        # Keep decode failures distinct from processor/template configuration errors.
+        raise VlmMediaDecodeError(f"Cannot decode conversation media: {exc}") from exc
+    conversation = example["conversation"]
+
+    # Inject fake image into pure-text samples for FSDP/Zero3.
+    injected_fake = inject_fake_images and not _conversation_has_media(conversation)
+    if injected_fake:
+        conversation = inject_fake_image_into_conversation(conversation)
+
+    # Ensure images are RGB
+    for message in conversation:
+        content = message.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("image"), Image.Image):
+                    item["image"] = item["image"].convert("RGB")
+
+    # Preserve video timestamps and skip re-sampling pre-loaded frames.
+    video_metadata = _build_video_metadata(conversation)
+    processor_kwargs = {"do_sample_frames": False}
+    if video_metadata:
+        processor_kwargs["video_metadata"] = [video_metadata]
+
+    chat_template = processor.chat_template if isinstance(processor, ProcessorMixin) else None
+    template_kwargs = (
+        {"chat_template": resolve_chat_template_string(chat_template)} if isinstance(chat_template, dict) else {}
+    )
+    chat_template = resolve_chat_template_string(chat_template)
+    template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
+    if template_has_generation_kwd:
+        result = processor.apply_chat_template(
+            [conversation],
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            return_assistant_tokens_mask=True,
+            processor_kwargs=processor_kwargs,
+            **template_kwargs,
+        )
+    else:
+        text = processor.apply_chat_template([conversation], tokenize=False, **template_kwargs)
+        if isinstance(text, list):
+            text = text[0]
+        images, videos = _extract_media_from_conversations([conversation])
+        result = processor(text=[text], images=images, videos=videos, return_tensors="pt", **processor_kwargs)
+    if post_tokenize_hook is not None:
+        result = post_tokenize_hook(result, processor)
+
+    input_ids = result["input_ids"][0]  # (seq_len,)
+    seq_len = input_ids.shape[0]
+
+    # Precise length check — truncate or replace overlong samples
+    if max_length is not None and seq_len > max_length:
+        if not truncate:
+            raise ValueError(f"Document has {seq_len} tokens, exceeding max_length={max_length}.")
+
+    # Build labels BEFORE truncation so the full assistant text
+    # can be matched against the full input_ids.
+    if template_has_generation_kwd:
+        labels = result["input_ids"].masked_fill(result.pop("assistant_masks") == 0, -100)[0]
+    else:
+        labels = build_labels_from_template(result["input_ids"], [conversation], processor)[0]
+
+    # Now truncate if needed (after labels are built)
+    if truncate and max_length is not None and seq_len > max_length:
+        ml = max_length
+        input_ids = input_ids[:ml]
+        labels = labels[:ml]
+        result = {
+            k: (
+                v[:, :ml]
+                if isinstance(v, torch.Tensor) and v.dim() == 2 and v.shape[1] == seq_len
+                else v[:ml]
+                if isinstance(v, torch.Tensor) and v.dim() == 1 and v.shape[0] == seq_len
+                else v
+            )
+            for k, v in result.items()
+        }
+        seq_len = ml
+
+    mismatch = _media_token_mismatch(input_ids, result, processor)
+    if mismatch is not None:
+        raise VlmMediaTokenMismatchError(f"Media token mismatch after tokenization/truncation: {mismatch}.")
+
+    output = {
+        "input_ids": input_ids,
+        "attention_mask": result["attention_mask"][0],
+        "labels": labels,
+    }
+
+    # Copy media tensors (these don't have a sample batch dim)
+    for key in (
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "second_per_grid_ts",
+        "image_position_ids",
+        "image_sizes",
+        "mm_token_type_ids",
+    ):
+        if key in result and result[key] is not None:
+            output[key] = result[key]
+    if "mm_token_type_ids" in output:
+        output["mm_token_type_ids"] = output["mm_token_type_ids"].squeeze(0)
+
+    # Mask fake vision tokens so they don't affect attention.
+    if injected_fake:
+        mask_fake_vision_tokens_single(output, processor)
+
+    return output
+
+
 @dataclass
 class PreTokenizedDatasetWrapperConfig:
     """Construction-time configuration for :class:`PreTokenizedDatasetWrapper`."""
@@ -1504,7 +1711,7 @@ class PreTokenizedDatasetWrapperConfig:
     """If ``True``, truncate overlong samples instead of replacing them."""
     inject_fake_images: bool = True
     """If ``True``, inject a fake image into text-only samples for sharded training."""
-    post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None
+    post_tokenize_hook: Callable[[dict[str, object], ProcessorMixin], dict[str, object]] | None = None
     """Optional declarative callback applied to each tokenizer result."""
 
     def build(
@@ -1578,146 +1785,16 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         rng = _replacement_rng(idx)
-        from nemo_automodel.components.datasets.vlm.collate_fns import (
-            _extract_media_from_conversations,
-            build_labels_from_template,
-        )
-        from nemo_automodel.components.datasets.vlm.fake_image import (
-            _conversation_has_media,
-            inject_fake_image_into_conversation,
-            mask_fake_vision_tokens_single,
-        )
-
         for attempt in range(self.max_retries):
             try:
-                example = self.dataset[idx]
-                # preserve_video_metadata=True: store _video_fps and
-                # _frame_indices on each video item so we can fix timestamps.
-                example = _preload_media(
-                    example,
+                return encode_vlm_document(
+                    self.dataset[idx],
                     self.processor,
-                    preserve_video_metadata=True,
+                    max_length=self.max_length,
+                    truncate=self.truncate,
+                    inject_fake_images=self.inject_fake_images,
+                    post_tokenize_hook=self.post_tokenize_hook,
                 )
-                conversation = example["conversation"]
-
-                # Inject fake image into pure-text samples for FSDP/Zero3.
-                injected_fake = self.inject_fake_images and not _conversation_has_media(conversation)
-                if injected_fake:
-                    conversation = inject_fake_image_into_conversation(conversation)
-
-                # Ensure images are RGB
-                for message in conversation:
-                    content = message.get("content")
-                    if isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict) and isinstance(item.get("image"), Image.Image):
-                                item["image"] = item["image"].convert("RGB")
-
-                # Preserve video timestamps and skip re-sampling pre-loaded frames.
-                video_metadata = _build_video_metadata(conversation)
-                processor_kwargs = {"do_sample_frames": False}
-                if video_metadata:
-                    processor_kwargs["video_metadata"] = [video_metadata]
-
-                chat_template = self.processor.chat_template if isinstance(self.processor, ProcessorMixin) else None
-                if isinstance(chat_template, dict):
-                    chat_template = chat_template.get("default")
-                template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
-                if template_has_generation_kwd:
-                    result = self.processor.apply_chat_template(
-                        [conversation],
-                        tokenize=True,
-                        return_dict=True,
-                        return_tensors="pt",
-                        return_assistant_tokens_mask=True,
-                        processor_kwargs=processor_kwargs,
-                    )
-                else:
-                    text = self.processor.apply_chat_template([conversation], tokenize=False)
-                    if isinstance(text, list):
-                        text = text[0]
-                    images, videos = _extract_media_from_conversations([conversation])
-                    result = self.processor(
-                        text=[text], images=images, videos=videos, return_tensors="pt", **processor_kwargs
-                    )
-                if self.post_tokenize_hook is not None:
-                    result = self.post_tokenize_hook(result, self.processor)
-
-                input_ids = result["input_ids"][0]  # (seq_len,)
-                seq_len = input_ids.shape[0]
-
-                # Precise length check — truncate or replace overlong samples
-                if self.max_length is not None and seq_len > self.max_length:
-                    if not self.truncate:
-                        logger.warning(
-                            "Sample %d: %d tokens > max_length %d, replacing.",
-                            idx,
-                            seq_len,
-                            self.max_length,
-                        )
-                        idx = rng.randint(0, len(self.dataset) - 1)
-                        continue
-
-                # Build labels BEFORE truncation so the full assistant text
-                # can be matched against the full input_ids.
-                if template_has_generation_kwd:
-                    labels = result["input_ids"].masked_fill(result.pop("assistant_masks") == 0, -100)[0]
-                else:
-                    labels = build_labels_from_template(result["input_ids"], [conversation], self.processor)[0]
-
-                # Now truncate if needed (after labels are built)
-                if self.truncate and self.max_length is not None and seq_len > self.max_length:
-                    ml = self.max_length
-                    input_ids = input_ids[:ml]
-                    labels = labels[:ml]
-                    result = {
-                        k: (
-                            v[:, :ml]
-                            if isinstance(v, torch.Tensor) and v.dim() == 2 and v.shape[1] == seq_len
-                            else v[:ml]
-                            if isinstance(v, torch.Tensor) and v.dim() == 1 and v.shape[0] == seq_len
-                            else v
-                        )
-                        for k, v in result.items()
-                    }
-                    seq_len = ml
-
-                mismatch = _media_token_mismatch(input_ids, result, self.processor)
-                if mismatch is not None:
-                    logger.warning(
-                        "Sample %d: media token mismatch after tokenization/truncation (%s), replacing.",
-                        idx,
-                        mismatch,
-                    )
-                    idx = rng.randint(0, len(self.dataset) - 1)
-                    continue
-
-                output = {
-                    "input_ids": input_ids,
-                    "attention_mask": result["attention_mask"][0],
-                    "labels": labels,
-                }
-
-                # Copy media tensors (these don't have a sample batch dim)
-                for key in (
-                    "pixel_values",
-                    "pixel_values_videos",
-                    "image_grid_thw",
-                    "video_grid_thw",
-                    "second_per_grid_ts",
-                    "image_position_ids",
-                    "image_sizes",
-                    "mm_token_type_ids",
-                ):
-                    if key in result and result[key] is not None:
-                        output[key] = result[key]
-
-                # Mask fake vision tokens so they don't affect attention.
-                if injected_fake:
-                    mask_fake_vision_tokens_single(output, self.processor)
-
-                return output
-
             except Exception as e:
                 logger.warning(
                     "Error processing sample %d (attempt %d/%d): %s",
