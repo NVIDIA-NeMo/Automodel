@@ -26,14 +26,25 @@ depend on the model and document lengths.
 Provide a local Hugging Face checkpoint with its configuration, weights, tokenizer,
 and image processor. Select the initialization for the stage:
 
-- **Embed 8B:** A prepared Mistral3 multimodal checkpoint with the Nemotron-3-Embed-8B
-  language model and a compatible vision encoder and projector, as described in the model card.
+- **Embed 8B:** Manually assemble a local Mistral3 multimodal checkpoint before
+  training. Start with
+  [Ministral-3-8B-Instruct-2512-BF16](https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512-BF16)
+  and replace its language-model component with weights from
+  [Nemotron-3-Embed-8B-BF16](https://huggingface.co/nvidia/Nemotron-3-Embed-8B-BF16).
+  Retain the compatible Mistral3 vision and multimodal components. This example
+  does not perform checkpoint assembly.
 - **Rerank 8B:** A complete Mistral3 reranker checkpoint from text training,
   including the trained scoring head, vision encoder, and projector.
 
 The examples begin at these checkpoints. Checkpoint assembly and earlier text
 training are separate steps. Using a released Nemotron 3.5 checkpoint as the
 starting checkpoint performs continued training.
+
+The embedding configuration assumes the assembled checkpoint and sets
+`freeze_language_model: true` to preserve the trained Nemotron text component
+while updating the vision encoder and multimodal projector. If you start from an
+unmodified Mistral3 checkpoint, set `freeze_language_model: false` and fine-tune
+the language model.
 
 ## Prepare Data
 
