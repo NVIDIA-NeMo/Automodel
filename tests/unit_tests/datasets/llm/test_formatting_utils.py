@@ -372,3 +372,13 @@ def test_shipped_gemma4_coderforge_template_has_generation_block():
     ).read_text()
     assert formatting_utils.GENERATION_REGEX.search(template) is not None
     assert template.count("{% generation %}") == template.count("{% endgeneration %}") >= 1
+
+
+def test_named_chat_template_resolution_is_shared_and_preserves_tool_preference():
+    resolve = formatting_utils.resolve_chat_template_string
+    assert resolve(None) is None
+    assert resolve({}) is None
+    assert resolve("literal") == "literal"
+    assert resolve({"named": "first", "later": "second"}) == "first"
+    assert resolve({"named": "first", "default": "default"}) == "default"
+    assert resolve({"default": "default", "tool_use": "tools"}, tools=[]) == "tools"

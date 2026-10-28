@@ -21,6 +21,7 @@ import pytest
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonDataloaderConfig,
+    ZephonInstructionSourceConfig,
     ZephonOptions,
     ZephonPackingOptions,
     ZephonSource,
@@ -91,6 +92,28 @@ def test_shipped_yaml_resolves(recipe_name):
     assert config.dataloader.batch_size == config.get("step_scheduler.local_batch_size")
 
 
+def test_existing_instruction_config_selects_sft_and_rejects_ambiguous_transport(tmp_path):
+    raw = {
+        "dataset": {
+            "_target_": "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDatasetConfig",
+            "column_mapping": {"question": "prompt", "answer": "response"},
+            "use_hf_chat_template": True,
+        },
+        "dataloader": {
+            "_target_": "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
+            "zephon": {"sources": [{"name": "local", "path": str(tmp_path)}], "map_parallelism": 3},
+        },
+        "step_scheduler": {"max_steps": 2, "local_batch_size": 1},
+    }
+    resolved = RecipeConfig(ConfigNode(raw)).dataloader
+    assert isinstance(resolved.dataset_config, ZephonInstructionSourceConfig)
+    assert resolved.dataset_config.use_hf_chat_template
+    assert resolved.zephon.workers.map_parallelism == 3
+    raw["dataset"]["path_or_dataset_id"] = str(tmp_path)
+    with pytest.raises(ValueError, match="not both"):
+        RecipeConfig(ConfigNode(raw)).dataloader
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -117,7 +140,12 @@ def test_shared_zephon_option_resolution_keeps_explicit_seed_and_rejects_unknown
 
     def resolve(settings, **loader_overrides):
         return ZephonDataloaderConfig.from_recipe(
-            ZephonTextSourceConfig, {}, {"zephon": settings, **loader_overrides}, seed=42, batch_size=1, packing={}
+            ZephonTextSourceConfig,
+            {},
+            {"zephon": settings, **loader_overrides},
+            seed=42,
+            batch_size=1,
+            packing={},
         )
 
     assert resolve(values).zephon.seed == 9
@@ -132,7 +160,12 @@ def test_shared_zephon_option_resolution_keeps_explicit_seed_and_rejects_unknown
 def test_raw_text_defaults_and_policy_precedence():
     sources = [{"name": "text", "path": "unused"}]
     config = ZephonDataloaderConfig.from_recipe(
-        ZephonTextSourceConfig, {}, {"zephon": {"sources": sources}}, seed=42, batch_size=1, packing={}
+        ZephonTextSourceConfig,
+        {},
+        {"zephon": {"sources": sources}},
+        seed=42,
+        batch_size=1,
+        packing={},
     )
     assert config.dataset_config.tokenize_special_tokens == "bos_eos"
     assert config.zephon.workers.fetch_parallelism == 2
@@ -173,15 +206,34 @@ def test_reference_special_token_policy_maps_to_dataset_without_warnings(tmp_pat
     assert resolve({"tokenize_special_tokens": "none"}).dataset_config.tokenize_special_tokens == "none"
 
 
-def test_numeric_token_overrides_require_corresponding_explicit_insertion() -> None:
-    assert ZephonTextSourceConfig(bos_token_id=0, eos_token_id=7).bos_token_id == 0
+def test_instruction_special_tokens_validate_template_ownership():
+    for policy in ("assistant_eos", "tokenizer_default"):
+        with pytest.raises(ValueError, match="require use_hf_chat_template=false"):
+            ZephonInstructionSourceConfig(
+                column_mapping={"question": "q", "answer": "a"}, use_hf_chat_template=True, special_tokens=policy
+            )
+    assert (
+        ZephonInstructionSourceConfig(
+            column_mapping={"question": "q", "answer": "a"}, use_hf_chat_template=True, special_tokens="eos"
+        ).special_tokens
+        == "eos"
+    )
+
+
+@pytest.mark.parametrize("instruction", [False, True])
+def test_numeric_token_overrides_require_corresponding_explicit_insertion(instruction: bool) -> None:
+    config_type = ZephonInstructionSourceConfig if instruction else ZephonTextSourceConfig
+    fields = {"column_mapping": {"question": "q", "answer": "a"}} if instruction else {}
+    policy_field = "special_tokens" if instruction else "tokenize_special_tokens"
+    assert config_type(**fields, **{policy_field: "bos_eos", "bos_token_id": 0, "eos_token_id": 7}).bos_token_id == 0
     for invalid_id in (True, -1, 1.5, "7"):
         with pytest.raises(ValueError, match="nonnegative integer"):
-            ZephonTextSourceConfig(eos_token_id=invalid_id)
+            config_type(**fields, **{policy_field: "bos_eos", "eos_token_id": invalid_id})
     for token_name, opposite_policy in (("bos_token_id", "eos"), ("eos_token_id", "bos")):
-        for policy in (opposite_policy, "none", "tokenizer_default"):
+        policies = [opposite_policy, "none", "tokenizer_default"] + (["assistant_eos", None] if instruction else [])
+        for policy in policies:
             with pytest.raises(ValueError, match=f"{token_name} requires an explicit"):
-                ZephonTextSourceConfig(tokenize_special_tokens=policy, **{token_name: 7})
+                config_type(**fields, **{policy_field: policy, token_name: 7})
 
 
 @pytest.mark.parametrize(
@@ -193,6 +245,26 @@ def test_packing_defaults_are_resolved_once(algorithm, expected):
     )
     assert options.packing.drop_oversized is expected
     assert options.packing.shuffle_after_pack is expected
+
+
+@pytest.mark.parametrize(
+    "target,kwargs",
+    [
+        ("ZephonTextSourceConfig", {}),
+        ("ZephonEncodedTextSourceConfig", {}),
+        ("ZephonInstructionSourceConfig", {"column_mapping": {"question": "q", "answer": "a"}}),
+    ],
+)
+def test_unknown_source_fields_are_actionable(target, kwargs):
+    with pytest.raises(ValueError, match=f"Unexpected {target} dataset fields.*typo"):
+        ZephonDataloaderConfig.from_recipe(
+            f"nemo_automodel.components.datasets.zephon.{target}",
+            {**kwargs, "typo": 1},
+            {"zephon": {"sources": [{"name": "text", "path": "unused"}]}},
+            seed=42,
+            batch_size=1,
+            packing={},
+        )
 
 
 def test_toml_missing_file_source_path_and_source_options_have_context(tmp_path):
@@ -235,18 +307,6 @@ def test_pinned_canonical_step_alignment_fails_before_runtime(global_batch, loca
     else:
         with pytest.raises(ValueError, match="canonical_replicas.*lane windows"):
             RecipeConfig(ConfigNode(raw)).dataloader
-
-
-def test_unknown_raw_text_source_field_is_actionable():
-    with pytest.raises(ValueError, match="Unexpected ZephonTextSourceConfig dataset fields.*typo"):
-        ZephonDataloaderConfig.from_recipe(
-            ZephonTextSourceConfig,
-            {"typo": 1},
-            {"zephon": {"sources": [{"name": "text", "path": "unused"}]}},
-            seed=42,
-            batch_size=1,
-            packing={},
-        )
 
 
 def test_output_format_recipe_choice_and_early_validation(tmp_path):

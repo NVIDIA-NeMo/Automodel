@@ -315,8 +315,8 @@ Operator worker counts live under `dataloader.zephon.workers`:
 | --- | --- | --- |
 | `fetch_parallelism` | Read records from source shards | `2` |
 | `prefetch_parallelism` | Download ahead when `prefetch_buffer_size > 0` | `null` |
-| `map_parallelism` | Unused for raw text | `null` |
-| `tokenize_parallelism` | Raw-text `tokenize` | `3` |
+| `map_parallelism` | Normalize SFT columns or validate encoded documents | `null` |
+| `tokenize_parallelism` | Raw-text `tokenize`, SFT `tokenize_chat`, or VLM image/text encoding | `3` |
 | `pack_parallelism` | Materialize `pack_flat` or VLM `pack_sequences` bins | `1` |
 | `shuffle_parallelism` | Shuffle packed documents when `shuffle_after_pack: true` | `null` |
 
@@ -384,3 +384,87 @@ validation run; the CPU oracle does not exercise FlashAttention kernels.
 The GPU comparison should measure native versus Zephon throughput with the same
 model and batches, the per-step availability collective overhead, and a
 fetch/tokenize worker sweep of 1/1 versus 2/3 at eight ranks per node.
+
+
+## Instruction and encoded sources
+
+`prepare_tiny.py` also writes an instruction corpus. Run the SFT variant with:
+
+```sh
+uv run automodel examples/llm_pretrain/zephon/sft.yaml --nproc-per-node 1
+```
+
+The existing `ColumnMappedTextInstructionDatasetConfig` target selects SFT from
+its `column_mapping`, `answer_only_loss_mask` and `use_hf_chat_template` fields.
+Transport comes from `dataloader.zephon.sources`. Alternatively,
+`dataset.path_or_dataset_id` can supply Zephon-compatible shard directories/URIs;
+setting both is rejected. HF dataset IDs and individual JSONL files must first
+be supplied as Zephon-supported shard sources. Native dataset padding,
+truncation, subset selection and sample limits are rejected rather than ignored;
+Zephon owns packing and source traversal.
+
+All instruction sources use Zephon `tokenize_chat`. AutoModel only normalizes
+columns into messages, preserving its existing prompt whitespace or
+system/user/assistant order. Plain prompt/completion uses
+`apply_chat_template=False` with `special_tokens="tokenizer_default"`; chat uses
+the effective tokenizer template with `special_tokens="none"`. These are the
+same special-token policies exposed by Zephon text tokenization. Zephon selects
+generation-tag or prefix-based masking internally. Untagged templates supervise
+the assistant header as well as its answer, preserving AutoModel's default header
+policy. Full-token supervision
+uses `loss_scope="all_tokens"`. The adapter adds no EOS beyond tokens supplied
+by the tokenizer or template. A tokenizer/template that does not supply EOS
+therefore produces SFT documents without EOS, matching the native formatting
+policy. To choose a different policy explicitly, use the Zephon instruction
+source target and set `dataset.special_tokens: eos` or `bos_eos`; these bracket
+the complete conversation, while `assistant_eos` is the chat-only per-assistant
+policy with `use_hf_chat_template: false`. No deprecated EOS boolean is needed.
+
+SFT supports the same numeric insertion overrides as raw text:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonInstructionSourceConfig
+  column_mapping: {question: question, answer: answer}
+  use_hf_chat_template: true
+  special_tokens: eos
+  eos_token_id: 1  # An existing vocabulary ID, appended after the rendered conversation.
+```
+
+`special_tokens: bos_eos` additionally permits `bos_token_id`; omitted IDs use
+the effective tokenizer's BOS/EOS. These policies bracket the complete encoded
+conversation. Template turn markers remain where the template puts them, so a
+template-provided end-of-turn token may precede the explicitly inserted EOS.
+The default policies (`none` with a template, `tokenizer_default` without one)
+and `assistant_eos` reject numeric overrides because those modes do not perform
+the corresponding explicit conversation-level insertion. An EOS string loader
+override is a separate Zephon API feature and is not configured here.
+
+Zephon masks tokens by overlap with assistant text. This deliberately differs
+from native prompt-length arithmetic when tokenization merges across a boundary:
+for `"hello " + "world"`, a token containing the space and `world` remains
+supervised. The first token of each source document remains masked, including
+with full-token supervision; cross-document attention does not change loss
+masks. Zephon logs empty or unsupervised document drops. Oversized documents
+follow the configured packer policy without prior truncation.
+
+Select `nemo_automodel.components.datasets.zephon.ZephonEncodedTextSourceConfig`
+for encoded text. Set `dataset.tokens_field` (default `input_ids`); the optional
+`loss_mask_field` defaults to `loss_mask`. Each source document contains a
+one-dimensional integer token list and, when present, an equally sized binary
+mask selecting target tokens **before** shifting. A supplied mask must exclude
+the first token, so the previous document cannot predict a supervised SFT start.
+Without a mask, ordinary pretraining supervision is retained. Tokens must belong to the
+resolved model tokenizer. The adapter skips encoding and uses normal Zephon
+packing and `to_training()` shifting. Already shifted `labels`, existing packing
+boundaries, and padded documents are rejected; this is an encoded-document
+adapter, not a universal prepacked-cache importer. No legacy window inference
+is performed. Raw-text special-token policy lives on its own dataset config.
+
+Token-aware allocation also works for instruction and encoded sources. Zephon's
+built-in SFT counter replays deterministic column normalization and the same
+tokenizer settings used for delivery. Encoded inputs provide a token-count
+function because they skip tokenization. No mixture correction stage is
+installed. CPU tests cover chat/header masks, tokenizer special tokens,
+cross-boundary token merges, raw/encoded delivery, source-token calibration and
+fresh-loader replay through process workers.
