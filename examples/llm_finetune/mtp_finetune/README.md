@@ -46,6 +46,6 @@ automodel examples/llm_finetune/mtp_finetune/nemotron_nano_v3_5_lightning_mtp_fi
 ```
 
 Watch `val_mtp_tau_sim` across validation runs: it should trend upward as the
-MTP head adapts to the finetuning domain. A value near `1.0` means the MTP
+MTP head adapts to the fine-tuning domain. A value near `1.0` means the MTP
 head is barely contributing beyond the main head's own next token; a value
 approaching `1 + num_mtp_layers` means every MTP depth is being accepted.
