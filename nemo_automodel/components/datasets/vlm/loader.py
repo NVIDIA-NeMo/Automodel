@@ -36,6 +36,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_cha
 from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDatasetConfig
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    BatchOutputFormat,
     PackedSequenceContract,
     resolve_packing_contract,
 )
@@ -284,6 +285,16 @@ class VlmDataloaderConfig:
     persistent_workers: bool = False
     prefetch_factor: int | None = None
     drop_last: bool = False
+
+    @property
+    def is_packed(self) -> bool:
+        """Whether this loader emits packed multimodal inputs."""
+        return self.packing is not None
+
+    @property
+    def output_format(self) -> BatchOutputFormat:
+        """Selected native batch representation, independent of the packing algorithm."""
+        return "thd" if self.packing is not None and self.packing.packing_format == "thd" else "batched"
 
     def _build_source(
         self,

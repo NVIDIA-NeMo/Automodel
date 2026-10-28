@@ -751,3 +751,26 @@ def test_thd_mixed_chunks_compute_padding_for_each_microbatch(reverse):
             out["input_ids"][index : index + 1], out["position_ids"][index : index + 1], None, kwargs
         )
         assert kwargs["pad_between_seqs"] is (lengths == [3, 3])
+
+
+def test_thd_original_document_ids_survive_attention_joining_and_pp_chunks():
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd, split_batch_into_thd_chunks
+
+    tokens = torch.arange(12).reshape(2, 6)
+    batch = dict(
+        input_ids=tokens,
+        labels=tokens,
+        position_ids=tokens,
+        seq_lens=torch.tensor([[6], [6]]),
+        seq_lens_padded=torch.tensor([[6], [6]]),
+        _packed_seq_ids=torch.ones((2, 6), dtype=torch.long),
+        document_ids=torch.tensor([[1, 1, 2, 2, 3, 3], [1, 1, 1, 2, 2, 2]]),
+    )
+    prepared = process_input_for_thd(batch)
+    assert prepared["_packed_seq_ids"].tolist() == [1] * 6 + [2] * 6
+    assert prepared["document_ids"].tolist() == [1, 1, 2, 2, 3, 3, 4, 4, 4, 5, 5, 5]
+    assert prepared["cu_seqlens"].tolist() == [0, 6, 12]
+    chunked = split_batch_into_thd_chunks(batch, num_chunks=2)
+    torch.testing.assert_close(chunked["_packed_seq_ids"], batch["_packed_seq_ids"])
+
+    torch.testing.assert_close(chunked["document_ids"], batch["document_ids"])

@@ -501,6 +501,8 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
 
     loader_config = SimpleNamespace(
         packing=None,
+        is_packed=False,
+        output_format="batched",
         build=_build_dataloader,
     )
     monkeypatch.setattr(
