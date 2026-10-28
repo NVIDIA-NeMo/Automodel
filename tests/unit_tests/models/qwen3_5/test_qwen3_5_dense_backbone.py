@@ -419,6 +419,23 @@ class TestDenseTextBackbone:
         out = backbone(inputs_embeds=embeds)
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
 
+    def test_blockdiag_cp_skips_full_pack_metadata(self, monkeypatch):
+        import nemo_automodel.components.distributed.blockdiag_cp as blockdiag_cp
+
+        cfg = _tiny_config(layer_types=("full_attention",))
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
+        layer_kwargs = []
+        backbone.layers["0"].forward = lambda x, **kwargs: layer_kwargs.append(kwargs) or x
+        # The block-diagonal CP sharder keeps local document IDs but strips packed_token_indices and cu_seqlens.
+        inputs = {"inputs_embeds": torch.randn(1, 4, cfg.hidden_size), "_packed_seq_ids": torch.tensor([[1, 1, 2, 2]])}
+
+        with pytest.raises(ValueError, match="dataset-provided packed_token_indices and cu_seqlens"):
+            backbone(**inputs)
+        monkeypatch.setattr(blockdiag_cp, "current_blockdiag_cp_state", lambda: object())
+        backbone(**inputs)
+
+        assert layer_kwargs[-1]["packed_gdn_metadata"] is None
+
     def test_reuses_packed_metadata_across_checkpointed_layers(self):
         torch.manual_seed(123)
         cfg = _tiny_config(layer_types=("linear_attention", "linear_attention"))

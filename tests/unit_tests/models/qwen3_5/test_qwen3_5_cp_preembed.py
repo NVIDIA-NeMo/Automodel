@@ -28,11 +28,20 @@ from nemo_automodel.components.models.qwen3_5.model import (
     HFQwen3_5Model,
     Qwen3_5ForConditionalGeneration,
     Qwen3_5Model,
+    _Qwen3_5Attention,
     _splice_multimodal_features,
 )
 
 
-def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None, vision_start_token_id=None):
+def _build_model(
+    *,
+    rope_index=None,
+    image_token_id=None,
+    video_token_id=None,
+    vision_start_token_id=None,
+    attn_backend="sdpa",
+    mtp=None,
+):
     """Build a barebones Qwen3_5ForConditionalGeneration with stubbed deps."""
     model = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
     nn.Module.__init__(model)
@@ -64,6 +73,8 @@ def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None, v
         video_token_id=video_token_id,
         vision_start_token_id=vision_start_token_id,
     )
+    model.backend = types.SimpleNamespace(attn=attn_backend)
+    model.mtp = mtp
     return model
 
 
@@ -169,6 +180,98 @@ class TestPrepareModelInputsForCP:
 
         # token 6 -> image (1), token 8 -> video (2), others 0.
         assert captured["mm_token_type_ids"].tolist() == [[0, 1, 0, 2]]
+
+    def test_packed_batch_selects_contiguous_blockdiag_sharder(self):
+        from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
+        from nemo_automodel.components.distributed.context_parallel.sharder import contiguous_local_indices
+
+        model = _build_model()
+        out = model.prepare_model_inputs_for_cp(
+            {"input_ids": torch.tensor([[5, 6, 7, 8]]), "_packed_seq_ids": torch.tensor([[1, 1, 2, 2]])}
+        )
+
+        sharder = out["cp_sharder"]
+        assert sharder.shard_batch.func is make_cp_blockdiag_batch_and_ctx
+        assert sharder.shard_batch.keywords == {"shard_primary": False}
+        assert sharder.local_token_global_indices is contiguous_local_indices
+
+    def test_single_document_4d_mask_selects_blockdiag_sharder(self):
+        from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
+
+        model = _build_model()
+        out = model.prepare_model_inputs_for_cp(
+            {
+                "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                "attention_mask": torch.ones(1, 1, 4, 4, dtype=torch.bool).tril(),
+            }
+        )
+
+        assert out["cp_sharder"].shard_batch.func is make_cp_blockdiag_batch_and_ctx
+
+    def test_unpacked_batch_keeps_round_robin_sharder(self):
+        from nemo_automodel.components.distributed.context_parallel.sharder import (
+            round_robin_local_indices,
+            shard_batch_aux_only,
+        )
+
+        model = _build_model(attn_backend="te")
+        out = model.prepare_model_inputs_for_cp(
+            {"input_ids": torch.tensor([[5, 6, 7, 8]]), "attention_mask": torch.ones(1, 4, dtype=torch.long)}
+        )
+
+        assert out["cp_sharder"].shard_batch is shard_batch_aux_only
+        assert out["cp_sharder"].local_token_global_indices is round_robin_local_indices
+
+    @pytest.mark.parametrize("attn_backend", ["te", "fa4"])
+    def test_packed_batch_rejects_non_sdpa_attention(self, attn_backend):
+        model = _build_model(attn_backend=attn_backend)
+        with pytest.raises(ValueError, match="packed context parallelism requires model.backend.attn='sdpa'"):
+            model.prepare_model_inputs_for_cp(
+                {"input_ids": torch.tensor([[5, 6, 7, 8]]), "_packed_seq_ids": torch.tensor([[1, 1, 2, 2]])}
+            )
+
+    def test_packed_batch_rejects_mtp(self):
+        model = _build_model(mtp=types.SimpleNamespace(num_depths=1))
+        with pytest.raises(NotImplementedError, match="does not support MTP"):
+            model.prepare_model_inputs_for_cp(
+                {"input_ids": torch.tensor([[5, 6, 7, 8]]), "_packed_seq_ids": torch.tensor([[1, 1, 2, 2]])}
+            )
+
+
+class TestPackedCPAttentionDispatch:
+    @staticmethod
+    def _attention(attn_backend):
+        attention = _Qwen3_5Attention.__new__(_Qwen3_5Attention)
+        nn.Module.__init__(attention)
+        attention.backend = types.SimpleNamespace(attn=attn_backend)
+        attention._base_attn_func = lambda query, key, value, **kwargs: "backend"
+        return attention
+
+    @staticmethod
+    def _qkv():
+        return torch.zeros(1, 2, 4, 8), torch.zeros(1, 2, 4, 8), torch.zeros(1, 2, 4, 8)
+
+    def test_active_blockdiag_state_routes_to_cp_sdpa(self, monkeypatch):
+        import nemo_automodel.components.distributed.blockdiag_cp as blockdiag_cp
+
+        monkeypatch.setattr(blockdiag_cp, "current_blockdiag_cp_state", lambda: object())
+        monkeypatch.setattr(blockdiag_cp, "cp_blockdiag_sdpa", lambda query, key, value, **kwargs: "blockdiag")
+
+        assert self._attention("sdpa")._dispatch_attention(*self._qkv()) == "blockdiag"
+
+    def test_without_blockdiag_state_uses_configured_backend(self, monkeypatch):
+        import nemo_automodel.components.distributed.blockdiag_cp as blockdiag_cp
+
+        monkeypatch.setattr(blockdiag_cp, "current_blockdiag_cp_state", lambda: None)
+
+        assert self._attention("fa4")._dispatch_attention(*self._qkv()) == "backend"
+
+    def test_active_blockdiag_state_rejects_non_sdpa_backend(self, monkeypatch):
+        import nemo_automodel.components.distributed.blockdiag_cp as blockdiag_cp
+
+        monkeypatch.setattr(blockdiag_cp, "current_blockdiag_cp_state", lambda: object())
+        with pytest.raises(ValueError, match="requires model.backend.attn='sdpa'"):
+            self._attention("te")._dispatch_attention(*self._qkv())
 
 
 class TestPopStagedVlmMedia:
