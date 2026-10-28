@@ -15,6 +15,10 @@
 #!/bin/bash
 set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
+# Turn off Google's NCCL telemetry on Google Cloud runners. The container image sets this
+# as well; exporting it here also covers test runs in other images.
+export NCCL_TELEMETRY_MODE=0
+
 UNIT_TEST=false
 CPU=false
 TEST_NAME=""
