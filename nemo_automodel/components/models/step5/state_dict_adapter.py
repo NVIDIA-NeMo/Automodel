@@ -15,8 +15,8 @@
 """Step-5 FP8 loading, interleaved QKV mapping and native expert conversion."""
 
 import re
-from collections.abc import Iterator
-from typing import cast
+from collections.abc import Iterator, Mapping
+from typing import Any, cast
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -75,6 +75,7 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,
+        checkpoint_metadata: Mapping[str, Any] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load in bounded parts unless this rank holds only part of the decoder.
 
@@ -85,6 +86,7 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
         Args:
             model_state_dict: Final native storage; see ``_iter_checkpoint_load_parts``.
             device_mesh: Optional expert mesh used for native/HF conversion.
+            checkpoint_metadata: Unused; part destinations derive from model shapes.
 
         Returns:
             Checkpoint load parts, or ``None`` on a distributed rank whose state

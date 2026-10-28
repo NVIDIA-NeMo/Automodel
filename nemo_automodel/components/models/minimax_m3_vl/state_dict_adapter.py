@@ -32,7 +32,7 @@ grouped expert parameter or ordinary projection.
 """
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional
@@ -411,6 +411,7 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,
+        checkpoint_metadata: Mapping[str, Any] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load M3.1 mixed quantized weights into bounded model-owned parts.
 
@@ -421,6 +422,7 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
                 preserved. The iterator never creates a full model copy.
             device_mesh: Existing expert mesh; placements are read from each
                 destination DTensor.
+            checkpoint_metadata: Unused; part destinations derive from model shapes.
 
         Returns:
             One direct-load part followed by one part per quantized native
@@ -763,6 +765,7 @@ class MiniMaxM3VLStateDictAdapter(StateDictAdapter):
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,
+        checkpoint_metadata: Mapping[str, Any] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Stream text quantization while loading native vision storage directly.
 
@@ -772,6 +775,7 @@ class MiniMaxM3VLStateDictAdapter(StateDictAdapter):
                 tensors retain their arbitrary native shapes and DTensor
                 placements. DCP writes every destination in place.
             device_mesh: Existing expert mesh; tensor placements are retained.
+            checkpoint_metadata: Unused; part destinations derive from model shapes.
 
         Returns:
             Complete, bounded M3.1 load parts, or None for earlier checkpoints.
