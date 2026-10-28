@@ -78,6 +78,7 @@ def _adapter(
     second_engram_rows: int | None = None,
     dtype: torch.dtype = torch.float32,
     experts: str = "torch_mm",
+    dispatcher: str = "torch",
     dim: int = 32,
 ) -> DeepseekV41StateDictAdapter:
     engram_layers = [] if engram_rows is None else [1]
@@ -116,7 +117,7 @@ def _adapter(
     return DeepseekV41StateDictAdapter(
         DeepseekV41Config(text_config=text),
         moe,
-        BackendConfig(linear="torch", attn="sdpa", dispatcher="torch", experts=experts),
+        BackendConfig(linear="torch", attn="sdpa", dispatcher=dispatcher, experts=experts),
         dtype=dtype,
     )
 
@@ -657,3 +658,92 @@ def test_iter_checkpoint_load_parts_requires_checkpoint_ground_truth() -> None:
     covered = set().union(*(part.model_keys for part in parts))
     assert covered == set(model_state) | {"lm_head.weight"}
     assert all("head.weight" not in part.checkpoint_tensors for part in parts)
+
+
+def test_iter_checkpoint_load_parts_rejects_corrupt_quantized_checkpoints() -> None:
+    """Partially served expert groups and scale-less quantized weights reject, not load.
+
+    A missing expert scale used to count the whole grouped destination as absent (it
+    kept its initialization while the part reported completion) and a missing dense FP8
+    scale fell through to a direct copy of raw payload values. Both must raise like the
+    full-state conversion does.
+    """
+
+    def _metadata(with_experts: bool, with_dense_scale: bool) -> dict[str, SimpleNamespace]:
+        metadata: dict[str, SimpleNamespace] = {}
+        if with_experts:
+            for expert in range(2):
+                for projection in ("w1", "w3", "w2"):
+                    base = f"layers.1.ffn.experts.{expert}.{projection}"
+                    metadata[base + ".weight"] = SimpleNamespace(
+                        size=torch.Size((16, 16)), properties=SimpleNamespace(dtype=torch.int8)
+                    )
+                    metadata[base + ".scale"] = SimpleNamespace(
+                        size=torch.Size((16, 1)), properties=SimpleNamespace(dtype=torch.float8_e8m0fnu)
+                    )
+        if with_dense_scale:
+            metadata["layers.1.attn.wq_a.scale"] = SimpleNamespace(
+                size=torch.Size((1, 1)), properties=SimpleNamespace(dtype=torch.float8_e8m0fnu)
+            )
+        metadata["layers.1.attn.wq_a.weight"] = SimpleNamespace(
+            size=torch.Size((32, 32)), properties=SimpleNamespace(dtype=torch.float8_e4m3fn)
+        )
+        return metadata
+
+    adapter = _adapter()
+    model_state = {
+        "model.layers.1.attn.wq_a.weight": torch.zeros(32, 32, dtype=adapter.dtype),
+        "model.layers.1.ffn.experts.gate_and_up_projs": torch.zeros(2, 32, 64),
+        "model.layers.1.ffn.experts.down_projs": torch.zeros(2, 32, 32),
+    }
+
+    complete = _metadata(with_experts=True, with_dense_scale=True)
+    assert adapter.iter_checkpoint_load_parts(model_state, None, complete) is not None
+
+    partial_experts = _metadata(with_experts=True, with_dense_scale=True)
+    del partial_experts["layers.1.ffn.experts.0.w1.scale"]
+    with pytest.raises(ValueError, match="expert projections for layer 1 are incomplete"):
+        adapter.iter_checkpoint_load_parts(model_state, None, partial_experts)
+
+    missing_dense_scale = _metadata(with_experts=True, with_dense_scale=False)
+    with pytest.raises(ValueError, match="missing its scale tensor"):
+        adapter.iter_checkpoint_load_parts(model_state, None, missing_dense_scale)
+
+    # A layer whose experts are entirely absent from the checkpoint is not corrupt: the
+    # grouped tensors keep their initialization and the remaining keys still load in parts.
+    no_experts = _metadata(with_experts=False, with_dense_scale=True)
+    parts = list(adapter.iter_checkpoint_load_parts(model_state, None, no_experts))
+    covered = set().union(*(part.model_keys for part in parts))
+    assert covered == set(model_state)
+    assert all(".ffn.experts." not in key for part in parts for key in part.checkpoint_tensors)
+
+
+def _stacked_expert_storage_worker(rank: int, rendezvous: str) -> None:
+    """At world size 2, TE grouped experts must decline while torch_mm experts stay served."""
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        model_state = {"model.layers.1.ffn.experts.gate_and_up_projs": torch.zeros(2, 32, 64)}
+        metadata: dict[str, SimpleNamespace] = {}
+        for expert in range(2):
+            for projection in ("w1", "w3", "w2"):
+                base = f"layers.1.ffn.experts.{expert}.{projection}"
+                metadata[base + ".weight"] = SimpleNamespace(
+                    size=torch.Size((32, 16)), properties=SimpleNamespace(dtype=torch.int8)
+                )
+                metadata[base + ".scale"] = SimpleNamespace(
+                    size=torch.Size((32, 1)), properties=SimpleNamespace(dtype=torch.float8_e8m0fnu)
+                )
+        te = _adapter(experts="te", dispatcher="hybridep")
+        assert te.iter_checkpoint_load_parts(model_state, None, metadata) is None, (
+            "GroupedExpertsTE exposes grouped experts as stacked copies at world size > 1; "
+            "part destinations would never reach model storage"
+        )
+        torch_mm = _adapter(experts="torch_mm", dispatcher="hybridep")
+        assert torch_mm.iter_checkpoint_load_parts(model_state, None, metadata) is not None
+    finally:
+        dist.destroy_process_group()
+
+
+def test_part_loading_declines_when_expert_state_dict_does_not_alias_model_storage(tmp_path: Path) -> None:
+    """GroupedExpertsTE state-dict tensors are stacked copies; parts must decline at world > 1."""
+    mp.spawn(_stacked_expert_storage_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)

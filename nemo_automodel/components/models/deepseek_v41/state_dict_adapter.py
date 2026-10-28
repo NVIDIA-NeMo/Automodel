@@ -565,7 +565,9 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
 
         Requires the checkpoint's DCP metadata as ground truth; returns ``None``
         (falling back to the full-state path) for DSpark-shaped state dicts, non-tensor
-        entries, dtype mismatches, or any model tensor the checkpoint cannot serve.
+        entries, dtype mismatches, grouped expert state-dict tensors that do not alias
+        model storage (TE / MoK experts), or any model tensor the checkpoint cannot
+        serve.
 
         Args:
             model_state_dict: Native names mapped to final parameter and persistent-buffer
@@ -576,6 +578,12 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
 
         Returns:
             One load part per decoder layer plus one for shared tensors, or ``None``.
+
+        Raises:
+            ValueError: The checkpoint holds an expert layer's projections only partially,
+                or a quantized weight without its scale companion. Corrupt checkpoints
+                reject here instead of loading silently wrong values; the full-state
+                path raises equivalent errors for the same checkpoints.
         """
         if checkpoint_metadata is None:
             logging.info("%s: part loading declined (no checkpoint metadata)", type(self).__name__)
@@ -602,7 +610,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             expert_range = (0, 0)
         absent_keys: list[str] = []
         for model_key, target in model_state_dict.items():
-            classified = self._classify_model_key(model_key, expert_range, checkpoint_metadata)
+            classified = self._classify_model_key(model_key, expert_range, n_experts, checkpoint_metadata)
             if classified is None:
                 # Keys absent from the checkpoint (LoRA parameters injected before the base
                 # load, a tied lm_head the checkpoint omits, ...) keep their initialization,
@@ -610,6 +618,16 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                 absent_keys.append(model_key)
                 continue
             kind, required = classified
+            if kind == "fused" and not self._expert_checkpoint_tensors_use_model_storage:
+                # GroupedExpertsTE and the MoK gate/up storage expose grouped experts through
+                # stacked copies of the real parameters, so part destinations would write into
+                # the copies while the model keeps its initialization. The full-state path
+                # rebuilds and installs those tensors after the read; serve it there.
+                logging.info(
+                    "%s: part loading declined (grouped expert state-dict tensors do not alias model storage)",
+                    type(self).__name__,
+                )
+                return None
             if kind == "quantized":
                 if target.ndim != 2 or target.dtype != self.dtype:
                     logging.info(
@@ -655,12 +673,13 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                 len(absent_keys),
                 absent_keys[:5],
             )
-        return self._iter_checkpoint_load_parts(model_state_dict, expert_range, checkpoint_metadata)
+        return self._iter_checkpoint_load_parts(model_state_dict, expert_range, n_experts, checkpoint_metadata)
 
     def _classify_model_key(
         self,
         model_key: str,
         expert_range: tuple[int, int],
+        n_experts: int,
         checkpoint_metadata: "Mapping[str, Any]",
     ) -> tuple[str, frozenset[str]] | None:
         """Classify one model key against the checkpoint and list its required checkpoint keys.
@@ -668,25 +687,55 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         Args:
             model_key: Native model state-dict name.
             expert_range: Inclusive-exclusive global expert IDs owned by this rank.
+            n_experts: Total routed experts per MoE layer, used for a rank-independent
+                completeness check over the classified layer.
             checkpoint_metadata: Checkpoint names mapped to DCP storage metadata.
 
         Returns:
             ``("fused"|"engram"|"quantized"|"direct", required checkpoint keys)``, or
-            ``None`` when the checkpoint cannot serve this key on the part-by-part path.
+            ``None`` when the checkpoint legitimately lacks this key, whose model tensor
+            then keeps its initialization like on the full-state path.
+
+        Raises:
+            ValueError: The layer's expert projections are only partially present in the
+                checkpoint, or a quantized checkpoint weight lacks its scale companion.
+                Both are corrupt checkpoints and must reject exactly like the full-state
+                conversion instead of silently keeping initialization or installing raw
+                payload values.
         """
         fused = _FUSED_EXPERT_KEY.match(model_key)
         if fused is not None:
             required: set[str] = set()
             layer_num = fused.group(1)
-            for global_expert in range(expert_range[0], expert_range[1]):
+            any_expert_key = False
+            complete = True
+            for global_expert in range(n_experts):
                 for projection in ("w1", "w3", "w2"):
                     base = f"layers.{layer_num}.ffn.experts.{global_expert}.{projection}"
-                    required.update((base + ".weight", base + ".scale"))
-            return ("fused", frozenset(required)) if required <= checkpoint_metadata.keys() else None
+                    weight_key, scale_key = base + ".weight", base + ".scale"
+                    has_weight = weight_key in checkpoint_metadata
+                    has_scale = scale_key in checkpoint_metadata
+                    any_expert_key = any_expert_key or has_weight or has_scale
+                    if not (has_weight and has_scale):
+                        complete = False
+                    if expert_range[0] <= global_expert < expert_range[1]:
+                        required.update((weight_key, scale_key))
+            if not any_expert_key:
+                return None
+            if not complete:
+                raise ValueError(
+                    f"Checkpoint expert projections for layer {layer_num} are incomplete; expected a weight and a "
+                    f"scale for w1/w3/w2 of all {n_experts} routed experts"
+                )
+            return ("fused", frozenset(required))
         released = _released_key(model_key)
         if released not in checkpoint_metadata:
             return None
         scale_key = released[: -len(".weight")] + ".scale" if released.endswith(".weight") else None
+        if scale_key is not None and scale_key not in checkpoint_metadata:
+            properties = getattr(checkpoint_metadata[released], "properties", None)
+            if getattr(properties, "dtype", None) in (torch.float8_e4m3fn, torch.int8):
+                raise ValueError(f"Quantized checkpoint weight {released} is missing its scale tensor {scale_key}")
         if scale_key is not None and scale_key in checkpoint_metadata:
             if ".engram.embed." in model_key:
                 return ("engram", frozenset((released, scale_key)))
@@ -697,6 +746,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         self,
         model_state_dict: dict[str, torch.Tensor],
         expert_range: tuple[int, int],
+        n_experts: int,
         checkpoint_metadata: "Mapping[str, Any]",
     ) -> Iterator[CheckpointLoadPart]:
         """Build per-layer load parts after :meth:`iter_checkpoint_load_parts` validated the inputs.
@@ -704,6 +754,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         Args:
             model_state_dict: Native names mapped to final tensors with their placements.
             expert_range: Inclusive-exclusive global expert IDs owned by this rank.
+            n_experts: Total routed experts per MoE layer.
             checkpoint_metadata: Checkpoint names mapped to DCP storage metadata; sizes
                 allocate the temporary destinations at checkpoint-side shapes.
 
@@ -743,7 +794,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             experts: list[tuple[torch.Tensor, int, str, torch.Tensor, torch.Tensor, int, int, int]] = []
             for model_key in group_keys:
                 target = model_state_dict[model_key]
-                classified = self._classify_model_key(model_key, expert_range, checkpoint_metadata)
+                classified = self._classify_model_key(model_key, expert_range, n_experts, checkpoint_metadata)
                 if classified is None:
                     # Absent from the checkpoint: no destination, covered keep-at-init.
                     continue
