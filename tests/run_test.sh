@@ -44,6 +44,10 @@ fi
 
 if [[ "$CPU" == "false" ]]; then
     export CUDA_VISIBLE_DEVICES="0,1"
+    # On GCP hosts the NGC shell init (/etc/shinit_v2) enables Google's NCCL profiler plugin.
+    # Its gRPC telemetry client times out during interpreter shutdown, so a pytest process
+    # that created an NCCL communicator segfaults on exit after every test passed.
+    export NCCL_PROFILER_PLUGIN=none
 else
     export ADDITIONAL_ARGS="--cpu"
 fi
