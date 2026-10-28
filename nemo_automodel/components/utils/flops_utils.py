@@ -15,8 +15,6 @@
 import warnings
 from typing import Any, Callable
 
-from nemo_automodel.components.models.glm5_next.flops import glm5_next_flops
-
 
 def calculate_mfu(
     tflops: float,
@@ -2039,7 +2037,6 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         # GPT-OSS
         "GptOssConfig": gpt_oss_flops,
         # GLM family
-        "Glm5NextTextConfig": glm5_next_flops,  # Explicit text scope for the GLM-5.3 VLM wrapper
         "Glm4Config": qwen3_flops,  # Dense GQA + SwiGLU (e.g. GLM-4-9B-0414)
         "Glm4MoeConfig": glm4_moe_flops,  # GLM-4.7 (GQA + MoE)
         "Glm4MoeLiteConfig": mla_moe_flops,  # GLM-4.7-Flash (MLA + MoE)

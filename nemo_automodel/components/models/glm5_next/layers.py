@@ -25,7 +25,7 @@ from nemo_automodel.components.models.common.cudnn_sparse_attention import (
     cudnn_sparse_attention,
     is_cudnn_sparse_attention_available,
 )
-from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dsv4_sinkhorn_normalize
+from nemo_automodel.components.models.common.sinkhorn import sinkhorn_normalize_tile_kernels, sinkhorn_normalize_torch
 from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
@@ -105,7 +105,10 @@ class Glm5NextHyperConnectionFp32Params(nn.Module):
         pre = torch.sigmoid(pre_w * pre_scale + pre_b) + eps
         post = 2 * torch.sigmoid(post_w * post_scale + post_b)
         comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
-        comb = dsv4_sinkhorn_normalize(comb_logits, backend=self.sinkhorn_backend, repeat=sinkhorn_iters, eps=eps)
+        if self.sinkhorn_backend == "tilelang":
+            comb = sinkhorn_normalize_tile_kernels(comb_logits, repeat=sinkhorn_iters, eps=eps)
+        else:
+            comb = sinkhorn_normalize_torch(comb_logits, repeat=sinkhorn_iters, eps=eps)
         return pre, post, comb
 
 

@@ -6,6 +6,7 @@
 import pytest
 
 from nemo_automodel.components.models.glm5_next.config import Glm5NextConfig, Glm5NextTextConfig
+from nemo_automodel.components.models.glm5_next.flops import glm5_next_flops
 from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config
 
 
@@ -40,8 +41,7 @@ def test_text_registration_requires_explicit_multimodal_scope() -> None:
     """The benchmark must opt into text FLOPs instead of claiming vision coverage."""
     config = Glm5NextTextConfig(index_kpool=4)
     formula = get_flops_formula_for_hf_config(config)
-    assert formula is not None
-    assert formula.__module__ == "nemo_automodel.components.models.glm5_next.flops"
+    assert formula is glm5_next_flops
     assert get_flops_formula_for_hf_config(Glm5NextConfig(text_config=config)) is None
 
 

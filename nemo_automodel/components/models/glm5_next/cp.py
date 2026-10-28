@@ -12,11 +12,14 @@ that both KDA and KPool-DSA consume.
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
 from nemo_automodel.shared.import_utils import safe_import_from
@@ -295,15 +298,15 @@ def _global_doc_ids_from_batch(batch: dict[str, Any], seq_len: int) -> torch.Ten
 
 
 def shard_batch_for_glm5_next_cp(
-    cp_mesh,
-    tp_mesh,
+    cp_mesh: DeviceMesh | None,
+    tp_mesh: DeviceMesh | None,
     batch: dict[str, Any],
     *,
-    loss_mask=None,
+    loss_mask: torch.Tensor | None = None,
     padding_token_id: int = 0,
     shard_primary: bool = False,
     num_chunks: int = 1,
-):
+) -> tuple[Callable[[], AbstractContextManager[None]], dict[str, Any], ShardLayout]:
     """Contiguously shard packed GLM-5.3 token streams.
 
     The top-level VLM uses ``shard_primary=False``: image features must be
