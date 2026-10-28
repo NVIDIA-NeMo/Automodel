@@ -46,7 +46,26 @@ def _reference_hc(
     eps: float,
     iterations: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Independent, explicit mathematical reference with the original cast sites."""
+    """Independent, explicit mathematical reference with the original cast sites.
+
+    Args:
+        hidden: Tensor of shape [batch, sequence, streams, hidden], where
+            streams is ``hc``.
+        fn: Tensor of shape [streams * (2 + streams), streams * hidden].
+        base: FP32 tensor of shape [streams * (2 + streams)], split into
+            pre, post and row-major comb biases.
+        scale: FP32 tensor of shape [3] holding the pre, post and comb scales.
+        hc: Number of residual streams.
+        norm_eps: RMS normalization epsilon.
+        eps: Sinkhorn and ``pre`` stabilizer.
+        iterations: Number of Sinkhorn rounds.
+
+    Returns:
+        FP32 ``post`` of shape [batch, sequence, streams], FP32 ``comb`` of
+        shape [batch, sequence, streams, streams] indexed [source_stream,
+        destination_stream], and ``collapsed`` of shape [batch, sequence,
+        hidden] in ``hidden``'s dtype.
+    """
     flat = hidden.flatten(start_dim=2).float()
     flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
     pre_w, post_w, comb_w = F.linear(flat, fn.float()).split([hc, hc, hc * hc], dim=-1)

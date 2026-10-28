@@ -91,7 +91,31 @@ def _packed_context_from_inputs(
     cu_seqlens: torch.Tensor | None,
     packed_seq_ids: torch.Tensor | None,
 ) -> Glm5NextPackedContext:
-    """Build one global document map for a non-CP forward."""
+    """Build one global document map for a non-CP forward.
+
+    Sources are tried in order: ``packed_seq_ids``, ``cu_seqlens``, a 2-D
+    ``attention_mask``, then ``padding_mask``; otherwise every token belongs
+    to document 1.
+
+    Args:
+        input_ids: Tensor of shape [batch, sequence]. Only its shape and
+            device are read.
+        attention_mask: Optional integer tensor of shape [batch, sequence],
+            either binary (one document) or one-based packed document ids
+            with 0 at padding.
+        padding_mask: Optional Boolean tensor of shape [batch, sequence],
+            with True marking padding.
+        cu_seqlens: Optional integer tensor of cumulative document
+            boundaries, flattened to [documents + 1]; negative entries are
+            ignored. Describes a single packed row.
+        packed_seq_ids: Optional integer tensor of shape [batch, sequence] or
+            [sequence] holding one-based document ids, with 0 at padding.
+
+    Returns:
+        Context whose ``doc_ids`` is an int32 tensor of shape [batch,
+        sequence] (``[1, sequence]`` when built from ``cu_seqlens``), with
+        ``seq_start=0`` and ``cp_size=1``.
+    """
     sequence = input_ids.shape[1]
     if packed_seq_ids is not None:
         doc_ids = packed_seq_ids.to(torch.int32)
@@ -150,10 +174,32 @@ class Glm5NextTextModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Decode local tokens, preserving ``[B, S, hc_mult, H]`` between PP stages.
+        """Decode local tokens, preserving residual streams between PP stages.
 
-        Only the embedding stage expands the streams; the final norm stage
-        collapses them to ``[B, S, H]``.
+        Only the embedding stage (``embed_tokens`` present) expands the
+        streams; the final-norm stage (``norm`` present) averages them and
+        applies RMSNorm. ``streams`` below is ``config.hc_mult``.
+
+        Args:
+            input_ids: Optional integer tensor of shape [batch,
+                local_sequence], embedded on the embedding stage. Exactly one
+                of ``input_ids`` and ``inputs_embeds`` must be given.
+            inputs_embeds: Optional tensor of shape [batch, local_sequence,
+                hidden] on the embedding stage, or residual streams of shape
+                [batch, local_sequence, streams, hidden] on later PP stages.
+            glm5_next_packed_context: Global document layout. Its ``doc_ids``
+                tensor has shape [batch, padded_global_sequence] and is
+                replicated across CP ranks; ``seq_start`` locates this rank's
+                local interval. Each row's document-range cache is filled in
+                place before the decoder layers run.
+            padding_mask: Optional Boolean tensor of shape [batch,
+                local_sequence], with True marking padding.
+            **kwargs: Forwarded unchanged to every decoder layer.
+
+        Returns:
+            On the final-norm stage, a tensor of shape [batch, local_sequence,
+            hidden]; on other stages, residual streams of shape [batch,
+            local_sequence, streams, hidden]. Both use the stream dtype.
         """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids and inputs_embeds")
@@ -373,6 +419,22 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         CP pads the global length to a multiple of its size. Only the last
         stage emits collapsed hidden states ``[B,S/CP,H]`` or logits
         ``[B,S/CP,V]``; the first stage still receives unsharded token ids.
+
+        Args:
+            is_first: Whether the stage owns the token embedding.
+            microbatch_size: PP microbatch size.
+            seq_len: Global sequence length before CP padding.
+            dtype: Activation dtype.
+
+        Returns:
+            One-element input and output tuples of meta tensors. The input is
+            int64 ids of shape [microbatch, seq_len] on the first stage, else
+            streams of shape [microbatch, local_sequence, streams, hidden],
+            where local_sequence is the CP-padded length divided by the CP
+            size and streams is ``hc_mult``. The output is that stream shape
+            on stages without the final norm, otherwise [microbatch,
+            local_sequence, hidden] for hidden-state returns or [microbatch,
+            local_sequence, vocab] for logits.
         """
         config = self.config.text_config
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
@@ -410,7 +472,63 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
 
         Vision splice and CP slicing run only on the embedding stage. Packed
         metadata arrives as a chunkable tuple under multi-microbatch PP, then
-        gets a fresh per-microbatch boundary cache.
+        gets a fresh per-microbatch boundary cache. ``streams`` below is
+        ``config.text_config.hc_mult``; ``padded_global_sequence`` is the
+        global length padded to a multiple of the CP size, and
+        ``local_sequence`` is that length divided by the CP size.
+
+        Args:
+            input_ids: Integer tensor of shape [microbatch, global_sequence]
+                (or [global_sequence]) on the embedding stage; it is not CP
+                sharded. Later PP stages receive residual streams of shape
+                [microbatch, local_sequence, streams, hidden] in this
+                position, already local to this CP rank.
+            attention_mask: Optional integer tensor of shape [microbatch,
+                global_sequence], binary or holding one-based document ids.
+                Read only when ``glm5_next_packed_context`` is None.
+            position_ids: Ignored; positions follow the document map.
+            inputs_embeds: Optional tensor of shape [microbatch,
+                global_sequence, hidden] on the embedding stage, padded and
+                sliced here to this rank's interval; or already-local
+                [microbatch, local_sequence, streams, hidden] on later stages.
+            padding_mask: Optional Boolean tensor of shape [microbatch,
+                local_sequence], with True marking padding. Defaults to
+                nonpositive local document ids.
+            pixel_values: Optional flattened image patches of shape
+                [vision_patches, channels * temporal_patch * patch * patch].
+                Under PP microbatching the embedding stage reads its chunk
+                from ``_vlm_pixel_values_chunks`` instead.
+            image_grid_thw: Integer tensor of shape [images, 3] holding each
+                image's (t, h, w) patch grid; required with ``pixel_values``.
+            pixel_values_videos: Unsupported; must be None. Empty PP chunks
+                are treated as None.
+            logits_to_keep: 0 to project every local position, or the
+                positions to keep as in ``compute_lm_head_logits``.
+            output_hidden_states: Whether to attach final hidden states.
+            glm5_next_packed_context: Per-microbatch context or
+                (doc_ids, seq_start, cp_size, original_seq_len). doc_ids is an
+                integer tensor of shape [microbatch, padded_global_sequence],
+                replicated across CP ranks; nonpositive values mark padding.
+                seq_start is the global offset of this rank's contiguous
+                interval, and original_seq_len is the length before CP
+                padding. The global map is used even on later PP stages,
+                whose activations are already local. When None, a non-CP
+                context is built from ``input_ids``, ``attention_mask``,
+                ``padding_mask`` and ``cu_seqlens``/``_packed_seq_ids``.
+            **kwargs: ``qkv_format="thd"`` restores a batch axis on THD
+                logits; ``cu_seqlens`` and ``_packed_seq_ids`` feed the
+                fallback context. All kwargs reach the decoder layers.
+
+        Returns:
+            With ``_pp_return_hidden_states``, the text-model tensor: [microbatch,
+            local_sequence, hidden] on the final-norm stage, else [microbatch,
+            local_sequence, streams, hidden]. Otherwise a
+            ``CausalLMOutputWithPast`` whose ``logits`` has shape [microbatch,
+            local_sequence, vocab] (kept positions only when
+            ``logits_to_keep`` is nonzero); on a stage without ``lm_head`` it
+            carries the stream activation unchanged. ``hidden_states`` holds
+            the [microbatch, local_sequence, hidden] final states when
+            requested, else None.
         """
         del position_ids
         first_stage = self.language_model.embed_tokens is not None

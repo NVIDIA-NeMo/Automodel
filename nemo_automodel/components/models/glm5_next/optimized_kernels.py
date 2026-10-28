@@ -31,12 +31,16 @@ def project_core(hidden_streams: torch.Tensor, fn: torch.Tensor, eps: float) -> 
     """Normalize the flattened streams in FP32 before the coefficient GEMM.
 
     Args:
-        hidden_streams: Residual streams ``[batch, sequence, streams, hidden]``.
-        fn: Projection weight ``[streams * (2 + streams), streams * hidden]``.
+        hidden_streams: Tensor of shape [batch, sequence, streams, hidden],
+            where streams is ``config.hc_mult``.
+        fn: Tensor of shape [streams * (2 + streams), streams * hidden], the
+            projection weight.
         eps: Additive RMS normalization epsilon.
 
     Returns:
-        FP32 raw coefficients ``[batch, sequence, streams * (2 + streams)]``.
+        FP32 tensor of shape [batch, sequence, streams * (2 + streams)],
+        ordered as pre (streams), post (streams) and row-major comb
+        (streams * streams) raw coefficients.
     """
     flat = hidden_streams.flatten(start_dim=2).float()
     flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
@@ -47,11 +51,11 @@ def collapse_core(hidden_streams: torch.Tensor, pre: torch.Tensor) -> torch.Tens
     """Accumulate FP32 pre-weighted streams, then round the output once.
 
     Args:
-        hidden_streams: Residual streams ``[batch, sequence, streams, hidden]``.
-        pre: FP32 coefficients ``[batch, sequence, streams]``.
+        hidden_streams: Tensor of shape [batch, sequence, streams, hidden].
+        pre: FP32 tensor of shape [batch, sequence, streams].
 
     Returns:
-        Collapsed ``[batch, sequence, hidden]`` in the residual-stream dtype.
+        Tensor of shape [batch, sequence, hidden] in the residual-stream dtype.
     """
     return (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
 
@@ -60,13 +64,16 @@ def expand_core(update: torch.Tensor, residual: torch.Tensor, post: torch.Tensor
     """Keep coefficient, product, BMM output and sum rounding in GLM's order.
 
     Args:
-        update: Sublayer output ``[batch, sequence, hidden]`` in residual dtype.
-        residual: Residual streams ``[batch, sequence, streams, hidden]``.
-        post: FP32 coefficients ``[batch, sequence, streams]``.
-        comb: FP32 combinations ``[batch, sequence, source_stream, destination_stream]``.
+        update: Tensor of shape [batch, sequence, hidden] in the residual
+            dtype, the sublayer output.
+        residual: Tensor of shape [batch, sequence, streams, hidden].
+        post: FP32 tensor of shape [batch, sequence, streams].
+        comb: FP32 tensor of shape [batch, sequence, streams, streams],
+            indexed [source_stream, destination_stream].
 
     Returns:
-        Updated ``[batch, sequence, streams, hidden]`` in residual dtype.
+        Tensor of shape [batch, sequence, streams, hidden] in the residual
+        dtype. Coefficients are rounded to that dtype before each product.
     """
     dtype = residual.dtype
     return post.to(dtype).unsqueeze(-1) * update.unsqueeze(-2) + torch.matmul(
@@ -80,10 +87,11 @@ def _expand_core_four_streams(
     """Fuse four-stream BF16 mixing with the expansion's existing cast boundaries.
 
     Args:
-        update: BF16 sublayer output of shape [batch, sequence, hidden].
-        residual: BF16 streams of shape [batch, sequence, streams, hidden].
-        post: FP32 coefficients of shape [batch, sequence, streams].
-        comb: FP32 combinations of shape [batch, sequence, source_stream, destination_stream].
+        update: BF16 tensor of shape [batch, sequence, hidden].
+        residual: BF16 tensor of shape [batch, sequence, streams, hidden].
+        post: FP32 tensor of shape [batch, sequence, streams].
+        comb: FP32 tensor of shape [batch, sequence, streams, streams],
+            indexed [source_stream, destination_stream].
 
     Returns:
         Updated streams of shape [batch, sequence, streams, hidden], in the
@@ -104,12 +112,14 @@ def norm_core(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> 
     """Round normalized values before multiplying the norm weight, as GLM does.
 
     Args:
-        hidden_states: Input ``[..., hidden]`` with arbitrary leading axes.
-        weight: Learned scale ``[hidden]`` in the input dtype.
+        hidden_states: Tensor of shape [..., hidden], with arbitrary leading
+            dimensions.
+        weight: Tensor of shape [hidden] in the input dtype.
         eps: Additive RMS normalization epsilon.
 
     Returns:
-        Normalized values with the input shape and dtype.
+        Tensor with the input shape and dtype. The FP32 normalized values are
+        rounded to the input dtype before the weight multiply.
     """
     states = hidden_states.float()
     states = states * torch.rsqrt(states.square().mean(-1, keepdim=True) + eps)
@@ -117,7 +127,20 @@ def norm_core(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> 
 
 
 def gated_norm_core(hidden_states: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Normalize and sigmoid-gate KDA output, preserving eager cast boundaries."""
+    """Normalize and sigmoid-gate KDA output, preserving eager cast boundaries.
+
+    Args:
+        hidden_states: Tensor of shape [batch, sequence, heads, head_dim].
+        gate: Tensor of shape [batch, sequence, heads, head_dim].
+        weight: Tensor of shape [head_dim] in ``hidden_states``'s dtype.
+        eps: Additive RMS normalization epsilon.
+
+    Returns:
+        Tensor of shape [batch, sequence, heads, head_dim] in
+        ``hidden_states``'s dtype. Normalization runs in FP32 and is rounded
+        to that dtype before the weight multiply; the sigmoid gate is
+        computed in FP32 and rounded to that dtype before the final product.
+    """
     return norm_core(hidden_states, weight, eps) * torch.sigmoid(gate.float()).to(hidden_states.dtype)
 
 

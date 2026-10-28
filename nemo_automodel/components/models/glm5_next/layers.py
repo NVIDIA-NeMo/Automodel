@@ -60,7 +60,16 @@ class Glm5NextRMSNorm(nn.Module):
         self._norm_core = rms_norm_core(compile_norm)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Normalize ``[..., hidden]`` and preserve the input dtype."""
+        """Normalize the last axis and preserve the input dtype.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden], with arbitrary
+                leading dimensions.
+
+        Returns:
+            Tensor with ``hidden_states``'s shape. Normalization runs in FP32
+            and is rounded to the input dtype before the weight multiply.
+        """
         return self._norm_core(hidden_states, self.weight, self.variance_epsilon)
 
     def reset_parameters(self) -> None:
@@ -99,7 +108,32 @@ class Glm5NextHyperConnectionFp32Params(nn.Module):
         eps: float,
         sinkhorn_iters: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build FP32 mHC weights while this holder's FSDP unit is unsharded."""
+        """Build FP32 mHC weights while this holder's FSDP unit is unsharded.
+
+        ``streams`` below is ``hc``, the number of residual streams
+        (``config.hc_mult``).
+
+        Args:
+            pre_w: FP32 tensor of shape [batch, sequence, streams], the raw
+                collapse coefficients.
+            post_w: FP32 tensor of shape [batch, sequence, streams], the raw
+                expansion coefficients.
+            comb_w: FP32 tensor of shape [batch, sequence, streams * streams],
+                row-major raw mixing logits indexed [source_stream,
+                destination_stream]. It may be a last-axis slice of a larger
+                projection.
+            hc: Number of residual streams.
+            eps: Additive stabilizer for ``pre`` and Sinkhorn denominators.
+            sinkhorn_iters: Number of Sinkhorn normalization rounds.
+
+        Returns:
+            ``pre`` of shape [batch, sequence, streams] (sigmoid plus eps),
+            ``post`` of shape [batch, sequence, streams] (twice the sigmoid),
+            and ``comb`` of shape [batch, sequence, streams, streams] indexed
+            [source_stream, destination_stream], approximately doubly
+            stochastic after its final column normalization. All are FP32
+            for FP32 inputs.
+        """
         pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
         pre_scale, post_scale, comb_scale = self.scale.unbind(0)
         pre = torch.sigmoid(pre_w * pre_scale + pre_b) + eps
@@ -158,7 +192,8 @@ class Glm5NextHyperConnection(nn.Module):
 
         Returns:
             FP32 post weights [batch, sequence, hc_mult], FP32 combination
-            weights [batch, sequence, hc_mult, hc_mult], and collapsed states
+            weights [batch, sequence, hc_mult, hc_mult] indexed
+            [source_stream, destination_stream], and collapsed states
             [batch, sequence, hidden] in the input dtype.
         """
         hc = self.hc_mult
@@ -205,7 +240,28 @@ class _TorchShortConvolution(nn.Module):
         cu_seqlens_cpu: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
-        """Convolve ``[batch, sequence, channels]`` and reset at packed boundaries."""
+        """Apply causal depthwise convolution and SiLU, resetting at packed boundaries.
+
+        Args:
+            x: Tensor of shape [batch, sequence, channels]. Packed callers
+                pass one row, [1, sequence, channels].
+            cu_seqlens: Optional integer tensor of shape [segments + 1] on
+                ``x``'s device, holding ascending row-local boundaries from 0
+                to sequence; segments are consecutive equal-document-id runs,
+                padding included. The CPU fallback applies the same
+                boundaries to every batch row.
+            cu_seqlens_cpu: Optional CPU tensor of shape [segments + 1] with
+                the same values as ``cu_seqlens``. Only the FLA CUDA kernel
+                reads it, to avoid a device synchronization.
+            **kwargs: FLA-only ``cache`` (initial state),
+                ``output_final_state`` and ``cp_context``; the CPU fallback
+                ignores them.
+
+        Returns:
+            Output of shape [batch, sequence, channels] in ``x``'s dtype, and
+            the FLA final state, which is None unless ``output_final_state``
+            is set on the CUDA path.
+        """
         if _SHORT_CONV_OK and x.is_cuda:
             return _fla_causal_conv1d(
                 x=x,
@@ -243,7 +299,16 @@ class _TorchRMSNormGated(Glm5NextRMSNorm):
         self._gated_norm_core = rms_norm_gated_core(compile_norm)
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Normalize ``[batch, sequence, heads, head_dim]`` then sigmoid-gate it."""
+        """Normalize each head then sigmoid-gate it.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, heads, head_dim].
+            gate: Tensor with ``hidden_states``'s shape.
+
+        Returns:
+            Tensor with ``hidden_states``'s shape and dtype; see
+            ``gated_norm_core`` for the rounding boundaries.
+        """
         return self._gated_norm_core(hidden_states, gate, self.weight, self.variance_epsilon)
 
 
@@ -373,7 +438,22 @@ class Glm5NextLinearAttention(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
-        """Run KDA over ``[batch, local_sequence, hidden]`` without crossing documents."""
+        """Run KDA over local tokens without crossing documents.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden],
+                this rank's contiguous CP interval.
+            packed_context: Optional global document layout whose
+                ``doc_ids`` has shape [batch, padded_global_sequence]. With CP
+                each row runs through FLA's CP context; without CP its
+                per-row boundaries reset the recurrence. None runs each row
+                as one sequence.
+            padding_mask: Optional Boolean tensor of shape [batch,
+                local_sequence], with True marking padding.
+
+        Returns:
+            Tensor of shape [batch, local_sequence, hidden], zero at padding.
+        """
         if packed_context is not None and packed_context.cp_enabled:
             if self._cp_mesh is None:
                 raise RuntimeError("GLM-5.3 KDA received a CP batch before apply_cp attached its mesh")
@@ -408,7 +488,23 @@ class Glm5NextLinearAttention(nn.Module):
         cu_seqlens_cpu: torch.Tensor | None = None,
         cp_context: Any = None,
     ) -> torch.Tensor:
-        """Project and execute KDA for one packed row or a regular batch."""
+        """Project and execute KDA for one packed row or a regular batch.
+
+        Args:
+            hidden_states: Tensor of shape [rows, sequence, hidden]. Packed
+                and CP calls pass one row, [1, local_sequence, hidden].
+            cu_seqlens: Optional integer tensor of shape [segments + 1] on
+                the input device with ascending row-local boundaries from 0 to
+                sequence. It is cloned before use and never mutated.
+            cu_seqlens_cpu: Optional CPU tensor of shape [segments + 1] with
+                the same values as ``cu_seqlens``, passed to FLA to avoid a
+                device synchronization.
+            cp_context: Optional FLA CP context for this row, carrying its own
+                boundaries; callers pass it instead of ``cu_seqlens``.
+
+        Returns:
+            Tensor of shape [rows, sequence, hidden] in the projection dtype.
+        """
         if cu_seqlens is not None:
             # FLA caches metadata by tensor identity. PP interleaves microbatches,
             # so use a fresh identity on both forward and checkpoint recompute.
@@ -554,22 +650,25 @@ class Glm5NextKPoolIndexer(nn.Module):
         """Select raw key indices for one query chunk.
 
         Args:
-            query_hidden: Hidden states with shape ``[1, queries, hidden]``.
-            query_resid: Low-rank query states with shape
-                ``[1, queries, q_lora_rank]``.
-            query_positions: Document-local positions with shape ``[queries]``.
-            pool_keys: Prepared KPool keys with shape
-                ``[complete_pools, index_head_dim]``.
-            pool_indices: Prepared raw token indices with shape
-                ``[complete_pools, index_kpool]``.
+            query_hidden: Tensor of shape [1, queries, hidden].
+            query_resid: Tensor of shape [1, queries, q_lora_rank], the
+                normalized low-rank query states.
+            query_positions: Integer tensor of shape [queries] holding
+                document-local positions. The cuDNN backend requires them to
+                be contiguous and ascending.
+            pool_keys: Tensor of shape [complete_pools, index_head_dim] from
+                ``prepare_pools``.
+            pool_indices: Integer tensor of shape [complete_pools,
+                index_kpool] holding document-local token indices.
             key_length: Number of tokens in the unpadded document.
             query_projection_chunk_size: Original projection tile size, preserved
                 when the cuDNN score kernel processes several tiles together.
 
         Returns:
-            Int32 raw indices with shape
-            ``[1, queries, index_topk + index_kpool - 1]`` when tail selection
-            is enabled, otherwise ``[1, queries, index_topk]``.
+            Int32 document-local indices of shape [1, queries, index_topk +
+            index_kpool - 1] when tail selection is enabled and index_kpool >
+            1, otherwise [1, queries, index_topk]. Unused slots and
+            non-causal selections are -1.
         """
         complete_pools = pool_keys.shape[0]
 
@@ -665,13 +764,16 @@ def _dense_prefix_indices(
     """Enumerate every visible key when all complete causal pools fit the budget.
 
     Args:
-        positions: Document-local query positions [queries].
+        positions: Integer tensor of shape [queries] holding document-local
+            query positions.
         index_topk: Maximum number of tokens selected from complete pools.
         pool_size: Number of tokens per complete pool.
         always_select_tail: Whether to include the incomplete causal pool.
 
     Returns:
-        Int32 indices [1, queries, index_topk + tail_width], with an ascending
+        Int32 tensor of shape [1, queries, index_topk + tail_width], where
+        tail_width is pool_size - 1 when always_select_tail is set and 0
+        otherwise. Each row holds an ascending
         valid prefix and -1 padding. The caller establishes that the complete
         pool count of every query is no greater than index_topk // pool_size.
     """
@@ -742,7 +844,25 @@ class Glm5NextSparseAttention(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
-        """Run document-isolated sparse attention on ``[batch, local_sequence, hidden]``."""
+        """Run document-isolated sparse attention for this rank's queries.
+
+        Keys come from the full document, so under CP the local states are
+        all-gathered along the sequence with a gradient-summing backward.
+
+        Args:
+            hidden_states: Tensor of shape [batch, local_sequence, hidden],
+                this rank's contiguous interval of the CP-padded sequence.
+            packed_context: Global document layout. ``doc_ids`` is an integer
+                tensor of shape [batch, padded_global_sequence], replicated
+                across CP ranks, with nonpositive values at padding;
+                ``seq_start`` is this rank's global query offset.
+            padding_mask: Optional Boolean tensor of shape [batch,
+                local_sequence], with True marking padding.
+
+        Returns:
+            Tensor of shape [batch, local_sequence, hidden], zero at padding
+            and at tokens outside positive-id documents.
+        """
         if packed_context is None:
             raise ValueError("GLM-5.3 sparse attention requires a packed document context")
         if packed_context.cp_enabled:
@@ -842,12 +962,18 @@ class Glm5NextSparseAttention(nn.Module):
         projection order and shapes. Concatenate only the attention inputs.
 
         Args:
-            full_hidden: Gathered states [batch, global_sequence, hidden].
-            packed_context: Global document map and this rank's query offset.
+            full_hidden: CUDA tensor of shape [batch, padded_global_sequence,
+                hidden], all-gathered across CP ranks (the local tensor when
+                CP is disabled).
+            packed_context: Global document layout. ``doc_ids`` has shape
+                [batch, padded_global_sequence]; ``seq_start`` is this rank's
+                global query offset.
             local_sequence_length: Number of tokens owned by this CP rank.
 
         Returns:
-            Attention states [batch, local_sequence, hidden], zero at padding.
+            Tensor of shape [batch, local_sequence, hidden], zero at tokens
+            outside positive-id documents. The caller applies the padding
+            mask.
         """
         if not is_cudnn_sparse_attention_available():
             raise RuntimeError("Packed cuDNN attention requires the FlashMLA/cuDNN runtimes.")
@@ -920,17 +1046,22 @@ class Glm5NextSparseAttention(nn.Module):
         """Select document-local keys using the original indexer projection tiles.
 
         Args:
-            query_hidden: Local query states [1, queries, hidden].
-            q_resid: Normalized low-rank queries [1, queries, q_lora_rank].
-            pool_keys: Compressed index keys [complete_pools, index_head_dim].
-            pool_indices: Document-local indices [complete_pools, index_kpool].
+            query_hidden: Tensor of shape [1, queries, hidden], where
+                queries is query_end - query_start.
+            q_resid: Tensor of shape [1, queries, q_lora_rank], the
+                normalized low-rank queries.
+            pool_keys: Tensor of shape [complete_pools, index_head_dim].
+            pool_indices: Integer tensor of shape [complete_pools,
+                index_kpool] holding document-local token indices.
             query_start: First local query's position within the document.
             query_end: Exclusive document-local query end.
             length: Full document length.
 
         Returns:
-            Selected document-local indices [queries, 1, selection_width].
-            Invalid entries retain the -1 sentinel.
+            Contiguous int32 tensor of shape [queries, 1, selection_width]
+            holding document-local key indices, where selection_width is
+            index_topk + index_kpool - 1 with tail selection and index_topk
+            otherwise. Invalid entries retain the -1 sentinel.
         """
         selected_indices = []
 
@@ -1032,7 +1163,20 @@ class Glm5NextDecoderLayer(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Transform residual streams ``[batch, local_sequence, hc_mult, hidden]``."""
+        """Apply attention and feed-forward sublayers through two mHC mixers.
+
+        Args:
+            hidden_streams: Tensor of shape [batch, local_sequence, streams,
+                hidden], where streams is ``config.hc_mult``.
+            packed_context: Global document layout passed to attention;
+                ``doc_ids`` has shape [batch, padded_global_sequence].
+            padding_mask: Optional Boolean tensor of shape [batch,
+                local_sequence], with True marking padding.
+            **kwargs: Forwarded to the attention module.
+
+        Returns:
+            Tensor with ``hidden_streams``'s shape and dtype.
+        """
         residual = hidden_streams
         post, comb, collapsed = self.attn_hc(hidden_streams)
         update = self.self_attn(

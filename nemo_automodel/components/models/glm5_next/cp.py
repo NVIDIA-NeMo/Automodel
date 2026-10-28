@@ -160,7 +160,11 @@ def build_fla_cp_context(
     """Build FLA's KDA context for one batch row.
 
     Args:
-        packed_context: Global document layout.
+        packed_context: Global document layout whose ``doc_ids`` tensor has
+            shape [batch, padded_global_sequence]. Its cached device and CPU
+            boundaries, each an integer tensor of shape [segments + 1] where
+            segments are consecutive equal-id runs including padding, are
+            read; FLA receives a fresh clone of the device boundaries.
         row: Batch row being executed.
         cp_group: Context-parallel process group.
         conv_kernel_size: Short-convolution width used for the left halo.
@@ -187,6 +191,22 @@ class _AllGatherSequence(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, local_tensor: torch.Tensor, group: Any, dim: int) -> torch.Tensor:
+        """Concatenate every rank's sequence shard in rank order.
+
+        Args:
+            ctx: Autograd context; stores the group, dimension, rank and
+                local shard length for backward.
+            local_tensor: Tensor of arbitrary rank whose ``dim`` axis is this
+                rank's local_sequence shard. Every rank must pass the same
+                shape and dtype.
+            group: Context-parallel process group of size cp_size.
+            dim: Sequence axis; negative values count from the end.
+
+        Returns:
+            Contiguous tensor with ``local_tensor``'s shape except that axis
+            ``dim`` has length cp_size * local_sequence. It owns new storage
+            and does not alias ``local_tensor``.
+        """
         dim = dim if dim >= 0 else local_tensor.ndim + dim
         gathered = local_tensor.new_empty((dist.get_world_size(group), *local_tensor.shape))
         dist.all_gather_into_tensor(gathered.flatten(0, 1), local_tensor.contiguous(), group=group)
@@ -201,8 +221,9 @@ class _AllGatherSequence(torch.autograd.Function):
         """Reduce a private copy of the full-sequence gradient.
 
         Args:
-            grad_output: Tensor of arbitrary rank with the global sequence on
-                ctx.dim. Its dtype matches the forward input, and its storage
+            ctx: Autograd context saved by forward.
+            grad_output: Tensor with the forward output's shape, global
+                sequence on ctx.dim. Its dtype matches the forward input, and its storage
                 may still be owned by the caller or another autograd branch.
 
         Returns:
@@ -221,11 +242,32 @@ class _AllGatherBackwardAnchor(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, gathered: torch.Tensor) -> torch.Tensor:
+        """Return a broadcastable zero tied to ``gathered``.
+
+        Args:
+            ctx: Autograd context; stores the input shape for backward.
+            gathered: Tensor of shape [batch, global_sequence, hidden], the
+                all-gathered sequence.
+
+        Returns:
+            Zero tensor of shape [batch, 1, 1] in ``gathered``'s dtype and
+            device, broadcastable onto [batch, local_sequence, hidden].
+        """
         ctx.input_shape = gathered.shape
         return gathered.new_zeros((gathered.shape[0], 1, 1))
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        """Send a zero gradient to the gathered tensor.
+
+        Args:
+            ctx: Autograd context saved by forward.
+            grad_output: Tensor of shape [batch, 1, 1].
+
+        Returns:
+            Zero tensor with the forward input's shape [batch,
+            global_sequence, hidden], so the gather backward still runs.
+        """
         return grad_output.new_zeros(ctx.input_shape)
 
 
@@ -317,8 +359,14 @@ def shard_batch_for_glm5_next_cp(
     Args:
         cp_mesh: One-dimensional CP mesh or ``None``.
         tp_mesh: Unused tensor-parallel mesh, accepted by the sharder protocol.
-        batch: Batch containing token tensors with shape ``[batch, sequence]``.
-        loss_mask: Optional loss mask ``[batch, sequence]``.
+        batch: Batch mutated in place. Token tensors such as ``input_ids``,
+            ``labels``, ``position_ids`` and ``padding_mask`` have shape
+            [batch, sequence] (a 1-D THD row gains a batch axis). Packing
+            metadata (``_packed_seq_ids`` or ``attention_mask`` of shape
+            [batch, sequence], ``seq_lens``/``seq_lens_padded`` of shape
+            [batch, documents], or ``cu_seqlens`` of shape [documents + 1])
+            is consumed and removed.
+        loss_mask: Optional tensor of shape [batch, sequence].
         padding_token_id: Fill value for padded token ids.
         shard_primary: Whether to shard ``input_ids`` in this function.
         num_chunks: PP microbatches. With multiple chunks, expose the document
@@ -326,6 +374,15 @@ def shard_batch_for_glm5_next_cp(
 
     Returns:
         Context factory, mutated local batch, and the global shard layout.
+        In the batch, ``labels``, ``position_ids``, ``padding_mask`` (True at
+        padding), ``loss_mask`` and, with ``shard_primary``, ``input_ids``
+        become contiguous [batch, local_sequence] slices of the CP-padded
+        sequence. Otherwise ``input_ids`` stays global and unpadded.
+        ``glm5_next_packed_context`` holds int32 ``doc_ids`` of shape [batch,
+        padded_global_sequence], replicated on every CP rank, plus
+        ``seq_start``, ``cp_size`` and the unpadded length: a
+        ``Glm5NextPackedContext``, or the equivalent tuple when
+        ``num_chunks > 1``.
     """
     del tp_mesh
     _normalize_batch_axis(batch)
