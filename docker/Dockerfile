@@ -360,6 +360,19 @@ ARG RUNTIME_GID=65532
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
 
+# On Google Cloud A3 Ultra, A4, A4X and A4X Max machines, the NGC PyTorch base image's shell
+# init (/etc/shinit_v2) enables Google's NCCL profiler plugin (CoMMA), which by default uploads
+# NCCL telemetry to Google. Turn the telemetry off and do not load the plugin. The shell init
+# runs in every bash process and would set NCCL_PROFILER_PLUGIN=gcp again, so make it keep a
+# value that is already set. Run with NCCL_PROFILER_PLUGIN=gcp NCCL_TELEMETRY_MODE=3 to opt in.
+ENV NCCL_TELEMETRY_MODE=0 \
+    NCCL_PROFILER_PLUGIN=none
+RUN if [ -f /opt/gcp/nccl-plugins/lib64/libnccl-profiler-gcp.so ]; then \
+        sed -i 's/^\( *\)export NCCL_PROFILER_PLUGIN=gcp$/\1export NCCL_PROFILER_PLUGIN=${NCCL_PROFILER_PLUGIN:-gcp}/' /etc/shinit_v2 && \
+        grep -qF 'export NCCL_PROFILER_PLUGIN=${NCCL_PROFILER_PLUGIN:-gcp}' /etc/shinit_v2 || \
+        { echo "Update the NCCL_PROFILER_PLUGIN patch for this base image's /etc/shinit_v2" >&2; exit 1; }; \
+    fi
+
 COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} . /opt/Automodel
 
 # The checkout is owned by RUNTIME_UID but the image still runs as root by default,
