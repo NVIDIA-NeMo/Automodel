@@ -97,7 +97,9 @@ optimizer:
 
 ci:
   cluster_tag: gb10
+  recipe_owner: kashif
   time: "00:20:00"
+  nodes: 1
   nproc_per_node: 1
   env_vars:
     OMP_NUM_THREADS: 8
