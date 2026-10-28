@@ -524,6 +524,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # (e.g. unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
     domain_mixture = None
+    # Tokens per pack when sequence packing is on; setup() sets it.
+    pack_size = None
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -883,6 +885,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
 
         self.dataloader = materialize_loader(self.cfg.dataloader)
+        packing = self.cfg.dataloader.packing
+        self.pack_size = packing.packed_sequence_size if packing is not None else None
         self.val_dataloaders = {
             name: materialize_loader(
                 dl_config
@@ -1457,7 +1461,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Execute a single training step.
 
         Args:
-            batches: List of batches of training data.
+            batches: Microbatches of training data. Each holds ``labels``, a tensor of shape [batch, sequence]
+                right-padded with -100; with sequence packing each row is one pack.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
@@ -1506,12 +1511,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         loss_buffer = []
 
-        # number of tokens in the batch, excluding any tail padding.
-        num_tokens_in_batch = torch.tensor(
-            sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+        # Number of tokens in the batch, excluding any tail padding, and of packs (one per row) when packing.
+        token_counts = torch.tensor(
+            [
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
+            ],
             dtype=torch.long,
         )
-        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
+        num_tokens_in_batch, num_packs = self._dp_allreduce(token_counts).tolist()
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
@@ -1631,6 +1639,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "num_tokens_per_step": num_tokens_in_batch,
             "num_label_tokens": num_label_tokens,
         }
+        if self.pack_size:
+            # Share of the step's pack capacity holding tokens rather than padding.
+            metrics["pack_fill"] = num_tokens_in_batch / (num_packs * self.pack_size)
         if domain_label_counts is not None:
             total_domain_labels = max(int(domain_label_counts.sum().item()), 1)
             for name, count in zip(self.domain_mixture.names, domain_label_counts.tolist()):
@@ -1853,6 +1864,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     "tps": Tokens per second.
                     "tps_per_gpu": Tokens per second per GPU.
                     "num_label_tokens": Number of label tokens.
+                    "pack_fill": Share of pack capacity holding tokens; present only with sequence packing.
         """
         if not self.dist_env.is_main:
             return
@@ -1886,11 +1898,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
+        pack_fill = log_data.metrics.get("pack_fill")
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            "step {} | epoch {} | loss {:.4f}{} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
+                "" if pack_fill is None else f" | pack_fill {pack_fill:.3f}",
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],

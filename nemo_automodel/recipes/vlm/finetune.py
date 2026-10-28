@@ -464,6 +464,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
     # disabled default keeps the train step working if setup() is skipped (e.g.
     # unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
+    # Tokens per pack when sequence packing is on; setup() sets it.
+    pack_size = None
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -705,6 +707,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
         self.dataloader = dataloader_build.dataloader
         self.processor = dataloader_build.processor
+        self.pack_size = dataloader_config.packing.pack_size if dataloader_config.packing is not None else None
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
@@ -1179,20 +1182,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """Execute a single training step.
 
         Args:
-            batches: List of batches of training data.
+            batches: Microbatches of training data. Each holds ``labels``, a tensor of shape [batch, sequence]
+                right-padded with -100; with sequence packing each row is one pack.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        # Both counts are needed as Python integers. Reduce and read them in one
-        # transfer so the second count does not introduce another device sync.
+        # The counts are needed as Python integers. Reduce and read them in one
+        # transfer so each additional count does not introduce another device sync.
         token_counts = torch.tensor(
             [
                 sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
                 sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+                sum(batch["labels"].shape[0] for batch in batches) if self.pack_size else 0,
             ],
             dtype=torch.long,
         )
-        num_label_tokens, num_tokens_in_batch = self._dp_allreduce(token_counts).tolist()
+        num_label_tokens, num_tokens_in_batch, num_packs = self._dp_allreduce(token_counts).tolist()
 
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
@@ -1293,19 +1298,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
         reporting_loss = reporting_loss.item()
         # fix reporting_loss, tps across ranks
 
+        metrics = {
+            "loss": reporting_loss,
+            "grad_norm": grad_norm,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            "tps": tps,
+            "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+            "num_tokens_per_step": num_tokens_in_batch,
+            "num_label_tokens": num_label_tokens,
+        }
+        if self.pack_size:
+            # Share of the step's pack capacity holding tokens. Packs are padded only to the longest pack
+            # in the batch, so the capacity comes from pack_size rather than from the padded shape.
+            metrics["pack_fill"] = num_tokens_in_batch / (num_packs * self.pack_size)
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "loss": reporting_loss,
-                "grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": tps,
-                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
-                "num_tokens_per_step": num_tokens_in_batch,
-                "num_label_tokens": num_label_tokens,
-            },
+            metrics=metrics,
         )
 
     @torch.no_grad()
@@ -1446,11 +1456,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
+        pack_fill = log_data.metrics.get("pack_fill")
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            "step {} | epoch {} | loss {:.4f}{} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
+                "" if pack_fill is None else f" | pack_fill {pack_fill:.3f}",
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],
