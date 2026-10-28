@@ -15,7 +15,7 @@ the main next-token loss. At inference, an engine can use those depths to
 propose several tokens per verification step, the same way a separate draft
 model does for EAGLE or DFlash.
 
-MTP finetuning is **not** a separate draft model or recipe. It reuses the
+MTP fine-tuning is **not** a separate draft model or recipe. It reuses the
 standard `TrainFinetuneRecipeForNextTokenPrediction` recipe, which already
 computes the MTP auxiliary loss whenever the loaded model's MTP head is
 enabled. Fine-tuning just the MTP head for a new domain is a matter of freezing
