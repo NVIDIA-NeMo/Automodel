@@ -34,9 +34,10 @@ from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextHyperConnectionFp32Params,
     Glm5NextKDAFp32Params,
 )
+from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
 from nemo_automodel.components.models.glm5_next.parallelization import PARALLELIZER
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from tests.unit_tests.models.glm5_next.conftest import tiny_glm5_next_model
+from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config
 
 _WORLD_SIZE = 2
 _ROWS = 4
@@ -67,7 +68,13 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
         device = torch.device("cuda", rank)
 
         torch.manual_seed(1234)
-        model = tiny_glm5_next_model().to(device)
+        config = tiny_glm5_next_config()
+        # FLA's CUDA KDA kernels need a head width of at least 8.
+        config.text_config.linear_head_dim = 32
+        config.text_config.hc_mult = 4
+        model = Glm5NextForConditionalGeneration(config, backend=tiny_backend(adapter=False))
+        model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+        model.to(device)
         reference = copy.deepcopy(model)
         mesh_context = MeshContext.build(
             FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)),
