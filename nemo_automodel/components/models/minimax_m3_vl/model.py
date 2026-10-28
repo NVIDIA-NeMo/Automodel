@@ -58,6 +58,7 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
 
 
 @dataclass
@@ -759,37 +760,16 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 "set text_config.num_mtp_modules=0 for pp_size>1 runs."
             )
 
-        # Pipeline stage 0 does not receive media in the batch: the VLM-PP collate
-        # strips pixel_values/grids and stage_vlm_media_for_pp attaches them here as
-        # per-microbatch chunks. Pull this microbatch's media off the cursor before
-        # embedding so vision features still get spliced (mirrors KimiVL/Step3p7).
-        # `_vlm_image_grid_hws_chunks` holds M3's image_grid_thw values (the PP media
-        # prep stores whatever grid the model emits under that key), so no reshape.
-        chunks = getattr(self, "_vlm_pixel_values_chunks", None)
         if (
             pixel_values is None
             and pixel_values_videos is None
             and input_ids is not None
             and not torch.is_floating_point(input_ids)
-            and (chunks is not None or getattr(self, "_vlm_pixel_values_videos_chunks", None) is not None)
         ):
-            chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-            consumed = False
-            if chunks is not None and (input_ids == self.image_token_index).any() and chunk_idx < len(chunks):
-                pixel_values = chunks[chunk_idx]
-                image_grid_thw = self._vlm_image_grid_hws_chunks[chunk_idx]
-                consumed = True
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if (
-                video_chunks is not None
-                and (input_ids == self.video_token_index).any()
-                and chunk_idx < len(video_chunks)
-            ):
-                pixel_values_videos = video_chunks[chunk_idx]
-                video_grid_thw = self._vlm_video_grid_thw_chunks[chunk_idx]
-                consumed = True
-            if consumed:
-                self._vlm_chunk_idx = chunk_idx + 1
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values, image_grid_thw = media.pixel_values, media.image_grid
+                pixel_values_videos, video_grid_thw = media.pixel_values_videos, media.video_grid
 
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
 

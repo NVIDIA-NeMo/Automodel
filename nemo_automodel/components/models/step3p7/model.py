@@ -47,6 +47,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -556,6 +557,29 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | Step3p7CausalLMOutput:
+        """Run one microbatch with direct or explicitly staged patch-based media.
+
+        Args:
+            input_ids: Token IDs [batch, sequence], or [tokens] for THD.
+            *mtp_embed_inputs: Optional MTP embeddings [batch, sequence, hidden]
+                propagated by a previous pipeline stage.
+            position_ids: Scalar positions matching the token axes.
+            attention_mask: Optional [batch, sequence] attention eligibility.
+            padding_mask: Optional boolean padding flags matching token axes.
+            inputs_embeds: Optional embeddings [batch, sequence, hidden].
+            cache_position: Optional cache positions [sequence].
+            logits_to_keep: Number of trailing logits, or indices [selected_tokens].
+            output_hidden_states: Include final hidden states in the model output.
+            **kwargs: Media pixels [images, channels, height, width], patch pixels
+                [patches, channels, height, width], patch counts [images], newline
+                flags [patches], and optional packed cumulative offsets [segments + 1].
+
+        Returns:
+            Logits [batch, sequence, vocab] or a model output containing those
+            logits, optional hidden states [batch, sequence, hidden], and MTP
+            logits with the same token axes. Non-final PP stages return hidden
+            values and optional propagated MTP embeddings.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -566,43 +590,22 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
         use_mtp = self.mtp is not None and self.training
 
-        pixel_values = kwargs.get("pixel_values", None)
-        has_image_tokens = (
-            input_ids is not None
-            and isinstance(input_ids, torch.Tensor)
-            and input_ids.dtype not in (torch.float16, torch.bfloat16, torch.float32)
-            and (input_ids == self.config.image_token_id).any()
-        )
-
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        consumed_vlm_chunk = False
-        if pixel_values is None and has_image_tokens:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            if image_chunks is not None and chunk_idx < len(image_chunks):
-                kwargs["pixel_values"] = image_chunks[chunk_idx]
-                patch_chunks = getattr(self, "_vlm_patch_pixel_values_chunks", None)
-                if patch_chunks is not None and chunk_idx < len(patch_chunks):
-                    kwargs["patch_pixel_values"] = patch_chunks[chunk_idx]
-                num_patches_chunks = getattr(self, "_vlm_num_patches_chunks", None)
-                if num_patches_chunks is not None and chunk_idx < len(num_patches_chunks):
-                    kwargs["num_patches"] = num_patches_chunks[chunk_idx]
-                newline_chunks = getattr(self, "_vlm_patch_newline_mask_chunks", None)
-                if newline_chunks is not None and chunk_idx < len(newline_chunks):
-                    kwargs["patch_newline_mask"] = newline_chunks[chunk_idx]
-                consumed_vlm_chunk = True
+        if kwargs.get("pixel_values") is None:
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                kwargs.update(
+                    pixel_values=media.pixel_values,
+                    patch_pixel_values=media.patch_pixel_values,
+                    num_patches=media.num_patches,
+                    patch_newline_mask=media.patch_newline_mask,
+                )
                 if _debug_vision_enabled():
                     _debug_vision_log(
-                        "[step3p7][rank %s] PP consumed vision chunk=%s pixel_values=%s num_patches=%s",
+                        "[step3p7][rank %s] PP consumed vision chunk=%s pixel_values=%s",
                         _rank(),
-                        chunk_idx,
-                        tuple(image_chunks[chunk_idx].shape),
-                        None
-                        if kwargs.get("num_patches", None) is None
-                        else [int(x) for x in kwargs["num_patches"].detach().cpu().view(-1).tolist()],
+                        self._vlm_chunk_idx - 1,
+                        None if media.pixel_values is None else tuple(media.pixel_values.shape),
                     )
-
-        if consumed_vlm_chunk:
-            self._vlm_chunk_idx = chunk_idx + 1
 
         if (
             inputs_embeds is not None

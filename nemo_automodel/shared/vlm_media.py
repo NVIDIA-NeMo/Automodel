@@ -21,23 +21,30 @@ import torch
 
 @dataclass(frozen=True)
 class VlmMediaChunk:
-    """One microbatch's views of staged image tensors.
+    """One microbatch's views of staged image and video tensors.
 
-    Pixels retain their processor layout, with images or patches on axis zero.
-    Grids have shape [images, coordinates]. Empty media
+    Image/video pixels retain their processor layout, with images or patches on
+    axis zero. Grids have shape [images or videos, coordinates]. Empty media
     chunks become None; nonempty tensors alias the staged inputs unchanged.
     """
 
     pixel_values: torch.Tensor | None
     image_grid: torch.Tensor | None
+    pixel_values_videos: torch.Tensor | None
+    video_grid: torch.Tensor | None
+    patch_pixel_values: torch.Tensor | None = None
+    num_patches: torch.Tensor | None = None
+    patch_newline_mask: torch.Tensor | None = None
 
 
 def next_vlm_media_chunk(module: torch.nn.Module) -> VlmMediaChunk | None:
     """Advance staged media once, including for a text-only microbatch.
 
     Args:
-        module: Pipeline stage carrying image chunk lists. Pixel tensors retain
-            their image/patch-major layouts; metadata is [images, coordinates].
+        module: Pipeline stage carrying image/video chunk lists. Pixel tensors
+            retain their image/patch-major layouts; metadata is [media, coordinates].
+            Optional patch pixels retain [patches, channels, height, width], patch
+            counts [images], and newline masks [patches] for patch-based consumers.
 
     Returns:
         The next chunk with original nonempty tensor views, or None when no media
@@ -47,7 +54,8 @@ def next_vlm_media_chunk(module: torch.nn.Module) -> VlmMediaChunk | None:
         ValueError: If a media or grid list is exhausted before the schedule.
     """
     images = getattr(module, "_vlm_pixel_values_chunks", None)
-    if images is None:
+    videos = getattr(module, "_vlm_pixel_values_videos_chunks", None)
+    if images is None and videos is None:
         return None
     index = getattr(module, "_vlm_chunk_idx", 0) or 0
 
@@ -73,6 +81,11 @@ def next_vlm_media_chunk(module: torch.nn.Module) -> VlmMediaChunk | None:
     result = VlmMediaChunk(
         take(images, "image"),
         take(getattr(module, "_vlm_image_grid_hws_chunks", None), "image metadata"),
+        take(videos, "video"),
+        take(getattr(module, "_vlm_video_grid_thw_chunks", None), "video metadata"),
+        take(getattr(module, "_vlm_patch_pixel_values_chunks", None), "patch pixels"),
+        take(getattr(module, "_vlm_num_patches_chunks", None), "patch counts"),
+        take(getattr(module, "_vlm_patch_newline_mask_chunks", None), "patch newline metadata"),
     )
     module._vlm_chunk_idx = index + 1
     return result

@@ -20,21 +20,28 @@ import torch
 from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
 
 
-def test_empty_then_image_consumes_each_chunk_exactly_once():
+def test_empty_then_image_then_video_consumes_each_chunk_exactly_once():
     stage = torch.nn.Module()
     image = torch.ones(1, 3, 4, 4)
+    video = torch.ones(2, 8)
     grid = torch.tensor([[1, 2, 2]])
-    stage._vlm_pixel_values_chunks = [image[:0], image]
-    stage._vlm_image_grid_hws_chunks = [grid[:0], grid]
+    stage._vlm_pixel_values_chunks = [image[:0], image, image[:0]]
+    stage._vlm_image_grid_hws_chunks = [grid[:0], grid, grid[:0]]
+    stage._vlm_pixel_values_videos_chunks = [video[:0], video[:0], video]
+    stage._vlm_video_grid_thw_chunks = [grid[:0], grid[:0], grid]
     stage._vlm_chunk_idx = 0
     first = next_vlm_media_chunk(stage)
-    assert first.pixel_values is None and first.image_grid is None
+    assert first.pixel_values is None and first.pixel_values_videos is None
     second = next_vlm_media_chunk(stage)
     assert second.pixel_values is image and second.image_grid is grid
-    assert stage._vlm_chunk_idx == 2
-    with pytest.raises(ValueError, match="exhausted at microbatch 2"):
+    assert second.pixel_values_videos is None
+    third = next_vlm_media_chunk(stage)
+    assert third.pixel_values is None
+    assert third.pixel_values_videos is video and third.video_grid is grid
+    assert stage._vlm_chunk_idx == 3
+    with pytest.raises(ValueError, match="exhausted at microbatch 3"):
         next_vlm_media_chunk(stage)
-    assert stage._vlm_chunk_idx == 2
+    assert stage._vlm_chunk_idx == 3
 
 
 def test_missing_metadata_chunk_does_not_partially_advance_cursor():
@@ -50,3 +57,27 @@ def test_no_staged_media_leaves_module_unchanged():
     stage = torch.nn.Module()
     assert next_vlm_media_chunk(stage) is None
     assert not hasattr(stage, "_vlm_chunk_idx")
+
+
+def test_patch_media_and_optional_grid_are_consumed_atomically():
+    stage = torch.nn.Module()
+    pixels = torch.randn(1, 3, 4, 4)
+    patches = torch.randn(3, 3, 2, 2)
+    counts = torch.tensor([3])
+    newline = torch.tensor([False, True, False])
+    stage._vlm_pixel_values_chunks = [pixels[:0], pixels]
+    stage._vlm_image_grid_hws_chunks = [None, None]
+    stage._vlm_patch_pixel_values_chunks = [patches[:0], patches]
+    stage._vlm_num_patches_chunks = [counts[:0], counts]
+    stage._vlm_patch_newline_mask_chunks = [newline[:0], newline]
+    first = next_vlm_media_chunk(stage)
+    assert first.pixel_values is None and first.patch_pixel_values is None
+    second = next_vlm_media_chunk(stage)
+    assert second.image_grid is None
+    assert second.patch_pixel_values is patches and second.num_patches is counts
+    assert second.patch_newline_mask is newline
+    stage._vlm_chunk_idx = 1
+    stage._vlm_num_patches_chunks = []
+    with pytest.raises(ValueError, match="patch counts chunks exhausted"):
+        next_vlm_media_chunk(stage)
+    assert stage._vlm_chunk_idx == 1

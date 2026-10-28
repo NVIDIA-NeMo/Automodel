@@ -1426,31 +1426,40 @@ class TestKimiK25VLForConditionalGenerationForward:
         for param in expected_params:
             assert param in params, f"Missing parameter: {param}"
 
-    def test_forward_vlm_chunk_retrieval_logic(self):
-        """Test VLM chunk retrieval from model attributes."""
-        # Simulate the chunk retrieval logic
-        pixel_values = None
-        _vlm_pixel_values_chunks = [torch.randn(64, 3, 14, 14), torch.randn(32, 3, 14, 14)]
-        _vlm_image_grid_hws_chunks = [torch.tensor([[28, 28]]), torch.tensor([[14, 14]])]
-        media_placeholder_token_id = 163605
-        input_ids = torch.tensor([[1, 2, media_placeholder_token_id, 3, 4]])
-        _vlm_chunk_idx = 0
+    def test_forward_consumes_empty_then_image_media_and_converts_grid(self):
+        from types import SimpleNamespace
 
-        has_media_tokens = (
-            input_ids is not None
-            and media_placeholder_token_id is not None
-            and (input_ids == media_placeholder_token_id).any().item()
-        )
+        class RecordingBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = torch.nn.Module()
+                self.language_model.lm_head = torch.nn.Linear(3, 5, bias=False)
+                self.calls = []
 
-        assert has_media_tokens == True
+            def forward(self, **kwargs):
+                self.calls.append(kwargs)
+                return torch.zeros((*kwargs["input_ids"].shape, 3))
 
-        if has_media_tokens:
-            if _vlm_chunk_idx < len(_vlm_pixel_values_chunks):
-                pixel_values = _vlm_pixel_values_chunks[_vlm_chunk_idx]
-                image_grid_hws = _vlm_image_grid_hws_chunks[_vlm_chunk_idx]
+        model = KimiK25VLForConditionalGeneration.__new__(KimiK25VLForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(text_config=SimpleNamespace(output_hidden_states=False))
+        model.model = RecordingBackbone()
+        pixels = torch.randn(4, 3, 2, 2)
+        grid = torch.tensor([[2, 2]])
+        model._vlm_pixel_values_chunks = [pixels[:0], pixels]
+        model._vlm_image_grid_hws_chunks = [grid[:0], grid]
+        model._vlm_chunk_idx = 0
+        ids = torch.tensor([[1, 2, 3]])
 
-                assert pixel_values.shape == (64, 3, 14, 14)
-                assert image_grid_hws.shape == (1, 2)
+        model(ids)
+        assert model.model.calls[-1]["pixel_values"] is None
+        assert model._vlm_chunk_idx == 1
+        model(ids)
+        assert model.model.calls[-1]["pixel_values"] is pixels
+        torch.testing.assert_close(model.model.calls[-1]["grid_thws"], torch.tensor([[1, 2, 2]]))
+        assert model._vlm_chunk_idx == 2
+        model(ids, pixel_values=pixels, grid_thws=torch.tensor([[1, 2, 2]]))
+        assert model._vlm_chunk_idx == 2
 
     def test_forward_grid_thws_conversion(self):
         """Test conversion from image_grid_hws [N, 2] to grid_thws [N, 3]."""

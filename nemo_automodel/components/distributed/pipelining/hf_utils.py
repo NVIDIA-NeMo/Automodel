@@ -750,31 +750,30 @@ def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
 
     issues: list[str] = []
 
+    # Inspect the actual alias: a composite config's nested tie flag can disagree
+    # with its controlling outer flag. Identity also works before meta materialization.
+    lm_head = getattr(model, "lm_head", None)
+    inner = getattr(model, "model", model)
+    embed_tokens = getattr(inner, "embed_tokens", None)
+    if embed_tokens is None:
+        lang = getattr(inner, "language_model", None)
+        if lang is not None:
+            embed_tokens = getattr(lang, "embed_tokens", None)
+    weights_tied = (
+        lm_head is not None
+        and embed_tokens is not None
+        and hasattr(lm_head, "weight")
+        and hasattr(embed_tokens, "weight")
+        and lm_head.weight is embed_tokens.weight
+    )
+    if weights_tied:
+        issues.append(
+            "Pipeline parallelism does not support tie_word_embeddings=True, and overriding "
+            "it to tie_word_embeddings=False is not supported either. Train this model with "
+            "another supported parallelism strategy (e.g., FSDP2) instead."
+        )
+
     if config is not None:
-        # For VLMs, check text_config (the outer VLM config tie flag is irrelevant for PP)
-        check_config = getattr(config, "text_config", config)
-        if getattr(check_config, "tie_word_embeddings", False):
-            # Only a real problem if lm_head and embed_tokens share the same weight tensor
-            lm_head = getattr(model, "lm_head", None)
-            inner = getattr(model, "model", model)
-            embed_tokens = getattr(inner, "embed_tokens", None)
-            if embed_tokens is None:
-                lang = getattr(inner, "language_model", None)
-                if lang is not None:
-                    embed_tokens = getattr(lang, "embed_tokens", None)
-            weights_tied = (
-                lm_head is not None
-                and embed_tokens is not None
-                and hasattr(lm_head, "weight")
-                and hasattr(embed_tokens, "weight")
-                and lm_head.weight is embed_tokens.weight
-            )
-            if weights_tied:
-                issues.append(
-                    "Pipeline parallelism does not support tie_word_embeddings=True, and overriding "
-                    "it to tie_word_embeddings=False is not supported either. Train this model with "
-                    "another supported parallelism strategy (e.g., FSDP2) instead."
-                )
         if getattr(config, "is_encoder_decoder", False):
             issues.append("Encoder-Decoder models with cross-attention are not supported yet for pipeline parallelism.")
 

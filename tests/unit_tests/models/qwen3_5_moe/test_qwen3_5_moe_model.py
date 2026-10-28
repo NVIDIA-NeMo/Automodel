@@ -809,15 +809,15 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
         torch.testing.assert_close(captured["pixel_values"], pixel_chunk)
         assert captured["image_grid_thw"] is None
 
-    def test_forward_no_media_tokens_skips_chunk_retrieval(self, vl_config, backend_config, moe_config, device):
-        """Input without image/vision_start tokens should not retrieve chunks."""
+    def test_forward_empty_chunk_advances_without_media_tokens(self, vl_config, backend_config, moe_config, device):
+        """Explicit empty media owns a text-only microbatch and advances its cursor."""
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         model_dtype = next(model.parameters()).dtype
 
         pixel_chunk = torch.randn(1, 3, 4, 4, device=device, dtype=model_dtype)
 
-        model._vlm_pixel_values_chunks = [pixel_chunk]
-        model._vlm_image_grid_hws_chunks = [torch.tensor([[2, 2]], device=device)]
+        model._vlm_pixel_values_chunks = [pixel_chunk[:0]]
+        model._vlm_image_grid_hws_chunks = [torch.empty((0, 2), dtype=torch.long, device=device)]
         model._vlm_chunk_idx = 0
 
         # Token ID 0 should not match the special token IDs (typically > 150000)
@@ -826,11 +826,11 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
 
         captured = self._run_forward_capturing_kwargs(model, input_ids, device)
 
-        assert model._vlm_chunk_idx == 0  # Not incremented
-        assert "pixel_values" not in captured
+        assert model._vlm_chunk_idx == 1
+        assert captured["pixel_values"] is None
 
-    def test_forward_exhausted_chunks_skips_retrieval(self, vl_config, backend_config, moe_config, device):
-        """When chunk_idx >= len(chunks), no pixel_values should be injected."""
+    def test_forward_exhausted_chunks_raises(self, vl_config, backend_config, moe_config, device):
+        """Exhausted explicit media must fail instead of silently dropping an image."""
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         model_dtype = next(model.parameters()).dtype
 
@@ -841,10 +841,9 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
         model._vlm_chunk_idx = 1  # Already past the single chunk
 
         input_ids = torch.tensor([[vl_config.image_token_id, 1, 2, 3]], device=device)
-        captured = self._run_forward_capturing_kwargs(model, input_ids, device)
-
-        assert model._vlm_chunk_idx == 1  # Not incremented
-        assert "pixel_values" not in captured
+        with pytest.raises(ValueError, match="chunks exhausted at microbatch 1"):
+            self._run_forward_capturing_kwargs(model, input_ids, device)
+        assert model._vlm_chunk_idx == 1
 
     def test_forward_vision_start_token_triggers_chunk_retrieval(self, vl_config, backend_config, moe_config, device):
         """vision_start_token_id (not just image_token_id) should trigger chunk retrieval."""
