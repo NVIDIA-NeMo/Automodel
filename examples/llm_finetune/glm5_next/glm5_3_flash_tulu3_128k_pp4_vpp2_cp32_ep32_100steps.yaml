@@ -471,6 +471,7 @@ mfu:
 validation_dataset: null
 validation_dataloader: null
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 16
   time: 00:30:00
