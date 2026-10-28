@@ -1,9 +1,9 @@
-# Step-3.7 text SFT with THD packed sequences
+# Step-3.7 Text SFT with THD Packed Sequences
 
 AutoModel's VLM packing pipeline can now consume tokenizer-aware datasets such
 as `ChatDataset` without re-tokenizing them through the multimodal processor.
 
-## Data flow
+## Data Flow
 
 1. `ChatDataset` renders the Step-3.7 chat template and creates unshifted
    `input_ids`, `attention_mask`, and assistant-only `labels`.
@@ -52,12 +52,12 @@ packed_sequence:
 
 `local_batch_size` counts packs, not original conversations.
 
-## Validation evidence
+## Validation Evidence
 
 On 128 real Step-3.5-Flash-SFT samples, the CPU pipeline produced 54 packs with
 99.18% mean utilization and 2.37 documents per pack. A config-built THD batch
 had shape `(4, 8192)`, and a multi-document pack emitted sequence lengths
 `[7377, 312, 191, 136]`.
 
-GPU forward/backward/optimizer validation must be performed only after the
+Perform GPU forward, backward, and optimizer validation only after the
 currently running 8-H200 job releases the GPUs.
