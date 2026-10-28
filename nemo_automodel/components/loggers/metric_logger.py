@@ -227,7 +227,19 @@ class TensorBoardMetricLogger(MetricLogger):
         from torch.utils.tensorboard import SummaryWriter
 
         log_dir = os.environ.get("TENSORBOARD_LOG_DIR") or os.path.join(os.path.dirname(self.filepath), "tensorboard")
-        stream = "validation" if "validation" in os.path.basename(self.filepath) else "train"
+        # Preserve the stream identity of each JSONL file in the tag prefix:
+        # the LLM recipe creates ``validation_<dataset>.jsonl`` loggers (one per
+        # dataset) plus a weighted aggregate, each emitting the same unprefixed
+        # keys (e.g. ``val_loss``) at the same step. Collapsing all of them to
+        # one shared ``validation`` prefix would fuse distinct datasets into a
+        # single misleading curve, so the dataset part of the filename rides
+        # along with the stream.
+        stem = os.path.splitext(os.path.basename(self.filepath))[0]
+        if stem.startswith("validation"):
+            dataset_part = stem[len("validation") :].lstrip("_-")
+            stream = "validation" if not dataset_part else f"validation_{dataset_part}"
+        else:
+            stream = "train"
         self._tb_prefix = stream
         self._writer = SummaryWriter(log_dir=log_dir)
 

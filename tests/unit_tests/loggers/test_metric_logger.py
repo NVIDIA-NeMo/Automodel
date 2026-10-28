@@ -246,9 +246,7 @@ class TestTensorBoardLoggerContracts:
 
     def test_factory_tensorboard_path_accepts_buffer_size(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TENSORBOARD_LOG_DIR", str(tmp_path / "tb"))
-        logger = metric_logger_mod.build_metric_logger(
-            str(tmp_path / "metrics.jsonl"), buffer_size=8
-        )
+        logger = metric_logger_mod.build_metric_logger(str(tmp_path / "metrics.jsonl"), buffer_size=8)
         try:
             assert isinstance(logger, metric_logger_mod.TensorBoardMetricLogger)
             assert logger.buffer_size == 8
@@ -300,3 +298,49 @@ class TestTensorBoardLoggerContracts:
         finally:
             if dist.is_initialized():
                 dist.destroy_process_group()
+
+    def test_tensorboard_prefix_preserves_named_validation_streams(self, tmp_path, monkeypatch):
+        """``validation_<dataset>.jsonl`` streams must keep their dataset
+        identity in the tag prefix instead of collapsing onto one shared
+        ``validation`` curve (third-review finding)."""
+        monkeypatch.setenv("TENSORBOARD_LOG_DIR", str(tmp_path / "tb"))
+        loggers = []
+        try:
+            for name in ("validation_dsA.jsonl", "validation_dsB.jsonl", "validation.jsonl", "train.jsonl"):
+                loggers.append(metric_logger_mod.TensorBoardMetricLogger(str(tmp_path / name), append=False))
+            assert loggers[0]._tb_prefix == "validation_dsA"
+            assert loggers[1]._tb_prefix == "validation_dsB"
+            assert loggers[2]._tb_prefix == "validation"
+            assert loggers[3]._tb_prefix == "train"
+        finally:
+            for lg in loggers:
+                lg.close()
+
+    def test_tensorboard_named_streams_write_distinct_event_tags(self, tmp_path, monkeypatch):
+        """End-to-end through the real SummaryWriter/event reader: two named
+        validation streams stay two distinct scalar series."""
+        try:
+            from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        except ImportError:
+            pytest.skip("tensorboard not installed")
+
+        tb_dir = tmp_path / "tb"
+        monkeypatch.setenv("TENSORBOARD_LOG_DIR", str(tb_dir))
+        for dataset, loss in (("dsA", 1.25), ("dsB", 9.5)):
+            logger = metric_logger_mod.TensorBoardMetricLogger(
+                str(tmp_path / f"validation_{dataset}.jsonl"), append=False
+            )
+            try:
+                logger.log(metric_logger_mod.MetricsSample(step=7, epoch=0, metrics={"val_loss": loss}))
+            finally:
+                logger.close()
+
+        acc = EventAccumulator(str(tb_dir))
+        acc.Reload()
+        tags = acc.Tags()["scalars"]
+        assert "validation_dsA/val_loss" in tags
+        assert "validation_dsB/val_loss" in tags
+        # Each series carries only its own dataset's point.
+        a = [e.value for e in acc.Scalars("validation_dsA/val_loss")]
+        b = [e.value for e in acc.Scalars("validation_dsB/val_loss")]
+        assert a == [1.25] and b == [9.5]
