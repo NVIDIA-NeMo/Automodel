@@ -234,6 +234,21 @@ def freqs_cis_from_position_ids(
     for_fused_rope: bool = False,
     cp_size: int = 1,
 ) -> torch.Tensor:
+    """Build FP32 rotary angles or complex64 phases for the supplied positions.
+
+    Args:
+        position_ids: Integer tensor [batch, sequence] for BSHD or [tokens]
+            for packed THD. Fused THD uses sequential positions across CP ranks.
+        freqs: FP32 inverse frequencies of shape [rotary_dim / 2].
+        qkv_format: BSHD or packed THD tensor layout.
+        for_fused_rope: Whether to return raw angles for the fused kernel.
+        cp_size: Context-parallel world size for fused THD positions.
+
+    Returns:
+        FP32 angles [sequence, 1, 1, rotary_dim] for fused RoPE; otherwise
+        complex64 phases [batch, sequence, rotary_dim / 2] or
+        [tokens, rotary_dim / 2] for THD.
+    """
     if qkv_format == "thd":
         if for_fused_rope:
             # For fused rope with thd, use sequential positions
@@ -247,9 +262,8 @@ def freqs_cis_from_position_ids(
 
     freqs = freqs.to(device=position_ids.device)
 
-    # Compute angles: (B, T, D/2) - same as original implementation
-    # angles = torch.matmul(position_ids.unsqueeze(-1).float(), freqs.unsqueeze(0))
-    angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), freqs)
+    # Pointwise multiplication keeps angles FP32 under CPU and CUDA autocast.
+    angles = position_ids.to(dtype=torch.float32).unsqueeze(-1) * freqs.float()
 
     if for_fused_rope:
         if qkv_format == "thd":

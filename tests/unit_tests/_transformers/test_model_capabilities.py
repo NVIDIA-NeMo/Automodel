@@ -31,7 +31,7 @@ from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegis
 # ---------------------------------------------------------------------------
 # 1. Every registered class must declare capabilities via exactly one pattern
 #
-# Modeled on tests/unit_tests/_transformers/test_doc_coverage.py: walk every
+# Modeled on tests/unit_tests/tools/docs/checks/test_architecture.py: walk every
 # entry in MODEL_ARCH_MAPPING, collect violations, and surface them in a
 # single actionable assertion. Any new model onboarded into the registry that
 # forgets to declare capabilities (or declares both patterns by mistake) will

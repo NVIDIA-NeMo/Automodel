@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+from types import MethodType
 from typing import TYPE_CHECKING
 
+import torch
 from torch import nn
 
 from nemo_automodel.components.distributed.config import (
@@ -170,6 +172,22 @@ def _parallelize_unsharded_fsdp2(
                 apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
     if mesh_context.reapply_trainability is not None:
         mesh_context.reapply_trainability(model)
+    # No fully_shard hooks run on this path, so its mixed-precision policy
+    # cannot provide compute casts. Autocast preserves resident/master weights
+    # and precision-sensitive buffers, including during checkpoint recomputation.
+    compute_dtype = config.autocast_dtype
+    if compute_dtype is None and config.mp_policy is not None:
+        compute_dtype = config.mp_policy.param_dtype
+    if compute_dtype in (torch.bfloat16, torch.float16):
+        assert mesh_context.device_mesh is not None
+        autocast = torch.autocast(device_type=mesh_context.device_mesh.device_type, dtype=compute_dtype)
+        forward = model.forward
+        # Decorate the unbound method so deepcopy rebinds it to the copied model.
+        # functools.wraps inside autocast preserves forward's inspected signature.
+        if isinstance(forward, MethodType):
+            model.forward = MethodType(autocast(forward.__func__), model)
+        else:
+            model.forward = autocast(forward)
     return model
 
 
