@@ -977,9 +977,7 @@ class Checkpointer:
             part_bytes = sum(estimate_tensor_bytes(tensor) for tensor in part.checkpoint_tensors.values())
             requested_bytes += part_bytes
             temporary_bytes = sum(
-                estimate_tensor_bytes(
-                    tensor.to_local() if type(tensor).__name__ == "DTensor" else tensor  # noqa: PLC2801
-                )
+                estimate_tensor_bytes(tensor.to_local() if isinstance(tensor, DTensor) else tensor)
                 for checkpoint_key, tensor in part.checkpoint_tensors.items()
                 if checkpoint_key in part.temporary_checkpoint_keys
             )
