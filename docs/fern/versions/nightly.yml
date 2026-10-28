@@ -293,7 +293,7 @@ navigation:
               - page: "Kimi-K3"
                 path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
               - page: "Kimi-Linear-48B-A3B-Instruct"
-                path: ../../model-coverage/llm/moonshotai/kimi-linear.mdx
+                path: ../../model-coverage/llm/moonshotai/kimi-linear-48b-a3b-instruct.mdx
               - page: "Moonlight-16B-A3B"
                 path: ../../model-coverage/llm/moonshotai/moonlight.mdx
           - section: "Nanbeige"

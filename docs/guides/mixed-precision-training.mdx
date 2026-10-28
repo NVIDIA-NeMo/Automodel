@@ -113,6 +113,19 @@ Use one of these patterns for long full-parameter training (pretraining or exten
 
 Both patterns keep forward and backward compute in bf16 through FSDP2 mixed precision. They differ in where the fp32 master weight lives, how much peak memory they use for a specific model, and what dtype is written to the training checkpoint.
 
+On a single-rank or single-element mesh, AutoModel skips FSDP2 sharding and
+applies the policy's compute dtype through forward autocast instead. This also
+applies to direct model calls. Resident parameters and buffers retain their
+storage precision, and activation-checkpoint recomputation retains autocast.
+An explicit `distributed.autocast_dtype` overrides the policy's compute dtype
+on this unsharded path.
+This path does not apply `mp_policy.output_dtype`. Native AutoModel
+implementations protect explicitly fp32 math, including routing, rotary angle
+construction, sparse indexer scores, and hyperconnections, inside the forward
+autocast region. Models loaded with `force_hf=True` or through the Hugging Face
+fallback use the upstream implementation's autocast behavior; AutoModel does
+not add fp32 compatibility patches to those implementations.
+
 ### Pattern A Using TE FusedAdam and bf16 Model Storage
 
 Use Transformer Engine FusedAdam when it has been validated for the model. The resident model parameters remain bf16, so model checkpoints can stay bf16, while TE keeps the optimizer's master weights and Adam EMA buffers in fp32.
@@ -217,7 +230,7 @@ This keeps the resident model parameters in bf16 instead of fp32, so it can redu
 
 Frozen base parameters do not receive optimizer updates or acquire Adam state. Keeping them in bf16 therefore does not reduce the precision of adapter updates. With `torch.optim.Adam` or `AdamW`, it is the **trainable adapter storage dtype** that determines the precision of adapter updates and EMA buffers.
 
-For multi-rank, unquantized FSDP2 LoRA training, set the adapter dtype explicitly to keep adapter storage and Adam moments in fp32 while allowing frozen base storage and forward/backward compute to remain bf16:
+For multi-rank, unquantized FSDP2 LoRA training, set the adapter dtype explicitly to keep adapter storage and Adam moments in fp32 while allowing frozen base storage and forward and backward compute to remain bf16:
 
 ```yaml
 peft:
@@ -230,6 +243,7 @@ On a single-rank FSDP2 setup, parameters remain unsharded and mixed LoRA submodu
 
 <Warning>
 The automatic warning about torch Adam/AdamW with trainable bf16 parameters currently skips PEFT runs. Absence of this warning does not mean your adapters or their optimizer state are fp32. Check `peft.lora_dtype` and the actual trainable parameter dtypes; use `peft.lora_dtype: float32` to request fp32 adapter storage with torch Adam/AdamW on multi-rank FSDP2 runs.
+
 </Warning>
 
 ## Example Configs

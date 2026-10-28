@@ -475,6 +475,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 
 # Checkpoint model_type to local image/text processor implementation.
 _CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
+    "kimi_k3": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
 }
 

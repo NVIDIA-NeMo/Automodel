@@ -77,8 +77,10 @@ recipe_args:
 
   # --- chat template ---
   # The released chat_template.jinja plus {% generation %} loss spans, defaulting
-  # to chat mode; see the file header to train on thinking-mode data.
+  # to chat mode. For thinking-mode data (assistant turns with reasoning_content),
+  # uncomment chat_template_kwargs; it also takes drop_thinking and reasoning_effort.
   chat_template: examples/llm_finetune/deepseek_v41/deepseek_v41_flash_training_chat_template.jinja
+  # chat_template_kwargs: {thinking_mode: thinking}
 
   # --- native checkpoint-owned DSpark architecture ---
   draft_num_hidden_layers: 3
