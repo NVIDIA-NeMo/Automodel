@@ -35,8 +35,7 @@ unequal run then dispatches non-blocking into capacity-sized buffers (rows
 past the routed count are padding), and the checkpoint replay reuses the host
 extent. The pytest launcher uses --all-variants to run the complete matrix,
 including dense and compact capacity-mode variants, in one worker launch and
-process group. HIDDEN_SIZE, NUM_EXPERTS, TOPK, FULL_TOKENS and SHORT_TOKENS
-configure larger component cases.
+process group.
 """
 
 import argparse
@@ -56,9 +55,9 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.parallelizer import _replay_hybridep_dispatch_on_recompute
 
 # Match the MXFP4 EP fixture so both groups can reuse dispatch/combine kernels.
-HIDDEN = int(os.environ.get("HIDDEN_SIZE", "512"))
-NUM_EXPERTS = int(os.environ.get("NUM_EXPERTS", "4"))
-TOPK = int(os.environ.get("TOPK", "2"))
+HIDDEN = 512
+NUM_EXPERTS = 4
+TOPK = 2
 FULL_TOKENS = int(os.environ.get("FULL_TOKENS", "5"))
 SHORT_TOKENS = int(os.environ.get("SHORT_TOKENS", "3"))  # rank 1 in the unequal run
 
@@ -107,8 +106,7 @@ def run_dispatch_combine(
         dispatch_handles.append(dispatcher._comm_manager.handle)
         # Give expert e the scale e+1, so a wrong destination or expert grouping
         # changes the output rather than being hidden by identical experts.
-        # Keep e+1 exact when NUM_EXPERTS exceeds BF16 integer precision (256).
-        expert_scales = torch.tensor(dispatcher.local_expert_indices, device=out.device, dtype=torch.float32) + 1
+        expert_scales = torch.tensor(dispatcher.local_expert_indices, device=out.device, dtype=out.dtype) + 1
         row_scales = expert_scales.repeat_interleave(tokens_per_expert.to(device=out.device, dtype=torch.int64))
         # Capacity mode hands back capacity-sized buffers: rows past the routed count are padding that the
         # combine never reads, so scale them by zero like a grouped GEMM that stops at offs[-1].

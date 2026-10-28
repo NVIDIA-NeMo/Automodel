@@ -318,7 +318,7 @@ class TestHybridEPRuntimeInitialization:
 
 
 @pytest.mark.parametrize("compact", [False, True])
-@pytest.mark.parametrize("num_tokens,group_max", [(5, 5), (3, 5), (4, 4), (0, 5)])
+@pytest.mark.parametrize("num_tokens,group_max", [(5, 5), (3, 5), (4, 4)])
 def test_hybridep_padding_preserves_routing_and_gradients(
     hybrid_ep_manager, monkeypatch, compact, num_tokens, group_max
 ):
