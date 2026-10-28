@@ -20,7 +20,7 @@ from nemo_automodel.components.datasets.packed_seq import (
     packed_seq_params_from_doc_ids,
     to_flash_attention_kwargs,
 )
-from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
+from nemo_automodel.components.datasets.utils import indexed_mask_to_4d_block_causal
 
 
 def _block_causal_from_cu_seqlens(cu_seqlens: torch.Tensor, total: int) -> torch.Tensor:
@@ -82,7 +82,7 @@ def test_parity_with_sdpa_block_causal_mask():
 
     flash_allowed = _block_causal_from_cu_seqlens(params.cu_seqlens, batch * seq)
 
-    sdpa_4d = _indexed_mask_to_4d_block_causal(doc_ids)  # [B, 1, S, S]
+    sdpa_4d = indexed_mask_to_4d_block_causal(doc_ids)  # [B, 1, S, S]
     # The flash path treats the batch as one flattened stream; compare per row
     # (block-diagonal across rows is guaranteed by the forced row boundaries).
     # Compare only non-padding positions: padding tokens attend themselves in the

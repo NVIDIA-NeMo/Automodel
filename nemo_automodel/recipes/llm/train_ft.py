@@ -34,6 +34,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from nemo_automodel.shared.batch import move_batch_to_device
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_MLFLOW, mlflow = safe_import(
@@ -65,7 +66,6 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
-from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -92,7 +92,11 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
-from nemo_automodel.components.models.common.packing import PackingCapabilities
+from nemo_automodel.components.models.common.packing import (
+    PackingCapabilities,
+    configure_packing_for_models,
+    validate_thd_packing_support,
+)
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -150,9 +154,9 @@ def _should_pack_validation(
     """Return whether validation must use the configured training packer."""
     if validation_dataloader.packing is None:
         return False
-    if replace(validation_dataloader, packing=None).emits_thd:
+    if replace(validation_dataloader, packing=None).output_format == "thd":
         return True
-    if training_dataloader is None or not training_dataloader.emits_thd:
+    if training_dataloader is None or training_dataloader.output_format != "thd":
         return False
     model_requires_packing = bool(
         callable(getattr(model, "should_pack_validation_with_training", None))
@@ -549,11 +553,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Whether this rank owns the trainable model and its components."""
         return True
 
-    def _configure_packing(self) -> PackingCapabilities:
-        """Configure every local model stage and return its NEAT data requirements."""
-        from nemo_automodel.components.models.common.packing import configure_packing_for_models
+    def _get_packing_contract(self) -> PackingCapabilities:
+        """Query loader requests; KD can include a teacher constructed later."""
+        from nemo_automodel.components.models.common.packing import get_packing_capabilities_for_models
 
-        return configure_packing_for_models(self.model_parts)
+        return get_packing_capabilities_for_models(self.model_parts)
 
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
@@ -655,10 +659,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
             if self.cfg.dataloader is None:
                 raise ValueError("domain_mixture requires a dataset/dataloader configuration")
-            # emits_thd is the canonical predicate: a config selecting
+            # output_format describes the selected representation: a config selecting
             # packed_sequence_thd_collater directly has packing=None but still
             # produces packed batches (and drops dataset_id).
-            if self.cfg.dataloader.emits_thd or self.cfg.dataloader.packing is not None:
+            if self.cfg.dataloader.output_format == "thd" or self.cfg.dataloader.packing is not None:
                 raise ValueError(
                     "domain_mixture does not support sequence packing because packed batches do not preserve "
                     "per-token dataset_id provenance"
@@ -693,7 +697,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.mesh_context.cp_size > 1
                 and self.cfg.get("model.backend.attn", self.cfg.get("model.attn_implementation", None)) == "te"
                 and self.cfg.dataloader is not None
-                and self.cfg.dataloader.emits_thd
+                and self.cfg.dataloader.output_format == "thd"
             ):
                 pp_microbatch_size = 1
                 pp_batch_size = pp_batch_size // self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
@@ -753,7 +757,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         model = build_model(
             self.cfg.model,
             self.peft_config,
-            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+            has_packed_sequence=self.cfg.dataloader.is_packed,
             seed=self.cfg.get("seed", 42),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
@@ -847,12 +851,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
-        if (
-            self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
-            and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
-        ):
-            packing_contract = self._configure_packing()
+        # Every loader receives model return requests; only packed batched input
+        # configures mask/Flash/gather adapters. THD owns its length-based route.
+        packing_contract = self._get_packing_contract()
+        if self.cfg.dataloader.output_format == "thd":
+            validate_thd_packing_support(self.model_parts)
+        elif self.cfg.dataloader.is_packed:
+            configure_packing_for_models(self.model_parts)
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config):
@@ -1215,7 +1220,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         Args:
             idx: Microbatch index in the accumulation window.
-            batch: Input mapping with token IDs, labels, and physical NEAT
+            batch: Input mapping with token IDs, labels, and effective packed
                 document IDs of shape [batch, sequence]. NEAT attention metadata
                 is batch-major; legacy THD inputs are flattened by the sharder.
                 THD MTP requires physical boundaries in cu_seqlens_padded of
@@ -1227,15 +1232,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_batches: Number of microbatches in the accumulation window.
             is_train: Whether to backpropagate the combined main and MTP loss.
         """
-        # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
+        batch = move_batch_to_device(batch, self.dist_env.device)
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         mtp_cp_enabled = not self.pp_enabled and self._get_cp_group_size() > 1 and model.supports.mtp_enabled
@@ -1270,7 +1267,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
-        # Preserve physical NEAT document IDs before model-kwarg filtering. The
+        # Preserve effective document IDs before model-kwarg filtering. The
         # loss needs these even when the forward does not accept packing metadata.
         mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
         # Preserve packing metadata needed by the loss before model-kwarg filtering.

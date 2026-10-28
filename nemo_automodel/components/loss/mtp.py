@@ -168,7 +168,9 @@ def calculate_mtp_loss(
         seq_idx: Optional per-token sub-sequence index ``[B, S]`` (or ``[S]``).
             Equality classes are what matter; absolute values can be any
             ints. Takes precedence over ``cu_seqlens``. Used to mask label
-            rolls whose source position lies in a different sub-sequence.
+            rolls whose source position lies in a different sub-sequence. This
+            describes selected attention boundaries, including joined documents;
+            it may reside on CPU or the labels device.
         lm_weight: Optional LM-head weight tensor of shape ``[vocab, hidden]``.
             Supplying it lets the main loss and all MTP depths share one DTensor
             ``full_tensor()`` gather on the FusedLinearCrossEntropy path.
@@ -279,10 +281,10 @@ def calculate_mtp_loss(
 
             # Mask labels whose rolled source (position t+k+1) lives in a
             # different sub-seq than position t — predictions across sub-seq
-            # boundaries are nonsensical.
+            # boundaries are excluded by the selected segmentation.
             if seq_idx is not None:
                 rolled_seq_idx = roll_tensor(seq_idx, shifts=-(k + 1), dim=-1)
-                cross_seq = rolled_seq_idx != seq_idx
+                cross_seq = (rolled_seq_idx != seq_idx).to(device=masked.device, non_blocking=True)
                 masked = torch.where(cross_seq, torch.full_like(masked, ignore_index), masked)
         else:
             masked = mtp_per_depth_targets[k]

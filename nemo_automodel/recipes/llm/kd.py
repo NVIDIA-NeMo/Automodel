@@ -325,9 +325,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             pp_microbatch_size=pp_microbatch_size,
         )
 
-    def _configure_packing(self) -> PackingCapabilities:
+    def _get_packing_contract(self) -> PackingCapabilities:
         """Emit metadata for both KD consumers, including a teacher built later."""
-        return replace(super()._configure_packing(), requires_packed_sequence_metadata=True)
+        return replace(super()._get_packing_contract(), return_packed_sequence_metadata=True)
 
     def _configure_teacher_packing(self) -> None:
         """Adapt teacher stages and reject incompatible student/teacher mask layouts.

@@ -814,25 +814,26 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
 
     model = _PackedModel()
 
-    dl, _ = _build_loader(
-        cfg_ds=cfg_ds,
-        cfg_dl=cfg_dl,
-        cfg_model=cfg_model,
-        cfg_ps=cfg_ps,
-        seed=123,
-        local_batch_size=1,
-        global_batch_size=1,
-        max_steps=None,
-        val_check_interval=None,
-        dp_rank=0,
-        dp_world_size=1,
-        pp_enabled=False,
-        cp_size=2,
-        model=model,
-    )
+    with nullcontext() if supports_thd else pytest.raises(ValueError, match="THD packing requires"):
+        dl, _ = _build_loader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=1,
+            global_batch_size=1,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=False,
+            cp_size=2,
+            model=model,
+        )
 
-    assert dl.dataset.__class__.__name__ == "DummyMapDataset"
     if supports_thd:
+        assert dl.dataset.__class__.__name__ == "DummyMapDataset"
         assert captured["cp_size"] == 2
     else:
         assert captured == {}
@@ -1065,6 +1066,8 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
             lambda self: SimpleNamespace(
                 build=lambda **k: "dl",
                 dataset_builds_on_all_ranks=False,
+                is_packed=False,
+                output_format="batched",
                 seed=42,
             )
         ),
@@ -3852,7 +3855,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
         )
     batch = neat_packed_collater(
         samples,
-        packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=packing_format == "neat_varlen"),
+        packing=PackingCapabilities("block_causal", return_packed_sequence_metadata=packing_format == "neat_varlen"),
     )
     if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded", "thd_native_padded"):
         batch.pop("_packed_seq_ids")
@@ -4104,3 +4107,60 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         torch.testing.assert_close(model.logits.grad, reference_logits.grad)
     else:
         assert model.logits.grad is None
+
+
+@pytest.mark.parametrize("recipe_kind", ["llm", "vlm"])
+@pytest.mark.parametrize("is_packed,output_format", [(False, "batched"), (True, "batched"), (True, "thd")])
+def test_setup_always_passes_return_contract_and_only_configures_packed_batched_inputs(
+    monkeypatch, recipe_kind, is_packed, output_format
+):
+    from nemo_automodel.components.models.common.packing import PackingCapabilities
+    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+    from tests.unit_tests.recipes.test_finetune_vlm_helpers import _minimal_vlm_cfg, _patch_vlm_setup_minimals
+
+    if recipe_kind == "llm":
+        _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+        recipe_type = TrainFinetuneRecipeForNextTokenPrediction
+        raw = _minimal_cfg_with_nvtx(False)
+        config_property = "dataloader"
+        module = "nemo_automodel.recipes.llm.train_ft"
+    else:
+        _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+        recipe_type = FinetuneRecipeForVLM
+        raw = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+        config_property = "vlm_dataloader"
+        module = "nemo_automodel.recipes.vlm.finetune"
+    contract = PackingCapabilities("block_causal", return_packed_sequence_metadata=True, return_document_ids=True)
+    queries = []
+    configured = []
+    thd_validated = []
+
+    def query(self):
+        queries.append(True)
+        return contract
+
+    class LoaderReached(Exception):
+        pass
+
+    def build(**kwargs):
+        assert kwargs["packing_contract"] is contract
+        raise LoaderReached
+
+    config = SimpleNamespace(
+        is_packed=is_packed,
+        output_format=output_format,
+        packed_sequence_length=0,
+        seed=42,
+        dataset_builds_on_all_ranks=True,
+        packing=None,
+        build=build,
+    )
+    monkeypatch.setattr(RecipeConfig, config_property, property(lambda self: config))
+    monkeypatch.setattr(recipe_type, "_get_packing_contract", query)
+    monkeypatch.setattr(f"{module}.configure_packing_for_models", lambda models: configured.append(True))
+    monkeypatch.setattr(f"{module}.validate_thd_packing_support", lambda models: thd_validated.append(True))
+    with pytest.raises(LoaderReached):
+        recipe_type(raw).setup()
+    assert queries == [True]
+    assert configured == ([True] if is_packed and output_format == "batched" else [])
+    assert thd_validated == ([True] if output_format == "thd" else [])

@@ -85,14 +85,16 @@ def prepare_gated_delta_packed_metadata(
         documented by :class:`GatedDeltaPackedMetadata`, or ``None`` for an
         unpacked mask.
     """
-    # ``_packed_seq_ids`` is the collater's authoritative indexed mask. Prefer
-    # it when present so a backend-specific attention mask does not need a
-    # device scalar decision. Otherwise a structurally eligible 2D attention
-    # mask is the only candidate.
+    # An explicit metadata bundle also represents a single
+    # joined document, whose padding still needs gathering before recurrence.
+    has_metadata = packed_token_indices is not None or cu_seqlens is not None
     document_ids = None
+    metadata_candidate = None
     for candidate in (packed_seq_ids, attention_mask):
         if candidate is None or candidate.dtype == torch.bool or candidate.dim() != 2:
             continue
+        if metadata_candidate is None:
+            metadata_candidate = candidate
         candidate_cpu = (
             host_packed_seq_ids.tensor
             if candidate is packed_seq_ids and host_packed_seq_ids is not None
@@ -101,6 +103,8 @@ def prepare_gated_delta_packed_metadata(
         if is_indexed_packed_mask(candidate_cpu):
             document_ids = candidate
             break
+    if document_ids is None:
+        document_ids = metadata_candidate if has_metadata else None
     if document_ids is None:
         return None
 

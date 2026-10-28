@@ -764,7 +764,7 @@ def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
 
     packing = SimpleNamespace(
         packed_mask_type="block_causal",
-        requires_packed_sequence_metadata=False,
+        return_packed_sequence_metadata=False,
     )
     result = config.build(
         pretrained_model_name_or_path="unused",

@@ -3274,7 +3274,7 @@ class TestNeatPackedVlmCollaterPackingContract:
     def _packing(*, packed_mask_type="block_causal", requires_metadata=False):
         return types.SimpleNamespace(
             packed_mask_type=packed_mask_type,
-            requires_packed_sequence_metadata=requires_metadata,
+            return_packed_sequence_metadata=requires_metadata,
         )
 
     def test_flash_attention_2_emits_varlen_kwargs_instead_of_mask(self):
