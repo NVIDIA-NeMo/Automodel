@@ -57,6 +57,8 @@ jobs:
       NVIDIA_MANAGEMENT_ORG_PAT: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
 
   linting:
+    needs: [pre-flight]
+    if: needs.pre-flight.outputs.docs_only != 'true'
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
@@ -64,11 +66,13 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Set up UV
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -109,6 +113,8 @@ jobs:
           uv run --active python tools/lint_model_parallelizer_contract.py
 
   import_linting:
+    needs: [pre-flight]
+    if: needs.pre-flight.outputs.docs_only != 'true'
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
@@ -116,11 +122,13 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Set up UV
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -149,6 +157,8 @@ jobs:
           uv run --active python tests/ci_tests/test_import_contracts.py
 
   type_checking:
+    needs: [pre-flight]
+    if: needs.pre-flight.outputs.docs_only != 'true'
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout
@@ -156,11 +166,13 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Set up UV
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.8.22
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -202,12 +214,14 @@ jobs:
           uv run --active ty check --verbose $TY_DIRS
 
   Nemo_Linting_Test:
-    needs: [linting, import_linting, type_checking]
+    needs: [pre-flight, linting, import_linting, type_checking]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Main
         env:
+          PRE_FLIGHT_RESULT: ${{ needs.pre-flight.result }}
+          DOCS_ONLY: ${{ needs.pre-flight.outputs.docs_only }}
           LINTING_RESULT: ${{ toJson(needs.linting) }}
           IMPORT_LINTING_RESULT: ${{ toJson(needs.import_linting) }}
           TYPE_CHECKING_RESULT: ${{ toJson(needs.type_checking) }}
@@ -215,6 +229,15 @@ jobs:
           LINTING=$(echo "$LINTING_RESULT" | jq -r '.result')
           IMPORT_LINTING=$(echo "$IMPORT_LINTING_RESULT" | jq -r '.result')
           TYPE_CHECKING=$(echo "$TYPE_CHECKING_RESULT" | jq -r '.result')
+
+          if [[ "$PRE_FLIGHT_RESULT" != "success" ]]; then
+            echo "Pre-flight failed; cannot determine whether code linting may be skipped."
+            exit 1
+          fi
+          if [[ "$DOCS_ONLY" == "true" ]] && [[ "$LINTING" == "skipped" ]] && [[ "$IMPORT_LINTING" == "skipped" ]] && [[ "$TYPE_CHECKING" == "skipped" ]]; then
+            echo "Code linting skipped for docs-only changes."
+            exit 0
+          fi
 
           if [[ "$LINTING" == "success" ]] && [[ "$IMPORT_LINTING" == "success" ]] && [[ "$TYPE_CHECKING" == "success" ]]; then
             echo "All linting checks passed."
@@ -457,27 +480,38 @@ jobs:
   cicd-unit-tests:
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 4
       matrix:
         include:
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            is-unit-test: true
             cpu-only: true
             # The full CPU suite takes 28-30 minutes before teardown and coverage finish.
             timeout: 40
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            is-unit-test: true
             cpu-only: false
-            # GPU shards take ~30 minutes before teardown and coverage finish.
-            timeout: 40
+            # Shard 1 takes ~40 minutes before process exit and coverage finish.
+            timeout: 45
             shard-id: 0
             num-shards: 2
           - test-name: L0_Unit_Tests_GPU_2_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            is-unit-test: true
             cpu-only: false
             timeout: 40
             shard-id: 1
             num-shards: 2
+          # Run cold Magi/TileLang compilation alongside the general unit shards.
+          # These functional parity checks remain required on every PR.
+          - test-name: L0_Kernel_Parity_GPU
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            is-unit-test: false
+            cpu-only: false
+            test-folder: kernel_parity
+            timeout: 20
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: ${{ startsWith(matrix.runner, 'ephe-v2-') && format('{0}-a{1}', matrix.runner, github.run_attempt) || matrix.runner }}
     name: ${{ matrix.test-name }}
@@ -505,7 +539,8 @@ jobs:
           # Keep one confirmation for runner failures without allowing a stuck
           # unit-test shard to consume three consecutive 20-30m attempts.
           max-attempts: "2"
-          is-unit-test: "true"
+          is-unit-test: ${{ matrix.is-unit-test }}
+          test-folder: ${{ matrix.test-folder }}
           cpu-only: ${{ matrix.cpu-only || false }}
           shard-id: ${{ matrix.shard-id }}
           num-shards: ${{ matrix.num-shards }}
@@ -541,8 +576,10 @@ jobs:
           # 14.8 min median), well under the 16.6 min L2_HF_Transformer_Finetune that
           # sets the stage floor. A 40-minute timeout leaves more than 2x headroom
           # over the measured merged runtime while bounding timeout retries.
+          # Kimi Linear FA4 parity is also collected here; its kernel compilation
+          # is not included in the historical timings above.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data,models/gemma4
+            test-folder: hf_transformer,hf_transformer_llm,data,models/gemma4,models/kimi_linear
             timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
@@ -558,7 +595,7 @@ jobs:
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 20
+            timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval
@@ -574,10 +611,11 @@ jobs:
           # moe + parallelism merged (2.8 + 5.8 = 8.6 min median) to fit `max-parallel: 10`.
           # Each parity test in `parallelism` runs the proxy twice (1-rank baseline +
           # 2-rank parallel), so the budget is roughly double a single smoke test.
-          # A 30-minute timeout leaves more than 2x measured-runtime headroom.
+          # The merged pytest run takes about 30 minutes, so a 45-minute timeout
+          # leaves room for slow runners without letting a hung test retry for long.
           - test-name: L2_Distributed
             test-folder: moe,parallelism
-            timeout: 30
+            timeout: 45
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
@@ -640,9 +678,10 @@ jobs:
           # Merged with hf_transformer_llm + data, mirroring cicd-e2e-tests
           # (2.4 + 3.8 + 4.3 = 10.5 min median, under the 13.2 min L2_Context_Parallel
           # floor). Together with attention, this uses the 10 available matrix slots.
-          # Include models/minimax_m3_vl here; its runtime is not part of the 10.5 min median.
+          # Include models/minimax_m3_vl and models/kimi_linear here; their runtimes
+          # are not part of the historical 10.5 min median.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data,models/minimax_m3_vl,models/gemma4
+            test-folder: hf_transformer,hf_transformer_llm,data,models/minimax_m3_vl,models/gemma4,models/kimi_linear
             timeout: 40
           - test-name: L2_HF_Transformer_Finetune
             test-folder: hf_transformer_finetune
@@ -653,14 +692,14 @@ jobs:
             is-optional: "true"
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 20
+            timeout: 30
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20
-          # moe + parallelism merged (2.1 + 4.1 = 6.2 min median), mirroring cicd-e2e-tests.
+          # moe + parallelism merged, mirroring cicd-e2e-tests (about 30 minutes of pytest).
           - test-name: L2_Distributed
             test-folder: moe,parallelism
-            timeout: 30
+            timeout: 45
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
     name: gb200_${{ matrix.test-name }}
@@ -776,10 +815,13 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [pre-flight, Nemo_CICD_Test]
+    needs: [pre-flight, Nemo_CICD_Test, cicd-unit-tests, cicd-e2e-tests]
+    # The summary permits failures on CI workloads; publish only complete test runs.
     if: |
       !cancelled()
       && needs.Nemo_CICD_Test.result == 'success'
+      && needs.cicd-unit-tests.result == 'success'
+      && needs.cicd-e2e-tests.result == 'success'
       && vars.ENABLE_CODECOV == 'true'
     strategy:
       matrix:
@@ -793,6 +835,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
+        with:
+          version: 0.8.22
+
       - name: Download coverage reports of current branch
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
@@ -801,18 +848,20 @@ jobs:
 
       - name: Get total coverage of current branch
         shell: bash -x -e -u -o pipefail {0}
-        if: always()
         run: |
-          pip install coverage[toml]
-
-          if ! [ -d coverage-downloads ] || [ -z "$(ls -A coverage-downloads)" ]; then
-            echo "No coverage artifacts found for ${{ matrix.flag }}, skipping."
-            exit 0
+          if ! [ -d coverage-downloads ]; then
+            echo "::error::No coverage artifacts found for ${{ matrix.flag }}."
+            exit 1
+          fi
+          mapfile -d '' coverage_files < <(find coverage-downloads -name '.coverage' -type f -print0)
+          if [ "${#coverage_files[@]}" -eq 0 ]; then
+            echo "::error::No coverage data found for ${{ matrix.flag }}."
+            exit 1
           fi
           ls -al coverage-downloads/
-          coverage combine --keep $(find coverage-downloads -name '.coverage')
-          coverage report -i
-          coverage xml -i
+          uvx --from 'coverage[toml]' coverage combine --keep "${coverage_files[@]}"
+          uvx --from 'coverage[toml]' coverage report -i
+          uvx --from 'coverage[toml]' coverage xml -i
           rm -rf coverage-downloads
           ls -al
 
@@ -822,6 +871,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          files: coverage.xml
+          disable_search: true
+          fail_ci_if_error: true
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
           override_pr: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           override_commit: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}

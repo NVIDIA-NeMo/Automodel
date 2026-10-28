@@ -16,6 +16,8 @@ import math
 
 import torch
 
+from nemo_automodel.components.models.common.rope_triton import apply_complex_rope
+
 
 # Taken from https://github.com/huggingface/transformers/blob/main/src/transformers/models/deepseek_v3/modular_deepseek_v3.py#L78
 def yarn_get_mscale(scale=1, mscale=1):
@@ -120,27 +122,31 @@ def precompute_freqs_cis(
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, qkv_format: str = "bshd", unsqueeze_dim: int | None = None
 ) -> torch.Tensor:
-    """
-    Applies rotary positional embeddings to the input tensor.
+    """Rotate adjacent channel pairs using precomputed complex frequencies.
 
     Args:
-        x (torch.Tensor): Input tensor with positional embeddings to be applied.
-        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
+        x: Tensor of shape [batch, sequence, heads, channels] for ``bshd`` or
+            [tokens, heads, channels] for ``thd``. Shared keys may omit the head
+            dimension when ``unsqueeze_dim`` inserts it.
+        freqs_cis: Complex frequency table with channels / 2 pairs per token, shaped
+            [batch, sequence, channels / 2] or [tokens, channels / 2]. Cached CUDA complex64 frequencies
+            use the fused kernel; trainable frequencies retain autograd.
+        qkv_format: ``thd`` adds a temporary batch dimension for packed inputs.
+        unsqueeze_dim: Optional head dimension to insert after normalizing
+            packed inputs to include a batch dimension.
 
     Returns:
-        torch.Tensor: Tensor with rotary embeddings applied.
+        Tensor with the input shape and dtype. Rotation uses FP32 complex
+        multiplication before rounding back to the input dtype.
     """
-    dtype = x.dtype
     if qkv_format == "thd":
         x = x.unsqueeze(0)
 
     if unsqueeze_dim is not None:
         x = x.unsqueeze(unsqueeze_dim)
 
-    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))  # [b, s, h, d] -> [b, s, h, d/2, 2]
-    freqs_cis = freqs_cis.view(x.size(0), x.size(1), 1, x.size(-1))
-    y = torch.view_as_real(x * freqs_cis).flatten(3)
-    y = y.to(dtype)
+    frequencies = freqs_cis.reshape(x.size(0), x.size(1), x.size(-1) // 2)
+    y = apply_complex_rope(x, frequencies)
 
     if unsqueeze_dim is not None:
         y = y.squeeze(unsqueeze_dim)
@@ -228,6 +234,21 @@ def freqs_cis_from_position_ids(
     for_fused_rope: bool = False,
     cp_size: int = 1,
 ) -> torch.Tensor:
+    """Build FP32 rotary angles or complex64 phases for the supplied positions.
+
+    Args:
+        position_ids: Integer tensor [batch, sequence] for BSHD or [tokens]
+            for packed THD. Fused THD uses sequential positions across CP ranks.
+        freqs: FP32 inverse frequencies of shape [rotary_dim / 2].
+        qkv_format: BSHD or packed THD tensor layout.
+        for_fused_rope: Whether to return raw angles for the fused kernel.
+        cp_size: Context-parallel world size for fused THD positions.
+
+    Returns:
+        FP32 angles [sequence, 1, 1, rotary_dim] for fused RoPE; otherwise
+        complex64 phases [batch, sequence, rotary_dim / 2] or
+        [tokens, rotary_dim / 2] for THD.
+    """
     if qkv_format == "thd":
         if for_fused_rope:
             # For fused rope with thd, use sequential positions
@@ -241,9 +262,8 @@ def freqs_cis_from_position_ids(
 
     freqs = freqs.to(device=position_ids.device)
 
-    # Compute angles: (B, T, D/2) - same as original implementation
-    # angles = torch.matmul(position_ids.unsqueeze(-1).float(), freqs.unsqueeze(0))
-    angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), freqs)
+    # Pointwise multiplication keeps angles FP32 under CPU and CUDA autocast.
+    angles = position_ids.to(dtype=torch.float32).unsqueeze(-1) * freqs.float()
 
     if for_fused_rope:
         if qkv_format == "thd":

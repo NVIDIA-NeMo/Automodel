@@ -68,7 +68,8 @@ model:
     enable_fsdp_optimizations: true
 
 processor:
-  _target_: transformers.AutoProcessor.from_pretrained
+  # sglang-aligned image preprocessing (bilinear/0-255); see mimo_v2_flash/processing.py
+  _target_: nemo_automodel.components.models.mimo_v2_flash.processing.build_mimo_v2_processor
   pretrained_model_name_or_path: XiaomiMiMo/MiMo-V2.6-Flash-RL
   trust_remote_code: false
   max_pixels: 1048576
@@ -120,6 +121,8 @@ dataloader:
   drop_last: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    # Keep RGBA alpha so the sglang-aligned processor flattens it onto white.
+    preserve_alpha: true
     # The collater shifts inputs and labels once, yielding 4096 model tokens.
     max_length: 4097
 
@@ -150,6 +153,7 @@ clip_grad_norm:
 #   dir: logs/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: huiyingl
   nodes: 8
   time: "01:00:00"

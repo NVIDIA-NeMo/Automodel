@@ -329,6 +329,7 @@ def build_diffusion_pipeline(
     active_transformer: str | None = None,
     backend: BackendConfig | None = None,
     config_overrides: dict[str, ConfigFieldValue] | None = None,
+    transformer_config_overrides: dict[str, ConfigFieldValue] | None = None,
 ) -> tuple[NeMoAutoDiffusionPipeline, MeshContext]:
     """Build the sharded diffusion pipeline (model + parallel scheme).
 
@@ -357,7 +358,7 @@ def build_diffusion_pipeline(
             - Optional: pipeline_cls, load_full_pipeline
         peft_cfg: PeftConfig instance or None. When provided, only LoRA params
             are trained; base weights are frozen and sharded by FSDP2 for memory.
-        model_type: "flux" | "flux2" | "wan" | "hunyuan" | "ltx2". Required when peft_cfg is provided.
+        model_type: "flux" | "flux2" | "flux3" | "wan" | "hunyuan" | "ltx2". Required when peft_cfg is provided.
         active_transformer: For two-transformer pipelines (Wan2.2), select which
             transformer to finetune. ``"transformer"`` (default for Wan2.2 = high-noise)
             or ``"transformer_2"`` (low-noise). The unused transformer is dropped
@@ -365,6 +366,10 @@ def build_diffusion_pipeline(
         backend: ``BackendConfig`` for a transformer with a custom Automodel
             implementation (for example MoE diffusion transformers that need expert parallelism).
         config_overrides: Config attributes overridden before building a custom-model transformer.
+        transformer_config_overrides: Config kwargs forwarded to the transformer's
+            ``from_pretrained`` when finetuning a modular checkpoint (e.g. Flux3's
+            ``gen_type``/``cond_type`` mode selection for partial loading). Only
+            supported in finetune mode.
 
     Returns:
         Tuple of (pipeline, resolved MeshContext). The mesh context carries both the
@@ -422,9 +427,15 @@ def build_diffusion_pipeline(
             attention_backend=attention_backend,
             backend=backend,
             config_overrides=config_overrides,
+            transformer_config_overrides=transformer_config_overrides,
         )
     else:
         # Pretraining: initialize with random weights using pipeline_spec
+        if transformer_config_overrides:
+            raise ValueError(
+                "model.transformer_config_overrides is only supported in finetune mode; "
+                "for pretraining, set the desired config values via model.pipeline_spec."
+            )
         if pipeline_spec is None:
             raise ValueError(
                 "pipeline_spec is required for pretraining (finetune_mode=False). "
@@ -515,6 +526,22 @@ class TrainDiffusionRecipe(BaseRecipe):
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=model_name)
             if run is not None:
                 logging.info("🚀 View run at {}".format(run.url))
+
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            # Same two-stage Wan2.2 suffix as the wandb run name.
+            stage = self.cfg.get("model.stage", None)
+            if (
+                stage is not None
+                and self.cfg.trackio.name
+                and not self.cfg.trackio.name.endswith(f"_{str(stage).lower()}")
+            ):
+                self.cfg.trackio.name = f"{self.cfg.trackio.name}_{str(stage).lower()}"
+            model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=model_name
+            )
+            logging.info("Trackio experiment tracking enabled")
 
         self.seed = self.cfg.get("seed", 42)
         self.rng = StatefulRNG(seed=self.seed, ranked=True)
@@ -669,6 +696,11 @@ class TrainDiffusionRecipe(BaseRecipe):
         pipeline_spec_cfg = self.cfg.get("model.pipeline_spec", None)
         pipeline_spec = pipeline_spec_cfg.to_dict() if pipeline_spec_cfg is not None else None
 
+        # Transformer config overrides for modular checkpoints (e.g. Flux3
+        # gen_type/cond_type partial loading).
+        overrides_cfg = self.cfg.get("model.transformer_config_overrides", None)
+        transformer_config_overrides = overrides_cfg.to_dict() if overrides_cfg is not None else None
+
         # ── PEFT / LoRA configuration ─────────────────────────────────────────
         # Mirrors the LLM recipe pattern: peft block in YAML with _target_ pointing
         # to PeftConfig is instantiated directly, no intermediate wrapper class.
@@ -682,7 +714,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         if self.peft_cfg is not None and not self.model_type:
             raise ValueError(
                 "model.model_type must be set when peft config is provided. "
-                "Options: 'flux', 'flux2', 'wan', 'hunyuan', 'ltx2'"
+                "Options: 'flux', 'flux2', 'flux3', 'wan', 'hunyuan', 'ltx2'"
             )
 
         lora_status = (
@@ -720,6 +752,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             active_transformer=self.active_transformer,
             backend=backend,
             config_overrides=config_overrides,
+            transformer_config_overrides=transformer_config_overrides,
         )
         self.device_mesh = mesh_context.device_mesh
         # Expert-parallel mesh; None unless ep_size > 1.
@@ -1188,6 +1221,8 @@ class TrainDiffusionRecipe(BaseRecipe):
                     }
                     if _HAS_WANDB and wandb.run is not None:
                         wandb.log(log_dict, step=global_step)
+                    if self.trackio_logger is not None:
+                        self.trackio_logger.log_metrics(log_dict, step=global_step)
                     logging.info(
                         "[TRAIN] step=%s epoch=%s loss=%.6f avg_loss=%.6f lr=%.3e grad_norm=%.3f "
                         "step_time=%.3fs samples_per_sec=%.2f samples_per_sec_per_gpu=%.2f mem=%.2fGB",
@@ -1221,6 +1256,8 @@ class TrainDiffusionRecipe(BaseRecipe):
                     if self.dist_env.is_main:
                         if _HAS_WANDB and wandb.run is not None:
                             wandb.log({"val_loss": val_loss}, step=global_step)
+                        if self.trackio_logger is not None:
+                            self.trackio_logger.log_metrics({"val_loss": val_loss}, step=global_step)
                         logging.info(
                             "[VAL] step=%s epoch=%s val_loss=%.6f",
                             global_step,
@@ -1239,11 +1276,15 @@ class TrainDiffusionRecipe(BaseRecipe):
 
             if self.dist_env.is_main and _HAS_WANDB and wandb.run is not None:
                 wandb.log({"epoch/avg_loss": avg_loss, "epoch/num": epoch + 1}, step=global_step)
+            if self.dist_env.is_main and self.trackio_logger is not None:
+                self.trackio_logger.log_metrics({"epoch/avg_loss": avg_loss, "epoch/num": epoch + 1}, step=global_step)
 
         if self.dist_env.is_main:
             logging.info(f"[INFO] Saved final checkpoint at step {global_step}")
             if _HAS_WANDB and wandb.run is not None:
                 wandb.finish()
+            if self.trackio_logger is not None:
+                self.trackio_logger.finish()
 
         self._finalize_and_close_checkpointer()
         logging.info("[INFO] Training complete!")

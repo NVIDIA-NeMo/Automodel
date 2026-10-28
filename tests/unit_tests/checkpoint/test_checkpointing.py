@@ -3798,9 +3798,11 @@ def _make_ckptr(is_peft=False, is_async=False):
     config.is_async = is_async
     ckptr = MagicMock(spec=Checkpointer)
     ckptr.config = config
+    ckptr._load_process_group = None
+    ckptr._get_load_process_group = Checkpointer._get_load_process_group.__get__(ckptr)
+    ckptr.process_group = None
     ckptr._model_ctx = MagicMock(staging_active=False)
     ckptr._optim_ctx = MagicMock(staging_active=False)
-    ckptr.process_group = None
     ckptr._planner_cache_namespace = "test"
     return ckptr
 
@@ -4030,6 +4032,9 @@ class TestDoLoad:
         config.is_peft = is_peft
         ckptr = MagicMock(spec=Checkpointer)
         ckptr.config = config
+        ckptr._load_process_group = None
+        ckptr._get_load_process_group = Checkpointer._get_load_process_group.__get__(ckptr)
+        ckptr.process_group = None
         return ckptr
 
     def test_cloud_path_uses_msc_reader(self):
@@ -4086,6 +4091,9 @@ class TestDoLoad:
         config.is_async = False
         ckptr = MagicMock(spec=Checkpointer)
         ckptr.config = config
+        ckptr._load_process_group = None
+        ckptr._get_load_process_group = Checkpointer._get_load_process_group.__get__(ckptr)
+        ckptr.process_group = None
         ckptr._planner_cache_namespace = "test"
         state_dict = {"weight": torch.ones(4)}
         path = "msc://bucket/step-300"
@@ -4658,9 +4666,11 @@ class TestSyncAsyncSave:
         config.is_async = is_async
         ckptr = MagicMock(spec=Checkpointer)
         ckptr.config = config
+        ckptr._load_process_group = None
+        ckptr._get_load_process_group = Checkpointer._get_load_process_group.__get__(ckptr)
+        ckptr.process_group = None
         ckptr._model_ctx = MagicMock(staging_active=False)
         ckptr._optim_ctx = MagicMock(staging_active=False)
-        ckptr.process_group = None
         ckptr._planner_cache_namespace = "test"
         return ckptr
 

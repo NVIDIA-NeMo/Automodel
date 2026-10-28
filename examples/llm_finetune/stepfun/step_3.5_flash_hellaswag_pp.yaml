@@ -115,6 +115,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  cluster_tag: h100
   recipe_owner: hemildesai
   node_multiplier: true
   nodes: 16

@@ -44,7 +44,12 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import (
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+    generation_config_from_model_config,
+    restore_pretrained_generation_config,
+)
 from nemo_automodel.components.models.qwen3_5_moe.model import Fp32SafeQwen3_5MoeTextRotaryEmbedding
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -522,7 +527,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         """Construct architecture from a local/HF config before checkpoint load."""
         config = Qwen3_8_FlashNextConfig.from_pretrained(pretrained_model_name_or_path)
         config.language_model_only = True
-        return cls.from_config(config, *model_args, **kwargs)
+        model = cls.from_config(config, *model_args, **kwargs)
+        restore_pretrained_generation_config(model, pretrained_model_name_or_path)
+        return model
 
     def __init__(
         self,
@@ -566,6 +573,10 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         self.pad_token_id = config.text_config.pad_token_id if config.text_config.pad_token_id is not None else -1
         self.moe_config = self.model.language_model.moe_config
         self.mtp = None
+
+        # Match PreTrainedModel behavior so consolidated HF exports preserve
+        # generation defaults even for this native nn.Module implementation.
+        self.generation_config = generation_config_from_model_config(config)
 
         keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
         if "_fp32_params" not in keep_fp32:

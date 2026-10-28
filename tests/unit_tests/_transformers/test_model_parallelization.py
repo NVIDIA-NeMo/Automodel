@@ -52,6 +52,29 @@ def test_adapter_metadata_drives_generic_layer_extraction():
     assert _extract_model_layer_groups(model) == {"language": list(model.decoder.layers)}
 
 
+def test_nemotron_h_omni_metadata_avoids_nested_expert_layer_discovery():
+    """The remote VLM's decoder blocks must win over its larger expert list."""
+
+    class NemotronH_Omni_Reasoning_V3(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = nn.Module()
+            self.language_model.model = nn.Module()
+            self.language_model.model.layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(3)])
+            self.language_model.model.layers[0].experts = nn.ModuleList([nn.Linear(2, 2) for _ in range(8)])
+            self.vision_model = nn.Module()
+            self.vision_model.encoder = nn.Module()
+            self.vision_model.encoder.layer = nn.ModuleList([nn.Linear(2, 2) for _ in range(2)])
+
+    model_class = configure_parallelization_metadata(NemotronH_Omni_Reasoning_V3)
+    model = model_class()
+
+    assert _extract_model_layer_groups(model) == {
+        "language": list(model.language_model.model.layers),
+        "vision": list(model.vision_model.encoder.layer),
+    }
+
+
 @pytest.mark.parametrize(
     ("architecture", "model_package"),
     [

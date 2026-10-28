@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed configs for remote loggers (WandB, MLflow, Comet).
+"""Typed configs for remote loggers (WandB, Trackio, MLflow, Comet, SwanLab).
 
 Each logger config is a plain dataclass exposing its YAML-configurable fields
 plus a ``build(...)`` method that initialises and returns the logger / run
@@ -22,11 +22,117 @@ there is no free builder function — ``config.build(...)`` is the entry point.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.loggers.trackio_utils import TrackioLogger
+
+logger = logging.getLogger(__name__)
+
+# The SwanLabConfig whose mirror is installed in this process (it cannot be undone).
+_SWANLAB_MIRROR_INSTALLED: "SwanLabConfig | None" = None
+
+
+def _builtin_scalar(value: Any) -> Any:
+    """Return a 0-d numpy / torch value as the equivalent Python scalar; anything else unchanged."""
+    if getattr(value, "ndim", None) == 0 and hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+def _patch_mirror_values(swanlab: Any) -> None:
+    """Make ``swanlab.sync_wandb`` forward every value W&B logs.
+
+    The mirror (swanlab 0.10) forwards only Python ``int``/``float``/``bool``/``str``
+    values and SwanLab rejects strings as scalars, so a 0-d numpy or torch value
+    (e.g. ``grad_norm``) is dropped and a string (e.g. the per-step ``timestamp``)
+    fails to log. Unwrap 0-d values in ``Run.log`` before the mirror filters them
+    (the same hook ``sync_wandb`` patches; W&B stores the same number either way)
+    and log strings to SwanLab as text.
+    """
+    _, run_cls = safe_import_from("wandb.sdk.wandb_run", "Run")
+    log_mirrored = run_cls.log
+
+    def log_builtin_scalars(run, data=None, *args, **kwargs):
+        if isinstance(data, Mapping):
+            data = {k: _builtin_scalar(v) for k, v in data.items()}
+        return log_mirrored(run, data, *args, **kwargs)
+
+    run_cls.log = log_builtin_scalars
+    log_scalars = swanlab.log
+
+    def log_strings_as_text(data, step=None):
+        return log_scalars({k: swanlab.Text(v) if isinstance(v, str) else v for k, v in data.items()}, step=step)
+
+    swanlab.log = log_strings_as_text
+
+
+@dataclass
+class SwanLabConfig:
+    """Also log the W&B run to SwanLab (maps to the YAML ``wandb.swanlab:`` block).
+
+    SwanLab is an additional experiment tracker next to W&B; it is also useful
+    where Weights & Biases is not reachable. Instead of a parallel set of
+    logging calls in every recipe, it patches
+    ``wandb`` through ``swanlab.sync_wandb`` so every ``wandb.init`` /
+    ``wandb.log`` / ``wandb.config.update`` / ``finish`` a recipe makes is
+    forwarded to SwanLab. SwanLab therefore records the items W&B records: the
+    run name, project, tags, group, notes, the full run config, and every logged
+    number, string, and image at the same step. See the SwanLab logging guide
+    for the differences (e.g. W&B tables and histograms are not mirrored).
+
+    The SwanLab API key is read by the SDK from ``SWANLAB_API_KEY`` (or a prior
+    ``swanlab login``); it is never part of the YAML.
+
+    Attributes:
+        mode: SwanLab mode: ``online``, ``local``, ``offline``, or ``disabled``.
+        workspace: SwanLab workspace (user or organization). ``None`` uses the
+            account's default workspace.
+        log_dir: Local directory for SwanLab run files. ``None`` uses the SDK default.
+        upload_to_wandb: Keep uploading to W&B as usual (default). Set it to
+            ``False`` where W&B is not reachable: W&B then runs in offline mode
+            and only SwanLab receives the run.
+    """
+
+    mode: str = "online"
+    workspace: str | None = None
+    log_dir: str | None = None
+    upload_to_wandb: bool = True
+
+    def mirror_wandb(self) -> None:
+        """Patch ``wandb`` so the next ``wandb.init`` and all its logging also go to SwanLab.
+
+        Must run before ``wandb.init``. The patch is process-wide and cannot be
+        undone, so it is installed once: patching twice would forward every call to
+        SwanLab twice, and a later call with different settings is ignored with a
+        warning.
+        """
+        global _SWANLAB_MIRROR_INSTALLED
+        if _SWANLAB_MIRROR_INSTALLED is not None:
+            if _SWANLAB_MIRROR_INSTALLED != self:
+                logger.warning(
+                    "The SwanLab mirror is already installed with %s; ignoring the new settings %s.",
+                    _SWANLAB_MIRROR_INSTALLED,
+                    self,
+                )
+            return
+        _, swanlab = safe_import(
+            "swanlab",
+            msg="swanlab is not installed. To enable SwanLab experiment tracking, run: uv add nemo-automodel[swanlab]",
+        )
+        swanlab.sync_wandb(
+            mode=self.mode,
+            wandb_run=self.upload_to_wandb,
+            workspace=self.workspace,
+            log_dir=self.log_dir,
+        )
+        _patch_mirror_values(swanlab)
+        _SWANLAB_MIRROR_INSTALLED = self
 
 
 @dataclass
@@ -47,6 +153,8 @@ class WandbConfig:
         group: Group name for related runs.
         tags: List of string tags attached to the run.
         notes: Free-text notes shown in the WandB UI.
+        swanlab: Optional :class:`SwanLabConfig` that mirrors this run to
+            SwanLab (the ``wandb.swanlab:`` sub-block).
         extra: Any additional ``wandb.init()`` kwargs (``mode``, ``dir``,
             ...) carried through unfiltered.
     """
@@ -57,6 +165,7 @@ class WandbConfig:
     group: str | None = None
     tags: list[str] = field(default_factory=list)
     notes: str | None = None
+    swanlab: SwanLabConfig | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -73,6 +182,11 @@ class WandbConfig:
         if "extra" in kwargs:  # caller passed an explicit extra mapping
             extra = {**extra, **(kwargs["extra"] or {})}
             extra.pop("extra", None)
+        swanlab = direct.get("swanlab")
+        if isinstance(swanlab, Mapping):
+            direct["swanlab"] = SwanLabConfig(**swanlab)
+        elif swanlab is not None and not isinstance(swanlab, SwanLabConfig):
+            raise TypeError(f"wandb.swanlab must be a mapping of SwanLab options, got {swanlab!r}")
         return cls(**direct, extra=extra)
 
     def build(self, run_config: Mapping[str, Any] | None = None, model_name: str | None = None) -> Any:
@@ -96,9 +210,12 @@ class WandbConfig:
             msg="wandb is not installed. To enable W&B experiment tracking, run: uv add nemo-automodel[wandb]",
         )
 
+        if self.swanlab is not None:
+            self.swanlab.mirror_wandb()
+
         named = {}
         for config_field in fields(self):
-            if config_field.name == "extra":
+            if config_field.name in ("extra", "swanlab"):
                 continue
             value = getattr(self, config_field.name)
             if value is not None:
@@ -112,6 +229,86 @@ class WandbConfig:
             config=dict(run_config) if run_config is not None else None,
             settings=_WandbSettings(silent=True),
         )
+
+
+@dataclass
+class TrackioConfig:
+    """User-facing Trackio configuration (maps to the YAML ``trackio:`` block).
+
+    `Trackio <https://github.com/gradio-app/trackio>`_ is a local-first experiment tracker with a ``wandb``-style
+    API. Runs are stored locally (``TRACKIO_DIR``) unless ``space_id`` syncs them to a Hugging Face Space. Any other
+    key under the YAML ``trackio:`` block (e.g. ``resume``, ``private``, ``server_url``, ``bucket_id``,
+    ``auto_log_gpu``) is a valid ``trackio.init()`` kwarg and is preserved verbatim in ``extra``.
+
+    Attributes:
+        project: Trackio project name.
+        name: Display name for the run. When empty, ``build`` derives one from the model name.
+        group: Group name for related runs.
+        space_id: Hugging Face Space (``"user/space"`` or ``"space"``) to sync the project to. ``None`` keeps the
+            run local (or uses ``TRACKIO_SPACE_ID``).
+        extra: Any additional ``trackio.init()`` kwargs carried through unfiltered.
+    """
+
+    project: str = "automodel"
+    name: str = ""
+    group: str | None = None
+    space_id: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_kwargs(cls, **kwargs: Any) -> "TrackioConfig":
+        """Build from a flat kwargs dict, routing unknown keys to ``extra``."""
+        known = {f.name for f in fields(cls) if f.name != "extra"}
+        direct = {k: v for k, v in kwargs.items() if k in known}
+        extra = {k: v for k, v in kwargs.items() if k not in known}
+        if "extra" in kwargs:  # caller passed an explicit extra mapping
+            extra = {**extra, **(kwargs["extra"] or {})}
+            extra.pop("extra", None)
+        return cls(**direct, extra=extra)
+
+    def build(
+        self, run_config: Mapping[str, Any] | None = None, model_name: str | None = None
+    ) -> "TrackioLogger | None":
+        """Initialise a Trackio run on rank 0 and return its logger.
+
+        Args:
+            run_config: JSON-compatible run config, already serialized at the recipe boundary (e.g.
+                ``RecipeConfig.to_yaml_dict(use_orig_values=True)``).
+            model_name: Optional model name used to derive the run name when ``name`` is empty.
+
+        Returns:
+            A :class:`~nemo_automodel.components.loggers.trackio_utils.TrackioLogger` on rank 0, ``None`` on other
+            ranks so only one process writes the run.
+        """
+        import torch.distributed as dist
+
+        from nemo_automodel.components.loggers.trackio_utils import TrackioLogger
+
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return None
+        _, trackio = safe_import(
+            "trackio",
+            msg="trackio is not installed. To enable Trackio experiment tracking, run: uv add nemo-automodel[trackio]",
+        )
+        named = {}
+        for config_field in fields(self):
+            if config_field.name == "extra":
+                continue
+            value = getattr(self, config_field.name)
+            if value is not None:
+                named[config_field.name] = value
+        # ``extra`` (e.g. resume/private) is forwarded verbatim; named fields win on collision.
+        kwargs = {**self.extra, **named}
+        if kwargs.get("name", "") == "":
+            kwargs["name"] = "_".join(model_name.split("/")[-2:]) if model_name else None
+        config = None
+        if run_config is not None:
+            # ``trackio.init`` raises on top-level config keys starting with "_" (reserved for its own
+            # ``_Username``/``_Created``/``_Group``); YAML anchor-only sections such as ``_validation_dataset`` are
+            # not part of the run, so they are left out.
+            config = {k: v for k, v in run_config.items() if not str(k).startswith("_")}
+        run = trackio.init(**kwargs, config=config)
+        return TrackioLogger(run)
 
 
 @dataclass
@@ -290,4 +487,4 @@ class CometConfig:
         )
 
 
-__all__ = ["CometConfig", "MLflowConfig", "WandbConfig"]
+__all__ = ["CometConfig", "MLflowConfig", "SwanLabConfig", "TrackioConfig", "WandbConfig"]

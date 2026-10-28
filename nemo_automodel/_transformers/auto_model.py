@@ -422,6 +422,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         kwargs = dict(kwargs)  # Defensive copy so retries get clean state
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
+        load_metadata_with_gloo = kwargs.pop("load_metadata_with_gloo", False)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
         if isinstance(pretrained_model_name_or_path_or_config, str):
             # Hub loaders need the cache location; from_config constructors do not.
@@ -435,6 +436,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **kwargs,
                 "has_packed_sequence": has_packed_sequence,
                 "freeze_config": freeze_config,
+                "load_metadata_with_gloo": load_metadata_with_gloo,
                 "cache_dir": cache_dir,
             }
             return cls._build_model(
@@ -661,6 +663,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             freeze_config=freeze_config,
             weights_already_loaded=weights_already_loaded,
             inject_te_attention=inject_te_attention,
+            load_metadata_with_gloo=load_metadata_with_gloo,
         )
 
         return model
@@ -741,6 +744,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                   over ``torch_dtype`` when not ``None``; accepts ``auto``.
                 - has_packed_sequence (bool): Whether using packed sequences. Default: False.
                 - cache_dir (str): Cache directory for model weights.
+                - load_metadata_with_gloo (bool): Use a CPU process group for checkpoint
+                  load planning while retaining the training group. Default: False.
 
         Returns:
             transformers.PreTrainedModel: The loaded (and possibly patched)

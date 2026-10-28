@@ -19,6 +19,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from nemo_automodel.shared.import_utils import get_torch_version
+
+# torch 2.15 removed FSDPParam.to_accumulated_grad_if_needed: FSDP2 sets ``grad_dtype`` on the
+# unsharded param, so autograd accumulates in the reduce dtype and there is no grad to upcast.
+_FSDP_ACCUMULATED_GRAD_REMOVED_VERSION = (2, 15)
+
 
 def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
     """Return the float dtype among ``dtypes`` that every other one converts into losslessly.
@@ -153,7 +159,10 @@ def patch_fsdp_accumulated_grad_guard() -> None:
     (for example a vision tower on text-only data), deferred post-backward can
     dereference that missing field. Missing lazy state means there is no
     unsharded grad to upcast, so the exact missing-field case can return early.
+    Applies only before torch 2.15, which removed the upcast step this guards.
     """
+    if get_torch_version().release >= _FSDP_ACCUMULATED_GRAD_REMOVED_VERSION:
+        return
     try:
         from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
     except Exception:

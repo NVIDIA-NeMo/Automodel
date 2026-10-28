@@ -155,12 +155,17 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
 # instead of forcing C++17 (PyTorch's Rubin builds require C++20).
 # deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
 # Remove the configs.cuh/ibgda_device.cuh hunks when the pinned revision includes that fix.
+# The pinned revision includes https://github.com/deepseek-ai/DeepEP/pull/750,
+# which falls back to DMA-BUF when legacy ibv_reg_mr registration fails.
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
+ARG DEEPEP_COMMIT=96e3d1fc77be942438673e88b07be21d454af8a9
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
-RUN ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
+RUN apt-get update && apt-get install -y --allow-change-held-packages \
+        rdma-core libibverbs-dev && \
+    apt-get clean && \
+    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
     test -f /usr/lib/${ARCH_LIB}/libmlx5.so || \
         ln -sf /usr/lib/${ARCH_LIB}/libmlx5.so.1 /usr/lib/${ARCH_LIB}/libmlx5.so && \
     mkdir -p ${RDMA_CORE_HOME} && \
@@ -242,7 +247,8 @@ RUN git clone --filter=blob:none --no-checkout \
 # Pin >= #2762/#2507: older refs rebuilt the CuTe compile key every call when max_seqlen
 # is a tensor (varlen/packed), so HF models recompiled each step. Also picks up #2745
 # (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
-ARG FLASH_ATTN_REF=ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820
+# Includes #2888: native head_dim=192 SM90 GQA backward postprocessing.
+ARG FLASH_ATTN_REF=3c2c6b31e730fd13e7d6f0d384af22684b24c532
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=true
 ARG TARGETARCH
@@ -288,13 +294,13 @@ RUN pip install "aiohttp>=3.14.3" \
         "black>=26.3.1" \
         "GitPython>=3.1.59" \
         "jaraco-context>=6.1.0" \
-        "jupyter-server>=2.20.0" \
+        "jupyter-server>=2.21.1" \
         "jupyterlab>=4.5.10" \
         "mistune>=3.3.0" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
         "onnx>=1.22.0" \
-        "pillow>=12.3.0" \
+        "pillow>=13.0.0" \
         "protobuf>=6.33.5" \
         "setuptools>=83.0.0" \
         "tornado>=6.5.5" \
@@ -353,6 +359,19 @@ ARG RUNTIME_GID=65532
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
+
+# On Google Cloud A3 Ultra, A4, A4X and A4X Max machines, the NGC PyTorch base image's shell
+# init (/etc/shinit_v2) enables Google's NCCL profiler plugin (CoMMA), which by default uploads
+# NCCL telemetry to Google. Turn the telemetry off and do not load the plugin. The shell init
+# runs in every bash process and would set NCCL_PROFILER_PLUGIN=gcp again, so make it keep a
+# value that is already set. Run with NCCL_PROFILER_PLUGIN=gcp NCCL_TELEMETRY_MODE=3 to opt in.
+ENV NCCL_TELEMETRY_MODE=0 \
+    NCCL_PROFILER_PLUGIN=none
+RUN if [ -f /opt/gcp/nccl-plugins/lib64/libnccl-profiler-gcp.so ]; then \
+        sed -i 's/^\( *\)export NCCL_PROFILER_PLUGIN=gcp$/\1export NCCL_PROFILER_PLUGIN=${NCCL_PROFILER_PLUGIN:-gcp}/' /etc/shinit_v2 && \
+        grep -qF 'export NCCL_PROFILER_PLUGIN=${NCCL_PROFILER_PLUGIN:-gcp}' /etc/shinit_v2 || \
+        { echo "Update the NCCL_PROFILER_PLUGIN patch for this base image's /etc/shinit_v2" >&2; exit 1; }; \
+    fi
 
 COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} . /opt/Automodel
 

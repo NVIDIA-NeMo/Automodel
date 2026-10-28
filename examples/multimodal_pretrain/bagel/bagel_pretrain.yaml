@@ -185,3 +185,6 @@ wandb:
   project: bagel-pretraining
   mode: disabled
   name: bagel_mot_pretrain
+
+ci:
+  cluster_tag: h100

@@ -1,49 +1,125 @@
 ---
 title: "Performance Summary"
-description: ""
+description: "NeMo AutoModel training performance summary by GPU type and task, with benchmark recipes."
 position: 1
 ---
-This document provides performance benchmarks for various large language models using NeMo AutoModel with the PyTorch backend.
+Training performance measurements for language, vision-language, and image-generation models using NeMo AutoModel with the PyTorch backend. Model names link to pinned YAML recipes.
+
+## Fine-Tuning Performance
+
+### Full Fine-Tuning: NVIDIA H100 80GB, Precision: BF16
+
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [Qwen3.8-27B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/qwen3_8/qwen3_8_27b.yaml) | MedPix VLM | 8 | 8 | 1 | 1 | 1 | Variable | 1 | 1 | 1 | 1 | - | NR | SDPA + torch | 1.732 | NR | 1,865 | 233.07 |
+| [GLM-5.3](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/glm/glm_5.3_tulu3_4k_cudnn_100step.yaml) | Tulu-3 packed | 256 | 256 | 1 | 4 | 1 | 4096 | 1 | 4 | 1 | 64 | NR | NR | cuDNN + torch + HybridEP | 20.584 | NR | 41,615 | 162.56 |
+| [GLM-5.3-Flash](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/glm5_next/glm5_3_flash_medpix_packed2k_ep72_cp2_100steps.yaml) | MedPix packed | 72 | 144 | 1 | 1 | 4 | 2048 | 1 | 1 | 2 | 72 | - | NR | cuDNN + torch + torch_mm + HybridEP | 17.094 | NR | 9,480 | 131.66 |
+| [DeepSeek-V4-Flash-Vision-Exp](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/deepseek_v4/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps.yaml) | MedPix VLM | 128 | 128 | 1 | 4 | 1 | 4096 | 1 | 4 | 1 | 32 | NR | NR | TileLang + torch + torch_mm + HybridEP | 11.178 | NR | 3,299 | 25.77 |
+| [MiMo-V2.5-Pro](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/mimo_v25/mimo_v25_pro_hellaswag.yaml) | HellaSwag | 144 | 288 | 1 | 36 | 1 | Variable | 1 | 18 | 1 | 8 | NR | NR | SDPA + torch + torch_mm + DeepEP | 6.028 | NR | 1,816 | 12.61 |
+| [MiMo-V2.6-Flash-RL](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_flash_rl_tulu3_packed4k_ep64_cp2_100steps.yaml) | Tulu-3 packed | 64 | 64 | 1 | 1 | 1 | 4096 | 1 | 1 | 1 | 64 | - | NR | TE attention + torch + torch_mm + HybridEP | 5.221 | NR | 41,011 | 640.80 |
+| [Nemotron-3.5-Lightning-30B-A3B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/nemotron/nemotron_nano_v3_5_lightning_tulu3_packed_cp8_64k.yaml) | Tulu-3 packed | 8 | 8 | 1 | 1 | 1 | 8192 | 1 | 1 | 1 | 8 | - | NR | TE attention/linear + torch_mm + DeepEP | 1.025 | NR | 55,167 | 6,895.85 |
+| [Nemotron-3.5-Super-VL-120B-A12B-BF16](https://github.com/NVIDIA-NeMo/Automodel/blob/1e13f16700ea7f44766f271a9c6fe77a7dce19e9/examples/vlm_finetune/nemotron_3_5_super_vl/nemotron_3_5_super_vl_tulu3_packed_cp8_100steps.yaml) | Tulu-3 packed (text only) | 64 | 32 | 1 | 1 | 4 | 8192 | 1 | 1 | 8 | 64 | - | NR | TE attention/linear | 12.355 | NR | 14,737 | 230.26 |
+| [Kimi-Linear-48B-A3B-Instruct](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml) | HellaSwag packed | 8 | 8 | 1 | 1 | 1 | 4096 | 1 | 1 | 1 | 8 | - | NR | eager attention + torch | 2.862 | NR | 11,317 | 1,414.63 |
+| [Laguna-XS-2.1](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/laguna/laguna_xs_2p1_hellaswag_ep8.yaml) | HellaSwag packed | 8 | 8 | 1 | 1 | 1 | 1024 | 1 | 1 | 1 | 8 | - | NR | SDPA + torch + torch_mm | 1.323 | NR | 6,174 | 771.73 |
+
+- Qwen3.8-27B freezes vision; GLM-5.3-Flash and Nemotron-3.5-Super-VL freeze vision and embeddings.
+- Nemotron-3.5-Super-VL uses text-only checkpoint `nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained`.
+- Nemotron-3.5-Lightning uses all 52 layers with MTP disabled.
+
+### Full Fine-Tuning: NVIDIA GB200, Precision: BF16
+
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [DeepSeek-V4.1-Flash](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune/deepseek_v41/deepseek_v41_flash_medpix_4k_ep64.yaml) | MedPix VLM | 64 | 64 | 1 | 1 | 1 | 4096 | 1 | 1 | 1 | 64 | - | NR | TileLang + torch + torch_mm + HybridEP | 3.585 | NR | 5,473 | 85.52 |
+| [MiMo-V2.6-Pro-RL](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune/mimo_v2_flash/mimo_v2_6_pro_rl_tulu3_packed64k_ep64pp2cp8_100steps.yaml) | Tulu-3 packed | 128 | 16 | 1 | 2 | 1 | 65536 | 1 | 2 | 8 | 64 | NR | NR | TE attention/linear + torch_mm + HybridEP | 16.973 | NR | 58,391 | 456.18 |
+
+FSDP2; MiMo-V2.6-Pro-RL includes profiler overhead.
+
+<a id="fine-tuning-lora-performance" />
+
+## LoRA Performance
+
+### LoRA: NVIDIA H100 80GB, Precision: BF16
+
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [Llama3 8B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/llama3_1/llama3_1_8b_peft_benchmark.yaml) | Mock | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | TE + triton | 10.51 | 402 | 12,473 | 12472.87 |
+| [Qwen2.5 7B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/qwen/qwen2_5_7b_peft_benchmark.yaml) | Mock | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | TE + triton | 9.29 | 423 | 14,110 | 14110.05 |
+| [Llama3 70B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) | Mock | 8 | 32 | 2 | 2 | 4 | 4096 | 2 | 1 | 1 | - | 1 | 4 | TE + triton + fsdp2_prefetch | 15.00 | 316 | 8,735 | 1091.85 |
+| [Qwen2.5 32B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml) | Mock | 8 | 32 | 2 | 2 | 4 | 4096 | 2 | 1 | 1 | - | 1 | 4 | TE + triton + fsdp2_prefetch | 7.28 | 301 | 18,002 | 2250.31 |
+| [Llama3 70B 2-node](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml) | Mock | 16 | 32 | 2 | 2 | 2 | 4096 | 2 | 1 | 1 | - | 1 | 8 | TE + triton + fsdp2_prefetch | 8.32 | 285 | 15,758 | 984.85 |
+| [Qwen2.5 32B 2-node](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml) | Mock | 16 | 32 | 2 | 2 | 2 | 4096 | 2 | 1 | 1 | - | 1 | 8 | TE + triton + fsdp2_prefetch | 3.95 | 277 | 33,166 | 2072.89 |
+
+Full-length mock sequences; no padding.
 
 ## Pre-Training Performance
 
-The table below shows training performance for full sequences with no padding across different model architectures and scales.
+### GPU: NVIDIA H100 80GB, Precision: BF16
 
-### System: DGX-H100, Precision: BF16
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [Nemotron V3 Super 120B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/nemotron/nemotron_super_v3_te_deepep.yaml) | Mock | 64 | 512 | 2 | 2 | 4 | 4096 | 1 | 1 | 1 | 64 | - | 64 | TE + DeepEP + TorchSDPA | 7.286 | 334 | 287,808 | 4,497 |
+| [Nemotron V3 Nano 30B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/nemotron/nemotron_nano_v3_te_deepep.yaml) | Mock | 8 | 512 | 4 | 4 | 16 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + DeepEP + TorchSDPA | 15.614 | 328 | 134,312 | 16,789 |
+| [Nemotron V3 Ultra 550B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/nemotron/nemotron_ultra_v3_te_deepep.yaml) | Mock | 128 | 256 | 2 | 2 | 1 | 4096 | 1 | 1 | 1 | 64 | - | 128 | TE + DeepEP + torch_mm | 10.05 | 293 | 104,320 | 815 |
+| [DeepSeek V3 671B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml) | Mock | 1024 | 8192 | 1 | 8 | 4 | 4096 | 1 | 4 | 1 | 64 | 8 | 256 | TE + DeepEP | 37.87 | 216 | 885,760 | 865 |
+| [DeepSeek V3 671B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep.yaml) | Mock | 256 | 512 | 1 | 8 | 1 | 4096 | 1 | 4 | 1 | 64 | 8 | 64 | TE + DeepEP | 8.18 | 250 | 256,512 | 1,002 |
+| [Kimi K2](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml) | Mock | 256 | 512 | 1 | 8 | 2 | 4096 | 1 | 8 | 1 | 32 | 4 | 32 | TE + DeepEP | 8.86 | 189 | 236,544 | 924 |
+| [Qwen3 MoE 30B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml) | Mock | 8 | 512 | 4 | 4 | 16 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + DeepEP | 21.773 | 277 | 96,320 | 12,040 |
+| [GPT-OSS 20B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/gpt_oss/gptoss_20b_te_deepep.yaml) | Mock | 8 | 256 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | - | 8 | TE + DeepEP + FlexAttn | 10.04 | 279 | 104,464 | 13,058 |
+| [GPT-OSS 120B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml) | Mock | 64 | 512 | 2 | 2 | 4 | 4096 | 1 | 1 | 1 | - | - | 64 | TE + DeepEP + FlexAttn | 4.30 | 231 | 488,064 | 7,626 |
+| [Llama3 70B](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) | Mock | 64 | 128 | 1 | 1 | 4 | 8192 | 1 | 1 | 2 | - | - | 32 | TE + fsdp2_prefetch | 18.90 | 389 | 55,473 | 866.77 |
+| [Qwen3.8-Flash-Next](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark/qwen/qwen3_8_flash_next_fa4_ep64.yaml) | Mock, balanced routing | 64 | 64 | 1 | 1 | 1 | 8192 | 1 | 1 | 1 | 64 | - | 64 | FA4 QSA (`cute`) + torch + gmm + HybridEP | 3.931 | 86.85 | 133,364 | 2,083.81 |
 
-| Model | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec/GPU |
-|-------|------:|----:|----:|----:|---:|-----------:|---:|---:|---:|---:|---:|-----:|---------|-------------------------:|---------------------:|---------------:|
-| Nemotron V3 Super 120B (26.02) | 64 | 512 | 2 | 2 | 4 | 4096 | 1 | 1 | 1 | 64 | - | 64 | TE + DeepEP + TorchSDPA | 7.286 | 334 | 4,497 |
-| Nemotron V3 Nano 30B (26.02) | 8 | 512 | 4 | 4 | 16 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + DeepEP + TorchSDPA | 15.614 | 328 | 16,789 |
-| Nemotron V3 Ultra 550B (26.04) | 128 | 256 | 2 | 2 | 1 | 4096 | 1 | 1 | 1 | 64 | - | 128 | TE + DeepEP + torch_mm | 10.05 | 293 | 815 |
-| DeepSeek V3 671B | 1024 | 8192 | 1 | 8 | 4 | 4096 | 1 | 4 | 1 | 64 | 8 | 256 | TE + DeepEP | 37.87 | 216 | 865 |
-| DeepSeek V3 671B | 256 | 512 | 1 | 8 | 1 | 4096 | 1 | 4 | 1 | 64 | 8 | 64 | TE + DeepEP | 8.18 | 250 | 1,002 |
-| Kimi K2 | 256 | 512 | 1 | 8 | 2 | 4096 | 1 | 8 | 1 | 32 | 4 | 32 | TE + DeepEP | 8.86 | 189 | 924 |
-| Qwen3 MoE 30B | 8 | 512 | 4 | 4 | 16 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + DeepEP | 21.773 | 277 | 12,040 |
-| GPT-OSS 20B | 8 | 256 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | - | 8 | TE + DeepEP + FlexAttn | 10.04 | 279 | 13,058 |
-| GPT-OSS 120B | 64 | 512 | 2 | 2 | 4 | 4096 | 1 | 1 | 1 | - | - | 64 | TE + DeepEP + FlexAttn | 4.30 | 231 | 7,626 |
-| Llama3 70B | 64 | 128 | 1 | 1 | 4 | 8192 | 1 | 1 | 2 | - | - | 32 | TE + fsdp2_prefetch | 18.90 | 389 | 866.77 |
+- Full-length mock sequences; balanced MoE routing.
+- Qwen3.8-Flash-Next: 20 warmup and 30 measured steps; label-token rate; TFLOPs derived from MFU.
 
-## Fine-Tuning (LoRA) Performance
+### GPU: NVIDIA H100 80GB, Precision: FP8
 
-The table below shows fine-tuning (LoRA) performance for full sequences with no padding across different model architectures and scales.
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [Moonlight 16B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/moonlight/moonlight_16b_te_fp8.yaml) | Mock, balanced routing | 8 | 256 | 4 | 4 | 8 | 2048 | 1 | 1 | 1 | 8 | - | 8 | TE FP8 + DeepEP | 3.006 | 324.94 | 174,414 | 21,801.73 |
 
-### System: DGX-H100, Precision: BF16
+TE current scaling; 10 warmup and 20 measured steps.
 
-| Model | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec/GPU |
-|-------|------:|----:|----:|----:|---:|-----------:|---:|---:|---:|---:|---:|-----:|---------|-------------------------:|---------------------:|---------------:|
-| Llama3 8B | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | TE + triton | 10.51 | 402 | 12472.87 |
-| Qwen2.5 7B | 1 | 32 | 2 | 2 | 16 | 4096 | 1 | 1 | 1 | - | 1 | 1 | TE + triton | 9.29 | 423 | 14110.05 |
-| Llama3 70B | 8 | 32 | 2 | 2 | 4 | 4096 | 2 | 1 | 1 | - | 1 | 4 | TE + triton + fsdp2_prefetch | 15.00 | 316 | 1091.85 |
-| Qwen2.5 32B | 8 | 32 | 2 | 2 | 4 | 4096 | 2 | 1 | 1 | - | 1 | 4 | TE + triton + fsdp2_prefetch | 7.28 | 301 | 2250.31 |
-| Llama3 70B 2-node | 16 | 32 | 2 | 2 | 2 | 4096 | 2 | 1 | 1 | - | 1 | 8 | TE + triton + fsdp2_prefetch | 8.32 | 285 | 984.85 |
-| Qwen2.5 32B 2-node | 16 | 32 | 2 | 2 | 2 | 4096 | 2 | 1 | 1 | - | 1 | 8 | TE + triton + fsdp2_prefetch | 3.95 | 277 | 2072.89 |
+### GPU: NVIDIA GB200, Precision: MXFP8
+
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [DeepSeek V3 671B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/deepseek/deepseek_v3_te_mxfp8_gb200.yaml) | Mock, balanced routing | 64 | 128 | 2 | 2 | 1 | 4096 | 1 | 1 | 1 | 64 | - | 64 | TE MXFP8 + HybridEP | 2.986 | 685.45 | 175,582 | 2,743.47 |
+| [DeepSeek V3 671B (compiled MLA)](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/deepseek/deepseek_v3_sdpa_compile_mxfp8_gb200.yaml) | Mock, balanced routing | 64 | 128 | 2 | 2 | 1 | 4096 | 1 | 1 | 1 | 64 | - | 64 | SDPA + compiled MLA + TE MXFP8 + HybridEP | 6.044 | 338.57 | 86,745 | 1,355.39 |
+| [Qwen3 MoE 30B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml) | Mock, balanced routing | 8 | 512 | 16 | 16 | 4 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE MXFP8 + HybridEP | 9.164 | 658.08 | 228,847 | 28,605.85 |
+| [Qwen3 MoE 235B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/qwen/qwen3_moe_235b_te_mxfp8_gb200.yaml) | Mock, balanced routing | 32 | 8192 | 4 | 4 | 64 | 4096 | 1 | 1 | 1 | 32 | - | 32 | TE MXFP8 + HybridEP | 194.098 | 799.73 | 172,874 | 5,402.30 |
+| [GPT-OSS 120B](https://github.com/NVIDIA-NeMo/Automodel/blob/43b643d84cf91e521448c5220ee1b09d8a2c5b1c/examples/llm_benchmark/gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml) | Mock, balanced routing | 32 | 1280 | 8 | 8 | 5 | 4096 | 1 | 1 | 1 | 16 | - | 32 | TE MXFP8 + HybridEP | 7.840 | 681.95 | 668,735 | 20,897.96 |
+
+- TE MXFP8 block scaling; 10 warmup and 20 measured steps, except Qwen3 MoE 235B (two warmup and three measured steps).
+- FP8/MXFP8 token rates count full sequences; TFLOPs derive from MFU and the configured peak.
+
+## Image Generation Performance
+
+### Image Generation, Full Fine-Tuning: NVIDIA H100 80GB, Precision: BF16
+
+| Model | Mode | #GPUs | GBS | MBS | LBS | GA | TP | PP | CP | EP | Optimizer | Time per Global Step (s) | Images/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| [Qwen-Image-2.1](https://github.com/NVIDIA-NeMo/Automodel/blob/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/diffusion/finetune/qwen_image_21_t2i_flow.yaml) | Full fine-tuning | 8 | 16 | 2 | 2 | 1 | 1 | 1 | 1 | - | TE FusedAdam, FP32 master weights | ~1.38 | ~1.45 |
+
+Naruto BLIP, 1024 x 1024, FSDP2. Author-reported 1,000-step run; warmup exclusion unspecified.
+
+### Image Generation, LoRA: NVIDIA H100 80GB, Precision: BF16
+
+| Model | Mode | #GPUs | GBS | MBS | LBS | GA | TP | PP | CP | EP | Optimizer | Time per Global Step (s) | Images/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| [HunyuanImage-3.0](https://github.com/NVIDIA-NeMo/Automodel/blob/aae8680a20ca5b1deeec218fde64b1dea0286ad3/examples/diffusion/finetune/hunyuan_image3_t2i_flow_lora.yaml) | LoRA, rank 64 | 8 | 8 | 1 | 1 | 1 | 1 | 1 | 1 | 8 | TE FusedAdam, 16-bit remainders | 2.226 | 0.449 |
+
+FSDP2; 100 steps, averaging steps 10-99. Cached 1024 x 1024 Naruto BLIP inputs; synchronized maximum-rank timing excludes setup and checkpoint I/O.
 
 ## Glossary
 
+- **NR**: Not recorded or not verified
 - **MFU**: Model FLOPs Utilization - ratio of achieved compute to peak hardware capability
 - **TP**: Tensor Parallelism - splits individual layers across GPUs
 - **PP**: Pipeline Parallelism - splits model layers into stages
+- **CP**: Context Parallelism - splits the sequence across GPUs
+- **FSDP**: Fully Sharded Data Parallelism - the table column gives the shard degree when verified
 - **EP**: Expert Parallelism - distributes MoE experts across GPUs
 - **DP**: Data Parallelism - replicates model and splits data
 - **VP**: Virtual Pipeline - number of pipeline stages per GPU for interleaving
@@ -52,36 +128,15 @@ The table below shows fine-tuning (LoRA) performance for full sequences with no 
 - **GBS**: Global Batch Size - total batch size across all GPUs
 - **GA**: Gradient Accumulation - number of local-batches before optimizer step
 - **TE**: Transformer Engine kernel optimizations - RMSNorm, Linear and DotProductAttention
-- **DeepEP**: Deep Expert Parallelism - advanced EP routing for MoE models
+- **[DeepEP](https://github.com/deepseek-ai/DeepEP)**: Expert-parallel communication library for MoE token dispatch and combine
 - **FlexAttn**: PyTorch's [Flex Attention](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html)
 
 ## Configuration Files
 
-Pre-training and fine-tuning (LoRA) benchmark configurations are available in [`examples/llm_benchmark/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark):
-
-- [`deepseek_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/deepseek/deepseek_v3_te_deepep.yaml) - DeepSeek V3 with TE and DeepEP
-- [`kimi_k2_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml) - Kimi K2 optimized configuration
-- [`qwen3_moe_30b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml) - Qwen3 MoE with TE and DeepEP
-- [`nemotron_ultra_v3_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/nemotron/nemotron_ultra_v3_te_deepep.yaml) - Nemotron V3 Ultra 550B with TE + DeepEP
-- [`gptoss_20b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/gpt_oss/gptoss_20b_te_deepep.yaml) - GPT-OSS 20B with optimizations
-- [`gptoss_120b_te_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml) - GPT-OSS 120B optimized
-- [`custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml) - Llama3-70B optimized
-- [`llama3_1_8b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/llama3_1/llama3_1_8b_peft_benchmark.yaml) - Llama-8B fine-tuning (LoRA) optimized
-- [`qwen2_5_7b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/qwen/qwen2_5_7b_peft_benchmark.yaml) - Qwen2.5-7B fine-tuning (LoRA) optimized
-- [`custom_llama3_3_70b_instruct_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml) - Llama-70B fine-tuning (LoRA) optimized
-- [`custom_qwen2_5_32b_peft_benchmark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml) - Qwen2.5-32B fine-tuning (LoRA) optimized
-- [`custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml) - Llama-70B fine-tuning (LoRA) optimized on 2 nodes
-- [`custom_qwen2_5_32b_peft_benchmark_2nodes.yaml`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml) - Qwen2.5-32B fine-tuning (LoRA) optimized on 2 nodes
-
-<Note>
-- All benchmarks use mock data for consistent performance measurement.
-- Fake balanced gate is enabled to simulate ideal expert routing.
-- No gradient clipping applied for pure performance measurement.
-- MFU calculated using peak TFLOPs for the system (989 for BF16 H100).
-- Step times include forward and backward passes and optimizer step for the global batch.
-
-</Note>
+Model names in the tables link directly to their YAML recipes. Mock-data benchmarks live in [`examples/llm_benchmark/`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_benchmark); dataset-based recipes live in [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/llm_finetune), [`examples/vlm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/vlm_finetune), [`examples/retrieval/`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/retrieval), and [`examples/diffusion/finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856/examples/diffusion/finetune). Use the recorded table settings and pinned recipes when reproducing a historical result.
 
 ## Version Information
-- **Last Updated**: 2025-10-02
-- **NeMo AutoModel Version**: `main` Branch
+
+- **Last Updated**: 2026-10-14
+- **Default Recipe Snapshot**: [`b203f3f9`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856)
+- **Measurements**: Historical development and benchmark runs; source commits vary.

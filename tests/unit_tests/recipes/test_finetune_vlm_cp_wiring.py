@@ -472,7 +472,7 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     )
 
     def _stub_build_checkpoint_config(*args, **kwargs):
-        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None, load_metadata_with_gloo=False)
         cfg.build = lambda **kw: SimpleNamespace(
             config=cfg,
             load_base_model=lambda *args, **kwargs: None,

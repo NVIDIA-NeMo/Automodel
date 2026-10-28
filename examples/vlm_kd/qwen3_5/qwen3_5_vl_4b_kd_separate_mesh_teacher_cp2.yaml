@@ -145,3 +145,6 @@ freeze_config:
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
+
+ci:
+  cluster_tag: h100

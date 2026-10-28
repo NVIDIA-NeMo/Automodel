@@ -14,8 +14,10 @@
 
 import gc
 import importlib.util
+import sys
 import weakref
 from dataclasses import replace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -27,6 +29,26 @@ from nemo_automodel.components.distributed.activation_checkpointing import make_
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_CUDA = torch.cuda.is_available()
 SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
+
+
+def _grouped_mm_available() -> bool:
+    """``torch._grouped_mm`` runs on CUDA, and on CPU only where torch ships the CPU kernel."""
+    if torch.cuda.is_available():
+        return True
+    try:
+        torch._grouped_mm(
+            torch.ones(16, 16, dtype=torch.bfloat16),
+            torch.ones(1, 16, 16, dtype=torch.bfloat16),
+            torch.tensor([16], dtype=torch.int32),
+        )
+    except (RuntimeError, NotImplementedError):
+        return False
+    return True
+
+
+requires_grouped_mm = pytest.mark.skipif(
+    not _grouped_mm_available(), reason="torch._grouped_mm needs CUDA or a torch with its CPU kernel"
+)
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
@@ -113,7 +135,7 @@ class TestActivationFunctions:
         # Should be a functools.partial wrapping swiglu_clamped_deepep with limit=7.0
         assert isinstance(activation_fn, partial)
         assert activation_fn.func is swiglu_clamped_deepep
-        assert activation_fn.keywords == {"limit": 7.0}
+        assert activation_fn.keywords == {"limit": 7.0, "clamp_after_activation": False}
 
     def test_get_expert_activation_for_deepep_swiglu_negative_limit_uses_fused(self, moe_config):
         """A non-positive ``swiglu_limit`` (e.g. 0.0 or negative) falls back to the fused path."""
@@ -314,6 +336,32 @@ class TestGroupedExpertsRouteWeightAfterDown:
             ]
         )
         torch.testing.assert_close(output, expected)
+
+    def test_post_expert_output_runs_before_route_reduction(self):
+        """A per-expert transform is applied before top-k weighting/combine."""
+        config = self._tiny_config()
+        experts = GroupedExperts(config)
+        with torch.no_grad():
+            experts.gate_and_up_projs.fill_(0.25)
+            experts.down_projs.fill_(0.5)
+            experts.gate_up_proj_bias.zero_()
+            experts.down_proj_bias.zero_()
+
+        x = torch.tensor([[1.0, -2.0], [0.5, 1.5]])
+        weights = torch.tensor([[0.2, 0.7], [0.4, 0.3]])
+        indices = torch.tensor([[0, 1], [1, 0]])
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool)
+
+        baseline = experts(x, token_mask, weights, indices)
+        transformed = experts(
+            x,
+            token_mask,
+            weights,
+            indices,
+            post_expert_output=lambda expert_output: expert_output * 2,
+        )
+
+        torch.testing.assert_close(transformed, baseline * 2)
 
 
 class TestGroupedExpertsZeroActiveExperts:
@@ -982,6 +1030,8 @@ class TestGroupedExpertsDeepEP:
         hidden_states, probs = args[4], args[5]
         hidden_states.requires_grad_()
         probs.requires_grad_()
+        # Match the mocked dispatched probabilities with a trainable input router.
+        args[2].requires_grad_()
         gemm_rows = []
 
         def dense_mm(value, weights, offs):
@@ -1031,6 +1081,46 @@ class TestGroupedExpertsDeepEP:
         torch.testing.assert_close(output, expected)
         for actual, reference in zip(actual_grads, expected_grads):
             torch.testing.assert_close(actual, reference)
+
+    @pytest.mark.parametrize(
+        ("backend_kwargs", "skips_host_read"),
+        [
+            ({"dispatcher": "deepep"}, False),
+            ({"dispatcher": "hybridep", "dispatcher_capacity_factor": 1.5}, True),
+            ({"dispatcher": "hybridep", "fake_balanced_gate": True, "benchmark_static_routing": True}, True),
+        ],
+        ids=["blocking", "capacity", "static-routing"],
+    )
+    def test_grouped_experts_deepep_forward_skips_count_nonzero_when_rows_are_never_empty(
+        self, moe_config, monkeypatch, backend_kwargs, skips_host_read
+    ):
+        """Capacity mode and static routing never dispatch an empty buffer: the per-microbatch
+        ``count_nonzero`` device-to-host read is skipped; the blocking path still performs it."""
+        config = replace(
+            moe_config, n_routed_experts=1, n_activated_experts=1, dim=4, moe_inter_dim=3, dtype=torch.float32
+        )
+        torch.manual_seed(42)
+        backend = BackendConfig(experts="torch_mm", **backend_kwargs)
+        experts = GroupedExpertsDeepEP(config, backend=backend)
+        assert experts.dispatch_rows_never_empty is skips_host_read
+        for parameter in experts.parameters():
+            torch.nn.init.normal_(parameter, std=0.1)
+        args = self._prepare_forward_path(experts, num_tokens=5)
+        experts.expert_activation = lambda value, probabilities: value.chunk(2, dim=-1)[0] * probabilities
+        monkeypatch.setattr(
+            "nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: lambda v, w, offs: v @ w[0]
+        )
+        host_reads = []
+        real_count_nonzero = torch.count_nonzero
+
+        def counting_count_nonzero(*a, **kw):
+            host_reads.append(1)
+            return real_count_nonzero(*a, **kw)
+
+        monkeypatch.setattr(torch, "count_nonzero", counting_count_nonzero)
+        output = experts(*args[:4])
+        assert output.shape == (5, config.dim)
+        assert (len(host_reads) == 0) is skips_host_read
 
     def test_grouped_experts_deepep_forward_preserves_bias_free_mxfp8_backend(self, moe_config, monkeypatch):
         """Bias-free whole-dispatch execution forwards the requested MXFP8 backend."""
@@ -1084,6 +1174,61 @@ class TestGroupedExpertsDeepEP:
         expected = permuted_probs.unsqueeze(-1).expand_as(hidden_states)
         torch.testing.assert_close(output, expected)
 
+    def test_chunked_nonlinear_post_expert_precedes_router_weight(self, moe_config, monkeypatch):
+        """Chunking preserves nonlinear postprocessing and routing gradients."""
+        # Expert parameters follow config.dtype (#4388); the hand-written fp32 reference below compares the
+        # chunked path with default tolerances, so build the experts in fp32 like the other reference tests.
+        moe_config.dtype = torch.float32
+        moe_config.apply_router_weight_after_down = True
+        moe_config.expert_bias = True
+        experts = GroupedExpertsDeepEP(moe_config)
+        args = self._prepare_forward_path(experts, num_tokens=3)
+        hidden, probabilities = args[4], args[5]
+        hidden.div_(hidden.numel()).requires_grad_()
+        probabilities.requires_grad_()
+        # Match the mocked dispatched probabilities with a trainable input router.
+        args[2].requires_grad_()
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(std=0.01)
+            experts.down_projs.normal_(std=0.01)
+            experts.gate_up_proj_bias.zero_()
+            experts.down_proj_bias.zero_()
+
+        def grouped_mm(value, weights, offs):
+            """Multiply [tokens, input] by expert weights [experts, input, output].
+
+            Args:
+                value: Tensor of shape [tokens, input] grouped by expert.
+                weights: Tensor of shape [experts, input, output].
+                offs: Tensor of shape [experts] with cumulative token offsets.
+
+            Returns:
+                Tensor of shape [tokens, output].
+            """
+            starts = [0, *offs.tolist()]
+            return torch.cat([value[starts[i] : starts[i + 1]] @ weights[i] for i in range(weights.shape[0])])
+
+        monkeypatch.setattr("nemo_automodel.components.moe.experts.select_grouped_mm", lambda use_mxfp8: grouped_mm)
+        monkeypatch.setattr("nemo_automodel.components.moe.experts._EXPERT_MLP_CHUNK_BYTES", 0)
+        reference_inputs = [
+            tensor.detach().clone().requires_grad_()
+            for tensor in (hidden, experts.gate_and_up_projs, experts.down_projs, probabilities)
+        ]
+        result = experts(*args[:4], post_expert_output=torch.tanh)
+        ref_hidden, ref_up, ref_down, ref_probs = reference_inputs
+        ref_up = ref_up.to(ref_hidden.dtype)
+        ref_down = ref_down.to(ref_hidden.dtype)
+        unweighted = experts.expert_activation(ref_hidden @ ref_up[0], torch.ones(3, 1)) @ ref_down[0]
+        expected = torch.tanh(unweighted) * ref_probs[:, None]
+        gradient = torch.randn_like(result)
+        result.backward(gradient)
+        expected.backward(gradient)
+        torch.testing.assert_close(result, expected)
+        for actual, reference in zip(
+            (hidden, experts.gate_and_up_projs, experts.down_projs, probabilities), reference_inputs
+        ):
+            torch.testing.assert_close(actual.grad, reference.grad)
+
     def test_grouped_experts_provides_dispatcher_pipeline_runtime_initializers(self, moe_config):
         experts = GroupedExpertsDeepEP(moe_config)
         initializer = object()
@@ -1095,6 +1240,80 @@ class TestGroupedExpertsDeepEP:
             hidden_dim=moe_config.expert_dim,
             dtype=moe_config.dtype,
         )
+
+    @pytest.mark.parametrize("train_router", [False, True])
+    def test_dispatch_preserves_routing_gradient_requirement(self, moe_config, train_router):
+        """A dispatcher's coupled outputs must not unfreeze constant routing weights."""
+
+        class CoupledDispatch(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: object, hidden: torch.Tensor, probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                """Couple dispatch outputs through one autograd node.
+
+                Args:
+                    ctx: Autograd context, unused by this identity dispatch.
+                    hidden: Token activations shaped [tokens, hidden].
+                    probs: Routing probabilities shaped [tokens, 1].
+
+                Returns:
+                    Cloned activations and probabilities shaped [tokens].
+                """
+                return hidden.clone(), probs[:, 0].clone()
+
+            @staticmethod
+            def backward(
+                ctx: object, hidden_grad: torch.Tensor, probs_grad: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                """Restore gradients to the input layouts.
+
+                Args:
+                    ctx: Autograd context, unused by this identity dispatch.
+                    hidden_grad: Activation gradient shaped [tokens, hidden].
+                    probs_grad: Routing gradient shaped [tokens].
+
+                Returns:
+                    Activation gradient and routing gradient shaped [tokens, 1].
+                """
+                return hidden_grad, probs_grad.unsqueeze(-1)
+
+        experts = GroupedExpertsDeepEP(moe_config)
+        experts.token_dispatcher = Mock()
+
+        def dispatch(
+            *,
+            hidden_states: torch.Tensor,
+            num_local_tokens: int,
+            token_probs: torch.Tensor,
+            token_indices: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Simulate dispatch where autograd initially couples both outputs.
+
+            Args:
+                hidden_states: Activations shaped [tokens, hidden].
+                num_local_tokens: Number of tokens assigned to the single expert.
+                token_probs: Routing probabilities shaped [tokens, 1].
+                token_indices: Expert indices shaped [tokens, 1], unused here.
+
+            Returns:
+                Activations [tokens, hidden], counts [1], and probabilities [tokens].
+            """
+            hidden, probs = CoupledDispatch.apply(hidden_states, token_probs)
+            assert probs.requires_grad  # Autograd couples the dispatcher outputs.
+            return hidden, torch.tensor([num_local_tokens]), probs
+
+        experts.token_dispatcher.token_permutation2.side_effect = dispatch
+        hidden = torch.randn(4, 8, requires_grad=True)
+        probs = torch.rand(4, 1, requires_grad=train_router)
+        routed, _, routed_probs = experts._dispatch_tokens(
+            hidden, torch.ones(4, dtype=torch.bool), probs, torch.zeros(4, 1, dtype=torch.long)
+        )
+        assert routed_probs.requires_grad == train_router
+        (routed * routed_probs).sum().backward()
+        torch.testing.assert_close(hidden.grad, probs.detach().expand_as(hidden))
+        if train_router:
+            torch.testing.assert_close(probs.grad, hidden.detach().sum(-1, keepdim=True))
+        else:
+            assert probs.grad is None
 
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
@@ -2043,14 +2262,263 @@ class TestNonGatedActivations:
         )
 
 
-def test_grouped_experts_te_rejects_router_weight_after_down_without_te_import(moe_config):
-    """TE must fail loudly before importing optional TE when route weights would be applied incorrectly."""
+@pytest.mark.parametrize("native", [False, True])
+def test_grouped_experts_te_legacy_constructor_compatibility(moe_config, monkeypatch, native):
+    """The default path still constructs with TE releases lacking the new keyword."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    class LegacyGroupedLinear(torch.nn.Module):
+        def __init__(self, *, num_gemms, in_features, out_features, bias, params_dtype, device):
+            super().__init__()
+            self.num_gemms = num_gemms
+
+    class LegacyPadding(torch.nn.Module):
+        def __init__(self, num_gemms):
+            super().__init__()
+
+    te = ModuleType("transformer_engine")
+    te.__version__ = "2.14.1"
+    te_pytorch = ModuleType("transformer_engine.pytorch")
+    te_pytorch.GroupedLinear = LegacyGroupedLinear
+    te_pytorch.Fp8Padding = LegacyPadding
+    te_pytorch.Fp8Unpadding = LegacyPadding
+    monkeypatch.setitem(sys.modules, "transformer_engine", te)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te_pytorch)
+    monkeypatch.setattr("nemo_automodel.components.models.common.utils._patch_te_modules", lambda: None)
+    backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native)
+    if native:
+        with pytest.raises(ValueError, match="Transformer Engine 2.19.0 or newer"):
+            GroupedExpertsTE(moe_config, backend=backend)
+    else:
+        experts = GroupedExpertsTE(moe_config, backend=backend)
+        assert experts.gate_up_linear.num_gemms == moe_config.n_routed_experts
+        assert experts.down_linear.num_gemms == moe_config.n_routed_experts
+        mesh = Mock()
+        mesh.size.return_value = 2
+        mesh.get_local_rank.return_value = 0
+        mesh.mesh_dim_names = ("ep",)
+        with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher"):
+            experts.init_token_dispatcher(mesh)
+        assert experts.gate_up_linear.num_gemms == moe_config.n_routed_experts // 2
+        assert experts.down_linear.num_gemms == moe_config.n_routed_experts // 2
+
+
+@pytest.fixture
+def fake_native_te(monkeypatch):
+    """Exercise Automodel's TE integration on CPU, including coupled autograd outputs."""
+
+    class GroupedLinear(torch.nn.Module):
+        def __init__(
+            self, *, num_gemms, in_features, out_features, bias, params_dtype, device, use_grouped_tensor=False
+        ):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.use_grouped_tensor = use_grouped_tensor
+            self.weight = torch.nn.Parameter(torch.randn(out_features, in_features, dtype=params_dtype) * 0.02)
+
+        def forward(self, values, splits):
+            assert isinstance(splits, torch.Tensor) == self.use_grouped_tensor
+            return torch.nn.functional.linear(values, self.weight)
+
+    class Padding(torch.nn.Module):
+        def __init__(self, num_gemms, align_size=None):
+            super().__init__()
+            self.num_gemms = num_gemms
+            self.align_size = align_size
+            self.calls = 0
+
+        def forward(self, values, splits):
+            self.calls += 1
+            return values, splits
+
+    class Unpadding(Padding):
+        def forward(self, values, splits):
+            self.calls += 1
+            return values
+
+    class CoupledDispatch(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, probabilities):
+            ctx.set_materialize_grads(False)
+            return hidden.clone(), probabilities[:, 0].clone()
+
+        @staticmethod
+        def backward(ctx, hidden_grad, probability_grad):
+            return hidden_grad, None if probability_grad is None else probability_grad.unsqueeze(-1)
+
+    class Dispatcher:
+        def __init__(self, num_local_experts, **kwargs):
+            self.num_local_experts = num_local_experts
+
+        def token_permutation2(self, hidden_states, token_probs, **kwargs):
+            hidden, probs = CoupledDispatch.apply(hidden_states, token_probs)
+            assert probs.requires_grad  # Even when the input probabilities are frozen.
+            return hidden, [hidden.shape[0]] + [0] * (self.num_local_experts - 1), probs
+
+        def token_unpermutation(self, values):
+            return values
+
+    state = Mock()
+    state.is_fp8_enabled.return_value = False
+    supported = Mock(return_value=True)
+    te = ModuleType("transformer_engine.pytorch")
+    te.GroupedLinear, te.Fp8Padding, te.Fp8Unpadding = GroupedLinear, Padding, Unpadding
+    quantization = ModuleType("transformer_engine.pytorch.quantization")
+    quantization.FP8GlobalStateManager = state
+    grouped_linear = ModuleType("transformer_engine.pytorch.module.grouped_linear")
+    grouped_linear.is_module_grouped_tensor_path_supported = supported
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.quantization", quantization)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.grouped_linear", grouped_linear)
+    monkeypatch.setattr("nemo_automodel.components.moe.experts.is_te_min_version", lambda version: True)
+    monkeypatch.setattr("nemo_automodel.components.models.common.utils._patch_te_modules", lambda: None)
+    monkeypatch.setattr("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher", Dispatcher)
+    return SimpleNamespace(state=state, supported=supported)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("train_router", [False, True])
+def test_te_construction_ep_rebuild_and_routing_gradients(moe_config, fake_native_te, native, train_router):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    backend = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native)
+    experts = GroupedExpertsTE(moe_config, backend=backend)
+    for ep_size in (1, 2):
+        if ep_size == 2:
+            mesh = Mock()
+            mesh.size.return_value = ep_size
+            mesh.get_local_rank.return_value = 0
+            mesh.mesh_dim_names = ("ep",)
+            experts.init_token_dispatcher(mesh)
+        for layer in (experts.gate_up_linear, experts.down_linear):
+            assert layer.num_gemms == moe_config.n_routed_experts // ep_size
+            assert layer.use_grouped_tensor is native
+        assert experts.fp8_padding.num_gemms == moe_config.n_routed_experts // ep_size
+        if native:
+            for padding in (experts.native_fp8_padding, experts.native_fp8_unpadding):
+                assert padding.num_gemms == moe_config.n_routed_experts // ep_size
+                assert padding.align_size == 128
+
+    def activation(values, probabilities):
+        return values.chunk(2, -1)[0] * probabilities
+
+    experts.expert_activation = activation
+    x = torch.randn(3, moe_config.dim, dtype=moe_config.dtype, requires_grad=True)
+    weights = torch.rand(3, 1, dtype=moe_config.dtype, requires_grad=train_router)
+    experts(x, torch.ones(3, dtype=torch.bool), weights, torch.zeros(3, 1, dtype=torch.long)).sum().backward()
+    assert x.grad is not None
+    assert (weights.grad is not None) == train_router
+    assert fake_native_te.supported.call_count == int(native)
+
+
+@pytest.mark.parametrize("with_post", [False, True])
+@pytest.mark.parametrize("train_router", [False, True])
+def test_te_router_weight_after_down_scales_post_expert_output(moe_config, fake_native_te, with_post, train_router):
+    """After-down routing runs the expert MLP unweighted and scales its post-processed output in fp32."""
     from nemo_automodel.components.moe.experts import GroupedExpertsTE
 
     moe_config.apply_router_weight_after_down = True
+    experts = GroupedExpertsTE(moe_config, backend=BackendConfig(experts="te", dispatcher="deepep"))
+    mesh = Mock()
+    mesh.size.return_value = 1
+    mesh.get_local_rank.return_value = 0
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+    activation_probs = []
 
-    with pytest.raises(ValueError, match="GroupedExpertsTE"):
-        GroupedExpertsTE(moe_config)
+    def activation(values: torch.Tensor, probabilities: torch.Tensor) -> torch.Tensor:
+        """Gated activation over [rows, 2 * inter] values with [rows, 1] weights, cast back to values' dtype."""
+        activation_probs.append(probabilities.detach().clone())
+        gate, up = values.chunk(2, -1)
+        return (torch.nn.functional.silu(gate) * up * probabilities).to(values.dtype)
+
+    def post(values: torch.Tensor) -> torch.Tensor:
+        """Row RMS normalization of [rows, dim] expert outputs; nonlinear, so it fixes the weighting order."""
+        scale = torch.rsqrt(values.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+        return (values.float() * scale).to(values.dtype)
+
+    experts.expert_activation = activation
+    post_expert_output = post if with_post else None
+    x = torch.randn(5, moe_config.dim, dtype=moe_config.dtype, requires_grad=True)
+    weights = torch.rand(5, 1, dtype=torch.float32, requires_grad=train_router)
+    output = experts(
+        x,
+        torch.ones(5, dtype=torch.bool),
+        weights,
+        torch.zeros(5, 1, dtype=torch.long),
+        post_expert_output=post_expert_output,
+    )
+
+    x_ref = x.detach().clone().requires_grad_()
+    weights_ref = weights.detach().clone().requires_grad_(train_router)
+    hidden = activation(torch.nn.functional.linear(x_ref, experts.gate_up_linear.weight), torch.ones_like(weights_ref))
+    expert_out = torch.nn.functional.linear(hidden, experts.down_linear.weight)
+    if with_post:
+        expert_out = post(expert_out)
+    expected = (expert_out.float() * weights_ref.float()).to(moe_config.dtype)
+    upstream = torch.randn_like(output)
+    output.backward(upstream)
+    expected.backward(upstream)
+
+    assert torch.equal(activation_probs[0], torch.ones(5, 1))
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, x_ref.grad, rtol=0, atol=0)
+    if train_router:
+        torch.testing.assert_close(weights.grad, weights_ref.grad, rtol=0, atol=0)
+    else:
+        assert weights.grad is None
+
+
+def test_te_honors_compile_router_weight(moe_config, fake_native_te, monkeypatch):
+    """TE experts compile the fp32 router-weight multiply when the backend asks, like the other expert classes."""
+    import nemo_automodel.components.moe.experts as experts_module
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    called = []
+    monkeypatch.setattr(experts_module, "_compile_router_weight_cores", lambda: called.append(1))
+    GroupedExpertsTE(moe_config, backend=BackendConfig(experts="te", dispatcher="deepep"))
+    assert called == []
+    GroupedExpertsTE(moe_config, backend=BackendConfig(experts="te", dispatcher="deepep", compile_router_weight=True))
+    assert called == [1]
+
+
+def test_te_native_recipe_validation_and_padding(moe_config, fake_native_te):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    experts = GroupedExpertsTE(
+        moe_config, backend=BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=True)
+    )
+    mesh = Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+    experts.expert_activation = lambda values, probabilities: values.chunk(2, -1)[0] * probabilities
+    x = torch.randn(3, moe_config.dim, dtype=moe_config.dtype, requires_grad=True)
+    args = (x, torch.ones(3, dtype=torch.bool), torch.ones(3, 1, dtype=x.dtype), torch.zeros(3, 1, dtype=torch.long))
+    experts(*args)
+    experts(*args)
+    fake_native_te.supported.assert_called_once_with(None, x.dtype)
+
+    fake_native_te.state.is_fp8_enabled.return_value = True
+    for mxfp8, block in ((False, False), (True, False), (False, True)):
+        recipe = Mock()
+        recipe.mxfp8.return_value = mxfp8
+        recipe.float8_block_scaling.return_value = block
+        fake_native_te.state.get_fp8_recipe.return_value = recipe
+        experts(*args)
+        experts(*args)
+        fake_native_te.supported.assert_called_with(recipe, x.dtype)
+    assert fake_native_te.supported.call_count == 4
+    assert experts.fp8_padding.calls == 4
+    assert experts.native_fp8_padding.calls == 8
+    assert experts.native_fp8_unpadding.calls == 4
+
+    fake_native_te.state.get_fp8_recipe.return_value = Mock(name="DelayedScaling")
+    fake_native_te.supported.return_value = False
+    with patch("torch.tensor", side_effect=AssertionError("Must reject before creating device splits")):
+        with pytest.raises(ValueError, match="Set te_grouped_tensor=False"):
+            experts(*args)
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
@@ -2472,6 +2940,29 @@ class TestGroupedExpertsTE:
             assert experts.ep_rank == 0
             assert experts.num_local_experts == te_moe_config.n_routed_experts // 2
             assert experts.token_dispatcher is not None
+
+    def test_grouped_experts_te_forwards_the_combine_cache_to_the_dispatcher(self, te_moe_config):
+        """BackendConfig accepts TE + HybridEP + "combine": the setting must reach the dispatcher config, or the
+        requested cache silently reverts to "none" on this construction path (review of #4395)."""
+        from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+        backend = BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="combine")
+        experts = GroupedExpertsTE(te_moe_config, backend=backend, dispatcher_backend="hybridep")
+        assert experts.dispatcher_recompute_cache == "combine"
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+        mock_mesh.get_local_rank.return_value = 0
+        mock_mesh.get_group.return_value = Mock()
+        mock_mesh.mesh_dim_names = ("ep",)
+        with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher") as mock_dispatcher:
+            mock_dispatcher.return_value = Mock()
+            experts.init_token_dispatcher(mock_mesh)
+            call_kwargs = mock_dispatcher.call_args
+            config_arg = call_kwargs.kwargs.get("config") or call_kwargs[1].get("config")
+            if config_arg is None:
+                config_arg = call_kwargs[0][2]  # positional arg
+            assert config_arg.moe_flex_dispatcher_backend == "hybridep"
+            assert config_arg.moe_hybridep_recompute_cache == "combine"
 
     def test_grouped_experts_te_init_token_dispatcher_updates_linear_layers(self, te_moe_config):
         """Test init_token_dispatcher recreates linear layers with correct num_gemms."""
@@ -3475,3 +3966,214 @@ class TestGroupedExpertsConvergenceFixes:
         assert x.grad is not None
         assert experts.gate_up_proj_bias.grad is not None, "gate_up_proj_bias should have gradients"
         assert experts.down_projs.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# BackendConfig.dispatcher_recompute_cache="moe_tail": the down projection skips
+# its GEMM in a recompute whose combine is served from the cache
+# ---------------------------------------------------------------------------
+
+
+def _grouped_shapes():
+    torch.manual_seed(0)
+    x = torch.randn(48, 16, dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(3, 16, 32, dtype=torch.bfloat16, requires_grad=True)
+    offs = torch.tensor([16, 40, 48], dtype=torch.int32)
+    return x, w, offs
+
+
+@requires_grouped_mm
+def test_down_proj_grouped_mm_matches_native_autograd_bitwise():
+    from nemo_automodel.components.moe.experts import _DownProjGroupedMM
+
+    x, w, offs = _grouped_shapes()
+    out_ref = torch._grouped_mm(x, w, offs)
+    grad = torch.randn_like(out_ref)
+    out_ref.backward(grad)
+    dx_ref, dw_ref = x.grad.clone(), w.grad.clone()
+    x.grad = None
+    w.grad = None
+
+    out = _DownProjGroupedMM.apply(x, w, offs)
+    assert torch.equal(out, out_ref)
+    out.backward(grad)
+    assert torch.equal(x.grad, dx_ref)
+    assert torch.equal(w.grad, dw_ref)
+
+
+@requires_grouped_mm
+def test_down_proj_grouped_mm_skips_the_gemm_when_the_combine_is_cached(monkeypatch):
+    import nemo_automodel.components.moe.experts as experts_module
+    from nemo_automodel.components.moe.experts import _DownProjGroupedMM
+
+    x, w, offs = _grouped_shapes()
+    calls = []
+    real_grouped_mm = torch._grouped_mm
+
+    def counting_grouped_mm(*args, **kwargs):
+        calls.append(tuple(t.shape for t in args[:2]))
+        return real_grouped_mm(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "_grouped_mm", counting_grouped_mm)
+    monkeypatch.setattr(experts_module, "hybridep_combine_output_cached", lambda: True)
+
+    out = _DownProjGroupedMM.apply(x, w, offs)
+    assert calls == []  # no forward GEMM
+    assert out.shape == (48, 32) and out.dtype == torch.bfloat16
+    # the backward still produces the real gradients from the saved inputs
+    out.backward(torch.ones_like(out))
+    assert len(calls) == 2
+    assert x.grad is not None and w.grad is not None and w.grad.shape == w.shape
+
+
+@requires_grouped_mm
+def test_torch_mm_experts_fwd_defers_the_down_projection_only_when_asked(monkeypatch):
+    import nemo_automodel.components.moe.experts as experts_module
+    from nemo_automodel.components.moe.experts import _torch_mm_experts_fwd
+
+    x, w_down, offs = _grouped_shapes()
+    w_gate_up = torch.randn(3, 16, 2 * 16, dtype=torch.bfloat16, requires_grad=True)
+    tokens_per_expert = torch.tensor([16, 24, 8])
+    probs = torch.ones(48, 1, dtype=torch.bfloat16)
+
+    def activation(h, p):
+        a, b = h.chunk(2, dim=-1)
+        return torch.nn.functional.silu(a) * b * p
+
+    applied = []
+    real_apply = experts_module._DownProjGroupedMM.apply
+    monkeypatch.setattr(
+        experts_module._DownProjGroupedMM, "apply", staticmethod(lambda *a: (applied.append(1), real_apply(*a))[1])
+    )
+    plain = _torch_mm_experts_fwd(x, w_gate_up, w_down, tokens_per_expert, probs, activation)
+    assert applied == []
+    deferred = _torch_mm_experts_fwd(x, w_gate_up, w_down, tokens_per_expert, probs, activation, defer_down_proj=True)
+    assert applied == [1]
+    assert torch.equal(plain, deferred)  # outside a cached recompute the deferred path computes the same GEMM
+
+
+def _grouped_mm_outcome(fn, x, w, offs):
+    """Forward + backward of ``fn(x, w, offs)``: the dtypes and values it produced, or the ``RuntimeError`` it raised."""
+    x = x.detach().clone().requires_grad_(True)
+    w = w.detach().clone().requires_grad_(True)
+    try:
+        out = fn(x, w, offs)
+    except RuntimeError as err:
+        return ("raises", type(err).__name__)
+    grad_x, grad_w = torch.autograd.grad(out.float().square().sum(), (x, w))
+    return ("ok", out.dtype, grad_x.dtype, grad_w.dtype, out, grad_x, grad_w)
+
+
+@pytest.mark.parametrize(
+    ("input_dtype", "param_dtype"),
+    [(torch.bfloat16, torch.bfloat16), (torch.bfloat16, torch.float32), (torch.float32, torch.float32)],
+    ids=["bf16-in_bf16-params", "bf16-in_fp32-params", "fp32-in_fp32-params"],
+)
+@requires_grouped_mm
+def test_down_proj_grouped_mm_under_autocast_behaves_like_the_native_op(input_dtype, param_dtype):
+    """``torch._grouped_mm`` has no autocast rule (no Autocast kernel is registered for it), so under BF16 autocast the
+    Function must do exactly what the op does: compute in the dtypes it was given, return the gradients in those dtypes
+    and reject a dtype mix -- never cast silently, never return another dtype. FP32 parameters under BF16 autocast are
+    the AMP case: with BF16 inputs the op rejects the mix; with FP32 inputs the CPU kernel runs in FP32 while CUDA has no
+    FP32 grouped GEMM -- the Function's outcome has to be the op's either way."""
+    from nemo_automodel.components.moe.experts import _DownProjGroupedMM
+
+    x, w, offs = _grouped_shapes()
+    x, w = x.detach().to(input_dtype), w.detach().to(param_dtype)
+    with torch.autocast(x.device.type, dtype=torch.bfloat16):
+        ref = _grouped_mm_outcome(torch._grouped_mm, x, w, offs)
+        got = _grouped_mm_outcome(_DownProjGroupedMM.apply, x, w, offs)
+    assert got[0] == ref[0]
+    if ref[0] == "ok":
+        assert got[1:4] == ref[1:4]  # output dtype, input-gradient dtype, weight-gradient dtype
+        assert all(torch.equal(a, b) for a, b in zip(got[4:], ref[4:]))
+    if input_dtype == param_dtype == torch.bfloat16:
+        assert ref[0] == "ok" and ref[1] == torch.bfloat16  # the training path runs and autocast leaves it alone
+
+
+@pytest.mark.runtime_budget(30, hard_timeout=120, reason="torch.compile tracing of the expert forward, twice")
+@requires_grouped_mm
+def test_deferred_down_projection_compiles_like_the_plain_expert_forward():
+    """``torch._dynamo.explain`` sees one graph and no graph break whether the down projection is the plain grouped GEMM
+    (the merge base) or ``_DownProjGroupedMM``; ``fullgraph=True`` forward + backward match eager."""
+    from nemo_automodel.components.moe.experts import _torch_mm_experts_fwd
+
+    x, w_down, _ = _grouped_shapes()
+    w_gate_up = torch.randn(3, 16, 2 * 16, dtype=torch.bfloat16, requires_grad=True)
+    tokens_per_expert = torch.tensor([16, 24, 8])
+    probs = torch.rand(48, 1, dtype=torch.bfloat16)
+
+    def activation(h, p):
+        a, b = h.chunk(2, dim=-1)
+        return torch.nn.functional.silu(a) * b * p
+
+    def experts_fwd(x, w_gate_up, w_down, defer):
+        return _torch_mm_experts_fwd(x, w_gate_up, w_down, tokens_per_expert, probs, activation, defer_down_proj=defer)
+
+    counts = {}
+    for defer in (False, True):
+        torch._dynamo.reset()
+        explanation = torch._dynamo.explain(experts_fwd)(x, w_gate_up, w_down, defer)
+        counts[defer] = (explanation.graph_count, explanation.graph_break_count)
+    assert counts[True] == counts[False] == (1, 0), counts
+
+    torch._dynamo.reset()
+    compiled = torch.compile(experts_fwd, backend="eager", fullgraph=True)
+    out_c = compiled(x, w_gate_up, w_down, True)
+    grads_c = torch.autograd.grad(out_c.float().square().sum(), (x, w_gate_up, w_down))
+    out_e = experts_fwd(x, w_gate_up, w_down, True)
+    grads_e = torch.autograd.grad(out_e.float().square().sum(), (x, w_gate_up, w_down))
+    assert torch.equal(out_c, out_e)
+    for grad_c, grad_e in zip(grads_c, grads_e):
+        torch.testing.assert_close(grad_c, grad_e)
+
+
+class TestDispatcherRecomputeCacheKnob:
+    def test_knob_is_read_from_backend(self, moe_config):
+        backend = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache="moe_tail")
+        experts = GroupedExpertsDeepEP(moe_config, backend=backend)
+        assert experts.dispatcher_recompute_cache == "moe_tail"
+
+    def test_knob_defaults_to_none_without_backend(self, moe_config):
+        assert GroupedExpertsDeepEP(moe_config).dispatcher_recompute_cache == "none"
+
+    def test_moe_tail_rejects_router_weight_after_down(self, moe_config):
+        backend = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache="moe_tail")
+        with pytest.raises(ValueError, match="moe_tail' requires apply_router_weight_after_down=False"):
+            GroupedExpertsDeepEP(replace(moe_config, apply_router_weight_after_down=True), backend=backend)
+        # the combine cache alone is fine with it
+        combine_only = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache="combine")
+        GroupedExpertsDeepEP(replace(moe_config, apply_router_weight_after_down=True), backend=combine_only)
+
+    def test_moe_tail_keeps_the_down_projection_for_a_post_expert_callback(self, moe_config, monkeypatch):
+        """A post-expert callback reads the down projection's output: in a cached recompute the deferred (skipped)
+        GEMM would hand it an uninitialised tensor and its backward would save garbage (review of #4395)."""
+        import nemo_automodel.components.moe.experts as experts_module
+
+        backend = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache="moe_tail")
+        experts = GroupedExpertsDeepEP(moe_config, backend=backend)
+        args = TestGroupedExpertsDeepEP._prepare_forward_path(experts, num_tokens=3)
+        with torch.no_grad():
+            experts.gate_and_up_projs.normal_(std=0.01)
+            experts.down_projs.normal_(std=0.01)
+
+        def grouped_mm(value, weights, offs):
+            """Multiply [tokens, input] grouped by expert with weights [experts, input, output] -> [tokens, output]."""
+            starts = [0, *offs.tolist()]
+            return torch.cat([value[starts[i] : starts[i + 1]] @ weights[i] for i in range(weights.shape[0])])
+
+        monkeypatch.setattr(experts_module, "select_grouped_mm", lambda use_mxfp8: grouped_mm)
+        monkeypatch.setattr(experts_module, "hybridep_combine_output_cached", lambda: True)  # a cached recompute
+        deferred = []
+        real_apply = experts_module._DownProjGroupedMM.apply
+        monkeypatch.setattr(
+            experts_module._DownProjGroupedMM, "apply", staticmethod(lambda *a: (deferred.append(1), real_apply(*a))[1])
+        )
+        with_callback = experts(*args[:4], post_expert_output=torch.tanh)
+        assert deferred == []  # the GEMM ran: the callback saw real values
+        experts.dispatcher_recompute_cache = "none"
+        reference = experts(*args[:4], post_expert_output=torch.tanh)
+        torch.testing.assert_close(with_callback, reference, rtol=0, atol=0)
+        experts.dispatcher_recompute_cache = "moe_tail"
+        experts(*args[:4])
+        assert deferred == [1]  # with no reader of the output the GEMM is skipped as before

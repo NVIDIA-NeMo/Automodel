@@ -231,8 +231,13 @@ def build_model(
     cfg_compile=None,
     distributed_setup: DistributedSetup | None = None,
     cfg_quantization=None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
+
+    Args:
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
 
     Returns:
         The instantiated model and optimizer.
@@ -242,6 +247,7 @@ def build_model(
         kwargs = {
             "peft_config": cfg_peft,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
+            "load_metadata_with_gloo": load_metadata_with_gloo,
         }
         if distributed_setup is not None:
             kwargs["distributed_setup"] = distributed_setup
@@ -532,6 +538,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         if self.dist_env.is_main and self.cfg.mlflow is not None:
             run_config = self.cfg.to_yaml_dict(use_orig_values=True)
             checkpoint_dir = self.cfg.get("checkpoint.checkpoint_dir", None)
@@ -604,6 +617,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
         _validate_cp_vision_frame_sharding_support(capability_model, self.cp_vision_frame_sharding)
@@ -620,6 +634,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             self.model_parts = [model]
             self.pp = None
+
+        if self.cfg.get("nvtx", False):
+            import nemo_automodel.autonvtx as autonvtx
+
+            for i, part in enumerate(self.model_parts):
+                name = f"PipelineStage_{i}" if self.pp is not None else type(part).__name__
+                # Backward module hooks introduce views that conflict with VLM
+                # in-place operations. Annotate forward and recomputation only.
+                autonvtx.patch(part, name=name, add_backward_hooks=False)
 
         # Loss-function capability check
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
@@ -912,8 +935,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             num_batches: Number of microbatches in the accumulation window.
             is_train: Whether to backpropagate the combined main and MTP loss.
         """
-        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
-
         # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
         # a plain method call (prepare_model_inputs_for_cp): sharder-only, it
         # touches no weights and consumes nothing. Invoke it on EVERY pp stage so
@@ -928,6 +949,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
             and self.device_mesh["cp"].size() > 1
         )
+        if not _cp_active and not self.pp_enabled:
+            prepare_host_metadata = getattr(self.model_parts[0], "prepare_host_batch_metadata", None)
+            if prepare_host_metadata is not None:
+                batch = {**batch, **prepare_host_metadata(batch)}
+        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
         if _cp_active and not _is_first_or_no_pp and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
             # Non-first PP stages don't embed; drop raw multimodal inputs so their
             # forwards see only text.
@@ -1157,22 +1183,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        num_label_tokens = torch.tensor(
-            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
+        # Both counts are needed as Python integers. Reduce and read them in one
+        # transfer so the second count does not introduce another device sync.
+        token_counts = torch.tensor(
+            [
+                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+            ],
+            dtype=torch.long,
         )
-        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        num_label_tokens, num_tokens_in_batch = self._dp_allreduce(token_counts).tolist()
 
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
-
-        # number of tokens in the batch, excluding any tail padding.
-        num_tokens_in_batch = torch.tensor(
-            sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-            dtype=torch.long,
-        )
-        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
@@ -1377,6 +1402,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         if _HAS_MLFLOW and mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
@@ -1410,6 +1438,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=self.step_scheduler.step)
 

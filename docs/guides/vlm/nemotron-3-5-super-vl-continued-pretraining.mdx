@@ -1,10 +1,10 @@
 ---
-title: "Nemotron 3.5 Super VL: Continued Pretraining on FineWeb"
+title: "NVIDIA Nemotron 3.5 Super VL: Continued Pretraining on FineWeb"
 description: "Prepare FineWeb as Megatron indexed data, continue training the Super 3.5 VL language backbone, and track training and validation loss with Weights & Biases."
 position: 17
 ---
 
-This guide shows how to continue training the language backbone of **Nemotron 3.5 Super VL** on raw
+This guide shows how to continue training the language backbone of **NVIDIA Nemotron 3.5 Super VL** on raw
 [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) text. It follows the
 setup, training, checkpoint, and results structure of the
 [CORD-v2 tutorial](/recipes-e2e-examples/nemotron-3-5-super-vl) and uses a next-token pretraining
@@ -70,7 +70,7 @@ image understanding.
 | Batch | Local batch 1, global batch 32, 2 accumulation microbatches per DP rank |
 | Training | 200 measured optimizer steps; configured schedule horizon of 10,000 steps |
 | Validation | 128 sequences, every 25 steps |
-| Precision and kernels | BF16, TE attention/linear, torch grouped matrix multiplication, DeepEP |
+| Precision and kernels | BF16, TE attention/linear, torch grouped matrix multiplication, HybridEP |
 | Optimizer | TE FusedAdam, FP32 master weights, BF16 moments |
 | Learning rate | Peak 1e-5, 10-step warmup, cosine decay toward 1e-6 over 10,000 steps |
 | Checkpoint | Sharded checkpoint every 100 steps; retain the latest two plus pointer-protected checkpoints |
@@ -79,11 +79,11 @@ image understanding.
 ## Step 0 — Set Up the Environment
 
 Run preparation and training in the NeMo AutoModel container on allocated compute nodes.
-For a source overlay inside an existing container:
+Start in the repository root on a shared filesystem. For a source overlay inside an existing container:
 
 ```bash
-cd /path/to/Automodel
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export AUTOMODEL_REPO="$PWD"
+export PYTHONPATH="$AUTOMODEL_REPO:${PYTHONPATH:-}"
 
 # Install these only if they are absent from the environment.
 uv pip install --python "$(command -v python3)" huggingface_hub pyarrow wandb
@@ -98,20 +98,21 @@ Set shared paths accessible from every training node:
 ```bash
 export MODEL=nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
 export MODEL_REVISION=main
-export HF_HOME=/path/to/shared/hf_cache
-export CPT_DATA_ROOT=/path/to/shared/super35_fineweb
+export HF_HOME="$AUTOMODEL_REPO/.cache/huggingface"
+export CPT_DATA_ROOT="$AUTOMODEL_REPO/data/super35_fineweb"
 export FINEWEB_DATA_DIR="$CPT_DATA_ROOT/megatron"
+export CPT_CHECKPOINT_DIR="$AUTOMODEL_REPO/checkpoints/nemotron_3_5_super_vl_fineweb_cpt"
 mkdir -p "$CPT_DATA_ROOT" "$FINEWEB_DATA_DIR"
 
-export WANDB_ENTITY=your-wandb-entity
-export WANDB_PROJECT=your-wandb-project
+export WANDB_PROJECT=nemotron-3-5-super-vl-fineweb-cpt
 export WANDB_MODE=online
 export WANDB_CONSOLE=off
 ```
 
-Replace the W&B entity and project placeholders with your values. Authenticate Hugging Face
-if the model requires access. Download the BF16 model once into the shared cache before starting a
-multi-node allocation:
+These paths match the recipe defaults relative to the repository root. All nodes must see them
+at the same absolute paths, including inside containers. W&B uses the authenticated account's default
+entity; set `WANDB_ENTITY` if you want to use a team. Authenticate Hugging Face if the model requires
+access. Download the BF16 model once into the shared cache before starting a multi-node allocation:
 
 ```bash
 MODEL_SNAPSHOT=$(hf download "$MODEL" \
@@ -225,7 +226,7 @@ python tools/preprocess_megatron_dataset.py \
 Expected outputs:
 
 ```text
-super35_fineweb/
+data/super35_fineweb/
 ├── manifest.json
 ├── fineweb_100k.parquet
 ├── tokenizer/
@@ -311,8 +312,8 @@ The important data fields are:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: /path/to/shared/super35_fineweb/megatron/fineweb_0_text_document
-  index_mapping_dir: /path/to/shared/super35_fineweb/megatron/index_mapping
+  paths: data/super35_fineweb/megatron/fineweb_0_text_document
+  index_mapping_dir: data/super35_fineweb/megatron/index_mapping
   seq_length: 4096
   seed: 1234
   split: "99,1,0"
@@ -354,8 +355,9 @@ for section in ["dataset", "validation_dataset"]:
     config[section]["index_mapping_dir"] = str(data_dir / "index_mapping")
     config[section]["tokenizer"]["pretrained_model_name_or_path"] = snapshot
 config["wandb"]["enable"] = True
-config["wandb"]["entity"] = os.environ["WANDB_ENTITY"]
+config["wandb"]["entity"] = os.environ.get("WANDB_ENTITY")
 config["wandb"]["project"] = os.environ["WANDB_PROJECT"]
+config["checkpoint"]["checkpoint_dir"] = os.environ["CPT_CHECKPOINT_DIR"]
 Path(os.environ["CPT_RECIPE"]).write_text(yaml.safe_dump(config, sort_keys=False))
 print(os.environ["CPT_RECIPE"])
 ```
@@ -386,64 +388,24 @@ indices for that horizon, and the cosine scheduler uses the same horizon after a
 The recipe's example default is `wandb.enable: false`, following the repository's opt-in
 convention. **The commands in this tutorial explicitly enable online W&B.**
 
-Example `fineweb_cpt.sub`:
+Use your cluster-configured Slurm submission script, following the
+[Run on a Cluster guide](/job-launchers/slurm-cluster). In that script, select
+`CONFIG=fineweb_cpt_effective.yaml` and run from the repository root. The configuration
+requires **8 nodes with 8 H100 GPUs each**. The example below calls the configured script
+`fineweb_cpt.sub`; it must provide the cluster's account, partition, container, and mounts,
+and forward the exported environment to every worker.
+
+Submit from the shell used for preparation:
 
 ```bash
-#!/usr/bin/env bash
-#SBATCH --account=YOUR_SLURM_ACCOUNT
-#SBATCH --partition=YOUR_GPU_PARTITION
-#SBATCH --nodes=8
-#SBATCH --gpus-per-node=8
-#SBATCH --ntasks-per-node=8
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=0
-#SBATCH --exclusive
-#SBATCH --time=00:45:00
-#SBATCH --job-name=super35-fineweb-cpt
-#SBATCH --output=super35-cpt-%j.out
-#SBATCH --error=super35-cpt-%j.err
-set -euo pipefail
-
-export AUTOMODEL_REPO=/path/to/shared/Automodel
-export CPT_RECIPE=/path/to/shared/Automodel/fineweb_cpt_effective.yaml
-export HF_HOME=/path/to/shared/hf_cache
-export FINEWEB_DATA_DIR=/path/to/shared/super35_fineweb/megatron
-export CPT_CHECKPOINT_DIR=/path/to/shared/checkpoints/super35_cpt_${SLURM_JOB_ID}
-export WANDB_ENTITY=your-wandb-entity
-export WANDB_PROJECT=your-wandb-project
-export WANDB_MODE=online
-export WANDB_CONSOLE=off
-export WANDB_RUN_ID=super35cpt${SLURM_JOB_ID}
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
-export MASTER_PORT=29577
-: "${WANDB_API_KEY:?Export WANDB_API_KEY before sbatch}"
-
-srun --kill-on-bad-exit=1 \
-  --container-image=/path/to/shared/automodel.sqsh \
-  --container-mounts=/path/to/shared:/path/to/shared \
-  --no-container-mount-home \
-  bash -c '
-    set -euo pipefail
-    cd "$AUTOMODEL_REPO"
-    export PYTHONPATH="$AUTOMODEL_REPO:${PYTHONPATH:-}"
-    export RANK=$SLURM_PROCID LOCAL_RANK=$SLURM_LOCALID WORLD_SIZE=$SLURM_NTASKS
-    export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-    export PYTORCH_ALLOC_CONF=expandable_segments:True
-    export TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=8
-    python3 examples/llm_pretrain/pretrain.py \
-      -c "$CPT_RECIPE" \
-      --checkpoint.checkpoint_dir="$CPT_CHECKPOINT_DIR" \
-      --wandb.enable=true \
-      --wandb.name="super35-fineweb-cpt-${SLURM_JOB_ID}"
-  '
-```
-
-Submit:
-
-```bash
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+export TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=8
 read -rsp "W&B API key: " WANDB_API_KEY
 export WANDB_API_KEY
-sbatch fineweb_cpt.sub
+sbatch --nodes=8 --gpus-per-node=8 --time=00:45:00 fineweb_cpt.sub
 ```
 
 The rank-zero log prints the online W&B run URL. View the `loss` panel against
@@ -468,7 +430,7 @@ scheduler, and dataloader state. Add the following override to the per-rank trai
 command after checking that `LATEST` resolves to a complete checkpoint:
 
 ```bash
---checkpoint.restore_from=/path/to/checkpoints/LATEST
+--checkpoint.restore_from="$CPT_CHECKPOINT_DIR/LATEST"
 ```
 
 Keep the tokenizer, dataset prefix, dataset revision, training and validation split, seed, and batch

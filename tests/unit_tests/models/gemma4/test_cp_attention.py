@@ -25,7 +25,9 @@ from unittest import mock
 
 import pytest
 import torch
+from packaging.version import Version
 
+from nemo_automodel.components.distributed import fsdp_patches
 from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
 
 
@@ -841,6 +843,7 @@ def test_fsdp_guard_skips_uninitialized_and_runs_orig_and_is_idempotent(monkeypa
     fake_mod = types.ModuleType("torch.distributed.fsdp._fully_shard._fsdp_param")
     fake_mod.FSDPParam = FakeFSDPParam
     monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_mod)
+    monkeypatch.setattr(fsdp_patches, "get_torch_version", lambda: Version("2.14.1"))
 
     cpa._patch_fsdp_accumulated_grad_guard()
 

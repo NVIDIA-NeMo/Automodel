@@ -84,11 +84,14 @@ def test_probability_gradient_is_skipped_when_not_required():
 
 
 def test_cpu_inputs_take_the_compiled_path():
+    # Isolate this fixed-limit dispatch check from earlier scalar specializations.
+    torch._dynamo.reset()
     x, probs, grad = _inputs(6, 8, 2.0, "cpu")
     assert not swiglu_triton.uses_triton_kernel(x, probs)
     out = swiglu_clamped_deepep(x, probs, 2.0)
     ref = _swiglu_clamped_deepep_compiled(x.detach().clone(), probs.detach().clone(), 2.0)
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    torch.testing.assert_close(out, _reference(x, probs, 2.0), rtol=0, atol=0)
     out.backward(grad)
     assert x.grad is not None and probs.grad is not None
 

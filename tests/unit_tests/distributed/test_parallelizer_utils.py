@@ -652,6 +652,57 @@ def test_fully_shard_by_dtype_storage_equals_compute_keeps_storage_dtype(monkeyp
     assert fully_calls[0][1].param_dtype == torch.bfloat16
 
 
+def test_fully_shard_by_dtype_frozen_bf16_base_joins_fp32_trainable_adapter(monkeypatch):
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+        fully_calls.append((mod, mp_policy))
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+    )
+
+    experts = nn.Module()
+    experts.base = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16), requires_grad=False)
+    experts.lora = nn.Parameter(torch.zeros(4, dtype=torch.float32), requires_grad=True)
+    policy = _make_mp_policy()
+
+    fully_shard_by_dtype(experts, mesh=object(), mp_policy=policy, offload_policy=object())
+
+    assert [module for module, _ in fully_calls] == [experts]
+    assert fully_calls[0][1].param_dtype == torch.bfloat16
+
+
+def test_fully_shard_by_dtype_keeps_distinct_trainable_storage_dtypes_split(monkeypatch):
+    fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+    sub_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []
+
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+        fully_calls.append((mod, mp_policy))
+
+    def fake__fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None, **_kwargs):
+        sub_calls.append((mod, mp_policy))
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard, raising=True
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils._fully_shard", fake__fully_shard, raising=True
+    )
+
+    model = nn.Module()
+    model.base = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+    model.base.requires_grad_(False)
+    model.lora_fp32 = nn.Linear(4, 4, bias=False).to(torch.float32)
+    model.lora_bf16 = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+
+    fully_shard_by_dtype(model, mesh=object(), mp_policy=_make_mp_policy(), offload_policy=object())
+
+    assert [module for module, _ in sub_calls] == [model.lora_fp32]
+    assert fully_calls[0][0] == model
+    assert fully_calls[0][1].param_dtype == torch.bfloat16
+
+
 def test_fully_shard_by_dtype_genuine_fp32_compute_unchanged(monkeypatch):
     """Uniform fp32 storage with an fp32-compute policy keeps fp32 compute."""
     fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []

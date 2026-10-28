@@ -80,3 +80,6 @@ checkpoint:
 #   project: domino
 #   entity: my-team
 #   name: qwen3-8b-domino
+
+ci:
+  cluster_tag: h100

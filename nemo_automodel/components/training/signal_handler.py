@@ -84,11 +84,17 @@ def all_gather_item(
     else:
         group_size = torch.distributed.get_world_size()
 
-    tensor = torch.tensor([item], device=device, dtype=dtype)
+    tensor = torch.tensor([item], dtype=dtype)
+    if device.type == "cuda":
+        tensor = tensor.pin_memory()
+    tensor = tensor.to(device, non_blocking=device.type == "cuda")
     output_tensors = [torch.zeros(1, dtype=tensor.dtype, device=tensor.device) for _ in range(group_size)]
-    torch.distributed.all_gather(output_tensors, tensor, group, async_op)
-    output = [elem.item() for elem in output_tensors]
-    return output
+    work = torch.distributed.all_gather(output_tensors, tensor, group, async_op)
+    if work is not None:
+        work.wait()
+    # Read the gathered flags in one transfer instead of synchronizing once
+    # for every rank's scalar.
+    return torch.cat(output_tensors).cpu().tolist()
 
 
 class DistributedSignalHandler:

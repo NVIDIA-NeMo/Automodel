@@ -167,28 +167,48 @@ class TestDrafterClassStructure:
         assert model.lm_head.weight is model.model.embed_tokens.weight
 
     def test_use_ordered_embeddings_creates_masked_embedder(self):
-        from transformers.models.gemma4_assistant.configuration_gemma4_assistant import (
-            Gemma4AssistantConfig,
-        )
-
         from nemo_automodel.components.models.gemma4_drafter.model import (
             Gemma4DrafterForCausalLM,
         )
 
-        text_cfg = _make_tiny_drafter_text_config()
-        cfg = Gemma4AssistantConfig(
-            text_config=text_cfg,
-            backbone_hidden_size=text_cfg.hidden_size,
-            use_ordered_embeddings=True,
-            num_centroids=4,
-            centroid_intermediate_top_k=2,
-        )
+        cfg = _make_ordered_drafter_config()
         model = Gemma4DrafterForCausalLM(cfg)
 
         assert model.masked_embedding is not None
         # token_ordering must be a registered buffer of shape [vocab_size].
-        assert model.masked_embedding.token_ordering.shape == (text_cfg.vocab_size,)
+        assert model.masked_embedding.token_ordering.shape == (cfg.text_config.vocab_size,)
         assert model.masked_embedding.token_ordering.dtype == torch.long
+
+    def test_ordered_head_trains_on_full_vocabulary_with_unchanged_state(self):
+        """Issue #4022: the ordered head scores the full vocabulary; checkpoints keep its tensors for export."""
+        from transformers.models.gemma4_assistant.modeling_gemma4_assistant import Gemma4AssistantForCausalLM
+
+        from nemo_automodel.components.models.gemma4_drafter.model import (
+            Gemma4DrafterForCausalLM,
+            Gemma4DrafterFullVocabEmbedder,
+        )
+
+        cfg = _make_ordered_drafter_config()
+        model = Gemma4DrafterForCausalLM(cfg)
+
+        assert isinstance(model.masked_embedding, Gemma4DrafterFullVocabEmbedder)
+        assert set(model.state_dict()) == set(Gemma4AssistantForCausalLM(cfg).state_dict())
+        hidden = torch.randn(2, 3, cfg.text_config.hidden_size)
+        torch.testing.assert_close(model.masked_embedding(hidden, model.lm_head.weight), model.lm_head(hidden))
+
+
+def _make_ordered_drafter_config():
+    """Tiny drafter config with the ordered-embedding head (4 clusters of 16 tokens, one picked per position)."""
+    from transformers.models.gemma4_assistant.configuration_gemma4_assistant import Gemma4AssistantConfig
+
+    text_cfg = _make_tiny_drafter_text_config()
+    return Gemma4AssistantConfig(
+        text_config=text_cfg,
+        backbone_hidden_size=text_cfg.hidden_size,
+        use_ordered_embeddings=True,
+        num_centroids=4,
+        centroid_intermediate_top_k=1,
+    )
 
 
 def _make_tiny_drafter_text_config():

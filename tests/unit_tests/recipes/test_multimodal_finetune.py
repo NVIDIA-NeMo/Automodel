@@ -104,3 +104,27 @@ def test_bagel_dataloader_resolved_through_recipeconfig():
             and isinstance(node.value.func, ast.Name)
             and node.value.func.id == "RecipeConfig"
         ), "bagel_dataloader must be resolved via RecipeConfig(self.cfg), not accessed on a raw ConfigNode"
+
+
+def test_bagel_build_wandb_uses_shared_init_with_model_default_name(monkeypatch):
+    """BAGEL starts W&B through ``init_wandb_run`` so a ``wandb.swanlab`` block is honored."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.recipes.multimodal import finetune
+    from nemo_automodel.recipes.multimodal.finetune import FinetuneRecipeForMultimodal
+
+    calls = []
+    monkeypatch.setattr(finetune, "init_wandb_run", lambda *a, **kw: calls.append((a, kw)) or "run")
+    values = {
+        "wandb": SimpleNamespace(to_dict=lambda: {"project": "p"}),
+        "model.pretrained_model_name_or_path": "org/bagel-7b",
+    }
+    recipe = FinetuneRecipeForMultimodal.__new__(FinetuneRecipeForMultimodal)
+    recipe.cfg = SimpleNamespace(
+        get=lambda key, default=None: values.get(key, default),
+        wandb=values["wandb"],
+        to_dict=lambda: {"all": 1},
+    )
+
+    assert recipe._build_wandb() == "run"
+    assert calls == [(({"project": "p"}, {"all": 1}), {"default_name": "org_bagel-7b"})]

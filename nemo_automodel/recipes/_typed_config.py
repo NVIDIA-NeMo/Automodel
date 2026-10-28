@@ -20,7 +20,7 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
-``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
+``apply()``: ``wandb``/``trackio``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
 ``embedding_row_repair``/``mfu``/``domain_mixture`` map to component config
 dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
@@ -46,7 +46,7 @@ from dataclasses import fields, is_dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
@@ -133,7 +133,7 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
-    ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
+    ``wandb``, ``trackio``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
     ``loss_fn``, ``domain_mixture`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
@@ -156,6 +156,11 @@ class RecipeConfig:
     def wandb(self) -> WandbConfig | None:
         node = self._raw.get("wandb", None)
         return WandbConfig.from_kwargs(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def trackio(self) -> TrackioConfig | None:
+        node = self._raw.get("trackio", None)
+        return TrackioConfig.from_kwargs(**_section_kwargs(node)) if node else None
 
     @cached_property
     def mlflow(self) -> MLflowConfig | None:

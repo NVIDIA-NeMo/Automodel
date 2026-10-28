@@ -1,0 +1,106 @@
+---
+title: "NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16"
+description: "Fine-tune NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16 with NeMo AutoModel using the checked-in full-parameter and LoRA recipes for the Gemma 4 E4B architecture."
+slug: model-coverage/vision-language-models/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16
+---
+
+[NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16)
+is a small language model post-trained by NVIDIA from
+[Gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it). It keeps the Gemma 4 E4B architecture and
+refreshes the weights and the chat template. The BF16 release is the full-precision checkpoint intended for
+customization, post-training, and evaluation. NeMo AutoModel provides full-parameter and Low-Rank Adaptation
+(LoRA) recipes that load the checkpoint through the native Gemma 4 path and apply the chat template shipped with
+the checkpoint.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel)
+or follow the [installation instructions](/get-started/installation).
+
+## Fine-Tune NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16
+
+From the repository root, run the 8-GPU full-parameter recipe:
+
+```bash
+uv run automodel examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e4b.yaml --nproc-per-node 8
+```
+
+Or run the 2-GPU LoRA recipe:
+
+```bash
+uv run automodel examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e4b_peft.yaml --nproc-per-node 2
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Full-parameter fine-tuning on MedPix-VQA | Use [nemotron_3_5_bolt_e4b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e4b.yaml). |
+| LoRA fine-tuning on MedPix-VQA | Use [nemotron_3_5_bolt_e4b_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_e4b_peft.yaml). |
+
+### Configuration
+
+| Setting | Full-parameter recipe | LoRA recipe |
+| --- | --- | --- |
+| Hardware | 8 NVIDIA H100 80GB GPUs | 2 NVIDIA H100 80GB GPUs |
+| Strategy | FSDP2; `tp_size=1`, `cp_size=1` | FSDP2; `tp_size=1`, `cp_size=1` |
+| Batch | `local_batch_size=1`, `global_batch_size=8` | `local_batch_size=1`, `global_batch_size=8` |
+| Attention | Eager | SDPA |
+| Adapter | None | LoRA `dim=16`, `alpha=32` on the language model linear layers |
+| Optimizer | AdamW, `lr=1e-5` | AdamW, `lr=2e-4`, cosine decay |
+| Frozen modules | Vision and audio towers | Vision and audio towers, plus the base weights |
+
+Both recipes set `dataset.chat_template` and `validation_dataset.chat_template` to the chat template shipped
+with the checkpoint, so the training prompts match the template the model was post-trained with. The template
+exposes the same controls as the model card: `enable_thinking` switches reasoning on or off, and
+`conversational_mode` adds the spoken-conversation system instruction for concise, low-formatting replies.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Developer | NVIDIA Corporation |
+| Base model | [`google/gemma-4-E4B-it`](https://huggingface.co/google/gemma-4-E4B-it) |
+| Architecture type | Gemma 4 |
+| Network architecture | Gemma-4-E4B |
+| Hugging Face architecture | `Gemma4ForConditionalGeneration` |
+| Total parameters | 8B (4B effective) |
+| Precision | BF16 |
+| Context length | Input up to 64K tokens; output up to 64K tokens |
+| Inputs and outputs | Text in, text out |
+| Reasoning mode | Chat-template controls (`enable_thinking=True/False`) and a runtime thinking budget |
+| Conversational mode | Chat-template control (`conversational_mode=True/False`) |
+| Recommended sampling | Temperature 1.0, top_p 0.95 in both thinking modes |
+| Best for | Local voice and device assistants, interactive personas, and embedded interfaces |
+| License | [OpenMDW-1.1](https://github.com/OpenMDW/OpenMDW/blob/main/1.1/LICENSE.OpenMDW-1.1) |
+| Checkpoint | [`nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16) |
+
+### Training Methodology
+
+The model was post-trained from Gemma-4-E4B-it with multi-environment reinforcement learning using Group
+Relative Policy Optimization (GRPO) across instruction following, multi-step tool use, multi-turn
+conversations, and structured-output environments, on an asynchronous RL architecture that decouples training
+from inference. The reinforcement learning used [NeMo RL](https://github.com/NVIDIA-NeMo/RL) and
+[NeMo Gym](https://github.com/NVIDIA-NeMo/Gym).
+
+### Prompting Guidelines
+
+The model card recommends the following for conversational and agentic applications:
+
+- Store persistent behavior constraints and operational guidelines in system prompts, with explicit headers
+  for roles, tasks, tool configs, and formatting rules.
+- Write unambiguous, verifiable instructions and use explicit constraints such as "limit responses to 1-2
+  sentences" instead of vague requests.
+- Adhere strictly to standard `system/user/assistant/tool` turn sequences and avoid synthetic outputs in
+  `assistant` turns.
+- Set `conversational_mode=True` for concise, low-formatting outputs suited to spoken interaction.
+
+### Available Models
+
+- [`nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-BF16) (HF BF16)
+- [`nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB) (Q4_K_M GGUF for inference)
+
+## Related Resources
+
+- [Gemma 4 Fine-Tuning Guide](/recipes-e2e-examples/gemma-4)
+- [NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16](/model-coverage/vision-language-models/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16)

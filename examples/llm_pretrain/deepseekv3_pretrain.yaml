@@ -154,6 +154,7 @@ lr_scheduler:
   min_lr: 0.0
 
 ci:
+  cluster_tag: h100
   # pp_size(8) * ep_size(16) = 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 16

@@ -82,6 +82,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
         ),
         (
+            "FlintForCausalLM",
+            ("nemo_automodel.components.models.flint.model", "FlintForCausalLM"),
+        ),
+        (
             "Glm4MoeForCausalLM",
             ("nemo_automodel.components.models.glm4_moe.model", "Glm4MoeForCausalLM"),
         ),
@@ -264,6 +268,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.muse_glimmer.model", "MuseGlimmerForConditionalGeneration"),
         ),
         (
+            "MuseSparkForConditionalGeneration",
+            ("nemo_automodel.components.models.muse_spark.model", "MuseSpark1xOmniForCausalLM"),
+        ),
+        (
+            "MuseSpark1xOmniForCausalLM",
+            ("nemo_automodel.components.models.muse_spark.model", "MuseSpark1xOmniForCausalLM"),
+        ),
+        (
             "LLaVAOneVision1_5_ForConditionalGeneration",
             (
                 "nemo_automodel.components.models.llava_onevision.model",
@@ -316,6 +328,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_moe.model", "Qwen3MoeForCausalLM"),
         ),
         (
+            "BeamForCausalLM",
+            ("nemo_automodel.components.models.beam.model", "BeamForCausalLM"),
+        ),
+        (
             "Qwen3NextForCausalLM",
             ("nemo_automodel.components.models.qwen3_next.model", "Qwen3NextForCausalLM"),
         ),
@@ -363,6 +379,11 @@ MODEL_ARCH_MAPPING = OrderedDict(
             "Step3p6ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
+        ("Step5ForCausalLM", ("nemo_automodel.components.models.step5.model", "Step5ForCausalLM")),
+        (
+            "Step5ForConditionalGeneration",
+            ("nemo_automodel.components.models.step5.model", "Step5ForConditionalGeneration"),
+        ),
         (
             "Step3p5ForCausalLM",
             ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
@@ -383,6 +404,8 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "step5": ("nemo_automodel.components.models.step5.configuration", "Step5Config"),
+    "step5_vl": ("nemo_automodel.components.models.step5.configuration", "Step5VLConfig"),
     "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
@@ -390,6 +413,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41Config"),
     "deepseek_v41_text": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41TextConfig"),
     "deepseek_v41_vision": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41VisionConfig"),
+    "flint": ("nemo_automodel.components.models.flint.config", "FlintConfig"),
     "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
     "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
@@ -417,6 +441,14 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
     "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),
+    "muse_spark": (
+        "nemo_automodel.components.models.muse_spark.configuration_muse_spark",
+        "MuseSparkConfig",
+    ),
+    "musespark1x_omni": (
+        "nemo_automodel.components.models.muse_spark.config",
+        "MuseSpark1xOmniConfig",
+    ),
     "qwen3_8_flash_next": ("nemo_automodel.components.models.qwen3_8_flash_next.config", "Qwen3_8_FlashNextConfig"),
     "qwen3_8_flash_next_text": (
         "nemo_automodel.components.models.qwen3_8_flash_next.config",
@@ -437,6 +469,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 
 # Checkpoint model_type to local image/text processor implementation.
 _CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
+    "kimi_k3": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
 }
 

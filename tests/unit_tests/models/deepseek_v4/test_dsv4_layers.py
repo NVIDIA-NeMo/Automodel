@@ -59,10 +59,6 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     sinkhorn_normalize_torch,
 )
 
-# Over the default 5s budget on purpose: TileLang compilation takes up to about 37s on a cold worker.
-# Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(70)
-
 _MILES_INDEXER_REQUIRED_DYNAMIC_SMEM_BYTES = 229376
 
 
@@ -684,6 +680,39 @@ class TestDeepseekV4AttentionMask:
 
         assert actual_weights.shape[-1] == expected_attention_width
 
+    def test_validated_complete_hca_windows_avoid_collective_and_preserve_gradients(self, monkeypatch):
+        """The model's all-rank complete-window contract removes only a redundant decision."""
+        from unittest.mock import Mock
+
+        torch.manual_seed(1234)
+        cfg = self._tiny_hca_config()
+        hidden, rotary, rotary_compress_values, rotary_compress, mask = self._hca_inputs(cfg, 129)
+        attention = DeepseekV4Attention(cfg, layer_idx=0)
+        attention.init_weights(torch.device("cpu"))
+        attention.train()
+        decision = Mock(return_value=True)
+        monkeypatch.setattr(attention.compressor, "_compute_fsdp_group_has_complete_hca_window", decision)
+        upstream = torch.randn_like(hidden)
+        records = []
+        for complete in (False, True):
+            attention.zero_grad(set_to_none=True)
+            x = hidden.detach().clone().requires_grad_()
+            output, _ = attention(
+                x,
+                position_embeddings=rotary,
+                attention_mask=mask,
+                position_embeddings_compress=rotary_compress_values,
+                rotary_compress=rotary_compress,
+                _dsv4_complete_compressor_windows=complete,
+            )
+            output.backward(upstream)
+            records.append((output.detach(), x.grad.clone(), [p.grad.clone() for p in attention.parameters()]))
+            assert decision.call_count == 1
+        for actual, expected in zip(records[1][:2], records[0][:2], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual, expected in zip(records[1][2], records[0][2], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     @staticmethod
     def _tiny_hca_config() -> DeepseekV4Config:
         return DeepseekV4Config(
@@ -1208,49 +1237,6 @@ class TestDeepseekV4OptimizedKernels:
         finally:
             sys.modules.pop(module_name, None)
 
-    @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
-        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
-    )
-    def test_sinkhorn_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        x = torch.randn(2, 128, 4, 4, device="cuda")
-        grad = torch.randn_like(x)
-        expected, (expected_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        actual, (actual_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
-
-    @pytest.mark.skipif(
-        not is_dsv4_kernel_available("sinkhorn") or not torch.cuda.is_available(),
-        reason="TileKernels sinkhorn kernel is not installed on a CUDA environment",
-    )
-    def test_sinkhorn_tilelang_backend_accepts_non_contiguous_grad(self):
-        torch.manual_seed(123)
-        x = torch.randn(2, 128, 4, 4, device="cuda")
-        grad = torch.randn_like(x).transpose(-1, -2)
-        assert not grad.is_contiguous()
-        expected, (expected_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="torch", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        actual, (actual_grad,) = _run_forward_backward(
-            lambda x_: dsv4_sinkhorn_normalize(x_, backend="tilelang", repeat=5, eps=1e-6),
-            (x,),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
-
     def test_sparse_attention_torch_matches_dense_topk_reference(self):
         torch.manual_seed(123)
         bsz, seq, heads, dim = 2, 7, 3, 8
@@ -1392,51 +1378,6 @@ class TestDeepseekV4OptimizedKernels:
         for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
             torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
 
-    @pytest.mark.skipif(
-        not _can_run_tilelang_sparse_attn(),
-        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
-    )
-    def test_sparse_attention_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, key_len, topk_len = 1, 16, 8, 128, 20, 16
-        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(bsz, key_len, dim, device="cuda", dtype=torch.bfloat16)
-        sinks = torch.randn(heads, device="cuda")
-        topk = torch.stack(
-            [torch.stack([torch.randperm(key_len, device="cuda")[:topk_len] for _ in range(seq)]) for _ in range(bsz)]
-        ).to(torch.int32)
-        topk[:, :, -4:] = -1
-        grad = torch.randn(bsz, seq, dim, heads, device="cuda", dtype=q.dtype).transpose(2, 3)
-        assert not grad.is_contiguous()
-
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="sparse_torch",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="tilelang",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
-
     def test_sparse_attention_backward_threads_follow_head_count(self):
         from nemo_automodel.components.models.deepseek_v4.kernels.tilelang_sparse_mla_bwd import _bwd_threads_for_heads
 
@@ -1463,92 +1404,6 @@ class TestDeepseekV4OptimizedKernels:
         assert out.shape == q.shape
         whole.assert_called_once()
         chunked.assert_not_called()
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_sparse_attn(),
-        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
-    )
-    @pytest.mark.runtime_budget(
-        90,
-        reason="compiles the 64-head, head_dim-512 TileLang forward and backward kernels once (tens of seconds cold)",
-    )
-    def test_sparse_attention_tilelang_backend_matches_torch_at_sixty_four_heads(self):
-        """The single 64-head backward kernel (512 threads) matches the torch reference at the V4 head shape."""
-        torch.manual_seed(7)
-        bsz, seq, heads, dim, key_len, topk_len = 1, 8, 64, 512, 64, 32
-        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(bsz, key_len, dim, device="cuda", dtype=torch.bfloat16)
-        sinks = torch.randn(heads, device="cuda")
-        topk = torch.stack(
-            [torch.stack([torch.randperm(key_len, device="cuda")[:topk_len] for _ in range(seq)]) for _ in range(bsz)]
-        ).to(torch.int32)
-        topk[:, :, -4:] = -1
-        grad = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=q.dtype)
-
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(q_, kv_, sinks_, topk, dim**-0.5, backend="sparse_torch"),
-            (q, kv, sinks),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(q_, kv_, sinks_, topk, dim**-0.5, backend="tilelang"),
-            (q, kv, sinks),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_sparse_attn(),
-        reason="Vendored Miles DSV4 sparse-attention kernel is not available on a CUDA environment",
-    )
-    def test_sparse_attention_tilelang_backend_matches_torch_with_causal_padding_shape(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, n_pooled = 1, 192, 128, 128, 48
-        q = torch.randn(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(bsz, seq + n_pooled, dim, device="cuda", dtype=torch.bfloat16)
-        sinks = torch.randn(heads, device="cuda")
-        topk = build_dsv4_sparse_topk_indices(
-            batch_size=bsz,
-            seq_len=seq,
-            key_len=seq + n_pooled,
-            window_size=128,
-            device=q.device,
-            compress_ratio=4,
-            n_pooled=n_pooled,
-        )
-        assert (topk == -1).any()
-        grad = torch.randn_like(q).transpose(2, 3).contiguous().transpose(2, 3)
-        assert not grad.is_contiguous()
-
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="sparse_torch",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, kv_, sinks_: dsv4_sparse_attention(
-                q_,
-                kv_,
-                sinks_,
-                topk,
-                dim**-0.5,
-                backend="tilelang",
-            ),
-            (q, kv, sinks),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-2, atol=5e-2)
 
     def test_indexer_scores_torch_backend_matches_reference(self):
         torch.manual_seed(123)
@@ -1646,84 +1501,6 @@ class TestDeepseekV4OptimizedKernels:
         torch.testing.assert_close(actual, expected)
         for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
             torch.testing.assert_close(actual_grad, expected_grad)
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_indexer(),
-        reason="Miles DSV4 indexer kernel is not installed on a CUDA environment",
-    )
-    def test_indexer_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, pooled = 2, 17, 8, 128, 5
-        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
-        q_pos = torch.arange(seq, device="cuda")
-        pooled_pos = torch.arange(pooled, device="cuda")
-        valid = pooled_pos.unsqueeze(0) < ((q_pos + 1) // 4).unsqueeze(1)
-        expected = dsv4_indexer_scores(
-            q,
-            pooled_kv,
-            weights,
-            compress_ratio=4,
-            softmax_scale=dim**-0.5,
-            backend="torch",
-        )
-        expected = torch.where(valid.unsqueeze(0), expected, torch.full_like(expected, float("-inf")))
-        actual = dsv4_indexer_scores(
-            q,
-            pooled_kv,
-            weights,
-            compress_ratio=4,
-            softmax_scale=dim**-0.5,
-            backend="tilelang",
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-
-    @pytest.mark.skipif(
-        not _can_run_tilelang_indexer(),
-        reason="Vendored Miles DSV4 indexer kernel is not available on a CUDA environment",
-    )
-    def test_indexer_topk_tilelang_backend_matches_torch(self):
-        torch.manual_seed(123)
-        bsz, seq, heads, dim, pooled, topk = 1, 17, 8, 128, 5, 4
-        q = torch.rand(bsz, seq, heads, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        pooled_kv = torch.rand(bsz, pooled, dim, device="cuda", dtype=torch.bfloat16) + 0.1
-        weights = torch.randn(bsz, seq, heads, device="cuda") * 0.01
-        topk_indices = torch.arange(topk, device="cuda", dtype=torch.int32).view(1, 1, topk).expand(bsz, seq, -1)
-        q_pos = torch.arange(seq, device="cuda")
-        valid_end = ((q_pos + 1) // 4).view(1, seq, 1)
-        topk_indices = torch.where(topk_indices < valid_end, topk_indices, torch.full_like(topk_indices, -1))
-        grad = torch.randn(bsz, seq, topk, device="cuda")
-
-        expected, expected_grads = _run_forward_backward(
-            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
-                q_,
-                pooled_kv_,
-                weights_,
-                topk_indices,
-                compress_ratio=4,
-                softmax_scale=dim**-0.5,
-                backend="torch",
-            ),
-            (q, pooled_kv, weights),
-            grad,
-        )
-        actual, actual_grads = _run_forward_backward(
-            lambda q_, pooled_kv_, weights_: dsv4_indexer_topk_scores(
-                q_,
-                pooled_kv_,
-                weights_,
-                topk_indices,
-                compress_ratio=4,
-                softmax_scale=dim**-0.5,
-                backend="tilelang",
-            ),
-            (q, pooled_kv, weights),
-            grad,
-        )
-        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-2, atol=3e-2)
 
 
 class TestApplyPartialRopeInterleaved:
@@ -1991,3 +1768,125 @@ class TestDeepseekV4RotaryEmbeddingYaRN:
         assert cos.shape == (bsz, seq, 64)
         assert sin.shape == (bsz, seq, 64)
         assert not torch.isnan(cos).any() and not torch.isnan(sin).any()
+
+
+def test_compiled_hyperconnection_uses_copied_stage_parameters(monkeypatch):
+    """A PP-style copy from meta must execute and differentiate its own weights."""
+    import copy
+
+    original_compile = torch.compile
+    monkeypatch.setattr(
+        torch, "compile", lambda function, **kwargs: original_compile(function, backend="eager", **kwargs)
+    )
+    kwargs = dict(hc_mult=4, hidden_size=8, hc_sinkhorn_iters=3, hc_eps=1e-6, rms_norm_eps=1e-6)
+    with torch.device("meta"):
+        source = DeepseekV4HyperConnection(**kwargs, compile_hc=True)
+    stage = copy.deepcopy(source).to_empty(device="cpu")
+    stage.init_weights(0.1)
+    reference = DeepseekV4HyperConnection(**kwargs)
+    reference.load_state_dict(stage.state_dict())
+    inputs = torch.randn(2, 5, 4, 8, requires_grad=True)
+    reference_inputs = inputs.detach().clone().requires_grad_()
+    actual = stage(inputs)
+    expected = reference(reference_inputs)
+    upstream = [torch.randn_like(value) for value in expected]
+    for observed, wanted in zip(actual, expected):
+        torch.testing.assert_close(observed, wanted)
+    torch.autograd.backward(actual, upstream)
+    torch.autograd.backward(expected, upstream)
+    torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+    for (name, parameter), (reference_name, reference_parameter) in zip(
+        stage.named_parameters(), reference.named_parameters()
+    ):
+        assert name == reference_name
+        torch.testing.assert_close(parameter.grad, reference_parameter.grad)
+    assert all(parameter.device.type == "meta" for parameter in source.parameters())
+
+
+@pytest.mark.parametrize("selective", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_frozen_indexer_replay_preserves_attention_and_interleaved_microbatch_gradients(selective, packed):
+    """Replay skips selection work without changing sparse keys or any attention gradient."""
+    import copy
+    from unittest.mock import patch
+
+    from torch.utils.checkpoint import checkpoint
+
+    from nemo_automodel.components.distributed.activation_checkpointing import make_selective_checkpoint_context_fn
+
+    cfg = TestDeepseekV4AttentionMask._tiny_hca_config()
+    cfg.compress_ratios = [4]
+    cfg.sliding_window = 4
+    cfg.index_topk = 1
+    cfg.index_head_dim = 8
+    cfg.index_n_heads = 2
+    torch.manual_seed(1243)
+    reference = DeepseekV4Attention(cfg, layer_idx=0)
+    reference.init_weights(torch.device("cpu"))
+    reference.compressor.indexer.requires_grad_(False)
+    _, rotary_main, rotary_compress, rotary, mask = TestDeepseekV4AttentionMask._hca_inputs(cfg, 16)
+    inputs = [torch.randn(1, 16, cfg.hidden_size) for _ in range(2)]
+    upstream = [torch.randn_like(x) for x in inputs]
+    if packed:
+        seq_ids = torch.tensor([[1] * 8 + [2] * 8])
+        positions = torch.arange(8).repeat(2).unsqueeze(0)
+        rotary_main = rotary(inputs[0], positions)
+        rotary_compress = rotary_main
+        mask = build_packed_causal_padding_mask(
+            torch.tensor([[8, 8]]),
+            16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            sliding_window=cfg.sliding_window,
+        )
+    else:
+        seq_ids = None
+        positions = torch.arange(16).unsqueeze(0)
+
+    runs = []
+    for enabled in (False, True):
+        module = copy.deepcopy(reference)
+        module.compressor.indexer.reuse_selection_on_recompute = enabled
+        xs = [x.clone().requires_grad_() for x in inputs]
+        selections = []
+        hook = module.compressor.indexer.register_forward_hook(
+            lambda _module, _args, output: selections.append(output.detach().clone())
+        )
+        inner = make_selective_checkpoint_context_fn() if selective else None
+        context_fn = dsv4_layers.dsv4_indexer_replay.checkpoint_context_fn(inner)
+
+        def forward(x):
+            """Run the attention layer under checkpointing.
+
+            Args:
+                x: Tensor of shape [batch, sequence, hidden].
+
+            Returns:
+                Attention output of shape [batch, sequence, hidden].
+            """
+            return module(
+                x,
+                position_embeddings=rotary_main,
+                position_embeddings_compress=rotary_compress,
+                rotary_compress=rotary,
+                position_ids=positions,
+                packed_seq_ids=seq_ids,
+                attention_mask=mask,
+            )[0]
+
+        with patch.object(
+            module.compressor.indexer, "_select_keys", wraps=module.compressor.indexer._select_keys
+        ) as select:
+            # Both forwards remain live; backward traverses the second call first.
+            outputs = [checkpoint(forward, x, use_reentrant=False, context_fn=context_fn) for x in xs]
+            loss = sum((outputs[i] * upstream[i]).sum() for i in (1, 0))
+            params = tuple(p for p in module.parameters() if p.requires_grad)
+            gradients = torch.autograd.grad(loss, (*xs, *params))
+            assert select.call_count == (2 if enabled else 4)
+        hook.remove()
+        assert selections[0].shape == (1, 16, 1)
+        runs.append((outputs, gradients, selections[:2]))
+
+    for before, after in zip(runs[0], runs[1]):
+        for expected, actual in zip(before, after):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

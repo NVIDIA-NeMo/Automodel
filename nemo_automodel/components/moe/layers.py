@@ -557,14 +557,14 @@ class Gate(nn.Module):
         Forward pass for the gating mechanism.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
+            x: Tensor of shape [tokens, hidden] containing local token states.
+            token_mask: Boolean tensor of shape [tokens] indicating valid tokens.
             cp_mesh (Optional[DeviceMesh]): Device mesh for context parallel computation.
 
         Returns:
-            weights (torch.Tensor): Routing weights for the selected experts.
-            indices (torch.Tensor): Indices of the selected experts.
-            aux_loss (Optional[torch.Tensor]): Auxiliary loss for load balancing.
+            weights: Tensor of shape [tokens, topk] with selected routing weights.
+            indices: Integer tensor of shape [tokens, topk] with expert indices.
+            aux_loss: Scalar auxiliary load-balancing loss, or None.
         """
         original_dtype = x.dtype
 
@@ -577,7 +577,9 @@ class Gate(nn.Module):
             weight = self.weight.to(dtype=x.dtype)
             bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
 
-        scores = F.linear(x_compute, weight, bias=bias)
+        # Explicit gate precision must override an enclosing model autocast.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            scores = F.linear(x_compute, weight, bias=bias)
         if self.use_routing_core:
             weights, indices, original_scores = self.routing_core(scores, self)
         else:
@@ -684,23 +686,24 @@ class Gate(nn.Module):
         indices: torch.Tensor,
         token_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Computes the load of each expert based on the selected indices.
+        """Compute expert loads from this rank's local tokens.
+
         Args:
-            indices (torch.Tensor): Indices of the selected experts.
-                Shape is [num_tokens, num_activated_experts].
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
-                Shape is [num_tokens].
+            indices: Integer tensor of shape [tokens, activated_experts] containing
+                selected expert IDs. Repeated IDs count once per token.
+            token_mask: Tensor of shape [tokens] on the same device as ``indices``.
+                Boolean values select valid tokens; numeric values are converted
+                to the indices' dtype before contributing to the load.
 
         Returns:
-            torch.Tensor: Load of each expert (number of tokens routed to each expert).
-                Shape is [num_local_experts].
+            Int64 tensor of shape [n_experts] on the same device as ``indices``,
+            containing each expert's load from the local tokens.
         """
-        # Create a mask for the experts based on the selected indices.
-        expert_mask = indices.new_zeros((indices.shape[0], self.n_experts))
-        contribution = token_mask.to(dtype=expert_mask.dtype).unsqueeze(-1).expand(-1, indices.shape[1])
-        expert_mask.scatter_(dim=1, index=indices, src=contribution)
-        return expert_mask.sum(dim=0)
+        # Keep the token reduction contiguous to avoid column-reduction scratch storage.
+        expert_mask = indices.new_zeros((self.n_experts, indices.shape[0]))
+        contribution = token_mask.to(dtype=expert_mask.dtype).unsqueeze(0).expand(indices.shape[1], -1)
+        expert_mask.scatter_(dim=0, index=indices.T, src=contribution)
+        return expert_mask.sum(dim=1)
 
     def _compute_aux_loss(
         self,
@@ -1007,7 +1010,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
 
     with torch.device(buffer_device):
         if isinstance(module, Gate):
-            to_local(module.weight).normal_(mean=0.0, std=init_std)
+            # Preserve DTensor RNG offsets so FSDP shards do not repeat router rows.
+            nn.init.normal_(module.weight, mean=0.0, std=init_std)
             if module.e_score_correction_bias is not None:
                 to_local(module.e_score_correction_bias).zero_()
             if module.bias is not None:

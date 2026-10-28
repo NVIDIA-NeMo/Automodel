@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+from weakref import WeakKeyDictionary
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -105,6 +106,14 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
+
+# Load metadata groups belong to the distributed world, not an individual checkpointer.
+# Retaining one per caller group avoids reusing Gloo rendezvous keys after close/reopen
+# on PyTorch 2.10. destroy_process_group() tears down every registered group; weak keys
+# release cache entries when the corresponding caller groups are no longer referenced.
+_load_metadata_groups: WeakKeyDictionary[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup] = (
+    WeakKeyDictionary()
+)
 
 
 class _DTensorInitCopyMode(TorchFunctionMode):
@@ -622,6 +631,7 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
+        self._load_process_group: torch.distributed.ProcessGroup | None = None
         self.lifecycle = CheckpointLifecycle(config=config, process_group=process_group)
         self._planner_cache_namespace = uuid.uuid4().hex
 
@@ -656,6 +666,25 @@ class Checkpointer:
         if self.config.is_peft:
             self._addons.append(PeftAddon())
         _warn_if_inline_consolidation_enabled(self.config)
+
+    def _get_load_process_group(self) -> torch.distributed.ProcessGroup | None:
+        """Reuse a world-owned CPU metadata group with the caller's membership."""
+        if (
+            self._load_process_group is None
+            and self.config.load_metadata_with_gloo
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=self.process_group) > 1
+            and torch.distributed.get_backend(self.process_group) != "gloo"
+        ):
+            # DCP exchanges Python load plans. NCCL can retain root-side P2P buffers.
+            caller_group = self.process_group if self.process_group is not None else torch.distributed.group.WORLD
+            load_group = _load_metadata_groups.get(caller_group)
+            if load_group is None:
+                load_group = _new_gloo_process_group(self.process_group)
+                _load_metadata_groups[caller_group] = load_group
+            self._load_process_group = load_group
+            logger.info("Using a shared Gloo process group for checkpoint load metadata.")
+        return self._load_process_group if self._load_process_group is not None else self.process_group
 
     @torch.no_grad()
     def save_model(
@@ -879,7 +908,8 @@ class Checkpointer:
         Args:
             model_state: Wrapper for the model whose final parameter storage is populated.
             load_parts: Adapter-owned sequence of checkpoint destinations and finish callbacks.
-            model_state_dict: Native model names mapped to final model tensors. Every key must be completed exactly
+            model_state_dict: Native names mapped to final tensors of arbitrary shape/dtype on their destination
+                devices. DTensors retain their global shape and mesh placements. Every key must be completed exactly
                 once across ``load_parts``.
             model_path: Hugging Face safetensors checkpoint directory.
             storage_reader: Reader already bound to ``model_path``. Its parsed metadata is reused across parts.
@@ -900,7 +930,8 @@ class Checkpointer:
         read_seconds = 0.0
         finish_seconds = 0.0
         part_count = 0
-        process_group_kwargs = {"process_group": self.process_group} if self.process_group is not None else {}
+        process_group = self._get_load_process_group()
+        process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
 
         for part in load_parts:
             if not isinstance(part, CheckpointLoadPart):
@@ -1852,17 +1883,26 @@ class Checkpointer:
         dcp.save(state_dict, checkpoint_id=state_dir, planner=planner, **process_group_kwargs)
 
     def load_distributed_state(self, state: Any, state_name: str, path: str) -> None:
-        """Load a custom stateful object previously saved with DCP."""
+        """Load a custom stateful object previously saved with DCP.
+
+        Args:
+            state: Stateful object whose state dict maps keys to tensors of arbitrary shape/dtype or auxiliary
+                values. Tensor devices and DTensor mesh placements define the rank-local load destinations.
+            state_name: Subdirectory containing the saved state.
+            path: Checkpoint root directory.
+        """
         state_dir = os.path.join(path, state_name)
         state_dict = state.state_dict()
-        process_group = getattr(self, "process_group", None)
+        process_group = self._get_load_process_group()
         process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
         dcp.load(state_dict, checkpoint_id=state_dir, **process_group_kwargs)
         state.load_state_dict(state_dict)
 
     def close(self) -> None:
-        """
-        Close the checkpointer.
+        """Close owned save resources and release the shared load-group reference.
+
+        Load metadata groups are reused across checkpointers with the same caller
+        group and destroyed by the final distributed-world teardown.
         """
         self.maybe_wait_for_staging()
         self.async_wait()
@@ -1872,6 +1912,8 @@ class Checkpointer:
             self._optim_ctx.stager.close()
         consolidation_process_group = self._consolidation_process_group
         self._consolidation_process_group = None
+        # The load group is shared across checkpointers until distributed-world teardown.
+        self._load_process_group = None
         if torch.distributed.is_initialized():
             for context in (self._model_ctx, self._optim_ctx):
                 if context.process_group is not None:
@@ -1900,13 +1942,15 @@ class Checkpointer:
         Load a state dictionary from `path` using DCP or PEFT special-case logic.
 
         Args:
-            state_dict: Mutable state dict to populate with tensors.
+            state_dict: Mutable mapping to destination tensors of arbitrary shape/dtype. DTensors retain their
+                global shape and mesh placements; each rank loads its local shard on the existing device.
             path: Checkpoint directory path.
             storage_reader: Optional HF storage reader for safetensors.
             is_init_step: True if loading from a base checkpoint during initialization.
 
         Returns:
-            The populated state dictionary (may be replaced for PEFT).
+            The populated mapping, preserving tensor shapes/dtypes/devices and DTensor placements. DCP fills
+            existing tensor storage in place; PEFT may replace the mapping.
         """
         # Both model and optimizer loading is done in this function.
         is_model = _is_model_checkpoint_path(path)
@@ -1915,7 +1959,7 @@ class Checkpointer:
             state_dict = _load_safetensors(_adapter_path(path))
         else:
             storage_reader = _maybe_msc_reader(path, storage_reader)
-            process_group = getattr(self, "process_group", None)
+            process_group = self._get_load_process_group()
             process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
             dcp.load(state_dict, checkpoint_id=path, storage_reader=storage_reader, **process_group_kwargs)
         return state_dict

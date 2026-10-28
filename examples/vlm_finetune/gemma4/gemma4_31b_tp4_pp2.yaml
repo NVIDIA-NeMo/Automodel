@@ -111,5 +111,6 @@ freeze_config:
   freeze_language_model: false
 
 ci:
+  cluster_tag: h100
   recipe_owner: athitten
   time: "00:30:00"

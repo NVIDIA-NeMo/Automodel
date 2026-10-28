@@ -25,6 +25,7 @@ def test_glm5_next_medpix_ep72_cp2_recipe_contract():
         "_target_": "nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset",
         "path_or_dataset": "mmoukouba/MedPix-VQA",
         "split": "train",
+        "chat_template": "examples/llm_finetune/glm5_next/glm5_3_flash_training_chat_template.jinja",
     }
     assert recipe["step_scheduler"]["max_steps"] == 100
     assert recipe["step_scheduler"]["global_batch_size"] == 144

@@ -147,13 +147,24 @@ class Glm5NextHyperConnection(nn.Module):
         return self._fp32_params.scale
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build Sinkhorn mixing weights and collapse streams for one sublayer."""
+        """Build Sinkhorn mixing weights and collapse streams for one sublayer.
+
+        Args:
+            hidden_streams: Tensor of shape [batch, sequence, hc_mult, hidden],
+                where hc_mult is the number of residual streams.
+
+        Returns:
+            FP32 post weights [batch, sequence, hc_mult], FP32 combination
+            weights [batch, sequence, hc_mult, hc_mult], and collapsed states
+            [batch, sequence, hidden] in the input dtype.
+        """
         hc = self.hc_mult
-        if self._compile_hc:
-            projected = self._project_core(hidden_streams, self.fn, self.input_norm.eps)
-        else:
-            flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
-            projected = F.linear(flat, self.fn.float())
+        with torch.autocast(device_type=hidden_streams.device.type, enabled=False):
+            if self._compile_hc:
+                projected = self._project_core(hidden_streams, self.fn, self.input_norm.eps)
+            else:
+                flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+                projected = F.linear(flat, self.fn.float())
         pre_w, post_w, comb_w = projected.split([hc, hc, hc * hc], dim=-1)
         pre, post, comb = self._fp32_params(
             pre_w,
@@ -278,8 +289,17 @@ def _torch_recurrent_kda(
 ) -> torch.Tensor:
     """Differentiable reference KDA for CPU/small tensors.
 
-    All q/k/v/g tensors are ``[batch, sequence, heads, head_dim]`` and beta is
-    ``[batch, sequence, heads]``. Packed boundaries reset the recurrent state.
+    Args:
+        q: Query tensor of shape [batch, sequence, heads, head_dim].
+        k: Key tensor with q's layout.
+        v: Value tensor with q's layout.
+        g: Log-decay tensor with q's layout.
+        beta: Update weights of shape [batch, sequence, heads].
+        cu_seqlens: Optional integer tensor [documents + 1] containing packed
+            boundaries. Each boundary resets the FP32 recurrent state.
+
+    Returns:
+        Tensor of shape [batch, sequence, heads, head_dim] in v's dtype.
     """
     batch, sequence, heads, head_dim = q.shape
     output = torch.zeros_like(v)
@@ -290,10 +310,12 @@ def _torch_recurrent_kda(
             q_t = q[:, token].float() * (head_dim**-0.5)
             k_t, v_t = k[:, token].float(), v[:, token].float()
             state = state * g[:, token].exp().unsqueeze(-1)
-            prediction = torch.einsum("bhd,bhdv->bhv", k_t, state)
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                prediction = torch.einsum("bhd,bhdv->bhv", k_t, state)
             error = (v_t - prediction) * beta[:, token].float().unsqueeze(-1)
-            state = state + torch.einsum("bhd,bhv->bhdv", k_t, error)
-            output[:, token] = torch.einsum("bhd,bhdv->bhv", q_t, state).to(output.dtype)
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                state = state + torch.einsum("bhd,bhv->bhdv", k_t, error)
+                output[:, token] = torch.einsum("bhd,bhdv->bhv", q_t, state).to(output.dtype)
     return output
 
 
@@ -565,7 +587,8 @@ class Glm5NextKPoolIndexer(nn.Module):
             )
         else:
             queries = self.wq_b(query_resid).view(1, -1, self.n_heads, self.head_dim)
-            scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
+            with torch.autocast(device_type=queries.device.type, enabled=False):
+                scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
             scores = F.relu(scores * self.softmax_scale)
             # Keep the narrow BF16 projection at the validated query tile shape.
             if query_hidden.shape[1] > 512:
@@ -573,7 +596,8 @@ class Glm5NextKPoolIndexer(nn.Module):
             else:
                 weights = self.weights_proj(query_hidden)
             weights = weights.float() * (self.n_heads**-0.5)
-            scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
+            with torch.autocast(device_type=queries.device.type, enabled=False):
+                scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
         if complete_pools:
             pool_end = pool_indices[:, -1]
             visible = pool_end.view(1, 1, -1) <= query_positions.view(1, -1, 1)

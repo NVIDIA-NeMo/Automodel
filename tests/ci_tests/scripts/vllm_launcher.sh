@@ -22,6 +22,12 @@ export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 
 cd /opt/Automodel
 
+# Transformers copies remote code from local checkpoints into this cache and
+# chmods it. A shared cache can contain files owned by another CI user.
+HF_MODULES_CACHE=$(mktemp -d)
+export HF_MODULES_CACHE
+trap 'rm -rf "$HF_MODULES_CACHE"' EXIT
+
 # Expose ci.vllm_deploy_gpus GPUs (default 1) so large models can tensor-parallel.
 # Set after cd so the relative $CONFIG_PATH resolves under /opt/Automodel.
 export CUDA_VISIBLE_DEVICES="$(python3 -c "import yaml; cfg = yaml.safe_load(open('$CONFIG_PATH')) or {}; n = int((cfg.get('ci') or {}).get('vllm_deploy_gpus', 1) or 1); print(','.join(map(str, range(n))))" 2>/dev/null || echo 0)"

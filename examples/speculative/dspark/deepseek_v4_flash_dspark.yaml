@@ -150,3 +150,6 @@ checkpoint:
   model_save_format: safetensors
   save_consolidated: final
   # restore_from: LATEST
+
+ci:
+  cluster_tag: h100
