@@ -305,6 +305,7 @@ def test_kd_setup_preserves_requested_storage_dtype(monkeypatch, recipe_module, 
         {
             "model": model_settings,
             "teacher_model": {},
+            "dataloader": None,
             "optimizer": {"_target_": "torch.optim.AdamW", "lr": 0.01},
         }
     )
