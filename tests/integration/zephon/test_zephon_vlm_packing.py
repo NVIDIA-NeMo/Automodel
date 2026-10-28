@@ -16,7 +16,6 @@
 
 import json
 from contextlib import closing
-from operator import itemgetter
 
 import pytest
 import torch
@@ -49,7 +48,6 @@ def _pipeline(inputs, algorithm, runner, *, on_media_error="raise"):
     )
     pipeline = Pipeline(source).add_op(operator)
     pipeline.pack_sequences(max_length=41, algorithm=algorithm, num_bins=2, pack_payloads=merge_image_documents)
-    pipeline.map_transform(itemgetter("packed_samples"), parallelism=1)
     pipeline.batch(2, drop_last=False)
     pipeline.options(deterministic=True, max_workers=2, runner=runner, mtp_mode=False, shm_enabled=False)
     return pipeline
