@@ -46,7 +46,7 @@ from nemo_automodel.components.moe import fsdp_mixin
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin, patched_backward_maybe_with_nosync
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
-pytestmark = pytest.mark.timeout(120)
+pytestmark = [pytest.mark.timeout(120), pytest.mark.cpu_only]
 
 _HIDDEN = 8
 _MICROBATCH = 4
