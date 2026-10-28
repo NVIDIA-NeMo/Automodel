@@ -3,7 +3,7 @@
 Several model families (Qwen3.5 dense/MoE, nemotron_v3, step3p7, minimax_m3_vl,
 deepseek_v4, GLM-5.2, nemotron_omni) ship a native MTP head: extra decoder
 depths that each predict one additional future token, trained alongside the
-main next-token loss. MTP finetuning improves that head's self-speculative
+main next-token loss. MTP fine-tuning improves that head's self-speculative
 accept length for a target domain without retraining the base model.
 
 This is **not** a separate speculative-decoding recipe or draft model (see
