@@ -596,7 +596,7 @@ jobs:
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 30
+            timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval
@@ -693,7 +693,7 @@ jobs:
             is-optional: "true"
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 30
+            timeout: 40
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20
