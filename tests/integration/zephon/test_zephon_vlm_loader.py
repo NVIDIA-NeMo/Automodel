@@ -308,3 +308,30 @@ def test_parent_position_factory_and_processor_context_do_not_enter_workers(conf
 
     with pytest.raises(ValueError, match="context parallel"):
         config.build(pretrained_model_name_or_path=inputs[0], dp_rank=0, dp_world_size=1, batch_size=2, cp_size=2)
+
+
+def test_thd_image_pipeline_keeps_expanded_positions_pixels_and_shifted_labels(config, inputs):
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+
+    config = replace(config, dataset_config=replace(config.dataset_config, inject_fake_images=False))
+    with (
+        closing(_build(config, inputs)) as batched,
+        closing(_build(replace(config, output_format="thd"), inputs)) as thd,
+    ):
+        expected, actual = next(batched), next(thd)
+        assert actual["qkv_format"] == "thd"
+        for key in (
+            "input_ids",
+            "labels",
+            "position_ids",
+            "padding_mask",
+            "_packed_seq_ids",
+            "pixel_values",
+            "image_grid_thw",
+        ):
+            torch.testing.assert_close(actual[key], expected[key])
+        prepared = process_input_for_thd(actual)
+        torch.testing.assert_close(prepared["position_ids"], expected["position_ids"].reshape(3, 1, -1))
+        torch.testing.assert_close(prepared["labels"], expected["labels"].flatten())
+        torch.testing.assert_close(prepared["padding_mask"], expected["padding_mask"].flatten())
+        assert prepared["pixel_values"] is actual["pixel_values"]
