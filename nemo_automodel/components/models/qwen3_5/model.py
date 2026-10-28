@@ -758,8 +758,11 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
+        from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+
         packed_gdn_metadata = None
-        if not getattr(self, "_cp_enabled", False):
+        # Block-diagonal CP strips the full-pack metadata; each block reads its documents from the CP state.
+        if not getattr(self, "_cp_enabled", False) and current_blockdiag_cp_state() is None:
             host_packed_seq_ids = attn_kwargs.pop("_host_packed_seq_ids", None)
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
