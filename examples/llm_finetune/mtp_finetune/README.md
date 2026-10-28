@@ -24,7 +24,7 @@ supports it. The only two pieces this directory adds are:
 
 2. **`val_mtp_tau_sim`**, a validation-only metric (see
    `nemo_automodel/components/speculative/mtp/core.py`) reporting the expected
-   self-speculative accept length under teacher-forced decoding — the same
+   self-speculative accept length under teacher-forced decoding, the same
    `tau_sim` convention the EAGLE-3 recipe already logs. Acceptance is judged
    against the model's **own main-head greedy prediction** (the actual
    verifier in self-speculative decoding), not the dataset label, since those
