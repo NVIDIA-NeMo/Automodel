@@ -24,7 +24,7 @@ gate. Everything here is BSHD in and BSHD out; the compact ``[tokens, ...]`` lay
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import cached_property, lru_cache
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -253,9 +253,13 @@ def _contiguous_runs(
 
 
 _MEMO: WeakIdKeyDictionary = WeakIdKeyDictionary()  # _packed_seq_ids -> (version, microbatch)
+# A microbatch's scorer plans, keyed by its cu_seqlens rather than cached on the instance: FSDP2's forward-input
+# cast rebuilds dataclass arguments with dataclasses.replace (torch.distributed.utils._apply_to_tensors), so every
+# decoder block receives its own copy of the microbatch. The copies share the integer tensors by identity.
+_PLANS: WeakIdKeyDictionary = WeakIdKeyDictionary()  # cu_seqlens -> {forced_blocks: _SelectionPlan}
 
 
-@dataclass(frozen=True)  # no slots: the scorer plan is a cached_property
+@dataclass(frozen=True)
 class MSAMicrobatch:
     """One packed microbatch's MSA state, built once and shared by every attention layer and stage.
 
@@ -446,18 +450,35 @@ class MSAMicrobatch:
         rows = packed.new_zeros((self.padding_mask.numel(), *packed.shape[1:]))
         return rows.index_copy_(0, self.token_rows, packed).reshape(shape)
 
-    @cached_property
+    @property
     def _plan(self) -> "_SelectionPlan":
-        """The scorer plan of this microbatch, built on the first block selection.
+        """The scorer plan of this microbatch, built by ``prepare_selection`` or on the first block selection.
 
-        The first plan of a process also compiles every scorer variant production can reach: the
-        ``from_pretrained`` path skips ``initialize_weights``, so this is the one model-owned point both
-        load paths pass through before the first scoring pass (ADR 0010).
+        Memoized on ``cu_seqlens`` (see ``_PLANS``), so every copy of the microbatch reuses one plan instead of
+        re-planning, with a host sync, in each decoder block. The first plan of a process also compiles every
+        scorer variant production can reach: the ``from_pretrained`` path skips ``initialize_weights``, so this
+        is the one model-owned point both load paths pass through before the first scoring pass (ADR 0010).
         """
-        device = self.cu_seqlens.device
-        require_sm100(device)
-        _warm_scorer(device, self.forced_blocks)
-        return _SelectionPlan.build(self)
+        plans = _PLANS.setdefault(self.cu_seqlens, {})
+        plan = plans.get(self.forced_blocks)
+        if plan is None:
+            device = self.cu_seqlens.device
+            require_sm100(device)
+            _warm_scorer(device, self.forced_blocks)
+            plan = plans[self.forced_blocks] = _SelectionPlan.build(self)
+        return plan
+
+    def prepare_selection(self) -> None:
+        """Build the scorer plan now, before any activation-checkpointed decoder block runs.
+
+        Planning is one-time work per microbatch (a host sync, and on a process's first plan the scorer
+        warm-up). Done inside a checkpointed block, it runs in the checkpoint forward but not in the
+        recompute, which finds the plan already built. A checkpoint policy that saves the planning ops
+        then hands their outputs to the wrong recompute calls: the MoE ``ignore_router_for_ac`` policy saves
+        ``aten.topk``, so the layer's own block selection received the warm-up's 16-token selection and MSA
+        failed with ``k2q_q_indices.shape[1] (256) must be >= total_q * topK``.
+        """
+        _ = self._plan
 
     def select_blocks(self, index_q: torch.Tensor, index_k: torch.Tensor) -> torch.Tensor:
         """Choose each query's key blocks within its own document for one layer.

@@ -6,133 +6,210 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import (
-    get_attn_implementation,
-    get_seqlens_in_batch,
-    get_unpad_data,
+    configure_packing,
+    flatten_packed_sequence_metadata,
+    get_model_attn_implementation,
+    get_packing_capabilities,
     validate_flash_packing_support,
 )
+from nemo_automodel.components.models.common.utils import BackendConfig
 
 # ---------------------------------------------------------------------------
-# get_seqlens_in_batch
-# ---------------------------------------------------------------------------
-
-
-class TestGetSeqlensInBatch:
-    def test_single_sequence(self):
-        mask = torch.tensor([[1, 1, 1, 0, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-    def test_packed_sequences(self):
-        mask = torch.tensor([[1, 1, 2, 2, 2, 0]])
-        result = get_seqlens_in_batch(mask)
-        assert sorted(result.tolist()) == [2, 3]
-
-    def test_no_padding(self):
-        mask = torch.tensor([[1, 1, 1]])
-        result = get_seqlens_in_batch(mask)
-        assert result.tolist() == [3]
-
-
-# ---------------------------------------------------------------------------
-# get_unpad_data  (pure helper used by in-tree custom models)
-# ---------------------------------------------------------------------------
-
-
-class TestGetUnpadData:
-    def test_basic(self):
-        mask = torch.tensor([[1, 1, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert cu_seqlens.tolist() == [0, 2]
-
-    def test_packed(self):
-        mask = torch.tensor([[1, 1, 2, 2, 0]])
-        indices, cu_seqlens, max_seqlen = get_unpad_data(mask)
-        assert max_seqlen == 2
-        assert indices.tolist() == [0, 1, 2, 3]
-
-
-# ---------------------------------------------------------------------------
-# get_attn_implementation
+# model-derived packing and metadata
 # ---------------------------------------------------------------------------
 
 
 class TestGetAttnImplementation:
     def test_from_backend_config(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        assert get_attn_implementation(cfg) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        assert get_model_attn_implementation(model) == "te"
 
     def test_from_attn_implementation(self):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        assert get_attn_implementation(cfg) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
     def test_default_sdpa(self):
-        assert get_attn_implementation(None) == "sdpa"
+        assert get_model_attn_implementation(torch.nn.Module()) == "sdpa"
 
     def test_backend_takes_precedence(self):
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        cfg.get = MagicMock(return_value="flash_attention_2")
-        assert get_attn_implementation(cfg) == "te"
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="te")
+        model.config = SimpleNamespace(_attn_implementation="sdpa")
+        assert get_model_attn_implementation(model) == "te"
 
-    def test_built_model_wins_over_stale_config(self):
-        """A packed run force-switches the model to flash; the config keeps saying sdpa."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+    def test_declared_hf_fa4_dispatch_takes_precedence(self):
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
+        model._uses_hf_attention = True
 
-    def test_backend_config_wins_over_built_model(self):
-        """Custom models keep naming their backend; ``te`` inits through sdpa."""
-        cfg = SimpleNamespace(backend=SimpleNamespace(attn="te"))
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
-        assert get_attn_implementation(cfg, model=model) == "te"
+        assert get_model_attn_implementation(model) == "flash_attention_4"
+
+    def test_declared_hf_dispatch_uses_live_hf_backend(self):
+        model = torch.nn.Module()
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="sdpa")
+        model._uses_hf_attention = True
+
+        assert get_model_attn_implementation(model) == "sdpa"
+
+    def test_native_fa4_consumer_uses_typed_backend(self):
+        model = torch.nn.Module()
+        model._uses_native_fa4 = True
+        model.backend = BackendConfig(attn="fa4")
+        model.config = SimpleNamespace(_attn_implementation="flash_attention_4")
+
+        assert get_model_attn_implementation(model) == "fa4"
 
     def test_reads_through_ddp_wrapper(self):
         """DDP holds the model as ``.module`` and does not proxy attribute access."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "sdpa"
-        inner = SimpleNamespace(config=SimpleNamespace(_attn_implementation="flash_attention_2"))
-        assert get_attn_implementation(cfg, model=SimpleNamespace(module=inner)) == "flash_attention_2"
+        inner = torch.nn.Module()
+        inner.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        wrapper = torch.nn.Module()
+        wrapper.module = inner
+        assert get_model_attn_implementation(wrapper) == "flash_attention_2"
 
     def test_kernels_hub_id_maps_back_to_mainline_flash(self):
         """Transformers records a kernels-hub id when only ``kernels`` provides FA2."""
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "flash_attention_2"
-        model = SimpleNamespace(config=SimpleNamespace(_attn_implementation="kernels-community/flash-attn2"))
-        assert get_attn_implementation(cfg, model=model) == "flash_attention_2"
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation="kernels-community/flash-attn2")
+        assert get_model_attn_implementation(model) == "flash_attention_2"
 
-    @pytest.mark.parametrize(
-        "model",
-        [
-            SimpleNamespace(),
-            SimpleNamespace(config=SimpleNamespace()),
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation=None)),
-            # A dispatch key naming no layout packing knows about must not select one.
-            SimpleNamespace(config=SimpleNamespace(_attn_implementation="some_future_backend")),
-        ],
-    )
-    def test_falls_back_to_config_when_model_names_no_known_backend(self, model):
-        cfg = MagicMock()
-        del cfg.backend
-        cfg.get.return_value = "eager"
-        assert get_attn_implementation(cfg, model=model) == "eager"
+    @pytest.mark.parametrize("implementation", ["magi", "some_future_backend"])
+    def test_preserves_live_dispatch_key(self, implementation):
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_attn_implementation=implementation)
+        assert get_model_attn_implementation(model) == implementation
+
+    def test_requires_built_model(self):
+        with pytest.raises(TypeError, match="built torch.nn.Module"):
+            get_model_attn_implementation(SimpleNamespace())
 
 
 # ---------------------------------------------------------------------------
-# validate_flash_packing_support
+# configure_packing
 # ---------------------------------------------------------------------------
+
+
+class TestConfigurePacking:
+    def test_model_semantics_select_document_ids_and_explicit_metadata(self):
+        model = SimpleNamespace(
+            packed_mask_type="document_ids",
+            requires_packed_sequence_metadata=True,
+        )
+
+        capabilities = get_packing_capabilities("sdpa", model=model)
+
+        assert capabilities.packed_mask_type == "document_ids"
+        assert capabilities.requires_packed_sequence_metadata is True
+
+    def test_fa4_requires_explicit_native_consumer_capability(self):
+        hf_dispatched_model = torch.nn.Module()
+        native_model = torch.nn.Module()
+        native_model._uses_native_fa4 = True
+
+        with pytest.raises(ValueError, match="declaring native FA4 support"):
+            get_packing_capabilities("fa4", model=hf_dispatched_model)
+        native_capabilities = get_packing_capabilities("fa4", model=native_model)
+
+        assert native_capabilities.requires_packed_sequence_metadata is True
+        assert native_capabilities.uses_native_fa4 is True
+
+    def test_batch_major_metadata_flattens_after_microbatch_splitting(self):
+        indices, cu_seqlens = flatten_packed_sequence_metadata(
+            torch.tensor([[0, 1, 2, -1]]),
+            torch.tensor([[0, 1, 3]], dtype=torch.int32),
+            batch_size=1,
+            sequence_length=4,
+        )
+
+        assert indices.tolist() == [0, 1, 2]
+        assert cu_seqlens.tolist() == [0, 1, 3]
+
+    def test_native_fa4_flattens_metadata_once_per_model_forward(self):
+        class NativeFA4Model(torch.nn.Module):
+            _uses_native_fa4 = True
+
+            def forward(self, input_ids: torch.Tensor, **kwargs):
+                """Capture normalized packed metadata.
+
+                Args:
+                    input_ids: Token IDs of shape [batch, sequence].
+                    **kwargs: Model inputs containing packed token indices of
+                        shape [tokens] and cumulative lengths of shape
+                        [documents + 1].
+
+                Returns:
+                    The received keyword-input mapping with tensor layouts
+                    unchanged.
+                """
+                del input_ids
+                return kwargs
+
+        model = NativeFA4Model()
+        configure_packing("fa4", model=model)
+        configure_packing("fa4", model=model)
+        assert len(model._forward_pre_hooks) == 1
+        with pytest.raises(ValueError, match="pre-packed THD"):
+            model(torch.ones(2, 4, dtype=torch.long), qkv_format="thd")
+
+        output = model(
+            torch.ones(2, 4, dtype=torch.long),
+            packed_token_indices=torch.tensor([[0, 1, 2, -1], [0, 1, -1, -1]]),
+            cu_seqlens=torch.tensor([[0, 1, 3], [0, 2, -1]], dtype=torch.int32),
+            max_seqlen=2,
+        )
+
+        assert output["packed_token_indices"].tolist() == [0, 1, 2, 4, 5]
+        assert output["cu_seqlens"].tolist() == [0, 1, 3, 5]
+
+    def test_native_fa4_rejects_incomplete_metadata_at_model_entry(self):
+        class NativeFA4Model(torch.nn.Module):
+            _uses_native_fa4 = True
+
+            def forward(self, **kwargs):
+                """Return the received model inputs unchanged.
+
+                Args:
+                    **kwargs: Optional cu_seqlens of shape [documents + 1] or
+                        [batch, max_documents + 1], supplied without token indices.
+
+                Returns:
+                    The input mapping, unchanged; the entry hook rejects this call.
+                """
+                return kwargs
+
+        model = NativeFA4Model()
+        configure_packing("fa4", model=model)
+
+        with pytest.raises(ValueError, match="must be tensors supplied together"):
+            model(cu_seqlens=torch.tensor([0, 2], dtype=torch.int32))
+
+
+def test_non_metadata_consumer_preserves_legacy_thd_boundaries():
+    class LegacyModel(torch.nn.Module):
+        def forward(self, **kwargs):
+            """Return legacy THD boundaries unchanged.
+
+            Args:
+                **kwargs: ``cu_seqlens`` of shape [documents + 1] and scalar format options.
+
+            Returns:
+                The original boundary tensor of shape [documents + 1].
+            """
+            return kwargs["cu_seqlens"]
+
+    model = LegacyModel()
+    configure_packing("sdpa", model=model)
+    boundaries = torch.tensor([0, 2, 5], dtype=torch.int32)
+    assert model(cu_seqlens=boundaries, qkv_format="thd") is boundaries
 
 
 class TestValidateFlashPackingSupport:
@@ -151,7 +228,8 @@ class TestValidateFlashPackingSupport:
         import transformers.modeling_flash_attention_utils as fa_utils
 
         original_unpad = fa_utils._get_unpad_data
-        validate_flash_packing_support("flash_attention_2")
+        contract = configure_packing("flash_attention_2")
+        assert contract.packed_mask_type == "flash_varlen"
         assert fa_utils._get_unpad_data is original_unpad
 
     def test_raises_when_varlen_kwargs_missing(self, monkeypatch):

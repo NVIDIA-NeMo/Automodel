@@ -39,7 +39,6 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 _FLA_MSG = "GLM-5.3 KDA requires the flash-linear-attention/fla extra for GPU training."
 _SHORT_CONV_OK, _fla_causal_conv1d = safe_import_from("fla.modules.conv", "causal_conv1d", msg=_FLA_MSG)
 _CHUNK_KDA_OK, _chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
-_RECURRENT_KDA_OK, _recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
 _KDA_GATE_OK, _fused_kda_gate = safe_import_from("fla.ops.kda.gate", "fused_kda_gate", msg=_FLA_MSG)
 
 
@@ -141,10 +140,21 @@ class Glm5NextHyperConnection(nn.Module):
         return self._fp32_params.scale
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build Sinkhorn mixing weights and collapse streams for one sublayer."""
+        """Build Sinkhorn mixing weights and collapse streams for one sublayer.
+
+        Args:
+            hidden_streams: Tensor of shape [batch, sequence, hc_mult, hidden],
+                where hc_mult is the number of residual streams.
+
+        Returns:
+            FP32 post weights [batch, sequence, hc_mult], FP32 combination
+            weights [batch, sequence, hc_mult, hc_mult], and collapsed states
+            [batch, sequence, hidden] in the input dtype.
+        """
         hc = self.hc_mult
         flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
-        pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
+        with torch.autocast(device_type=hidden_streams.device.type, enabled=False):
+            pre_w, post_w, comb_w = F.linear(flat, self.fn.float()).split([hc, hc, hc * hc], dim=-1)
         pre, post, comb = self._fp32_params(
             pre_w,
             post_w,
@@ -262,8 +272,17 @@ def _torch_recurrent_kda(
 ) -> torch.Tensor:
     """Differentiable reference KDA for CPU/small tensors.
 
-    All q/k/v/g tensors are ``[batch, sequence, heads, head_dim]`` and beta is
-    ``[batch, sequence, heads]``. Packed boundaries reset the recurrent state.
+    Args:
+        q: Query tensor of shape [batch, sequence, heads, head_dim].
+        k: Key tensor with q's layout.
+        v: Value tensor with q's layout.
+        g: Log-decay tensor with q's layout.
+        beta: Update weights of shape [batch, sequence, heads].
+        cu_seqlens: Optional integer tensor [documents + 1] containing packed
+            boundaries. Each boundary resets the FP32 recurrent state.
+
+    Returns:
+        Tensor of shape [batch, sequence, heads, head_dim] in v's dtype.
     """
     batch, sequence, heads, head_dim = q.shape
     output = torch.zeros_like(v)
@@ -274,10 +293,12 @@ def _torch_recurrent_kda(
             q_t = q[:, token].float() * (head_dim**-0.5)
             k_t, v_t = k[:, token].float(), v[:, token].float()
             state = state * g[:, token].exp().unsqueeze(-1)
-            prediction = torch.einsum("bhd,bhdv->bhv", k_t, state)
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                prediction = torch.einsum("bhd,bhdv->bhv", k_t, state)
             error = (v_t - prediction) * beta[:, token].float().unsqueeze(-1)
-            state = state + torch.einsum("bhd,bhv->bhdv", k_t, error)
-            output[:, token] = torch.einsum("bhd,bhdv->bhv", q_t, state).to(output.dtype)
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                state = state + torch.einsum("bhd,bhv->bhdv", k_t, error)
+                output[:, token] = torch.einsum("bhd,bhdv->bhv", q_t, state).to(output.dtype)
     return output
 
 
@@ -376,14 +397,14 @@ class Glm5NextLinearAttention(nn.Module):
         gate = self._fp32_params(gate, self.head_dim, self.config.linear_lower_bound).contiguous()
         beta = self.b_proj(hidden_states).float().sigmoid().contiguous()
         if _CHUNK_KDA_OK and hidden_states.is_cuda:
-            kernel = _chunk_kda if cp_context is not None or hidden_states.shape[1] > 64 else _recurrent_kda
+            # The chunk kernel runs at every sequence length: FLA's fused_recurrent_kda
+            # implements only the forward pass, so the KDA parameters would get no gradient.
             kernel_options: dict[str, Any] = {
                 "use_qk_l2norm_in_kernel": True,
                 "transpose_state_layout": True,
+                "safe_gate": self.config.linear_lower_bound is not None,
             }
-            if kernel is _chunk_kda:
-                kernel_options["safe_gate"] = self.config.linear_lower_bound is not None
-            output, _ = kernel(
+            output, _ = _chunk_kda(
                 q=q,
                 k=k,
                 v=v,
@@ -510,10 +531,12 @@ class Glm5NextKPoolIndexer(nn.Module):
         complete_pools = pool_keys.shape[0]
 
         queries = self.wq_b(query_resid).view(1, -1, self.n_heads, self.head_dim)
-        scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
+        with torch.autocast(device_type=queries.device.type, enabled=False):
+            scores = torch.einsum("bqhd,pd->bqhp", queries.float(), pool_keys.float())
         scores = F.relu(scores * self.softmax_scale)
         weights = self.weights_proj(query_hidden).float() * (self.n_heads**-0.5)
-        scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
+        with torch.autocast(device_type=queries.device.type, enabled=False):
+            scores = torch.einsum("bqh,bqhp->bqp", weights, scores)
         if complete_pools:
             pool_end = pool_indices[:, -1]
             visible = pool_end.view(1, 1, -1) <= query_positions.view(1, -1, 1)

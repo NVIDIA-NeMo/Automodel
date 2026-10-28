@@ -138,5 +138,6 @@ optimizer:
   eps: 1e-8
 
 ci:
+  cluster_tag: h100
   recipe_owner: ZhiyuLi-Nvidia
   local_batch_size: 1

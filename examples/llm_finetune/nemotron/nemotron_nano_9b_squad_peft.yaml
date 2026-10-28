@@ -109,6 +109,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  cluster_tag: h100
   vllm_deploy: true
   recipe_owner: HuiyingLi
   time: "00:30:00"

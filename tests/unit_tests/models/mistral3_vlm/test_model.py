@@ -112,6 +112,8 @@ def _make_dummy_init_super():
         captured["config"] = config
         # Minimal nn.Module bookkeeping so subsequent attribute access doesn't fail.
         nn.Module.__init__(self)
+        self.model = nn.Module()
+        self.model.vision_tower = nn.Module()
 
     return _init, captured
 
@@ -182,6 +184,8 @@ class TestInitRegistersRotaryHooks:
         # with inv_freq buffers — that's what our hook iterates over.
         def _init_with_rotaries(self, config):
             nn.Module.__init__(self)
+            self.model = nn.Module()
+            self.model.vision_tower = nn.Module()
             self.text_rotary = nn.Module()
             self.text_rotary.register_buffer("inv_freq", torch.zeros(4), persistent=False)
             self.vision_rotary = nn.Module()

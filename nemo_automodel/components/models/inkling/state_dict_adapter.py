@@ -224,6 +224,12 @@ class InklingStateDictAdapter(StateDictAdapter):
             if key.startswith("model.mtp.") or key.startswith("mtp.") or key.endswith("_scale_inv"):
                 continue
 
+            # Transformers 5.18 owns the embedding norm inside its embedding
+            # module; published checkpoints keep the separate raw norm key.
+            if key == "model.language_model.embed_tokens.embed_norm.weight":
+                state_dict["model.language_model.embed_norm.weight"] = value
+                continue
+
             if key.startswith(("model.llm.", "model.audio.", "model.visual.")):
                 native_key = _raw_to_native_key(key)
                 state_dict[native_key] = (

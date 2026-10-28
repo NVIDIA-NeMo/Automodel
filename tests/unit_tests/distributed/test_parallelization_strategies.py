@@ -26,6 +26,7 @@ from torch.distributed.tensor.parallel import ColwiseParallel
 
 from nemo_automodel._diffusers import parallelization as diffusers_parallelization
 from nemo_automodel._diffusers.parallelization import HunyuanModelParallelizer, WanModelParallelizer
+from nemo_automodel.components.distributed import FSDP2Config, MeshContext
 from nemo_automodel.components.distributed import parallelizer as parallelizer_mod
 from nemo_automodel.components.distributed.activation_checkpointing import sdpa_backend_snapshot_context_fn
 
@@ -737,7 +738,7 @@ class TestNemotronHModelParallelizer:
         )
 
         with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
-            strategy._apply(model=nemotron_model, device_mesh=mesh)
+            strategy.parallelize(nemotron_model, MeshContext(device_mesh=mesh, strategy_config=FSDP2Config()))
 
     def test_cp_raises_when_enabled_mtp_layers_are_unavailable(
         self,
@@ -796,7 +797,7 @@ class TestNemotronHModelParallelizer:
         )
 
         with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
-            strategy._apply(model=nemotron_model, device_mesh=mesh)
+            strategy.parallelize(nemotron_model, MeshContext(device_mesh=mesh, strategy_config=FSDP2Config()))
 
     def test_sequence_parallel_not_supported(self, strategy, mock_device_mesh, nemotron_model):
         """Test that sequence parallelism raises assertion error."""
@@ -1070,6 +1071,25 @@ class TestQwen3_5ModelParallelizer:
         assert [call.args[0] for call in layer_calls] == list(model.model.layers)
         assert all(call.kwargs["model_parallelizer"] is strategy for call in layer_calls)
         assert custom_fully_shard.call_args_list[-1].args[0] is model
+
+
+@pytest.mark.parametrize("pp_size, cp_size, mtp_enabled", [(1, 2, True), (2, 1, True), (2, 2, False)])
+def test_qwen35_mtp_allows_supported_topologies(pp_size, cp_size, mtp_enabled, monkeypatch):
+    model = nn.Module()
+    model.supports = SimpleNamespace(mtp_enabled=mtp_enabled, supports_mtp_cp=True, supports_mtp_cp_pp=False)
+    mesh = MagicMock(spec=DeviceMesh)
+    mesh.mesh_dim_names = ("pp", "cp")
+    submeshes = {name: MagicMock() for name in mesh.mesh_dim_names}
+    submeshes["pp"].size.return_value = pp_size
+    submeshes["cp"].size.return_value = cp_size
+    mesh.__getitem__.side_effect = submeshes.__getitem__
+    monkeypatch.setattr(ModelParallelizer, "_apply", lambda self, model, *args, **kwargs: model)
+
+    assert Qwen3_5ModelParallelizer()._apply(model, mesh) is model
+    if cp_size > 1:
+        assert model.cp_mesh is submeshes["cp"]
+    else:
+        assert not hasattr(model, "cp_mesh")
 
 
 class TestModelSidecars:

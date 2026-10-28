@@ -60,6 +60,15 @@ class StateDictAdapter(ABC):
     _supports_low_memory_dcp_load: bool = False
 
     @property
+    def checkpoint_key_aliases(self) -> dict[str, str]:
+        """Current HF names mapped to legacy names accepted during strict checkpoint reads.
+
+        The loader uses an alias only when the current name is absent, then restores the current name
+        before invoking from_hf. Saving always uses the current names.
+        """
+        return {}
+
+    @property
     def supports_low_memory_dcp_load(self) -> bool:
         """Whether DCP can load the checkpoint with zero or small temporary tensors.
 

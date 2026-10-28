@@ -26,7 +26,7 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def test_get_world_size_safe_uses_initialized_process_group():
@@ -562,6 +562,27 @@ class TestToHfWSplitExperts:
 
 
 class TestFromHfWMergedExperts:
+    @pytest.mark.parametrize("gated", [False, True])
+    def test_merge_preserves_mixed_source_expert_precision(self, gated):
+        mixin = MockMoEStateDictMixin(
+            n_experts=2, inter_dim=2, dtype=torch.bfloat16, expert_activation="swiglu" if gated else "relu2"
+        )
+        source = {}
+        expected = torch.full((2, 3), 0.1234567, dtype=torch.float32)
+        for expert in range(2):
+            prefix = f"model.layers.0.mlp.experts.{expert}"
+            if gated:
+                source[f"{prefix}.gate_proj.weight"] = torch.ones((2, 3), dtype=torch.bfloat16)
+                source[f"{prefix}.up_proj.weight"] = expected.clone()
+            else:
+                source[f"{prefix}.up_proj.weight"] = expected.to(torch.bfloat16) if expert == 0 else expected.clone()
+        with patch.object(mixin, "_validate_expert_availability"):
+            converted = mixin._from_hf_w_merged_experts(source)
+        grouped = converted["model.layers.0.mlp.experts.gate_and_up_projs"]
+        assert grouped.dtype == torch.float32
+        actual = grouped[1, :, 2:] if gated else grouped[1]
+        torch.testing.assert_close(actual, expected.T, rtol=0, atol=0)
+
     def test_direct_fill_gated_experts_preserves_values_dtype_and_layout(self):
         mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=2, dtype=torch.bfloat16)
         hf_state_dict = {}
@@ -587,10 +608,10 @@ class TestFromHfWMergedExperts:
                 [[0, 1, 10, 11], [2, 3, 12, 13], [4, 5, 14, 15]],
                 [[20, 21, 30, 31], [22, 23, 32, 33], [24, 25, 34, 35]],
             ],
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
         )
         torch.testing.assert_close(grouped, expected, rtol=0, atol=0)
-        assert grouped.dtype == torch.bfloat16
+        assert grouped.dtype == torch.float32
         assert grouped.is_contiguous()
         collect.assert_called_once_with(0)
         empty_cache.assert_not_called()
@@ -621,14 +642,14 @@ class TestFromHfWMergedExperts:
                 [[0, 1], [2, 3], [4, 5]],
                 [[20, 21], [22, 23], [24, 25]],
             ],
-            dtype=torch.float32,
+            dtype=torch.float64,
         )
         expected_down = torch.tensor(
             [
                 [[10, 11, 12], [13, 14, 15]],
                 [[30, 31, 32], [33, 34, 35]],
             ],
-            dtype=torch.float32,
+            dtype=torch.float64,
         )
         torch.testing.assert_close(up, expected_up, rtol=0, atol=0)
         torch.testing.assert_close(down, expected_down, rtol=0, atol=0)

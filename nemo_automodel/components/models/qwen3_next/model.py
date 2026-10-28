@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -269,6 +270,7 @@ class Qwen3NextModel(nn.Module):
 
 
 class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _uses_native_fa4 = True
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     _keep_in_fp32_modules_strict = ["_fp32_params"]
@@ -351,6 +353,31 @@ class Qwen3NextForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
+        """Run Qwen3Next without unsupported packed FA4 recurrent attention.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence].
+            position_ids: Optional positions of shape [batch, sequence].
+            attention_mask: Padding/document IDs of shape [batch, sequence] or
+                an explicit mask of shape [batch, 1, sequence, sequence].
+            padding_mask: Optional padding mask of shape [batch, sequence].
+            logits_to_keep: Number of trailing logits, or indices of shape [kept_tokens].
+            output_hidden_states: Whether to return the final hidden states.
+            **attn_kwargs: Attention metadata, including cumulative document
+                lengths of shape [documents + 1] and packed indices of shape [tokens].
+
+        Returns:
+            Model output with logits of shape [batch, kept_sequence, vocab] and
+            optional final hidden states of shape [batch, sequence, hidden].
+
+        Raises:
+            ValueError: If packed FA4 is requested, since recurrent layers do not
+                reset state at document boundaries.
+        """
+        if self.backend.attn == "fa4" and (
+            attn_kwargs.get("cu_seqlens") is not None or is_indexed_packed_mask(attention_mask)
+        ):
+            raise ValueError("Qwen3Next does not support packed FA4 recurrent attention. Disable sequence packing.")
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None

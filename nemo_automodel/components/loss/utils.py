@@ -147,7 +147,8 @@ def prepare_lm_weight(
 
     Args:
         loss_fn: Linear-projection loss that owns materialization semantics.
-        model: Model with an output head of global shape [vocab, hidden].
+        model: Model or DDP wrapper whose wrapped module owns the config and
+            output head of global shape [vocab, hidden].
         grad_reduce_group: Group contributing independent token losses.
 
     Returns:
@@ -155,6 +156,9 @@ def prepare_lm_weight(
         and gradient contract. Chunked CE also honors the head's compute dtype;
         share this result across loss calls to retain only one converted copy.
     """
+    # Match setup's head/config lookup without changing the training wrapper.
+    if isinstance(model, nn.parallel.DistributedDataParallel):
+        model = model.module
     if isinstance(loss_fn, ChunkedCrossEntropy):
         return loss_fn.prepare_lm_weight(
             _get_lm_head_module(model),

@@ -18,6 +18,10 @@ from nemo_automodel.components.models.mimo_v2_flash.model import (
     MiMoV2FlashModel,
     MiMoV2ForCausalLM,
 )
+from nemo_automodel.components.models.mimo_v2_flash.processing import (
+    MimoV2ImageProcessor,
+    build_mimo_v2_processor,
+)
 from nemo_automodel.components.models.mimo_v2_flash.state_dict_adapter import MiMoV2FlashStateDictAdapter
 
 __all__ = [
@@ -27,4 +31,6 @@ __all__ = [
     "MiMoV2FlashModel",
     "MiMoV2FlashStateDictAdapter",
     "MiMoV2ForCausalLM",
+    "MimoV2ImageProcessor",
+    "build_mimo_v2_processor",
 ]

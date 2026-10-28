@@ -29,7 +29,7 @@ import functools
 from dataclasses import dataclass
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,9 @@ class FlexQSAMask:
     has_routes: torch.Tensor
     query_length: int
     kv_length: int
+
+
+_FLEX_BLOCK_SIZE = 128
 
 
 @functools.cache
@@ -165,15 +168,73 @@ def build_flex_qsa_mask(
         offset = _membership_flat_offset(b, safe_q, safe_kv, query_length, kv_length)
         return in_range & membership_flat[offset]
 
-    block_mask = create_block_mask(
-        mask_mod,
-        B=batch_size,
-        H=None,
-        Q_LEN=query_length,
-        KV_LEN=kv_length,
-        device=str(device),
-    )
+    block_mask = _block_mask_from_membership(membership, mask_mod)
     return FlexQSAMask(block_mask=block_mask, has_routes=has_routes, query_length=query_length, kv_length=kv_length)
+
+
+def _dense_blocks_to_ordered(dense_blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row block counts and column order, matching ``torch.nn.attention.flex_attention``.
+
+    Args:
+        dense_blocks: Boolean block occupancy ``[B, H, num_q_blocks, num_kv_blocks]``.
+
+    Returns:
+        int32 counts ``[B, H, num_q_blocks]`` and int32 kv-block indices
+        ``[B, H, num_q_blocks, num_kv_blocks]`` with the selected blocks first in
+        ascending order (stable descending argsort of the 0/1 occupancy).
+    """
+    occupancy = dense_blocks.to(torch.int32)
+    num_blocks = occupancy.sum(dim=-1)
+    indices = torch.argsort(occupancy, dim=-1, descending=True, stable=True)
+    return num_blocks.to(torch.int32).contiguous(), indices.to(torch.int32).contiguous()
+
+
+def _block_mask_from_membership(
+    membership: torch.Tensor,
+    mask_mod,
+    block_size: int = _FLEX_BLOCK_SIZE,
+) -> BlockMask:
+    """Build the FlexAttention ``BlockMask`` directly from the dense membership table.
+
+    ``create_block_mask`` would evaluate ``mask_mod`` through vmap at every
+    ``[B, S_q, KV]`` coordinate only to recover the membership table this module
+    already holds, then reduce it to block occupancy. The vmap evaluation is a
+    long chain of small host-side ops (about 8 ms per QSA layer on GB200);
+    reducing the existing table costs a handful of launches and yields the same
+    block structure. ``mask_mod`` is still attached so the kernel can resolve
+    partial blocks element-wise.
+
+    Args:
+        membership: Boolean ``[B, S_q, KV]`` table; ``True`` where a query may
+            attend a K/V row. ``S_q`` and ``KV`` need not be block multiples.
+        mask_mod: Element-wise FlexAttention mask function consistent with
+            ``membership`` inside ``[0, S_q) x [0, KV)`` and ``False`` outside.
+        block_size: Square sparse block size of the BlockMask.
+
+    Returns:
+        A ``BlockMask`` over ``[B, S_q, KV]`` with heads broadcast (``H = 1``),
+        equal to ``create_block_mask(mask_mod, B, None, S_q, KV)``.
+    """
+    batch_size, query_length, kv_length = membership.shape
+    padded_q = -(-query_length // block_size) * block_size
+    padded_kv = -(-kv_length // block_size) * block_size
+    padded = torch.nn.functional.pad(membership, (0, padded_kv - kv_length, 0, padded_q - query_length))
+    tiles = padded.view(batch_size, 1, padded_q // block_size, block_size, padded_kv // block_size, block_size)
+    tile_counts = tiles.permute(0, 1, 2, 4, 3, 5).sum(dim=(-2, -1))
+    full_tile = block_size * block_size
+    full_blocks = tile_counts == full_tile
+    partial_blocks = (tile_counts > 0) & ~full_blocks
+    kv_num_blocks, kv_indices = _dense_blocks_to_ordered(partial_blocks)
+    full_kv_num_blocks, full_kv_indices = _dense_blocks_to_ordered(full_blocks)
+    return BlockMask.from_kv_blocks(
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        BLOCK_SIZE=(block_size, block_size),
+        mask_mod=mask_mod,
+        seq_lengths=(query_length, kv_length),
+    )
 
 
 def flex_sparse_gqa_attention(

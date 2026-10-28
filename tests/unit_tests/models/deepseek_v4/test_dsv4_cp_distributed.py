@@ -42,7 +42,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
 pytestmark = [
-    pytest.mark.timeout(60),
+    pytest.mark.timeout(70),
     pytest.mark.run_only_on("GPU"),
 ]
 

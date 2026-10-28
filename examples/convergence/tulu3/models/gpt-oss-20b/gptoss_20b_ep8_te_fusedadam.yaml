@@ -113,3 +113,6 @@ optimizer:
 moe_metrics:
   enabled: true
   mode: brief
+
+ci:
+  cluster_tag: h100

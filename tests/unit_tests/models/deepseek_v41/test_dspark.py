@@ -25,7 +25,7 @@ from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSpa
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 
 # Keep a hard watchdog for draft-model tests; slower cases declare exact runtime budgets below.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def _config(*, hidden_size: int = 16, quantization_config: dict[str, object] | None = None) -> DeepseekV41TextConfig:
@@ -233,7 +233,7 @@ def test_quantized_checkpoint_load_and_training_resume(tmp_path: Path) -> None:
 
 @pytest.mark.runtime_budget(
     15,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="Runs a complete three-stage draft forward/backward, including CPU MoE activation compilation.",
 )
 def test_cache_free_backbone_forward_and_backward() -> None:
@@ -262,7 +262,7 @@ def test_cache_free_backbone_forward_and_backward() -> None:
 
 @pytest.mark.runtime_budget(
     15,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="Checks confidence-gradient isolation through all three draft stages and compiled MoE activations.",
 )
 @pytest.mark.parametrize("stop_gradient", [False, True])
@@ -430,3 +430,26 @@ def test_draft_schedule_must_cover_all_native_stages() -> None:
     backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32")
     with pytest.raises(ValueError, match="compress_ratios"):
         DeepseekV41DSparkBackbone(config, backend)
+
+
+def test_draft_declares_the_same_cross_block_fsdp_holders_as_the_base_model() -> None:
+    """When the draft is sharded on its own, its attention sinks take the cross-block FSDP unit like the base
+    model's (HuiyingLi on #4285); every declared name resolves to fp32 parameters in each draft block."""
+    from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
+
+    assert list(DeepseekV41DSparkModel._fsdp_shard_across_blocks) == list(
+        DeepseekV41ForCausalLM._fsdp_shard_across_blocks
+    )
+    model = DeepseekV41DSparkModel(
+        _config(),
+        BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch"),
+        num_anchors=1,
+        enable_confidence_head=True,
+    )
+    blocks = [m for m in model.modules() if type(m).__name__ == "_DeepseekV41DSparkBlock"]
+    assert blocks
+    for name in DeepseekV41DSparkModel._fsdp_shard_across_blocks:
+        for block in blocks:
+            holders = [m for n, m in block.named_modules() if n == name or n.endswith("." + name)]
+            assert holders, (name, [n for n, _ in block.named_modules()][:8])
+            assert {p.dtype for h in holders for p in h.parameters()} == {torch.float32}

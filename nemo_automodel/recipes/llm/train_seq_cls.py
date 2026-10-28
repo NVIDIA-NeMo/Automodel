@@ -86,6 +86,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         self._log_experiment_details()
         self._log_library_versions()
 
@@ -125,6 +132,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
             cfg_freeze=freeze_config,
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
@@ -385,14 +393,24 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 out = model(**batch)
                 logits = getattr(out, "logits", out)
                 loss = self.loss_fn(logits, labels.view(-1))
-            total_loss += loss.detach()
+            # Summed, not the batch mean: the last batch of a shard is usually
+            # short, so batch means cannot be averaged with equal weight. In FP32,
+            # so a half-precision loss cannot overflow while the sum grows.
+            total_loss += loss.detach().float() * labels.numel()
 
             # Collect predictions for accuracy
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds)
             all_labels.append(labels.view(-1))
-            count += 1
+            count += labels.numel()
 
+        # Each DP rank validates a disjoint shard; reduce like the accuracy below.
+        if self._get_dp_group_size(include_cp=True) > 1:
+            device = self.dist_env.device
+            total_loss = self._dp_allreduce(
+                torch.as_tensor(total_loss, dtype=torch.float32, device=device), include_cp=True
+            )
+            count = self._dp_allreduce(torch.tensor(count, dtype=torch.float32, device=device), include_cp=True).item()
         total_loss = total_loss if count == 0 else total_loss / count
 
         # Calculate accuracy
@@ -443,6 +461,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
         self.metric_logger_valid.log(log_data)
@@ -476,10 +497,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB) according to step_scheduler frequency
+        # Log to remote services (WandB, Trackio) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)

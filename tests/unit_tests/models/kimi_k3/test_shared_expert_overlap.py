@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-import nemo_automodel.components.models.kimi_k3.model as model_mod
+import nemo_automodel.components.moe.layers as layers_mod
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
 from nemo_automodel.components.models.kimi_k3.model import KimiK3MoE, _build_moe_config
@@ -98,7 +98,7 @@ def _assert_same(a: torch.Tensor, b: torch.Tensor, what: str) -> None:
 
 def test_cpu_path_ignores_overlap_flag(monkeypatch):
     calls = []
-    monkeypatch.setattr(model_mod, "_shared_expert_stream", lambda device: calls.append(device) or None)
+    monkeypatch.setattr(layers_mod, "_shared_expert_stream", lambda device: calls.append(device) or None)
     moe_ref = _build_moe(False, "cpu")
     moe_ovl = _build_moe(True, "cpu")
     moe_ovl.load_state_dict(moe_ref.state_dict())
@@ -114,14 +114,14 @@ def test_cpu_path_ignores_overlap_flag(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="stream overlap needs CUDA")
 def test_gpu_overlap_matches_sequential(monkeypatch):
-    real_stream = model_mod._shared_expert_stream
+    real_stream = layers_mod._shared_expert_stream
     calls = []
 
     def counted(device):
         calls.append(device)
         return real_stream(device)
 
-    monkeypatch.setattr(model_mod, "_shared_expert_stream", counted)
+    monkeypatch.setattr(layers_mod, "_shared_expert_stream", counted)
     moe_ref = _build_moe(False, "cuda")
     moe_ovl = _build_moe(True, "cuda")
     moe_ovl.load_state_dict(moe_ref.state_dict())

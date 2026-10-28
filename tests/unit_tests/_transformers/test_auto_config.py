@@ -22,7 +22,9 @@ import httpx
 import pytest
 import yaml
 from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import RepositoryNotFoundError
 from transformers import AutoConfig
+from transformers.utils.hub import resolve_revision
 
 from nemo_automodel import NeMoAutoConfig
 from nemo_automodel.components.config.loader import ConfigNode
@@ -32,12 +34,26 @@ A, B = "a" * 40, "b" * 40
 REPO = "test/config-race"
 
 
+@pytest.fixture
+def config_hub_without_revision_api(hf_config_hub, monkeypatch):
+    """Keep config-file HTTP working while native revision resolution fails."""
+    respond = httpx.Client.send
+
+    def deny_revision_api(client, request, *args, **kwargs):
+        if request.url.path.startswith("/api/models/"):
+            return httpx.Response(403, request=request)
+        return respond(client, request, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.Client, "send", deny_revision_api)
+    return hf_config_hub
+
+
 def test_default_resolution_refreshes_stale_branch(hf_config_hub):
     root, _, _, requests = hf_config_hub
     config = NeMoAutoConfig.from_pretrained(REPO, cache_dir=root)
     assert config.n_embd == 64
-    assert config._commit_hash == B
-    assert any(request.method == "HEAD" for request in requests)
+    assert not hasattr(config, "_commit_hash")
+    assert any("/api/models/" in request.url.path for request in requests)
 
 
 @pytest.mark.parametrize("kwargs", [{"local_files_only": True}, {"revision": A}])
@@ -45,7 +61,6 @@ def test_explicit_cached_revision_does_not_require_network(hf_config_hub, kwargs
     root, _, _, requests = hf_config_hub
     config = NeMoAutoConfig.from_pretrained(REPO, cache_dir=root, **kwargs)
     assert config.n_embd == 32
-    assert config._commit_hash == A
     assert requests == []
 
 
@@ -53,7 +68,6 @@ def test_force_download_refreshes_cached_file(hf_config_hub):
     root, _, _, requests = hf_config_hub
     config = NeMoAutoConfig.from_pretrained(REPO, cache_dir=root, force_download=True)
     assert config.n_embd == 64
-    assert config._commit_hash == B
     assert any(request.method == "GET" for request in requests)
 
 
@@ -61,7 +75,7 @@ def test_config_dict_and_overrides_use_selected_snapshot(hf_config_hub):
     root, _, _, _ = hf_config_hub
     data, unused = NeMoAutoConfig.get_config_dict(REPO, cache_dir=root, n_layer=3)
     assert data["n_embd"] == 64
-    assert data["_commit_hash"] == B
+    assert "_commit_hash" not in data
     assert unused["n_layer"] == 3
     config, unused = NeMoAutoConfig.from_pretrained(
         REPO, cache_dir=root, n_layer=3, sentinel=7, return_unused_kwargs=True
@@ -93,7 +107,6 @@ def test_explicit_yaml_target_preserves_nested_overrides(hf_config_hub):
     config = cfg.instantiate()
     assert config.n_embd == 64
     assert config.n_layer == 3
-    assert config._commit_hash == B
 
 
 def test_plain_transformers_target_keeps_online_semantics(hf_config_hub):
@@ -107,9 +120,41 @@ def test_plain_transformers_target_keeps_online_semantics(hf_config_hub):
 
 @pytest.mark.parametrize("writer_kind", ["thread", "process"])
 @pytest.mark.parametrize("loader", [AutoConfig, NeMoAutoConfig])
-def test_concurrent_ref_truncation_after_download(hf_config_hub, monkeypatch, loader, writer_kind):
+def test_concurrent_ref_truncation_after_resolution(hf_config_hub, monkeypatch, loader, writer_kind):
     """Hold a real writer inside the ref's truncate/write window during the read."""
     root, _, ref, _ = hf_config_hub
+    context = multiprocessing.get_context("spawn") if writer_kind == "process" else threading
+    resolution_done, ref_empty, release_writer = (context.Event() for _ in range(3))
+
+    def interleaved_resolution(*args, **kwargs):
+        result = resolve_revision(*args, **kwargs)
+        resolution_done.set()
+        assert ref_empty.wait(5)
+        return result
+
+    monkeypatch.setattr("transformers.models.auto.configuration_auto.resolve_revision", interleaved_resolution)
+    writer_class = context.Process if writer_kind == "process" else context.Thread
+    writing = writer_class(target=_truncate_ref, args=(ref, resolution_done, ref_empty, release_writer, B))
+    writing.start()
+    try:
+        config = loader.from_pretrained(REPO, cache_dir=root)
+        assert config.n_embd == 64
+    finally:
+        release_writer.set()
+        writing.join(timeout=10)
+    assert not writing.is_alive()
+    if writer_kind == "process":
+        assert writing.exitcode == 0
+    assert ref.read_text() == B
+
+
+@pytest.mark.parametrize("writer_kind", ["thread", "process"])
+@pytest.mark.parametrize("loader", [AutoConfig, NeMoAutoConfig])
+def test_concurrent_ref_truncation_after_fallback_download(
+    config_hub_without_revision_api, monkeypatch, loader, writer_kind
+):
+    """Issue #3975 stays fixed when the revision API fails but config downloads work."""
+    root, _, ref, _ = config_hub_without_revision_api
     context = multiprocessing.get_context("spawn") if writer_kind == "process" else threading
     download_done, ref_empty, release_writer = (context.Event() for _ in range(3))
 
@@ -126,13 +171,14 @@ def test_concurrent_ref_truncation_after_download(hf_config_hub, monkeypatch, lo
     writing.start()
     try:
         if loader is AutoConfig:
-            # Positive control: the unfixed path reproduces issue #3975.
+            # Positive control: native fallback still reproduces the original failure.
             with pytest.raises(ValueError, match="Unrecognized model"):
                 loader.from_pretrained(REPO, cache_dir=root)
         else:
             config = loader.from_pretrained(REPO, cache_dir=root)
             assert config.n_embd == 64
-            assert config._commit_hash == B
+            assert not hasattr(config, "_commit_hash")
+        assert ref.read_text() == ""
     finally:
         release_writer.set()
         writing.join(timeout=10)
@@ -142,23 +188,64 @@ def test_concurrent_ref_truncation_after_download(hf_config_hub, monkeypatch, lo
     assert ref.read_text() == B
 
 
-def test_two_threaded_loads_keep_their_downloaded_snapshot(hf_config_hub, monkeypatch):
-    root, _, ref, _ = hf_config_hub
-    downloaded = threading.Barrier(2)
-    ref_changed = threading.Barrier(2)
+@pytest.mark.parametrize("changed_ref", ["", A])
+def test_config_dict_fallback_keeps_downloaded_snapshot(config_hub_without_revision_api, monkeypatch, changed_ref):
+    root, _, ref, _ = config_hub_without_revision_api
 
     def interleaved_download(*args, **kwargs):
         result = hf_hub_download(*args, **kwargs)
-        if downloaded.wait(timeout=5) == 0:
+        ref.write_text(changed_ref)
+        return result
+
+    monkeypatch.setattr("transformers.utils.hub.hf_hub_download", interleaved_download)
+    monkeypatch.setattr("nemo_automodel._transformers.auto_config.hf_hub_download", interleaved_download)
+    data, unused = NeMoAutoConfig.get_config_dict(REPO, cache_dir=root, n_layer=3)
+    assert data["n_embd"] == 64
+    assert "_commit_hash" not in data
+    assert unused["n_layer"] == 3
+    assert ref.read_text() == changed_ref
+
+
+def test_fallback_preserves_loading_options(config_hub_without_revision_api):
+    root, cache, _, requests = config_hub_without_revision_api
+    nested = cache / "snapshots" / B / "nested"
+    nested.mkdir()
+    (nested / "config.json").write_text(json.dumps({"model_type": "gpt2", "n_embd": 96}))
+    config, unused = NeMoAutoConfig.from_pretrained(
+        REPO,
+        cache_dir=root,
+        subfolder="nested",
+        token="test-token",
+        force_download=True,
+        n_layer=3,
+        sentinel=7,
+        return_unused_kwargs=True,
+    )
+    assert config.n_embd == 96
+    assert config.n_layer == 3
+    assert unused["sentinel"] == 7
+    assert not hasattr(config, "_commit_hash")
+    assert any(request.method == "GET" for request in requests)
+    assert all(request.headers["authorization"] == "Bearer test-token" for request in requests)
+
+
+def test_two_threaded_loads_keep_their_resolved_snapshot(hf_config_hub, monkeypatch):
+    root, _, ref, _ = hf_config_hub
+    resolved = threading.Barrier(2)
+    ref_changed = threading.Barrier(2)
+
+    def interleaved_resolution(*args, **kwargs):
+        result = resolve_revision(*args, **kwargs)
+        if resolved.wait(timeout=5) == 0:
             ref.write_text(A)
         ref_changed.wait(timeout=5)
         return result
 
-    monkeypatch.setattr("nemo_automodel._transformers.auto_config.hf_hub_download", interleaved_download)
+    monkeypatch.setattr("transformers.models.auto.configuration_auto.resolve_revision", interleaved_resolution)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(NeMoAutoConfig.from_pretrained, REPO, cache_dir=root) for _ in range(2)]
         configs = [future.result(timeout=5) for future in futures]
-    assert [(config.n_embd, config._commit_hash) for config in configs] == [(64, B), (64, B)]
+    assert [config.n_embd for config in configs] == [64, 64]
     assert ref.read_text() == A
 
 
@@ -180,7 +267,6 @@ def test_cold_cache_downloads_current_config(hf_config_hub):
     (cache / "snapshots" / B / "config.json").unlink()
     config = NeMoAutoConfig.from_pretrained(REPO, cache_dir=root)
     assert config.n_embd == 64
-    assert config._commit_hash == B
     assert any(request.method == "GET" for request in requests)
 
 
@@ -191,8 +277,6 @@ def test_authentication_failure_is_propagated(hf_config_hub, monkeypatch):
         return httpx.Response(401, request=request, headers={"X-Error-Code": "RepoNotFound"})
 
     monkeypatch.setattr(httpx.Client, "send", denied)
-    from huggingface_hub.errors import RepositoryNotFoundError
-
     with pytest.raises(RepositoryNotFoundError):
         NeMoAutoConfig.from_pretrained(REPO, cache_dir=root / "empty")
 
@@ -204,14 +288,15 @@ def test_subfolder_and_token_are_preserved(hf_config_hub):
     (nested / "config.json").write_text(json.dumps({"model_type": "gpt2", "n_embd": 96}))
     config = NeMoAutoConfig.from_pretrained(REPO, cache_dir=root, subfolder="nested", token="test-token")
     assert config.n_embd == 96
-    assert config._commit_hash == B
-    assert requests[0].url.path.endswith("/nested/config.json")
     assert requests[0].headers["authorization"] == "Bearer test-token"
 
 
+@pytest.mark.parametrize("hub_fixture", ["hf_config_hub", "config_hub_without_revision_api"])
 @pytest.mark.parametrize("code_revision, expected", [(None, "b"), (A, "a")])
-def test_remote_code_follows_resolved_commit_or_explicit_override(hf_config_hub, monkeypatch, code_revision, expected):
-    root, cache, _, _ = hf_config_hub
+def test_remote_code_follows_resolved_commit_or_explicit_override(
+    request, hub_fixture, monkeypatch, code_revision, expected
+):
+    root, cache, _, _ = request.getfixturevalue(hub_fixture)
     monkeypatch.setattr("transformers.dynamic_module_utils.HF_MODULES_CACHE", str(root / "modules"))
     for revision in (A, B):
         snapshot = cache / "snapshots" / revision
@@ -232,5 +317,4 @@ def test_remote_code_follows_resolved_commit_or_explicit_override(hf_config_hub,
         )
     config = NeMoAutoConfig.from_pretrained(REPO, cache_dir=root, trust_remote_code=True, code_revision=code_revision)
     assert config.hidden_size == 64
-    assert config._commit_hash == B
     assert config.implementation_revision == expected

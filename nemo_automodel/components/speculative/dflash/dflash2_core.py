@@ -34,8 +34,27 @@ inside the candidate list. Positions whose true token missed the candidate list
 carry no selector signal -- there is nothing there to select -- and are excluded
 from the selector term; ``candidate_recall`` reports how often that happens.
 
-Both terms use the same block-position decay weights, so a position's importance
-is identical in the two objectives.
+Both terms share ``base_loss``'s ``DFlashDecayLoss`` position-weighting scheme
+(fixed decay for ``loss_type="dflash"``, detached D-PACE confidence for the
+``"dpace*"`` variants, arXiv:2605.18810) via
+:meth:`~nemo_automodel.components.loss.dllm_loss.DFlashDecayLoss.weighted_mean`,
+so a position's importance is identical in the two objectives and switching
+``loss_type`` rescales both consistently. The selector term's weight *schedule*
+is always built from the full ``pred_mask`` -- the same mask ``base_loss`` uses
+-- and only narrowed to the positions with selector signal (``has_target``)
+afterward, via ``weighted_mean``'s ``value_mask``. D-PACE's weight is a
+sequential cumprod/cumsum across the block, so building it from a narrower mask
+directly (e.g. ``pred_mask * has_target``) would corrupt neighboring positions'
+weights, not just the excluded one's. ``loss_type="variable_prefix"`` is
+rejected: the selector teacher-forces the predecessor from the fixed-anchor
+block layout, which a variable visible prefix breaks.
+
+Both terms also share the base objective's ``total_blocks`` fix: D-PACE's
+"mean" denominator is ``batch_size * num_anchors`` (the trainer's *configured*
+block-sampling budget), not the batch's achieved sampled-block count, which
+varies with each micro-batch's own content and therefore differs across DP
+ranks -- see
+:meth:`~nemo_automodel.components.loss.dllm_loss.DFlashDecayLoss._mean_denominator`.
 """
 
 from __future__ import annotations
@@ -66,15 +85,20 @@ class DFlash2StepMetrics:
 
     Attributes:
         loss: Scalar tensor containing the differentiable training loss.
-        loss_weight: Scalar tensor containing the effective loss denominator.
+        loss_weight: Scalar tensor containing the effective denominator of
+            ``base_loss``.
         accuracy: Scalar tensor containing selector-path greedy token accuracy.
         valid_tokens: Scalar tensor containing the supervised-token count.
         correct_tokens: Scalar tensor containing selector-path correct-token count.
         accept_len: Scalar tensor containing selector-path mean acceptance length.
         accept_len_sum: Scalar tensor containing selector-path additive acceptance length.
         valid_blocks: Scalar tensor containing the number of evaluated draft blocks.
-        base_loss: Scalar tensor containing the backbone block-CE term.
-        selector_loss: Scalar tensor containing the candidate-selection CE term.
+        base_loss: Scalar tensor containing the backbone block-CE term,
+            normalized by ``loss_weight``.
+        selector_loss: Scalar tensor containing the candidate-selection CE term,
+            normalized by ``selector_loss_denominator``.
+        selector_loss_denominator: Scalar tensor containing the effective
+            denominator of ``selector_loss``.
         base_accuracy: Scalar tensor containing backbone top-1 token accuracy.
         base_correct_tokens: Scalar tensor containing backbone correct-token count.
         base_accept_len: Scalar tensor containing backbone mean acceptance length.
@@ -94,6 +118,7 @@ class DFlash2StepMetrics:
     valid_blocks: torch.Tensor
     base_loss: torch.Tensor
     selector_loss: torch.Tensor
+    selector_loss_denominator: torch.Tensor
     base_accuracy: torch.Tensor
     base_correct_tokens: torch.Tensor
     base_accept_len: torch.Tensor
@@ -116,7 +141,19 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         loss_decay_gamma: float | None = None,
         selector_loss_weight: float = 1.0,
         sliding_window: int | None = None,
+        # Keyword-only, and appended after the pre-existing params above: an
+        # old positional caller of this constructor must not have a later
+        # argument silently rebound to one of these when they were inserted.
+        *,
+        loss_type: str = "dflash",
+        dpace_alpha: float = 0.5,
     ):
+        if loss_type == "variable_prefix":
+            raise ValueError(
+                "DFlash 2 does not support loss_type='variable_prefix': the candidate selector "
+                "teacher-forces the predecessor from the fixed-anchor block layout, which a variable "
+                "visible prefix breaks."
+            )
         super().__init__(
             draft_model=draft_model,
             target_lm_head=target_lm_head,
@@ -126,6 +163,8 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             attention_backend=attention_backend,
             num_anchors=num_anchors,
             loss_decay_gamma=loss_decay_gamma,
+            loss_type=loss_type,
+            dpace_alpha=dpace_alpha,
             sliding_window=sliding_window,
         )
         if getattr(draft_model, "candidate_selector", None) is None:
@@ -136,22 +175,6 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         if selector_loss_weight < 0:
             raise ValueError(f"selector_loss_weight must be >= 0, got {selector_loss_weight}.")
         self.selector_loss_weight = float(selector_loss_weight)
-
-    def _depth_weights(self, mask: torch.Tensor) -> torch.Tensor:
-        """Block-position decay weights for the ``block_size - 1`` predicted positions.
-
-        Args:
-            mask: Tensor of shape [batch, blocks, depth]; the supervised-position
-                mask the weights are multiplied into.
-
-        Returns:
-            Tensor of shape [batch, blocks, depth] equal to ``mask`` scaled by
-            ``exp(-k / loss_decay_gamma)``, or ``mask`` itself when decay is off.
-        """
-        if self.loss_decay_gamma is None:
-            return mask
-        depth = torch.exp(-torch.arange(mask.shape[-1], device=mask.device, dtype=mask.dtype) / self.loss_decay_gamma)
-        return mask * depth
 
     def _selector_scores(
         self,
@@ -198,6 +221,7 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         position_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
+        label_ids: torch.Tensor | None = None,
     ) -> DFlash2StepMetrics:
         """Parallel block-wise training forward with the DFlash 2 path selector.
 
@@ -217,11 +241,18 @@ class DFlash2TrainerModule(DFlashTrainerModule):
                 lengths, or ``None`` when unpacked.
             doc_remaining: Long tensor of shape [batch, sequence]; real tokens left
                 in each position's document, or ``None`` when unpacked.
+            label_ids: Optional long tensor with the shape, dtype and device of
+                ``input_ids``; ``label_ids[:, t]`` is the unshifted supervision
+                token for position ``t``. Every entry must be a valid vocabulary
+                id, since in-block labels are embedded as selector predecessors;
+                exclude positions with ``loss_mask``, not ``-100``. ``input_ids``
+                remains the context/anchor stream; ``None`` supervises ``input_ids``.
 
         Returns:
             DFlash2StepMetrics for this micro-batch.
         """
         bsz, seq_len = input_ids.shape
+        supervision_ids = self._resolve_supervision_ids(input_ids, label_ids)
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, _ = (
             self._prepare_block_inputs(
@@ -241,8 +272,13 @@ class DFlash2TrainerModule(DFlashTrainerModule):
 
         n, bs = anchor_positions.size(1), self.block_size
         _, target_ids, block_mask = self._build_block_targets(
-            input_ids, loss_mask, anchor_positions, block_keep_mask, seq_len, doc_remaining=doc_remaining
+            supervision_ids, loss_mask, anchor_positions, block_keep_mask, seq_len, doc_remaining=doc_remaining
         )
+        if label_ids is not None:
+            # Position 1's selector predecessor is the visible clean anchor,
+            # which comes from input_ids even when later labels are distilled.
+            target_ids = target_ids.clone()
+            target_ids[..., 0] = torch.gather(input_ids, 1, anchor_positions.clamp(min=0))
 
         # Drop block position 0 (the clean anchor token, never a target); the
         # remaining bs-1 positions are what both objectives supervise.
@@ -252,22 +288,26 @@ class DFlash2TrainerModule(DFlashTrainerModule):
         pred_mask = block_mask[:, :, 1:]
 
         loss_fn = self.loss_fn
-        assert loss_fn is not None, "loss_fn is always constructed for loss_type='dflash'"
-        loss_out = loss_fn(
-            pred_logits.reshape(bsz, n * (bs - 1), -1),
-            pred_targets.reshape(bsz, -1),
-            pred_mask.reshape(bsz, -1),
-            num_tokens=None,
-            block_size=bs,
+        assert loss_fn is not None, "loss_fn is always constructed (loss_type='variable_prefix' is rejected)"
+        # forward_with_token_nll's own per-token NLL is reused below for the
+        # selector's D-PACE weighting, instead of a second full-vocabulary CE
+        # pass over pred_logits.
+        loss_details = loss_fn.forward_with_token_nll(
+            pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors
         )
+        base_token_nll = loss_details.token_nll
+        loss_out = loss_details.output
 
         scores, candidate_ids, target_index, has_target = self._selector_scores(pred_hidden, pred_logits, target_ids)
         selector_mask = pred_mask * has_target.to(pred_mask.dtype)
-        selector_weights = self._depth_weights(selector_mask)
-        token_nll = F.cross_entropy(
+        selector_nll = F.cross_entropy(
             scores.reshape(-1, scores.shape[-1]).float(), target_index.reshape(-1), reduction="none"
         ).view_as(selector_mask)
-        selector_loss = (token_nll * selector_weights).sum() / (selector_weights.sum() + 1e-6)
+        # See the module docstring for why the schedule mask stays pred_mask and
+        # has_target only narrows via value_mask.
+        selector_loss, selector_loss_denominator = loss_fn.weighted_mean(
+            selector_nll, base_token_nll, pred_mask, value_mask=selector_mask, total_blocks=self.num_anchors
+        )
         loss = loss_out.total_loss + self.selector_loss_weight * selector_loss
 
         with torch.no_grad():
@@ -276,22 +316,23 @@ class DFlash2TrainerModule(DFlashTrainerModule):
             selected_ids = candidate_ids.gather(-1, scores.argmax(dim=-1, keepdim=True)).squeeze(-1)
             correct_tokens = ((selected_ids == pred_targets) & eval_mask).sum()
             accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(selected_ids, pred_targets, eval_mask)
-            base_ids = pred_logits.argmax(dim=-1)
+            base_ids = loss_details.pred_ids
             base_correct_tokens = ((base_ids == pred_targets) & eval_mask).sum()
             base_accept_len, base_accept_len_sum, _ = compute_acceptance_stats(base_ids, pred_targets, eval_mask)
             denominator = valid_tokens.clamp_min(1)
 
         return DFlash2StepMetrics(
             loss=loss,
-            loss_weight=self._depth_weights(pred_mask).sum().detach(),
+            loss_weight=loss_details.denominator,
             accuracy=(correct_tokens / denominator).detach(),
             valid_tokens=valid_tokens.detach(),
             correct_tokens=correct_tokens.detach(),
             accept_len=accept_len.detach(),
             accept_len_sum=accept_len_sum.detach(),
             valid_blocks=valid_blocks.detach(),
-            base_loss=loss_out.total_loss.detach(),
-            selector_loss=selector_loss.detach(),
+            base_loss=loss_out.total_loss,
+            selector_loss=selector_loss,
+            selector_loss_denominator=selector_loss_denominator,
             base_accuracy=(base_correct_tokens / denominator).detach(),
             base_correct_tokens=base_correct_tokens.detach(),
             base_accept_len=base_accept_len.detach(),

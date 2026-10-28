@@ -43,12 +43,22 @@ SFT vs PEFT is determined by whether `peft` appears in the recipe filename.
 
 ## Recipe CI Configuration
 
-Each recipe YAML under `examples/` has a `ci:` section. It is required for
-newly added CI recipes, which must declare `recipe_owner`, `time`, and `nodes`
-(enforced by `validate_new_recipe_ci.py`); pre-existing recipes are grandfathered:
+Every recipe YAML under `examples/` must declare a nonempty `ci.cluster_tag`
+or boolean `ci.deprecated: true` (enforced by `tools/lint_example_yamls.py`).
+Deprecated configurations remain available as examples, but generate no training,
+checkpoint, deployment, or evaluation jobs in any CI scope. This applies even
+when a recipe also sets `allow_failure`, a hardware tag, or optional variants.
+An entirely excluded nonempty scope gets a lightweight completion job.
+Utility configs excluded by the linter are exempt. The tag selects GPU hardware,
+such as `h100`, `gb200`, or `gb10`, rather than a specific cluster.
+
+Newly added CI recipes must also declare `recipe_owner`, `time`, and `nodes`
+(enforced by `validate_new_recipe_ci.py`); pre-existing recipes are grandfathered
+for these three fields:
 
 ```yaml
 ci:
+  cluster_tag: h100               # Required unless ci.deprecated is true. GPU hardware selector
   recipe_owner: username          # Required. Maintainer's handle
   time: "00:25:00"                # Required. SLURM wall time (HH:MM:SS)
   nodes: 2                        # Required for new recipes. SLURM node count (omitted -> defaults to 1)
@@ -319,7 +329,7 @@ separate fresh baseline.
 ### Add a New Recipe to Nightly
 
 1. Create recipe YAML under `examples/{test_folder}/{model_family}/`
-2. Add `ci:` section with `recipe_owner`, `time`, and `nodes` (use `nodes: 1` for single-node)
+2. Add `ci:` section with `cluster_tag`, `recipe_owner`, `time`, and `nodes` (use `nodes: 1` for single-node)
 3. Add the path to `configs/{test_folder}/nightly_recipes.yml`
 
 ### Enable Checkpoint Robustness

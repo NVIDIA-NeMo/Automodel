@@ -48,11 +48,17 @@ class MiniMaxM3MTPBlock(nn.Module):
     def __init__(self, config: Any, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
         gemma = getattr(config, "use_gemma_norm", False)
-        self.enorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
-        self.hnorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
+        self.enorm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
+        self.hnorm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
         self.eh_proj = initialize_linear_module(backend.linear, 2 * config.hidden_size, config.hidden_size, bias=False)
         self.transformer_layer = Block(config.num_hidden_layers - 1, config, moe_config, backend)
-        self.final_layernorm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
+        self.final_layernorm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
 
     def forward(
         self,

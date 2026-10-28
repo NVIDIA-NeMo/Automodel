@@ -16,32 +16,78 @@
 # throughput benchmark at 2k-token rows on 64 nodes x 4 GB200 (256 GPUs):
 # EP32 x PP8, DP32, GBS 4096.
 #
+# This file carries the kernel and schedule stack that measured best for this
+# shape. The model.config knobs are all off by default in the model; the
+# backend and schedule keys replace this file's previous explicit settings:
+#
+#   model.config   kda_conv_backend: cuda  -- FLA short convolutions on the
+#                  causal-conv1d CUDA kernels (#3932; FLA falls back to its
+#                  Triton kernels when causal-conv1d is not importable).
+#                  kda_chunk_impl: fused  -- fused CUDA forward + Triton
+#                  backward for the KDA chunk kernel (#3954); the CUDA
+#                  extension is JIT-built on first use (needs nvcc, as in the
+#                  NeMo container). The FLA-only knobs kda_disable_recompute
+#                  and kda_transpose_state_layout have no effect under
+#                  "fused" and are therefore not set here.
+#                  situ_backend: triton_fast_math  -- Triton SiTU activation
+#                  kernels with SFU fast-math variants (#3894, #3985); <= 1
+#                  bf16 ulp from the exact (libdevice) Triton chain.
+#                  attn_res_triton: true  -- fused Triton attention-residual
+#                  mix (#3894) instead of torch.cat + fp32 upcast.
+#   model.backend  attn: te  -- TE attention (cuDNN fused attention on the
+#                  MLA layers) instead of this file's previous eager.
+#                  experts: torch_mm  -- one torch._grouped_mm per expert
+#                  call instead of TE GroupedLinear.
+#                  compile_router_weight: true  -- fp32 router-weight compile
+#                  island (#3894), next to compile_situ and compile_norm.
+#   distributed    pp_microbatch_size: 4  -- 32 microbatches of 8192 tokens
+#                  (fewer, larger GEMMs and launches; 1F1B bubble 17.9%).
+#   optimizer      fused: true  -- fused-kernel AdamW
+#                  (torch.optim.AdamW(fused=True)).
+#   prewarm        pipeline_stage_compile: true  -- all PP stages compile
+#                  concurrently before the first step (#3893); startup only.
+#   loss_fn        impl: torch_compile  -- cut_cross_entropy's compiled
+#                  projection + cross-entropy (#4048) instead of the default cce
+#                  kernel. The loss runs only on the last pipeline stage, where
+#                  the cce kernel (fp32 hidden-gradient accumulation since #4048)
+#                  sits on the 1F1B critical path; the compiled path rounds the
+#                  supervised tokens' logits to bf16 before the fp32 cross-entropy
+#                  (as MaskedCrossEntropy does) and reached the same loss within
+#                  the A/A band. Worth +9.7% at 64 nodes (measured block below)
+#                  and +18% on the 8-node 16-layer twin, because the loss runs on
+#                  the pipeline's critical path.
+#
 # Measured with this exact configuration (64 nodes, 12 iterations, recipe
-# summary = mean over the 9 iterations after 3 warm-up iterations; same Slurm
-# job as this file without gc_every_steps, which measured 578.7 tok/s/GPU at
-# 56.6 s/iteration with a 1.7% iteration-time spread):
-# 627.3 tok/s/GPU at 52.2 s/iteration (0.1% spread), Average MFU 15.8% on the
-# recipe's config-derived FLOPs basis against the 2.5 PF GB200 BF16 dense peak
-# (the run printed 17.5% with the earlier 2.25 PF setting; 15.8% is that figure
-# rescaled to the corrected peak; 15.7% on tok/s/GPU * 6 * 104e9 / 2.5e15).
-# Peak memory 150.2 GiB per GPU (34 GiB headroom on 184 GiB HBM). Run
-# the file through nemo_automodel/recipes/llm/benchmark.py --config <this file>
-# for the recipe's own per-iteration MFU and Average MFU summary.
+# summary over the 9 iterations after 3 warm-up iterations; one Slurm job on
+# main @2d365eda1 plus the HybridEP replay fix of the companion PR, running
+# this file's previous settings first as the baseline, this file next, and an
+# identical repeat of this file last):
+# 876.0 tok/s/GPU at 37.41 s/iteration (identical repeat 876.3 at 37.40 s),
+# Average MFU 22.0% on the recipe's config-derived FLOPs basis against the
+# 2.5 PF GB200 BF16 dense peak (21.9% on tok/s/GPU * 6 * 104e9 / 2.5e15); peak
+# torch memory 153.3 GiB on rank 0; final loss 12.4536 vs 12.4535 for the
+# baseline row. This file's previous settings (same stack with the default cce
+# loss implementation) measured 798.7 tok/s/GPU at 41.03 s/iteration (20.1%) in
+# the same job, so this file is +9.7% over them. The settings this file
+# replaced earlier (attn: eager, experts: te, pp_microbatch_size: 2, foreach
+# AdamW, cce loss) measured 614.4 tok/s/GPU at 53.34 s/iteration (15.4%) in an
+# earlier allocation on the same main commit; see this file's git history.
+#
+# Startup caches (optional; steady state is unaffected): NEMO_HYBRIDEP_JIT_CACHE
+# keeps the HybridEP nvcc-JIT kernels across jobs (docs/guides/configuration.mdx)
+# and NEMO_KDA_FUSED_BUILD_DIR does the same for the fused KDA extension
+# (default ~/.cache/nemo_automodel/kda_fused).
+#
+# This shape REQUIRES distributed.pipeline.pp_recv_buffer_pool: without it,
+# torch pre-allocates recv buffers for every microbatch x both directions
+# (~52 GiB on middle stages at this shape) and the run OOMs during step 1.
+# The ring pool sizes buffers to the 1F1B in-flight depth instead.
 #
 # Why 2k rows beat the 1k config (kimi_k3_gb200.yaml: 392.4 tok/s/GPU, 9.8%
 # on the 2026-09-04 tree, when this file measured 538.8 = 13.5%) by 37% / 3.7pp
 # on the 2.5 PF basis: at this scale the workload is launch-bound, so doubling
 # tokens per row halves the per-token kernel-launch tax, and K3's KDA linear
-# attention does not penalize longer rows. The PP bubble at this point is 9.9%
-# (64 microbatches).
-#
-# This shape REQUIRES distributed.pipeline.pp_recv_buffer_pool: without it,
-# torch pre-allocates recv buffers for all 64 microbatches x both directions
-# (~52 GiB on middle stages at 2k) and the run OOMs during step 1. The ring
-# pool sizes buffers to the 1F1B in-flight depth instead, saving ~45 GiB.
-#
-# compile_norm is on: the fp32 RMSNorm chain is the remaining per-token launch
-# tax at this scale (see kimi_k3_gb200.yaml); the figures above include it.
+# attention does not penalize longer rows.
 #
 # Other benchmark regime notes match examples/llm_benchmark/kimi/kimi_k3_gb200.yaml.
 #
@@ -82,6 +128,10 @@ model:
     _target_: nemo_automodel.components.models.kimi_k3.config.KimiK3TextConfig
     architectures: [KimiK3ForCausalLM]
     dtype: bfloat16
+    kda_conv_backend: cuda   # FLA short convolutions on causal-conv1d CUDA kernels (#3932)
+    kda_chunk_impl: fused   # fused CUDA forward + Triton backward for chunk_kda (#3954); FLA remains the default
+    situ_backend: triton_fast_math   # torch | triton | triton_fast_math (#3894, #3985)
+    attn_res_triton: true   # fused Triton attention-residual mix (#3894)
   torch_dtype: bfloat16
   trust_remote_code: false
   kda_mode: chunk
@@ -89,10 +139,10 @@ model:
   use_sdpa_patching: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: eager
+    attn: te   # TE attention: cuDNN fused attention on the MLA layers
     linear: torch
     rms_norm: torch_fp32
-    experts: te
+    experts: torch_mm   # torch._grouped_mm: one kernel per grouped GEMM
     dispatcher: hybridep
     dispatcher_num_sms: 32
     rope_fusion: false
@@ -100,6 +150,7 @@ model:
     fake_gate_noise: 0.0
     compile_situ: true
     compile_norm: true
+    compile_router_weight: true   # fp32 router-weight compile island (#3894)
     benchmark_static_routing: true   # requires fake_balanced_gate, noise 0.0
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -118,7 +169,7 @@ distributed:
   enable_fsdp2_prefetch: true
   pipeline:
     pp_schedule: 1f1b
-    pp_microbatch_size: 2
+    pp_microbatch_size: 4   # 32 microbatches of 8192 tokens — see header
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
@@ -129,6 +180,7 @@ distributed:
 
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile   # cut_cross_entropy's compiled projection + CE (#4048); the default cce kernel sits on the last pipeline stage's critical path -- see header
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
@@ -144,12 +196,14 @@ dataloader:
 
 optimizer:
   _target_: torch.optim.AdamW
+  fused: true
   lr: 1.0e-5
   weight_decay: 0.0
   betas: [0.9, 0.95]
   eps: 1.0e-8
 
 prewarm:
+  pipeline_stage_compile: true   # all PP stages compile concurrently before the loop (#3893); startup only
   comm_groups: true
   fla_gdn_autotune: true
   cublas_backward: true

@@ -31,6 +31,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
@@ -679,7 +680,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
             if isinstance(layer.mlp, MoE):
                 layer.mlp.gate.e_score_correction_bias = torch.zeros(

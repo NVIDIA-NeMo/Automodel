@@ -93,6 +93,27 @@ def test_print_trainable_parameters_custom_name(dummy_model, caplog):
     assert "Model summary:" not in caplog.text
 
 
+@pytest.mark.parametrize("packed_dtype", [torch.int8, torch.uint8])
+def test_model_param_stats_skips_packed_weight_norm(packed_dtype, monkeypatch):
+    """Packed weights still count, but their storage bytes are not a weight norm."""
+    model = nn.Module()
+    model.register_parameter("adapter", nn.Parameter(torch.tensor([3.0, 4.0])))
+    packed = nn.Parameter(torch.ones(8, dtype=packed_dtype), requires_grad=False)
+    model.register_parameter("packed", packed)
+    norm_dtypes = []
+    original_norm = torch.Tensor.norm
+
+    def record_norm(tensor, *args, **kwargs):
+        norm_dtypes.append(tensor.dtype)
+        return original_norm(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "norm", record_norm)
+    total, trainable, local_sq_norm = model_utils._get_model_param_stats(model)
+
+    assert norm_dtypes == [torch.float32]
+    assert (total, trainable, local_sq_norm) == (10, 2, 25.0)
+
+
 def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypatch):
     """
     Helper must stay silent for non-zero ranks.

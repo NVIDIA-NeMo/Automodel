@@ -66,6 +66,11 @@ def main() -> None:
     if not callable(getattr(flash_mla, "flash_mla_sparse_fwd", None)):
         raise RuntimeError("FlashMLA does not provide the required flash_mla_sparse_fwd kernel")
 
+    # MoK recipes import both modules; loading them also checks the compiled
+    # mok._C extension against the final image's PyTorch/CUDA libraries.
+    importlib.import_module("mok.functional")
+    importlib.import_module("mok.ops")
+
 
 if __name__ == "__main__":
     main()

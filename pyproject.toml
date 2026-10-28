@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools >= 80.10.2"]
+requires = ["setuptools >= 83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -37,7 +37,7 @@ maintainers = [
     { name = "Huiying Li", email = "huiyingl@nvidia.com" },
     { name = "NVIDIA", email = "nemo-toolkit@nvidia.com" },
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     # How mature is this project? Common values are
     #  1 - Planning
@@ -64,7 +64,6 @@ classifiers = [
     'License :: OSI Approved :: Apache Software License',
     # Supported python versions
     'Programming Language :: Python :: 3',
-    'Programming Language :: Python :: 3.10',
     'Programming Language :: Python :: 3.11',
     'Programming Language :: Python :: 3.12',
     # Additional Setting
@@ -79,11 +78,16 @@ dependencies = [
     "ninja",
     "pyyaml",
     "tiktoken",
-    "torch>=2.6.0",
+    "torch>=2.8.0",
     "torchdata",
-    "transformers==5.15.1",
-    "torchao",
-    "flashoptim>=0.1.3",
+    # Before upgrading, recheck HF #49373 and nemo_automodel/components/models/pixtral/compat.py.
+    # Run tests/ci_tests/scripts/test_pixtral_compat.sh cpu <version> and gpu <version>:
+    # retrieval and ordinary Mistral VLMs need output/gradient parity and image isolation (FA2/FA3).
+    # Remove the backport and affected-release CI checks only after the upstream fix passes those tests.
+    "transformers==5.18.0",
+    # peft>=0.20 raises ImportError from get_peft_model() when an installed torchao is older than 0.16.0.
+    "torchao>=0.16.0",
+    "flashoptim>=0.1.3; sys_platform == 'linux'",
     # 0.6.4 pins nvidia-cutlass-dsl==4.6.2, matching what flash_attn.cute requires at the
     # pinned FLASH_ATTN_REF. Both import `cutlass`, so they have to agree. (0.6.1 pinned 4.6.0.)
     "quack-kernels==0.6.4; sys_platform == 'linux'",
@@ -143,12 +147,17 @@ fla = [
 ]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
-    "databricks-sql-connector>=4.4.0",  # Minimum connector compatible with patched Thrift 0.24.0
+    "databricks-sql-connector>=4.4.0",  # Thrift 0.24+ APIs; security override below lifts the connector cap
 ]
 moe = [
     "nemo-automodel[cuda]",
     "nemo-automodel[fla]",
     "deep_ep",
+]
+# MoK is Blackwell-only and requires Python 3.12+ and a matching CUDA 13 toolkit.
+# Keep it opt-in, like msa, instead of adding hardware-specific builds to all.
+mok = [
+    "mixture-of-kittens; sys_platform == 'linux' and python_version >= '3.12'",
 ]
 vlm = [
     "backoff",
@@ -191,16 +200,26 @@ mlflow = [
     # Avoids the mlflow vs mlflow-skinny mutual-exclusion conflict that breaks
     # environments using sagemaker-mlflow, kedro-mlflow, and managed ML platforms.
     "mlflow-skinny>=3.16.1",
+    # MLflow's default local SQLite store needs both the SQL backend and migrations.
+    # Match the bounds in full MLflow while keeping its server/UI stack optional.
+    "sqlalchemy>=1.4.0,<3",
+    "alembic!=1.10.0,<2",
 ]
 mlflow-full = [
     # Full mlflow stack: tracking server, UI, SQL backend, pyarrow, etc.
-    # Use when you need the MLflow UI or sql:// artifact stores.
+    # Use when you need the MLflow server or UI.
     "mlflow>=3.16.1",
 ]
 wandb = ["wandb>=0.30.0"]
+trackio = ["trackio[gpu]>=0.40.0"]  # [gpu] adds nvidia-ml-py for automatic GPU metrics
+# SwanLab mirrors the W&B run, so it needs the wandb extra as well.
+# Lower bound: swanlab<0.10.2 imports wandb.sdk.internal.datastore, which wandb>=0.30 removed.
+# Upper bound: the mirror relies on how swanlab 0.10's ``sync_wandb`` forwards values.
+swanlab = ["nemo-automodel[wandb]", "swanlab>=0.10.2,<0.11"]
 tracking = [
-    # Convenience meta-extra: installs both experiment-tracking backends.
+    # Convenience meta-extra: installs the experiment-tracking backends.
     "nemo-automodel[mlflow]",
+    "nemo-automodel[trackio]",
     "nemo-automodel[wandb]",
 ]
 # Official MSA (Linux + SM100); the model-private patch supplies the CuTe DSL 4.6.2 fmax fix.
@@ -245,17 +264,22 @@ linting = [
     "pre-commit>=4.2.0",
     "ruff~=0.12.0",
     "import-linter~=2.4",
-    "ty>=0.0.20",
+    "ty>=0.0.91",
 ]
 test = [
     "coverage",
     "pytest",
+    "pytest-cov>=7.0",
     "pytest-shard",
     "pytest-timeout",
+    "pytest-xdist>=3.8",
     "peft>=0.20.0",
     "ruamel.yaml",
     "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "sentence-transformers>=5.6.0",
+    # Real-SDK check of the SwanLab mirror (tests/unit_tests/loggers/test_swanlab_logger.py).
+    "swanlab>=0.10.2,<0.11",
+    "wandb>=0.30.0",
 ]
 dev = [
     "cut-cross-entropy",
@@ -268,6 +292,12 @@ magi = [
 
 [tool.uv]
 managed = true
+# Preserve the Linux x86_64 partition consumed by the CUDA wheelhouse selector.
+# Windows reports AMD64; a platform-independent x86_64 split requests nonexistent Windows wheels.
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform != 'linux' or platform_machine != 'x86_64'",
+]
 default-groups = ["build", "docs", "test"]
 no-build-isolation-package = [
     "bitsandbytes",
@@ -277,25 +307,39 @@ no-build-isolation-package = [
     "flash-attn-3",  # FA3: source build from Dao-AILab/flash-attention hopper/ (needs image torch)
     "magi_attention",
     "mamba-ssm",
+    "mixture-of-kittens",
     "transformer-engine",
     "transformer-engine-torch",
 ]
 constraint-dependencies = [
+    "flask>=3.1.3", # Address CVE-2026-27205
+    "h2>=4.4.1", # Address CVE-2026-71554
+    "hpack>=4.2.0", # Address CVE-2026-59980
+    "idna>=3.15", # Address CVE-2026-45409
+    "multidict>=6.9.1", # Address CVE-2026-104874
+    "python-dotenv>=1.2.2", # Address CVE-2026-28684
+    "requests>=2.33.0", # Address CVE-2026-25645
+    "virtualenv>=21.7.13", # Address activation, seed-wheel, and directory-creation CVEs
+    "werkzeug>=3.1.9", # Address Windows safe_join security fixes through CVE-2026-102598
+    "accelerate>=1.15.0", # Security floor requested by AUT-2490
+    "click>=8.3.3", # Security floor requested by AUT-2490
     "anyio>=4.14.2", # Security floor requested by AUT-2465
     "aiohttp>=3.14.3", # Address aiohttp security fixes through CVE-2026-69244
-    "cryptography>=48.0.1", # Address CVE GHSA-537c-gmf6-5ccf
+    "cryptography>=50.0.0", # Security floor requested by AUT-2490
     "diffusers>=0.38.0",
+    "fsspec>=2026.6.0", # Security floor requested by AUT-2490
     "gitpython>=3.1.60",
     "jaraco-context>=6.1.0", # Address CVE GHSA-58pv-8j8x-9vj2
-    "mako>=1.3.11",
+    "mako>=1.4.2", # Address CVE-2026-102991
     "msgpack>=1.2.1", # Address CVE GHSA-6v7p-g79w-8964
     "pillow>=12.3.0", # Address the Pillow 12.3.0 security fixes
     "protobuf>=6.33.5", # Address CVE GHSA-7gcm-g887-7qv7
-    "pyarrow>=23.0.1", # Address CVE GHSA-rgxp-2hwp-jwgg
+    # PyArrow 26 requires NumPy 2; retain this cap while the build uses NumPy 1.26.
+    "pyarrow>=23.0.1,<26", # Address CVE GHSA-rgxp-2hwp-jwgg
     "pyasn1>=0.6.4", # Address GHSA-hm4w-wwcw-mr6r and GHSA-8ppf-4f7h-5ppj
     "ray>=2.56.0", # Address CVE-2026-57516
     "starlette>=1.3.1", # Address GHSA-wqp7-x3pw-xc5r and later Starlette security fixes
-    "setuptools>=80.10.2",
+    "setuptools>=83.0.0", # Address CVE-2026-59890
     "soupsieve>=2.8.4", # Address GHSA-836r-79rf-4m37 and GHSA-2wc2-fm75-p42x
     "sqlparse>=0.6.0", # Security floor requested by AUT-2465
     "urllib3>=2.8.0", # Address CVE GHSA-gm62-xv2j-4w53
@@ -304,9 +348,9 @@ constraint-dependencies = [
     "fonttools>=4.60.2", # Address CVE-2025-66034
     "mlflow>=3.16.1", # Security floor requested by AUT-2465
     "mlflow-skinny>=3.16.1", # Keep the tracking-only extra on the same security floor
-    "thrift>=0.24.0", # Address CVE-2026-41608 and related Thrift 0.24.0 fixes
+    "thrift>=0.25.0", # Security floor for patched Apache Thrift releases
     "tornado>=6.5.5",
-    "onnx>=1.21.0",
+    "onnx>=1.22.0", # Address CVE-2026-44512 and CVE-2026-63632
     "onnx-ir>=0.1.16", # PyTorch 26.04 needs onnx_ir.schemas
     "pyjwt>=2.14.0",
     "pytest>=8.4.3",
@@ -318,11 +362,17 @@ constraint-dependencies = [
     "apache-tvm-ffi<=0.1.11",
 ]
 override-dependencies = [
+    # Override Trackio's Pillow<13 cap to enforce the security update.
+    "pillow==13.0.0",
     # leptonai (via nemo-run) caps anyio<=4.9.0; override to keep the security floor
     "anyio>=4.14.2",
-    "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
+    # TE native grouped GEMM with current-scaling FP8 requires cuBLASLt 13.5+ on Hopper.
+    "nvidia-cublas>=13.5; sys_platform == 'linux'",
     # leptonai pins 7.0.0, which caps Starlette below its security-fixed 1.x releases
     "prometheus-fastapi-instrumentator>=8.1.0",
+    # databricks-sql-connector caps thrift<0.25; override to retain the security floor.
+    # Remove once the connector accepts Thrift 0.25+; binary protocol/RPC smoke checks pass.
+    "thrift>=0.25.0",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
     "urllib3>=2.8.0",
 ]
@@ -331,16 +381,24 @@ prerelease = "allow"
 [tool.uv.extra-build-variables.deep-ep]
 CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl"
 
+[tool.uv.extra-build-variables.mixture-of-kittens]
+CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl"
+LIBRARY_PATH = "/usr/local/cuda/lib64/stubs"
+
 [tool.uv.extra-build-variables.transformer-engine-torch]
 CPLUS_INCLUDE_PATH = "/usr/local/cuda/include:/usr/local/cuda/include/cccl"
 NVTE_BUILD_USE_NVIDIA_WHEELS = "1"
 NVTE_WITH_NCCL_EP = "0"
 
 [tool.uv.sources]
+mamba-ssm = { git = "https://github.com/akoumpa/cute-mamba.git", rev = "a8b8882fa03668613f7b06831950d504a03b647a" }
 megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }
-deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "10d4dd7377d5bce900fbb4b80cce863764892b95" }
+deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "96e3d1fc77be942438673e88b07be21d454af8a9" }
+# cursor/mixture-of-kittens#18: qualify the ThunderKittens namespace and support both Blackwell targets.
+# Use the PR author's fork until merged so uv can fetch this revision without GitHub's PR-only refs.
+mixture-of-kittens = { git = "https://github.com/balasaajay/mixture-of-kittens.git", rev = "5c8c32e23d71d88a851ff90dcb6c0b663e445cad" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
-magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
+magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "2ed6ff5e2b0807325eff82e29617d7c57c662353" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 fmha-sm100 = { git = "https://github.com/MiniMax-AI/MSA.git", rev = "80434d7f67877c6570ca19cac444b84bc9855dac" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
@@ -397,13 +455,24 @@ transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+10d4dd7"
+version = "v1.2.1+96e3d1f"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "magi_attention"
-version = "1.1.1"
+version = "1.1.6"
 requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.0"
+requires-python = ">=3.9"
+requires-dist = [
+    "torch", "triton", "ninja", "einops", "transformers", "packaging", "setuptools>=61.0.0",
+    'causal-conv1d>=1.2.0; extra == "causal-conv1d"',
+    'pytest; extra == "dev"',
+]
+provides-extra = ["causal-conv1d", "dev"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -422,6 +491,8 @@ omit = [
     "nemo_automodel/components/_peft/lora_kernel.py",
     "nemo_automodel/components/loss/triton/te_cross_entropy.py",
     "nemo_automodel/components/moe/megatron/*.py",
+    # Triton JIT bodies cannot be traced; parity is covered by L2_Rotary_Kernel_Parity.sh.
+    "nemo_automodel/components/models/common/rope_triton.py",
     # Kimi-K3 Triton kernels: coverage.py cannot trace @triton.jit bodies; the Python wrappers
     # are exercised by tests/unit_tests/models/kimi_k3/test_situ_triton.py and test_attn_res_triton.py
     "nemo_automodel/components/models/kimi_k3/situ_triton.py",
@@ -443,7 +514,7 @@ omit = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 exclude = [
    "tests/",
 ]
@@ -563,6 +634,36 @@ ignore_imports = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "Datasets must not directly import models or attention"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.datasets"]
+forbidden_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel.components.attention",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Models and attention must not directly import datasets"
+type = "forbidden"
+source_modules = [
+    "nemo_automodel.components.models",
+    "nemo_automodel.components.attention",
+]
+forbidden_modules = ["nemo_automodel.components.datasets"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Models must not import recipe configuration"
+type = "forbidden"
+source_modules = ["nemo_automodel.components.models"]
+forbidden_modules = [
+    "nemo_automodel.components.config",
+    "nemo_automodel.recipes",
+]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
 name = "Distributed infrastructure must not import model implementations"
 type = "forbidden"
 source_modules = ["nemo_automodel.components.distributed"]
@@ -579,7 +680,7 @@ allow_indirect_imports = true
 # To advance to the next phase, move module paths from the "Phase 2" comment
 # into the active overrides list and fix any new errors.
 [tool.ty.environment]
-python-version = "3.10"
+python-version = "3.11"
 
 [tool.ty.src]
 include = ["nemo_automodel", "examples"]
@@ -637,6 +738,7 @@ possibly-missing-attribute = "ignore"
 [[tool.ty.overrides]]
 include = [
     "nemo_automodel/components/attention/**",
+    "nemo_automodel/components/_peft/**",
     "nemo_automodel/components/config/**",
     "nemo_automodel/components/launcher/**",
     "nemo_automodel/components/loggers/**",

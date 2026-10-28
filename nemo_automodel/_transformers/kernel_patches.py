@@ -185,8 +185,14 @@ def _patch_liger_kernel(model):
 
             liger_kernel_trf = liger_kernel.transformers
 
-        liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
-        logger.info("Applied liger-kernel to model")
+        backbone = getattr(model, "model", model)
+        model_owned_patch = getattr(backbone, "_nemo_apply_liger_kernel", None)
+        if callable(model_owned_patch):
+            model_owned_patch(liger_kernel_trf)
+            logger.info("Applied model-owned Liger kernel patch")
+        else:
+            liger_kernel_trf._apply_liger_kernel_to_instance(model=model)
+            logger.info("Applied liger-kernel to model")
         return model
     except Exception:
         logger.warning("Failed to apply liger-kernels to model; falling back to eager")

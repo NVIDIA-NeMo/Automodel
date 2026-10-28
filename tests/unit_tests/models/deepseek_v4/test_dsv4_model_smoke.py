@@ -37,7 +37,7 @@ from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCaus
 
 # Over the default 5s budget on purpose: CUDA model forward and backward initialize compiled kernels.
 # Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 # ``MoE.forward`` (in ``nemo_automodel/components/moe/layers.py``)
 # unconditionally creates a ``torch.cuda.Stream()`` when the model has a
@@ -578,11 +578,16 @@ class TestDeepseekV4ModelSmoke:
     def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
         """Both HC expand sites mix residual streams as ``comb.T @ x``.
 
-        The fake HC modules intentionally expose only ``forward`` so this also
-        guards against bypassing module hooks via direct ``compute_weights`` calls.
+        The fake HC modules retain the production collapse/expand contract while
+        overriding only coefficient prediction, including its module hooks.
         """
 
+        from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4HyperConnection
+
         class _FixedHC(torch.nn.Module):
+            collapse = staticmethod(DeepseekV4HyperConnection.collapse)
+            expand = staticmethod(DeepseekV4HyperConnection.expand)
+
             def __init__(self, comb):
                 super().__init__()
                 self.register_buffer("comb", comb)
@@ -886,3 +891,124 @@ if __name__ == "__main__":
         sys.exit(1)
     else:
         print(f"All {len(cases)} tests passed.")
+
+
+def test_pipeline_hidden_output_preserves_logits_and_gradients() -> None:
+    """Linear CE can own the FP32 projection without retaining PP logits."""
+    torch.manual_seed(7)
+    config = _tiny_config(num_hidden_layers=0, num_hash_layers=0, compress_ratios=[])
+    model = _make_model(config)
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    model.model.embed_tokens = None
+    model.train()
+    inputs = torch.randn(1, 8, config.hc_mult, config.hidden_size, requires_grad=True)
+    upstream = torch.randn(1, 8, config.vocab_size)
+    reference_logits = model(inputs)
+    reference_logits.backward(upstream)
+    expected_input_grad = inputs.grad.clone()
+    expected_param_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+    model.zero_grad(set_to_none=True)
+    inputs.grad = None
+
+    model._pp_return_hidden_states = True
+    hidden = model(inputs)
+    assert hidden.shape == (1, 8, config.hidden_size)
+    _, outputs_meta = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=8, dtype=torch.float32)
+    assert outputs_meta[0].shape == hidden.shape
+    actual_logits = torch.nn.functional.linear(hidden.float(), model.lm_head.weight).to(hidden.dtype)
+    torch.testing.assert_close(actual_logits, reference_logits, rtol=0, atol=0)
+    actual_logits.backward(upstream)
+    torch.testing.assert_close(inputs.grad, expected_input_grad, rtol=0, atol=0)
+    for name, parameter in model.named_parameters():
+        if name in expected_param_grads:
+            torch.testing.assert_close(parameter.grad, expected_param_grads[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("case", ["canonical", "implicit", "shifted", "reset", "padding", "packed"])
+def test_unpadded_sparse_mask_fastpath_requires_canonical_unmasked_inputs(case):
+    """Only implicit positions bypass empty-query filtering; explicit ones are never host-checked."""
+    config = _tiny_config(num_hidden_layers=0, num_hash_layers=0, compress_ratios=[])
+    model = _make_model(config)
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    model.model.backend.attn = "cudnn"
+    model.model.hc_head = None
+    model.model.norm = None
+    observed = []
+
+    class RecordLayer(torch.nn.Module):
+        def forward(self, x, attention_mask, **kwargs):
+            """Record the mask decision and pass the HC streams through.
+
+            Args:
+                x: Tensor of shape [batch, sequence, streams, hidden].
+                attention_mask: Additive mask of shape [batch, 1, sequence, sequence], or None.
+                **kwargs: Remaining block inputs, including the nonempty-query flag.
+
+            Returns:
+                x unchanged.
+            """
+            observed.append((attention_mask, kwargs["_dsv4_all_queries_nonempty"]))
+            return x
+
+    model.model.layers["0"] = RecordLayer()
+    positions = torch.arange(16).unsqueeze(0)
+    kwargs = {}
+    if case == "implicit":
+        positions = None
+    elif case == "shifted":
+        positions = positions + 3
+    elif case == "reset":
+        positions = torch.arange(8).repeat(2).unsqueeze(0)
+    elif case == "padding":
+        kwargs["attention_mask"] = torch.tensor([[1] * 14 + [0] * 2])
+    elif case == "packed":
+        kwargs["packed_seq_ids"] = torch.tensor([[1] * 8 + [2] * 8])
+    model.model(input_ids=torch.ones(1, 16, dtype=torch.long), position_ids=positions, **kwargs)
+    mask, nonempty = observed[0]
+    expected = case == "implicit"
+    assert nonempty is expected
+    assert (mask is None) is expected
+
+
+@pytest.mark.parametrize("case", ["canonical", "explicit", "short", "shifted", "padding", "packed"])
+def test_grouped_compressor_guard_rejects_inputs_with_optional_parameter_participation(case):
+    """Fail before grouped compressor execution when grad=None could become a zero gradient."""
+    config = _tiny_config(num_hidden_layers=0, num_hash_layers=0, compress_ratios=[])
+    model = _make_model(config)
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    model.model.backend.attn = "cudnn"
+    model.model.hc_head = None
+    model.model.norm = None
+    config.group_compressor_fsdp_units = True
+    config.compress_ratios = [128]
+    called = []
+
+    class RecordLayer(torch.nn.Module):
+        def forward(self, x, **kwargs):
+            """Record the complete-window flag and pass the HC streams through.
+
+            Args:
+                x: Tensor of shape [batch, sequence, streams, hidden].
+                **kwargs: Remaining block inputs, including the complete-window flag.
+
+            Returns:
+                x unchanged.
+            """
+            called.append(kwargs["_dsv4_complete_compressor_windows"])
+            return x
+
+    model.model.layers["0"] = RecordLayer()
+    length = 127 if case == "short" else 128
+    positions = torch.arange(length).unsqueeze(0) + (1 if case == "shifted" else 0)
+    kwargs = {}
+    if case == "padding":
+        kwargs["attention_mask"] = torch.ones(1, length, dtype=torch.long)
+    elif case == "packed":
+        kwargs["packed_seq_ids"] = torch.zeros(1, length, dtype=torch.long)
+    if case == "canonical":
+        model.model(input_ids=torch.ones(1, length, dtype=torch.long), position_ids=None, **kwargs)
+        assert called == [True]
+    else:
+        with pytest.raises(ValueError, match="complete local window"):
+            model.model(input_ids=torch.ones(1, length, dtype=torch.long), position_ids=positions, **kwargs)
+        assert not called

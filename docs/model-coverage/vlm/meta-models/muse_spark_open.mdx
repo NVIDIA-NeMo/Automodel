@@ -1,0 +1,138 @@
+---
+title: "Muse-Spark-open-816B-A42B"
+description: "Fine-tune meta-models/Muse-Spark-open-816B-A42B with NeMo AutoModel using MedPix vision-language recipes and packed Tulu 3 context parallelism."
+slug: model-coverage/vision-language-models/meta-models/Muse-Spark-open-816B-A42B
+---
+
+Muse Spark Open is an omni Mixture-of-Experts model with an approximately
+816B-parameter language backbone and 42B active parameters per token.
+NeMo AutoModel provides a native model implementation, configuration,
+multimodal processor, and checkpoint adapter for
+`meta-models/Muse-Spark-open-816B-A42B`.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Model ID | [`meta-models/Muse-Spark-open-816B-A42B`](https://huggingface.co/meta-models/Muse-Spark-open-816B-A42B) |
+| Architecture | `MuseSparkForConditionalGeneration`, `MuseSpark1xOmniForCausalLM` |
+| Model type | `musespark1x_omni` |
+| Validated training inputs | Text and image-text |
+| Language backbone | 62 layers, hidden size 8192 |
+| Attention | GQA with 128 query heads, 16 KV heads, and head dimension 64 |
+| Experts | 256 routed experts per layer, top-8 sigmoid routing |
+| Checkpoint precision | BF16 weights with an FP32 residual stream |
+
+The language backbone mixes 46 sliding-window attention layers with 16
+full-attention layers. Sliding layers use a 2048-token causal window and
+adjacent-pair RoPE; full-attention layers omit RoPE. Attention includes Q/K
+normalization, output normalization, and a sigmoid output gate. MoE blocks
+project into a 4096-wide expert space and apply pre-expert and post-expert
+normalization.
+
+The multimodal implementation includes a 50-layer NaViT vision tower, image
+and video preprocessing, and a waveform audio encoder. The recipes below
+cover text and image-text training. Audio and video training are outside the
+scope of these examples.
+
+## Choose a Workflow
+
+Run the commands below from the AutoModel repository root on the `main` branch.
+
+| Goal | Recipe | Configuration |
+| --- | --- | --- |
+| Image-text SFT, non-packed 4K | [MedPix SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_ep64_pp4_100steps.yaml) | 256 H100 GPUs; EP64 / PP4 / CP1; 100 steps |
+| Image-text LoRA, non-packed 4K | [MedPix LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_lora_ep32.yaml) | 32 GB200 GPUs; EP32 / PP1 / CP1; rank 8 |
+| Text SFT, packed 128K | [Packed Tulu 3 with MagiAttention](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/muse_spark/muse_spark_open_tulu3_packed128k_ep32_pp2_cp32_magi.yaml) | 64 GB200 GPUs; EP32 / PP2 / CP32; 50 steps |
+
+These distributed recipes instantiate the complete 62-layer model. The
+non-packed recipes pad or truncate each source sample to 4096 model tokens and
+freeze the vision and audio towers while training the language model or its
+LoRA adapters.
+
+## Run MedPix LoRA
+
+Follow the [installation instructions](/get-started/installation) and the
+[Slurm cluster guide](/job-launchers/slurm-cluster). Use an environment with
+Transformer Engine, HybridEP, and the fused linear cross-entropy dependency
+installed.
+
+Point `MUSE_SPARK_MODEL` to the checkpoint directory. The model path and run
+directory must be accessible to every worker:
+
+```bash
+export MUSE_SPARK_MODEL=/path/to/Muse-Spark-open-816B-A42B
+export MUSE_RUN_DIR=/path/to/shared/training-output
+export WANDB_RUN_ID=muse-spark-open-medpix-lora-001
+export WANDB_ENTITY=your-wandb-entity
+export WANDB_PROJECT=muse-spark-open-finetuning
+mkdir -p "${MUSE_RUN_DIR}"
+```
+
+Within an eight-node allocation with four GB200 GPUs per node, run one
+`torchrun` launcher per node. Set `NODE_RANK` to the node index from 0 to 7 and
+`MASTER_ADDR` to the first node's reachable hostname:
+
+```bash
+torchrun --nnodes=8 --nproc-per-node=4 \
+  --node-rank="${NODE_RANK}" \
+  --rdzv-id="${WANDB_RUN_ID}" \
+  --rdzv-backend=c10d --rdzv-endpoint="${MASTER_ADDR}:29500" \
+  -m nemo_automodel.cli.app \
+  examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_lora_ep32.yaml \
+  --model.pretrained_model_name_or_path "${MUSE_SPARK_MODEL}" \
+  --processor.pretrained_model_name_or_path "${MUSE_SPARK_MODEL}" \
+  --wandb.enable=true --wandb.mode=online \
+  --wandb.entity="${WANDB_ENTITY}" --wandb.project="${WANDB_PROJECT}" \
+  --wandb.name="${WANDB_RUN_ID}" --wandb.dir="${MUSE_RUN_DIR}/wandb"
+```
+
+The LoRA recipe uses local batch size 1, global batch size 32, and one gradient
+accumulation step. It uses TE FusedAdam with FP32 master weights, parameter
+remainders, and BF16 optimizer moments. W&B and checkpoint writing are
+disabled by default; enable and configure them explicitly for runs whose
+metrics or checkpoints must be retained.
+
+## Packed Context Parallelism
+
+Packed training preserves document boundaries through THD cumulative sequence
+lengths and per-document position IDs. Attention remains causal within each
+document, so tokens cannot attend across packed document boundaries. The
+2048-token sliding-attention window does not impose a maximum document length.
+
+The checked-in 128K recipe uses MagiAttention for packed text and combines
+EP32, PP2, CP32, and VPP2 Interleaved1F1B on 64 GB200 GPUs. It uses local batch
+size 8, global batch size 8, DP1, and one gradient accumulation step. The
+default prepacked dataset location is
+`data/tulu3_128k_longdoc_shuffle_v2/train`; override `dataset.dataset_path` at
+launch when the packs are stored elsewhere.
+
+Prepare the Tulu 3 documents with the model tokenizer and seed 1234. Shuffle
+eligible documents before packing, preserve each document boundary in the THD
+metadata, and shuffle the completed packed rows once more. Reuse the frozen
+packs and row order when comparing parallel configurations.
+
+MagiAttention and its Blackwell attention-kernel dependencies must be present
+in the training environment. The Magi path is for packed text; image, video,
+and audio inputs are not supported by that path.
+
+## Distributed and Kernel Support
+
+- FSDP2, expert parallelism, context parallelism, and pipeline parallelism,
+  including Interleaved1F1B.
+- Activation checkpointing and separate dense and MoE
+  `reshard_after_forward` controls.
+- Transformer Engine and MagiAttention backends, TE linear layers, HybridEP
+  dispatch, and native `torch_mm` or TE GroupedLinear (`experts: te`) grouped
+  experts.
+- Compiled normalization, QK-normalization/RoPE fusion, and
+  output-normalization/gate fusion.
+- Fused LM head plus cross entropy with the checkpoint's logit soft cap of 20.
+
+Tensor parallelism greater than one is not supported for this architecture. Preserve each recipe's batch and parallelism
+relationships when adapting a launch.
+
+See the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared
+training options.

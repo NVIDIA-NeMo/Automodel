@@ -100,8 +100,10 @@ def _build_model() -> Qwen3_5ForConditionalGeneration:
 
 
 def _expected_inv_freq(rotary) -> torch.Tensor:
-    """The exact fp32 table implied by the module's theta/dim."""
-    return 1.0 / (rotary.theta ** (torch.arange(0, rotary.dim, 2, dtype=torch.float32) / rotary.dim))
+    """The exact fp32 table for one spatial axis of the vision config."""
+    config = rotary.config
+    dim = config.hidden_size // config.num_heads // 2
+    return 1.0 / (config.rope_parameters["rope_theta"] ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
 
 
 def _assert_exact_fp32(rotary) -> None:
@@ -115,7 +117,9 @@ def test_class_declares_vision_rotary_in_fp32_modules():
     # Buffer-preservation requirement only: the non-strict list keeps matched
     # buffers fp32 through both casts without forcing a separate fp32 FSDP group.
     assert "rotary_pos_emb" in Qwen3_5ForConditionalGeneration._keep_in_fp32_modules
-    assert "rotary_pos_emb" not in (getattr(Qwen3_5ForConditionalGeneration, "_keep_in_fp32_modules_strict", None) or [])
+    assert "rotary_pos_emb" not in (
+        getattr(Qwen3_5ForConditionalGeneration, "_keep_in_fp32_modules_strict", None) or []
+    )
 
 
 def test_initialize_weights_bf16_keeps_vision_inv_freq_exact_fp32():
@@ -165,11 +169,12 @@ def test_rope_output_after_frozen_cast_equals_fp32_reference():
     cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
 
     rotary = model.model.visual.rotary_pos_emb
-    # 3-D grid the way the vision tower feeds it: (t, h, w) per patch.
-    pos_ids = torch.tensor([[[0, 0, 0], [0, 0, 1], [0, 1, 0], [1, 0, 0], [0, 1, 1], [1, 1, 1]]], dtype=torch.float32)
+    # Spatial (height, width) coordinates for each patch, as used by HF 5.18.
+    pos_ids = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=torch.float32)
     with torch.no_grad():
-        out = rotary(pos_ids)
+        cos, sin = rotary(torch.empty(4, rotary.config.hidden_size), pos_ids)
 
-    # Reference built the way the module does: outer(pos, inv_freq) flattened.
-    ref = (pos_ids.unsqueeze(-1) * _expected_inv_freq(rotary)).flatten(1)
-    torch.testing.assert_close(out, ref, rtol=0.0, atol=0.0)
+    angles = (pos_ids.unsqueeze(-1) * _expected_inv_freq(rotary)).flatten(1)
+    angles = torch.cat((angles, angles), dim=-1)
+    torch.testing.assert_close(cos, angles.cos(), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(sin, angles.sin(), rtol=0.0, atol=0.0)

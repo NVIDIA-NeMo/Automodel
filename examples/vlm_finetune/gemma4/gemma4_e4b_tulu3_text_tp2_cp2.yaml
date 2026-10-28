@@ -129,6 +129,7 @@ wandb:
   dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: athitten
   nodes: 1
   time: "01:00:00"

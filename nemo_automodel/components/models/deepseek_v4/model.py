@@ -43,6 +43,8 @@ Compress-ratio sliding-window attention is not yet implemented.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, Union
 
@@ -84,6 +86,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     _dsv4_sinkhorn_backend,
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
+    dsv4_indexer_replay,
 )
 from nemo_automodel.components.models.deepseek_v4.parallelization import PARALLELIZER
 from nemo_automodel.components.models.deepseek_v4.processing import (
@@ -258,9 +261,26 @@ class DeepseekV4Block(nn.Module):
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
             sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
+            compile_hc=backend.compile_hc,
         )
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
+
+    def nemo_checkpoint_context_fn(
+        self,
+        context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Bind frozen indexer decisions to this checkpoint invocation.
+
+        Args:
+            context_fn: Existing forward/recompute context factory.
+
+        Returns:
+            A factory with selection replay when requested, otherwise unchanged.
+        """
+        if not self.self_attn.config.reuse_sparse_selection_on_recompute:
+            return context_fn
+        return dsv4_indexer_replay.checkpoint_context_fn(context_fn)
 
     def forward(
         self,
@@ -303,8 +323,17 @@ class DeepseekV4Block(nn.Module):
             padding_mask = attention_mask.bool().logical_not()
 
         def attention_site(hidden_streams: torch.Tensor) -> torch.Tensor:
+            """Collapse HC streams, attend, and mix the result back into the streams.
+
+            Args:
+                hidden_streams: Tensor of shape [batch, sequence, streams, hidden],
+                    where streams is ``hc_mult``.
+
+            Returns:
+                Tensor of shape [batch, sequence, streams, hidden].
+            """
             pre, post, comb = self.attn_hc(hidden_streams)
-            collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+            collapsed = self.attn_hc.collapse(hidden_streams, pre)
             attn_out, _ = self.self_attn(
                 hidden_states=self.input_layernorm(collapsed),
                 position_embeddings=position_embeddings,
@@ -315,15 +344,22 @@ class DeepseekV4Block(nn.Module):
                 vision_token_types=vision_token_types,
                 **attn_kwargs,
             )
-            dtype = hidden_streams.dtype
-            # Expand: native DSV4 uses comb[j, h] * residual[j], i.e. comb.T @ residual.
-            return post.to(dtype).unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(
-                comb.transpose(-1, -2).to(dtype), hidden_streams
-            )
+            return self.attn_hc.expand(attn_out, hidden_streams, post, comb)
 
         def ffn_prepare(hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Collapse HC streams for the FFN and return the mixing coefficients.
+
+            Args:
+                hidden_streams: Tensor of shape [batch, sequence, streams, hidden].
+
+            Returns:
+                Collapsed input of shape [batch, sequence, hidden] in the
+                activation dtype, FP32 post coefficients of shape
+                [batch, sequence, streams], and FP32 combination coefficients of
+                shape [batch, sequence, input_streams, output_streams].
+            """
             pre, post, comb = self.ffn_hc(hidden_streams)
-            collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+            collapsed = self.ffn_hc.collapse(hidden_streams, pre)
             return collapsed, post, comb
 
         x = attention_site(x)
@@ -336,9 +372,10 @@ class DeepseekV4Block(nn.Module):
             gate.set_routing_context(input_ids, vision_token_types)
         elif self.is_hash_routing_layer and isinstance(gate, DeepseekV4HashGate):
             gate.set_input_ids(input_ids)
-        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
-        dtype = x.dtype
-        return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
+        mlp_input = self.post_attention_layernorm(collapsed)
+        with torch.profiler.record_function(f"DSV4_MOE_{self.layer_idx}"):
+            mlp_out = self.mlp(mlp_input, padding_mask)
+        return self.ffn_hc.expand(mlp_out, x, post, comb)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.input_layernorm.reset_parameters()
@@ -421,6 +458,17 @@ class DeepseekV4HashGate(nn.Module):
         token_mask: torch.Tensor | None = None,
         cp_mesh: "DeviceMesh | None" = None,  # noqa: F821 — MoE passes it but we do not need it
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """Route local states by the pending hash table or FP32 scores.
+
+        Args:
+            x: Tensor of shape [tokens, hidden].
+            token_mask: Optional boolean tensor [tokens]; unused by this router.
+            cp_mesh: Optional context-parallel mesh; unused by this router.
+
+        Returns:
+            Weights in the input dtype and integer expert indices, each shaped
+            [tokens, topk], followed by None for auxiliary loss.
+        """
         import torch.nn.functional as F
 
         input_ids = self._pending_input_ids
@@ -428,7 +476,8 @@ class DeepseekV4HashGate(nn.Module):
         # forward that forgets to set it.
         self._pending_input_ids = None
 
-        scores = F.linear(x.float(), self.weight.float())
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            scores = F.linear(x.float(), self.weight.float())
         if self.score_func == "sqrtsoftplus":
             scores = F.softplus(scores).sqrt()
         elif self.score_func == "sigmoid":
@@ -904,6 +953,7 @@ class DeepseekV4Model(nn.Module):
         if position_ids is not None and position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
 
+        positions_are_canonical = position_ids is None
         if position_ids is None:
             seq_len = shape_ref.shape[1]
             position_ids = torch.arange(seq_len, device=shape_ref.device).unsqueeze(0).expand(shape_ref.shape[0], -1)
@@ -944,7 +994,39 @@ class DeepseekV4Model(nn.Module):
                 packed_seq_ids = packed_seq_ids.unsqueeze(0)
             attn_kwargs["packed_seq_ids"] = packed_seq_ids
 
-        if cp_active and packed_seq_ids is not None:
+        # An unpacked, unpadded sequence with canonical positions always sees
+        # its diagonal key, so it can skip the dense mask and cuDNN's per-layer
+        # empty-query scan and gradient gathers. Only implicit positions
+        # (``position_ids=None``) qualify: proving that explicit positions equal
+        # ``arange`` would need a device-to-host sync on every microbatch.
+        unpadded_sparse = (
+            self.backend.attn in ("tilelang", "cudnn")
+            and attention_mask is None
+            and padding_mask is None
+            and packed_seq_lens is None
+            and packed_seq_ids is None
+            and not cp_active
+            and vision_token_types is None
+            and shape_ref.shape[1] > 0
+            and positions_are_canonical
+        )
+        attn_kwargs["_dsv4_all_queries_nonempty"] = unpadded_sparse
+        # Grouped compressor units must all participate in backward. Keep the
+        # general short/packed/CP behavior on independent units, where unused
+        # parameters retain grad=None and their optimizer state is untouched.
+        if self.config.group_compressor_fsdp_units:
+            if not unpadded_sparse or shape_ref.shape[1] < max(self.config.compress_ratios, default=0):
+                raise ValueError(
+                    "group_compressor_fsdp_units requires unpadded sparse-attention inputs with "
+                    "implicit positions (position_ids=None) and a complete local window for every compressor"
+                )
+        # This model-level guard applies on every rank and proves all compressor
+        # windows participate. HCA need not synchronize the same True decision
+        # once per microbatch; general short/packed/CP paths still align it.
+        attn_kwargs["_dsv4_complete_compressor_windows"] = self.config.group_compressor_fsdp_units
+        if unpadded_sparse:
+            attention_mask_4d = None
+        elif cp_active and packed_seq_ids is not None:
             cp_padding_mask = padding_mask
             if cp_padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
                 cp_padding_mask = attention_mask.bool().logical_not()
@@ -1044,6 +1126,9 @@ class DeepseekV4Model(nn.Module):
         return h
 
     def update_moe_gate_bias(self) -> None:
+        """Update routing biases only when enabled by the model's MoE configuration."""
+        if not self.moe_config.train_gate or self.moe_config.gate_bias_update_factor <= 0:
+            return
         with torch.no_grad():
             for block in self.layers.values():
                 if isinstance(block.mlp, MoE):
@@ -1078,6 +1163,8 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # of modular_deepseek_v4.py) plus the existing ``e_score_correction_bias``
     # entry that is specific to KAutomodel's shared Gate buffer.
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _pp_return_hidden_states_supported: bool = True
+    _pp_return_hidden_states: bool = False
     _keep_in_fp32_modules_strict = [
         "attn_hc.fn",
         "attn_hc.base",
@@ -1150,6 +1237,22 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
+        # These sites participate in every decoder block call. Keep their small
+        # FP32 weights resident and communicate one group per role, as V4.1 does
+        # for sinks. Compressor parameters retain their independent FSDP units
+        # because short sequences may legitimately leave their gradients absent.
+        self._fsdp_shard_across_blocks = (
+            ("attn_hc", "ffn_hc", "self_attn.sinks_param") if config.group_fp32_fsdp_units else ()
+        )
+        if config.group_compressor_fsdp_units:
+            self._fsdp_shard_across_blocks += (
+                "self_attn.compressor.wkv",
+                "self_attn.compressor.wgate",
+                "self_attn.compressor.ape_param",
+                "self_attn.compressor.indexer.wkv",
+                "self_attn.compressor.indexer.wgate",
+                "self_attn.compressor.indexer.ape_param",
+            )
         moe_overrides = kwargs.pop("moe_overrides", None)
         mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
         self.model = DeepseekV4Model(
@@ -1180,6 +1283,9 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         self.mtp_config = build_mtp_config_from_hf(config, loss_scaling_factor=mtp_loss_scaling_factor)
+        # PipelineCausalLMLoss rejects linear-loss MTP tuples, so only advertise
+        # hidden-state output when the final stage returns bare hidden states.
+        self._pp_return_hidden_states_supported = not self.mtp_config.enabled
         if self.mtp_config.enabled:
             self.mtp = build_deepseek_v4_mtp(
                 config=config,
@@ -1260,7 +1366,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         else:
             inputs_meta = append_mtp_metas(meta(hc_hidden_shape if self.config.hc_mult > 1 else hidden_shape))
 
-        if self.lm_head is not None:
+        if self.lm_head is not None and not self._pp_return_hidden_states:
             output_meta = meta((microbatch_size, seq_len, self.config.vocab_size))
         elif getattr(self.model, "norm", None) is not None:
             output_meta = meta(hidden_shape)
@@ -1431,9 +1537,15 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         # deepseek runs the lm_head in fp32: project in fp32 and cast the logits
         # back to the hidden dtype via the shared helper.
-        logits = compute_lm_head_logits(
-            self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode, fp32_lm_head=True
-        ).logits
+        # Linear CE owns the final projection in PP, avoiding a full logits
+        # allocation for every in-flight microbatch. MTP still carries its
+        # per-depth hidden states through the existing tuple contract.
+        if self._pp_return_hidden_states:
+            logits = hidden_states
+        else:
+            logits = compute_lm_head_logits(
+                self.lm_head, hidden_states, logits_to_keep, is_thd=thd_mode, fp32_lm_head=True
+            ).logits
 
         if pp_mtp_enabled and self.lm_head is None:
             if not mtp_embed_inputs:

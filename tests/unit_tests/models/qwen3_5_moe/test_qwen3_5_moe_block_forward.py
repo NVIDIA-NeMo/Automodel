@@ -16,6 +16,7 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.qwen3_5_moe")
 
+from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
 from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeBlock
 
 
@@ -99,16 +100,19 @@ class TestQwen3_5MoeBlockForward:
         assert recorded["mlp_padding_mask"].shape == (1, 5)
 
     def test_linear_attention_with_indexed_mask(self):
-        """attention_mask carrying doc ids -> derived cu_seqlens/indices reach linear_attn."""
+        """Dataset metadata for an indexed mask reaches linear_attn."""
         block, recorded = _build_block("linear_attention")
         x = torch.zeros(1, 5, 4)
         indexed = torch.tensor([[1, 1, 2, 2, 2]], dtype=torch.long)
+        packed_metadata = build_packed_sequence_metadata(indexed)
         block(
             x,
             freqs_cis=torch.zeros(3, 1, 5, 2),
             attention_mask=indexed,
             padding_mask=None,
             position_ids=torch.arange(5).unsqueeze(0),
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
         )
         la = recorded["linear_attn_kwargs"]
         assert la["cu_seqlens"].tolist() == [0, 2, 5]
@@ -122,6 +126,7 @@ class TestQwen3_5MoeBlockForward:
         x = torch.zeros(1, 5, 4)
         sdpa_mask = torch.ones(1, 1, 5, 5, dtype=torch.bool).tril()
         packed_seq_ids = torch.tensor([[1, 1, 2, 2, 2]], dtype=torch.long)
+        packed_metadata = build_packed_sequence_metadata(packed_seq_ids)
         block(
             x,
             freqs_cis=torch.zeros(3, 1, 5, 2),
@@ -129,12 +134,36 @@ class TestQwen3_5MoeBlockForward:
             padding_mask=None,
             position_ids=torch.arange(5).unsqueeze(0),
             _packed_seq_ids=packed_seq_ids,
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
         )
         la = recorded["linear_attn_kwargs"]
         assert la["cu_seqlens"].tolist() == [0, 2, 5]
         assert la["indices"].tolist() == [0, 1, 2, 3, 4]
         # linear_attn sees the indexed mask, not the 4D SDPA mask.
         assert torch.equal(la["attention_mask"], packed_seq_ids)
+
+    @pytest.mark.parametrize("missing_key", ["packed_token_indices", "cu_seqlens"])
+    def test_linear_attention_rejects_missing_packed_metadata(self, missing_key):
+        """Each required dataset-provided metadata field is validated."""
+        block, _ = _build_block("linear_attention")
+        indexed = torch.tensor([[1, 1, 2, 2, 2]], dtype=torch.long)
+        packed_metadata = build_packed_sequence_metadata(indexed)
+        metadata_kwargs = {
+            "packed_token_indices": packed_metadata["packed_token_indices"],
+            "cu_seqlens": packed_metadata["cu_seqlens"],
+        }
+        metadata_kwargs.pop(missing_key)
+
+        with pytest.raises(ValueError, match="dataset-provided packed_token_indices and cu_seqlens"):
+            block(
+                torch.zeros(1, 5, 4),
+                freqs_cis=torch.zeros(3, 1, 5, 2),
+                attention_mask=indexed,
+                padding_mask=None,
+                position_ids=torch.arange(5).unsqueeze(0),
+                **metadata_kwargs,
+            )
 
     def test_linear_attention_forwards_seq_index(self):
         """seq_index in attn_kwargs is threaded through to linear_attn (CP dense index)."""

@@ -12,8 +12,9 @@
 #
 # The frozen 40-layer target and its 384 experts are sharded with EP/FSDP2. The
 # 128-expert draft is independently FSDP2-sharded and is the only trainable
-# model. TP, PP, CP, sequence packing, image inputs, and the serving-time
-# confidence scheduler are not supported by the DSpark training path.
+# model. TP, PP, CP, image inputs, and the serving-time confidence scheduler
+# are not supported by the DSpark training path. Set
+# recipe_args.packed_sequence_size to pack documents into fixed-width rows.
 #
 # This is a production-scale configuration. Adapt the node count, EP size,
 # accumulation, data paths, and checkpoint path to the cluster. EP size must
@@ -74,11 +75,12 @@ recipe_args:
   ckpt_every_steps: 500
   save_checkpoint_every_epoch: true
 
-  # --- chat template (REQUIRED for V4.1-Flash) ---
-  # The released tokenizer has no chat template. This is DeepSeek's non-thinking
-  # conversation framing and marks assistant spans for loss.
-  chat_template: |-
-    {{ bos_token }}{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}{% elif message['role'] == 'user' %}{{ '<｜User｜>' + message['content'] }}{% elif message['role'] == 'assistant' %}{{ '<｜Assistant｜></think>' }}{% generation %}{{ message['content'] }}{{ eos_token }}{% endgeneration %}{% else %}{{ raise_exception('Unsupported role: ' + message['role']) }}{% endif %}{% endfor %}{% if add_generation_prompt is defined and add_generation_prompt and (messages|length == 0 or messages[-1]['role'] != 'assistant') %}{{ '<｜Assistant｜></think>' }}{% endif %}
+  # --- chat template ---
+  # The released chat_template.jinja plus {% generation %} loss spans, defaulting
+  # to chat mode. For thinking-mode data (assistant turns with reasoning_content),
+  # uncomment chat_template_kwargs; it also takes drop_thinking and reasoning_effort.
+  chat_template: examples/llm_finetune/deepseek_v41/deepseek_v41_flash_training_chat_template.jinja
+  # chat_template_kwargs: {thinking_mode: thinking}
 
   # --- native checkpoint-owned DSpark architecture ---
   draft_num_hidden_layers: 3
@@ -128,3 +130,6 @@ checkpoint:
   save_consolidated: final
   dequantize_base_checkpoint: true
   # restore_from: LATEST
+
+ci:
+  cluster_tag: h100

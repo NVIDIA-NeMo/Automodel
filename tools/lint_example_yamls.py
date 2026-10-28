@@ -43,6 +43,7 @@ EXCLUDED_RECIPE_PREFIXES = (
 
 EXCLUDED_RECIPE_FILES = {
     Path("examples/retrieval/data_utils/mining_config.yaml"),
+    Path("examples/retrieval/data_utils/mining_multimodal_config.yaml"),
     # Command-only configs: launched via
     # `python -m nemo_automodel.recipes.llm.precompute_dspark_dist -c <config>`
     # (torchrun for multi-node), so they have no recipe-class entry point by design.
@@ -86,7 +87,9 @@ def lint_yaml_text(text: str, path: Path, automodel_dir: Path) -> list[LintError
         return [LintError(path, line, f"YAML syntax error: {exc}")]
 
     if document is None:
-        return []
+        if _relative_path(path, automodel_dir) in EXCLUDED_RECIPE_FILES:
+            return []
+        return _lint_ci_cluster_tag(path, {}, [])
     if not isinstance(document, yaml.MappingNode):
         return [LintError(path, document.start_mark.line + 1, "Top-level YAML document must be a mapping.")]
     if not isinstance(data, dict):
@@ -95,6 +98,8 @@ def lint_yaml_text(text: str, path: Path, automodel_dir: Path) -> list[LintError
     key_lines = _top_level_key_lines(document)
     errors = _lint_top_level_keys(path, key_lines)
     errors.extend(_lint_wandb_disabled(path, data, key_lines))
+    if _relative_path(path, automodel_dir) not in EXCLUDED_RECIPE_FILES:
+        errors.extend(_lint_ci_cluster_tag(path, data, key_lines))
     if _should_require_recipe(path, automodel_dir):
         errors.extend(_lint_recipe_target(path, data, key_lines, automodel_dir))
     return errors
@@ -130,6 +135,22 @@ def _lint_top_level_keys(path: Path, key_lines: list[tuple[str, int]]) -> list[L
         errors.append(LintError(path, ci_line, "Top-level `ci` section must be the last section."))
 
     return errors
+
+
+def _lint_ci_cluster_tag(path: Path, data: dict, key_lines: list[tuple[str, int]]) -> list[LintError]:
+    """Require an explicit GPU tag unless the recipe is marked deprecated."""
+    ci = data.get("ci")
+    if isinstance(ci, dict):
+        cluster_tag = ci.get("cluster_tag")
+        if ci.get("deprecated") is True or (isinstance(cluster_tag, str) and cluster_tag.strip()):
+            return []
+    return [
+        LintError(
+            path,
+            dict(key_lines).get("ci", 1),
+            "Recipe must declare a nonempty `ci.cluster_tag` (e.g. h100, gb200, gb10) or `ci.deprecated: true`.",
+        )
+    ]
 
 
 def _lint_wandb_disabled(path: Path, data: dict, key_lines: list[tuple[str, int]]) -> list[LintError]:

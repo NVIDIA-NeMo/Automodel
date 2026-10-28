@@ -306,6 +306,20 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
                 dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
                 dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
             )
+        self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
+        self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
+        self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
+        self.dispatcher_hybridep_num_blocks_permute = orig_module.dispatcher_hybridep_num_blocks_permute
+        self.dispatcher_hybridep_num_blocks_unpermute = orig_module.dispatcher_hybridep_num_blocks_unpermute
+        # Sync-free dispatch knobs (BackendConfig.dispatcher_capacity_factor / dispatcher_equal_token_counts) travel
+        # with the other HybridEP settings: the shared dispatcher is built from the first (wrapped) layer.
+        self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
+        self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
+        self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
+        # The combine cache (BackendConfig.dispatcher_recompute_cache) is read by the shared dispatcher's config as
+        # well: a frozen layer next to a LoRA one must carry the same mode, or the shared-manager check rejects the
+        # pair and an all-frozen conversion silently loses the request (review of #4395).
+        self.dispatcher_recompute_cache = orig_module.dispatcher_recompute_cache
         # These fresh parameters have no autograd history or optimizer references.
         for name in self._MXFP4_BASE_NAMES:
             getattr(self, name).data = _to_local(getattr(orig_module, name)).clone()
@@ -336,7 +350,9 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
             x, token_mask, weights, indices
         )
 
-        if torch.count_nonzero(tokens_per_expert) > 0:
+        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
+        # GroupedExpertsDeepEP.forward does.
+        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
 

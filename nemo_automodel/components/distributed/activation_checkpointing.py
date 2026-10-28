@@ -45,6 +45,22 @@ from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint
 
 from nemo_automodel.shared.import_utils import get_torch_version, safe_import
 
+__all__ = [
+    "SELECTIVE_AC_WRAPPER_FLAG",
+    "apply_full_layer_checkpointing_to_layers",
+    "apply_selective_checkpointing_to_layers",
+    "apply_submodule_checkpointing",
+    "detect_kv_sharing_and_maybe_disable_cache",
+    "ensure_fsdp_ops_sac_ignored",
+    "ensure_profiler_ops_sac_ignored",
+    "ignore_sac_ops",
+    "is_selective_activation_checkpointing",
+    "make_selective_checkpoint_context_fn",
+    "sdpa_backend_snapshot_context_fn",
+    "transformer_engine_attention_backend_snapshot_context_fn",
+    "unwrap_checkpoint_wrapper",
+]
+
 logger = logging.getLogger(__name__)
 
 _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION = (2, 13)
@@ -363,6 +379,20 @@ def ensure_fsdp_ops_sac_ignored() -> None:
             )
         )
     )
+
+
+def ensure_moe_recompute_cache_ops_sac_ignored() -> None:
+    """Keep the deferred expert down projection's placeholder out of SAC's op-stream replay.
+
+    ``BackendConfig.dispatcher_recompute_cache="moe_tail"`` skips the down-projection GEMM in a checkpoint
+    recompute whose HybridEP combine is served from the forward's cache: ``moe/experts._DownProjGroupedMM``
+    then only allocates its output (``aten.new_empty``). That allocation exists in the recompute alone, and
+    selective checkpointing — including the router-saving context ``apply_ac`` installs under
+    ``ignore_router_for_ac`` — indexes every recompute op against the forward's stream
+    (``aten.new_empty.default encountered during backward but not found in storage``). The placeholder
+    carries no activation; it executes outside the accounting like FSDP's recompute-only allocations above.
+    """
+    ignore_sac_ops([getattr(getattr(torch.ops.aten, "new_empty", None), "default", None)])
 
 
 def make_selective_checkpoint_context_fn():
