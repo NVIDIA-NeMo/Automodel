@@ -598,6 +598,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             return
 
         dataloader_config = self.cfg.dataloader
+        validate_parallelism = getattr(dataloader_config, "validate_parallelism", None)
+        if callable(validate_parallelism):
+            validate_parallelism(cp_size=self.mesh_context.cp_size)
         packed_input_length = dataloader_config.packed_sequence_length
 
         # MagiAttention (FFA / context-parallel) backend, enabled via

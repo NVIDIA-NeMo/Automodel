@@ -4177,6 +4177,107 @@ def test_recipe_saves_terminal_state_at_closed_pass_frontier() -> None:
     recipe._finalize_and_close_checkpointer.assert_called_once()
 
 
+@pytest.mark.parametrize("attention_backend", ["sdpa", "eager"])
+def test_zephon_setup_preserves_requested_attention_backend(monkeypatch, tmp_path, attention_backend):
+    """Zephon supplies masks without selecting the native flash packing preload flag."""
+    from nemo_automodel._transformers.kernel_patches import _apply_preload_overrides
+    from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig, ZephonOptions, ZephonSource
+
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    config = ZephonDataloaderConfig(zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),)))
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: config))
+    module = "nemo_automodel.recipes.llm.train_ft"
+    recipe_type = TrainFinetuneRecipeForNextTokenPrediction
+    raw = _minimal_cfg_with_nvtx(False)
+
+    class ModelBuildReached(Exception):
+        pass
+
+    def build(*args, **kwargs):
+        attention, _ = _apply_preload_overrides(
+            tp_size=1,
+            cp_size=1,
+            has_packed_sequence=kwargs.get("has_packed_sequence", False),
+            attn_implementation=attention_backend,
+            use_liger_kernel=False,
+        )
+        assert attention == attention_backend
+        raise ModelBuildReached
+
+    monkeypatch.setattr(f"{module}.build_model", build)
+    original = getattr(recipe_type, "_create_distributed_setup")
+
+    def setup(self):
+        result = original(self)
+        result.mesh_context.tp_size = 1
+        return result
+
+    monkeypatch.setattr(recipe_type, "_create_distributed_setup", setup)
+    with pytest.raises(ModelBuildReached):
+        recipe_type(raw).setup()
+
+
+@pytest.mark.parametrize("backend", ["native", "zephon"])
+def test_common_loader_build_keeps_rng_owned_by_loader_and_rank_order(monkeypatch, tmp_path, backend):
+    from contextlib import contextmanager
+
+    from nemo_automodel.components.datasets.loader import DataloaderConfig
+    from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+    from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig, ZephonOptions, ZephonSource
+
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+    if backend == "native":
+        config = DataloaderConfig(dataset_config=SimpleNamespace(build=lambda: []), seed=123)
+    else:
+        config = ZephonDataloaderConfig(zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),)))
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: config))
+    recipe_type = TrainFinetuneRecipeForNextTokenPrediction
+    monkeypatch.setattr(recipe_type, "_get_packing_contract", lambda self: DEFAULT_PACKED_SEQUENCE_CONTRACT)
+    original_setup = recipe_type._create_distributed_setup
+
+    def setup(self):
+        result = original_setup(self)
+        result.mesh_context.tp_size = 1
+        return result
+
+    monkeypatch.setattr(recipe_type, "_create_distributed_setup", setup)
+    events = []
+
+    @contextmanager
+    def rng_context(*, seed, ranked):
+        events.append(("rng-enter", seed, ranked))
+        try:
+            yield
+        finally:
+            events.append(("rng-exit", seed, ranked))
+
+    @contextmanager
+    def rank_context(*, group):
+        events.append("rank-enter")
+        yield
+        events.append("rank-exit")
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", rng_context)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.FirstRankPerNode", rank_context)
+
+    class BuildReached(Exception):
+        pass
+
+    def build(self, **kwargs):
+        with kwargs["dataset_build_context"]:
+            events.append("build")
+        assert kwargs["cp_size"] == 1
+        assert kwargs["pp_enabled"] is False
+        assert kwargs["ignore_index"] == -100
+        raise BuildReached
+
+    monkeypatch.setattr(type(config), "build", build)
+    with pytest.raises(BuildReached):
+        recipe_type(_minimal_cfg_with_nvtx(False)).setup()
+    # build() is mocked above: its owned RNG context must not be duplicated by the recipe.
+    assert events == (["rank-enter", "build", "rank-exit"] if backend == "native" else ["build"])
+
+
 @pytest.mark.parametrize("recipe_kind", ["llm", "vlm"])
 @pytest.mark.parametrize("is_packed,output_format", [(False, "batched"), (True, "batched"), (True, "thd")])
 def test_setup_always_passes_return_contract_and_only_configures_packed_batched_inputs(

@@ -55,6 +55,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -353,6 +354,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
     def setup(self):  # noqa: C901 – same complexity as parent
         """Build student & teacher, dataloaders, optimizers, etc."""
+        if isinstance(self.cfg.dataloader, ZephonDataloaderConfig):
+            raise ValueError("Zephon knowledge distillation is not yet certified")
         # Right now, we only support tokenizer compatibility for the same tokenizer.
         # We will add support for different tokenizers in the future.
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
