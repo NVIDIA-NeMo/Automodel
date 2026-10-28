@@ -363,6 +363,7 @@ class _DionConfigBase(OptimizerConfig):
     # Dion optimizers are incompatible with Megatron-FSDP optimizer sharding.
     supports_megatron_fsdp_sharding: ClassVar[bool] = False
     supports_batched_matrices: ClassVar[bool] = False
+    use_matrix_layout: ClassVar[bool] = False
 
     lr: float = 5e-4
     weight_decay: float = 0.0

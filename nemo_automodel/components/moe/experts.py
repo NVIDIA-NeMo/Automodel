@@ -42,6 +42,7 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 from nemo_automodel.shared.import_utils import is_te_min_version, safe_import
+from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
@@ -727,7 +728,7 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None, reuse_input
     return (flat_value + expanded_bias).view(shape).to(value.dtype)
 
 
-class GroupedExperts(nn.Module):
+class GroupedExperts(TransposedMatrixModule, nn.Module):
     """
     Sparse MoE implementation using all-gather/reduce-scatter primitives.
 
@@ -741,9 +742,6 @@ class GroupedExperts(nn.Module):
         gate_and_up_projs (nn.Parameter): Linear layer for gate+up (gated) or just up (non-gated).
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
-
-    # Grouped GEMMs store [..., input, output], unlike nn.Linear's [..., output, input].
-    _nemo_transposed_matrix_parameters: tuple[str, ...] = ("gate_and_up_projs", "down_projs")
 
     def __init__(self, config: MoEConfig, backend: Optional["BackendConfig"] = None):
         """
@@ -1454,7 +1452,7 @@ def _checkpointed_chunked_expert_mlp(
     return output
 
 
-class GroupedExpertsDeepEP(nn.Module):
+class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
 
@@ -1469,9 +1467,6 @@ class GroupedExpertsDeepEP(nn.Module):
         gate_and_up_projs (nn.Parameter): Linear layer for gate+up (gated) or just up (non-gated).
         down_projs (nn.Parameter): Linear layer for hidden-to-output transformation.
     """
-
-    # Grouped GEMMs store [..., input, output], unlike nn.Linear's [..., output, input].
-    _nemo_transposed_matrix_parameters: tuple[str, ...] = ("gate_and_up_projs", "down_projs")
 
     def __init__(
         self,

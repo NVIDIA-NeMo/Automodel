@@ -606,7 +606,8 @@ class Muown(_MuonBase):
             # Guard only degenerate rows, preserving the fused arithmetic for
             # ordinary neurons instead of perturbing every norm's rounding.
             param.copy_(torch.where(norm >= group["epsilon"], param, state["g"] * (direction / group["epsilon"])))
-            norm.clamp_min_(group["epsilon"])
+            # Out of place: DTensor has no sharding rule for aten.clamp_min_ on stable PyTorch.
+            norm = norm.clamp_min(group["epsilon"])
             if previous is not None:
                 param.add_(previous, alpha=-group["lr"] * group["weight_decay"])
             state["v_norm"].copy_(norm)

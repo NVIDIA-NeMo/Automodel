@@ -31,6 +31,7 @@ from nemo_automodel.components.optim.optimizer import (
     ParamGroupOverride,
     build_optimizer_config,
 )
+from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
 
 @pytest.fixture(autouse=True)
@@ -120,9 +121,7 @@ def test_unsupported_dion_revision_is_rejected(monkeypatch):
 
 
 def test_typed_config_layout_and_scalar_groups():
-    class Experts(nn.Module):
-        _nemo_transposed_matrix_parameters = ("projection",)
-
+    class Experts(TransposedMatrixModule, nn.Module):
         def __init__(self):
             super().__init__()
             self.projection = nn.Parameter(torch.randn(4, 8, 12))
@@ -304,9 +303,7 @@ def test_algorithm_override_is_not_a_generic_group_option():
 
 
 def test_override_preserves_transposed_experts_and_ignores_frozen_parameters(caplog):
-    class Experts(nn.Module):
-        _nemo_transposed_matrix_parameters = ("projection",)
-
+    class Experts(TransposedMatrixModule, nn.Module):
         def __init__(self):
             super().__init__()
             self.projection = nn.Parameter(torch.randn(2, 8, 12))
@@ -428,9 +425,7 @@ def test_adamw_patterns_work_independently_of_lr_overrides(scalar_opt, with_over
 
 
 def test_adamw_patterns_split_transposed_expert_groups():
-    class Experts(nn.Module):
-        _nemo_transposed_matrix_parameters = ("selected", "remaining")
-
+    class Experts(TransposedMatrixModule, nn.Module):
         def __init__(self):
             super().__init__()
             self.selected = nn.Parameter(torch.randn(2, 8, 12))

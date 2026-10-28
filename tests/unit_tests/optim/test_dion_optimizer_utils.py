@@ -126,18 +126,25 @@ class TestSeparateParamGroups:
         assert groups[3]["weight_decay"] == 0.0
 
     @pytest.mark.parametrize("use_matrix_layout", [False, True])
-    def test_stale_transposed_parameter_declaration_is_rejected(self, use_matrix_layout):
-        class RenamedExperts(nn.Module):
-            _nemo_transposed_matrix_parameters = ("gate_and_up_projs", "down_projs")
+    def test_transposed_matrix_modules_get_their_own_group(self, use_matrix_layout):
+        from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
+        class Experts(TransposedMatrixModule, nn.Module):
             def __init__(self):
                 super().__init__()
                 self.gate_and_up_projs = nn.Parameter(torch.randn(2, 4, 8))
-                self.renamed_down_projs = nn.Parameter(torch.randn(2, 4, 4))
+                self.lora_down_A = nn.Parameter(torch.randn(2, 4, 2))
+                self.gate_up_proj_bias = nn.Parameter(torch.randn(2, 8))
+
+        class PlainBatched(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(2, 8, 4))
 
         model = TinyModel(with_bias=True)
-        model.experts = RenamedExperts()
-        kwargs = dict(
+        model.experts = Experts()
+        model.plain = PlainBatched()
+        groups = self._call(
             model=model,
             base_lr=1e-3,
             scalar_opt="adamw",
@@ -145,16 +152,39 @@ class TestSeparateParamGroups:
             supports_batched_matrices=True,
             use_matrix_layout=use_matrix_layout,
         )
+        transposed = [g for g in groups if g.get("matrix_transposed")]
+        matrix_ids = {id(p) for p in groups[0]["params"]}
+        expert_matrices = {id(model.experts.gate_and_up_projs), id(model.experts.lora_down_A)}
         if use_matrix_layout:
-            with pytest.raises(ValueError, match=r"RenamedExperts at 'experts' lists \['down_projs'\]"):
-                self._call(**kwargs)
+            (group,) = transposed
+            assert {id(p) for p in group["params"]} == expert_matrices, "every expert matrix, LoRA factors included"
+            assert not expert_matrices & matrix_ids
         else:
-            self._call(**kwargs)
+            assert not transposed
+            assert expert_matrices <= matrix_ids
+        # Only the marker class selects the transposed group; shape alone does not.
+        assert id(model.plain.weight) in matrix_ids
+        # Expert biases are not matrices.
+        assert id(model.experts.gate_up_proj_bias) in {id(p) for p in groups[1]["params"]}
 
-    def test_grouped_expert_declarations_name_real_parameters(self):
+    def test_grouped_expert_classes_declare_transposed_storage(self):
+        from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
         from nemo_automodel.components.moe.config import MoEConfig
-        from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
-        from nemo_automodel.components.moe.quantized_experts import MXFP4ExpertStorageMixin
+        from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
+        from nemo_automodel.components.moe.quantized_experts import GroupedExpertsDeepEPMXFP4, GroupedExpertsMXFP4
+        from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
+
+        for cls in (
+            GroupedExperts,
+            GroupedExpertsDeepEP,
+            GroupedExpertsLoRA,
+            GroupedExpertsDeepEPLoRA,
+            GroupedExpertsMXFP4,
+            GroupedExpertsDeepEPMXFP4,
+        ):
+            assert issubclass(cls, TransposedMatrixModule), cls.__name__
+        # TE GroupedLinear keeps nn.Linear's [output, input] per-expert weights.
+        assert not issubclass(GroupedExpertsTE, TransposedMatrixModule)
 
         config = MoEConfig(
             n_routed_experts=4,
@@ -174,12 +204,19 @@ class TestSeparateParamGroups:
             expert_activation="swiglu",
             dtype=torch.float32,
         )
-        for experts_cls in (GroupedExperts, GroupedExpertsDeepEP):
-            experts = experts_cls(config)
-            assert experts._nemo_transposed_matrix_parameters
-            assert all(name in experts._parameters for name in experts._nemo_transposed_matrix_parameters)
-        # MXFP4 experts drop the float projections for frozen [experts, out, in] packed storage.
-        assert MXFP4ExpertStorageMixin._nemo_transposed_matrix_parameters == ()
+        # The contract is [experts, input, output] for every trainable matrix, so the input
+        # dimension of each projection chain must equal the previous output dimension.
+        experts = GroupedExpertsLoRA(GroupedExperts(config), lora_dim=4, alpha=8)
+        chains = (
+            ("gate_and_up_projs", "lora_gate_and_up_A", "lora_gate_and_up_B"),
+            ("down_projs", "lora_down_A", "lora_down_B"),
+        )
+        for base, lora_a, lora_b in chains:
+            weight, a, b = (getattr(experts, name) for name in (base, lora_a, lora_b))
+            assert weight.ndim == a.ndim == b.ndim == 3
+            assert a.shape[1] == weight.shape[1], "LoRA A consumes the projection input"
+            assert b.shape[2] == weight.shape[2], "LoRA B produces the projection output"
+            assert a.shape[2] == b.shape[1] == 4
 
     @pytest.mark.parametrize("supports_batched_matrices", [False, True])
     def test_2d_bias_routing_follows_optimizer_capability(self, supports_batched_matrices):
@@ -408,6 +445,7 @@ class FakeDionConfig:
     """
 
     supports_batched_matrices = False
+    use_matrix_layout = False
 
     def __init__(
         self,

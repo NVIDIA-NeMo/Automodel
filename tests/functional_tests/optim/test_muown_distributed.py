@@ -230,10 +230,21 @@ def _check_fsdp_training(use_triton=False, checkpoint_dir=None):
         _assert_parameters(model, reference)
 
 
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 @pytest.mark.parametrize("use_triton", [False, True])
 def test_muown_fsdp_ep_checkpoint(tmp_path, use_triton):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    mp.spawn(_worker, args=(2, port, str(tmp_path), use_triton), nprocs=2, join=True)
+    mp.spawn(_worker, args=(2, _free_port(), str(tmp_path), use_triton), nprocs=2, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four CUDA devices")
+@pytest.mark.parametrize("use_triton", [False, True])
+def test_muown_fsdp_ep_checkpoint_four_ranks(tmp_path, use_triton):
+    # Expert mesh (edp=2, ep=2): exercises simultaneous expert-parallel and expert-FSDP
+    # matrix sharding plus the both-axes rejection that two ranks cannot reach.
+    mp.spawn(_worker, args=(4, _free_port(), str(tmp_path), use_triton), nprocs=4, join=True)
