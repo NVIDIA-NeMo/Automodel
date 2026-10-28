@@ -113,7 +113,7 @@ overrides = [
 
 [[manifest.dependency-metadata]]
 name = "deep-ep"
-version = "1.2.1+10d4dd7"
+version = "1.2.1+96e3d1f"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]
@@ -1477,8 +1477,8 @@ wheels = [
 
 [[package]]
 name = "deep-ep"
-version = "1.2.1+10d4dd7"
-source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=10d4dd7377d5bce900fbb4b80cce863764892b95#10d4dd7377d5bce900fbb4b80cce863764892b95" }
+version = "1.2.1+96e3d1f"
+source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=96e3d1fc77be942438673e88b07be21d454af8a9#96e3d1fc77be942438673e88b07be21d454af8a9" }
 dependencies = [
     { name = "ninja" },
     { name = "packaging" },
@@ -4011,7 +4011,7 @@ requires-dist = [
     { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=4.4.0" },
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "decord", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm-media'" },
-    { name = "deep-ep", marker = "extra == 'moe'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=10d4dd7377d5bce900fbb4b80cce863764892b95" },
+    { name = "deep-ep", marker = "extra == 'moe'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=96e3d1fc77be942438673e88b07be21d454af8a9" },
     { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
     { name = "diffusers", marker = "extra == 'diffusion'", specifier = ">=0.39.0" },
     { name = "ffpa-attn", marker = "extra == 'ffpa'", specifier = ">=0.2.4" },
