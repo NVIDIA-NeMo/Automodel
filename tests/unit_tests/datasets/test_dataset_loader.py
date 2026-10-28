@@ -442,6 +442,86 @@ def test_prepacked_thd_is_reported_as_packed_without_online_packing():
     assert config.is_packed and config.output_format == "thd"
 
 
+def test_public_close_hook_is_optional_and_propagates_errors():
+    from nemo_automodel.components.datasets.loader import close_dataloader
+
+    close_dataloader(object())
+    calls = []
+
+    class Loader:
+        def close(self):
+            calls.append("closed")
+            raise RuntimeError("cleanup failed")
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        close_dataloader(Loader())
+    assert calls == ["closed"]
+
+
+@pytest.mark.parametrize("fail_construction", [False, True])
+def test_build_owns_ranked_rng_and_restores_ambient_state(monkeypatch, fail_construction):
+    import random
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from nemo_automodel.components.datasets import loader as loader_module
+    from nemo_automodel.components.datasets.loader import PackingConfig
+    from nemo_automodel.shared.rng import ScopedRNG
+
+    def draw():
+        return random.random(), float(np.random.random()), float(torch.rand(()))
+
+    seed, rank = 31, 3
+    with ScopedRNG(seed=seed + rank):
+        expected = [draw() for _ in range(4)]
+    seen = []
+
+    class Source:
+        def build(self):
+            seen.append(draw())
+            return [1]
+
+    class Pack(PackingConfig):
+        def build(self, dataset, **kwargs):
+            seen.append(draw())
+            return dataset, None
+
+    class Sampler:
+        def build(self, **kwargs):
+            seen.append(draw())
+            return [[0]]
+
+    def loader(*args, **kwargs):
+        seen.append(draw())
+        assert kwargs["seed"] == seed  # The explicit sampler seed is not rank-adjusted.
+        if fail_construction:
+            raise RuntimeError("construction failed")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(loader_module, "ParallelAwareDataloader", loader)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+    config = DataloaderConfig(
+        dataset_config=Source(),
+        packing=Pack(packed_sequence_size=8),
+        batch_sampler_config=Sampler(),
+        seed=seed,
+    )
+    py_state, np_state, torch_state = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    if fail_construction:
+        with pytest.raises(RuntimeError, match="construction failed"):
+            config.build(dp_rank=0, dp_world_size=1)
+    else:
+        config.build(dp_rank=0, dp_world_size=1)
+    assert seen == expected
+    assert random.getstate() == py_state
+    after_np = np.random.get_state()
+    assert after_np[0] == np_state[0] and after_np[2:] == np_state[2:]
+    np.testing.assert_array_equal(after_np[1], np_state[1])
+    assert torch.equal(torch.get_rng_state(), torch_state)
+
+
 def test_emits_thd_compatibility_alias_warns():
     config = DataloaderConfig(dataset_config=StaticDatasetConfig([]))
     with pytest.warns(FutureWarning, match="output_format"):

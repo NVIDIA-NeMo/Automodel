@@ -44,11 +44,24 @@ from nemo_automodel.components.datasets.packing import (
     PackedSequenceContract,
     resolve_packing_contract,
 )
+from nemo_automodel.shared.rng import ScopedRNG
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 logger = logging.getLogger(__name__)
+
+
+def close_dataloader(dataloader: object) -> None:
+    """Release resources through a loader's public close method, when provided.
+
+    Native PyTorch loaders retain their existing iterator-owned worker lifecycle.
+    Stateful stream loaders can release resources without changing checkpoint routing.
+    """
+    close = getattr(dataloader, "close", None)
+    if callable(close):
+        close()
+
 
 CollateFn = Callable[[list[object]], object]
 
@@ -110,6 +123,47 @@ class BatchSamplerConfig(Protocol):
 
 
 DatasetConfig = PlainDatasetConfig | TokenizerDatasetConfig | ScheduledDatasetConfig
+
+
+class TextDataloaderConfig(Protocol):
+    """Construction and capability contract shared by text loader backends."""
+
+    @property
+    def is_packed(self) -> bool:
+        """Whether the loader emits packed inputs, independent of its implementation."""
+        ...
+
+    @property
+    def packed_sequence_length(self) -> int:
+        """Packed input length, or zero when the loader does not pack."""
+        ...
+
+    @property
+    def dataset_builds_on_all_ranks(self) -> bool:
+        """Whether dataset construction must bypass rank-zero-first ordering."""
+        ...
+
+    @property
+    def output_format(self) -> BatchOutputFormat:
+        """Selected batched or seq_lens-based THD input format, independent of packing."""
+        ...
+
+    def build(
+        self,
+        *,
+        dp_rank: int,
+        dp_world_size: int,
+        pp_enabled: bool = False,
+        tokenizer: "PreTrainedTokenizerBase | None" = None,
+        dataset_build_context: AbstractContextManager[object] | None = None,
+        supports_seq_lens: bool = True,
+        cp_size: int = 1,
+        packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+        collate_wrapper: Callable[[CollateFn], CollateFn] | None = None,
+        ignore_index: int = -100,
+    ) -> object:
+        """Build one loader from explicit runtime dependencies owned by the recipe."""
+        ...
 
 
 def _set_spawn_start_method() -> None:
@@ -613,6 +667,11 @@ class DataloaderConfig:
         return self.packing is not None or self.output_format == "thd"
 
     @property
+    def packed_sequence_length(self) -> int:
+        """Configured packed input length, or zero for ordinary examples."""
+        return self.packing.packed_sequence_size if self.packing is not None else 0
+
+    @property
     def dataset_builds_on_all_ranks(self) -> bool:
         """Whether dataset construction must bypass rank-zero-first ordering."""
         return isinstance(self.dataset_config, AllRanksDatasetConfig)
@@ -668,6 +727,7 @@ class DataloaderConfig:
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         collate_wrapper: Callable[[CollateFn], CollateFn] | None = None,
+        ignore_index: int = -100,
     ) -> DataLoader:
         """Build the configured dataset, packing, sampler, collator, and stateful dataloader.
 
@@ -685,79 +745,84 @@ class DataloaderConfig:
             packing_contract: Structural model contract used by NEAT packing.
                 Defaults to block-causal masking without packed-sequence metadata.
             collate_wrapper: Optional recipe-owned wrapper around the resolved collator.
+            ignore_index: Stream-backend label exclusion value. Native collators retain
+                their own configured supervision policy and do not consume this value.
 
         Returns:
             Stateful, data-parallel-aware dataloader.
         """
-        packing_contract = resolve_packing_contract(packing_contract, attn_implementation)
-        dataset = self._build_dataset(tokenizer=tokenizer, dataset_build_context=dataset_build_context)
+        with ScopedRNG(seed=self.seed, ranked=True):
+            del ignore_index
+            packing_contract = resolve_packing_contract(packing_contract, attn_implementation)
+            dataset = self._build_dataset(tokenizer=tokenizer, dataset_build_context=dataset_build_context)
 
-        collate_override = None
-        if self.packing is not None and not self.packing.prepacked:
-            dataset, collate_override = self.packing.build(
-                dataset,
-                split=getattr(self.dataset_config, "split", None),
-                seed=self.seed,
-                supports_seq_lens=supports_seq_lens,
-                pad_token_id=getattr(tokenizer, "pad_token_id", 0),
-                cp_size=cp_size,
-                packing_contract=packing_contract,
-            )
-        elif self.packing is not None:
-            logger.info(
-                "Using prepacked sequence dataset with size %s; skipping loader-side packing",
-                self.packing.packed_sequence_size,
-            )
-
-        # Collate: packing override -> custom collate_fn -> shared default; then the optional PP wrapper.
-        collate_fn = collate_override or self.collate_fn
-        if isinstance(collate_fn, CollatorConfig):
-            if tokenizer is None:
-                raise ValueError("A tokenizer or processor is required to build the configured collator")
-            collate_fn = collate_fn.build(tokenizer=tokenizer)
-        if collate_fn is None:
-            if self.batch_size is None:
-                from torch.utils.data import default_convert
-
-                collate_fn = default_convert
-            else:
-                from nemo_automodel.components.datasets.utils import default_collater
-
-                collate_fn = default_collater
-        if collate_wrapper is not None:
-            collate_fn = collate_wrapper(collate_fn)
-
-        batch_sampler = None
-        if self.batch_sampler_config is not None:
-            if not isinstance(dataset, Sized):
-                raise TypeError(
-                    f"{type(self.batch_sampler_config).__name__} requires a sized dataset, got {type(dataset).__name__}"
+            collate_override = None
+            if self.packing is not None and not self.packing.prepacked:
+                dataset, collate_override = self.packing.build(
+                    dataset,
+                    split=getattr(self.dataset_config, "split", None),
+                    seed=self.seed,
+                    supports_seq_lens=supports_seq_lens,
+                    pad_token_id=getattr(tokenizer, "pad_token_id", 0),
+                    cp_size=cp_size,
+                    packing_contract=packing_contract,
                 )
-            batch_sampler = self.batch_sampler_config.build(
-                dataset_len=len(dataset), rank=dp_rank, world_size=dp_world_size
-            )
+            elif self.packing is not None:
+                logger.info(
+                    "Using prepacked sequence dataset with size %s; skipping loader-side packing",
+                    self.packing.packed_sequence_size,
+                )
 
-        return ParallelAwareDataloader(
-            dataset,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            batch_size=self.batch_size,
-            collate_fn=collate_fn,
-            batch_sampler=batch_sampler,
-            seed=self.seed,
-            shuffle=self.shuffle,
-            group_by_length=self.group_by_length,
-            pp_enabled=pp_enabled,
-            shuffle_buffer_size=self.shuffle_buffer_size,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            prefetch_factor=self.prefetch_factor,
-            drop_last=self.drop_last,
-        )
+            # Collate: packing override -> custom collate_fn -> shared default; then the optional PP wrapper.
+            collate_fn = collate_override or self.collate_fn
+            if isinstance(collate_fn, CollatorConfig):
+                if tokenizer is None:
+                    raise ValueError("A tokenizer or processor is required to build the configured collator")
+                collate_fn = collate_fn.build(tokenizer=tokenizer)
+            if collate_fn is None:
+                if self.batch_size is None:
+                    from torch.utils.data import default_convert
+
+                    collate_fn = default_convert
+                else:
+                    from nemo_automodel.components.datasets.utils import default_collater
+
+                    collate_fn = default_collater
+            if collate_wrapper is not None:
+                collate_fn = collate_wrapper(collate_fn)
+
+            batch_sampler = None
+            if self.batch_sampler_config is not None:
+                if not isinstance(dataset, Sized):
+                    raise TypeError(
+                        f"{type(self.batch_sampler_config).__name__} requires a sized dataset, got {type(dataset).__name__}"
+                    )
+                batch_sampler = self.batch_sampler_config.build(
+                    dataset_len=len(dataset), rank=dp_rank, world_size=dp_world_size
+                )
+
+            return ParallelAwareDataloader(
+                dataset,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
+                batch_size=self.batch_size,
+                collate_fn=collate_fn,
+                batch_sampler=batch_sampler,
+                seed=self.seed,
+                shuffle=self.shuffle,
+                group_by_length=self.group_by_length,
+                pp_enabled=pp_enabled,
+                shuffle_buffer_size=self.shuffle_buffer_size,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.persistent_workers,
+                prefetch_factor=self.prefetch_factor,
+                drop_last=self.drop_last,
+            )
 
 
 __all__ = [
+    "close_dataloader",
     "CollatorConfig",
     "DatasetBuildSchedule",
     "DataloaderConfig",

@@ -343,6 +343,7 @@ class VlmDataloaderConfig:
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         pp_n_microbatches: int | None = None,
         cp_size: int = 1,
+        ignore_index: int = -100,
     ) -> VlmDataloaderBuild:
         """Build the processor, dataset wrappers, sampler, collator, and dataloader.
 
@@ -361,10 +362,13 @@ class VlmDataloaderConfig:
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
                 compact document IDs instead of a dense quadratic attention mask;
                 THD packing also accounts for per-document CP alignment.
+            ignore_index: Stream-backend label exclusion value. Native collators retain
+                their existing configured supervision policy.
 
         Returns:
             Named result containing the stateful dataloader and runtime processor.
         """
+        del ignore_index
         if self.num_workers < 0:
             raise ValueError("VLM num_workers must be zero (automatic workers) or a positive worker count.")
         dataset, processor = self._build_source(
