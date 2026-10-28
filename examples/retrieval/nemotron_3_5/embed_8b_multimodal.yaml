@@ -45,7 +45,7 @@ tokenizer:
   query_prefix: "query:"
   passage_prefix: "passage:"
   pad_to_multiple_of: 8
-  image_longest_edge: 1284
+  image_longest_edge: 1120
   do_pad: true
 
 dataset:
@@ -65,7 +65,7 @@ dataloader:
 
 step_scheduler:
   global_batch_size: 128
-  local_batch_size: 2
+  local_batch_size: 1
   num_epochs: 1
   ckpt_every_steps: 1000
 
@@ -84,7 +84,7 @@ lr_scheduler:
 distributed:
   strategy: fsdp2
   activation_checkpointing: true
-  reshard_after_forward: false
+  reshard_after_forward: true
 
 checkpoint:
   checkpoint_dir: outputs/nemotron_3_5_embed_8b

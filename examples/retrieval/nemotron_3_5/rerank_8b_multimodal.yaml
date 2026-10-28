@@ -89,7 +89,7 @@ lr_scheduler:
 distributed:
   strategy: fsdp2
   activation_checkpointing: true
-  reshard_after_forward: false
+  reshard_after_forward: true
 
 checkpoint:
   checkpoint_dir: outputs/nemotron_3_5_rerank_8b

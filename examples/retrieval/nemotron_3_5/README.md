@@ -57,11 +57,11 @@ Embedding training uses 100 warmup steps, and reranker training uses 200. Each r
 must include more optimizer steps than warmup steps. For a short validation run, add
 `--lr_scheduler.lr_warmup_steps 0` to the launch command.
 
-The embedding configuration uses an image longest-edge setting of 1,284 pixels
-and limits document sequences to 4,096 tokens. To reduce peak memory, the reranker
-uses 1,120 pixels, 3,072 tokens per query-document pair, and one query per GPU per
-micro-batch. Each query has four document candidates. Gradient accumulation
-preserves the reranker's global batch of 256 queries.
+The configurations use an image longest-edge setting of 1,120 pixels and one
+query per GPU per microbatch. The embedding configuration limits document
+sequences to 4,096 tokens. The reranker limits each query-document pair to 3,072
+tokens. Each query has four document candidates. Gradient accumulation preserves
+the configured global batch size.
 
 ## Run Training
 
@@ -81,7 +81,22 @@ Transformer Engine FusedAdam uses AdamW mode with FP32 master weights.
 Under `checkpoint.checkpoint_dir`, check `training.jsonl` for finite losses and
 advancing steps. The final checkpoint contains the model in `model/consolidated`.
 
-Adjust the learning rate, schedule, batch sizes, and sequence lengths for your data
-and hardware. Keep `global_batch_size` divisible by `local_batch_size` times the
-number of GPUs. Use `--checkpoint.checkpoint_dir` to select a new output directory
-for each run.
+## Adjust Memory and Distributed Training
+
+The configurations set `reshard_after_forward: true` to reduce peak memory on an
+eight-GPU node. FSDP2 reshards each layer after its forward pass, at the cost of
+additional parameter all-gathers during recomputation. If your GPUs have enough
+memory, setting this option to `false` can reduce communication overhead.
+
+Keep `global_batch_size` divisible by `local_batch_size` times the data-parallel
+world size. Increasing the world size reduces each FSDP2 shard and can reduce the
+number of gradient-accumulation microbatches. Reducing `local_batch_size`,
+`image_longest_edge`, and `p_max_length` or `rerank_max_length` lowers peak memory.
+Changing the global batch size also changes optimization behavior.
+
+Freezing a tower removes its gradients and optimizer state, but its weights and
+forward activations still use memory. The embedding configuration freezes the
+language model. The reranker configuration updates both towers and therefore
+requires more memory. Adjust the learning rate and schedule for your data and
+effective global batch size. Use `--checkpoint.checkpoint_dir` to select a new
+output directory for each run.
