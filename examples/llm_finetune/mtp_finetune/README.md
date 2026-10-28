@@ -9,7 +9,7 @@ accept length for a target domain without retraining the base model.
 This is **not** a separate speculative-decoding recipe or draft model (see
 `examples/speculative/` for those). MTP already trains through the standard
 `TrainFinetuneRecipeForNextTokenPrediction` recipe whenever the loaded model
-supports it — the only two pieces this directory adds are:
+supports it. The only two pieces this directory adds are:
 
 1. **`freeze_config`** to freeze everything except the MTP block, so training
    only touches the MTP depths:
