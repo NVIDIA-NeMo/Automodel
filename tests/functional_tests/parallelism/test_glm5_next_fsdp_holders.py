@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-rank numerical regression for GLM-5.3's FP32-holder FSDP policy under EP2 x DP2."""
+"""Two-rank numerical regression for GLM-5.3's FP32-holder FSDP policy under EP2 x DP2.
+
+The model stores BF16 weights with FP32 mHC/KDA holders, as in training, so FSDP splits the
+holders into their own units through the GLM sidecar. The reference is an unsharded copy with
+the same dtypes; BF16 accumulation order bounds the agreement.
+"""
 
 from __future__ import annotations
 
@@ -60,6 +65,24 @@ def _full(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
 
 
+def _assert_relative(observed: torch.Tensor, reference: torch.Tensor, name: str, rms: float, worst: float) -> None:
+    """Bound RMS and worst-case error relative to the reference's RMS.
+
+    Args:
+        observed: Full (unsharded) tensor of any shape.
+        reference: Reference tensor with the same shape and dtype.
+        name: Label used in assertion messages.
+        rms: Maximum relative RMS error.
+        worst: Maximum relative worst-case error.
+    """
+    assert observed.shape == reference.shape and observed.dtype == reference.dtype, name
+    assert torch.isfinite(observed).all(), name
+    scale = reference.double().square().mean().sqrt().clamp_min(1e-12)
+    error = observed.double() - reference.double()
+    assert error.square().mean().sqrt() / scale <= rms, (name, float(error.square().mean().sqrt() / scale))
+    assert error.abs().max() / scale <= worst, (name, float(error.abs().max() / scale))
+
+
 def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
     try:
         os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(_WORLD_SIZE))
@@ -73,11 +96,11 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
         config.text_config.linear_head_dim = 32
         config.text_config.hc_mult = 4
         model = Glm5NextForConditionalGeneration(config, backend=tiny_backend(adapter=False))
-        model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+        model.initialize_weights(torch.device("cpu"), dtype=torch.bfloat16)
         model.to(device)
         reference = copy.deepcopy(model)
         mesh_context = MeshContext.build(
-            FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)),
+            FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)),
             ParallelismSizes(dp_size=_WORLD_SIZE, ep_size=_WORLD_SIZE),
             moe_parallel_config=MoEParallelizerConfig(reshard_after_forward=True),
             activation_checkpointing=activation_checkpointing,
@@ -86,6 +109,9 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
         model = PARALLELIZER.parallelize(model, mesh_context)
         holder_names = {_strip(name) for name, module in model.named_modules() if isinstance(module, _HOLDERS)}
         assert holder_names, "the tiny model must contain mHC and KDA FP32 holders"
+        for name, module in model.named_modules():
+            if isinstance(module, _HOLDERS):
+                assert all(p.dtype == torch.float32 for p in module.parameters()), name
 
         # Every rank draws the same global batch [rows, sequence]; each owns two rows, one per microbatch.
         torch.manual_seed(307)
@@ -130,7 +156,7 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
             local_loss += loss.detach()
             (loss * _WORLD_SIZE).backward()
         dist.all_reduce(local_loss)
-        torch.testing.assert_close(local_loss, reference_loss, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(local_loss, reference_loss, rtol=1e-2, atol=1e-3)
 
         actual_norm = scale_grads_and_clip_grad_norm(
             _MAX_NORM,
@@ -141,7 +167,7 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
             num_label_tokens=count,
             dp_group_size=_WORLD_SIZE,
         )
-        torch.testing.assert_close(actual_norm.float(), expected_norm, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual_norm.float(), expected_norm, rtol=2e-2, atol=1e-4)
 
         expected = dict(reference.named_parameters())
         compared_holders = set()
@@ -151,9 +177,8 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
             if parameter.grad is None:
                 continue
             assert parameter.grad.dtype == reference_parameter.grad.dtype, name
-            torch.testing.assert_close(
-                _full(parameter.grad), reference_parameter.grad, rtol=1e-4, atol=1e-6, msg=lambda m: f"{name}: {m}"
-            )
+            # A holder gradient reduced twice (or not at all) would be off by 100%.
+            _assert_relative(_full(parameter.grad), reference_parameter.grad, name, rms=0.02, worst=0.2)
             compared_holders.update(holder for holder in holder_names if _strip(name).startswith(holder + "."))
         assert compared_holders == holder_names, holder_names - compared_holders
 
@@ -162,9 +187,7 @@ def _worker(rank: int, port: int, activation_checkpointing: bool) -> None:
         optimizer.step()
         reference_optimizer.step()
         for name, parameter in model.named_parameters():
-            torch.testing.assert_close(
-                _full(parameter.detach()), expected[_strip(name)].detach(), rtol=1e-5, atol=1e-6, msg=name
-            )
+            _assert_relative(_full(parameter.detach()), expected[_strip(name)].detach(), name, rms=0.01, worst=0.05)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
