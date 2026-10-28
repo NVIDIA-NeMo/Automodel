@@ -4,7 +4,6 @@
 """GLM pipeline stage, packed microbatch and vision regression tests."""
 
 import copy
-from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
@@ -15,14 +14,6 @@ from nemo_automodel.components.models.glm5_next.cp import Glm5NextPackedContext
 from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
 from nemo_automodel.components.moe.parallelizer import apply_ac
 from tests.unit_tests.models.glm5_next.conftest import tiny_glm5_next_model
-
-
-@pytest.fixture(autouse=True)
-def single_cpu_thread() -> Iterator[None]:
-    previous = torch.get_num_threads()
-    torch.set_num_threads(1)
-    yield
-    torch.set_num_threads(previous)
 
 
 def split_stages(model: Glm5NextForConditionalGeneration, count: int) -> list[Glm5NextForConditionalGeneration]:
