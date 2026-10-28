@@ -95,9 +95,9 @@ packed_sequence:
   max_length: 2048
   pack_size: 2048
   collate_max_length: 2048
-  # Image tokens are now estimated from image sizes, which fills packs about twice as full
-  # as the old 500-token fallback; 0.5 keeps the memory this recipe was tuned for.
-  packing_ratio: 0.5
+  # Image tokens are now counted from image sizes rather than a flat 500 per image, so the
+  # same ratio packs more samples; 0.6 keeps the pack fill this recipe was tuned with.
+  packing_ratio: 0.6
   drop_long_samples: true
   balance_media_tokens: true
   packing_format: thd

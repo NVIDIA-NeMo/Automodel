@@ -82,9 +82,7 @@ packed_sequence:
   pretokenize: true
   max_length: 16384
   pack_size: 16384
-  # Image tokens are now estimated from image sizes, which fills packs about twice as full
-  # as the old 500-token fallback; 0.5 keeps the memory this recipe was tuned for.
-  packing_ratio: 0.5
+  packing_ratio: 0.9
   drop_long_samples: true
   post_tokenize_hook_fn: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_inject_thinking_prefix
 
