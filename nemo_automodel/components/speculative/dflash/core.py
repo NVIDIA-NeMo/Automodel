@@ -21,11 +21,21 @@ per anchor (the block's first token is the real anchor token, the rest are
 computes a block-wise cross-entropy loss against the ground-truth continuation
 of each anchor.
 
-Two training objectives are supported via ``loss_type``:
+Three training objectives are supported via ``loss_type``:
 
 * ``"dflash"`` (default): the DFlash paper's fixed-anchor objective. Only block
   position 0 is a real token; positions ``1..block_size-1`` are supervised with
   the decay-weighted CE of Eq. 4 (``w_k = exp(-(k-1)/gamma)``).
+* ``"dpace*"``: the D-PACE objective (arXiv:2605.18810). Same fixed-anchor block
+  as ``"dflash"``, but the CE is reweighted by detached Dynamic Position-Aware
+  weights built from the draft's own confidence (see ``DFlashDecayLoss``);
+  ``dpace_alpha`` smooths those confidence products. Its ``normalize="mean"``
+  denominator is ``batch_size * num_anchors`` (the *configured* block-sampling
+  budget passed as ``total_blocks``), not the batch's achieved sampled-block
+  count -- that count is ``min(num_anchors, valid_anchors_in_batch)``, which
+  varies with each micro-batch's own content and therefore differs across DP
+  ranks, desyncing the averaged gradient if used directly (see
+  ``DFlashDecayLoss._mean_denominator``).
 * ``"variable_prefix"``: the D2SD VP-Drafter objective (arXiv:2606.04446). Each
   block draws a visible-prefix length ``l`` from a truncated geometric prior
   (``Pr(l) ~ prefix_weight_base ** l``), positions ``< l`` are filled with the
@@ -51,7 +61,7 @@ from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
-from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+from nemo_automodel.components.loss.loss import DFlashDecayLossConfig
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
@@ -104,9 +114,14 @@ class DFlashStepMetrics:
         accept_len_sum: Scalar tensor containing the additive acceptance-length sum.
         valid_blocks: Scalar tensor containing the number of evaluated draft blocks.
 
-    The count and sum fields retain the additive statistics needed for
-    token-weighted, distributed validation. Averaging ``accuracy`` or
-    ``accept_len`` per micro-batch would bias batches with fewer valid tokens or blocks.
+    ``correct_tokens`` and ``valid_tokens`` are the raw per-rank counts behind
+    ``accuracy``. Recipes log the global accuracy by SUM-reducing both across the
+    DP group and dividing once; a mean of the per-rank ``accuracy`` ratios would
+    be biased whenever ``valid_tokens`` differs across ranks (it always does --
+    anchors are sampled per sample). The count and sum fields retain the additive
+    statistics needed for token-weighted, distributed validation. Averaging
+    ``accuracy`` or ``accept_len`` per micro-batch would bias batches with fewer
+    valid tokens or blocks.
     """
 
     loss: torch.Tensor
@@ -165,9 +180,6 @@ def compute_acceptance_stats(
     return accept_len, accept_len_sum, valid_blocks
 
 
-_DFLASH_LOSS_TYPES = ("dflash", "variable_prefix")
-
-
 class DFlashTrainerModule(nn.Module):
     """DFlash online training wrapper with block-wise CE loss."""
 
@@ -184,10 +196,15 @@ class DFlashTrainerModule(nn.Module):
         loss_type: str = "dflash",
         prefix_weight_base: float = 0.9,
         sliding_window: int | None = None,
+        # dpace_alpha is the only parameter this PR actually adds; it is
+        # appended after every pre-existing parameter (including loss_type and
+        # prefix_weight_base, both predating D-PACE) and keyword-only, so an
+        # old positional caller's arguments keep binding to what they always
+        # bound to.
+        *,
+        dpace_alpha: float = 0.5,
     ):
         super().__init__()
-        if loss_type not in _DFLASH_LOSS_TYPES:
-            raise ValueError(f"loss_type must be one of {_DFLASH_LOSS_TYPES}, got {loss_type!r}")
         if prefix_weight_base <= 0:
             raise ValueError(f"prefix_weight_base must be > 0, got {prefix_weight_base}")
         self.draft_model = draft_model
@@ -212,17 +229,27 @@ class DFlashTrainerModule(nn.Module):
         self.sliding_window = sliding_window
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
+        self.dpace_alpha = float(dpace_alpha)
         self.prefix_weight_base = float(prefix_weight_base)
         # Smallest visible-prefix length variable-prefix training samples (and the
         # slice point of its loss); single source of truth for both methods.
         self._min_prefix = min(2, block_size - 1)
 
-        # Block-wise decay-weighted CE for the fixed-anchor objective.
-        # ``normalize="mean"`` gives a local per-micro-batch decay-weighted mean;
-        # ``loss_decay_gamma=None`` disables decay (uniform weights). The
-        # variable-prefix objective needs per-block data-dependent weights and
-        # computes its loss inline instead (see _variable_prefix_loss).
-        self.loss_fn = DFlashDecayLoss(loss_gamma=loss_decay_gamma, normalize="mean") if loss_type == "dflash" else None
+        # Block-wise decay-weighted CE for the fixed-anchor objectives (``dflash``
+        # and the D-PACE variants). ``normalize="mean"`` gives a local per-micro-batch
+        # decay-weighted mean; ``loss_decay_gamma=None`` disables decay (uniform
+        # weights). The variable-prefix objective needs per-block data-dependent
+        # weights and computes its loss inline instead (see _variable_prefix_loss).
+        self.loss_fn = (
+            None
+            if loss_type == "variable_prefix"
+            else DFlashDecayLossConfig(
+                loss_gamma=loss_decay_gamma,
+                normalize="mean",
+                loss_type=loss_type,
+                dpace_alpha=dpace_alpha,
+            ).build()
+        )
 
         # Per-block offset constant (block_size,) for label gathering / position ids.
         self.register_buffer("_block_offsets", torch.arange(block_size).view(1, 1, -1), persistent=False)
@@ -528,6 +555,35 @@ class DFlashTrainerModule(nn.Module):
             )
         return anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, prefix_lengths
 
+    @staticmethod
+    def _resolve_supervision_ids(input_ids: torch.Tensor, label_ids: torch.Tensor | None) -> torch.Tensor:
+        """Validate the optional label stream and return the supervised token ids.
+
+        Args:
+            input_ids: Long tensor of shape ``[batch, sequence]``; the context tokens.
+            label_ids: Long tensor of shape ``[batch, sequence]`` on the same device
+                as ``input_ids``, indexed like ``input_ids`` (unshifted) and holding
+                valid vocabulary ids everywhere, or ``None`` to supervise ``input_ids``.
+                Values are not range-checked here, to avoid a device sync.
+
+        Returns:
+            ``label_ids`` when given, else ``input_ids``; shape ``[batch, sequence]``.
+
+        Raises:
+            ValueError: If ``label_ids`` differs from ``input_ids`` in shape, dtype, or device.
+        """
+        if label_ids is None:
+            return input_ids
+        if label_ids.shape != input_ids.shape:
+            raise ValueError(
+                f"label_ids must match input_ids shape {tuple(input_ids.shape)}, got {tuple(label_ids.shape)}"
+            )
+        if label_ids.dtype != input_ids.dtype:
+            raise ValueError(f"label_ids must have dtype {input_ids.dtype}, got {label_ids.dtype}")
+        if label_ids.device != input_ids.device:
+            raise ValueError(f"label_ids must be on {input_ids.device}, got {label_ids.device}")
+        return label_ids
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -536,6 +592,7 @@ class DFlashTrainerModule(nn.Module):
         position_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
         doc_remaining: torch.Tensor | None = None,
+        label_ids: torch.Tensor | None = None,
     ) -> DFlashStepMetrics:
         """Parallel block-wise training forward pass.
 
@@ -544,8 +601,30 @@ class DFlashTrainerModule(nn.Module):
         keeps every block inside one document: anchors are constrained so the block
         does not cross a boundary, the block's context prefix attends only within the
         anchor's document, and the draft's RoPE uses the per-document positions.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence]; the context tokens.
+            hidden_states: Tensor of shape [batch, sequence, layers * hidden]; the
+                captured target-model context features.
+            loss_mask: Tensor of shape [batch, sequence]; the supervised-token mask.
+            position_ids: Long tensor of shape [batch, sequence] with per-document
+                reset positions under packing, or ``None``.
+            seq_lens: Long tensor of shape [batch, max_docs] with packed document
+                lengths, or ``None`` when unpacked.
+            doc_remaining: Long tensor of shape [batch, sequence]; real tokens left
+                in each position's document, or ``None`` when unpacked.
+            label_ids: Optional long tensor with the shape, dtype and device of
+                ``input_ids``; ``label_ids[:, t]`` is the unshifted supervision
+                token for position ``t``. Every entry must be a valid vocabulary
+                id; exclude positions with ``loss_mask``, not ``-100``. Context,
+                clean anchors and visible ``variable_prefix`` tokens still use
+                ``input_ids``; ``None`` supervises ``input_ids``.
+
+        Returns:
+            DFlashStepMetrics for this micro-batch.
         """
         bsz, seq_len = input_ids.shape
+        supervision_ids = self._resolve_supervision_ids(input_ids, label_ids)
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, prefix_lengths = (
             self._prepare_block_inputs(
@@ -570,38 +649,41 @@ class DFlashTrainerModule(nn.Module):
 
         # Block position k predicts the token at anchor + k.
         _, target_ids, block_mask = self._build_block_targets(
-            input_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
+            supervision_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
         )
 
         if self.loss_type == "variable_prefix":
             return self._variable_prefix_loss(logits.view(bsz, n, bs, -1), target_ids, block_mask, prefix_lengths)
 
         # Drop block position 0 (the clean anchor token, never a target); the
-        # remaining bs-1 predicted positions are what the loss supervises.
-        pred_logits = logits.view(bsz, n, bs, -1)[:, :, 1:, :].reshape(bsz, n * (bs - 1), -1)
-        pred_targets = target_ids[:, :, 1:].reshape(bsz, n * (bs - 1))
-        pred_mask = block_mask[:, :, 1:].reshape(bsz, n * (bs - 1))
+        # remaining bs-1 predicted positions are what the loss supervises. The
+        # [bsz, n, bs-1, ...] block layout is kept (not flattened) so the loss's
+        # per-block confidence reset is structural.
+        pred_logits = logits.view(bsz, n, bs, -1)[:, :, 1:, :]  # [bsz, n, bs-1, V]
+        pred_targets = target_ids[:, :, 1:]  # [bsz, n, bs-1]
+        pred_mask = block_mask[:, :, 1:]  # [bsz, n, bs-1]
 
         loss_fn = self.loss_fn
-        assert loss_fn is not None, "loss_fn is always constructed for loss_type='dflash'"
-        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs)
+        assert loss_fn is not None, "loss_fn is constructed for every loss_type except 'variable_prefix'"
+        # total_blocks=self.num_anchors: see the "dpace*" bullet above.
+        loss_details = loss_fn.forward_with_token_nll(
+            pred_logits, pred_targets, pred_mask, num_tokens=None, total_blocks=self.num_anchors
+        )
+        loss_out = loss_details.output
 
-        loss_weights = pred_mask.view(bsz, n, bs - 1)
-        if self.loss_decay_gamma is not None:
-            depth_weights = torch.exp(
-                -torch.arange(bs - 1, device=pred_mask.device, dtype=pred_mask.dtype) / self.loss_decay_gamma
-            )
-            loss_weights = loss_weights * depth_weights
-        loss_weight = loss_weights.sum()
+        # The loss reports the exact denominator it divided by (batch * blocks for
+        # D-PACE, the effective decay-weight sum for dflash), so read it directly --
+        # the metric can never drift from the loss's own normalization.
+        loss_weight = loss_details.denominator
 
         count_per_pos = loss_out.draft_count_per_pos
         valid_tokens = count_per_pos.sum()
         correct_tokens = loss_out.draft_correct_per_pos.sum()
         accuracy = correct_tokens / valid_tokens.clamp_min(1)
         accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(
-            pred_logits.argmax(dim=-1).view(bsz, n, bs - 1),
-            pred_targets.view(bsz, n, bs - 1),
-            pred_mask.view(bsz, n, bs - 1).bool(),
+            loss_details.pred_ids,
+            pred_targets,
+            pred_mask.bool(),
         )
 
         return DFlashStepMetrics(
@@ -668,15 +750,15 @@ class DFlashTrainerModule(nn.Module):
 
         valid_tokens = supervised.sum()
         pred_ids = logits.argmax(dim=-1)
-        correct = ((pred_ids == target_ids).float() * supervised).sum()
-        accuracy = correct / valid_tokens.clamp_min(1)
+        correct_tokens = ((pred_ids == target_ids).float() * supervised).sum()
+        accuracy = correct_tokens / valid_tokens.clamp_min(1)
         accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(pred_ids, target_ids, supervised.bool())
         return DFlashStepMetrics(
             loss=loss,
             loss_weight=weights.sum().detach(),
             accuracy=accuracy.detach(),
             valid_tokens=valid_tokens.detach(),
-            correct_tokens=correct.detach(),
+            correct_tokens=correct_tokens.detach(),
             accept_len=accept_len.detach(),
             accept_len_sum=accept_len_sum.detach(),
             valid_blocks=valid_blocks.detach(),

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from typing import Literal
 
 import pytest
 import torch
@@ -190,6 +191,25 @@ class TestBackendConfigHybridEP:
         """Test that dispatcher_num_sms accepts a custom value."""
         config = BackendConfig(dispatcher="hybridep", dispatcher_num_sms=24)
         assert config.dispatcher_num_sms == 24
+
+    def test_hybridep_kernel_tuning_options(self):
+        """HybridEP constructor tuning accepts explicit block counts."""
+        config = BackendConfig(
+            dispatcher="hybridep",
+            dispatcher_hybridep_num_sms_preprocessing=132,
+            dispatcher_hybridep_num_blocks_permute=112,
+            dispatcher_hybridep_num_blocks_unpermute=112,
+        )
+        assert config.dispatcher_hybridep_num_sms_preprocessing == 132
+        assert config.dispatcher_hybridep_num_blocks_permute == 112
+        assert config.dispatcher_hybridep_num_blocks_unpermute == 112
+
+    def test_hybridep_compact_routing_is_opt_in(self):
+        default = BackendConfig(dispatcher="hybridep")
+        compact = BackendConfig(dispatcher="hybridep", dispatcher_hybridep_compact_routing=True)
+
+        assert default.dispatcher_hybridep_compact_routing is False
+        assert compact.dispatcher_hybridep_compact_routing is True
 
     def test_dispatcher_share_token_dispatcher_default(self):
         """Test that dispatcher_share_token_dispatcher defaults to enabled."""
@@ -487,3 +507,93 @@ class TestBackendConfigPartialCudaGraphs:
                 dispatcher="deepep",
                 cuda_graph=CudaGraphConfig(modules=["moe_router", "moe_preprocess"]),
             )
+
+
+@pytest.mark.parametrize("experts,dispatcher", [("torch", "torch"), ("torch_mm", "deepep")])
+def test_native_te_grouped_tensor_rejects_other_expert_backends(
+    experts: Literal["torch", "torch_mm"], dispatcher: Literal["torch", "deepep"]
+) -> None:
+    with pytest.raises(ValueError, match="te_grouped_tensor=True requires experts='te'"):
+        BackendConfig(experts=experts, dispatcher=dispatcher, te_grouped_tensor=True)
+
+
+@pytest.mark.parametrize("dispatcher", ["torch", "mok"])
+def test_native_te_grouped_tensor_rejects_unsupported_dispatchers(dispatcher: Literal["torch", "mok"]) -> None:
+    with pytest.raises(ValueError, match="te_grouped_tensor=True requires dispatcher=") as exc_info:
+        BackendConfig(experts="te", dispatcher=dispatcher, te_grouped_tensor=True)
+
+    assert f"got dispatcher='{dispatcher}'" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("dispatcher", ["deepep", "hybridep", "uccl_ep"])
+def test_native_te_grouped_tensor_is_opt_in(dispatcher: Literal["deepep", "hybridep", "uccl_ep"]) -> None:
+    assert not BackendConfig(experts="te", dispatcher=dispatcher).te_grouped_tensor
+    config = BackendConfig(experts="te", dispatcher=dispatcher, te_grouped_tensor=True)
+    assert config.te_grouped_tensor
+    assert config.experts == "te"
+    assert config.dispatcher == dispatcher
+
+
+class TestBackendConfigHybridEPSyncFree:
+    """The two HybridEP sync-free knobs default off, pass through unchanged, and are HybridEP-only."""
+
+    def test_dispatcher_capacity_factor_defaults_off(self):
+        assert BackendConfig().dispatcher_capacity_factor is None
+        config = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_capacity_factor=1.5)
+        assert config.dispatcher_capacity_factor == 1.5
+
+    def test_dispatcher_equal_token_counts_defaults_off(self):
+        assert BackendConfig().dispatcher_equal_token_counts is False
+        config = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_equal_token_counts=True)
+        assert config.dispatcher_equal_token_counts is True
+
+    @pytest.mark.parametrize("dispatcher", ["torch", "deepep"])
+    @pytest.mark.parametrize(
+        "knob",
+        [{"dispatcher_capacity_factor": 1.5}, {"dispatcher_equal_token_counts": True}],
+        ids=["capacity", "equal"],
+    )
+    def test_sync_free_knobs_require_hybridep(self, dispatcher, knob):
+        with pytest.raises(ValueError, match="require dispatcher='hybridep'"):
+            BackendConfig(experts="torch_mm", dispatcher=dispatcher, **knob)
+
+    def test_capacity_factor_below_one_is_rejected(self):
+        with pytest.raises(ValueError, match="must be >= 1.0"):
+            BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_capacity_factor=0.5)
+
+    def test_capacity_factor_with_static_routing_is_rejected(self):
+        """The pinned static count already keeps the dispatch non-blocking; the factor would be silently unused."""
+        with pytest.raises(ValueError, match="no effect under benchmark_static_routing"):
+            BackendConfig(
+                experts="torch_mm",
+                dispatcher="hybridep",
+                fake_balanced_gate=True,
+                benchmark_static_routing=True,
+                dispatcher_capacity_factor=1.5,
+            )
+
+
+class TestDispatcherRecomputeCache:
+    """BackendConfig.dispatcher_recompute_cache: HybridEP-only recompute cache of the MoE combine output."""
+
+    def test_default_is_none(self):
+        assert BackendConfig().dispatcher_recompute_cache == "none"
+
+    @pytest.mark.parametrize("value", ["combine", "moe_tail"])
+    def test_accepts_the_two_modes_with_hybridep_and_torch_mm(self, value):
+        config = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache=value)
+        assert config.dispatcher_recompute_cache == value
+
+    def test_rejects_unknown_value(self):
+        with pytest.raises(ValueError, match="dispatcher_recompute_cache must be one of"):
+            BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache="all")
+
+    def test_requires_hybridep(self):
+        with pytest.raises(ValueError, match="dispatcher_recompute_cache requires dispatcher='hybridep'"):
+            BackendConfig(experts="torch_mm", dispatcher="deepep", dispatcher_recompute_cache="combine")
+
+    def test_moe_tail_requires_torch_mm_experts(self):
+        with pytest.raises(ValueError, match="moe_tail' requires experts='torch_mm'"):
+            BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="moe_tail")
+        # the combine cache alone does not care about the expert kernel
+        assert BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="combine")

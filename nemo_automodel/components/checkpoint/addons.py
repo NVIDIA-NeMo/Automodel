@@ -16,6 +16,7 @@ import glob
 import json
 import os
 import shutil
+from dataclasses import fields
 from typing import TYPE_CHECKING, Protocol
 
 import torch
@@ -35,6 +36,7 @@ from nemo_automodel.components.moe.state_dict_mixin import (
     MoESplitExpertsStateDictMixin,
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.peft_config import PeftConfig as _AutomodelPeftConfig
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -137,8 +139,9 @@ class _ConsolidatedHFMetadataExporter(Protocol):
         hf_metadata_dir: str,
         tokenizer: object,
         original_model_path: str | None,
+        v4_compatible: bool,
     ) -> None:
-        """Write model-specific metadata into the shared Hugging Face metadata directory."""
+        """Write model-specific metadata, honoring the requested v4 config layout."""
         ...
 
 
@@ -161,6 +164,7 @@ class ConsolidatedHFAddon:
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
             original_model_path (str | None): Authoritative source checkpoint snapshot.
+            v4_compatible (bool): Preserve the source config beside the generated v5 config when available.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
@@ -194,6 +198,7 @@ class ConsolidatedHFAddon:
                     hf_metadata_dir=hf_metadata_dir,
                     tokenizer=tokenizer,
                     original_model_path=original_model_path,
+                    v4_compatible=kwargs.get("v4_compatible", False),
                 )
             else:
                 _save_generated_hf_assets(
@@ -378,7 +383,7 @@ def _get_paramwrapper_layout_stamp(adapter, v4_compatible: bool, legacy_paramwra
     return _PARAMWRAPPER_LAYOUT_LEGACY if legacy_paramwrapper_layout else _PARAMWRAPPER_LAYOUT_MODERN
 
 
-def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
+def _get_automodel_peft_metadata(peft_config: _AutomodelPeftConfig) -> dict:
     """
     Get the PEFT metadata in the format expected by Automodel.
 
@@ -391,13 +396,36 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     """
     PEFT_KEYS = {"dim", "alpha"}
     result = {}
-    for k, v in peft_config.to_dict().items():
-        if k in PEFT_KEYS:
+    for config_field in fields(peft_config):
+        if config_field.name in PEFT_KEYS:
             continue
+        v = getattr(peft_config, config_field.name)
         if isinstance(v, torch.dtype):
             v = str(v)
-        result[k] = v
+        result[config_field.name] = v
     return result
+
+
+def load_automodel_peft_config_dict(model_path: str) -> dict:
+    """Read back the PEFT configuration ``PeftAddon`` saved in a ``model/`` checkpoint directory.
+
+    ``automodel_peft_config.json`` holds every ``PeftConfig`` field except ``dim`` and ``alpha``, which are taken
+    from the PEFT ``adapter_config.json`` (``r`` / ``lora_alpha``).
+
+    Args:
+        model_path: The checkpoint's ``model/`` directory.
+
+    Returns:
+        Constructor kwargs for ``PeftConfig``, excluding checkpoint-only metadata
+        such as the expert ParamWrapper layout stamp.
+    """
+    with open(os.path.join(model_path, "automodel_peft_config.json")) as f:
+        metadata = json.load(f)
+    with open(os.path.join(model_path, "adapter_config.json")) as f:
+        hf_config = json.load(f)
+    config_fields = {field.name for field in fields(_AutomodelPeftConfig)}
+    config = {key: value for key, value in metadata.items() if key in config_fields}
+    return {**config, "dim": hf_config["r"], "alpha": hf_config["lora_alpha"]}
 
 
 def _has_trainable_moe_lora_parameters(
@@ -696,8 +724,11 @@ def _maybe_save_custom_model_code(
     hub id (e.g. ``nvidia/Nemotron-Flash-1B``) and the loaded model has ``auto_map`` custom
     code, copy the ``.py`` files from the cached ``transformers_modules`` directory so the
     consolidated checkpoint carries ``modeling_*.py`` locally and reloads without needing
-    ``trust_remote_code=True``.
+    ``trust_remote_code=True``. Models marked for stock export intentionally skip this copy.
     """
+    if model_part is not None and getattr(model_part, "_export_as_stock_model", False):
+        return
+
     copied: set[str] = set()
 
     def _copy_py_tree(src_dir: str) -> None:

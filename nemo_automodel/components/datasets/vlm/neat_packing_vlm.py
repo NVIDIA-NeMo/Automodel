@@ -58,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 MEDIA_KEYS = (
     "pixel_values",
+    "patch_pixel_values",
+    "num_patches",
     "image_grid_thw",
     "image_position_ids",
     "pixel_values_videos",
@@ -386,6 +388,8 @@ def _build_packed_vlm_sample(
     seq_lens_padded: list[int] = []
 
     pixel_values_list: list[torch.Tensor | list[torch.Tensor]] = []
+    patch_pixel_values_list: list[torch.Tensor] = []
+    num_patches_list: list[torch.Tensor] = []
     image_grid_thw_list: list[torch.Tensor] = []
     image_position_ids_list: list[torch.Tensor] = []
     pixel_values_videos_list: list[torch.Tensor] = []
@@ -425,6 +429,10 @@ def _build_packed_vlm_sample(
 
         if "pixel_values" in sample and sample["pixel_values"] is not None:
             pixel_values_list.append(sample["pixel_values"])
+        if "patch_pixel_values" in sample and sample["patch_pixel_values"] is not None:
+            patch_pixel_values_list.append(sample["patch_pixel_values"])
+        if "num_patches" in sample and sample["num_patches"] is not None:
+            num_patches_list.append(torch.as_tensor(sample["num_patches"], dtype=torch.long))
         if "image_grid_thw" in sample and sample["image_grid_thw"] is not None:
             n_images += sample["image_grid_thw"].shape[0]
             image_grid_thw_list.append(sample["image_grid_thw"])
@@ -469,6 +477,10 @@ def _build_packed_vlm_sample(
         raise TypeError("Packed VLM pixel_values must be consistently tensors or variable-resolution lists.")
     else:
         packed["pixel_values"] = None
+    if patch_pixel_values_list:
+        packed["patch_pixel_values"] = torch.cat(patch_pixel_values_list, dim=0)
+    if num_patches_list:
+        packed["num_patches"] = torch.cat(num_patches_list, dim=0)
     packed["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0) if image_grid_thw_list else None
     packed["image_position_ids"] = torch.cat(image_position_ids_list, dim=0) if image_position_ids_list else None
     packed["pixel_values_videos"] = torch.cat(pixel_values_videos_list, dim=0) if pixel_values_videos_list else None
@@ -660,7 +672,7 @@ class NeatPackConfig:
     collate_max_length: int | None = None
     """Optional maximum padded length used by the packed collator."""
     attn_implementation: str | None = None
-    """Optional packed-mask backend override used only with context parallelism."""
+    """Deprecated packed-mask backend override retained for Python compatibility."""
     packing_format: Literal["neat", "thd"] = "neat"
     """Packed collator format. ``thd`` emits Transformer Engine sequence metadata."""
 

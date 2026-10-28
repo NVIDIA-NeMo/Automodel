@@ -22,9 +22,9 @@ import logging
 import os
 import shutil
 import tempfile
-import threading
 import time
-from contextlib import contextmanager
+
+from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
 
 try:
     from deep_ep import Buffer
@@ -52,67 +52,12 @@ except ImportError:
 # Recording is scoped to one checkpoint frame: the AC wrapper builds a recorder
 # per checkpointed call, the forward appends each dispatch's handle and routing
 # metadata in call order, and the recompute consumes them in the same order.
-# Only the handle and the (small) per-token routing metadata are retained --
-# the dispatched activations themselves are still re-communicated, so the
-# memory that activation checkpointing saves is preserved.
-class DispatchReplayRecorder:
-    """Per-checkpoint-frame log of DeepEP dispatch results, replayed on recompute."""
-
-    def __init__(self) -> None:
-        self._records: list = []
-        self._cursor = 0
-        self.replay_misses = 0
-
-    def record(self, entry) -> None:
-        self._records.append(entry)
-
-    def take(self):
-        """Next recorded dispatch, or None when the replay outruns the log."""
-        if self._cursor >= len(self._records):
-            # Recompute issued more dispatches than the forward did. Fall back to
-            # a full dispatch rather than replaying a mismatched layout.
-            self.replay_misses += 1
-            return None
-        entry = self._records[self._cursor]
-        self._cursor += 1
-        return entry
-
-    def rewind(self) -> None:
-        self._cursor = 0
-
-
-class _DispatchReplayState(threading.local):
-    """Thread-local replay binding. ``threading.local`` runs ``__init__`` once per
-    thread, so both attributes always exist on every thread that touches it."""
-
-    def __init__(self) -> None:
-        self.recorder: DispatchReplayRecorder | None = None
-        self.mode: str | None = None
-
-
-_dispatch_replay_state = _DispatchReplayState()
-
-
-def _replay_mode() -> str | None:
-    return _dispatch_replay_state.mode
-
-
-def _active_recorder() -> "DispatchReplayRecorder | None":
-    return _dispatch_replay_state.recorder
-
-
-@contextmanager
-def dispatch_replay_scope(recorder: "DispatchReplayRecorder | None", mode: str):
-    """Bind ``recorder`` for the enclosed region. ``mode`` is 'record' or 'replay'."""
-    prev_recorder = _dispatch_replay_state.recorder
-    prev_mode = _dispatch_replay_state.mode
-    _dispatch_replay_state.recorder = recorder
-    _dispatch_replay_state.mode = mode if recorder is not None else None
-    try:
-        yield
-    finally:
-        _dispatch_replay_state.recorder = prev_recorder
-        _dispatch_replay_state.mode = prev_mode
+# Checkpoint-recompute replay of DeepEP dispatch layouts. Entries are
+# (handle, recv_token_indices, recv_token_probs, tokens_per_expert): only the
+# handle and the (small) per-token routing metadata are retained -- the
+# dispatched activations themselves are still re-communicated, so the memory
+# that activation checkpointing saves is preserved.
+deepep_dispatch_replay: RecomputeReplay[tuple] = RecomputeReplay("DeepEP dispatch")
 
 
 try:
@@ -139,64 +84,151 @@ _uccl_buffer = None
 logger = logging.getLogger(__name__)
 
 
-class HybridEPDispatchReplayRecorder:
-    """Record HybridEP layouts from checkpoint forward for deterministic replay."""
+class HybridEPDispatchReplayRecorder(RecomputeReplayRecorder[list]):
+    """Record HybridEP layouts from checkpoint forward for deterministic replay.
+
+    Entries are ``[handle, tokens_per_expert, num_permuted_tokens]``. HybridEP's
+    sync-free replay API expects the dispatched-token extent as a host integer.
+    Reading it with ``.item()`` right after every checkpointed block stalls the host
+    until the GPU has drained that block, once per layer per microbatch; on a
+    pipeline-parallel step those stalls surface as idle GPU time. The recorder
+    therefore splits the read in two: :meth:`finalize` (run when the
+    checkpoint-forward op context exits) runs the reduction and starts an
+    asynchronous device-to-host copy, and :meth:`resolve` (run when the recompute
+    context opens, long after the copy completed) turns the pinned scalars into
+    integers. Neither step runs inside a checkpoint op context, so the forward and
+    recompute traces stay identical.
+    """
 
     def __init__(self) -> None:
-        self._records: list = []
-        self._cursor = 0
-        self.replay_misses = 0
+        super().__init__()
+        self._copies: list = []
 
-    def record(self, handle, tokens_per_expert) -> None:
-        self._records.append([handle, tokens_per_expert, None])
+    def record(self, entry: list) -> None:
+        """Log one checkpoint-forward dispatch as ``[handle, tokens_per_expert, num_permuted_tokens]``.
+
+        When the forward already ran with a host ``int`` extent (capacity mode), that integer is
+        the extent its output was sized to and the one the replay must reuse; recording it also
+        spares ``finalize`` the device-to-host copy for that dispatch (a pre-filled extent is skipped).
+
+        Args:
+            entry: ``handle`` is the HybridEP dispatch handle the recompute replays from;
+                ``tokens_per_expert`` the ``[num_local_experts]`` integer tensor of rows per local
+                expert, whose sum ``finalize`` copies to the host asynchronously when no host extent
+                is recorded; ``num_permuted_tokens`` the host ``int`` extent the forward output was
+                sized to (capacity mode), or a tensor / ``None`` (blocking path, static-routing pin)
+                when ``finalize`` must reduce it.
+        """
+        handle, tokens_per_expert, num_permuted_tokens = entry
+        extent = num_permuted_tokens if isinstance(num_permuted_tokens, int) else None
+        super().record([handle, tokens_per_expert, extent])
+        self._copies.append(None)
 
     def finalize(self) -> None:
-        """Cache each layout extent after the checkpoint-forward op context exits."""
-        for entry in self._records:
-            if entry[2] is None:
-                # HybridEP's sync-free replay API expects a host integer.  Do
-                # both the reduction and device-to-host scalar conversion only
-                # after the selective-checkpoint context exits; otherwise the
-                # replay-only conversion adds aten._local_scalar_dense to the
-                # recompute trace.
-                entry[2] = int(entry[1].sum().item())
+        """Start the device-to-host copy of each layout extent (no host synchronization).
 
-    def take(self):
+        Runs after the checkpoint-forward op context exits, so the reduction does
+        not enter the forward trace; CPU tensors are converted immediately.
+        """
+        for index, entry in enumerate(self._records):
+            if entry[2] is not None or self._copies[index] is not None:
+                continue
+            extent = entry[1].sum()
+            if extent.is_cuda:
+                host = torch.empty((), dtype=extent.dtype, device="cpu", pin_memory=True)
+                host.copy_(extent, non_blocking=True)
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(extent.device))
+                self._copies[index] = (host, ready)
+            else:
+                entry[2] = int(extent)
+
+    def resolve(self) -> None:
+        """Turn the copied extents into host integers, waiting only for copies still in flight.
+
+        Called when the recompute context opens -- outside its op context, so the
+        conversion never enters the recompute trace.
+        """
+        self.finalize()
+        for index, entry in enumerate(self._records):
+            if entry[2] is None and self._copies[index] is not None:
+                host, ready = self._copies[index]
+                ready.synchronize()
+                entry[2] = int(host)
+                self._copies[index] = None
+
+    def take(self) -> list | None:
         """Return the next forward dispatch record, or ``None`` on divergence."""
-        if self._cursor >= len(self._records):
-            self.replay_misses += 1
-            return None
-        entry = self._records[self._cursor]
-        self._cursor += 1
+        entry = super().take()
+        if entry is not None and entry[2] is None:
+            self.resolve()
         return entry
 
-    def rewind(self) -> None:
-        self._cursor = 0
+    def on_record_exit(self) -> None:
+        # Start the extent copies only after the selective-op context exits (no extra
+        # aten.sum in the forward trace) and without a host synchronization -- reading
+        # them per block stalled the launch queue once per layer per microbatch.
+        self.finalize()
+
+    def on_replay_enter(self) -> None:
+        # Read the dispatch extents before the recompute op context opens: the copies
+        # started at the end of the checkpoint forward have normally completed by now,
+        # so this is at most a wait on an event that has already fired (once per
+        # microbatch, never once per layer), and no aten op enters the recompute trace.
+        self.resolve()
 
 
-class _HybridEPDispatchReplayState(threading.local):
-    def __init__(self) -> None:
-        self.recorder: HybridEPDispatchReplayRecorder | None = None
-        self.mode: str | None = None
+class MoERecomputeCache(RecomputeReplayRecorder[torch.Tensor]):
+    """Combine outputs of one checkpointed block forward, served to its recompute in call order.
+
+    ``BackendConfig.dispatcher_recompute_cache``: ``moe/parallelizer._cache_moe_combine_on_recompute`` binds one
+    per checkpointed call through :data:`moe_combine_replay` -- ``record`` around the checkpoint forward, ``replay``
+    around the backward recompute. Independent of the dispatch layout replay, so it also works when the router is
+    recomputed (``ignore_router_for_ac=False``).
+    """
+
+    def record(self, combined_hidden: torch.Tensor) -> None:
+        """Keep one combine output of the checkpoint forward (a detached clone)."""
+        super().record(combined_hidden.detach().clone())
+
+    def has_next(self) -> bool:
+        """Whether the recompute's next combine has a cached forward output."""
+        return self._cursor < len(self._records)
+
+    def take(self) -> torch.Tensor | None:
+        """Return the next cached output (released from the cache), or ``None`` when the recompute diverged."""
+        index = self._cursor
+        cached = super().take()
+        if cached is not None:
+            self._records[index] = None  # the recompute graph owns it from here
+        return cached
 
 
-_hybridep_dispatch_replay_state = _HybridEPDispatchReplayState()
+# Checkpoint-recompute replay of HybridEP combine outputs; see MoERecomputeCache.
+moe_combine_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("MoE combine", recorder_factory=MoERecomputeCache)
 
 
-@contextmanager
-def hybridep_dispatch_replay_scope(recorder: HybridEPDispatchReplayRecorder | None, mode: str):
-    """Bind a HybridEP dispatch recorder for checkpoint forward or recompute."""
-    if mode not in ("record", "replay"):
-        raise ValueError(f"Unsupported HybridEP dispatch replay mode: {mode}")
-    previous_recorder = _hybridep_dispatch_replay_state.recorder
-    previous_mode = _hybridep_dispatch_replay_state.mode
-    _hybridep_dispatch_replay_state.recorder = recorder
-    _hybridep_dispatch_replay_state.mode = mode if recorder is not None else None
-    try:
-        yield
-    finally:
-        _hybridep_dispatch_replay_state.recorder = previous_recorder
-        _hybridep_dispatch_replay_state.mode = previous_mode
+def moe_recompute_phase() -> str | None:
+    """``"record"`` inside a checkpoint forward with a bound cache, ``"replay"`` inside its recompute, else ``None``."""
+    replay = moe_combine_replay.current()
+    return replay[1] if replay is not None else None
+
+
+def hybridep_combine_output_cached() -> bool:
+    """Whether the current recompute will serve its next HybridEP combine from the forward's cache.
+
+    True only in the recompute of a region whose forward recorded a combine output
+    (``BackendConfig.dispatcher_recompute_cache``); the down projection feeding that combine may then skip
+    its GEMM (``moe/experts._DownProjGroupedMM``).
+    """
+    replay = moe_combine_replay.current()
+    return replay is not None and replay[1] == "replay" and replay[0].has_next()
+
+
+# Checkpoint-recompute replay of HybridEP dispatch layouts; see HybridEPDispatchReplayRecorder.
+hybridep_dispatch_replay: RecomputeReplay[list] = RecomputeReplay(
+    "HybridEP dispatch", recorder_factory=HybridEPDispatchReplayRecorder
+)
 
 
 def _is_nvshmem_available() -> bool:
@@ -309,9 +341,9 @@ class FusedDispatch(torch.autograd.Function):
         # Activation-checkpoint replay: reuse the layout this dispatch computed
         # on the original forward instead of recomputing it. Cached-mode dispatch
         # returns only recv_x, so the routing metadata comes from the record.
-        recorder = _active_recorder()
-        if recorder is not None and _replay_mode() == "replay":
-            replayed = recorder.take()
+        replay = deepep_dispatch_replay.current()
+        if replay is not None and replay[1] == "replay":
+            replayed = replay[0].take()
             if replayed is not None:
                 cached_handle, recv_token_indices, recv_token_probs, tokens_per_expert = replayed
                 recv_x, _, _, _, _, after_event_overlap = buffer.dispatch(
@@ -378,10 +410,10 @@ class FusedDispatch(torch.autograd.Function):
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
 
-        if recorder is not None and _replay_mode() == "record":
+        if replay is not None and replay[1] == "record":
             # Keep the handle and routing metadata (small) so the recompute can
             # skip the layout exchange; recv_x is deliberately not retained.
-            recorder.record((handle, recv_token_indices, recv_token_probs, tokens_per_expert))
+            replay[0].record((handle, recv_token_indices, recv_token_probs, tokens_per_expert))
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
 
@@ -660,6 +692,9 @@ def init_hybrid_ep_buffer(
     num_sms_dispatch_api: int,
     num_sms_combine_api: int,
     fp8_dispatch: bool,
+    num_sms_preprocessing_api: int | None = None,
+    num_blocks_permute: int | None = None,
+    num_blocks_unpermute: int | None = None,
 ) -> None:
     """Initialize the HybridEP buffer, including buffer allocation and metadata initialization.
 
@@ -675,6 +710,9 @@ def init_hybrid_ep_buffer(
         num_sms_dispatch_api: Number of SMs used by the dispatch API.
         num_sms_combine_api: Number of SMs used by the combine API.
         fp8_dispatch: Whether to use FP8 communication during the dispatch phase.
+        num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
+        num_blocks_permute: Optional dispatch permutation block count.
+        num_blocks_unpermute: Optional combine unpermutation block count.
     """
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
@@ -687,6 +725,9 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
+        num_sms_preprocessing_api=num_sms_preprocessing_api,
+        num_blocks_permute=num_blocks_permute,
+        num_blocks_unpermute=num_blocks_unpermute,
         **({"load_cached_kernels": True} if load_cached_kernels else {}),
     )
 
@@ -704,18 +745,52 @@ class HybridEPDispatch(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
-        x,
-        routing_map,
-        probs,
-        group,
-        num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
-        num_permuted_tokens=None,
-        pad_multiple=None,
-    ):
-        """Forward pass of fused dispatch of the HybridEP backend."""
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        routing_map: torch.Tensor | None,
+        probs: torch.Tensor,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        num_sms_dispatch_api: int = 24,
+        num_sms_combine_api: int = 24,
+        num_permuted_tokens: int | None = None,
+        pad_multiple: int | None = None,
+        topk_idx: torch.Tensor | None = None,
+        num_experts: int | None = None,
+        fuse_permute: bool = False,
+        num_sms_preprocessing_api: int | None = None,
+        num_blocks_permute: int | None = None,
+        num_blocks_unpermute: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, object]:
+        """Dispatch hidden states using compact indices or a dense routing map.
+
+        The probability tensor remains dense so its gradient layout is unchanged. When both
+        routing representations are provided, HybridEP gives ``routing_map`` precedence.
+
+        Args:
+            ctx: Autograd context that retains the dispatch handle for backward.
+            x: Hidden states with shape [tokens, hidden].
+            routing_map: Optional Boolean routing map with shape [tokens, experts].
+            probs: Dense routing probabilities with shape [tokens, experts].
+            group: Expert-parallel process group.
+            num_local_experts: Number of experts owned by each rank.
+            num_sms_dispatch_api: Number of SMs used by the dispatch API.
+            num_sms_combine_api: Number of SMs used by the combine API.
+            num_permuted_tokens: Optional static dispatched-token capacity.
+            pad_multiple: Optional token padding multiple.
+            topk_idx: Optional global expert indices with shape [tokens, top_k], with -1 for unused slots.
+            num_experts: Global expert count required with compact indices.
+            fuse_permute: Whether to fuse token permutation into dispatch.
+            num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
+            num_blocks_permute: Optional dispatch permutation block count.
+            num_blocks_unpermute: Optional combine unpermutation block count.
+
+        Returns:
+            Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
+            expert; float32 probabilities with shape [dispatched_tokens], aligned with the
+            hidden-state rows; no scaling metadata (FP8 dispatch is unsupported); token counts
+            with shape [local_experts]; and an opaque combine handle.
+        """
         first_call = _hybrid_ep_buffer is None
         if first_call:
             t_first = time.perf_counter()
@@ -729,11 +804,14 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_sms_dispatch_api,
                 num_sms_combine_api,
                 fp8_dispatch,
+                num_sms_preprocessing_api,
+                num_blocks_permute,
+                num_blocks_unpermute,
             )
 
-        recorder = _hybridep_dispatch_replay_state.recorder
-        if recorder is not None and _hybridep_dispatch_replay_state.mode == "replay":
-            replayed = recorder.take()
+        replay = hybridep_dispatch_replay.current()
+        if replay is not None and replay[1] == "replay":
+            replayed = replay[0].take()
             if replayed is not None:
                 handle, tokens_per_expert, num_permuted_tokens = replayed
                 replayed_outputs = _hybrid_ep_buffer.dispatch_with_permute(
@@ -743,10 +821,12 @@ class HybridEPDispatch(torch.autograd.Function):
                     handle=handle,
                     pad_multiple=pad_multiple,
                     num_permuted_tokens=num_permuted_tokens,
+                    fuse_permute_dispatch=fuse_permute,
                 )
                 dispatched_hidden, dispatched_probs, dispatched_scaling_factor, _, _ = replayed_outputs
                 ctx.handle = handle
                 ctx.pad_multiple = pad_multiple
+                ctx.fuse_permute = fuse_permute
                 return (
                     dispatched_hidden,
                     dispatched_probs,
@@ -764,17 +844,21 @@ class HybridEPDispatch(torch.autograd.Function):
             handle,
         ) = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=x,
+            topk_idx=topk_idx,
             routing_map=routing_map,
             probs=probs,
+            num_of_experts=num_experts,
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
+            fuse_permute_dispatch=fuse_permute,
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        ctx.fuse_permute = fuse_permute
         if first_call:
             # One-time cost: buffer allocation + handle exchange + nvcc JIT of the preprocessing /
             # dispatch / combine kernels (HybridEP compiles per process, so every job pays it).
@@ -782,10 +866,10 @@ class HybridEPDispatch(torch.autograd.Function):
             logger.info(
                 "HybridEP first dispatch (buffer init + kernel JIT + call): %.1f s", time.perf_counter() - t_first
             )
-        if recorder is not None and _hybridep_dispatch_replay_state.mode == "record":
+        if replay is not None and replay[1] == "record":
             # Keep only the reusable layout and its output extent. Recomputed
             # activations and probabilities are still redispatched through it.
-            recorder.record(handle, tokens_per_expert)
+            replay[0].record([handle, tokens_per_expert, num_permuted_tokens])
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -795,37 +879,123 @@ class HybridEPDispatch(torch.autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, grad_x, grad_probs, grad_scaling_factor, grad_tokens_per_expert, grad_handle):
-        """Backward pass of fused dispatch of the HybridEP backend."""
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_x: torch.Tensor,
+        grad_probs: torch.Tensor,
+        grad_scaling_factor: torch.Tensor | None,
+        grad_tokens_per_expert: torch.Tensor | None,
+        grad_handle: None,
+    ) -> tuple[torch.Tensor | None, ...]:
+        """Combine gradients while retaining the dense probability-gradient layout.
+
+        Args:
+            ctx: Autograd context populated by ``forward``.
+            grad_x: Hidden-state gradients with shape [dispatched_tokens, hidden].
+            grad_probs: Probability gradients with shape [dispatched_tokens], aligned with grad_x.
+            grad_scaling_factor: Optional gradient for dispatch scaling metadata.
+            grad_tokens_per_expert: Ignored gradient for token counts with shape [local_experts].
+            grad_handle: Ignored gradient for the opaque dispatch handle.
+
+        Returns:
+            Gradients for every forward argument. The hidden-state gradient has shape
+            [tokens, hidden], and the dense probability gradient has shape [tokens, experts].
+        """
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+            hidden=grad_x,
+            probs=grad_probs,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
+            fuse_unpermute_combine=ctx.fuse_permute,
         )
         global _jit_stored
         if _JIT_CACHE_ROOT and not _jit_stored:
             # The backward combine is the last HybridEP kernel variant compiled in a training step.
             _jit_stored = True
             store_hybrid_ep_jit_cache()
-        return combined_hidden, None, combined_probs, None, None, None, None, None, None
+        return (
+            combined_hidden,
+            None,
+            combined_probs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class HybridEPCombine(torch.autograd.Function):
     """Fused combine operation for permute + combine a2a + permute using the HybridEP backend."""
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
-        """Forward pass of fused combine of the HybridEP backend."""
-        combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x, handle=handle, pad_multiple=pad_multiple
-        )
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        handle: object,
+        num_permuted_tokens: int | None = None,
+        pad_multiple: int | None = None,
+        fuse_permute: bool = False,
+        cache_output: bool = False,
+    ) -> torch.Tensor:
+        """Combine dispatched expert outputs through HybridEP.
+
+        Args:
+            ctx: Autograd context that retains the dispatch handle for backward.
+            x: Expert outputs with shape [dispatched_tokens, hidden].
+            handle: Opaque handle returned by dispatch.
+            num_permuted_tokens: Optional static dispatched-token capacity.
+            pad_multiple: Optional token padding multiple.
+            fuse_permute: Whether to fuse output unpermutation into combine.
+            cache_output: ``BackendConfig.dispatcher_recompute_cache``: in a checkpoint forward keep a clone
+                of the output in the block's :class:`MoERecomputeCache`; in the recompute return that clone
+                instead of re-running the unpermute, the EP-group barrier and the combine all-to-all. The
+                backward (the gradient all-to-all through the dispatch handle) is unchanged.
+
+        Returns:
+            Combined hidden states with shape [tokens, hidden].
+        """
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.fuse_permute = fuse_permute
+        replay = moe_combine_replay.current() if cache_output else None
+        if replay is not None and replay[1] == "replay":
+            cached = replay[0].take()
+            if cached is not None:
+                return cached
+        combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
+            hidden=x,
+            handle=handle,
+            pad_multiple=pad_multiple,
+            fuse_unpermute_combine=fuse_permute,
+        )
+        if replay is not None and replay[1] == "record":
+            replay[0].record(combined_hidden)
         return combined_hidden
 
     @staticmethod
-    def backward(ctx, grad_x):
-        """Backward pass of fused combine of the HybridEP backend."""
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_x: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None, None]:
+        """Redispatch combined-output gradients through the saved layout.
+
+        Args:
+            ctx: Autograd context populated by ``forward``.
+            grad_x: Combined-output gradients with shape [tokens, hidden].
+
+        Returns:
+            Gradient for ``x`` with shape [dispatched_tokens, hidden], followed by ``None``
+            for each non-tensor forward argument.
+        """
         handle = ctx.handle
         dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=grad_x,
@@ -833,24 +1003,61 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            fuse_permute_dispatch=ctx.fuse_permute,
+            # Capacity mode hands a host int: the backward dispatch then needs no stream drain either.
+            # The static-routing pin is a 0-d tensor (``tokens_per_expert.sum()``): the forward treats
+            # any non-None extent as non-blocking, but the backward keeps that pin on the blocking path
+            # as before this change, which only moves the capacity path off the drain.
+            non_blocking=isinstance(ctx.num_permuted_tokens, int),
         )
-        return dispatched_hidden, None, None, None
+        return dispatched_hidden, None, None, None, None, None
 
 
 if HAVE_HYBRIDEP:
 
     def hybrid_ep_dispatch(
-        x,
-        routing_map,
-        probs,
-        group,
-        num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
-        num_permuted_tokens=None,
-        pad_multiple=None,
-    ):
-        """Perform fused dispatch for permute + dispatch a2a + permute using the HybridEP backend."""
+        x: torch.Tensor,
+        routing_map: torch.Tensor | None,
+        probs: torch.Tensor,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        num_sms_dispatch_api: int = 24,
+        num_sms_combine_api: int = 24,
+        num_permuted_tokens: int | None = None,
+        pad_multiple: int | None = None,
+        *,
+        topk_idx: torch.Tensor | None = None,
+        num_experts: int | None = None,
+        fuse_permute: bool = False,
+        num_sms_preprocessing_api: int | None = None,
+        num_blocks_permute: int | None = None,
+        num_blocks_unpermute: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, object]:
+        """Dispatch tokens through HybridEP while retaining dense probability layout.
+
+        Args:
+            x: Hidden states with shape [tokens, hidden].
+            routing_map: Optional dense routing map with shape [tokens, experts].
+            probs: Dense routing probabilities with shape [tokens, experts].
+            group: Expert-parallel process group.
+            num_local_experts: Number of experts owned by each rank.
+            num_sms_dispatch_api: SMs reserved for HybridEP dispatch.
+            num_sms_combine_api: SMs reserved for HybridEP combine.
+            num_permuted_tokens: Static output capacity for non-blocking dispatch.
+            pad_multiple: Optional token padding multiple.
+            topk_idx: Optional global expert indices with shape [tokens, top_k], with -1 for unused slots.
+            num_experts: Global expert count required with compact indices.
+            fuse_permute: Fuse token permutation into the dispatch kernel.
+            num_sms_preprocessing_api: Optional SM count for routing-metadata preprocessing.
+            num_blocks_permute: Optional dispatch permutation block count.
+            num_blocks_unpermute: Optional combine unpermutation block count.
+
+        Returns:
+            Dispatched hidden states with shape [dispatched_tokens, hidden], grouped by local
+            expert; float32 probabilities with shape [dispatched_tokens], aligned with the
+            hidden-state rows; no scaling metadata (FP8 dispatch is unsupported); token counts
+            with shape [local_experts]; and the opaque HybridEP combine handle.
+        """
         return HybridEPDispatch.apply(
             x,
             routing_map,
@@ -861,11 +1068,38 @@ if HAVE_HYBRIDEP:
             num_sms_combine_api,
             num_permuted_tokens,
             pad_multiple,
+            topk_idx,
+            num_experts,
+            fuse_permute,
+            num_sms_preprocessing_api,
+            num_blocks_permute,
+            num_blocks_unpermute,
         )
 
-    def hybrid_ep_combine(x, handle, num_permuted_tokens=None, pad_multiple=None):
-        """Perform fused combine for unpermute + combine a2a + unpermute using the HybridEP backend."""
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple)
+    def hybrid_ep_combine(
+        x: torch.Tensor,
+        handle: object,
+        num_permuted_tokens: int | None = None,
+        pad_multiple: int | None = None,
+        *,
+        fuse_permute: bool = False,
+        cache_output: bool = False,
+    ) -> torch.Tensor:
+        """Combine expert outputs through HybridEP.
+
+        Args:
+            x: Permuted expert outputs with shape [dispatched_tokens, hidden].
+            handle: Opaque handle returned by :func:`hybrid_ep_dispatch`.
+            num_permuted_tokens: Static token capacity used by non-blocking dispatch.
+            pad_multiple: Optional token padding multiple.
+            fuse_permute: Fuse output unpermutation into the combine kernel.
+            cache_output: Serve the output from the checkpoint forward in the recompute
+                (``BackendConfig.dispatcher_recompute_cache``).
+
+        Returns:
+            Combined hidden states in the original token order with shape [tokens, hidden].
+        """
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fuse_permute, cache_output)
 
 else:
     hybrid_ep_dispatch = None

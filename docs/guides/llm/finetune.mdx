@@ -47,8 +47,8 @@ uv pip install "nemo-automodel" --torch-backend=auto
 Alternatively, if you run into dependency or driver issues, use the pre-built Docker container:
 
 ```bash
-docker pull nvcr.io/nvidia/nemo-automodel:26.06.00
-docker run --gpus all -it --rm --shm-size=8g -v $(pwd)/checkpoints:/opt/Automodel/checkpoints nvcr.io/nvidia/nemo-automodel:26.06.00
+docker pull nvcr.io/nvidia/nemo-automodel:26.10.00
+docker run --gpus all -it --rm --shm-size=8g -v $(pwd)/checkpoints:/opt/Automodel/checkpoints nvcr.io/nvidia/nemo-automodel:26.10.00
 ```
 
 <Info>
@@ -220,6 +220,12 @@ peft:
 | `alpha` | Scaling factor applied to the adapter output (`alpha / dim`). Higher values give adapters more influence during training. |
 
 Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead. See [Switch Between SFT and PEFT](#switch-between-sft-and-peft).
+
+For MoE models with adaptive router correction biases, freeze those updates as
+well as the base parameters. This preserves routing when reloading the saved
+adapters; see
+[Router Correction Biases in MoE Models](/development/checkpointing#router-correction-biases-in-moe-models)
+for the recipe settings.
 
 #### QLoRA for Quantized Low-Rank Adaptation
 
@@ -910,7 +916,7 @@ optimizer:
       wd_mult: 1.0          # (optional) multiplier for weight decay; defaults to 1.0
 ```
 
-Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. Standard optimizers support LR/WD overrides. Dion-family configs also support `algorithm: adamw` to route matching matrices to auxiliary AdamW. Their LR/WD multipliers apply to the selected group's base settings, including when no LR scheduler is configured; matrix layout groups remain separate. Only Dion-family configs accept the `algorithm` field.
+Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. Standard optimizers apply `lr_mult` and `wd_mult`. Dion-family configs (Muon, NorMuon, Dion, Dion2, Muown) now apply `lr_mult` and `wd_mult` as well; previously they ignored `param_group_overrides` with a warning. Their LR/WD multipliers apply to each group's base settings, including when no LR scheduler is configured; matrix layout groups remain separate. Dion-family configs separately expose `adamw_param_patterns` to select parameters for auxiliary AdamW before applying these multipliers.
 
 ### Muown for Dense and MoE Weights
 
@@ -936,14 +942,17 @@ Optionally set `optimizer.muon_update_scale` to multiply the shape-scaled Muon d
 Router matrices keep the default Muown grouping unless you explicitly select AdamW. To opt in, add this to the optimizer block:
 
 ```yaml
+adamw_param_patterns:
+  - '(^|\.)(gate|router)\.weight$'
+
+# Optional: adjust LR/WD independently of the AdamW selection above.
 param_group_overrides:
   - pattern: '(^|\.)(gate|router)\.weight$'
-    algorithm: adamw
-    lr_mult: 1.0
-    wd_mult: 1.0
+    lr_mult: 0.5
+    wd_mult: 0.0
 ```
 
-This optional rule matches modules named `gate` or `router` without matching expert `gate_proj` projections. Newly routed matrices inherit `scalar_lr`, `scalar_betas` and `scalar_eps`; `lr_mult` and `wd_mult` can further scale that group. Existing embedding/head settings are preserved, and frozen parameters are excluded.
+The optional `adamw_param_patterns` list matches canonical parameter names with Python `re.search`; matching any pattern selects auxiliary AdamW, even when `scalar_opt` is `lion`. It defaults to an empty list. The example selects modules named `gate` or `router` without matching expert `gate_proj` projections. Newly routed matrices inherit `scalar_lr` (or `lr` if unset), `scalar_betas` and `scalar_eps`. The independent LR/WD rule then gives those parameters half the auxiliary learning rate and zero weight decay. Existing embedding/head LR/WD settings are preserved before overrides, frozen parameters are excluded, and a pattern matching no trainable parameters is skipped with a warning. `adamw_param_patterns` works without `param_group_overrides`, and ordinary LR/WD overrides do not change the selected optimizer algorithm.
 
 Grouped expert tensors are treated as batches of independent matrices. AutoModel's grouped GEMM experts declare their `[expert, input, output]` storage layout so magnitude normalization follows output neurons. Linear weights use `[output, input]`. Embeddings, output heads, normalization parameters, and biases use the scalar optimizer. `MuonConfig` also trains grouped expert tensors as batches of matrices (unless `flatten: true`, which keeps them on the scalar optimizer). Because `dion.Muon`'s `spectral_norm` LR adjustment assumes `[output, input]`, `MuonConfig` gives each transposed expert shape its own param group with `lr` scaled by `sqrt(output / input)` and `weight_decay` divided by the same factor, so the applied decay is unchanged; `rms_norm` and `null` do not depend on orientation and need no extra groups. `dion.Muon` gathers sharded matrix axes only over its data-parallel mesh, so `MuonConfig` raises an error for grouped experts when `ep_size` is greater than 1 but smaller than the data-parallel size; use `ep_size` equal to the data-parallel size, `ep_size: 1`, or `MuownConfig`.
 
@@ -951,7 +960,7 @@ Muown selects communication groups from each parameter's DTensor placements, all
 
 Set `optimizer.use_triton: true` to fuse Muown's direction preparation, momentum, magnitude Adam update, and weight recomposition on CUDA. This optional path requires Triton and contiguous FP32 local weights, gradients, and states. It supports complete input-feature axes up to 16384 elements for ordinary matrices and 8192 for transposed expert storage; wider, strided, other-dtype, and input-sharded tensors use the Torch path. Newton–Schulz arithmetic and FSDP communication are unchanged. The default is `false`.
 
-The default Newton–Schulz update uses five BF16 polynomial iterations and the reference implementation's shape-based QKV convention: a logical `[3d, d]` matrix is split into three `[d, d]` matrices. This rule follows shape, rather than inspecting module identity.
+The default Newton–Schulz update uses five BF16 polynomial iterations and the reference implementation's shape-based QKV convention: any logical matrix with `rows == 3 * cols` is split into three `[d, d]` blocks, mirroring the authors' reference. The rule is purely shape-based and does not inspect module identity: it does not fire for GQA fused QKV weights (where `q + 2 * kv != 3 * hidden`), and it does fire for any other weight with that shape, such as an MLP projection with intermediate size `3 × hidden`.
 
 See the [Qwen3-30B-A3B Muown recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_moe_30b_tulu3_muown.yaml) for real Tulu3 training with EP8, non-packed 4K sequences, and FP32 master weights on 8 GPUs. It runs a 30-step smoke test; tune learning rates and training duration for your workload.
 
@@ -1052,7 +1061,7 @@ distributed:
 ```
 
 <Info>
-When `cp_size > 1`, fused RoPE is automatically disabled. Some models also require the Transformer Engine (TE) attention backend for CP with packed sequences. The framework will raise an error with instructions if this applies.
+When `cp_size > 1`, fused RoPE is automatically disabled. Some models also require the Transformer Engine (TE) attention backend for CP with packed sequences. The framework raises an error with instructions if this applies.
 
 </Info>
 

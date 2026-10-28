@@ -62,9 +62,7 @@ def moe_config() -> MoEConfig:
         GroupedExpertsDeepEPLoRAMXFP4,
     ),
 )
-def test_rejects_router_weight_after_down(
-    cls: type[torch.nn.Module], device: str, moe_config: MoEConfig
-) -> None:
+def test_rejects_router_weight_after_down(cls: type[torch.nn.Module], device: str, moe_config: MoEConfig) -> None:
     config = replace(moe_config, apply_router_weight_after_down=True)
     base = GroupedExpertsDeepEP if issubclass(cls, GroupedExpertsDeepEP) else GroupedExperts
     with torch.device(device):

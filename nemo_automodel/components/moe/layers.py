@@ -112,15 +112,37 @@ class MLP(nn.Module):
         if self.swiglu_limit > 0.0:
             # Mirror DSV4 reference Expert.forward: fp32 SwiGLU with one-sided
             # gate clamp and symmetric up clamp; cast back before down_proj.
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if x.is_cuda:
+                # One fused kernel instead of two fp32 up-casts, two clamps, silu, mul and a down-cast
+                # (seven launches and two fp32 temporaries per call; the shared-expert branch is issued on
+                # a side stream while the main stream waits for its launches).
+                return self.down_proj(_clamped_swiglu_act(gate, up, self.swiglu_limit))
             dtype = x.dtype
-            gate = self.gate_proj(x).float().clamp(max=self.swiglu_limit)
-            up = self.up_proj(x).float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate = gate.float().clamp(max=self.swiglu_limit)
+            up = up.float().clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
             return self.down_proj((F.silu(gate) * up).to(dtype))
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
         self.apply(init_weights_fn)
+
+
+@torch.compile(fullgraph=True)
+def _clamped_swiglu_act(gate: torch.Tensor, up: torch.Tensor, limit: float) -> torch.Tensor:
+    """fp32 clamped SwiGLU on separate gate / up projections, cast back to the input dtype.
+
+    Same arithmetic as the eager branch of ``MLP.forward`` (the DeepSeek-V4 reference Expert.forward); inductor
+    fuses it into one kernel per direction. Dynamo's default shape policy: the first token count compiles a static
+    graph, the second recompiles once with a symbolic row count and every later shape reuses it — ``dynamic=False``
+    with ``fullgraph=True`` would instead raise ``FailOnRecompileLimitHit`` after ``recompile_limit`` distinct
+    token counts (variable-length batches). CPU inputs keep the eager chain.
+    """
+    gate_f = gate.float().clamp(max=limit)
+    up_f = up.float().clamp(min=-limit, max=limit)
+    return (F.silu(gate_f) * up_f).to(gate.dtype)
 
 
 class FakeBalancedGate(nn.Module):
@@ -535,14 +557,14 @@ class Gate(nn.Module):
         Forward pass for the gating mechanism.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
+            x: Tensor of shape [tokens, hidden] containing local token states.
+            token_mask: Boolean tensor of shape [tokens] indicating valid tokens.
             cp_mesh (Optional[DeviceMesh]): Device mesh for context parallel computation.
 
         Returns:
-            weights (torch.Tensor): Routing weights for the selected experts.
-            indices (torch.Tensor): Indices of the selected experts.
-            aux_loss (Optional[torch.Tensor]): Auxiliary loss for load balancing.
+            weights: Tensor of shape [tokens, topk] with selected routing weights.
+            indices: Integer tensor of shape [tokens, topk] with expert indices.
+            aux_loss: Scalar auxiliary load-balancing loss, or None.
         """
         original_dtype = x.dtype
 
@@ -555,7 +577,9 @@ class Gate(nn.Module):
             weight = self.weight.to(dtype=x.dtype)
             bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
 
-        scores = F.linear(x_compute, weight, bias=bias)
+        # Explicit gate precision must override an enclosing model autocast.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            scores = F.linear(x_compute, weight, bias=bias)
         if self.use_routing_core:
             weights, indices, original_scores = self.routing_core(scores, self)
         else:
@@ -662,23 +686,24 @@ class Gate(nn.Module):
         indices: torch.Tensor,
         token_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Computes the load of each expert based on the selected indices.
+        """Compute expert loads from this rank's local tokens.
+
         Args:
-            indices (torch.Tensor): Indices of the selected experts.
-                Shape is [num_tokens, num_activated_experts].
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
-                Shape is [num_tokens].
+            indices: Integer tensor of shape [tokens, activated_experts] containing
+                selected expert IDs. Repeated IDs count once per token.
+            token_mask: Tensor of shape [tokens] on the same device as ``indices``.
+                Boolean values select valid tokens; numeric values are converted
+                to the indices' dtype before contributing to the load.
 
         Returns:
-            torch.Tensor: Load of each expert (number of tokens routed to each expert).
-                Shape is [num_local_experts].
+            Int64 tensor of shape [n_experts] on the same device as ``indices``,
+            containing each expert's load from the local tokens.
         """
-        # Create a mask for the experts based on the selected indices.
-        expert_mask = indices.new_zeros((indices.shape[0], self.n_experts))
-        contribution = token_mask.to(dtype=expert_mask.dtype).unsqueeze(-1).expand(-1, indices.shape[1])
-        expert_mask.scatter_(dim=1, index=indices, src=contribution)
-        return expert_mask.sum(dim=0)
+        # Keep the token reduction contiguous to avoid column-reduction scratch storage.
+        expert_mask = indices.new_zeros((self.n_experts, indices.shape[0]))
+        contribution = token_mask.to(dtype=expert_mask.dtype).unsqueeze(0).expand(indices.shape[1], -1)
+        expert_mask.scatter_(dim=0, index=indices.T, src=contribution)
+        return expert_mask.sum(dim=1)
 
     def _compute_aux_loss(
         self,
@@ -741,6 +766,19 @@ class Gate(nn.Module):
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
+
+
+_SHARED_EXPERT_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _shared_expert_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return the per-device side stream used for shared-expert overlap (created lazily, one per process)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _SHARED_EXPERT_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _SHARED_EXPERT_STREAMS[index] = stream
+    return stream
 
 
 class MoE(nn.Module):
@@ -898,15 +936,25 @@ class MoE(nn.Module):
             z = None
         else:
             weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
-            # Shared-expert output (optionally gated), computed inline on the main stream.
+            # Shared-expert output (optionally gated). With BackendConfig.shared_expert_overlap the
+            # shared experts run on a side stream: they only depend on ``x``, and under expert
+            # parallelism the routed path spends most of its time in dispatch / combine
+            # communication, which leaves SMs free for the shared-expert GEMMs (Megatron-Core's
+            # moe_shared_expert_overlap; Kimi K3's MoE reuses the same helpers). Autograd replays each
+            # backward op on the stream its forward op used, so the overlap also covers the
+            # recompute and backward passes.
             z = None
+            shared_stream = None
             if self.shared_experts is not None:
-                z = self.shared_experts(x)
-                if self.shared_expert_gate is not None:
-                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+                if self.backend.shared_expert_overlap and x.is_cuda:
+                    z, shared_stream = self._shared_experts_on_side_stream(x)
+                else:
+                    z = self._shared_expert_output(x)
 
             # Routed experts on the main stream.
             y = self.experts(x_latent, token_mask, weights, indices)
+            if shared_stream is not None:
+                self._join_shared_experts(z, shared_stream)
 
         if self.fc2_latent_proj is not None:
             # ``self.experts`` is its own FSDP unit; an ``output_dtype`` in the FSDP
@@ -918,6 +966,35 @@ class MoE(nn.Module):
         if z is not None:
             y = y + z
         return y.view(shape)
+
+    def _shared_expert_output(self, x: torch.Tensor) -> torch.Tensor:
+        """Shared-expert output for ``x``, gated by ``shared_expert_gate`` when the model has one."""
+        z = self.shared_experts(x)
+        if self.shared_expert_gate is not None:
+            z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+        return z
+
+    def _shared_experts_on_side_stream(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.cuda.Stream]:
+        """Run the shared experts for ``x`` on the per-device side stream.
+
+        Returns the shared-expert output and the stream it was computed on; the caller runs the routed
+        path on the current stream and then joins with ``_join_shared_experts``. Subclasses with their
+        own ``forward`` (Kimi K3) reuse both helpers so the stream choreography lives in one place.
+        """
+        stream = _shared_expert_stream(x.device)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            z = self._shared_expert_output(x)
+        # ``x`` was allocated on the current stream; keep its block alive for the side stream.
+        x.record_stream(stream)
+        return z, stream
+
+    @staticmethod
+    def _join_shared_experts(z: torch.Tensor, stream: torch.cuda.Stream) -> None:
+        """Make the current stream wait for the side-stream shared-expert output ``z``."""
+        current = torch.cuda.current_stream()
+        current.wait_stream(stream)
+        z.record_stream(current)
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
@@ -933,7 +1010,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
 
     with torch.device(buffer_device):
         if isinstance(module, Gate):
-            to_local(module.weight).normal_(mean=0.0, std=init_std)
+            # Preserve DTensor RNG offsets so FSDP shards do not repeat router rows.
+            nn.init.normal_(module.weight, mean=0.0, std=init_std)
             if module.e_score_correction_bias is not None:
                 to_local(module.e_score_correction_bias).zero_()
             if module.bias is not None:

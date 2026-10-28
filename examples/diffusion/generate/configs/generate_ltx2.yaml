@@ -34,3 +34,6 @@ vae:
   enable_cpu_offload: false
 
 seed: 42
+
+ci:
+  cluster_tag: h100

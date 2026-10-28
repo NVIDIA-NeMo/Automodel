@@ -21,15 +21,54 @@ last) built by nulling modules the way the framework's splitter does.
 """
 
 import copy
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import generate_hf_model_fqn_per_model_part
 from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES, model_keeps_self_forward
 from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
 NUM_LAYERS = 3
+
+
+@pytest.mark.parametrize("is_first", [True, False])
+@pytest.mark.parametrize("has_lm_head", [True, False])
+@pytest.mark.parametrize("cp_size", [1, 8])
+@pytest.mark.parametrize("microbatch_size", [1, 2])
+def test_pipeline_runtime_uses_cp_local_token_capacity(vlm_model, is_first, has_lm_head, cp_size, microbatch_size):
+    vlm_model.cp_mesh = SimpleNamespace(size=lambda: cp_size)
+    if not has_lm_head:
+        vlm_model.lm_head = None
+    stage = SimpleNamespace(
+        is_first=is_first,
+        submod=vlm_model,
+        inputs_meta=None,
+        _configure_outputs_meta=Mock(),
+    )
+    ap = AutoPipeline(
+        world_mesh={"pp": object()},
+        pp_schedule="1f1b",
+        pp_microbatch_size=microbatch_size,
+        pp_batch_size=2 * microbatch_size,
+        device=torch.device("cpu"),
+    )
+    ap._model_config = vlm_model.config
+    ap._info.stages = [stage]
+    ap._info.schedule = SimpleNamespace()
+    initializer = Mock()
+    ap._runtime_initializers = [initializer]
+
+    # Exercise initial setup, a same-shape step, growth with CP padding, and shrink.
+    for seq_len in [16384, 16384, 16385, 8192]:
+        ap.update_seq_len(seq_len)
+        local_seq_len = seq_len if cp_size == 1 else (seq_len + (-seq_len) % (2 * cp_size)) // cp_size
+        initializer.prepare.assert_called_with(num_tokens=microbatch_size * local_seq_len, device=torch.device("cpu"))
+        expected_input_len = seq_len if is_first else local_seq_len
+        assert stage.inputs_meta[0].shape[:2] == (microbatch_size, expected_input_len)
 
 
 def _auto_fqns(num_stages: int):

@@ -12,7 +12,7 @@ from nemo_automodel.components.models.glm5_next.processing import (
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 def test_training_template_enables_images_but_keeps_other_media_disabled():

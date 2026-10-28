@@ -67,12 +67,12 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
         return cfg
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
-        """Build the DFlash 2 trainer wrapper (block CE + candidate-selection CE)."""
-        if (recipe_cfg.get("loss_type", None) or "dflash") != "dflash":
-            raise ValueError(
-                "loss_type is only supported by the DFlash recipe; the DFlash 2 trainer teacher-forces the "
-                "selector's predecessor from the fixed-anchor block layout and would silently ignore it."
-            )
+        """Build the DFlash 2 trainer wrapper (block CE + candidate-selection CE).
+
+        ``loss_type="variable_prefix"`` is rejected by ``DFlash2TrainerModule``
+        itself: the selector teacher-forces the predecessor from the fixed-anchor
+        block layout, which a variable visible prefix breaks.
+        """
         return DFlash2TrainerModule(
             draft_model=self.draft_model,
             target_lm_head=self.target_model.get_output_embeddings(),
@@ -85,6 +85,10 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
             # matches DFlashDecayLoss's own default. Set null explicitly in YAML
             # to disable the position decay (uniform weighting).
             loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
+            # ``or`` folds an explicit ``loss_type: null`` back to the default,
+            # matching the null convention of loss_decay_gamma above.
+            loss_type=str(recipe_cfg.get("loss_type", None) or "dflash"),
+            dpace_alpha=float(recipe_cfg.get("dpace_alpha", 0.5)),
             selector_loss_weight=float(recipe_cfg.get("selector_loss_weight", 1.0)),
             sliding_window=self.draft_sliding_window,
         )
@@ -139,15 +143,24 @@ class TrainDFlash2Recipe(TrainDFlashRecipe):
     def _extra_eval_metric_sums(self, metrics) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """Return additive DFlash 2 validation statistics.
 
-        Every returned value is a pair of scalar tensors on the trainer device.
         The shared validation loop SUM-reduces each pair before division.
+        Selector loss is weighted only by positions with a candidate hit.
+
+        Args:
+            metrics: DFlash2StepMetrics whose fields are scalar tensors of shape []
+                on the trainer device, with layouts documented by that dataclass.
+
+        Returns:
+            Metric names mapped to detached (numerator, denominator) pairs of
+            scalar tensors of shape [] on the trainer device.
         """
         loss_weight = metrics.loss_weight.detach()
+        selector_weight = metrics.selector_loss_denominator.detach()
         valid_tokens = metrics.valid_tokens.detach()
         valid_blocks = metrics.valid_blocks.detach()
         return {
             "val_base_loss": (metrics.base_loss.detach() * loss_weight, loss_weight),
-            "val_selector_loss": (metrics.selector_loss.detach() * loss_weight, loss_weight),
+            "val_selector_loss": (metrics.selector_loss.detach() * selector_weight, selector_weight),
             "val_base_accuracy": (metrics.base_correct_tokens.detach(), valid_tokens),
             "val_base_accept_len": (metrics.base_accept_len_sum.detach(), valid_blocks),
             "val_candidate_recall": (metrics.candidate_recall.detach() * valid_tokens, valid_tokens),

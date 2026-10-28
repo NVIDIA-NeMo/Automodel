@@ -214,6 +214,48 @@ def test_apply_mxfp4_to_moe_experts_handles_deepep(moe_config):
     assert model.experts is converted
 
 
+@pytest.mark.parametrize("device", ("cpu", "meta"))
+def test_frozen_mxfp4_conversion_preserves_hybridep_settings(moe_config: MoEConfig, device: str) -> None:
+    """Non-LoRA expert conversion retains the configured HybridEP routing and tuning."""
+    backend = BackendConfig(
+        experts="torch_mm",
+        dispatcher="hybridep",
+        dispatcher_hybridep_permute_fusion=True,
+        dispatcher_hybridep_compact_routing=True,
+        dispatcher_hybridep_num_sms_preprocessing=12,
+        dispatcher_hybridep_num_blocks_permute=16,
+        dispatcher_hybridep_num_blocks_unpermute=20,
+        dispatcher_capacity_factor=1.5,
+        dispatcher_equal_token_counts=True,
+        dispatcher_recompute_cache="combine",
+    )
+    with torch.device(device), torch.no_grad():
+        original = GroupedExpertsDeepEP(moe_config, backend, dispatcher_backend=backend.dispatcher)
+        original.init_weights(torch.device(device))
+    model = torch.nn.Module()
+    model.add_module("experts", original)
+    if device == "meta":
+        model.state_dict_adapter = MagicMock()
+
+    apply_mxfp4_to_moe_experts(model)
+
+    converted = model.experts
+    assert isinstance(converted, GroupedExpertsDeepEPMXFP4)
+    assert converted.dispatcher_backend == "hybridep"
+    assert converted.dispatcher_hybridep_permute_fusion is True
+    assert converted.dispatcher_hybridep_compact_routing is True
+    assert converted.dispatcher_hybridep_num_sms_preprocessing == 12
+    assert converted.dispatcher_hybridep_num_blocks_permute == 16
+    assert converted.dispatcher_hybridep_num_blocks_unpermute == 20
+    assert converted.dispatcher_capacity_factor == 1.5
+    assert converted.dispatcher_equal_token_counts is True
+    assert converted.dispatch_rows_never_empty is True
+    # a frozen layer next to a LoRA one must present the same cache mode to the shared dispatcher (review of #4395)
+    assert converted.dispatcher_recompute_cache == "combine"
+    assert all(not param.requires_grad for param in converted.parameters())
+    assert converted.gate_and_up_projs_packed.is_meta == (device == "meta")
+
+
 # --- forward numerics (mock dispatcher) ---------------------------------------
 
 
@@ -243,7 +285,10 @@ def test_frozen_deepep_mxfp4_forward_matches_bf16(moe_config, device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_lora_deepep_mxfp4_forward_matches_bf16(moe_config, device):
+@pytest.mark.parametrize("with_callback", [False, True])
+def test_lora_deepep_mxfp4_forward_matches_bf16(
+    moe_config: MoEConfig, device: torch.device, with_callback: bool
+) -> None:
     """LoRA mxfp4 DeepEP forward must match the bf16 DeepEP LoRA forward with the same adapters."""
     orig = _make_deepep(moe_config, device, representable=True)
 
@@ -270,9 +315,10 @@ def test_lora_deepep_mxfp4_forward_matches_bf16(moe_config, device):
     indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
     token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
-    y_mx = mx(x, token_mask, weights, indices)
+    callback = torch.tanh if with_callback else None
+    y_mx = mx(x, token_mask, weights, indices, post_expert_output=callback)
     with torch.no_grad(), patch.object(torch.Tensor, "to_local", new=lambda self: self, create=True):
-        y_ref = ref(x, token_mask, weights, indices)
+        y_ref = ref(x, token_mask, weights, indices, post_expert_output=callback)
 
     assert y_mx.shape == (num_tokens, moe_config.dim)
     torch.testing.assert_close(y_mx, y_ref, atol=1e-2, rtol=1e-2)

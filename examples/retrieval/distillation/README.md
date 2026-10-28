@@ -1,6 +1,15 @@
 # Retrieval Distillation (Automodel)
 
-Edit `nemotron3_embed_1b_distill.yaml` to set your dataset paths, checkpoint directory, model settings, and hyperparameters before running.
+`nemotron3_embed_1b_distill.yaml` distills the pretrained
+[`nvidia/Nemotron-3-Embed-1B-BF16`](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16)
+student from the frozen
+[`nvidia/Nemotron-3-Embed-8B-BF16`](https://huggingface.co/nvidia/Nemotron-3-Embed-8B-BF16)
+teacher. The student tokenizer is shared by both encoders; the projection maps
+the student embeddings to the teacher's 4,096-dimensional space.
+
+The recipe uses the public `nvidia/embed-nemotron-dataset-v1` dataset and saves
+checkpoints under `checkpoints/nemotron3_embed_1b_distill`. Adjust the dataset,
+checkpoint directory, and hyperparameters as needed before running.
 
 You can run the distillation training via the command below:
 

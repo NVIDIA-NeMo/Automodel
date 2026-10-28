@@ -43,7 +43,6 @@ COMMON_ARGS=(
     --config tests/functional_tests/parallelism/mistral3p5_proxy.yaml
     --model.pretrained_model_name_or_path "$PROXY_CKPT"
     --processor.pretrained_model_name_or_path "$PROXY_CKPT"
-    --step_scheduler.max_steps 6
     --step_scheduler.global_batch_size 2
     --step_scheduler.local_batch_size 2
     --distributed.pp_size 1

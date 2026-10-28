@@ -28,7 +28,6 @@ except ImportError:
 import gc
 import inspect
 import logging
-import math
 import pathlib
 import time
 from contextlib import nullcontext
@@ -66,6 +65,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
 from nemo_automodel.components.datasets.loader import DataloaderConfig
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -84,7 +84,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
     _get_lm_head_module,
@@ -92,6 +92,7 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -176,6 +177,9 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
     """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+    # Probe the wrapped model's signature, head, and config; training still calls DDP.
+    if isinstance(probe_module, nn.parallel.DistributedDataParallel):
+        probe_module = probe_module.module
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
         if isinstance(loss_fn, ChunkedCrossEntropy):
             raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
@@ -224,14 +228,14 @@ def _supports_loss_weights(loss_fn: nn.Module) -> bool:
     return any(parameter.name == "loss_weights" for parameter in parameters)
 
 
-def _validate_domain_sampling_weights(domain_mixture, dataloader_config: DataloaderConfig) -> None:
-    """Check explicit Megatron blend weights against the objective declaration."""
+def _get_domain_mixture_blend(dataloader_config: DataloaderConfig) -> tuple[list[str], list[float]]:
+    """Extract the explicit Megatron training blend for domain-mixture construction."""
     from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
 
     dataset_config = dataloader_config.dataset_config
     if not isinstance(dataset_config, MegatronPretrainingConfig):
         raise ValueError("domain_mixture currently requires a MegatronPretraining dataset")
-    paths = getattr(dataset_config, "paths", None)
+    paths = dataset_config.paths
     if isinstance(paths, dict):
         paths = paths.get("train")
     if not isinstance(paths, (list, tuple)):
@@ -239,21 +243,10 @@ def _validate_domain_sampling_weights(domain_mixture, dataloader_config: Dataloa
 
     from nemo_automodel.components.datasets.llm.megatron.megatron_utils import get_blend_from_list
 
-    _, blend_weights = get_blend_from_list(list(paths))
+    blend_paths, blend_weights = get_blend_from_list(list(paths))
     if blend_weights is None:
         raise ValueError("domain_mixture requires explicit sampling weights in dataset.paths")
-    blend_total = sum(blend_weights)
-    if blend_total <= 0:
-        raise ValueError(f"dataset.paths blend weights must have a positive sum, got {blend_weights}")
-    normalized = tuple(weight / blend_total for weight in blend_weights)
-    if len(normalized) != len(domain_mixture.sampling_weights) or any(
-        not math.isclose(actual, declared, rel_tol=1.0e-6, abs_tol=1.0e-8)
-        for actual, declared in zip(normalized, domain_mixture.sampling_weights)
-    ):
-        raise ValueError(
-            "domain_mixture sampling weights must match the explicit weights in dataset.paths; "
-            f"got dataset weights {normalized} and domain_mixture weights {domain_mixture.sampling_weights}"
-        )
+    return blend_paths, blend_weights
 
 
 def build_model(
@@ -269,6 +262,8 @@ def build_model(
     cfg_freeze: ConfigNode | dict[str, Any] | FreezeConfig | None = None,
     sdpa_method: list[str] | None = None,
     device_mesh=None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -287,6 +282,7 @@ def build_model(
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
         device_mesh: Pre-created device mesh forwarded when ``distributed_setup`` is not provided.
     """
     with ScopedRNG(seed=seed, ranked=True):
@@ -297,6 +293,7 @@ def build_model(
             # plain mappings or typed FreezeConfig objects.
             "freeze_config": cfg_freeze.to_dict() if isinstance(cfg_freeze, ConfigNode) else cfg_freeze,
             "sdpa_method": sdpa_method,
+            "load_metadata_with_gloo": load_metadata_with_gloo,
         }
         if distributed_setup is not None:
             kwargs["distributed_setup"] = distributed_setup
@@ -380,6 +377,7 @@ def build_model(
                 freeze_config=kwargs.get("freeze_config"),
                 pretrained_model_name_or_path=None,
                 load_base_model=False,
+                load_metadata_with_gloo=load_metadata_with_gloo,
                 cache_dir=hf_constants.HF_HUB_CACHE,
             )
 
@@ -551,6 +549,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Whether this rank owns the trainable model and its components."""
         return True
 
+    def _configure_packing(self) -> PackingCapabilities:
+        """Configure every local model stage and return its NEAT data requirements."""
+        from nemo_automodel.components.models.common.packing import configure_packing_for_models
+
+        return configure_packing_for_models(self.model_parts)
+
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
 
@@ -598,6 +602,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         if self.dist_env.is_main and self.cfg.mlflow is not None:
             run_config = self.cfg.to_yaml_dict(use_orig_values=True)
             checkpoint_dir = self.cfg.get("checkpoint.checkpoint_dir", None)
@@ -617,8 +628,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
         domain_mixture_config = self.cfg.domain_mixture
-        self.domain_mixture = domain_mixture_config.build() if domain_mixture_config is not None else None
-        if self.domain_mixture is not None:
+        self.domain_mixture = None
+        if domain_mixture_config is not None:
             if self.pp_enabled:
                 raise ValueError(
                     "domain_mixture does not currently support pipeline parallelism because the pipeline "
@@ -661,7 +672,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 raise ValueError(
                     f"domain_mixture requires a loss function with explicit reduction='sum'; got {reduction!r}"
                 )
-            _validate_domain_sampling_weights(self.domain_mixture, self.cfg.dataloader)
+            self.domain_mixture = domain_mixture_config.build(blend=_get_domain_mixture_blend(self.cfg.dataloader))
         if self.magi.hf_dispatch and isinstance(self.loss_fn, LinearCrossEntropy):  # pragma: no cover
             raise ValueError(
                 "The magi HF backend needs full logits and is incompatible with "
@@ -751,6 +762,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             cfg_freeze=self.cfg.get("freeze_config", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         self.embedding_row_repair_report = None
         embedding_row_repair = self.cfg.embedding_row_repair
@@ -835,18 +847,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        attn_implementation = None
+        packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
         if (
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
             and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
         ):
-            from nemo_automodel.components.models.common.packing import (
-                get_attn_implementation,
-                validate_flash_packing_support,
-            )
-
-            attn_implementation = get_attn_implementation(self.cfg.model, model=self.model_parts[0])
-            validate_flash_packing_support(attn_implementation=attn_implementation, model=self.model_parts[0])
+            packing_contract = self._configure_packing()
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config):
@@ -872,7 +878,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
                         else self.cfg.get("distributed.cp_size", 1)
                     ),
-                    attn_implementation=attn_implementation,
+                    packing_contract=packing_contract,
                     collate_wrapper=collate_wrapper,
                 )
 
@@ -1205,6 +1211,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches,
         is_train: bool = True,
     ):
+        """Run one local batch and accumulate its loss and optional gradients.
+
+        Args:
+            idx: Microbatch index in the accumulation window.
+            batch: Input mapping with token IDs, labels, and physical NEAT
+                document IDs of shape [batch, sequence]. NEAT attention metadata
+                is batch-major; legacy THD inputs are flattened by the sharder.
+                THD MTP requires physical boundaries in cu_seqlens_padded of
+                shape [num_sequences + 1] or [1, num_sequences + 1], or
+                _packed_seq_ids [batch, sequence] supplied by the native model
+                sharder from physical seq_lens_padded [batch, num_sequences].
+            loss_buffer: List receiving the detached scalar loss.
+            num_label_tokens: Global supervised-token count for loss normalization.
+            num_batches: Number of microbatches in the accumulation window.
+            is_train: Whether to backpropagate the combined main and MTP loss.
+        """
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
@@ -1248,6 +1270,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
+        # Preserve physical NEAT document IDs before model-kwarg filtering. The
+        # loss needs these even when the forward does not accept packing metadata.
+        mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
+        # Preserve packing metadata needed by the loss before model-kwarg filtering.
+        mtp_is_packed = "cu_seqlens" in batch or "cu_seqlens_padded" in batch or batch.get("qkv_format") == "thd"
+        mtp_cu_seqlens = batch.get("cu_seqlens_padded")
         labels = batch.pop("labels")
         dataset_ids = batch.pop("dataset_id", None)
         loss_weights = None
@@ -1287,16 +1315,22 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 batch_filtered = {
                     k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
                 }
-                # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
+                # Hand physical THD boundaries to the PP loss to mask cross-sequence targets —
                 # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
                 # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
-                # one pack/microbatch per step; the seq_idx tail handles differing per-microbatch boundaries.
-                cu_seqlens = batch_filtered.get("cu_seqlens")
+                # one pack/microbatch per step; batch-major NEAT metadata instead travels with each
+                # microbatch and its model-provided seq_idx tail.
+                cu_seqlens = (
+                    None if "packed_token_indices" in batch_filtered else batch_filtered.get("cu_seqlens_padded")
+                )
                 if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
                     cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 1:
+                    cu_seqlens = cu_seqlens[cu_seqlens != -1000]
                 pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
-                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
+                if isinstance(pp_loss_fn, PipelineCausalLMLoss):
                     pp_loss_fn.cu_seqlens = cu_seqlens
+                    pp_loss_fn.is_packed = mtp_is_packed or mtp_seq_idx is not None
                 if is_train:
                     # Use step for training (forward + backward)
                     if self.pp.info.has_first_stage:
@@ -1371,6 +1405,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
+                        # CP targets or NEAT document IDs already define the boundaries.
+                        mtp_cu_seqlens = None
+                    elif mtp_is_packed and mtp_cu_seqlens is None:
+                        raise ValueError(
+                            "Packed MTP requires cu_seqlens_padded with physical token boundaries, "
+                            "including padding; cu_seqlens alone is insufficient."
+                        )
                     mtp_cfg = self.cfg.mtp
                     if self._get_cp_group_size() > 1 and mtp_per_depth_targets is None:
                         raise NotImplementedError(
@@ -1385,16 +1427,21 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         mtp_per_depth_h=mtp_per_depth_h,
                         mtp_per_depth_logits=mtp_per_depth_logits,
                         mtp_per_depth_targets=mtp_per_depth_targets,
+                        seq_idx=mtp_seq_idx,
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,
                         num_label_tokens=num_label_tokens,
                         ignore_index=ignore_index,
-                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
-                        cu_seqlens=None if mtp_per_depth_targets is not None else batch.get("cu_seqlens"),
+                        # MTP shifts index physical token slots, including internal THD padding.
+                        cu_seqlens=mtp_cu_seqlens,
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )
+                # Autograd retains tensors needed by the losses. Release the
+                # output container and auxiliary aliases before backward so
+                # unused full-vocabulary logits do not overlap its allocations.
+                del out, mtp_per_depth_h, mtp_per_depth_logits
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
@@ -1751,6 +1798,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
                 wandb.log(metrics, step=log_data.step)
 
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            if val_name == "default":
+                trackio_logger.log_metrics(log_data.metrics, step=log_data.step)
+            else:
+                metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
+                trackio_logger.log_metrics(metrics, step=log_data.step)
+
         if _HAS_MLFLOW and mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
 
@@ -1802,10 +1857,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
+        # Log to remote services (WandB, Trackio, MLflow, Comet) according to step_scheduler frequency
+        trackio_logger = getattr(self, "trackio_logger", None)
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
@@ -1815,6 +1873,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+            if trackio_logger is not None:
+                self._log_moe_metrics(self.step_scheduler.step, trackio_logger.log_metrics)
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)

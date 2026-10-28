@@ -139,6 +139,7 @@ wandb:
   dir: logs/deepseek_v4_flash_vision_medpix_4k_ep32pp4_100steps/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 16
   time: "04:00:00"

@@ -50,14 +50,10 @@ dist_env:
   timeout_minutes: 120
 
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
-  config:
-    _target_: nemo_automodel.components.models.qwen3_8_flash_next.config.Qwen3_8_FlashNextConfig.from_pretrained
-    pretrained_model_name_or_path: Qwen/Qwen3.8-Flash-Next
-    name_or_path: Qwen/Qwen3.8-Flash-Next
-    language_model_only: true
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.8-Flash-Next
+  language_model_only: true
   trust_remote_code: false
-  load_base_model: true
   torch_dtype: bfloat16
   use_liger_kernel: false
   use_sdpa_patching: false
@@ -178,6 +174,7 @@ wandb:
   dir: wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: huiyingl
   # pp_size(1) * ep_size(64) = 64 GPUs => 8 nodes (8 GPUs/node).
   nodes: 8

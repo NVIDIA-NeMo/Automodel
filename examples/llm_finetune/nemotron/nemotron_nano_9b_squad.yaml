@@ -102,10 +102,16 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  cluster_tag: h100
   vllm_deploy: true
+  # NemotronH requires vLLM's native backend; its remote Transformers model is unsupported.
+  vllm_smoke_test: true
   recipe_owner: HuiyingLi
   time: "00:30:00"
   checkpoint_robustness:
+    # The vLLM deploy image uses Transformers v4, which cannot decode v5's
+    # tagged Infinity in time_step_limit before passing it to Mamba (AMINT-439).
+    checkpoint.v4_compatible: true
     distributed.tp_size: 2
     # Three TP2 x DP4 runs matched pre-update model, buffer, optimizer, scheduler,
     # counter, and RNG state exactly while measuring 0.09%-0.45% first-forward

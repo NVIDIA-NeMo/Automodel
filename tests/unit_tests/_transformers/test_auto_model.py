@@ -22,6 +22,7 @@ import torch
 
 from nemo_automodel._transformers.auto_model import (
     _MAX_BUILD_RETRIES,
+    NeMoAutoModelBiEncoder,
     NeMoAutoModelForCausalLM,
     _alias_remote_auto_map_for_target,
     _BaseNeMoAutoModelClass,
@@ -54,6 +55,7 @@ from nemo_automodel.components.distributed.config import (
 )
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 
 
 class _FakeMesh:
@@ -63,6 +65,61 @@ class _FakeMesh:
 
     def __getitem__(self, axis):
         return types.SimpleNamespace(size=lambda: self._sizes[axis])
+
+
+class _VisualRetriever(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.vision_tower = torch.nn.Linear(2, 2)
+        self.model.multi_modal_projector = torch.nn.Linear(2, 2)
+        self.model.language_model = torch.nn.Linear(2, 2)
+
+
+def test_retrieval_freeze_config_survives_kernel_retry_and_only_trains_projector():
+    freeze_config = {
+        "freeze_vision_tower": True,
+        "freeze_language_model": True,
+    }
+    model = _VisualRetriever()
+
+    def _apply_infrastructure(*, model, freeze_config, **kwargs):
+        apply_parameter_freezing(model, freeze_config)
+        return model
+
+    with (
+        patch(
+            "nemo_automodel._transformers.retrieval.BiEncoderModel.build",
+            side_effect=[_VisualRetriever(), model],
+        ) as mock_build,
+        patch(
+            "nemo_automodel._transformers.auto_model.instantiate_infrastructure",
+            return_value=(None, None, None, None),
+        ),
+        patch(
+            "nemo_automodel._transformers.auto_model._patch_liger_kernel",
+            side_effect=RuntimeError("unsupported test kernel"),
+        ),
+        patch(
+            "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+            side_effect=_apply_infrastructure,
+        ) as mock_infrastructure,
+        patch("torch.cuda.current_device", return_value=0),
+    ):
+        result = NeMoAutoModelBiEncoder.from_pretrained(
+            "test-model",
+            freeze_config=freeze_config,
+            use_sdpa_patching=False,
+        )
+
+    assert result is model
+    assert mock_build.call_count == 2
+    assert all("freeze_config" not in call.kwargs for call in mock_build.call_args_list)
+    assert mock_infrastructure.call_args.kwargs["freeze_config"] == freeze_config
+    assert {name for name, param in result.named_parameters() if param.requires_grad} == {
+        "model.multi_modal_projector.bias",
+        "model.multi_modal_projector.weight",
+    }
 
 
 class TestResolveMeshContext:
@@ -146,6 +203,7 @@ class TestResolveMeshContext:
         assert context.strategy_config.multimodal.frozen_sharding == "replicate"
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestFromPretrainedDeviceMesh:
     def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
@@ -639,6 +697,30 @@ def test_patch_liger_kernel_success(monkeypatch):
     attn_mock.assert_not_called()
 
 
+def test_patch_liger_kernel_uses_model_owned_hook(monkeypatch):
+    """Composite models can own their model-specific Liger policy."""
+    import nemo_automodel._transformers.kernel_patches as tgt
+
+    apply_mock, _ = prepare_env(monkeypatch, tgt, has_liger=True, apply_ok=True)
+
+    class ModelOwnedLigerPatch(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.liger_patch = MagicMock()
+
+        def _nemo_apply_liger_kernel(self, liger_kernel_transformers):
+            self.liger_patch(liger_kernel_transformers)
+
+    backbone = ModelOwnedLigerPatch()
+    model = torch.nn.Module()
+    model.model = backbone
+    patched = tgt._patch_liger_kernel(model)
+
+    assert patched is model
+    apply_mock.assert_not_called()
+    backbone.liger_patch.assert_called_once_with(tgt.liger_kernel_trf)
+
+
 def test_liger_not_available(monkeypatch):
     """
     Asked for Liger but HAS_LIGER_KERNEL is False.
@@ -1063,6 +1145,7 @@ class TestNeedSetupCacheClassesMapping:
 # =============================================================================
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestModelMappingKeyErrorFallback:
     """Test cases for _model_mapping KeyError fallback in _init_model."""
 
@@ -1076,7 +1159,6 @@ class TestModelMappingKeyErrorFallback:
         """force_hf path: _model_mapping lookup succeeds, class gets wrapped with mixin."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1145,7 +1227,6 @@ class TestModelMappingKeyErrorFallback:
         """force_hf pretrained path should restore each tensor dtype from the checkpoint."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1191,7 +1272,6 @@ class TestModelMappingKeyErrorFallback:
         """Explicit fp32 request unifies every floating tensor to fp32 (master weights)."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1241,7 +1321,6 @@ class TestModelMappingKeyErrorFallback:
         """Explicit bf16 request keeps bf16 params bf16 but preserves intrinsically-fp32 params."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1287,7 +1366,6 @@ class TestModelMappingKeyErrorFallback:
         """Fallback (non-force_hf, no custom model) path: _model_mapping succeeds."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1322,7 +1400,6 @@ class TestModelMappingKeyErrorFallback:
         """Fallback pretrained path should preserve tied-weight checkpoint dtypes."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
 
         class FakeModel(torch.nn.Module):
@@ -1367,7 +1444,6 @@ class TestModelMappingKeyErrorFallback:
         """Shared architecture names should stay on HF when the config does not match our custom model."""
 
         class FakeConfig:
-            _commit_hash = None
             name_or_path = "test-model"
             architectures = ["NemotronHForCausalLM"]
 
@@ -1544,7 +1620,6 @@ class TestBuildModelRetryDepth:
         """Minimal kwargs for _build_model with all required parameters."""
         mock_config = MagicMock()
         mock_config.quantization_config = None
-        mock_config._commit_hash = None
         mesh = MagicMock()
         mesh.tp_size = 1
         mesh.cp_size = 1
@@ -1598,9 +1673,11 @@ class TestBuildModelRetryDepth:
                 _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert mock_init.call_count == 1
 
-    def test_retry_succeeds_within_limit(self):
+    @pytest.mark.parametrize("load_metadata_with_gloo", [False, True])
+    def test_retry_succeeds_within_limit(self, load_metadata_with_gloo: bool) -> None:
         """When the retried call succeeds, the model is returned normally."""
         build_kwargs, mock_config = self._make_build_kwargs()
+        build_kwargs["load_metadata_with_gloo"] = load_metadata_with_gloo
         sentinel_model = MagicMock()
         with (
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
@@ -1611,7 +1688,9 @@ class TestBuildModelRetryDepth:
                 "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
                 return_value=sentinel_model,
             ),
-            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model
+            ) as apply_infrastructure,
             patch("torch.cuda.current_device", return_value=0),
         ):
             mock_init.side_effect = [
@@ -1621,6 +1700,8 @@ class TestBuildModelRetryDepth:
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert result is sentinel_model
             assert mock_init.call_count == 2
+            assert apply_infrastructure.call_args.kwargs["load_metadata_with_gloo"] is load_metadata_with_gloo
+            assert all("load_metadata_with_gloo" not in call.kwargs for call in mock_init.call_args_list)
 
     def test_build_model_applies_runtime_patches_before_infrastructure(self):
         """Model runtime hooks run after construction and before sharding/checkpoint infra."""
@@ -1792,15 +1873,22 @@ class TestBuildModelRetryDepth:
             assert mock_init.call_count == 2
 
     def test_checkpoint_loading_uses_config_snapshot_not_cached_main(self, hf_config_hub):
-        from transformers import GPT2Config
+        from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 
         root, cache, ref, _ = hf_config_hub
         # main and an unrelated weight index point to A; this config belongs to B.
         (cache / "snapshots" / ("a" * 40) / "model.safetensors.index.json").write_text("{}")
-        config = GPT2Config(n_embd=64, _commit_hash="b" * 40)
+        config = NeMoAutoConfig.from_pretrained("test/config-race", cache_dir=str(root), revision="b" * 40)
         config.name_or_path = "test/config-race"
         build_kwargs, _ = self._make_build_kwargs()
-        build_kwargs.update(is_hf_model=False, cache_dir=str(root), subfolder="nested")
+        from transformers.utils.hub import resolve_revision
+
+        build_kwargs.update(
+            is_hf_model=False,
+            cache_dir=str(root),
+            subfolder="nested",
+            revision=resolve_revision("test/config-race", "b" * 40, cache_dir=str(root)),
+        )
         sentinel_model = MagicMock()
         with (
             patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),

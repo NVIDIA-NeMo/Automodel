@@ -47,7 +47,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.dspark_cache import (
@@ -66,40 +65,18 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.datasets.llm.offline_cache import write_cache_shards_distributed
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41DSparkTargetConfig
-from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
-from nemo_automodel.components.speculative.dspark.registry import build_target_layer_ids
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
-from nemo_automodel.components.speculative.dspark.target_utils import (
-    DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
-)
-from nemo_automodel.components.speculative.dspark.target_utils import (
-    DEEPSEEK_V41_MODEL_TYPE as _DEEPSEEK_V41_MODEL_TYPE,
-)
-from nemo_automodel.components.speculative.dspark.target_utils import (
-    GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
-)
-from nemo_automodel.components.speculative.dspark.target_utils import (
-    GLM_5_2_MODEL_TYPE as _GLM_5_2_MODEL_TYPE,
-)
-from nemo_automodel.components.speculative.dspark.target_utils import (
-    KIMI_K3_MODEL_TYPES as _KIMI_K3_MODEL_TYPES,
-)
-from nemo_automodel.components.speculative.dspark.target_utils import (
-    MINIMAX_M3_MODEL_TYPES as _MINIMAX_M3_MODEL_TYPES,
-)
 from nemo_automodel.components.speculative.dspark.target_utils import (
     apply_target_chat_template as _apply_target_chat_template,
 )
 from nemo_automodel.components.speculative.dspark.target_utils import (
     read_target_model_type as _read_target_model_type,
 )
-from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.llm._dspark_target_build import (
-    build_deepseek_v4_target,
-    build_glm_5_2_target,
-    build_kimi_k3_target,
+    build_dspark_target,
+    chat_template_kwargs_from,
     gather_full_weight_module,
+    resolve_dspark_target_layer_ids,
     validate_dspark_parallelism_axes,
 )
 
@@ -148,98 +125,6 @@ def _ensure_output_dir_compatible(output_dir: str, manifest: dict[str, Any]) -> 
         )
 
 
-def _build_target(
-    *,
-    cfg,
-    recipe_cfg,
-    world_size: int,
-    device: torch.device,
-    compute_dtype: torch.dtype,
-    model_type: str,
-    target_path: str,
-    trust_remote_code: bool,
-):
-    """Build the frozen target for capture, dispatching on model type.
-
-    DeepSeek V4/V4.1, GLM-5.2, and Kimi K3 load through the sharded EP/FSDP path; other
-    single-process text targets (Qwen3, Gemma4) load replicated for data-parallel
-    throughput.
-    Returns ``(target_config, target_model)``.
-    """
-    if model_type in _MINIMAX_M3_MODEL_TYPES:
-        raise ValueError(
-            "MiniMax M3 is a multimodal target; the DSpark offline cache schema is text-only. "
-            "Use the online MiniMax M3 training path instead."
-        )
-    if model_type == _DEEPSEEK_V4_MODEL_TYPE:
-        target_config, target_model, _ = build_deepseek_v4_target(
-            cfg=cfg,
-            world_size=world_size,
-            device=device,
-            compute_dtype=compute_dtype,
-            target_path=target_path,
-            recipe_cfg=recipe_cfg,
-            trust_remote_code=trust_remote_code,
-        )
-        return target_config, target_model
-    if model_type == _DEEPSEEK_V41_MODEL_TYPE:
-        target_options = DeepseekV41DSparkTargetConfig(
-            target_path=target_path,
-            trust_remote_code=trust_remote_code,
-            target_num_hidden_layers=recipe_cfg.get("target_num_hidden_layers", None),
-        )
-        target_options.attn_backend = str(recipe_cfg.get("target_attn_backend", target_options.attn_backend))
-        target_options.dispatcher = str(recipe_cfg.get("target_dispatcher", target_options.dispatcher))
-        target_options.experts = str(recipe_cfg.get("target_experts", target_options.experts))
-        target_options.enable_fsdp_optimizations = bool(
-            recipe_cfg.get("target_enable_fsdp_optimizations", target_options.enable_fsdp_optimizations)
-        )
-        distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
-        target_model = target_options.build(
-            device=device,
-            compute_dtype=compute_dtype,
-            distributed_setup=distributed_setup,
-        )
-        target_config = target_model.config
-        return target_config, target_model
-    if model_type == _GLM_5_2_MODEL_TYPE:
-        target_config, target_model, _ = build_glm_5_2_target(
-            cfg=cfg,
-            world_size=world_size,
-            device=device,
-            compute_dtype=compute_dtype,
-            target_path=target_path,
-            recipe_cfg=recipe_cfg,
-            trust_remote_code=trust_remote_code,
-        )
-        return target_config, target_model
-    if model_type in _KIMI_K3_MODEL_TYPES:
-        target_config, target_model, _ = build_kimi_k3_target(
-            cfg=cfg,
-            world_size=world_size,
-            device=device,
-            compute_dtype=compute_dtype,
-            target_path=target_path,
-            recipe_cfg=recipe_cfg,
-            trust_remote_code=trust_remote_code,
-        )
-        return target_config, target_model
-    # Single-process text target (Qwen3, Gemma4): replicate on every rank; data
-    # parallelism over the contiguous per-rank shard blocks provides the throughput.
-    target_kwargs = {}
-    target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
-    if target_attn_implementation is not None:
-        target_kwargs["attn_implementation"] = target_attn_implementation
-    target_model = NeMoAutoModelForCausalLM.from_pretrained(
-        target_path,
-        trust_remote_code=trust_remote_code,
-        torch_dtype=compute_dtype,
-        force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-        **target_kwargs,
-    ).to(device)
-    return target_model.config, target_model
-
-
 def _make_sync_max_steps(world_size: int, device: torch.device):
     """Return an all-reduce-MAX reducer over the default group, or the identity."""
     if world_size <= 1 or not dist.is_available() or not dist.is_initialized():
@@ -275,7 +160,7 @@ def run(cfg) -> int:
     cache_dtype = DTYPE_MAP[cache_dtype_str]
 
     model_type = _read_target_model_type(target_path, trust_remote_code)
-    target_config, target_model = _build_target(
+    target_text_config, target_model = build_dspark_target(
         cfg=cfg,
         recipe_cfg=recipe_cfg,
         world_size=dist_env.world_size,
@@ -291,17 +176,7 @@ def run(cfg) -> int:
     tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
     _apply_target_chat_template(tokenizer, recipe_cfg.get("chat_template", None))
 
-    target_text_config = (
-        target_config.text_config
-        if model_type in _GEMMA4_MODEL_TYPES or model_type == _DEEPSEEK_V41_MODEL_TYPE
-        else target_config
-    )
-    num_target_layers = int(target_text_config.num_hidden_layers)
-    draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
-    target_layer_ids = list(
-        recipe_cfg.get("target_layer_ids", None) or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
-    )
-    target_layer_ids = validate_target_layer_ids(target_layer_ids, num_target_layers)
+    target_layer_ids = resolve_dspark_target_layer_ids(recipe_cfg, int(target_text_config.num_hidden_layers))
     target_wrapper = HFDSparkTargetModel(target_model, target_layer_ids=target_layer_ids)
 
     # Resolved once and passed to BOTH the dataloader and the manifest, so the
@@ -310,6 +185,7 @@ def run(cfg) -> int:
     shuffle_seed = int(recipe_cfg.get("shuffle_seed", 42))
     mask_reasoning_content = bool(recipe_cfg.get("mask_reasoning_content", False))
     mask_generation_prompt = bool(recipe_cfg.get("mask_generation_prompt", False))
+    chat_template_kwargs = chat_template_kwargs_from(recipe_cfg)
     dataloader = build_eagle3_dataloader(
         data_path=recipe_cfg.train_data_path,
         tokenizer=tokenizer,
@@ -322,6 +198,7 @@ def run(cfg) -> int:
         shuffle_seed=shuffle_seed,
         mask_reasoning_content=mask_reasoning_content,
         mask_generation_prompt=mask_generation_prompt,
+        chat_template_kwargs=chat_template_kwargs,
     )
     num_samples = len(dataloader.dataset)
 
@@ -340,6 +217,7 @@ def run(cfg) -> int:
         mask_reasoning_content=mask_reasoning_content,
         chat_template_sha256=tokenizer_chat_template_sha256(tokenizer),
         mask_generation_prompt=mask_generation_prompt,
+        chat_template_kwargs=chat_template_kwargs,
     )
 
     # Gather the (possibly DTensor-sharded) target embed_tokens / lm_head to full

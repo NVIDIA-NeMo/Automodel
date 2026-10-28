@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 import torch.nn as nn
 
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
 
 class _DionFamilyConfig(Protocol):
@@ -31,6 +32,8 @@ class _DionFamilyConfig(Protocol):
     scalar_opt: str
     scalar_betas: tuple[float, float]
     scalar_eps: float
+    supports_batched_matrices: ClassVar[bool]
+    use_matrix_layout: ClassVar[bool]
 
 
 _import_error: Exception | None = None
@@ -79,8 +82,9 @@ def _separate_param_groups(
         lm_head_lr: Learning rate for lm_head. Defaults to base_lr / sqrt(d_in).
         supports_batched_matrices: Route 3D+ weights to the matrix optimizer when
             it supports batches of matrices, including grouped MoE experts.
-        use_matrix_layout: Split transposed storage into its own matrix group for
-            optimizers whose update depends on the output-neuron axis.
+        use_matrix_layout: Give the matrix parameters of :class:`TransposedMatrixModule`
+            subclasses (``[..., input, output]`` storage) their own group for optimizers
+            whose update depends on the output-neuron axis.
     """
     matrix_params = []
     transposed_matrix_params = []
@@ -104,10 +108,11 @@ def _separate_param_groups(
             lm_head_params.append(param)
             continue
 
+        is_matrix = param.ndim == 2 or (supports_batched_matrices and param.ndim > 2)
+        # Batched-matrix optimizers keep 2D biases on the scalar optimizer; others keep main's ndim == 2 rule.
         is_bias = parameter_name == "bias" or parameter_name.endswith("_bias")
-        if not is_bias and (param.ndim == 2 or (supports_batched_matrices and param.ndim > 2)):
-            transposed_names = getattr(module, "_nemo_transposed_matrix_parameters", ())
-            if use_matrix_layout and parameter_name in transposed_names:
+        if is_matrix and not (supports_batched_matrices and is_bias):
+            if use_matrix_layout and isinstance(module, TransposedMatrixModule):
                 transposed_matrix_params.append(param)
             else:
                 matrix_params.append(param)
@@ -233,8 +238,8 @@ def build_dion_optimizer(
         scalar_lr=getattr(config, "scalar_lr", None),
         embed_lr=getattr(config, "embed_lr", None),
         lm_head_lr=getattr(config, "lm_head_lr", None),
-        supports_batched_matrices=getattr(config, "supports_batched_matrices", False),
-        use_matrix_layout=getattr(config, "use_matrix_layout", False),
+        supports_batched_matrices=config.supports_batched_matrices,
+        use_matrix_layout=config.use_matrix_layout,
     )
 
     dion_mesh = _get_dion_mesh(device_mesh)

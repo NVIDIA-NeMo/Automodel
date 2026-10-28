@@ -33,7 +33,7 @@ NeMo AutoModel supports several ways to launch training — through the AutoMode
 
 ### Standalone Slurm Script
 
-This recipe runs in the **26.04 NeMo AutoModel container** (`nvcr.io/nvidia/nemo-automodel:26.04.00`) and expects **your `main` checkout of AutoModel mounted over the container's `/opt/Automodel`**, so the run uses the latest code rather than the image's baked-in copy. Clone it once onto a shared filesystem that every node can see:
+This recipe runs in the **26.10 NeMo AutoModel container** (`nvcr.io/nvidia/nemo-automodel:26.10.00`) and expects **your `main` checkout of AutoModel mounted over the container's `/opt/Automodel`**, so the run uses the latest code rather than the image's baked-in copy. Clone it once onto a shared filesystem that every node can see:
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
@@ -61,8 +61,8 @@ export HF_TOKEN="<your-hf-token>"
 export HF_HOME=/your/shared/hf_cache
 export WANDB_API_KEY="<your-wandb-key>"
 
-export CONT=nvcr.io/nvidia/nemo-automodel:26.04.00
-export CONT_NAME=nemo-automodel-2604
+export CONT=nvcr.io/nvidia/nemo-automodel:26.10.00
+export CONT_NAME=nemo-automodel-2610
 
 # --- Mounts: overlay YOUR `main` checkout on /opt/Automodel, plus the shared FS ---
 export CONT_MOUNT="\
@@ -92,7 +92,7 @@ srun \
 
 <Warning>
 **Before you start:**
-- **Container**: use `nvcr.io/nvidia/nemo-automodel:26.04.00`. Pyxis pulls it from NGC on first use; on a multi-node run you can pre-import it to a local `.sqsh` (`enroot import`) to avoid every node pulling it.
+- **Container**: use `nvcr.io/nvidia/nemo-automodel:26.10.00`. Pyxis pulls it from NGC on first use; on a multi-node run you can pre-import it to a local `.sqsh` (`enroot import`) to avoid every node pulling it.
 - **Mount `main`**: the `/your/clone/of/Automodel:/opt/Automodel` bind mount is what makes the job run your checked-out `main` instead of the image's frozen copy — keep it pointed at the clone from the step above.
 - **GPU count**: set `--gpus-per-node` / `--nproc-per-node` to the GPUs per node (`4` on GB200) and size `distributed.ep_size` to the total GPU count (16 here).
 - **First-run download**: the recipe pulls the ~1 TB model from the Hugging Face Hub into `HF_HOME`. Because rank 0 downloads while the other ranks wait at a collective, the recipe ships with `dist_env.timeout_minutes: 120` — keep it generous, or pre-stage the model into `HF_HOME` (HF applies download rate limits, so cloning ahead of time is recommended).
@@ -102,6 +102,6 @@ srun \
 
 ## Training Results
 
-The recipe was validated with LoRA PEFT on HellaSwag on a 4 × GB200 (16-GPU) allocation, using the hybrid Mamba-2 and MoE Ultra backbone with MTP and Transformer Engine kernels. Training loss decreased steadily over the run (≈2.67 → ≈1.6), confirming healthy convergence end-to-end through model load, THD-packed data, FSDP2 and expert parallelism, and safetensors checkpointing.
+The recorded validation used the 26.04 container with LoRA PEFT on HellaSwag on a 4 × GB200 (16-GPU) allocation, using the hybrid Mamba-2 and MoE Ultra backbone with MTP and Transformer Engine kernels. Training loss decreased steadily over the run (≈2.67 → ≈1.6), confirming healthy convergence end-to-end through model load, THD-packed data, FSDP2 and expert parallelism, and safetensors checkpointing.
 
 <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/nemotron_ultra_loss.png" alt="Nemotron-3 Ultra Training Loss Curve" />

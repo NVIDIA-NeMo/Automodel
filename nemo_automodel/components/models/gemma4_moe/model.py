@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Replicate
+from torch.nn.attention.flex_attention import BlockMask
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -244,6 +245,18 @@ class Gemma4Gate(nn.Module):
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
+        """Select experts using FP32 router arithmetic.
+
+        Args:
+            x: Tensor of shape [..., hidden] with arbitrary leading dimensions.
+            token_mask: Optional boolean tensor matching x's leading dimensions;
+                unused by this router.
+            cp_mesh: Optional context-parallel mesh; unused by this router.
+
+        Returns:
+            Weights in the input dtype and integer expert indices, each shaped
+            [..., topk], followed by None for auxiliary loss.
+        """
         # Router math runs in fp32 regardless of parameter/activation storage
         # dtype. With bf16 storage (e.g. bf16 weights + fp32 master weights via
         # TE FusedAdam), bf16 logits can flip top-k expert selection, so keep
@@ -258,7 +271,8 @@ class Gemma4Gate(nn.Module):
         x_norm = self.norm(x).to(torch.float32)
         x_norm = x_norm * self.scale.to(torch.float32) * self.scalar_root_size
 
-        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
@@ -498,10 +512,7 @@ def _build_unpacked_gemma4_causal_mask_mapping(
     past_key_values,
     position_ids: torch.Tensor | None,
     mm_token_type_ids: torch.Tensor | None,
-    pixel_values: torch.Tensor | None,
-    *,
-    is_training: bool,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | BlockMask | None]:
     """Build full and sliding masks for an unpacked Gemma4 batch.
 
     Args:
@@ -515,48 +526,28 @@ def _build_unpacked_gemma4_causal_mask_mapping(
             token positions.
         mm_token_type_ids: Optional tensor of shape ``[batch, sequence]``
             containing multimodal token types.
-        pixel_values: Optional tensor of shape
-            ``[images, channels, height, width]`` containing image pixels. It is
-            forwarded only to the legacy Gemma4 mask builder.
-        is_training: Whether the owning model is in training mode.
 
     Returns:
         Mapping from ``full_attention`` and ``sliding_attention`` to tensors of
         shape ``[batch, 1, query, key]`` or equivalent block masks produced by
-        the active Transformers implementation.
+        the active Transformers implementation. A plain causal FFPA mask may
+        be ``None``; a padded FFPA mask has shape ``[batch, sequence]``.
     """
-    from transformers.models.gemma4 import modeling_gemma4
-
-    legacy_mask_mapping = getattr(modeling_gemma4, "create_causal_mask_mapping", None)
-    if legacy_mask_mapping is not None:
-        return legacy_mask_mapping(
-            config=config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-            mm_token_type_ids=mm_token_type_ids,
-            pixel_values=pixel_values,
-            is_training=is_training,
-        )
-
-    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+    from transformers.models.gemma4.modeling_gemma4 import create_masks_for_vision_model
 
     block_sequence_ids = torch.full(inputs_embeds.shape[:2], -1, device=inputs_embeds.device)
     if mm_token_type_ids is not None:
         block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
-    mask_kwargs = {
-        "config": config,
-        "inputs_embeds": inputs_embeds,
-        "attention_mask": attention_mask,
-        "past_key_values": past_key_values,
-        "position_ids": position_ids,
-        "block_sequence_ids": block_sequence_ids,
-    }
-    return {
-        "full_attention": create_causal_mask(**mask_kwargs),
-        "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-    }
+    # Full layers are causal for every backend, including image batches. Only
+    # sliding layers add image edges, constrained by the sliding-window overlay.
+    return create_masks_for_vision_model(
+        config=config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+        block_sequence_ids=block_sequence_ids,
+    )
 
 
 def _build_packed_gemma4_causal_mask_mapping(
@@ -778,11 +769,8 @@ class Gemma4MoETextModelBackend(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # Build causal masks. When use_bidirectional_attention == "vision" (e.g.
-        # gemma-4-26B-A4B, gemma-4-31B), HF uses create_causal_mask_mapping to
-        # build a vision-aware mask where tokens inside the same vision group
-        # attend to each other bidirectionally (not just causally). Missing this
-        # logic causes gen_kl_error to be ~10x higher on multimodal inputs.
+        # Gemma4 adds same-image bidirectional edges only to sliding layers;
+        # full-attention layers remain causal, including multimodal batches.
         use_vision_bidirectional_mask = getattr(self.config, "use_bidirectional_attention", None) == "vision"
         if use_vision_bidirectional_mask and mm_token_type_ids is None:
             mm_token_type_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
@@ -814,8 +802,6 @@ class Gemma4MoETextModelBackend(nn.Module):
                 past_key_values,
                 position_ids,
                 mm_token_type_ids,
-                pixel_values,
-                is_training=self.training,
             )
         else:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -1666,8 +1652,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ) -> None:
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            for p in self.parameters():
-                p.data = p.data.to(dtype)
+            cast_model_to_dtype(self, dtype)
             return
 
         # Guard: HF's super().__init__() calls post_init() -> init_weights() ->

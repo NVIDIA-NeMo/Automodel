@@ -19,9 +19,10 @@ from __future__ import annotations
 import copy
 import inspect
 import math
+import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -36,7 +37,10 @@ from nemo_automodel.components.attention.utils import (
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+from nemo_automodel.components.models.common.packing import (
+    flatten_packed_sequence_metadata,
+    is_indexed_packed_mask,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -69,6 +73,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
+from nemo_automodel.components.moe.router_replay import replay_selection
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
@@ -76,11 +81,15 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 _FLA_MSG = "Kimi K3 requires the flash-linear-attention/fla extra. Install with `uv sync --extra fla`."
 _SHORT_CONV_OK, ShortConvolution = safe_import_from("fla.modules", "ShortConvolution", msg=_FLA_MSG)
+_CAUSAL_CONV_OK, causal_conv1d = safe_import_from("fla.modules.conv.causal_conv1d", "causal_conv1d", msg=_FLA_MSG)
 _FUSED_RMSNORM_GATED_OK, FusedRMSNormGated = safe_import_from(
     "fla.modules",
     "FusedRMSNormGated",
     msg=_FLA_MSG,
 )
+if TYPE_CHECKING:
+    from fla.ops.cp import FLACPContext
+
 _CHUNK_KDA_OK, chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
 _RECURRENT_KDA_OK, fused_recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
 _CHUNK_KDA_HAS_DISABLE_RECOMPUTE = _CHUNK_KDA_OK and "disable_recompute" in inspect.signature(chunk_kda).parameters
@@ -109,7 +118,9 @@ except (TypeError, ValueError):
 
 
 def _require_fla() -> None:
-    if not all((_SHORT_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, _KDA_GATE_OK)):
+    if not all(
+        (_SHORT_CONV_OK, _CAUSAL_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, _KDA_GATE_OK)
+    ):
         raise UnavailableError(_FLA_MSG)
 
 
@@ -639,8 +650,7 @@ class KimiMLAAttention(nn.Module):
             key_states,
             value_states,
             q_doc_ids=packed_context.local_doc_ids,
-            kv_doc_ids=packed_context.doc_ids,
-            q_global_start=packed_context.seq_start,
+            block_mask=packed_context.mla_block_mask,
             scale=self.scaling,
         )
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, local_seq_length, -1)
@@ -683,6 +693,109 @@ class _KimiKDAFp32Param:
         if param is not None:
             return param
         raise AttributeError(f"{type(obj).__name__} has no KDA fp32 parameter {self.name!r}.")
+
+
+class _ContiguousConvolutionGradient(torch.autograd.Function):
+    """Normalize cotangent layout before FLA kernels that assume dense storage."""
+
+    @staticmethod
+    def forward(ctx: torch.autograd.function.FunctionCtx, value: torch.Tensor) -> torch.Tensor:
+        """Preserve convolution values while controlling their backward layout.
+
+        Args:
+            ctx: Autograd context.
+            value: Tensor of shape [batch, sequence, channels].
+
+        Returns:
+            Tensor of shape [batch, sequence, channels], aliasing value.
+        """
+        return value
+
+    @staticmethod
+    def backward(ctx: torch.autograd.function.FunctionCtx, gradient: torch.Tensor) -> torch.Tensor:
+        """Materialize strided or broadcast convolution cotangents.
+
+        Args:
+            ctx: Autograd context.
+            gradient: Tensor of shape [batch, sequence, channels], with arbitrary strides.
+
+        Returns:
+            Contiguous tensor of shape [batch, sequence, channels].
+        """
+        return gradient.contiguous()
+
+
+class KimiTrainingShortConvolution(nn.Conv1d):
+    """Differentiable FLA convolution, including one-token training documents.
+
+    FLA ShortConvolution dispatches all-singleton batches to its inference-only
+    update kernel. With no cache and output_final_state=False that path returns
+    zero, and it cannot train the convolution. Use the functional training path
+    for every length while retaining the checkpoint's [channels, 1, width] weight.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int,
+        activation: str = "silu",
+        bias: bool = False,
+        dtype: torch.dtype = torch.float32,
+        backend: str = "triton",
+    ) -> None:
+        super().__init__(
+            hidden_size, hidden_size, kernel_size, groups=hidden_size, padding=kernel_size - 1, bias=bias, dtype=dtype
+        )
+        if activation != "silu":
+            raise ValueError(f"K3 short convolution requires silu activation, got {activation!r}.")
+        if backend not in ("triton", "cuda"):
+            raise ValueError(f"Unsupported K3 short-convolution backend: {backend!r}.")
+        self.activation = activation
+        self.backend = backend
+        if backend == "cuda":
+            cuda_available, _ = safe_import_from("causal_conv1d", "causal_conv1d_fn")
+            if not cuda_available:
+                warnings.warn("causal_conv1d is unavailable; using the FLA Triton convolution backend.", stacklevel=2)
+                self.backend = "triton"
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        cache: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        cp_context: FLACPContext | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Convolve token features without crossing document or CP boundaries.
+
+        Args:
+            x: Features with shape [batch, sequence, channels].
+            cache: Optional preceding state of shape [documents, channels, kernel_size].
+            output_final_state: Whether to return the final convolution state.
+            cu_seqlens: Cumulative packed document offsets of shape [documents + 1].
+            cp_context: FLA metadata for the context-parallel partition.
+
+        Returns:
+            Convolved features of shape [batch, sequence, channels] and optional
+            final state of shape [documents, channels, kernel_size]. The output
+            keeps the input dtype; weights retain the checkpoint's FP32 storage.
+        """
+        output, final_state = causal_conv1d(
+            x=x,
+            weight=self.weight.squeeze(1),
+            bias=self.bias,
+            initial_state=cache,
+            output_final_state=output_final_state,
+            activation=self.activation,
+            backend=self.backend,
+            cu_seqlens=cu_seqlens,
+            cp_context=cp_context,
+        )
+        # FLA's convolution backward does not handle expanded/strided dy.
+        # An identity autograd node preserves forward values while materializing
+        # such cotangents (e.g. from sum()) before the external kernel reads them.
+        return _ContiguousConvolutionGradient.apply(output), final_state
 
 
 class _KimiFp32Module(nn.Module):
@@ -771,7 +884,7 @@ class KimiDeltaAttention(nn.Module):
         # causal-conv1d CUDA kernels when that package is installed (FLA falls back to Triton otherwise).
         conv_kwargs = _short_conv_backend_kwargs(getattr(config, "kda_conv_backend", "triton"))
         self.q_conv1d = _KimiFp32Module(
-            ShortConvolution(
+            KimiTrainingShortConvolution(
                 hidden_size=projection_k_size,
                 kernel_size=self.conv_size,
                 activation="silu",
@@ -780,7 +893,7 @@ class KimiDeltaAttention(nn.Module):
             )
         )
         self.k_conv1d = _KimiFp32Module(
-            ShortConvolution(
+            KimiTrainingShortConvolution(
                 hidden_size=projection_k_size,
                 kernel_size=self.conv_size,
                 activation="silu",
@@ -789,7 +902,7 @@ class KimiDeltaAttention(nn.Module):
             )
         )
         self.v_conv1d = _KimiFp32Module(
-            ShortConvolution(
+            KimiTrainingShortConvolution(
                 hidden_size=projection_size,
                 kernel_size=self.conv_size,
                 activation="silu",
@@ -842,11 +955,25 @@ class KimiDeltaAttention(nn.Module):
         Args:
             hidden_states: Tensor of shape [batch, sequence, hidden]; the sequence axis
                 holds this rank's contiguous shard under context parallelism.
-            attention_mask: Optional binary padding mask of shape [batch, sequence] where 1 marks valid tokens.
+            attention_mask: Optional tensor of shape [batch, sequence]. Without
+                packed metadata this is a binary validity mask (1 means valid).
+                With packed metadata it may hold 1-based document IDs and zero
+                for padding. Non-2D masks are not consumed directly; the legacy
+                fallback reads ``padding_mask`` instead.
             packed_context: Optional document layout of the batch, required under
                 context parallelism and used to reset the recurrent state at every
                 packed-document boundary.
-            **kwargs: Optional KDA kwargs, including ``cu_seqlens`` for packed sequences.
+            **kwargs: Optional KDA metadata. ``packed_token_indices`` contains
+                row-local valid-token positions of shape [batch, sequence] with
+                -1 padding, or flat positions of shape [tokens]. ``cu_seqlens``
+                contains row-local boundaries of shape [batch, max_documents + 1]
+                with -1 unused entries, or flat boundaries of shape [documents + 1].
+                With token indices, boundaries address the unpadded valid-token
+                stream; alone, flat boundaries address one physical row only when
+                neither a document mask nor ``_packed_seq_ids`` is supplied.
+                ``_packed_seq_ids`` optionally carries document IDs of shape
+                [batch, sequence]; ``padding_mask`` is boolean with the same
+                shape, where True marks padding.
 
         Returns:
             Tensor of shape [batch, sequence, hidden].
@@ -854,7 +981,13 @@ class KimiDeltaAttention(nn.Module):
         if packed_context is not None and packed_context.cp_enabled:
             return self._forward_with_cp(hidden_states, packed_context)
 
-        if attention_mask is not None:
+        packed_seq_ids = kwargs.get("_packed_seq_ids")
+        packed_document_ids = packed_seq_ids if packed_seq_ids is not None else attention_mask
+        has_dataset_packing = kwargs.get("packed_token_indices") is not None or (
+            packed_document_ids is not None
+            and (is_indexed_packed_mask(packed_document_ids) or kwargs.get("cu_seqlens") is not None)
+        )
+        if not has_dataset_packing and attention_mask is not None:
             if attention_mask.dim() != 2:
                 attention_mask = kwargs.get("padding_mask")
             if attention_mask is not None and attention_mask.dim() != 2:
@@ -864,10 +997,23 @@ class KimiDeltaAttention(nn.Module):
 
         cu_seqlens = kwargs.get("cu_seqlens")
         indices = None
-        if is_indexed_packed_mask(attention_mask):
+        if has_dataset_packing:
             # Packed rows: unpad to a single flat sequence and reset the recurrent
             # state per document instead of per row.
-            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            indices = kwargs.get("packed_token_indices")
+            if indices is None or cu_seqlens is None:
+                raise ValueError("Packed Kimi K3 inputs require dataset-provided packed_token_indices and cu_seqlens.")
+            indices, cu_seqlens = flatten_packed_sequence_metadata(
+                indices,
+                cu_seqlens,
+                batch_size=batch_size,
+                sequence_length=q_len,
+            )
+            indices = indices.to(device=hidden_states.device, dtype=torch.long)
+            if int(cu_seqlens[-1].item()) != indices.numel():
+                raise ValueError("Packed Kimi K3 token indices and cu_seqlens describe different token counts.")
+            if indices.numel() and (int(indices[0].item()) < 0 or int(indices[-1].item()) >= batch_size * q_len):
+                raise ValueError("Packed Kimi K3 token indices are outside the current batch layout.")
             hidden_states = _index_first_axis(hidden_states.reshape(batch_size * q_len, -1), indices).unsqueeze(0)
         elif attention_mask is not None and getattr(self.config, "kda_unpad_inputs", True):
             indices, cu_seqlens, _ = _get_unpad_data(attention_mask[:, -q_len:])
@@ -1065,7 +1211,8 @@ class KimiK3Gate(Gate):
             [tokens, activated_experts], and ``None`` for auxiliary loss.
         """
         del token_mask, cp_mesh
-        logits = F.linear(hidden_states.float(), self.weight.float(), None)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            logits = F.linear(hidden_states.float(), self.weight.float(), None)
         if self.score_func == "sigmoid_with_bias":
             scores = logits.sigmoid()
         elif self.score_func == "softmax_with_bias":
@@ -1086,23 +1233,11 @@ class KimiK3Gate(Gate):
             scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
         indices = scores_for_choice.topk(self.topk, dim=-1, sorted=False)[1]
+        indices = replay_selection(self.router_replay, indices)
         weights = scores.gather(1, indices)
         if self.topk > 1 and self.norm_topk_prob:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return weights * self.route_scale, indices, None
-
-
-_SHARED_EXPERT_STREAMS: dict[int, torch.cuda.Stream] = {}
-
-
-def _shared_expert_stream(device: torch.device) -> torch.cuda.Stream:
-    """Return the per-device side stream used for shared-expert overlap (created lazily, one per process)."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    stream = _SHARED_EXPERT_STREAMS.get(index)
-    if stream is None:
-        stream = torch.cuda.Stream(device=index)
-        _SHARED_EXPERT_STREAMS[index] = stream
-    return stream
 
 
 class KimiK3MoE(MoE):
@@ -1194,23 +1329,15 @@ class KimiK3MoE(MoE):
         weights, indices, _ = self.gate(identity, token_mask, gate_cp_mesh)
         routed_input = self.routed_expert_down_proj(identity)
         # Shared-expert overlap (BackendConfig.shared_expert_overlap): the shared experts only
-        # depend on ``identity``, so launch them on a side stream before the routed path and
-        # join after it. Under expert parallelism the routed path spends most of its time in
-        # dispatch / combine communication on the current stream, which leaves SMs free for the
-        # shared-expert GEMMs (same idea as Megatron-Core's ``moe_shared_expert_overlap``).
-        # Autograd replays each backward op on the stream its forward op used; measured on an
+        # depend on ``identity``, so launch them on the side stream before the routed path and
+        # join after it; the stream helpers are the shared ``MoE`` class's. Measured on an
         # 8-node EP32 K3 mini the win comes from the forward and recompute passes (launching the
         # shared experts after the routed path to reorder the backward was slower: the routed path
         # host-syncs on tokens_per_expert, which serializes the shared experts behind it).
         shared_output = None
         shared_stream = None
         if self.shared_experts is not None and self.backend.shared_expert_overlap and identity.is_cuda:
-            shared_stream = _shared_expert_stream(identity.device)
-            shared_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(shared_stream):
-                shared_output = self.shared_experts(identity)
-            # ``identity`` was allocated on the current stream; keep its block alive for the side stream.
-            identity.record_stream(shared_stream)
+            shared_output, shared_stream = self._shared_experts_on_side_stream(identity)
         if not self.training and not self._has_distributed_experts():
             routed = self._forward_reference_order(routed_input, indices, weights)
         else:
@@ -1219,9 +1346,7 @@ class KimiK3MoE(MoE):
             routed = self.routed_expert_norm(routed)
         output = self.routed_expert_up_proj(routed)
         if shared_output is not None:
-            current = torch.cuda.current_stream()
-            current.wait_stream(shared_stream)
-            shared_output.record_stream(current)
+            self._join_shared_experts(shared_output, shared_stream)
             output = output + shared_output
         elif self.shared_experts is not None:
             output = output + self.shared_experts(identity)
@@ -1637,7 +1762,13 @@ class KimiK3TextModel(nn.Module):
                 reconstruct ``kimi_packed_context`` after microbatch chunking.
             kimi_packed_seq_start: Global offset of this CP rank's sequence shard.
             kimi_packed_cp_size: Number of context-parallel sequence shards.
-            **attn_kwargs: Additional attention kwargs used by packed or THD execution.
+            **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
+                [batch, sequence] with 1-based document IDs and zero padding.
+                ``packed_token_indices`` has shape [batch, sequence] with row-local
+                positions and -1 padding, or [tokens] indexing flattened batch
+                and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
+                with row-local boundaries and -1 padding, or [documents + 1] for
+                flattened/THD inputs. ``max_seqlen`` is an integer document length.
 
         Returns:
             Tensor of shape [batch, sequence, hidden], or the hidden states and
@@ -1670,12 +1801,39 @@ class KimiK3TextModel(nn.Module):
                 cp_size=kimi_packed_cp_size,
             )
         if packed_context is None:
+            packed_seq_ids = attn_kwargs.get("_packed_seq_ids")
             packed_context = _packed_context_from_inputs(
                 inputs_embeds,
-                attention_mask=attention_mask,
+                attention_mask=packed_seq_ids if packed_seq_ids is not None else attention_mask,
                 cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
+        has_packed_inputs = (
+            attn_kwargs.get("_packed_seq_ids") is not None
+            or attn_kwargs.get("packed_token_indices") is not None
+            or attn_kwargs.get("cu_seqlens") is not None
+        )
+        # Packed attention consumes document metadata, but MoE routing still
+        # needs a separate mask for padding tokens, including in full-attention layers.
+        if packed_context is not None and packed_context.cp_enabled:
+            # FLA uses a process-global tensor cache. PP interleaves microbatches,
+            # so a cache hit in forward can become a miss during selective AC
+            # recomputation. Build metadata outside checkpointed decoder layers
+            # and retain it on this microbatch's context for the entire backward.
+            for layer in self.layers.values():
+                attention = layer.self_attn
+                if isinstance(attention, KimiDeltaAttention):
+                    if attention._cp_mesh is None:
+                        raise RuntimeError("Kimi KDA CP requires a configured process group.")
+                    for row in range(packed_context.doc_ids.shape[0]):
+                        build_fla_cp_context(packed_context, row, attention._cp_mesh.get_group(), attention.conv_size)
+                elif isinstance(attention, KimiMLAAttention):
+                    # Pipeline microbatches must not evict another microbatch's
+                    # mask between forward and selective-AC recomputation.
+                    _ = packed_context.mla_block_mask
+
+        if padding_mask is None and packed_context is not None:
+            padding_mask = packed_context.local_doc_ids == 0
+        linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
         causal_mask = (
             None
             if packed_context is not None and packed_context.cp_enabled
@@ -1698,7 +1856,7 @@ class KimiK3TextModel(nn.Module):
         for decoder_layer in self.layers.values():
             layer_mask = linear_attn_mask if decoder_layer.is_linear_attn else causal_mask
             layer_padding_mask = padding_mask
-            if decoder_layer.is_linear_attn and layer_mask is not None:
+            if decoder_layer.is_linear_attn and layer_mask is not None and layer_padding_mask is None:
                 layer_padding_mask = layer_mask.bool().logical_not()
             layer_output = decoder_layer(
                 hidden_states,
@@ -1775,6 +1933,11 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # Kimi Linear owns context parallelism end to end: it shards the batch itself
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.
+    requires_packed_sequence_metadata = True
+    # Batch callback of the CP sharder built by prepare_model_inputs_for_cp; the
+    # VLM overrides it to keep media token streams whole until embedding.
+    _cp_batch_sharder = staticmethod(shard_batch_for_kimi_cp)
+    packed_mask_type = "document_ids"
     _owns_cp_attention = True
     # Packed documents are masked by the model itself: MLA gets a document-blocked
     # causal mask and KDA resets its recurrent state on per-document ``cu_seqlens``.
@@ -2006,7 +2169,13 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
             logits_to_keep: Number of trailing sequence logits to compute, or tensor indices.
             output_hidden_states: Whether to include hidden states in the output.
-            **attn_kwargs: Additional attention kwargs used by packed or THD execution.
+            **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
+                [batch, sequence] with 1-based document IDs and zero padding.
+                ``packed_token_indices`` has shape [batch, sequence] with row-local
+                positions and -1 padding, or [tokens] indexing flattened batch
+                and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
+                with row-local boundaries and -1 padding, or [documents + 1] for
+                flattened/THD inputs. ``max_seqlen`` is an integer document length.
 
         Returns:
             Causal LM output whose logits have shape [batch, sequence, vocab] unless ``logits_to_keep`` trims sequence.
@@ -2092,7 +2261,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         del batch, num_chunks
         return {
             "cp_sharder": ContextParallelSharder(
-                shard_batch=shard_batch_for_kimi_cp,
+                shard_batch=self._cp_batch_sharder,
                 local_token_global_indices=contiguous_local_indices,
             )
         }

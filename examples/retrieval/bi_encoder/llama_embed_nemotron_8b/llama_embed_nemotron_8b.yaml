@@ -104,3 +104,6 @@ distributed:
 dist_env:
   backend: nccl
   timeout_minutes: 30
+
+ci:
+  cluster_tag: h100

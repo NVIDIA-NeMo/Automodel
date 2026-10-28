@@ -1,0 +1,208 @@
+---
+title: "flux-3-image-klein-base"
+description: "Fine-tune flux-3-image-klein-base (FLUX 3 Image Klein Base) for text-to-image generation and instruction-based image editing using NeMo AutoModel."
+slug: model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base
+---
+
+FLUX 3 Image Klein Base is Black Forest Labs' open-weight image model. NeMo AutoModel integrates its image-only `Flux3Transformer2DModel` for text-to-image generation and instruction-based image editing, using flow matching and Qwen3-VL text conditioning.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| **Task** | Text-to-Image, Image-to-Image (instruction editing) |
+| **Architecture** | Image DiT (Flow Matching) |
+| **Parameters** | 5.6B in the image transformer, excluding the text encoder and VAE |
+| **Developer** | [Black Forest Labs](https://huggingface.co/black-forest-labs) |
+
+### Available Models
+
+| Checkpoint | Format | Usage |
+|---|---|---|
+| [`black-forest-labs/flux-3-image-klein-base`](https://huggingface.co/black-forest-labs/flux-3-image-klein-base) | BF16 base model with Diffusers modular components | Download the self-contained repository; no conversion is needed for its modular files |
+
+<Note>
+The training workflow below covers **FLUX 3 Image Klein Base**, the non-distilled model that uses classifier-free guidance. The separate `black-forest-labs/flux-3-image-klein` checkpoint is distilled and is not covered by this training validation.
+</Note>
+
+## Example Recipes
+
+Run the commands below from the AutoModel repository root on the `main` branch.
+
+| Recipe | Description |
+|---|---|
+| [flux3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) | Text-to-image LoRA fine-tuning |
+| [flux3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow.yaml) | Text-to-image full fine-tuning template |
+| [flux3_i2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_i2i_flow.yaml) | Image-editing full fine-tuning template; add the LoRA configuration below for adapter training |
+| [generate_flux3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_flux3.yaml) | Native image generation with optional trained LoRA weights |
+
+The 100-step validation covers LoRA training. The full fine-tuning templates have not undergone the same end-to-end validation.
+
+## Checkpoint and Environment Setup
+
+Install NeMo AutoModel with diffusion dependencies using the [Installation Guide](/get-started/installation). Run the commands below from the AutoModel repository root in that environment.
+
+### Download the checkpoint
+
+The release repository includes Diffusers weights and `modular_model_index.json`, alongside the original BFL package. Download the base repository for fine-tuning; the separate distilled repository is intended for inference. The release model card uses a source installation of Diffusers:
+
+```bash
+uv pip install --upgrade "git+https://github.com/huggingface/diffusers.git"
+
+uv run --no-sync hf download black-forest-labs/flux-3-image-klein-base \
+  --local-dir /data/models/flux3-image-klein-base
+```
+
+After authenticating with an authorized Hugging Face account, use the local directory containing `modular_model_index.json` and the transformer, VAE, text encoder, and tokenizer component directories. AutoModel loads those modular components directly; converting the release repository's original BFL files is not required. The `variants/fp8r` and `variants/nvfp4` directories are quantized inference packages and are outside the BF16 training validation documented here.
+
+The examples use `uv run --no-sync` to preserve the installed Diffusers revision. Replace the example `/data` paths with your own directories.
+
+NeMo AutoModel loads the transformer for training and the complete modular pipeline for generation. Preprocessing caches VAE latents and text embeddings offline. The image VAE runs in FP32; the validated transformer and LoRA compute path uses BF16. Text conditioning uses the checkpoint-selected Qwen3-VL layers, pads prompts to multiples of 80 tokens with a maximum length of 8192, and preserves the training-time padding position IDs.
+
+## Text-to-Image LoRA Fine-Tuning
+
+### Prepare the dataset
+
+This example caches 32 image-caption pairs from [Tuxemon](https://huggingface.co/datasets/diffusers/tuxemon) at the 512p resolution preset:
+
+```bash
+uv run --no-sync python -m tools.diffusion.preprocessing_multiprocess image \
+  --processor flux3 \
+  --model_name /data/models/flux3-image-klein-base \
+  --dataset_name diffusers/tuxemon \
+  --dataset_media_column image \
+  --dataset_caption_column gpt4_turbo_caption \
+  --resolution_preset 512p \
+  --max_images 32 \
+  --num_gpus 2 \
+  --verify \
+  --output_dir /data/cache/flux3-klein-t2i
+```
+
+### Train for 100 steps
+
+The following overrides adapt the LoRA recipe to two GPUs, with native attention, activation checkpointing, global batch size 2, and a 10-step warmup. This configuration was validated on two NVIDIA H100 80GB GPUs.
+
+```bash
+uv run --no-sync torchrun --nproc-per-node=2 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux3_t2i_flow_lora.yaml \
+  --model.pretrained_model_name_or_path /data/models/flux3-image-klein-base \
+  --model.attention_backend native \
+  --fsdp.dp_size 2 \
+  --fsdp.activation_checkpointing true \
+  --fsdp.enable_fsdp2_prefetch false \
+  --data.dataloader.cache_dir /data/cache/flux3-klein-t2i \
+  --step_scheduler.global_batch_size 2 \
+  --step_scheduler.max_steps 100 \
+  --step_scheduler.ckpt_every_steps 50 \
+  --lr_scheduler.lr_warmup_steps 10 \
+  --checkpoint.checkpoint_dir /data/checkpoints/flux3-klein-t2i
+```
+
+Keep the text-to-image recipe's LoRA target list: it excludes the inactive reference-image stream. The recipe uses rank-4 BF16 adapters.
+
+### Generate images
+
+Point `model.lora_weights` at the saved checkpoint's `model/` directory:
+
+```bash
+uv run --no-sync python examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_flux3.yaml \
+  --model.pretrained_model_name_or_path /data/models/flux3-image-klein-base \
+  --model.lora_weights /data/checkpoints/flux3-klein-t2i/REPLACE_WITH_SAVED_CHECKPOINT/model \
+  --output.output_dir /data/outputs/flux3-klein-t2i
+```
+
+The generation config supplies a prompt, seed 42, 50 denoising steps, guidance scale 3.5, and a 1024 x 1024 output. Edit its `inference.prompts` list for your task. Omit the LoRA override to generate with the base checkpoint.
+
+## Image-Editing LoRA Fine-Tuning
+
+### Prepare paired images
+
+Image editing uses a target image, one clean source image, and an instruction. The source conditions the generation stream; it is not a second training target.
+
+```bash
+uv run --no-sync python -m tools.diffusion.preprocessing_multiprocess image-edit \
+  --processor flux3_image_edit \
+  --model_name /data/models/flux3-image-klein-base \
+  --dataset_name osunlp/MagicBrush \
+  --dataset_split train \
+  --dataset_streaming \
+  --dataset_media_mapping target=target_img \
+  --dataset_media_mapping context=source_img \
+  --dataset_caption_column instruction \
+  --max_items 32 \
+  --max_pixels 262144 \
+  --max_sequence_length 8192 \
+  --num_gpus 2 \
+  --verify \
+  --output_dir /data/cache/flux3-klein-i2i
+```
+
+### Configure adapters and train
+
+Copy `examples/diffusion/finetune/flux3_i2i_flow.yaml` to a local configuration. Add the following top-level `peft` block so adapters also train the active reference-image stream:
+
+```yaml
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  dim: 4
+  alpha: 4
+  dropout: 0.0
+  lora_dtype: bfloat16
+  target_modules:
+    - "*.to_q"
+    - "*.to_k"
+    - "*.to_v"
+    - "*.to_out.0"
+    - "*.ff.linear_in"
+    - "*.ff.linear_out"
+    - x_embedders.image
+    - proj_out
+    - context_embedder
+    - x_embedders.image_cond
+```
+
+Run the same native training entry point, using your edited configuration:
+
+```bash
+uv run --no-sync torchrun --nproc-per-node=2 \
+  examples/diffusion/finetune/finetune.py \
+  -c /data/configs/flux3_klein_i2i_lora.yaml \
+  --model.pretrained_model_name_or_path /data/models/flux3-image-klein-base \
+  --model.model_type flux3 \
+  --model.attention_backend native \
+  --fsdp.dp_size 2 \
+  --fsdp.activation_checkpointing true \
+  --fsdp.enable_fsdp2_prefetch false \
+  --data.dataloader.cache_dir /data/cache/flux3-klein-i2i \
+  --data.dataloader.num_workers 0 \
+  --optimizer.lr 1e-4 \
+  --lr_scheduler.lr_warmup_steps 10 \
+  --step_scheduler.global_batch_size 2 \
+  --step_scheduler.max_steps 100 \
+  --step_scheduler.ckpt_every_steps 50 \
+  --checkpoint.save_consolidated false \
+  --checkpoint.checkpoint_dir /data/checkpoints/flux3-klein-i2i
+```
+
+For generation, use the same native generation entry point with the image-editing LoRA checkpoint. In a copy of `generate_flux3.yaml`, set `inference.prompts` to editing instructions and `inference.input_images` to the corresponding source-image paths, one per prompt. Use output dimensions that preserve the source image's aspect ratio, with height and width divisible by 16. The tested editing workflow uses one reference image per prompt.
+
+## Validation Scope
+
+| Workflow | End-to-end coverage |
+|---|---|
+| Text-to-image LoRA | 100 steps on 32 Tuxemon examples; native FSDP2 loading and forward/backward on 2 H100 GPUs; checkpoint save, adapter reload, and image generation |
+| Image-editing LoRA | 100 steps on 32 MagicBrush training examples; native FSDP2 loading and forward/backward on 2 H100 GPUs; checkpoint save, adapter reload, and generation on 4 held-out edits |
+| Text-to-image resume | Native optimizer and adapter checkpoint resume from step 50 to step 100; bitwise-identical continuation is not established |
+
+These runs verify the training and generation workflow on a small dataset; they do not establish a quality improvement or a performance benchmark. Full-parameter fine-tuning, multi-node execution, tensor/context parallelism greater than one, image-editing resume, and FP8/NVFP4 training remain unvalidated. This integration covers image generation and editing, with no video or audio workflow.
+
+## Further Reading
+
+- [Diffusion Training and Fine-Tuning](/recipes-e2e-examples/diffusion-fine-tuning)
+- [Diffusion Dataset Preparation](/datasets/diffusion-dataset)
+- [Diffusion Model Coverage](/model-coverage/diffusion/overview)

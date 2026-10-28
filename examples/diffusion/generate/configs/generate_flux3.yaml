@@ -1,0 +1,23 @@
+# FLUX.3 Image Klein Base, with Diffusers modular components.
+# Requires Hugging Face access and a Diffusers revision with FLUX.3 support.
+model:
+  pretrained_model_name_or_path: black-forest-labs/flux-3-image-klein-base
+  lora_weights: null  # Set to the training checkpoint's model/ directory.
+
+inference:
+  dtype: bfloat16  # The modular image VAE remains FP32.
+  prompts:
+    - "A red fox stands alert in a snowy pine forest at golden hour, warm sunlight catching its orange fur and long blue shadows stretching across the snow."
+  height: 1024
+  width: 1024
+  num_inference_steps: 50
+  guidance_scale: 3.5
+  max_samples: 1
+
+output:
+  output_dir: outputs/flux3
+
+seed: 42
+
+ci:
+  cluster_tag: h100

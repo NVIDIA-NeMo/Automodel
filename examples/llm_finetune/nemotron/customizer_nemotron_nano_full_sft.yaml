@@ -85,6 +85,7 @@ parallelizer:
   activation_checkpointing: false
 
 ci:
+  cluster_tag: h100
   time: "00:30:00"
   checkpoint_robustness:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16

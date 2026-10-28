@@ -51,9 +51,16 @@ def parse_log(log_path: str) -> dict:
         if m:
             results[key] = float(m.group(1))
 
-    m = re.search(r"TFLOPs/GPU:\s+([\d.]+)", content)
+    # Match a log-message/field boundary so an earlier "MTP TFLOPs/..."
+    # diagnostic cannot supply the full model's count. Accept the legacy label
+    # for old logs; it historically held global-step FLOPs despite its name.
+    m = re.search(r"(?:^|\|)\s*TFLOPs/GPU(?:/step)?:\s+([\d.]+)", content, re.MULTILINE)
     if m:
         results["tflops_per_gpu"] = float(m.group(1))
+
+    m = re.search(r"(?:^|\|)\s*TFLOPs/global step:\s+([\d.]+)", content, re.MULTILINE)
+    if m:
+        results["tflops_total"] = float(m.group(1))
 
     m = re.search(r"TFLOPS multiplier for PEFT:.*?=\s+([\d.]+)", content)
     if m:

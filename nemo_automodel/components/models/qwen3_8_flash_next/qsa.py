@@ -32,7 +32,6 @@ import torch
 from torch import nn
 from torch.utils._python_dispatch import _disable_current_modes
 
-from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
@@ -42,6 +41,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
 from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import FlexQSAMask, flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # The gathered implementation is a numerical oracle and CPU fallback, not the
@@ -276,7 +276,8 @@ def select_qsa_token_ids(
                 sparse_start = min(max(first_sparse_position - first_position, 0), rows)
                 if sparse_start < rows:
                     sparse_queries = index_queries[batch_idx, query_start + sparse_start : query_end].float()
-                    scores = torch.einsum("qhd,pd->qhp", sparse_queries, keys)
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        scores = torch.einsum("qhd,pd->qhp", sparse_queries, keys)
                     scores = torch.relu(scores).sum(dim=1) / score_scale
                     block_ids = torch.arange(available_blocks, device=device)
                     sparse_visible = visible_blocks[sparse_start:]
@@ -341,11 +342,12 @@ def _gathered_qsa_gqa_attention_chunk(
     # [B, Q, K, Hkv, D] -> [B, Q, Hkv, K, D].
     gathered_key = key[batch_ids, safe_ids].permute(0, 1, 3, 2, 4)
     gathered_value = value[batch_ids, safe_ids].permute(0, 1, 3, 2, 4)
-    scores = torch.einsum(
-        "bqhgd,bqhkd->bqhgk",
-        grouped_query.float(),
-        gathered_key.float(),
-    )
+    with torch.autocast(device_type=grouped_query.device.type, enabled=False):
+        scores = torch.einsum(
+            "bqhgd,bqhkd->bqhgk",
+            grouped_query.float(),
+            gathered_key.float(),
+        )
     scores = scores * softmax_scale
     score_valid = valid[:, :, None, None, :]
     scores = scores.masked_fill(~score_valid, -torch.inf)
@@ -355,11 +357,12 @@ def _gathered_qsa_gqa_attention_chunk(
     has_tokens = valid.any(dim=-1)
     scores = torch.where(has_tokens[:, :, None, None, None], scores, torch.zeros_like(scores))
     probabilities = torch.softmax(scores, dim=-1).masked_fill(~score_valid, 0.0)
-    chunk_output = torch.einsum(
-        "bqhgk,bqhkd->bqhgd",
-        probabilities,
-        gathered_value.float(),
-    )
+    with torch.autocast(device_type=grouped_query.device.type, enabled=False):
+        chunk_output = torch.einsum(
+            "bqhgk,bqhkd->bqhgd",
+            probabilities,
+            gathered_value.float(),
+        )
     return chunk_output.flatten(2, 3).to(grouped_query.dtype)
 
 

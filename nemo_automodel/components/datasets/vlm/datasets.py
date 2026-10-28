@@ -25,17 +25,16 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
+from typing import ClassVar
 
 import torch
 import torch.utils.data
 from datasets import Dataset, load_dataset
 from datasets import Image as HfImage
 from PIL import Image
+from transformers import ProcessorMixin
 
-if TYPE_CHECKING:
-    from transformers import ProcessorMixin
-
+from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
     _lmdb_env_cache,
@@ -1614,34 +1613,33 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                             if isinstance(item, dict) and isinstance(item.get("image"), Image.Image):
                                 item["image"] = item["image"].convert("RGB")
 
-                # Render template text.
-                text = self.processor.apply_chat_template(
-                    [conversation],
-                    tokenize=False,
-                )
-                if isinstance(text, list):
-                    text = text[0]
-
-                # Extract pre-loaded media for the processor.
-                images, videos = _extract_media_from_conversations(
-                    [conversation],
-                )
-
-                # Build video_metadata from preserved _video_fps / _frame_indices
-                # so the processor inserts correct timestamps and skips re-sampling.
+                # Preserve video timestamps and skip re-sampling pre-loaded frames.
                 video_metadata = _build_video_metadata(conversation)
-
-                processor_kwargs = {
-                    "text": [text],
-                    "images": images,
-                    "videos": videos,
-                    "return_tensors": "pt",
-                    "do_sample_frames": False,
-                }
+                processor_kwargs = {"do_sample_frames": False}
                 if video_metadata:
                     processor_kwargs["video_metadata"] = [video_metadata]
 
-                result = self.processor(**processor_kwargs)
+                chat_template = self.processor.chat_template if isinstance(self.processor, ProcessorMixin) else None
+                if isinstance(chat_template, dict):
+                    chat_template = chat_template.get("default")
+                template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
+                if template_has_generation_kwd:
+                    result = self.processor.apply_chat_template(
+                        [conversation],
+                        tokenize=True,
+                        return_dict=True,
+                        return_tensors="pt",
+                        return_assistant_tokens_mask=True,
+                        processor_kwargs=processor_kwargs,
+                    )
+                else:
+                    text = self.processor.apply_chat_template([conversation], tokenize=False)
+                    if isinstance(text, list):
+                        text = text[0]
+                    images, videos = _extract_media_from_conversations([conversation])
+                    result = self.processor(
+                        text=[text], images=images, videos=videos, return_tensors="pt", **processor_kwargs
+                    )
                 if self.post_tokenize_hook is not None:
                     result = self.post_tokenize_hook(result, self.processor)
 
@@ -1662,11 +1660,10 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
 
                 # Build labels BEFORE truncation so the full assistant text
                 # can be matched against the full input_ids.
-                labels = build_labels_from_template(
-                    result["input_ids"],  # (1, seq_len)
-                    [conversation],
-                    self.processor,
-                )[0]  # (seq_len,)
+                if template_has_generation_kwd:
+                    labels = result["input_ids"].masked_fill(result.pop("assistant_masks") == 0, -100)[0]
+                else:
+                    labels = build_labels_from_template(result["input_ids"], [conversation], self.processor)[0]
 
                 # Now truncate if needed (after labels are built)
                 if self.truncate and self.max_length is not None and seq_len > self.max_length:

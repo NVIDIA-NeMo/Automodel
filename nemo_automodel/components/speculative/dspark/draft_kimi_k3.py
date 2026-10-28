@@ -194,6 +194,9 @@ class KimiK3DSparkModel(DeepseekV4DSparkModel):
     """DSpark draft with a dense K3 MLA backbone and no KDA or MoE layers."""
 
     _no_split_modules = ["KimiK3DSparkDecoderLayer"]
+    # The K3 target's KDA layers do not reset their state at packed document
+    # boundaries on the generic block-causal packing path.
+    supports_sequence_packing = False
 
     def __init__(self, config) -> None:
         nn.Module.__init__(self)

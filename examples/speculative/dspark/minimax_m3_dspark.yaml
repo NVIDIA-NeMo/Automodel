@@ -97,3 +97,6 @@ checkpoint:
   checkpoint_dir: ./outputs/dspark_minimax_m3_perfectblend/checkpoints
   model_save_format: safetensors
   save_consolidated: final
+
+ci:
+  cluster_tag: h100

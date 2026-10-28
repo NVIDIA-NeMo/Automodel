@@ -277,11 +277,25 @@ def test_tokenizer_build_preserves_checkpoint_revision(monkeypatch: pytest.Monke
         return tokenizer
 
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", from_pretrained)
-    config = DeepseekV41Config(name_or_path="local/checkpoint", _commit_hash="pinned-revision")
-    assert config.build_tokenizer() is tokenizer
+    config = DeepseekV41Config(name_or_path="local/checkpoint")
+    assert config.build_tokenizer(revision="pinned-revision") is tokenizer
     assert received == {
         "source": "local/checkpoint",
         "revision": "pinned-revision",
         "trust_remote_code": False,
         "use_fast": True,
     }
+
+
+def test_engram_strict_validation_defaults_off_for_v41():
+    """DeepSeek-V4.1 opts out of the shared Engram table's host-side validation (the table's own default stays strict)."""
+    from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
+    from nemo_automodel.components.models.qwen3_8_flash_next.engram import Qwen3_8_FlashNextEngramTableConfig
+
+    assert DeepseekV41TextConfig().engram_strict_validation is False
+    assert DeepseekV41TextConfig(engram_strict_validation=True).engram_strict_validation is True
+    assert Qwen3_8_FlashNextEngramTableConfig(num_embeddings=8, embedding_dim=2).strict_validation is True
+    # capacity mode (the exchange sized once, never read back) is an explicit opt-in on both configs
+    assert DeepseekV41TextConfig().engram_capacity_mode is False
+    assert DeepseekV41TextConfig(engram_capacity_mode=True).engram_capacity_mode is True
+    assert Qwen3_8_FlashNextEngramTableConfig(num_embeddings=8, embedding_dim=2).capacity_mode is False

@@ -20,6 +20,10 @@ Run with pytest (two GPUs), or select a case for diagnosis with:
 
 Base weights are MXFP4-representable in both implementations, and LoRA B is
 nonzero so adapter A gradients are exercised. No dispatch or collective is mocked.
+
+PR CI runs six representative cases per dispatcher, covering every variant,
+both LoRA ranks, checkpoint replay, and empty expert routing. Scheduled CI sets
+NEMO_MOE_TEST_FULL_MATRIX=true to retain all 96 original combinations.
 """
 
 import argparse
@@ -28,12 +32,15 @@ import json
 import os
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.utils.checkpoint import checkpoint
 
@@ -51,6 +58,30 @@ _CASES = ("balanced", "ragged", "ragged_checkpoint", "empty_rank_checkpoint")
 _HIDDEN = 512
 _INTER = 256
 _EXPERTS = 4
+# Preserve each distinct execution path in PR CI; the Cartesian product stays in nightly CI.
+_SMOKE_CASES = (
+    ("plain", "ragged", 8),
+    ("lora", "ragged_checkpoint", 8),
+    ("mxfp4", "ragged_checkpoint", 8),
+    ("mxfp4_lora", "ragged", 8),
+    ("mxfp4_lora", "empty_rank_checkpoint", 8),
+    ("mxfp4_lora", "ragged_checkpoint", 4),
+)
+
+
+@lru_cache(maxsize=8)
+def _rounded_weight(shape: tuple[int, ...], seed: int) -> torch.Tensor:
+    """Return a shared CPU BF16 fixture of shape [experts, input, output], rounded to MXFP4.
+
+    Callers copy the fixture into fresh parameters so optimizer steps cannot mutate it.
+
+    Returns:
+        Rounded weights of shape [experts, input, output] in CPU BF16.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    source = (torch.randn(shape, generator=generator) * 0.04).to(torch.bfloat16)
+    packed, scales = quantize_mxfp4(source.transpose(-2, -1).contiguous())
+    return dequantize_mxfp4(packed, scales, torch.bfloat16).transpose(-2, -1)
 
 
 def _model(variant: str, dispatcher: str, device: torch.device, lora_rank: int) -> torch.nn.Module:
@@ -84,10 +115,8 @@ def _model(variant: str, dispatcher: str, device: torch.device, lora_rank: int) 
         )
     generator = torch.Generator().manual_seed(4321)
     with torch.no_grad():
-        for param in orig.parameters():
-            source = (torch.randn(param.shape, generator=generator) * 0.04).to(torch.bfloat16)
-            packed, scales = quantize_mxfp4(source.transpose(-2, -1).contiguous())
-            source = dequantize_mxfp4(packed, scales, torch.bfloat16).transpose(-2, -1)
+        for index, param in enumerate(orig.parameters()):
+            source = _rounded_weight(tuple(param.shape), 4321 + index)
             param.copy_(source.to(device=device, dtype=param.dtype))
     if "lora" in variant:
         with torch.device(device):
@@ -138,7 +167,7 @@ def _compare(actual: torch.Tensor, expected: torch.Tensor, name: str) -> dict[st
     return {"relative_l2": relative_l2, "max_abs": max_abs}
 
 
-def _run_case(variant: str, dispatcher: str, case: str, lora_rank: int) -> None:
+def _run_case(variant: str, dispatcher: str, case: str, lora_rank: int, mesh: DeviceMesh) -> None:
     rank, world = dist.get_rank(), dist.get_world_size()
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     lengths = [16] * world if case == "balanced" else [17 + 14 * r for r in range(world)]
@@ -160,7 +189,6 @@ def _run_case(variant: str, dispatcher: str, case: str, lora_rank: int) -> None:
     assert x.grad is not None and weights.grad is not None
 
     model = _model(variant, dispatcher, device, lora_rank)
-    mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("ep",))
     # Match checkpoint passthrough: shard meta parameters before loading their local values.
     # NCCL cannot broadcast float8_e8m0fnu scales from materialized full parameters.
     full_params = {name: param.detach().cpu().clone() for name, param in model.named_parameters()}
@@ -227,24 +255,35 @@ def main() -> None:
     parser.add_argument("--variants", nargs="+", choices=_VARIANTS, default=list(_VARIANTS))
     parser.add_argument("--cases", nargs="+", choices=_CASES, default=list(_CASES))
     parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--matrix", choices=("smoke", "full"))
     args = parser.parse_args()
     initialize_distributed("nccl", timeout_minutes=1)
     try:
-        for variant in args.variants:
-            for case in args.cases:
-                _run_case(variant, args.dispatcher, case, args.lora_rank)
+        mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("ep",))
+        cases = (
+            _SMOKE_CASES
+            if args.matrix == "smoke"
+            else [
+                (variant, case, lora_rank)
+                for lora_rank in ((4, 8) if args.matrix == "full" else (args.lora_rank,))
+                for variant in args.variants
+                for case in args.cases
+            ]
+        )
+        for variant, case, lora_rank in cases:
+            start = time.perf_counter()
+            _run_case(variant, args.dispatcher, case, lora_rank, mesh)
+            print(
+                f"MXFP4 parity: dispatcher={args.dispatcher} variant={variant} case={case} "
+                f"lora_rank={lora_rank} elapsed={time.perf_counter() - start:.2f}s",
+                flush=True,
+            )
     finally:
         destroy_global_state()
 
 
-@pytest.mark.parametrize("lora_rank", (4, 8))
-@pytest.mark.parametrize("dispatcher", ("torch", "deepep", "hybridep"))
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices for real EP collectives")
-def test_mxfp4_expert_parallel(dispatcher: str, lora_rank: int) -> None:
-    """Exercise unequal shards and checkpointed empty routing with actual dispatchers."""
-    package = {"deepep": "deep_ep", "hybridep": "hybrid_ep_cpp"}.get(dispatcher)
-    if package is not None and importlib.util.find_spec(package) is None:
-        pytest.skip(f"{dispatcher} requires the optional {package} runtime")
+def _launch_dispatcher(dispatcher: str) -> None:
+    """Launch an isolated process group for one native dispatcher."""
     env = os.environ.copy()
     repo_root = Path(__file__).resolve().parents[3]
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(repo_root), env.get("PYTHONPATH", ""))))
@@ -261,13 +300,36 @@ def test_mxfp4_expert_parallel(dispatcher: str, lora_rank: int) -> None:
             str(Path(__file__).resolve()),
             "--dispatcher",
             dispatcher,
-            "--lora-rank",
-            str(lora_rank),
+            "--matrix",
+            "full" if env.get("NEMO_MOE_TEST_FULL_MATRIX") == "true" else "smoke",
         ],
         env=env,
         check=True,
-        timeout=300,
+        timeout=600 if env.get("NEMO_MOE_TEST_FULL_MATRIX") == "true" else 300,
     )
+
+
+@pytest.mark.parametrize(
+    "dispatcher",
+    ("torch", "deepep", "hybridep") if os.environ.get("NEMO_MOE_TEST_FULL_MATRIX") == "true" else ("all",),
+)
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices for real EP collectives")
+def test_mxfp4_expert_parallel(dispatcher: str) -> None:
+    """Run isolated PR workers concurrently, or the full nightly matrix sequentially."""
+    dispatchers = ("torch", "deepep", "hybridep") if dispatcher == "all" else (dispatcher,)
+    available = []
+    for backend in dispatchers:
+        package = {"deepep": "deep_ep", "hybridep": "hybrid_ep_cpp"}.get(backend)
+        if package is not None and importlib.util.find_spec(package) is None:
+            if dispatcher != "all":
+                pytest.skip(f"{backend} requires the optional {package} runtime")
+            print(f"Skipping {backend}: optional {package} runtime is unavailable", flush=True)
+        else:
+            available.append(backend)
+    # Tiny fixtures fit on the same two GPUs. Independent torchrun rendezvous and
+    # process groups preserve native backend isolation while overlapping startup.
+    with ThreadPoolExecutor(max_workers=len(available)) as workers:
+        list(workers.map(_launch_dispatcher, available))
 
 
 if __name__ == "__main__":

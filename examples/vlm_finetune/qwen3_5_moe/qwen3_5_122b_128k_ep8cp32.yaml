@@ -146,7 +146,6 @@ packed_sequence:
   drop_long_samples: true
   balance_media_tokens: true
   max_packs: 128
-  attn_implementation: sdpa
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -193,6 +192,7 @@ lr_scheduler:
 #   dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: yuhez
   time: "01:00:00"
   nodes: 16

@@ -1,0 +1,137 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# MiniMax-M3.1-Flash VL full SFT on MedPix: all 60 language layers, EP128, 16 nodes x 8 GPUs.
+# NVFP4 routed experts and MXFP8 projections are dequantized to BF16 on load.
+
+recipe: FinetuneRecipeForVLM
+seed: 1234
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 1000
+  max_steps: 100
+  num_epochs: 1
+  save_checkpoint_every_epoch: false
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3.1-Flash
+  trust_remote_code: false
+  torch_dtype: bfloat16
+  text_config:
+    num_mtp_modules: 0
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: fa4
+    sparse_attn: generic
+    linear: te
+    rms_norm: torch_fp32
+    compile_norm: true
+    experts: torch_mm
+    dispatcher: hybridep
+    rope_fusion: false
+    fake_balanced_gate: false
+    benchmark_static_routing: false
+    fake_gate_noise: 0
+    gate_precision: float32
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+  use_liger_kernel: false
+  use_sdpa_patching: false
+processor:
+  _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
+  pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3.1-Flash
+  trust_remote_code: true
+  size:
+    shortest_edge: 3136
+    longest_edge: 451584
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/minimax_m3_1_vl_sft_medpix_ep128_100steps
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+  load_metadata_with_gloo: true
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 128
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  ignore_index: -100
+  reduction: sum
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  persistent_workers: false
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+  drop_last: true
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:256]
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  lr: 1.0e-05
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+lr_scheduler:
+  lr_warmup_steps: 0
+  lr_decay_steps: 100
+  lr_decay_style: cosine
+  min_lr: 1.0e-06
+wandb:
+  enable: false
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: minimax_m3_1_vl_sft_medpix_ep128_100steps
+  dir: logs/minimax_m3_1_vl_sft_medpix_ep128_100steps/wandb
+ci:
+  cluster_tag: h100
+  recipe_owner: HuiyingLi
+  # ep_size(128) => 16 nodes (8 H100/node).
+  nodes: 16
+  time: "01:00:00"

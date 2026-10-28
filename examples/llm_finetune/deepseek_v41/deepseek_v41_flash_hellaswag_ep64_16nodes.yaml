@@ -96,7 +96,11 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
   moe:
-    reshard_after_forward: true
+    # Keep the expert parameters gathered between forward and backward: the backward re-gathers were
+    # 346 all-gathers per step on 16 GB200 nodes and removing them measured +3.5 % tokens/s on the
+    # 4K benchmark basis of this recipe (peak device memory 172 -> 179 GiB of 184 at local batch 2;
+    # this recipe's local batch 1 sits lower).
+    reshard_after_forward: false
     wrap_outer_model: true
     lm_head_precision: float32
     # Single-pass mHC carries FP32 coefficients alongside BF16 residuals.

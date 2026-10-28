@@ -280,6 +280,15 @@ def bwd(
     return sparse_mqa_bwd_kernel
 
 
+def _bwd_threads_for_heads(num_heads: int) -> int:
+    """Threads per backward kernel: 128 for up to 16 heads, 256 for up to 32, 512 beyond."""
+    if num_heads <= 16:
+        return 128
+    if num_heads <= 32:
+        return 256
+    return 512
+
+
 def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=None, return_dkv_accum_dtype=False):
     """Backward interface for V4 sparse MQA attention.
 
@@ -318,7 +327,11 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     preprocess_kernel = preprocess(B, S, H, D)
     delta = preprocess_kernel(o, do)
 
-    bwd_kernel = bwd(B, S, S_kv, H, D, topk, sm_scale)
+    # Thread count follows the head count: 128 threads serve up to 16 heads (the
+    # tensor-parallel case), 256 serve 32, 512 serve 64. Fewer threads per head
+    # spill registers (32 heads at 128 threads gained nothing over 16-head chunks),
+    # more than 8 heads per warp fails TileLang's warp_row_tiles check.
+    bwd_kernel = bwd(B, S, S_kv, H, D, topk, sm_scale, threads=_bwd_threads_for_heads(H))
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     d_attn_sink = torch.zeros_like(attn_sink)
     dq = bwd_kernel(q, kv, do, attn_sink, topk_idxs, valid_mask, lse, delta, dkv, d_attn_sink)

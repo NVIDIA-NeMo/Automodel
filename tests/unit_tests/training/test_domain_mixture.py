@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.training.domain_mixture import (
+    DomainMixture,
     DomainMixtureConfig,
     DomainWeightConfig,
 )
@@ -77,3 +78,47 @@ def test_domain_mixture_combines_named_validation_losses():
 def test_domain_mixture_rejects_invalid_domain_sets(domains):
     with pytest.raises(ValueError):
         DomainMixtureConfig(domains=domains)
+
+
+@pytest.mark.parametrize("path", ["", "  ", 42, ["/data/web"]])
+def test_domain_mixture_rejects_invalid_corpus_path(path):
+    with pytest.raises(ValueError, match="path must be a non-empty string.*web"):
+        DomainWeightConfig(name="web", sampling_weight=1, objective_weight=1, path=path)
+
+
+@pytest.mark.parametrize("provide_cache", [False, True])
+def test_domain_mixture_preserves_standalone_positional_constructor(provide_cache):
+    args = (("web", "code"), (0.5, 0.5), (0.25, 0.75), (0.5, 1.5))
+    cache = {}
+    mixture = DomainMixture(*args, cache) if provide_cache else DomainMixture(*args)
+
+    weights = mixture.loss_weights(torch.tensor([0, 1]), torch.tensor([[1, 2], [3, 4]]))
+
+    torch.testing.assert_close(weights, torch.tensor([[0.5, 0.5], [1.5, 1.5]]))
+    assert mixture.weighted_validation_loss({"web": 2.0, "code": 4.0}) == pytest.approx(3.5)
+    assert mixture.paths == ()
+    if provide_cache:
+        # The fifth positional argument must still receive the runtime cache.
+        torch.testing.assert_close(cache[torch.device("cpu")], torch.tensor([0.5, 1.5]))
+
+
+@pytest.mark.parametrize(
+    "paths, blend, message",
+    [
+        ((), (["/data/web", "/data/code"], [1, 1]), "requires a path for every domain"),
+        (("/data/code", "/data/web"), (["/data/web", "/data/code"], [1, 1]), "paths must match.*same order"),
+        (("/data/web", "/data/code"), (["/data/web", "/data/code"], [3, 1]), "sampling weights must match"),
+        (("/data/web", "/data/code"), (["/data/web", "/data/code"], [1]), "sampling weights must match"),
+        (("/data/web", "/data/code"), (["/data/web", "/data/code"], [0, 0]), "blend weights must have a positive sum"),
+    ],
+)
+def test_domain_mixture_validates_blend_at_construction(paths, blend, message):
+    with pytest.raises(ValueError, match=message):
+        DomainMixture(
+            names=("web", "code"),
+            sampling_weights=(0.5, 0.5),
+            objective_weights=(0.25, 0.75),
+            loss_multipliers=(0.5, 1.5),
+            paths=paths,
+            blend=blend,
+        )

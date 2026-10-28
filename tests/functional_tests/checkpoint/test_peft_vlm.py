@@ -856,7 +856,7 @@ def test_hf_peft_checkpoint():
     # compare the recipe configs
     with open(Path(trainer.checkpointer.config.checkpoint_dir) / "epoch_0_step_9" / "config.yaml", "r") as f:
         restored_config = yaml.safe_load(f)
-    compare_configs(trainer.cfg.raw_config, restored_config)
+    compare_configs(trainer.cfg.to_yaml_dict(use_orig_values=True), restored_config)
 
     # ---------------------------------------------------------------------
     # Compare the flattened in-memory model state with the on-disk view

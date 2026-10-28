@@ -768,6 +768,9 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             self._remote_log_window = []
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(remote_metrics, step=self.step_scheduler.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(remote_metrics, step=self.step_scheduler.step)
             if _HAS_MLFLOW and mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(remote_metrics), step=log_data.step)
             if self.comet_logger is not None:
