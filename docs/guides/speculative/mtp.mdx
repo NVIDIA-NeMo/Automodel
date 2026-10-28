@@ -60,7 +60,7 @@ length under teacher-forced decoding, using the same `tau_sim` convention the
 EAGLE-3 recipe already reports for its draft, computed here with no extra
 model forward pass. A draft depth is counted as accepted when its argmax
 agrees with the **model's own main-head greedy prediction** on the same
-teacher-forced context -- the actual verifier in self-speculative decoding --
+teacher-forced context (the actual verifier in self-speculative decoding),
 not when it agrees with the dataset label. Those two can disagree whenever
 the main head itself is imperfect, so matching the label is not the same
 thing as being accepted.
