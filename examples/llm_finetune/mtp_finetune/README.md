@@ -1,4 +1,4 @@
-# MTP (Multi-Token Prediction) Finetuning
+# Multi-Token Prediction (MTP) Fine-Tuning
 
 Several model families (Qwen3.5 dense/MoE, nemotron_v3, step3p7, minimax_m3_vl,
 deepseek_v4, GLM-5.2, nemotron_omni) ship a native MTP head: extra decoder
