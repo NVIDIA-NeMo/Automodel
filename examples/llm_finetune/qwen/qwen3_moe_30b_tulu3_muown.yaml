@@ -131,6 +131,7 @@ optimizer:
 #   name: qwen3-30b-a3b-tulu3-muown
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "00:30:00"
   nodes: 1
