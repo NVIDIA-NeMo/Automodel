@@ -521,6 +521,7 @@ def neat_packed_collater(
     attn_implementation: str | None = None,
     *,
     packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    defer_flash_metadata: bool = False,
 ) -> dict:
     """Collater for neat-packed LLM sequences.
 
@@ -540,6 +541,9 @@ def neat_packed_collater(
             Python-call compatibility during the packing-contract migration.
         packing: Structural model contract selecting the packed mask representation.
             Defaults to block-causal masking without packed-sequence metadata.
+        defer_flash_metadata: Keep Flash boundaries batch-major for pipeline
+            splitting. Model entry converts the map to microbatch-local offsets.
+            Other mask representations are unchanged.
 
     Returns:
         Mapping with ``input_ids``, ``labels``, and ``position_ids`` of shape
@@ -548,7 +552,10 @@ def neat_packed_collater(
         For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
         and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
         padding runs. ``max_length_q`` and ``max_length_k`` are Python ints.
-        Optional ``_packed_seq_ids`` retains the [batch, sequence] document map.
+        With ``defer_flash_metadata``, ``_packed_seq_ids`` instead carries
+        the [batch, sequence] attention map until model entry after PP splitting.
+        ``_packed_seq_ids`` retains the original map for multiple-document packs,
+        or for single-document packs when the model requests boundaries or metadata.
         A contract requiring native packed-sequence metadata additionally adds
         int64 ``packed_token_indices`` of shape [batch, sequence], containing
         row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
@@ -590,11 +597,12 @@ def neat_packed_collater(
         # HF consumes physical offsets, including padding, without an attention
         # mask. Native FA4's unpadded offsets below have a different contract.
         result.pop("attention_mask")
-        result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
+        if not defer_flash_metadata:
+            result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
     if packing.return_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
-    if attention_mask.max() > 1 or packing.return_packed_sequence_metadata:
-        result["_packed_seq_ids"] = attention_mask
+    # Original boundaries are data, including when a pack contains one document.
+    result["_packed_seq_ids"] = attention_mask
     return result
 
 

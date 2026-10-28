@@ -3331,15 +3331,13 @@ class TestNeatPackedVlmCollaterPackingContract:
         assert torch.equal(result["_packed_seq_ids"], result["attention_mask"])
         assert result["_packed_seq_ids"][0, 16:].eq(0).all()
 
-    def test_single_sequence_omits_packed_seq_ids(self):
-        """A single (unpacked) sequence carries no ``_packed_seq_ids``; the all-gather
-        CP path synthesizes the trivial one-document map downstream (see
-        ``context_parallel.utils._synthesize_single_document_seq_ids``)."""
+    def test_single_document_retains_original_boundaries(self):
+        """Original boundaries do not depend on document count or the consumer."""
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(4, 0)]
         result = neat_packed_vlm_collater(batch, max_length=6, packing=self._packing())
-        assert "_packed_seq_ids" not in result
+        assert result["_packed_seq_ids"].tolist() == [[1, 1, 1, 1, 0, 0]]
 
     def test_fixed_max_length_pads_to_max(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater

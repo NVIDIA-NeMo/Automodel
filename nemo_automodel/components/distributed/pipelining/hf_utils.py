@@ -69,12 +69,23 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
     Under pipeline parallelism the mask precomputed in the data pipeline only reaches
     the first stage; non-first stages arrive with ``causal_mask_mapping=None`` and used
     to recompute it on every microbatch (slow, and a torch.compile graph-break). When
-    no explicit ``attention_mask`` is provided -- the common fixed-length / packed
-    training case, and exactly what non-first stages receive -- the causal mask depends
-    only on ``(seq_len, dtype, device)`` and is constant across microbatches and steps,
-    so it is built once per stage and reused. With an explicit ``attention_mask`` (which
-    may encode per-batch padding) it is rebuilt each call. Behavior is identical to the
-    previous recompute; only the redundant recomputation is removed.
+    neither an explicit mask nor caller-supplied positions is provided, the causal
+    mask depends only on sequence length, dtype and device and can be reused.
+    Explicit position resets can encode packed boundaries, so masks derived from
+    those positions must be rebuilt for each microbatch.
+
+    Args:
+        module: Pipeline stage whose config selects full/sliding attention.
+        inputs_embeds: Tensor of shape [batch, sequence, hidden].
+        attention_mask: Optional tensor broadcastable to [batch, heads, sequence,
+            sequence], or a mapping of full/sliding names to such tensors.
+        cache_position: Optional tensor of shape [sequence].
+        position_ids: Optional tensor of shape [batch, sequence]. None indicates
+            default sequential positions, independent of per-document boundaries.
+
+    Returns:
+        Mapping from full/sliding attention names to mask tensors broadcastable
+        to [batch, heads, sequence, sequence], or None for ordinary causal SDPA.
     """
     # An ``attention_mask`` that is already a mask-mapping dict is used as-is.
     if isinstance(attention_mask, dict):
@@ -82,7 +93,7 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
 
     from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-    cacheable = attention_mask is None
+    cacheable = attention_mask is None and position_ids is None
     cache_key = (inputs_embeds.shape[1], inputs_embeds.dtype, inputs_embeds.device)
     cache = getattr(module, "_pp_causal_mask_cache", None)
     if cache is not None and not isinstance(cache, MutableMapping):
@@ -159,6 +170,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
+        mask_position_ids = position_ids
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
@@ -170,7 +182,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         # _build_or_reuse_pp_causal_mask) instead of recomputing every microbatch.
         if causal_mask_mapping is None:
             causal_mask_mapping = _build_or_reuse_pp_causal_mask(
-                self, inputs_embeds, attention_mask, cache_position, position_ids
+                self, inputs_embeds, attention_mask, cache_position, mask_position_ids
             )
 
         hidden_states = inputs_embeds

@@ -192,6 +192,7 @@ class PackingConfig:
         cp_size: int = 1,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+        defer_flash_metadata: bool = False,
     ) -> tuple[object, CollateFn | None]:
         """Pack ``dataset`` and return ``(dataset, collate_fn)``."""
         raise NotImplementedError
@@ -218,6 +219,7 @@ class ThdPackingConfig(PackingConfig):
         cp_size: int = 1,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+        defer_flash_metadata: bool = False,
     ) -> tuple[object, CollateFn | None]:
         """Pack with THD, rejecting models that cannot consume sequence lengths."""
         resolve_packing_contract(packing_contract, attn_implementation)
@@ -259,8 +261,13 @@ class NeatPackingConfig(PackingConfig):
         cp_size: int = 1,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+        defer_flash_metadata: bool = False,
     ) -> tuple[object, CollateFn]:
-        """Pack with NEAT and configure the collator for the selected attention implementation."""
+        """Pack with NEAT and select the model input format.
+
+        ``defer_flash_metadata`` is runtime-only: PP keeps document boundaries
+        batch-major until decoder entry; the default emits public Flash offsets.
+        """
         del supports_seq_lens, cp_size
         packing_contract = resolve_packing_contract(packing_contract, attn_implementation)
         from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
@@ -278,7 +285,9 @@ class NeatPackingConfig(PackingConfig):
             padding_idx=pad_token_id,
             drop_long_samples=self.drop_long_samples,
         )
-        return dataset, partial(neat_packed_collater, packing=packing_contract)
+        return dataset, partial(
+            neat_packed_collater, packing=packing_contract, defer_flash_metadata=defer_flash_metadata
+        )
 
 
 _PACKING_CONFIGS: dict[str, type[PackingConfig]] = {
@@ -702,6 +711,7 @@ class DataloaderConfig:
                 pad_token_id=getattr(tokenizer, "pad_token_id", 0),
                 cp_size=cp_size,
                 packing_contract=packing_contract,
+                defer_flash_metadata=pp_enabled,
             )
         elif self.packing is not None:
             logger.info(

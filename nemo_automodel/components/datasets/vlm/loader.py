@@ -416,6 +416,7 @@ class VlmDataloaderConfig:
                     max_length=self.packing.collate_max_length,
                     packing=packing_contract,
                     materialize_4d_mask=materialize_4d_mask,
+                    defer_flash_metadata=pp_n_microbatches is not None,
                 )
         elif self.collator is not None:
             collate_fn = self.collator.build(processor=processor)

@@ -297,6 +297,31 @@ def test_neat_packing_uses_default_contract(monkeypatch):
     assert collate_fn.keywords["packing"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
 
 
+@pytest.mark.parametrize("pp_enabled", [False, True])
+def test_native_loader_selects_flash_deferral_from_pipeline_runtime(monkeypatch, pp_enabled):
+    from nemo_automodel.components.models.common.packing import PackingCapabilities
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
+        lambda dataset, **_: dataset,
+    )
+    document = {"input_ids": [1, 2, 3], "labels": [2, 3, 4], "position_ids": [0, 1, 0], "attention_mask": [1, 1, 2]}
+    config = DataloaderConfig(
+        dataset_config=StaticDatasetConfig([document]),
+        packing=NeatPackingConfig(packed_sequence_size=3),
+        shuffle=False,
+    )
+    batch = next(
+        iter(
+            config.build(
+                dp_rank=0, dp_world_size=1, pp_enabled=pp_enabled, packing_contract=PackingCapabilities("flash_varlen")
+            )
+        )
+    )
+    assert "_packed_seq_ids" in batch
+    assert ("cu_seq_lens_q" in batch) is not pp_enabled
+
+
 def test_packing_config_build_preserves_deprecated_attention_keyword(monkeypatch):
     monkeypatch.setattr(
         "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
