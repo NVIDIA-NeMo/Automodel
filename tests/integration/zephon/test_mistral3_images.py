@@ -138,13 +138,10 @@ def test_shipped_recipe_uses_local_processor_and_preserves_expanded_images(sourc
         (Path(__file__).resolve().parents[3] / "examples/vlm_finetune/zephon/mistral3_tiny.yaml").read_text()
     )
     values["processor"]["pretrained_model_name_or_path"] = str(source / "processor")
-    values["dataloader"]["zephon"].update(
-        sources=[{"name": "images", "path": str(source / "corpus")}],
-        runner="inline",
-        mtp_mode=False,
-        aggregate_store=None,
-        run_id=None,
-    )
+    settings = values["dataloader"]["zephon"]
+    settings["sources"] = [{"name": "images", "path": str(source / "corpus")}]
+    settings.setdefault("runtime", {}).update(runner="inline", mtp_mode=False)
+    settings["checkpoint"].update(aggregate_store=None, run_id=None)
     resolved = RecipeConfig(ConfigNode(values)).vlm_dataloader
     config = AutoConfig.from_pretrained(source / "model", local_files_only=True)
     config._attn_implementation = values["model"]["attn_implementation"]
