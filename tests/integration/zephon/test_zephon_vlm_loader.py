@@ -91,13 +91,10 @@ def test_example_yaml_route_reads_actual_local_image_source(config, inputs):
     values = yaml.safe_load(path.read_text())
     values["model"]["pretrained_model_name_or_path"] = inputs[0]
     values["processor"] = {}
-    values["dataloader"]["zephon"].update(
-        sources=[asdict(source) for source in config.zephon.sources],
-        seq_len=40,
-        pack_num_bins=2,
-        runner="inline",
-        mtp_mode=False,
-    )
+    settings = values["dataloader"]["zephon"]
+    settings["sources"] = [asdict(source) for source in config.zephon.sources]
+    settings["packing"].update(seq_len=40, pack_num_bins=2)
+    settings.setdefault("runtime", {}).update(runner="inline", mtp_mode=False)
     resolved = RecipeConfig(ConfigNode(values)).vlm_dataloader
     assert isinstance(resolved, ZephonVlmDataloaderConfig)
     with closing(_build(resolved, inputs)) as loader:
