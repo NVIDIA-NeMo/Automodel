@@ -55,6 +55,7 @@ from nemo_automodel._transformers import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.loader import close_dataloader
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
@@ -532,6 +533,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
+        dataloader_config = self.cfg.vlm_dataloader
+        if dataloader_config is None:
+            raise ValueError("VLM training requires a dataset config")
+
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
         # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
@@ -611,10 +616,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.mesh_context.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
-
-        dataloader_config = self.cfg.vlm_dataloader
-        if dataloader_config is None:
-            raise ValueError("VLM training requires a dataset config")
 
         model = build_model(
             self.cfg.model,
@@ -710,6 +711,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 dataset_build_context=dataset_build_context,
                 get_rope_index=get_rope_index,
                 packing_contract=packing_contract,
+                ignore_index=_get_loss_ignore_index(self.loss_fn),
                 pp_n_microbatches=pp_n_microbatches,
                 cp_size=self.mesh_context.cp_size,
             )
@@ -771,6 +773,29 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self._log_step_scheduler_details(self.step_scheduler)
 
     # ------------------ main loop ------------------
+    def _run_validation_loader(self, *, step: int | None = None) -> dict[str, float]:
+        """Validate the configured VLM source and restore training mode.
+
+        Args:
+            step: Completed optimizer-step index for terminal validation.
+
+        Returns:
+            Validation loss used by checkpoint selection, or an empty mapping
+            when no validation loader is configured or PP is enabled.
+        """
+        if self.val_dataloader is None:
+            return {}
+        if self.pp_enabled:
+            logger.warning("Validation is not supported for pipeline parallelism")
+            return {}
+        val_log_data = self._run_validation_epoch(self.val_dataloader)
+        if step is not None:
+            val_log_data.step = step
+        self.log_val_metrics(val_log_data)
+        for model_part in self.model_parts:
+            model_part.train()
+        return {"val_loss": val_log_data.metrics["val_loss"]}
+
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches.
 
@@ -782,6 +807,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.timestamp = time.perf_counter()
 
         pbar = self._make_progress_bar()
+        log_data = None
+        last_validation_step = None
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
@@ -792,15 +819,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self._update_progress_bar(pbar, log_data.metrics)
 
                     val_loss = {}
-                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                        if self.pp_enabled:
-                            logger.warning("Validation is not supported for pipeline parallelism")
-                        else:
-                            val_log_data = self._run_validation_epoch(self.val_dataloader)
-                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_log_data)
-                        for mp in self.model_parts:
-                            mp.train()
+                    if self.step_scheduler.is_val_step:
+                        val_loss = self._run_validation_loader()
+                        last_validation_step = self.step_scheduler.step
 
                     if self.step_scheduler.is_ckpt_step:
                         self.save_checkpoint(
@@ -811,7 +832,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
+            if self.step_scheduler.stream_exhausted and log_data is not None:
+                completed_step = self.step_scheduler.step - 1
+                if last_validation_step != completed_step:
+                    val_loss = self._run_validation_loader(step=completed_step)
+                # The closed-pass frontier cannot overwrite a periodic checkpoint.
+                self.save_checkpoint(
+                    self.step_scheduler.epoch,
+                    completed_step,
+                    log_data.metrics["loss"],
+                    val_loss,
+                    best_metric_key=self.best_metric_key,
+                )
         finally:
+            close_dataloader(self.dataloader)
+            close_dataloader(self.val_dataloader)
             if pbar is not None:
                 pbar.close()
 
