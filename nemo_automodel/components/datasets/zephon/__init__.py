@@ -14,6 +14,8 @@
 
 """Zephon data backend for AutoModel recipes."""
 
+from typing import TYPE_CHECKING
+
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonDataloaderConfig,
     ZephonEncodedTextSourceConfig,
@@ -21,9 +23,28 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonTextSourceConfig,
 )
 
+if TYPE_CHECKING:
+    from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig, ZephonVlmSourceConfig
+
 __all__ = [
     "ZephonDataloaderConfig",
     "ZephonEncodedTextSourceConfig",
     "ZephonInstructionSourceConfig",
     "ZephonTextSourceConfig",
+    "ZephonVlmDataloaderConfig",
+    "ZephonVlmSourceConfig",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """Load image configuration only when a VLM caller requests it."""
+    if name in ("ZephonVlmDataloaderConfig", "ZephonVlmSourceConfig"):
+        from nemo_automodel.components.datasets.zephon.vlm_config import (
+            ZephonVlmDataloaderConfig,
+            ZephonVlmSourceConfig,
+        )
+
+        return {"ZephonVlmDataloaderConfig": ZephonVlmDataloaderConfig, "ZephonVlmSourceConfig": ZephonVlmSourceConfig}[
+            name
+        ]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

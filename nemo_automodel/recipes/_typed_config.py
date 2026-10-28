@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.datasets.loader import DataloaderConfig, TextDataloaderConfig
     from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
     from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
+    from nemo_automodel.components.datasets.zephon import ZephonVlmDataloaderConfig
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
@@ -399,7 +400,8 @@ class RecipeConfig:
         *,
         processor_node: Any = None,
         packed_sequence_node: Any = None,
-    ) -> "VlmDataloaderConfig":
+        seed: int = 42,
+    ) -> "VlmDataloaderConfig | ZephonVlmDataloaderConfig":
         """Resolve VLM YAML sections into one typed input-pipeline config.
 
         Args:
@@ -407,6 +409,7 @@ class RecipeConfig:
             dataloader_node: StatefulDataLoader config node.
             processor_node: Optional processor factory or AutoProcessor keyword config.
             packed_sequence_node: Optional top-level VLM neat-packing config.
+            seed: Recipe seed used when Zephon settings do not override it.
 
         Returns:
             Typed VLM input-pipeline config ready for runtime ``build`` arguments.
@@ -417,6 +420,22 @@ class RecipeConfig:
         from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
         from nemo_automodel.components.datasets.vlm.loader import VlmCollatorConfig, VlmDataloaderConfig
         from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
+        from nemo_automodel.components.datasets.zephon import ZephonVlmDataloaderConfig
+
+        loader_values = _as_dict(dataloader_node)
+        if loader_values.get("_target_") in (
+            ZephonVlmDataloaderConfig,
+            "nemo_automodel.components.datasets.zephon.ZephonVlmDataloaderConfig",
+        ):
+            target, dataset_values = _callable_and_kwargs(dataset_node)
+            return ZephonVlmDataloaderConfig.from_recipe(
+                target,
+                dataset_values,
+                loader_values,
+                processor_config=cls._resolve_vlm_processor(processor_node),
+                seed=seed,
+                packing=_as_dict(packed_sequence_node),
+            )
 
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
         # `tokenizer`/`processor` are runtime build args, not declarative dataset fields.
@@ -532,29 +551,45 @@ class RecipeConfig:
         )
 
     @cached_property
-    def vlm_dataloader(self) -> "VlmDataloaderConfig" | None:
+    def vlm_dataloader(self) -> "VlmDataloaderConfig | ZephonVlmDataloaderConfig" | None:
         """Typed VLM training input-pipeline config."""
+        from nemo_automodel.components.datasets.zephon import ZephonVlmDataloaderConfig
+
         dataset_node = self._raw.get("dataset", None)
         if dataset_node is None:
             return None
-        return self.resolve_vlm_dataloader(
+        resolved = self.resolve_vlm_dataloader(
             dataset_node,
             self._raw.get("dataloader", None),
             processor_node=self._raw.get("processor", None),
             packed_sequence_node=self._raw.get("packed_sequence", None),
+            seed=self._raw.get("seed", 42),
         )
+        if isinstance(resolved, ZephonVlmDataloaderConfig):
+            resolved.validate_training(
+                max_steps=self._raw.get("step_scheduler.max_steps", None),
+                global_batch_size=self.step_scheduler.global_batch_size,
+                local_batch_size=self._raw.get("step_scheduler.local_batch_size", 1),
+                domain_mixture=self._raw.get("domain_mixture", None),
+            )
+        return resolved
 
     @cached_property
     def vlm_validation_dataloader(self) -> "VlmDataloaderConfig" | None:
         """Typed VLM validation input-pipeline config."""
+        from nemo_automodel.components.datasets.zephon import ZephonVlmDataloaderConfig
+
         dataset_node = self._raw.get("validation_dataset", None)
         if dataset_node is None:
             return None
-        return self.resolve_vlm_dataloader(
+        resolved = self.resolve_vlm_dataloader(
             dataset_node,
             self._raw.get("validation_dataloader", None),
             processor_node=self._raw.get("processor", None),
         )
+        if isinstance(resolved, ZephonVlmDataloaderConfig):
+            raise ValueError("Zephon VLM is currently a training backend; use a native validation_dataloader")
+        return resolved
 
     @staticmethod
     def resolve_diffusion_dataloader(

@@ -29,6 +29,7 @@ import logging
 import pathlib
 import time
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 
 from nemo_automodel.shared.batch import move_batch_to_device
@@ -53,11 +54,13 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForMultimodalLM,
 )
+from nemo_automodel._transformers.registry import resolve_image_position_state
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.loader import close_dataloader
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
+from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -411,6 +414,8 @@ def build_dataloader(
         processor_node=cfg_processor,
         packed_sequence_node=cfg_ps,
     )
+    if isinstance(config, ZephonVlmDataloaderConfig):
+        raise ValueError("Zephon VLM requires typed recipe construction with model-owned position state")
     dp_rank = 0
     dp_world_size = 1
     cp_size = 1
@@ -536,6 +541,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         dataloader_config = self.cfg.vlm_dataloader
         if dataloader_config is None:
             raise ValueError("VLM training requires a dataset config")
+        validate_parallelism = getattr(dataloader_config, "validate_parallelism", None)
+        if callable(validate_parallelism):
+            validate_parallelism(cp_size=self.mesh_context.cp_size)
 
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
@@ -710,6 +718,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 dataset_build_context=dataset_build_context,
                 get_rope_index=get_rope_index,
+                position_state_factory=partial(resolve_image_position_state, self.model_parts[0]),
                 packing_contract=packing_contract,
                 ignore_index=_get_loss_ignore_index(self.loss_fn),
                 pp_n_microbatches=pp_n_microbatches,

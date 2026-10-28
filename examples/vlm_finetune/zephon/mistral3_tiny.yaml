@@ -1,0 +1,71 @@
+# Run prepare_mistral3.py first. This scratch model has no downloaded weights.
+# Run: automodel examples/vlm_finetune/zephon/mistral3_tiny.yaml --nproc-per-node 4
+recipe: FinetuneRecipeForVLM
+seed: 42
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 2
+  max_steps: 100
+  ckpt_every_steps: 20
+  preemption_signal: null
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_config
+  config: work/zephon-mistral3/model
+  dtype: float32
+  use_liger_kernel: false
+  attn_implementation: sdpa
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: work/zephon-mistral3/processor
+dataset:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonVlmSourceConfig
+  inject_fake_images: true
+dataloader:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonVlmDataloaderConfig
+  zephon:
+    sources:
+    - name: images
+      path: work/zephon-mistral3/corpus
+      fmt: jsonl
+    packing:
+      seq_len: 63
+      pack_algorithm: first_fit
+      pack_num_bins: 16
+      drop_oversized: true
+    source:
+      chunk_size: 16
+      stop_after_passes: 1
+    checkpoint:
+      aggregate_store: torch://
+      run_id: zephon-mistral3
+    training:
+      allow_cross_document_attention: false
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 2
+  pp_size: 2
+  cp_size: 1
+  sequence_parallel: false
+  pipeline:
+    pp_schedule: gpipe
+    pp_microbatch_size: 1
+    scale_grads_in_schedule: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  reduction: sum
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.00001
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/zephon-mistral3
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+ci:
+  cluster_tag: h100
+  recipe_owner: MaxiBoether
+  time: "00:30:00"
+  nodes: 1

@@ -3919,6 +3919,57 @@ def test_build_dataloader_forwards_inject_fake_images_false():
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
 
 
+@pytest.mark.parametrize("attention_backend", ["sdpa", "eager"])
+def test_zephon_setup_preserves_requested_attention_backend(monkeypatch, tmp_path, attention_backend):
+    """Zephon supplies masks without selecting the native flash packing preload flag."""
+    from nemo_automodel._transformers.kernel_patches import _apply_preload_overrides
+    from nemo_automodel.components.datasets.zephon.config import (
+        ZephonOptions,
+        ZephonPackingOptions,
+        ZephonSource,
+    )
+    from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig
+    from nemo_automodel.recipes._typed_config import RecipeConfig
+
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    config = ZephonVlmDataloaderConfig(
+        zephon=ZephonOptions(
+            sources=(ZephonSource(name="images", path=str(tmp_path)),),
+            packing=ZephonPackingOptions(pack_algorithm="first_fit", pack_num_bins=2),
+        )
+    )
+    monkeypatch.setattr(RecipeConfig, "vlm_dataloader", property(lambda self: config))
+    module = "nemo_automodel.recipes.vlm.finetune"
+    recipe_type = FinetuneRecipeForVLM
+    raw = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+
+    class ModelBuildReached(Exception):
+        pass
+
+    def build(*args, **kwargs):
+        attention, _ = _apply_preload_overrides(
+            tp_size=1,
+            cp_size=1,
+            has_packed_sequence=kwargs.get("has_packed_sequence", False),
+            attn_implementation=attention_backend,
+            use_liger_kernel=False,
+        )
+        assert attention == attention_backend
+        raise ModelBuildReached
+
+    monkeypatch.setattr(f"{module}.build_model", build)
+    original = getattr(recipe_type, "_create_distributed_setup")
+
+    def setup(self):
+        result = original(self)
+        result.mesh_context.tp_size = 1
+        return result
+
+    monkeypatch.setattr(recipe_type, "_create_distributed_setup", setup)
+    with pytest.raises(ModelBuildReached):
+        recipe_type(raw).setup()
+
+
 @pytest.mark.parametrize("pixel_shape", [(2, 4, 6), (2, 3, 4, 4)])
 def test_pipeline_image_counts_override_accidental_batch_size_match(pixel_shape):
     pixels = torch.arange(torch.tensor(pixel_shape).prod()).reshape(pixel_shape)
