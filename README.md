@@ -272,6 +272,20 @@ uv run automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml --nproc-pe
 > [!TIP]
 > **NeMo-Run submission:** The `cli` extra adds NeMo Run to the base package: `uv pip install "nemo-automodel[cli]"`. It is additive; the base package still installs its core training dependencies, including PyTorch.
 
+### NCCL Telemetry on Google Cloud
+
+On Google Cloud A3 Ultra, A4, A4X, and A4X Max machines, the NGC PyTorch base image enables Google's NCCL profiler plugin, [CoMMA](https://docs.cloud.google.com/ai-hypercomputer/docs/nccl/configure-comma). By default, the plugin uploads the metadata and completion times of NCCL operations to Google Cloud. With those defaults, it has also made processes that initialized NCCL crash at exit, after printing `grpc_wait_for_shutdown_with_timeout() timed out`.
+
+Containers built from `docker/Dockerfile` do not load the plugin and turn its telemetry off (`NCCL_PROFILER_PLUGIN=none` and `NCCL_TELEMETRY_MODE=0`). To use the Google Cloud features that need this telemetry, such as straggler detection, run the container with `-e NCCL_PROFILER_PLUGIN=gcp -e NCCL_TELEMETRY_MODE=3`.
+
+Releases up to `26.10.00` do not include this change. To turn the telemetry off in them, pass `NCCL_TELEMETRY_MODE=0` to `docker run`:
+
+```bash
+docker run --gpus all -it --rm -e NCCL_TELEMETRY_MODE=0 nvcr.io/nvidia/nemo-automodel:26.10.00
+```
+
+To stop those releases from loading the plugin, `export NCCL_PROFILER_PLUGIN=none` in the script that starts Python. Passing it with `docker run -e` has no effect there, because on these machines the image's shell startup sets `NCCL_PROFILER_PLUGIN=gcp` again in every new `bash` process.
+
 
 ## LLM Pre-training
 ### LLM Pre-training Single Node
