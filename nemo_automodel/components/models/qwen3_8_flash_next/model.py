@@ -16,9 +16,12 @@
 
 This implementation uses the checkpoint's compressed-block QSA router and
 FlexAttention or optional SM90 CuTe sparse GQA for CUDA BF16 long-sequence SFT,
-with a PyTorch oracle for CPU and numerical parity. Pipeline and tensor
-parallelism remain unsupported. Context parallelism uses a model-owned contiguous
-sequence shard for QSA, GDN, and PLE, and composes with sequence packing.
+with a PyTorch oracle for CPU and numerical parity. Pipeline parallelism splits
+the decoder layers into stages that exchange the flattened HyperConnection state
+``[batch, sequence, hc_count * hidden]``; the final stage owns the HC mixer and
+``lm_head``. Tensor parallelism remains unsupported. Context parallelism uses a
+model-owned contiguous sequence shard for QSA, GDN, and PLE, and composes with
+sequence packing; it has not been validated together with pipeline parallelism.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ from nemo_automodel.components.models.common.utils import (
     restore_pretrained_generation_config,
 )
 from nemo_automodel.components.models.qwen3_5_moe.model import Fp32SafeQwen3_5MoeTextRotaryEmbedding
+from nemo_automodel.components.models.qwen3_8_flash_next.parallelization import PARALLELIZER
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
@@ -91,12 +95,6 @@ def _resolve_model_dtype(config: object) -> torch.dtype:
     return get_dtype(value, torch.bfloat16)
 
 
-def _default_owner_group() -> dist.ProcessGroup | None:
-    if not dist.is_available() or not dist.is_initialized():
-        return None
-    return dist.group.WORLD
-
-
 class Qwen3_8_FlashNextTextModelBackend(nn.Module):
     """Qwen3.8-Flash-Next text decoder with four HC streams and one PLE layer.
 
@@ -105,8 +103,12 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         backend: Native attention, linear, and MoE backend configuration.
         moe_config: Optional native MoE configuration override.
         moe_overrides: Optional fields merged into the default MoE config.
-        engram_process_group: Group that owns contiguous PLE table row shards.
-            With the supported no-PP/no-TP topology this is the EP/world group.
+        engram_process_group: Explicit group that owns contiguous PLE table
+            row shards. When omitted in a distributed run the table binds the
+            FSDP (data/context shard) mesh of the pipeline stage that holds it
+            during parallelization, so the owner group is the stage's EP/FSDP
+            group rather than the world. Only the MoE parallelizer binds it,
+            so PLE layers require ``ep_size > 1``.
         engram_table_config: Optional tiny-table override for unit tests. The
             released checkpoint uses ``[320001536, 160]`` globally.
 
@@ -188,16 +190,19 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
                     embedding_dim=config.ple_embed_dim // ngram_heads,
                     initializer_range=config.initializer_range,
                 )
-                owner_group = engram_process_group if engram_process_group is not None else _default_owner_group()
-                if owner_group is None and engram_table_config is None:
+                distributed = dist.is_available() and dist.is_initialized()
+                if engram_process_group is None and not distributed and engram_table_config is None:
                     raise RuntimeError(
                         "The released Qwen3.8-Flash-Next PLE table must be constructed after "
                         "torch.distributed initialization so its 320M rows are owner-sharded. "
                         "Pass an explicit tiny engram_table_config only for a single-rank test."
                     )
                 table = table_config.build(
-                    process_group=owner_group,
+                    process_group=engram_process_group,
                     dtype=self.model_dtype,
+                    # The owner group is the FSDP mesh of the pipeline stage that
+                    # holds this layer; the parallelizer binds it.
+                    bind_owner_group_later=engram_process_group is None and distributed,
                 )
                 ple_embedding = Qwen3_8_FlashNextNGramEmbedding(
                     table,
@@ -265,10 +270,12 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
 
         Args:
             input_ids: Raw tokenizer IDs of shape ``[batch, sequence]``. They
-                remain required when ``inputs_embeds`` is supplied because PLE
-                hashes the raw IDs.
+                remain required when ``inputs_embeds`` is supplied and this
+                stage holds the PLE layer, because PLE hashes the raw IDs.
             inputs_embeds: Optional precomputed token/vision embeddings of shape
-                ``[batch, sequence, hidden_size]``.
+                ``[batch, sequence, hidden_size]``, or on a non-first pipeline
+                stage the incoming flattened HC state of shape
+                ``[batch, sequence, hc_count * hidden_size]``.
             attention_mask: Optional mask of shape ``[batch, sequence]`` or a
                 backend-specific attention mask.
             position_ids: Optional positions of shape ``[batch, sequence]`` or
@@ -286,7 +293,9 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
 
         Returns:
             A base-model output whose ``last_hidden_state`` has shape
-            ``[batch, sequence, hidden_size]``.
+            ``[batch, sequence, hidden_size]``, or the flattened HC state
+            ``[batch, sequence, hc_count * hidden_size]`` on a pipeline stage
+            without the final HC mixer.
         """
         if past_key_values is not None or use_cache:
             raise NotImplementedError("Qwen3.8-Flash-Next training does not support recurrent or KV caches")
@@ -331,11 +340,13 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
                     "Qwen3.8-Flash-Next context parallelism requires a non-packed [batch, local_sequence] attention mask"
                 )
         if input_ids is None:
-            if self.config.ple_layer_ids:
+            if any(layer.ple is not None for layer in self.layers.values()):
                 raise ValueError("input_ids are required because Qwen3.8-Flash-Next PLE hashes raw token IDs")
             if inputs_embeds is None:
                 raise ValueError("Either input_ids or inputs_embeds must be provided")
         if inputs_embeds is None:
+            if self.embed_tokens is None:
+                raise ValueError("inputs_embeds must be provided for pipeline stages without embed_tokens")
             inputs_embeds = self.embed_tokens(input_ids)
         if input_ids is None:
             input_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
@@ -392,9 +403,12 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
             if captured_states is not None:
                 captured_states.append(hidden_states)
 
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
-        if captured_states is not None:
-            captured_states.append(hidden_states)
+        # A non-final pipeline stage has no mixer and hands the flattened HC
+        # state to the next stage unchanged.
+        if self.hyper_connection_mixer is not None:
+            hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+            if captured_states is not None:
+                captured_states.append(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=None,
@@ -408,13 +422,16 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         Args:
             buffer_device: Device used by layer initializers.
         """
-        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
+        # A pipeline stage owns only a subset of these modules; the rest are None.
+        if self.embed_tokens is not None:
+            nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=self.config.initializer_range)
         for layer in self.layers.values():
             layer.init_weights(buffer_device, init_std=self.config.initializer_range)
             if layer.ple is not None:
                 layer.ple.ple_embedding.ngram_embedding.reset_parameters()
                 layer.ple.init_weights(self.config.initializer_range)
-        self.hyper_connection_mixer.init_weights(init_std=self.config.initializer_range)
+        if self.hyper_connection_mixer is not None:
+            self.hyper_connection_mixer.init_weights(init_std=self.config.initializer_range)
 
 
 class Qwen3_8_FlashNextModel(nn.Module):
@@ -443,7 +460,7 @@ class Qwen3_8_FlashNextModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
@@ -456,14 +473,16 @@ class Qwen3_8_FlashNextModel(nn.Module):
         """Run the language-only Qwen3.8-Flash-Next decoder.
 
         Args:
-            input_ids: Raw IDs of shape ``[batch, sequence]``; required for
-                PLE hashing.
+            input_ids: Raw IDs of shape ``[batch, sequence]``; required on the
+                stage that holds the PLE layer.
             attention_mask: Optional token-validity mask of shape
                 ``[batch, sequence]`` or backend-specific attention mask.
             position_ids: Optional positions of shape ``[batch, sequence]`` or
                 ``[axes, batch, sequence]``.
             inputs_embeds: Optional embeddings of shape
-                ``[batch, sequence, hidden_size]``.
+                ``[batch, sequence, hidden_size]``, or the incoming HC state
+                ``[batch, sequence, hc_count * hidden_size]`` on a non-first
+                pipeline stage.
             past_key_values: Cache state; unsupported for training.
             output_hidden_states: Capture decoder HC states.
             _qwen3_8_flash_next_cp_context: Internal contiguous CP metadata with replicated
@@ -472,7 +491,9 @@ class Qwen3_8_FlashNextModel(nn.Module):
 
         Returns:
             Base-model output whose final text states have shape
-            ``[batch, sequence, hidden_size]``.
+            ``[batch, sequence, hidden_size]``, or
+            ``[batch, sequence, hc_count * hidden_size]`` on a non-final
+            pipeline stage.
         """
         return self.language_model(
             input_ids=input_ids,
@@ -495,6 +516,10 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     # Packed (THD) training and packed CP are owned by the model's
     # route-indexed QSA path for the listed CUDA backends.
     _packed_cp_attn_backends = ("flex", "cute")
+    # Pipeline stages run this forward unchanged: a later stage receives the
+    # flattened HC state in place of token IDs and routes it as inputs_embeds.
+    _pp_keep_self_forward: bool = True
+    parallelizer = PARALLELIZER
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -502,7 +527,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
 
         supports_tp: bool = False
         supports_cp: bool = True
-        supports_pp: bool = False
+        supports_pp: bool = True
         supports_ep: bool = True
         supports_mtp_cp: bool = False
 
@@ -622,9 +647,14 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     def _nemo_prepare_model_owned_dtensors(self, fsdp_mesh: DeviceMesh) -> set[nn.Parameter]:
         """Convert PLE owner shards to global DTensors before FSDP wrapping.
 
+        Under pipeline parallelism this runs per stage on that stage's mesh,
+        after the stage split, so only the stage that holds the PLE layer binds
+        and shards the table.
+
         Args:
-            fsdp_mesh: Flattened data/context shard mesh whose rank order is
-                identical to the PLE owner process group.
+            fsdp_mesh: Flattened data/context shard mesh of this pipeline
+                stage. A pending table binds its group as the owner group; an
+                explicitly bound table requires the identical rank order.
 
         Returns:
             The exact registered parameter identities that FSDP must ignore
@@ -640,6 +670,77 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
                 raise RuntimeError("The parallelized Engram DTensor is not registered on the Qwen3.8-Flash-Next model")
             parameters.add(parameter)
         return parameters
+
+    def customize_pipeline_stage_modules(
+        self,
+        module_names_per_stage: list[list[str]],
+        *,
+        layers_prefix: str,
+        text_model: nn.Module | None = None,
+    ) -> list[list[str]]:
+        """Keep the final HyperConnection mixer on the last pipeline stage.
+
+        The generic stage planner only knows ``embed_tokens``, ``layers``,
+        ``norm``, ``rotary_emb`` and ``lm_head``. The HC mixer that collapses the
+        ``hc_count`` streams before ``lm_head`` lives next to it.
+
+        Args:
+            module_names_per_stage: Planner output, one module FQN list per stage.
+            layers_prefix: FQN prefix of the text decoder, ending in ``.``.
+            text_model: Unused; the mixer location is fixed by this class.
+
+        Returns:
+            Copied per-stage FQN lists with the mixer appended to the last stage.
+        """
+        del text_model
+        stage_modules = [list(modules) for modules in module_names_per_stage]
+        mixer_fqn = f"{layers_prefix}hyper_connection_mixer"
+        if mixer_fqn not in stage_modules[-1]:
+            stage_modules[-1].append(mixer_fqn)
+        return stage_modules
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Return static input/output meta tensors for this pipeline stage.
+
+        Stages exchange the flattened HC state, so a non-first stage receives
+        ``[batch, sequence, hc_count * hidden]`` rather than ``[batch, sequence,
+        hidden]``. The last stage collapses it through the HC mixer and emits
+        logits.
+
+        Args:
+            is_first: Whether this stage holds ``embed_tokens``.
+            microbatch_size: Pipeline micro-batch size.
+            seq_len: Sequence length of the padded batch.
+            dtype: Activation dtype of the exchanged tensors.
+
+        Returns:
+            ``(inputs_meta, outputs_meta)`` tuples of meta tensors. The first-stage
+            input is int64 ``[batch, sequence]``; every other input is
+            ``[batch, sequence, hc_count * hidden]``. The output is
+            ``[batch, sequence, vocab]`` on the stage that owns ``lm_head`` and
+            ``[batch, sequence, hc_count * hidden]`` otherwise.
+        """
+        if getattr(self, "_cp_enabled", False):
+            raise NotImplementedError(
+                "Qwen3.8-Flash-Next pipeline parallelism has not been validated with context parallelism"
+            )
+        text_config = self.config.text_config
+        hc_width = text_config.hc_count * text_config.hidden_size
+        if is_first:
+            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+        else:
+            inputs_meta = (torch.empty(microbatch_size, seq_len, hc_width, device="meta", dtype=dtype),)
+
+        output_width = text_config.vocab_size if self.lm_head is not None else hc_width
+        outputs_meta = (torch.empty(microbatch_size, seq_len, output_width, device="meta", dtype=dtype),)
+        return inputs_meta, outputs_meta
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
         """Return Qwen3.8-Flash-Next's contiguous model-owned CP batch sharder.
@@ -669,7 +770,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -684,7 +785,11 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         """Run language-only generation and project final HC-mixed states.
 
         Args:
-            input_ids: Raw tokenizer IDs of shape ``[batch, sequence]``.
+            input_ids: Raw tokenizer IDs of shape ``[batch, sequence]``. On a
+                non-first pipeline stage, where ``embed_tokens`` is absent, the
+                schedule passes the previous stage's floating-point HC state
+                ``[batch, sequence, hc_count * hidden_size]`` here instead; it
+                is routed as ``inputs_embeds``.
             attention_mask: Optional token-validity mask of shape
                 ``[batch, sequence]`` or backend-specific attention mask.
             position_ids: Optional positions of shape ``[batch, sequence]`` or
@@ -708,12 +813,21 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             **kwargs: Text-attention backend metadata.
 
         Returns:
-            Causal-LM output with logits
-            ``[batch, kept_sequence, vocab_size]``.
+            Causal-LM output with logits ``[batch, kept_sequence, vocab_size]``.
+            A pipeline stage without ``lm_head`` returns its outgoing state in
+            the ``logits`` field: ``[batch, sequence, hc_count * hidden_size]``.
         """
         del labels
         if use_cache:
             raise NotImplementedError("Qwen3.8-Flash-Next training does not support caches")
+        if (
+            inputs_embeds is None
+            and self.model.language_model.embed_tokens is None
+            and input_ids is not None
+            and torch.is_floating_point(input_ids)
+        ):
+            inputs_embeds = input_ids
+            input_ids = None
         capture_all_hidden_states = output_hidden_states is True
         return_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -757,8 +871,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
                 torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
             )
         self.model.language_model.init_weights(buffer_device)
-        std = self.config.text_config.hidden_size**-0.5
-        nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
+        if self.lm_head is not None:
+            std = self.config.text_config.hidden_size**-0.5
+            nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
         for layer in self.model.language_model.layers.values():
             if layer.ple is not None:

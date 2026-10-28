@@ -39,6 +39,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
     Qwen3_8_FlashNextOwnerShardedEmbedding,
     Qwen3_8_FlashNextPLELayer,
 )
+from nemo_automodel.shared.model_owned_sharding import model_owned_grad_divisor
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
@@ -436,11 +437,13 @@ def _engram_meta_dtensor_lifecycle_worker(rank: int, world_size: int, store_path
         assert table.weight.to_local().device.type == "cpu"
         assert tuple(table.weight.shape) == (12, 3)
         assert tuple(table.weight.placements) == (Shard(0),)
-        assert not hasattr(table.weight, "_nemo_model_owned_grad_divisor")
+        # Materialization rebuilds the parameter storage but carries over the
+        # owner-group gradient divisor; a pipeline stage that loads pretrained
+        # weights never re-runs the model initialization that also stamps it.
+        assert model_owned_grad_divisor(table.weight) == float(world_size)
         table.reset_parameters()
-        table.mark_sharding_contract()
         assert torch.isfinite(table.weight.to_local()).all()
-        assert hasattr(table.weight, "_nemo_model_owned_grad_divisor")
+        assert model_owned_grad_divisor(table.weight) == float(world_size)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

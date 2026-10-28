@@ -58,6 +58,7 @@ from nemo_automodel.components.moe.layers import (
 )
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.model_owned_sharding import model_owned_grad_divisor
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
@@ -932,9 +933,7 @@ def apply_fsdp(
     # parameter set while preserving the normal nn.Module path.
     outer_parameters = model.parameters() if hasattr(model, "parameters") else ()
     externally_sharded_params = prepared_model_owned_dtensors | {
-        parameter
-        for parameter in outer_parameters
-        if getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
+        parameter for parameter in outer_parameters if model_owned_grad_divisor(parameter) is not None
     }
     if externally_sharded_params:
         logger.info(

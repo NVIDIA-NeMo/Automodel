@@ -93,6 +93,10 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
+from nemo_automodel.shared.model_owned_sharding import (
+    model_owned_grad_divisor,
+    stamp_model_owned_grad_divisor,
+)
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
@@ -2657,6 +2661,13 @@ def _apply(module, fn, recurse=True) -> nn.Module:
     future flags controlling in-place vs swap behavior and safely handles
     wrapper subclasses.
 
+    A model-owned sharding contract (the owner-group gradient divisor of a
+    parameter the model shards itself) lives in the parameter's ``__dict__``.
+    Both the swap path and the rebuild path replace that dictionary, so the
+    marker is carried over to the materialized parameter: a pipeline stage that
+    loads pretrained weights never re-runs the model initialization that would
+    otherwise stamp it again.
+
     Args:
         module: Module whose parameters are to be transformed.
         fn: Callable applied to each parameter (and its gradient).
@@ -2700,6 +2711,7 @@ def _apply(module, fn, recurse=True) -> nn.Module:
         p_should_use_swap_tensors = should_use_swap_tensors or is_traceable_wrapper_subclass(param_applied)
 
         param_grad = param.grad
+        owner_grad_divisor = model_owned_grad_divisor(param)
         if p_should_use_swap_tensors:
             try:
                 if param_grad is not None:
@@ -2721,6 +2733,8 @@ def _apply(module, fn, recurse=True) -> nn.Module:
             assert param.is_leaf
             out_param = torch.nn.Parameter(param_applied, param.requires_grad)
             module._parameters[key] = out_param
+        if owner_grad_divisor is not None:
+            stamp_model_owned_grad_divisor(out_param, owner_grad_divisor)
 
         if param_grad is not None:
             with torch.no_grad():

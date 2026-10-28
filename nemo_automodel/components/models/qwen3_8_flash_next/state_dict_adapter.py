@@ -71,15 +71,25 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         self._table_hf_key_pattern = re.compile(rf"{re.escape(self._table_hf_prefix)}\.shard_(\d+)\.weight")
 
         self._rows_per_checkpoint_shard = engram_table.num_embeddings // self.split_ngram_parts
-        start, end = int(engram_table.global_row_start), int(engram_table.global_row_end)
+        if not engram_table.owner_group_pending:
+            self._local_checkpoint_shard_range()
+        self._view_loaded_native_keys: set[str] = set()
+
+    def _local_checkpoint_shard_range(self) -> tuple[int, int]:
+        """Return the half-open range of physical checkpoint shards this rank owns.
+
+        The owner group may be bound after construction (pipeline stages bind it
+        during parallelization), so the range is read from the table on demand.
+        """
+        if self.engram_table.owner_group_pending:
+            raise RuntimeError("The Engram owner group must be bound before converting its checkpoint shards")
+        start, end = int(self.engram_table.global_row_start), int(self.engram_table.global_row_end)
         if start % self._rows_per_checkpoint_shard or end % self._rows_per_checkpoint_shard:
             raise ValueError(
                 "The owner-sharded Engram row range must align to complete physical checkpoint shards; "
                 f"got [{start}, {end}) with {self._rows_per_checkpoint_shard} rows per shard."
             )
-        self._first_local_checkpoint_shard = start // self._rows_per_checkpoint_shard
-        self._end_local_checkpoint_shard = end // self._rows_per_checkpoint_shard
-        self._view_loaded_native_keys: set[str] = set()
+        return start // self._rows_per_checkpoint_shard, end // self._rows_per_checkpoint_shard
 
     @property
     def view_loaded_native_keys(self) -> set[str]:
@@ -125,7 +135,8 @@ class Qwen3_8_FlashNextStateDictAdapter(Qwen3_5MoeStateDictAdapter):
         local_tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
         exclude_key_regex = kwargs.get("exclude_key_regex")
         views: list[tuple[str, torch.Tensor]] = []
-        for shard_idx in range(self._first_local_checkpoint_shard, self._end_local_checkpoint_shard):
+        first_local_shard, end_local_shard = self._local_checkpoint_shard_range()
+        for shard_idx in range(first_local_shard, end_local_shard):
             key = f"{self._table_hf_prefix}.shard_{shard_idx}.weight"
             if exclude_key_regex and re.match(exclude_key_regex, key):
                 continue
