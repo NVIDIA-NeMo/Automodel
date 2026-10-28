@@ -12,17 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Resolved tokenizer IDs for raw-text training."""
+"""Text tokenizer IDs, instruction preparation and encoded-document validation."""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+    instruction_messages,
+    instruction_prompt_completion,
+)
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
+
+    from nemo_automodel.components.datasets.zephon.config import (
+        ZephonEncodedTextSourceConfig,
+        ZephonInstructionSourceConfig,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -78,3 +91,113 @@ def resolve_token_ids(tokenizer: PreTrainedTokenizerBase, *, pad_token_id: int |
     raise ValueError(
         "No padding ID is available; set dataloader.zephon.packing.pad_token_id to an existing vocabulary ID"
     )
+
+
+def map_instruction_fields(payload: Mapping[str, Any], config: ZephonInstructionSourceConfig) -> dict[str, str]:
+    """Map raw columns into the same logical fields as the native dataset."""
+    mapped = {role: payload[column] for role, column in config.column_mapping.items()}
+    if not all(isinstance(value, str) for value in mapped.values()):
+        raise ValueError("Instruction context/question/answer columns must contain strings")
+    return mapped
+
+
+def normalize_instruction_chat(payload: Mapping[str, Any], *, config: ZephonInstructionSourceConfig) -> dict[str, Any]:
+    """Normalize instruction columns into messages for Zephon's SFT tokenizer.
+
+    Chat inputs retain the native system/user/assistant order. Plain
+    prompt-completion inputs retain native prompt whitespace and carry the
+    complete prompt in one user message. No tokenization or masking occurs here.
+    """
+    mapped = map_instruction_fields(payload, config)
+    if config.use_hf_chat_template:
+        messages = instruction_messages(mapped)
+    else:
+        prompt, answer = instruction_prompt_completion(mapped)
+        messages = [{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}]
+    return {"messages": messages}
+
+
+def _validate_encoded_document(
+    payload: Mapping[str, Any],
+    *,
+    config: ZephonEncodedTextSourceConfig,
+    valid_token_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Validate tokens and supervision without allocating the delivered payload.
+
+    ``valid_token_ids`` is a sorted int64 vocabulary array constructed once per
+    pipeline. Exact vectorized membership preserves holes in tokenizer IDs.
+    """
+    incompatible = {"labels", "positions", "position_ids", "cu_seqlens", "cu_seq_lens_q"}.intersection(payload)
+    if incompatible:
+        raise ValueError(
+            f"Encoded text expects unshifted unpacked documents; unsupported fields: {sorted(incompatible)}"
+        )
+    raw_tokens = payload[config.tokens_field]
+    if not isinstance(raw_tokens, (Sequence, np.ndarray)) or isinstance(raw_tokens, (str, bytes)):
+        raise ValueError("Encoded tokens must be a one-dimensional integer sequence")
+    tokens = np.asarray(raw_tokens)
+    invalid_ids = "Encoded tokens must be existing integer tokenizer vocabulary IDs"
+    if tokens.ndim != 1 or (tokens.size and tokens.dtype.kind not in "iu"):
+        raise ValueError(invalid_ids)
+    if tokens.size:
+        # Check unsigned bounds before casting: uint64 values must never wrap
+        # into a valid signed embedding ID or compare through float64 rounding.
+        if tokens.min() < 0 or int(tokens.max()) > np.iinfo(np.int64).max:
+            raise ValueError(invalid_ids)
+        tokens = tokens.astype(np.int64, copy=False)
+        indices = np.searchsorted(valid_token_ids, tokens)
+        if (indices >= valid_token_ids.size).any() or not np.array_equal(valid_token_ids[indices], tokens):
+            raise ValueError(invalid_ids)
+    if "attention_mask" in payload:
+        attention = np.asarray(payload["attention_mask"])
+        if attention.shape != tokens.shape or not (attention == 1).all():
+            raise ValueError(
+                "Encoded attention_mask must match token length and contain only ones; packing owns padding"
+            )
+    mask = None
+    if config.loss_mask_field is not None and config.loss_mask_field in payload:
+        mask = np.asarray(payload[config.loss_mask_field])
+        if mask.shape != tokens.shape or not ((mask == 0) | (mask == 1)).all():
+            raise ValueError("Encoded loss_mask must be binary and match unshifted token length")
+        if mask.size and mask[0] != 0:
+            raise ValueError("Encoded loss_mask must mask the first token to avoid cross-document supervision")
+    return tokens, mask
+
+
+def normalize_encoded_document(
+    payload: Mapping[str, Any],
+    *,
+    config: ZephonEncodedTextSourceConfig,
+    valid_token_ids: np.ndarray,
+) -> dict[str, np.ndarray] | None:
+    """Return int64 tokens and uint8 supervision with shape [unshifted tokens].
+
+    Supplied masks must exclude the first token, as with Zephon chat encoding.
+    Missing masks retain pretraining semantics. Short or unsupervised documents
+    are dropped; shifted labels, packed boundaries and padding are rejected.
+    """
+    tokens, mask = _validate_encoded_document(payload, config=config, valid_token_ids=valid_token_ids)
+    if tokens.size < 2:
+        logger.debug("Zephon encoded drop: fewer than two tokens")
+        return None
+    if mask is not None and not mask[1:].any():
+        logger.debug("Zephon encoded drop: no supervised targets")
+        return None
+    # Uniform fields preserve supervision when masked and unmasked documents mix.
+    return {
+        "input_ids": tokens.astype(np.int64),
+        "loss_mask": np.ones(tokens.shape, dtype=np.uint8) if mask is None else mask.astype(np.uint8),
+    }
+
+
+def measure_encoded_document(
+    payload: Mapping[str, Any], *, config: ZephonEncodedTextSourceConfig, valid_token_ids: np.ndarray
+) -> int:
+    """Count delivered tokens without allocating normalized arrays or logging drops.
+
+    Validation and drop conditions match delivery, so malformed inputs cannot
+    silently contribute to calibration and unsupervised documents count as zero.
+    """
+    tokens, mask = _validate_encoded_document(payload, config=config, valid_token_ids=valid_token_ids)
+    return tokens.size if tokens.size >= 2 and (mask is None or mask[1:].any()) else 0

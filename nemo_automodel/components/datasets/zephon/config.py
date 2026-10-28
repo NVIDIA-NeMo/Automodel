@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.datasets.zephon.loader import ZephonDataLoader
 
 TextSpecialTokens = Literal["bos_eos", "bos", "eos", "none", "tokenizer_default"]
+ChatSpecialTokens = Literal["bos_eos", "bos", "eos", "none", "tokenizer_default", "assistant_eos"]
 
 
 def _validate_insertion_overrides(
@@ -140,6 +141,138 @@ class ZephonTextSourceConfig:
             bos_token_id=bos_token_id if self.tokenize_special_tokens in ("bos", "bos_eos") else None,
             eos_token_id=eos_token_id if self.tokenize_special_tokens in ("eos", "bos_eos") else None,
             parallelism=options.workers.tokenize_parallelism,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class ZephonInstructionSourceConfig:
+    """Normalize instruction columns and delegate tokenization to Zephon.
+
+    ``special_tokens`` selects conversation-level BOS/EOS insertion, tokenizer
+    postprocessing, or the plain-chat per-assistant EOS policy. Its
+    default preserves the native formatting policy: templates own their
+    special tokens; plain prompt/completion uses tokenizer postprocessing.
+    Explicit ``bos``, ``eos`` and ``bos_eos`` use the same resolved tokenizer
+    IDs as raw text unless overridden by ``bos_token_id`` or ``eos_token_id``.
+    Overrides must exist in the vocabulary and require the corresponding
+    explicit insertion policy. They never rewrite template markers or
+    postprocessors.
+    """
+
+    column_mapping: dict[str, str]
+    answer_only_loss_mask: bool = True
+    use_hf_chat_template: bool = False
+    special_tokens: ChatSpecialTokens | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | None = None
+
+    def __post_init__(self) -> None:
+        roles = set(self.column_mapping)
+        if "answer" not in roles or not roles <= {"context", "question", "answer"} or len(roles) not in (2, 3):
+            raise ValueError("Instruction column_mapping needs answer and context and/or question")
+        if not all(isinstance(value, str) and value for value in self.column_mapping.values()):
+            raise ValueError("Instruction column names must be nonempty strings")
+        if self.special_tokens not in (None, "bos_eos", "bos", "eos", "none", "tokenizer_default", "assistant_eos"):
+            raise ValueError("Unknown instruction special_tokens policy")
+        if self.use_hf_chat_template and self.special_tokens in ("assistant_eos", "tokenizer_default"):
+            raise ValueError("assistant_eos and tokenizer_default require use_hf_chat_template=false")
+        _validate_insertion_overrides(
+            self.special_tokens, bos_token_id=self.bos_token_id, eos_token_id=self.eos_token_id
+        )
+
+    def build(
+        self,
+        *,
+        tokenizer: PreTrainedTokenizerBase,
+        options: ZephonOptions,
+        ids: TokenIds,
+        dp_rank: int,
+        dp_world_size: int,
+    ) -> Pipeline:
+        """Build normalization and chat encoding with the raw-text token IDs.
+
+        Numeric IDs are supplied only for explicit conversation-level
+        insertion. A template or tokenizer-default policy retains its own
+        token choices instead of receiving an unused ID override.
+        """
+        from nemo_automodel.components.datasets.llm.formatting_utils import resolve_chat_template_string
+        from nemo_automodel.components.datasets.zephon.llm import normalize_instruction_chat
+        from nemo_automodel.components.datasets.zephon.pipeline import create_source_pipeline
+
+        if self.use_hf_chat_template and not tokenizer.chat_template:
+            raise ValueError("use_hf_chat_template requires a tokenizer chat template")
+        template = None
+        if (
+            self.use_hf_chat_template
+            and isinstance(tokenizer.chat_template, dict)
+            and "default" not in tokenizer.chat_template
+        ):
+            # Native AutoModel permits a named-only template; select its fallback explicitly.
+            template = resolve_chat_template_string(tokenizer.chat_template)
+        policy = self.special_tokens or ("none" if self.use_hf_chat_template else "tokenizer_default")
+        _validate_insertion_overrides(
+            policy, bos_token_id=self.bos_token_id, eos_token_id=self.eos_token_id, tokenizer=tokenizer
+        )
+        bos_token_id = self.bos_token_id if self.bos_token_id is not None else ids.bos
+        eos_token_id = self.eos_token_id if self.eos_token_id is not None else ids.eos
+        pipeline = create_source_pipeline(options, dp_rank=dp_rank, dp_world_size=dp_world_size)
+        pipeline.map_transform(
+            partial(normalize_instruction_chat, config=self), parallelism=options.workers.map_parallelism
+        )
+        return pipeline.tokenize_chat(
+            tokenizer=tokenizer,
+            chat_template=template,
+            apply_chat_template=self.use_hf_chat_template,
+            special_tokens=policy,
+            bos_token_id=bos_token_id if policy in ("bos", "bos_eos") else None,
+            eos_token_id=eos_token_id if policy in ("eos", "bos_eos") else None,
+            prefix_diff_include_header=self.use_hf_chat_template,
+            loss_scope="all_assistant" if self.answer_only_loss_mask else "all_tokens",
+            parallelism=options.workers.tokenize_parallelism,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class ZephonEncodedTextSourceConfig:
+    """Unshifted, unpadded tokens; an optional aligned loss mask selects targets.
+
+    The adapter skips encoding and uses the normal flat packer and to_training
+    shift. Already shifted labels and prepacked boundary fields are rejected.
+    """
+
+    tokens_field: str = "input_ids"
+    loss_mask_field: str | None = "loss_mask"
+
+    def __post_init__(self) -> None:
+        if not self.tokens_field or self.tokens_field == self.loss_mask_field:
+            raise ValueError("Encoded text needs distinct nonempty token and loss-mask fields")
+
+    def build(
+        self,
+        *,
+        tokenizer: PreTrainedTokenizerBase,
+        options: ZephonOptions,
+        ids: TokenIds,
+        dp_rank: int,
+        dp_world_size: int,
+    ) -> Pipeline:
+        """Build exact token validation and share its vocabulary with calibration."""
+        import numpy as np
+
+        from nemo_automodel.components.datasets.zephon.llm import measure_encoded_document, normalize_encoded_document
+        from nemo_automodel.components.datasets.zephon.pipeline import create_source_pipeline
+
+        del ids
+        valid_ids = np.asarray(sorted(set(tokenizer.get_vocab().values())), dtype=np.int64)
+        pipeline = create_source_pipeline(
+            options,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            measure=partial(measure_encoded_document, config=self, valid_token_ids=valid_ids),
+        )
+        return pipeline.map_transform(
+            partial(normalize_encoded_document, config=self, valid_token_ids=valid_ids),
+            parallelism=options.workers.map_parallelism,
         )
 
 
@@ -477,7 +610,9 @@ def zephon_options_from_recipe(values: dict[str, Any], *, seed: int) -> ZephonOp
 class ZephonDataloaderConfig(ZephonLoaderConfig):
     """Own construction of the Zephon training stream."""
 
-    dataset_config: ZephonTextSourceConfig = field(default_factory=ZephonTextSourceConfig)
+    dataset_config: ZephonTextSourceConfig | ZephonInstructionSourceConfig | ZephonEncodedTextSourceConfig = field(
+        default_factory=ZephonTextSourceConfig
+    )
     batch_size: int = 1
 
     @classmethod
@@ -491,7 +626,11 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
         batch_size: int,
         packing: dict[str, Any],
     ) -> ZephonDataloaderConfig:
-        """Resolve raw-text settings at the Zephon integration's recipe boundary."""
+        """Resolve Zephon-specific recipe settings without generic recipe coupling."""
+        from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+            ColumnMappedTextInstructionDatasetConfig,
+        )
+
         if (
             packing.get("packed_sequence_size", 0)
             or packing.get("pack_size", 0)
@@ -500,20 +639,58 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
             raise ValueError(
                 "Native packing is incompatible with Zephon; use dataloader.zephon.packing.seq_len and pack_algorithm"
             )
-        if dataset_target not in (
-            ZephonTextSourceConfig,
-            "nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig",
-        ):
-            raise ValueError("Zephon text training requires ZephonTextSourceConfig")
         dataset_values = dict(dataset_values)
         dataset_values.pop("tokenizer", None)
         values = resolve_zephon_recipe_settings(loader_values)
-        for key in ("text_field", "tokenize_special_tokens"):
-            if key in values:
-                dataset_values.setdefault(key, values.pop(key))
-        validate_zephon_dataset_fields(dataset_values, config_type=ZephonTextSourceConfig)
+        source_path = dataset_values.pop("path_or_dataset_id", None)
+        if source_path is not None:
+            if values.get("sources"):
+                raise ValueError("Choose dataset.path_or_dataset_id or dataloader.zephon.sources, not both")
+            paths = [source_path] if isinstance(source_path, str) else source_path
+            values["sources"] = [{"name": f"source_{index}", "path": path} for index, path in enumerate(paths)]
+        if dataset_target in (
+            ZephonTextSourceConfig,
+            "nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig",
+        ):
+            config_type = ZephonTextSourceConfig
+            for key in ("text_field", "tokenize_special_tokens"):
+                if key in values:
+                    dataset_values.setdefault(key, values.pop(key))
+        elif dataset_target in (
+            ZephonEncodedTextSourceConfig,
+            "nemo_automodel.components.datasets.zephon.ZephonEncodedTextSourceConfig",
+        ):
+            config_type = ZephonEncodedTextSourceConfig
+            if "tokens_field" in values:
+                dataset_values.setdefault("tokens_field", values.pop("tokens_field"))
+        elif dataset_target in (
+            ColumnMappedTextInstructionDatasetConfig,
+            "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDatasetConfig",
+            ZephonInstructionSourceConfig,
+            "nemo_automodel.components.datasets.zephon.ZephonInstructionSourceConfig",
+        ):
+            config_type = ZephonInstructionSourceConfig
+            defaults = {
+                "split": "train",
+                "name": None,
+                "seq_length": None,
+                "padding": "do_not_pad",
+                "truncation": "do_not_truncate",
+                "limit_dataset_samples": None,
+            }
+            for key, default in defaults.items():
+                value = dataset_values.pop(key, default)
+                if value != default and not (key in ("padding", "truncation") and value is False):
+                    raise ValueError(
+                        f"Zephon instruction adapter does not support dataset.{key}={value!r}; use source and packing options"
+                    )
+        else:
+            raise ValueError(
+                "Unsupported Zephon dataset target; select text, encoded tokens, or column-mapped instructions"
+            )
+        validate_zephon_dataset_fields(dataset_values, config_type=config_type)
         return cls(
-            dataset_config=ZephonTextSourceConfig(**dataset_values),
+            dataset_config=config_type(**dataset_values),
             zephon=zephon_options_from_recipe(values, seed=seed),
             batch_size=batch_size,
             output_format=loader_values.get("output_format", "batched"),
