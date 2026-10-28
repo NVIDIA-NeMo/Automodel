@@ -15,5 +15,6 @@
 """CUDA graph components."""
 
 from nemo_automodel.components.cuda_graphs.partial import PartialCudaGraphManager
+from nemo_automodel.components.cuda_graphs.whole_step import WholeStepGraph, WholeStepGraphValidation
 
-__all__ = ["PartialCudaGraphManager"]
+__all__ = ["PartialCudaGraphManager", "WholeStepGraph", "WholeStepGraphValidation"]
