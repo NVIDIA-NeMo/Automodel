@@ -19,7 +19,6 @@ import torch
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import (
-    _routes_to_membership,
     build_flex_qsa_mask,
 )
 
@@ -68,7 +67,10 @@ def _random_routes(batch: int, query_length: int, kv_length: int, width: int, se
 )
 def test_direct_block_mask_matches_create_block_mask(batch: int, query_length: int, kv_length: int) -> None:
     routes = _random_routes(batch, query_length, kv_length, width=160, seed=query_length + kv_length)
-    membership, _ = _routes_to_membership(routes, kv_length)
+    # Independent set-membership oracle, including the empty-row rescue.
+    ids = torch.arange(kv_length)
+    membership = (routes[..., None] == ids).any(-2)
+    membership[..., 0] |= ~membership.any(-1)
     expected = _reference_block_mask(membership)
 
     actual = build_flex_qsa_mask(routes, kv_length=kv_length, device=torch.device("cpu")).block_mask

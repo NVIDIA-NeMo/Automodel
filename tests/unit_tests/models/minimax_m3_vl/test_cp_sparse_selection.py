@@ -187,3 +187,23 @@ def test_block_sel_flat_offset_matches_direct_indexing():
     for index in torch.cartesian_prod(*(torch.arange(n) for n in block_sel.shape)):
         offset = _block_sel_flat_offset(index[0], index[1], index[2], index[3], *block_sel.shape[1:])
         assert bool(flat[offset]) == bool(block_sel[tuple(index.tolist())])
+
+
+@pytest.mark.parametrize("score_type", ["max", "lse"])
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("topk", [0, 3, 17])
+def test_packed_selection_matches_bool_with_cp_rows(score_type, chunked, topk, monkeypatch):
+    import nemo_automodel.components.models.minimax_m3_vl.layers as layers
+
+    q, k = _rand_idx(131, h_idx=3)
+    positions = torch.tensor([0, 7, 8, 63, 127, 130])
+    if chunked:
+        monkeypatch.setattr(layers, "_SELECT_SCORE_BUDGET_BYTES", 2 * 3 * 131 * 4 * 2)
+    kwargs = dict(
+        block_size=8, topk_blocks=topk, init_blocks=1, local_blocks=1, score_type=score_type, q_positions=positions
+    )
+    expected = select_sparse_blocks(q[:, positions], k, **kwargs)
+    packed = select_sparse_blocks(q[:, positions], k, packed=True, **kwargs)
+    blocks = torch.arange(expected.shape[-1])
+    actual = ((packed[..., blocks // 8].int() >> (blocks % 8)) & 1).bool()
+    assert torch.equal(actual, expected)

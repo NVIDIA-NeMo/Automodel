@@ -43,6 +43,7 @@ from nemo_automodel.components.attention.utils import (
     preprocess_args_and_kwargs_for_attn,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.route_bitset import build_route_bitset
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.minimax_m3_vl.msa import MSAMicrobatch, require_msa_support, sparse_attention
 from nemo_automodel.components.models.minimax_m3_vl.recompute import sparse_route_replay
@@ -166,6 +167,7 @@ def _select_sparse_blocks_chunk(
     init_blocks: int,
     local_blocks: int,
     score_type: str,
+    packed: bool,
 ) -> torch.Tensor:
     """Select key blocks for one local query chunk using FP32 scores.
 
@@ -220,6 +222,11 @@ def _select_sparse_blocks_chunk(
 
     k_eff = min(topk_blocks, num_blocks)
     topk_idx = sel.topk(k_eff, dim=-1).indices  # [B, H_idx, Tq, k_eff]
+    if packed:
+        topk_idx = topk_idx.masked_fill(topk_idx >= valid_blocks[None, None, :, None], -1)
+        return build_route_bitset(topk_idx.reshape(bsz * h_idx, tq, k_eff), num_blocks).reshape(
+            bsz, h_idx, tq, (num_blocks + 7) // 8
+        )
     block_sel = torch.zeros_like(block_score, dtype=torch.bool).scatter_(-1, topk_idx, True)
     block_sel = block_sel & causal_block[None, None]  # drop non-causal padding picks
     return block_sel  # [B, H_idx, Tq, num_blocks]
@@ -236,6 +243,7 @@ def select_sparse_blocks(
     local_blocks: int,
     score_type: str = "max",
     q_positions: torch.Tensor | None = None,
+    packed: bool = False,
 ) -> torch.Tensor:
     """Select, per query, which key blocks to attend to (DSA block top-k).
 
@@ -261,10 +269,12 @@ def select_sparse_blocks(
         idx_k: ``[B, Tk, 1, D]`` shared index key (post norm + RoPE).
         q_positions: ``[Tq]`` long global position of each query; defaults to
             ``arange(Tq)`` (the eager square case).
+        packed: Return one bit per key block for Flex/FA4 callbacks.
 
     Returns:
         ``[B, H_idx, Tq, num_blocks]`` bool block-selection mask (causal +
-        forced init/local blocks + top-k). Non-differentiable (hard selection).
+        forced init/local blocks + top-k), or uint8 [B, H_idx, Tq, ceil(num_blocks/8)]
+        when packed. Non-differentiable, with fresh storage and possibly padded strides.
     """
     bsz, tq, h_idx, dim = idx_q.shape
     tk = idx_k.shape[1]
@@ -279,6 +289,7 @@ def select_sparse_blocks(
         init_blocks=init_blocks,
         local_blocks=local_blocks,
         score_type=score_type,
+        packed=packed,
     )
 
     bytes_per_query = max(1, bsz * h_idx * tk * 4)
