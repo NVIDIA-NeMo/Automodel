@@ -32,9 +32,14 @@ import torch
 
 _RW_CHUNK_ROWS = 8192
 # Engage the eager chunked path only for large dispatch tensors, where the memory
-# saving matters; below this the backward recompute is a net compute tax. The
-# compiled cores have no such tax and serve every size.
+# saving matters; below this the backward recompute is a net compute tax.
 _RW_CHUNK_THRESHOLD = 12288
+# Below the chunk threshold, the compiled cores take only dispatches of at least
+# this many elements (rows x hidden). A warmed compiled forward + backward costs
+# about twice the eager multiply's launch overhead (~190 vs ~95 us on H100), so
+# back-to-back small calls run faster eager; the compiled path wins from about
+# 6.5M elements with bf16 outputs and 8.4M with fp32 outputs, at widths 2048-7168.
+_RW_COMPILED_MIN_NUMEL = 1 << 23
 
 
 def _rw_fwd_core(x: torch.Tensor, probs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -188,9 +193,10 @@ def _apply_router_weight_fp32(
     Large 2-D row-aligned inputs go through the chunked custom Function so
     autograd does not retain full-size fp32 intermediates; every other shape
     keeps the plain eager multiply (bitwise-identical result). Once
-    ``compile_router_weight`` has compiled the cores, row-aligned inputs of any
-    size take the Function, since its fused kernels have no chunk loop to
-    amortize and replace several eager fp32 kernels per pass.
+    ``compile_router_weight`` has compiled the cores, row-aligned inputs of at
+    least ``_RW_COMPILED_MIN_NUMEL`` elements also take the Function, since its
+    fused kernels replace several eager fp32 kernels per pass; smaller inputs
+    keep the eager multiply, which launches faster.
 
     Args:
         output2: Expert down-projection outputs of shape [tokens, hidden].
@@ -207,7 +213,9 @@ def _apply_router_weight_fp32(
         and permuted_probs.dim() == 2
         and permuted_probs.shape[0] == output2.shape[0]
         and permuted_probs.shape[1] == 1
-        and output2.shape[0] > (0 if _RW_CORES_COMPILED else _RW_CHUNK_THRESHOLD)
+        and (
+            output2.shape[0] > _RW_CHUNK_THRESHOLD or (_RW_CORES_COMPILED and output2.numel() >= _RW_COMPILED_MIN_NUMEL)
+        )
     ):
         return _RouterWeightMulFunction.apply(output2, permuted_probs, compute_dtype, permuted_probs.requires_grad)
     return (output2.float() * permuted_probs.float()).to(compute_dtype)
