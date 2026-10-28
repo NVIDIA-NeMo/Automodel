@@ -71,6 +71,50 @@ if TYPE_CHECKING:
 
 GENERATION_REGEX = re.compile(r"\{%-?\s+generation\s+-?%\}")
 
+# apply_chat_template's own parameters, the names its Jinja render binds itself (messages), and
+# _tokenize_chat's seq_length: a chat template kwarg with one of these names would collide with
+# the formatting code's own argument or silently change the render (continue_final_message).
+_RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
+    {
+        "add_generation_prompt",
+        "chat_template",
+        "continue_final_message",
+        "conversation",
+        "documents",
+        "max_length",
+        "messages",
+        "padding",
+        "return_assistant_tokens_mask",
+        "return_dict",
+        "return_tensors",
+        "seq_length",
+        "tokenize",
+        "tokenizer_kwargs",
+        "tools",
+        "truncation",
+    }
+)
+
+
+def _validate_chat_template_kwargs(chat_template_kwargs: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a copy of ``chat_template_kwargs`` (``{}`` for ``None``) after checking it can be forwarded.
+
+    Raises:
+        TypeError: If ``chat_template_kwargs`` is not a mapping.
+        ValueError: If it names an argument the formatting code or ``apply_chat_template`` sets itself.
+    """
+    if chat_template_kwargs is None:
+        return {}
+    if not isinstance(chat_template_kwargs, dict):
+        raise TypeError(f"chat_template_kwargs must be a mapping, got {type(chat_template_kwargs).__name__}")
+    reserved = sorted(_RESERVED_CHAT_TEMPLATE_KWARGS.intersection(chat_template_kwargs))
+    if reserved:
+        raise ValueError(
+            f"chat_template_kwargs may not set {', '.join(reserved)}: the formatting code or "
+            "apply_chat_template sets these itself."
+        )
+    return dict(chat_template_kwargs)
+
 
 def _tokenize_chat(
     tokenizer: "PreTrainedTokenizer",
@@ -170,6 +214,7 @@ def _build_multiturn_assistant_mask(
     seq_length: int | None = None,
     unpadded_full_ids: "list[int] | None" = None,
     prefix_cache: "dict[int, list[int]] | None" = None,
+    template_kwargs: dict[str, Any] | None = None,
 ) -> List[int]:
     """Build a fallback loss mask that supervises every assistant turn.
 
@@ -194,29 +239,20 @@ def _build_multiturn_assistant_mask(
     :func:`_is_consistent_render_prefix`). A known trailing EOS may differ when
     the prefix is rendered alone. Any other mismatch raises :class:`ValueError`
     because prefix arithmetic cannot place the spans safely.
+
+    ``template_kwargs`` (chat template arguments) apply to every render.
     """
     assistant_mask = [0] * len(input_ids)
     found_assistant = False
+    render_kwargs = dict(tools=tools, truncation=truncation, seq_length=seq_length, **(template_kwargs or {}))
 
     if unpadded_full_ids is None:
-        unpadded_full_ids = _tokenize_chat(
-            tokenizer,
-            formatted_text,
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
+        unpadded_full_ids = _tokenize_chat(tokenizer, formatted_text, **render_kwargs)
     length_cache: Dict[int, int] = {len(formatted_text): len(unpadded_full_ids)}
 
     def prefix_length(k: int) -> int:
         if k not in length_cache:
-            prefix_ids = _tokenize_chat(
-                tokenizer,
-                formatted_text[:k],
-                tools=tools,
-                truncation=truncation,
-                seq_length=seq_length,
-            )
+            prefix_ids = _tokenize_chat(tokenizer, formatted_text[:k], **render_kwargs)
             if not _is_consistent_render_prefix(
                 prefix_ids, unpadded_full_ids, trailing_token_id=getattr(tokenizer, "eos_token_id", None)
             ):
@@ -317,6 +353,7 @@ def _build_reasoning_mask(
     truncation: Union[str, bool] = "do_not_truncate",
     seq_length: int | None = None,
     unpadded_full_ids: "list[int] | None" = None,
+    template_kwargs: dict[str, Any] | None = None,
 ) -> List[int]:
     """Build a token mask for reasoning_content spans inside assistant turns.
 
@@ -325,17 +362,14 @@ def _build_reasoning_mask(
     cleared. This remains correct when the template rewrites earlier turns
     based on later messages. If clearing the field does not change the render,
     that turn's reasoning is not present and no tokens need to be masked.
+    ``template_kwargs`` (chat template arguments) apply to every render.
     """
     reasoning_mask = [0] * len(input_ids)
+    render_kwargs = dict(tools=tools, truncation=truncation, seq_length=seq_length, **(template_kwargs or {}))
+    untruncated_kwargs = {**render_kwargs, "truncation": False, "seq_length": None}
 
     if unpadded_full_ids is None:
-        unpadded_full_ids = _tokenize_chat(
-            tokenizer,
-            formatted_text,
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
+        unpadded_full_ids = _tokenize_chat(tokenizer, formatted_text, **render_kwargs)
 
     # Truncation only changes the render when it actually cut something; a sample
     # that fits keeps identical truncated and untruncated renders.
@@ -345,13 +379,7 @@ def _build_reasoning_mask(
     reference_full_ids = unpadded_full_ids
     reference_offset = 0
     if truncation_enabled:
-        reference_full_ids = _tokenize_chat(
-            tokenizer,
-            formatted_text,
-            tools=tools,
-            truncation=False,
-            seq_length=None,
-        )
+        reference_full_ids = _tokenize_chat(tokenizer, formatted_text, **untruncated_kwargs)
         reference_offset = _truncation_window_offset(
             tokenizer, unpadded_full_ids, reference_full_ids, "reasoning_content"
         )
@@ -362,11 +390,7 @@ def _build_reasoning_mask(
 
         masked_messages = formatted_text[:idx] + [_masked_reasoning_message(message)] + formatted_text[idx + 1 :]
         masked_ids = _tokenize_chat(
-            tokenizer,
-            masked_messages,
-            tools=tools,
-            truncation=False if truncation_enabled else truncation,
-            seq_length=None if truncation_enabled else seq_length,
+            tokenizer, masked_messages, **(untruncated_kwargs if truncation_enabled else render_kwargs)
         )
 
         span = _find_reasoning_span(reference_full_ids, masked_ids)
@@ -419,6 +443,7 @@ def _build_generation_prompt_mask(
     seq_length: int | None = None,
     unpadded_full_ids: list[int] | None = None,
     prefix_cache: dict[int, list[int]] | None = None,
+    template_kwargs: dict[str, Any] | None = None,
 ) -> list[int]:
     """Mark the tokens of each assistant turn that the generation prompt supplies.
 
@@ -471,17 +496,17 @@ def _build_generation_prompt_mask(
     from ``prefix_cache`` (nothing is written back). One or two extra
     ``apply_chat_template`` renders per assistant turn are the price, which is
     why this is opt-in.
+
+    ``template_kwargs`` (chat template arguments) apply to every render. When they
+    set ``enable_thinking``, the prompt is rendered only in that mode, since the
+    data is then known to follow it.
     """
     generation_prompt_mask = [0] * len(input_ids)
+    template_kwargs = template_kwargs or {}
+    render_kwargs: dict[str, Any] = dict(tools=tools, truncation=truncation, seq_length=seq_length, **template_kwargs)
 
     if unpadded_full_ids is None:
-        unpadded_full_ids = _tokenize_chat(
-            tokenizer,
-            formatted_text,
-            tools=tools,
-            truncation=truncation,
-            seq_length=seq_length,
-        )
+        unpadded_full_ids = _tokenize_chat(tokenizer, formatted_text, **render_kwargs)
     if prefix_cache is None:
         prefix_cache = {}
 
@@ -492,13 +517,12 @@ def _build_generation_prompt_mask(
     )
     reference_full_ids = unpadded_full_ids
     reference_offset = 0
-    render_kwargs: dict[str, Any] = dict(tools=tools, truncation=truncation, seq_length=seq_length)
     if truncation_enabled:
-        reference_full_ids = _tokenize_chat(tokenizer, formatted_text, tools=tools, truncation=False, seq_length=None)
+        render_kwargs = {**render_kwargs, "truncation": False, "seq_length": None}
+        reference_full_ids = _tokenize_chat(tokenizer, formatted_text, **render_kwargs)
         reference_offset = _truncation_window_offset(
             tokenizer, unpadded_full_ids, reference_full_ids, "the generation prompt"
         )
-        render_kwargs = dict(tools=tools, truncation=False, seq_length=None)
         # The shared cache holds truncated prefix renders; this builder needs untruncated ones.
         prefix_cache = {}
 
@@ -506,7 +530,8 @@ def _build_generation_prompt_mask(
     # prompt in both modes, and a backend without Jinja templates may reject the keyword.
     template = getattr(tokenizer, "chat_template", None)
     template_text = " ".join(template.values()) if isinstance(template, dict) else str(template or "")
-    prompt_modes = [{"enable_thinking": mode} for mode in (True, False)] if "enable_thinking" in template_text else [{}]
+    probe_thinking_modes = "enable_thinking" in template_text and "enable_thinking" not in template_kwargs
+    prompt_modes = [{"enable_thinking": mode} for mode in (True, False)] if probe_thinking_modes else [{}]
 
     def skip(reason: str, idx: int) -> None:
         if reason not in _warned_generation_prompt:
@@ -921,6 +946,7 @@ def format_chat_template(
     train_on_last_turn_only: bool = False,
     unshifted: bool = False,
     mask_generation_prompt: bool = False,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> Dict[str, List[int]]:
     """
     Format a chat template style example.
@@ -942,10 +968,15 @@ def format_chat_template(
             inference: the role header and any template-inserted empty reasoning
             block (for example ``<think></think>``). See
             :func:`_build_generation_prompt_mask`.
+        chat_template_kwargs: Extra variables for the chat template (for example
+            ``{"enable_thinking": False}``), passed to every ``apply_chat_template``
+            render, including the ones that build the loss masks. Names the formatting
+            code sets itself, such as ``tools``, are rejected.
 
     Returns:
         A dictionary with the formatted example.
     """
+    template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
     # Ensure we have a usable chat template
     if not _has_chat_template(tokenizer):
         raise ValueError("Tokenizer lacks a usable chat template (chat_template/apply_chat_template)")
@@ -977,6 +1008,7 @@ def format_chat_template(
         padding=padding,
         truncation=truncation,
         max_length=seq_length,
+        **template_kwargs,
     )
 
     input_ids = tokenized_chat.get("input_ids")
@@ -1014,6 +1046,7 @@ def format_chat_template(
             seq_length=seq_length,
             unpadded_full_ids=unpadded_full_ids(),
             prefix_cache=prefix_cache,
+            template_kwargs=template_kwargs,
         )
         # _build_multiturn_assistant_mask computes indices from unpadded
         # lengths — shift for left-padding tokenizers.
@@ -1048,6 +1081,7 @@ def format_chat_template(
             seq_length=seq_length,
             unpadded_full_ids=unpadded_full_ids(),
             prefix_cache=prefix_cache,
+            template_kwargs=template_kwargs,
         )
         # Computed from unpadded lengths, like the builders above.
         generation_prompt_mask = _maybe_shift_mask_for_left_padding(
@@ -1064,6 +1098,7 @@ def format_chat_template(
             truncation=truncation,
             seq_length=seq_length,
             unpadded_full_ids=unpadded_full_ids(),
+            template_kwargs=template_kwargs,
         )
         # _build_reasoning_mask also computes from unpadded lengths.
         reasoning_mask = _maybe_shift_mask_for_left_padding(

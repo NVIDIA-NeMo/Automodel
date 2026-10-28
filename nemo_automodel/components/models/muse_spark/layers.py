@@ -635,9 +635,20 @@ class MuseSparkGate(Gate):
         token_mask: torch.Tensor,
         cp_mesh: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
-        """Route local ``[tokens, hidden]`` states and return FP32 top-k weights."""
+        """Route local states with FP32 logits and selection arithmetic.
+
+        Args:
+            hidden_states: Tensor of shape [tokens, hidden].
+            token_mask: Boolean tensor of shape [tokens]; unused by this router.
+            cp_mesh: Optional context-parallel mesh; unused by this router.
+
+        Returns:
+            FP32 weights and integer indices of shape [tokens, topk], followed
+            by None for auxiliary loss.
+        """
         del token_mask, cp_mesh
-        logits = F.linear(hidden_states.float(), self.weight.float(), None)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            logits = F.linear(hidden_states.float(), self.weight.float(), None)
         scores = torch.sigmoid(logits * self.router_output_multiplier)
         selection_scores = scores
         correction_bias = self._local_score_correction_bias()

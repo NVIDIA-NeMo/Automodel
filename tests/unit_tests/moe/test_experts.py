@@ -2262,16 +2262,6 @@ class TestNonGatedActivations:
         )
 
 
-def test_grouped_experts_te_rejects_router_weight_after_down_without_te_import(moe_config):
-    """TE must fail loudly before importing optional TE when route weights would be applied incorrectly."""
-    from nemo_automodel.components.moe.experts import GroupedExpertsTE
-
-    moe_config.apply_router_weight_after_down = True
-
-    with pytest.raises(ValueError, match="GroupedExpertsTE"):
-        GroupedExpertsTE(moe_config)
-
-
 @pytest.mark.parametrize("native", [False, True])
 def test_grouped_experts_te_legacy_constructor_compatibility(moe_config, monkeypatch, native):
     """The default path still constructs with TE releases lacking the new keyword."""
@@ -2419,6 +2409,77 @@ def test_te_construction_ep_rebuild_and_routing_gradients(moe_config, fake_nativ
     assert x.grad is not None
     assert (weights.grad is not None) == train_router
     assert fake_native_te.supported.call_count == int(native)
+
+
+@pytest.mark.parametrize("with_post", [False, True])
+@pytest.mark.parametrize("train_router", [False, True])
+def test_te_router_weight_after_down_scales_post_expert_output(moe_config, fake_native_te, with_post, train_router):
+    """After-down routing runs the expert MLP unweighted and scales its post-processed output in fp32."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    moe_config.apply_router_weight_after_down = True
+    experts = GroupedExpertsTE(moe_config, backend=BackendConfig(experts="te", dispatcher="deepep"))
+    mesh = Mock()
+    mesh.size.return_value = 1
+    mesh.get_local_rank.return_value = 0
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+    activation_probs = []
+
+    def activation(values: torch.Tensor, probabilities: torch.Tensor) -> torch.Tensor:
+        """Gated activation over [rows, 2 * inter] values with [rows, 1] weights, cast back to values' dtype."""
+        activation_probs.append(probabilities.detach().clone())
+        gate, up = values.chunk(2, -1)
+        return (torch.nn.functional.silu(gate) * up * probabilities).to(values.dtype)
+
+    def post(values: torch.Tensor) -> torch.Tensor:
+        """Row RMS normalization of [rows, dim] expert outputs; nonlinear, so it fixes the weighting order."""
+        scale = torch.rsqrt(values.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+        return (values.float() * scale).to(values.dtype)
+
+    experts.expert_activation = activation
+    post_expert_output = post if with_post else None
+    x = torch.randn(5, moe_config.dim, dtype=moe_config.dtype, requires_grad=True)
+    weights = torch.rand(5, 1, dtype=torch.float32, requires_grad=train_router)
+    output = experts(
+        x,
+        torch.ones(5, dtype=torch.bool),
+        weights,
+        torch.zeros(5, 1, dtype=torch.long),
+        post_expert_output=post_expert_output,
+    )
+
+    x_ref = x.detach().clone().requires_grad_()
+    weights_ref = weights.detach().clone().requires_grad_(train_router)
+    hidden = activation(torch.nn.functional.linear(x_ref, experts.gate_up_linear.weight), torch.ones_like(weights_ref))
+    expert_out = torch.nn.functional.linear(hidden, experts.down_linear.weight)
+    if with_post:
+        expert_out = post(expert_out)
+    expected = (expert_out.float() * weights_ref.float()).to(moe_config.dtype)
+    upstream = torch.randn_like(output)
+    output.backward(upstream)
+    expected.backward(upstream)
+
+    assert torch.equal(activation_probs[0], torch.ones(5, 1))
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, x_ref.grad, rtol=0, atol=0)
+    if train_router:
+        torch.testing.assert_close(weights.grad, weights_ref.grad, rtol=0, atol=0)
+    else:
+        assert weights.grad is None
+
+
+def test_te_honors_compile_router_weight(moe_config, fake_native_te, monkeypatch):
+    """TE experts compile the fp32 router-weight multiply when the backend asks, like the other expert classes."""
+    import nemo_automodel.components.moe.experts as experts_module
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    called = []
+    monkeypatch.setattr(experts_module, "_compile_router_weight_cores", lambda: called.append(1))
+    GroupedExpertsTE(moe_config, backend=BackendConfig(experts="te", dispatcher="deepep"))
+    assert called == []
+    GroupedExpertsTE(moe_config, backend=BackendConfig(experts="te", dispatcher="deepep", compile_router_weight=True))
+    assert called == [1]
 
 
 def test_te_native_recipe_validation_and_padding(moe_config, fake_native_te):

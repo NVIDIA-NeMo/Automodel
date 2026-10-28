@@ -167,7 +167,21 @@ def _select_sparse_blocks_chunk(
     local_blocks: int,
     score_type: str,
 ) -> torch.Tensor:
-    """Block selection for one query chunk (see :func:`select_sparse_blocks`)."""
+    """Select key blocks for one local query chunk using FP32 scores.
+
+    Args:
+        idx_q: Tensor of shape [batch, queries, index_heads, head_dim].
+        idx_k: Tensor of shape [batch, keys, 1, head_dim].
+        q_positions: Integer tensor of shape [queries] with global positions.
+        block_size: Number of tokens in each key block.
+        topk_blocks: Number of score-selected blocks per query and index head.
+        init_blocks: Number of initial blocks always selected.
+        local_blocks: Number of recent blocks always selected.
+        score_type: Block score reduction, max or log-sum-exp.
+
+    Returns:
+        Boolean selection mask [batch, index_heads, queries, key_blocks].
+    """
     bsz, tq, h_idx, dim = idx_q.shape
     tk = idx_k.shape[1]
     device = idx_q.device
@@ -176,7 +190,8 @@ def _select_sparse_blocks_chunk(
 
     q = idx_q.permute(0, 2, 1, 3).float()  # [B, H_idx, Tq, D]
     k = idx_k.permute(0, 2, 1, 3).float()  # [B, 1, Tk, D]
-    scores = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B, H_idx, Tq, Tk]
+    with torch.autocast(device_type=device.type, enabled=False):
+        scores = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B, H_idx, Tq, Tk]
 
     # Key-level causal: key j is visible to query i iff j <= global_pos(i).
     kpos = torch.arange(tk, device=device)

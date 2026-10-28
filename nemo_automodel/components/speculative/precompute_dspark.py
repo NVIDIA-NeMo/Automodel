@@ -33,6 +33,7 @@ Typical usage (single device):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -205,11 +206,12 @@ def _run(args: argparse.Namespace) -> int:
         shuffle_seed=args.shuffle_seed,
         mask_reasoning_content=args.mask_reasoning_content,
         mask_generation_prompt=args.mask_generation_prompt,
+        chat_template_kwargs=args.chat_template_kwargs,
     )
     num_samples = len(dataloader.dataset)
 
     # The manifest guards resume for the tensor-shaping target/cache settings AND
-    # the run's input identity (dataset, split, seed, masking, chat template), so a
+    # the run's input identity (dataset, split, seed, masking, chat template and kwargs), so a
     # --resume with different inputs fails instead of mixing supervision.
     manifest = build_cache_manifest(
         target_model=args.target_model,
@@ -226,6 +228,7 @@ def _run(args: argparse.Namespace) -> int:
         mask_reasoning_content=bool(args.mask_reasoning_content),
         chat_template_sha256=tokenizer_chat_template_sha256(tokenizer),
         mask_generation_prompt=bool(args.mask_generation_prompt),
+        chat_template_kwargs=args.chat_template_kwargs,
     )
     if args.resume:
         _ensure_resume_compatible(args.output_dir, manifest, existing)
@@ -275,6 +278,17 @@ def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _json_object(value: str) -> dict[str, Any]:
+    """Parse a ``--chat-template-kwargs`` value, which must be a JSON object."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError(f"expected a JSON object, got {type(parsed).__name__}")
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Precompute the DSpark offline target-supervision cache.")
     parser.add_argument("--target-model", required=True, help="Target model path or HF repo id.")
@@ -294,6 +308,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-layer-ids", type=int, nargs="+", default=None, help="Target layers to capture.")
     parser.add_argument(
         "--chat-template", default=None, help="Inline Jinja template or path to template/tokenizer config."
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=_json_object,
+        default=None,
+        help="Extra chat template variables as a JSON object, e.g. '{\"enable_thinking\": false}'.",
     )
     parser.add_argument("--mask-reasoning-content", action="store_true")
     parser.add_argument(

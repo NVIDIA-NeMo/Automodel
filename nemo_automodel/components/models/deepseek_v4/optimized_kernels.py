@@ -324,12 +324,14 @@ def sparse_attention_torch(
     batch_idx = torch.arange(batch, device=q.device).view(batch, 1, 1)
     kv_gathered = kv_float[batch_idx, safe_idxs]
 
-    scores = torch.einsum("bshd,bskd->bshk", q_float, kv_gathered) * sm_scale
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        scores = torch.einsum("bshd,bskd->bshk", q_float, kv_gathered) * sm_scale
     scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
     scores_max = scores.max(dim=-1).values.clamp(min=-1e30)
     exp_scores = torch.exp(scores - scores_max.unsqueeze(-1))
 
-    numerator = torch.einsum("bshk,bskd->bshd", exp_scores, kv_gathered)
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        numerator = torch.einsum("bshk,bskd->bshd", exp_scores, kv_gathered)
     denominator = exp_scores.sum(dim=-1) + torch.exp(sinks.float().view(1, 1, heads) - scores_max)
     return (numerator / denominator.unsqueeze(-1)).to(q.dtype)
 
@@ -341,7 +343,18 @@ def dense_attention_topk_torch(
     topk_idxs: torch.Tensor,
     sm_scale: float,
 ) -> torch.Tensor:
-    """Dense torch oracle for the Miles top-k sparse-attention contract."""
+    """Compute a dense FP32 oracle for top-k sparse attention.
+
+    Args:
+        q: Query tensor of shape [batch, sequence, heads, head_dim].
+        kv: Shared key/value tensor of shape [batch, keys, head_dim].
+        sinks: Attention-sink logits of shape [heads].
+        topk_idxs: Integer tensor [batch, sequence, topk]; -1 masks an entry.
+        sm_scale: Attention scaling factor.
+
+    Returns:
+        Tensor [batch, sequence, heads, head_dim] in q's dtype.
+    """
     batch, seq_len, heads, _ = q.shape
     key_len = kv.shape[1]
     topk_len = topk_idxs.shape[-1]
@@ -352,11 +365,13 @@ def dense_attention_topk_torch(
     seq_idx = torch.arange(seq_len, device=q.device).view(1, seq_len, 1).expand(batch, seq_len, topk_len)
     attn_mask[batch_idx[valid], seq_idx[valid], safe_topk[valid].long()] = True
 
-    scores = torch.einsum("bshd,bkd->bshk", q.float(), kv.float()) * sm_scale
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        scores = torch.einsum("bshd,bkd->bshk", q.float(), kv.float()) * sm_scale
     scores = scores.masked_fill(~attn_mask.unsqueeze(2), float("-inf"))
     scores_max = scores.max(dim=-1).values.clamp(min=-1e30)
     exp_scores = torch.exp(scores - scores_max.unsqueeze(-1))
-    numerator = torch.einsum("bshk,bkd->bshd", exp_scores, kv.float())
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        numerator = torch.einsum("bshk,bkd->bshd", exp_scores, kv.float())
     denominator = exp_scores.sum(dim=-1) + torch.exp(sinks.float().view(1, 1, heads) - scores_max)
     return (numerator / denominator.unsqueeze(-1)).to(q.dtype)
 
@@ -571,8 +586,19 @@ def indexer_scores_torch(
     weights: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """Torch reference for the Miles DSV4 C4 indexer score kernel."""
-    scores = torch.matmul(q.float(), pooled_kv.transpose(-1, -2).float().unsqueeze(1))
+    """Compute FP32 indexer scores for compressed key selection.
+
+    Args:
+        q: Query tensor of shape [batch, sequence, heads, head_dim].
+        pooled_kv: Compressed keys of shape [batch, compressed, head_dim].
+        weights: Head weights of shape [batch, sequence, heads].
+        softmax_scale: Query/key scaling factor.
+
+    Returns:
+        FP32 scores of shape [batch, sequence, compressed].
+    """
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        scores = torch.matmul(q.float(), pooled_kv.transpose(-1, -2).float().unsqueeze(1))
     scores = torch.relu(scores) * softmax_scale
     return (scores * weights.float().unsqueeze(-1)).sum(dim=2)
 
