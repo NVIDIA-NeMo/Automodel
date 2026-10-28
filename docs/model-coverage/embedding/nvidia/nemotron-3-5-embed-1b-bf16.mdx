@@ -1,0 +1,38 @@
+---
+title: "Nemotron-3.5-Embed-1B-BF16"
+description: "Reference Nemotron-3.5-Embed-1B-BF16 in NeMo AutoModel, including its multimodal architecture, embedding dimensions, and published inference resources."
+slug: model-coverage/embedding-models/nvidia/Nemotron-3.5-Embed-1B-BF16
+---
+
+[Nemotron-3.5-Embed-1B-BF16](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16)
+embeds text queries and documents containing an image, text, or both. It combines
+a Pixtral vision encoder with the language model from
+[Nemotron 3 Embed 1B](/model-coverage/embedding-models/nvidia/Nemotron-3-Embed-1B-BF16).
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Mistral3Model` |
+| AutoModel Backbone | `Mistral3BidirectionalModel` |
+| Task | Multimodal embedding and dense retrieval |
+| AutoModel Wrapper | `NeMoAutoModelBiEncoder` |
+| Inputs | Text queries; image, text, or combined image-text documents |
+| Embedding Dimensions | 2,048 |
+
+## Training and Inference Resources
+
+The [model card](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16)
+describes distillation from the 8B multimodal teacher with a frozen language
+model and trainable vision components. It also provides inference examples and
+processor settings for the released checkpoint.
+
+This page provides a checkpoint reference. A complete AutoModel example for
+reproducing the 8B-to-1B multimodal distillation workflow is not included in this
+documentation. The Nemotron 3 text distillation example covers a different,
+text-only workflow.
+
+For the 8B contrastive training example, refer to
+[Nemotron 3.5 Embed 8B](/model-coverage/embedding-models/nvidia/Nemotron-3.5-Embed-8B-BF16).

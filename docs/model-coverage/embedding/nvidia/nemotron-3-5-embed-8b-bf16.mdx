@@ -1,0 +1,40 @@
+---
+title: "Nemotron-3.5-Embed-8B-BF16"
+description: "Train the vision encoder and projector of Nemotron-3.5-Embed-8B-BF16 with NeMo AutoModel using a frozen language model and a prepared multimodal checkpoint."
+slug: model-coverage/embedding-models/nvidia/Nemotron-3.5-Embed-8B-BF16
+---
+
+[Nemotron-3.5-Embed-8B-BF16](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16)
+embeds text queries and documents containing an image, text, or both. It combines
+a Pixtral vision encoder with the language model from
+[Nemotron 3 Embed 8B](/model-coverage/embedding-models/nvidia/Nemotron-3-Embed-8B-BF16).
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Mistral3Model` |
+| AutoModel Backbone | `Mistral3BidirectionalModel` |
+| Task | Multimodal embedding and dense retrieval |
+| AutoModel Wrapper | `NeMoAutoModelBiEncoder` |
+| Inputs | Text queries; image, text, or combined image-text documents |
+| Embedding Dimensions | 4,096 |
+
+## Training Resources
+
+The [8B multimodal embedding example](https://github.com/NVIDIA-NeMo/Automodel/blob/8f9b476dedf701a78f8acab3f1ca224d053da78c/examples/retrieval/nemotron_3_5/embed_8b_multimodal.yaml)
+trains the vision encoder and multimodal projector with a contrastive loss while
+keeping the language model frozen. Follow the
+[training README](https://github.com/NVIDIA-NeMo/Automodel/blob/8f9b476dedf701a78f8acab3f1ca224d053da78c/examples/retrieval/nemotron_3_5/README.md)
+for the starting checkpoint, dataset format, dependencies, and launch command.
+
+The example loads one prepared multimodal checkpoint. Combining the text and
+vision weights is a separate preparation step. Starting from the released
+Nemotron 3.5 checkpoint performs continued training.
+
+The [model card](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16)
+documents inference, processor settings, training data, and evaluation. For
+second-stage relevance scoring, refer to
+[Nemotron 3.5 Rerank 8B](/model-coverage/reranking-models/nvidia/Nemotron-3.5-Rerank-8B-BF16).

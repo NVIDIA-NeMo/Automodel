@@ -1,12 +1,12 @@
 ---
 title: "Reranking Models"
-description: "Reranking model coverage in NeMo AutoModel, including optimized Llama and Qwen3 backbones, Hugging Face Auto fallback, and supported workflows."
+description: "Reranking model coverage in NeMo AutoModel, including Nemotron 3.5 multimodal scoring, Llama and Qwen3 backbones, and supported workflows."
 position: 1
 ---
 
 ## Introduction
 
-Reranking models use cross-encoders to score a query-document pair jointly. They are typically used after an embedding model has produced an initial candidate set. NeMo AutoModel supports optimized bidirectional Llama rerankers and a causal Qwen3 reranker that scores with a yes or no decision at the final token, and falls back to Hugging Face `AutoModelForSequenceClassification` for other architectures.
+Reranking models use cross-encoders to score a query-document pair jointly. They are typically used after an embedding model has produced an initial candidate set. NeMo AutoModel supports bidirectional Llama rerankers, Mistral3 multimodal rerankers, and a causal Qwen3 reranker that scores with a yes or no decision at the final token. It falls back to Hugging Face `AutoModelForSequenceClassification` for other architectures.
 
 For first-stage dense retrieval, see [Embedding Models](/model-coverage/embedding-models/overview).
 
@@ -15,9 +15,12 @@ For first-stage dense retrieval, see [Embedding Models](/model-coverage/embeddin
 | Owner | Model | Architecture | Wrapper Class | Tasks |
 |---|---|---|---|---|
 | NVIDIA | [llama-nemotron-rerank-1b-v2](/model-coverage/reranking-models/nvidia/llama-nemotron-rerank-1b-v2) | `LlamaBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Reranking |
+| NVIDIA | [Nemotron-3.5-Rerank-8B-BF16](/model-coverage/reranking-models/nvidia/Nemotron-3.5-Rerank-8B-BF16) | `Mistral3VLBidirectionalForSequenceClassification` | `NeMoAutoModelCrossEncoder` | Multimodal Reranking |
 | Qwen | [Qwen3-Reranker-4B](/model-coverage/reranking-models/qwen/Qwen3-Reranker-4B) | `Qwen3RerankerForCausalReranking` | `NeMoAutoModelCrossEncoder` | Reranking |
 
 The Llama backbones convert to bidirectional attention. `Qwen3RerankerForCausalReranking` stays causal: it reuses the pretrained `lm_head` and scores a pair as `logit("yes") - logit("no")` at the final non-padding token, adding no parameters. Its checkpoints serialize as a plain `Qwen3ForCausalLM`, so they load in stock Transformers and vLLM without custom code.
+
+Nemotron 3.5 Rerank pairs text queries with image, text, or combined image-text documents. Its [multimodal training example](https://github.com/NVIDIA-NeMo/Automodel/blob/8f9b476dedf701a78f8acab3f1ca224d053da78c/examples/retrieval/nemotron_3_5/rerank_8b_multimodal.yaml) updates all parameters from a complete text-trained reranker checkpoint. Follow the [training README](https://github.com/NVIDIA-NeMo/Automodel/blob/8f9b476dedf701a78f8acab3f1ca224d053da78c/examples/retrieval/nemotron_3_5/README.md) for prerequisites and launch instructions.
 
 ## Hugging Face Auto Backbones
 

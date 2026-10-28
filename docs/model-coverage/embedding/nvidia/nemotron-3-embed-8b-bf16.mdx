@@ -1,0 +1,37 @@
+---
+title: "Nemotron-3-Embed-8B-BF16"
+description: "Reference Nemotron-3-Embed-8B-BF16 text embeddings and its role as a frozen teacher in NeMo AutoModel, with model details and training resources."
+slug: model-coverage/embedding-models/nvidia/Nemotron-3-Embed-8B-BF16
+---
+
+[Nemotron-3-Embed-8B-BF16](https://huggingface.co/nvidia/Nemotron-3-Embed-8B-BF16)
+is a multilingual text embedding model based on Ministral3. It uses bidirectional
+attention and average pooling to produce 4,096-dimensional embeddings.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Ministral3Model` |
+| Task | Text embedding and dense retrieval |
+| AutoModel Wrapper | `NeMoAutoModelBiEncoder` |
+| Inputs | Text queries and text documents |
+| Embedding Dimensions | 4,096 |
+
+## Training Resources
+
+The [text distillation workflow](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/distillation/README.md)
+uses this checkpoint as a frozen teacher for
+[Nemotron 3 Embed 1B](/model-coverage/embedding-models/nvidia/Nemotron-3-Embed-1B-BF16).
+It updates the student and its distillation projection, leaving the teacher unchanged.
+The workflow README provides dataset requirements and launch instructions.
+
+For contrastive training configuration and data preparation, use the
+[retrieval fine-tuning guide](/recipes-e2e-examples/retrieval-finetune).
+The [model card](https://huggingface.co/nvidia/Nemotron-3-Embed-8B-BF16)
+documents inference, query and passage prefixes, training data, and evaluation.
+
+For image and text documents, refer to
+[Nemotron 3.5 Embed 8B](/model-coverage/embedding-models/nvidia/Nemotron-3.5-Embed-8B-BF16).

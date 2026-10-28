@@ -1,0 +1,41 @@
+---
+title: "Nemotron-3.5-Rerank-8B-BF16"
+description: "Reference Nemotron-3.5-Rerank-8B-BF16 multimodal scoring and the NeMo AutoModel training example, including checkpoint preparation and trainable components."
+slug: model-coverage/reranking-models/nvidia/Nemotron-3.5-Rerank-8B-BF16
+---
+
+[Nemotron-3.5-Rerank-8B-BF16](https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16)
+scores each text query together with a document containing an image, text, or both.
+It combines a Pixtral vision encoder, a bidirectional Ministral3 language model,
+and a scoring head. Higher output logits indicate greater relevance.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Mistral3ForSequenceClassification` |
+| AutoModel Backbone | `Mistral3VLBidirectionalForSequenceClassification` |
+| Task | Multimodal reranking |
+| AutoModel Wrapper | `NeMoAutoModelCrossEncoder` |
+| Inputs | A text query paired with an image, text, or combined image-text document |
+| Output | One relevance logit per query-document pair |
+
+## Training Resources
+
+The [8B multimodal reranking example](https://github.com/NVIDIA-NeMo/Automodel/blob/8f9b476dedf701a78f8acab3f1ca224d053da78c/examples/retrieval/nemotron_3_5/rerank_8b_multimodal.yaml)
+updates all model parameters with listwise cross-entropy, including the language
+model. It starts from a complete text-trained Mistral3 reranker checkpoint with
+its scoring head, vision encoder, and projector.
+
+Follow the [training README](https://github.com/NVIDIA-NeMo/Automodel/blob/8f9b476dedf701a78f8acab3f1ca224d053da78c/examples/retrieval/nemotron_3_5/README.md)
+for checkpoint preparation, the dataset format, dependencies, and launch command.
+The example covers the multimodal training stage; earlier text training and
+checkpoint assembly are separate steps. Starting from the released Nemotron 3.5
+checkpoint performs continued training.
+
+The [model card](https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16)
+documents inference, input formatting, training data, and evaluation. For
+first-stage candidate retrieval, refer to
+[Nemotron 3.5 Embed 8B](/model-coverage/embedding-models/nvidia/Nemotron-3.5-Embed-8B-BF16).
