@@ -60,7 +60,8 @@ if HAVE_TRITON:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
-        pid_m = tl.program_id(0)
+        # Skewed expert routing can make rows * stride_x exceed 2**31.
+        pid_m = tl.program_id(0).to(tl.int64)
         pid_n = tl.program_id(1)
         row = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         col = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -95,7 +96,8 @@ if HAVE_TRITON:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
-        pid = tl.program_id(0)
+        # Promote before multiplying by the row stride, including grad_x offsets.
+        pid = tl.program_id(0).to(tl.int64)
         row = pid * BLOCK_M + tl.arange(0, BLOCK_M)
         row_ok = row < rows
         limit = limit.to(tl.float32)  # see the forward kernel: fp64 under inductor otherwise, and the loop-carried

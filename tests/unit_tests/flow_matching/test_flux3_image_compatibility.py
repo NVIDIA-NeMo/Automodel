@@ -150,7 +150,9 @@ def test_t2i_recipe_lora_targets_only_active_streams(flux3_transformer_cls: type
     from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
 
     recipe_path = Path(__file__).resolve().parents[3] / "examples/diffusion/finetune/flux3_t2i_flow_lora.yaml"
-    config = PeftConfig.from_dict(yaml.safe_load(recipe_path.read_text())["peft"])
+    peft_values = yaml.safe_load(recipe_path.read_text())["peft"]
+    peft_values.pop("_target_")
+    config = PeftConfig(**peft_values)
     config.lora_dtype = torch.float32
     model = flux3_transformer_cls(
         in_channels=4,
