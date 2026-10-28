@@ -36,6 +36,7 @@ from nemo_automodel.components.optim.optimizer import (
     build_optimizer_config,
 )
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
 
 def _model():
@@ -312,10 +313,8 @@ def _dion_test_model():
     return nn.Sequential(nn.Embedding(8, 16), nn.Linear(16, 16, bias=False), nn.Linear(16, 8, bias=False))
 
 
-class _TransposedExperts(nn.Module):
+class _TransposedExperts(TransposedMatrixModule, nn.Module):
     """Grouped experts with ``[expert, in, out]`` storage: one tall and one wide matrix shape."""
-
-    _nemo_transposed_matrix_parameters = ("gate_and_up_projs", "down_projs")
 
     def __init__(self):
         super().__init__()
