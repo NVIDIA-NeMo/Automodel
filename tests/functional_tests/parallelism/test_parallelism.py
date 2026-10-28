@@ -39,6 +39,7 @@ QWEN3_5_MOE_PP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_PP2_Parity.sh"
 QWEN3_5_MOE_EP2_PARITY_FILENAME = "L2_Parallelism_Qwen3_5MoE_EP2_Parity.sh"
 MISTRAL3P5_PP2_PARITY_FILENAME = "L2_Parallelism_VLM_Mistral3p5_PP2_Parity.sh"
 MISTRAL3P5_TP2_PARITY_FILENAME = "L2_Parallelism_VLM_Mistral3p5_TP2_Parity.sh"
+GLM5_NEXT_PP2_PARITY_FILENAME = "L2_Parallelism_GLM5_Next_PP2_Parity.sh"
 
 
 class TestParallelismParity:
@@ -71,3 +72,6 @@ class TestParallelismParity:
 
     def test_mistral3p5_tp2_parity(self):
         run_test_script(TEST_FOLDER, MISTRAL3P5_TP2_PARITY_FILENAME)
+
+    def test_glm5_next_pp2_parity(self):
+        run_test_script(TEST_FOLDER, GLM5_NEXT_PP2_PARITY_FILENAME)

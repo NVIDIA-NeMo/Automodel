@@ -245,3 +245,78 @@ def test_four_stream_expand_preserves_output_and_all_input_gradients(dtype: torc
             assert error.abs().max() / scale <= 0.05
     wrong_orientation = post.to(dtype).unsqueeze(-1) * update.unsqueeze(-2) + torch.matmul(comb.to(dtype), residual)
     assert not torch.allclose(wrong_orientation, expected, rtol=0.002, atol=0.002)
+
+
+def _assert_matches(observed: torch.Tensor, reference: torch.Tensor, name: str) -> None:
+    """Compare a compiled result with its eager oracle by RMS and worst-case error relative to the oracle scale.
+
+    Args:
+        observed: Compiled output or gradient of any shape.
+        reference: Eager oracle with the same shape as ``observed``.
+        name: Label used in assertion messages.
+    """
+    assert observed.shape == reference.shape and observed.dtype == reference.dtype, name
+    assert torch.isfinite(observed).all(), name
+    scale = reference.double().square().mean().sqrt().clamp_min(1e-12)
+    error = observed.double() - reference.double()
+    if reference.dtype == torch.float32:
+        assert error.abs().max() / scale <= 1e-4, name
+    else:
+        assert error.square().mean().sqrt() / scale <= 0.005, name
+        assert error.abs().max() / scale <= 0.05, name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA compilation requires a GPU")
+def test_compiled_mhc_cores_cuda_match_eager_arithmetic_and_vjps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the real compiled projection, collapse and four-stream expansion on CUDA."""
+    # The FP32 tolerances assume true FP32 GEMMs; some containers enable TF32 by default.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch._dynamo.reset()
+    torch.manual_seed(653)
+    streams, hidden = 4, 256
+    project, collapse, expand = optimized_kernels.hc_cores(True)
+    shape = (2, 33, streams, hidden)
+    hidden_streams = torch.randn(shape, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    fn = (torch.randn(streams * (2 + streams), streams * hidden, device="cuda") * 0.02).requires_grad_()
+    pre = torch.rand(2, 33, streams, device="cuda").requires_grad_()
+    update = torch.randn(2, 33, hidden, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    post = torch.rand(2, 33, streams, device="cuda").requires_grad_()
+    # Asymmetric source -> destination mixing, so a transposed implementation fails.
+    comb = (torch.rand(2, 33, streams, streams, device="cuda") * torch.arange(1, streams + 1, device="cuda")).detach()
+    comb.requires_grad_()
+
+    def project_oracle(states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """FP32 RMS-normalized flattened streams [2, 33, streams * hidden] times weight^T."""
+        flat = states.flatten(start_dim=2).float()
+        return F.linear(flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-5), weight.float())
+
+    def collapse_oracle(states: torch.Tensor, coefficients: torch.Tensor) -> torch.Tensor:
+        """Pre-weighted stream sum [2, 33, hidden], rounded once to the stream dtype."""
+        return (coefficients.unsqueeze(-1) * states).sum(dim=2).to(states.dtype)
+
+    def expand_oracle(
+        sublayer: torch.Tensor, residual: torch.Tensor, post_w: torch.Tensor, comb_w: torch.Tensor
+    ) -> torch.Tensor:
+        """Streams [2, 33, streams, hidden]: post-weighted update plus comb^T-mixed residual streams."""
+        dtype = residual.dtype
+        return post_w.to(dtype).unsqueeze(-1) * sublayer.unsqueeze(-2) + torch.matmul(
+            comb_w.to(dtype).transpose(-1, -2), residual
+        )
+
+    cases = [
+        ("project", project, project_oracle, (hidden_streams, fn), (1e-5,)),
+        ("collapse", collapse, collapse_oracle, (hidden_streams, pre), ()),
+        ("expand", expand, expand_oracle, (update, hidden_streams, post, comb), ()),
+    ]
+    for name, compiled, oracle, inputs, extra in cases:
+        actual = compiled(*inputs, *extra)
+        expected = oracle(*inputs)
+        # A fixed noncontiguous upstream gradient, as produced by transposed consumers.
+        upstream = torch.randn(*expected.shape[:-2], expected.shape[-1], expected.shape[-2], device="cuda")
+        upstream = upstream.to(expected.dtype).transpose(-1, -2)
+        assert not upstream.is_contiguous()
+        _assert_matches(actual, expected, name)
+        for index, (observed, reference) in enumerate(
+            zip(torch.autograd.grad(actual, inputs, upstream), torch.autograd.grad(expected, inputs, upstream))
+        ):
+            _assert_matches(observed, reference, f"{name} d_input{index}")

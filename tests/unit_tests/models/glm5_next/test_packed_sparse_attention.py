@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from nemo_automodel.components.models.common.cudnn_sparse_attention import is_cudnn_sparse_attention_available
 from nemo_automodel.components.models.glm5_next import layers as layer_module
 from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.config import Glm5NextTextConfig
@@ -242,3 +243,115 @@ def test_packed_attention_matches_independent_document_oracle(
                 torch.testing.assert_close(param.grad, torch.zeros_like(param.grad), atol=0, rtol=0)
         else:
             torch.testing.assert_close(param.grad, ref_param.grad, atol=3e-6, rtol=3e-5, msg=name)
+
+
+def _assert_bf16_close(observed: torch.Tensor, reference: torch.Tensor, name: str) -> None:
+    """Compare a BF16 kernel result with its FP32 oracle relative to the oracle's RMS.
+
+    BF16 inputs, weights and outputs carry about 3 significant digits, so the bounds allow
+    a 1% RMS and 6% worst-case error relative to the oracle scale.
+
+    Args:
+        observed: Kernel output or gradient of any shape.
+        reference: FP32 oracle with the same shape.
+        name: Label used in assertion messages.
+    """
+    assert observed.shape == reference.shape, name
+    assert torch.isfinite(observed).all(), name
+    scale = reference.double().square().mean().sqrt().clamp_min(1e-12)
+    error = observed.double() - reference.double()
+    assert error.square().mean().sqrt() / scale <= 0.01, (name, float(error.square().mean().sqrt() / scale))
+    assert error.abs().max() / scale <= 0.06, (name, float(error.abs().max() / scale))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_cudnn_sparse_attention_available(),
+    reason="requires CUDA and the cuDNN/FlashMLA sparse-attention kernels",
+)
+@pytest.mark.parametrize("tail", [True, False])
+@pytest.mark.parametrize("rows", [[[5, 3, 17, 7], [3, 21, 5]], [[7, 7, 7, 7, 4], []]])
+@pytest.mark.parametrize("ac", [False, True])
+@pytest.mark.parametrize("gap", [0, 3])
+def test_packed_attention_cuda_kernel_matches_independent_document_oracle(
+    tail: bool, rows: list[list[int]], ac: bool, gap: int
+) -> None:
+    """Run the real BF16 cuDNN/FlashMLA path on packed documents with padding gaps.
+
+    ``index_topk`` exceeds every document's complete pools, so each query selects all
+    visible pools and BF16 score ties cannot change the selected set; KPool selection
+    is covered separately by the indexer tests.
+    """
+    pool = 4
+    cfg = Glm5NextTextConfig(
+        hidden_size=32,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        q_lora_rank=16,
+        kv_lora_rank=512,
+        qk_nope_head_dim=8,
+        v_head_dim=8,
+        index_n_heads=2,
+        index_head_dim=8,
+        index_topk=32,
+        index_kpool=pool,
+        index_kpool_always_select_tail=tail,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        dtype=torch.float32,
+    )
+    backend = Glm5NextBackendConfig(attn="cudnn", linear="torch", rms_norm="torch")
+    torch.manual_seed(197)
+    model = Glm5NextSparseAttention(cfg, 0, backend)
+    model.init_weights(torch.device("cpu"), 0.15)
+    model.to(device="cuda", dtype=torch.bfloat16)
+    # The oracle runs in FP32 on the same BF16-rounded weights and inputs.
+    oracle = copy.deepcopy(model).float()
+    full = (torch.rand(2, 64, 32, device="cuda") + 0.1).to(torch.bfloat16)
+    dy = (torch.randn(2, 64, 32, device="cuda") / 32).to(torch.bfloat16)
+    docs = torch.zeros(2, 64, dtype=torch.int32, device="cuda")
+    for row, lengths in enumerate(rows):
+        cursor = 0
+        for j, n in enumerate(lengths):
+            docs[row, cursor : cursor + n] = j + 1
+            cursor += n + gap
+    context = Glm5NextPackedContext(docs)
+    expected_x = full.float().requires_grad_()
+    expected = reference(expected_x, oracle, rows, cfg.index_topk, pool, tail, gap)
+    expected.backward(dy.float())
+    x = full.clone().requires_grad_()
+
+    def forward(value: torch.Tensor) -> torch.Tensor:
+        """Run the model with the fixed document layout.
+
+        Args:
+            value: Packed BF16 states [batch, sequence, hidden].
+
+        Returns:
+            Attention states [batch, sequence, hidden].
+        """
+        return model(value, packed_context=context, padding_mask=docs.eq(0))
+
+    with patch.object(layer_module, "cudnn_sparse_attention", wraps=layer_module.cudnn_sparse_attention) as kernel:
+        actual = checkpoint(forward, x, use_reentrant=False) if ac else forward(x)
+        assert kernel.call_count == sum(bool(row) for row in rows)
+        actual.backward(dy)
+
+    assert torch.isfinite(actual).all()
+    assert actual[docs.eq(0)].eq(0).all(), "padding positions must be exactly zero"
+    if not tail:
+        # Queries before their document's first complete pool select nothing and must contribute zero.
+        for row, lengths in enumerate(rows):
+            cursor = 0
+            for n in lengths:
+                assert actual[row, cursor : cursor + min(n, pool - 1)].eq(0).all()
+                cursor += n + gap
+    _assert_bf16_close(actual.float(), expected, "output")
+    _assert_bf16_close(x.grad.float(), expected_x.grad, "input gradient")
+    for (name, param), (expected_name, ref_param) in zip(
+        model.named_parameters(), oracle.named_parameters(), strict=True
+    ):
+        assert name == expected_name
+        if name.startswith("indexer."):
+            assert param.grad is None, name
+        elif ref_param.grad is not None:
+            _assert_bf16_close(param.grad.float(), ref_param.grad, name)
