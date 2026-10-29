@@ -202,6 +202,7 @@ def test_load_openai_messages_local_and_errors(tmp_path, monkeypatch):
 
 
 def test_load_openai_messages_local_skip_invalid_samples(tmp_path):
+    
     jsonl = tmp_path / "broken.jsonl"
     jsonl.write_text(
         "\n".join(
@@ -221,6 +222,35 @@ def test_load_openai_messages_local_skip_invalid_samples(tmp_path):
     assert len(rows) == 2
     assert rows[0]["messages"][0]["content"] == "ok-1"
     assert rows[1]["messages"][0]["content"] == "ok-2"
+def test_load_openai_messages_keeps_rows_with_unicode_line_separators(tmp_path):
+    # JSON allows raw U+2028/U+2029/U+0085 inside strings; str.splitlines() would cut these rows in half.
+    row = {"messages": [{"role": "user", "content": "a\u2028b\u2029c\u0085d"}, {"role": "assistant", "content": "ok"}]}
+    jsonl = tmp_path / "data.jsonl"
+    jsonl.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    rows = tcd._load_openai_messages(str(jsonl))
+
+    assert len(rows) == 1
+    assert rows[0]["messages"][0]["content"] == "a\u2028b\u2029c\u0085d"
+
+
+@pytest.mark.parametrize("suffix", [".jsonl", ".json"])
+def test_load_openai_messages_local_applies_split_slice(tmp_path, suffix):
+    data = [{"messages": [{"role": "user", "content": f"q{i}"}]} for i in range(10)]
+    fp = tmp_path / f"data{suffix}"
+    if suffix == ".jsonl":
+        fp.write_text("\n".join(json.dumps(r) for r in data), encoding="utf-8")
+    else:
+        fp.write_text(json.dumps(data), encoding="utf-8")
+
+    def contents(rows):
+        return [r["messages"][0]["content"] for r in rows]
+
+    assert contents(tcd._load_openai_messages(str(fp), split="train[:2]")) == ["q0", "q1"]
+    assert contents(tcd._load_openai_messages(str(fp), split="train[8:]")) == ["q8", "q9"]
+    assert contents(tcd._load_openai_messages(str(fp), split="train[3:5]")) == ["q3", "q4"]
+    # A plain split name keeps every row.
+    assert len(tcd._load_openai_messages(str(fp), split="train")) == 10
 
 
 def test_load_openai_messages_hf_shuffle_and_slice(monkeypatch):
@@ -619,6 +649,7 @@ def test_getitem_auto_converts_conversations(monkeypatch):
     ds.mask_history = False
     ds.unshifted = False
     ds.mask_generation_prompt = False
+    ds.chat_template_kwargs = {}
 
     out = ds[0]
     assert out == {"input_ids": [1], "labels": [1]}
@@ -671,4 +702,8 @@ def test_chat_dataset_config_positional_layout_is_unchanged():
     assert cfg.unshifted is True
     assert cfg.skip_invalid_samples is True
     assert cfg.mask_generation_prompt is False
-    assert [f.name for f in dataclasses.fields(tcd.ChatDatasetConfig)][-1] == "mask_generation_prompt"
+    assert cfg.chat_template_kwargs is None
+    assert [f.name for f in dataclasses.fields(tcd.ChatDatasetConfig)][-2:] == [
+        "mask_generation_prompt",
+        "chat_template_kwargs",
+    ]

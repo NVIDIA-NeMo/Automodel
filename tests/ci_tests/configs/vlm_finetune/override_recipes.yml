@@ -16,8 +16,6 @@
 exempt_models:
   - gemma3
   - kimi
-  - phi4
-  - qwen2_5
   - cohere_micro_vision
 
 exempt_configs:

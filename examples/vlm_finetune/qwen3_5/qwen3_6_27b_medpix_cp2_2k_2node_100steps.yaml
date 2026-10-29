@@ -117,6 +117,7 @@ wandb:
   dir: logs/qwen3_6_27b_medpix_cp2_2k_2node_100steps/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 2
   time: "00:30:00"

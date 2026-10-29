@@ -92,6 +92,10 @@ logger = logging.getLogger(__name__)
 
 _VALID_MESSAGE_ROLES = {"system", "user", "assistant", "tool_call", "tool_response", "tool"}
 
+# Roles rendered as assistant output: a ``tool_call`` turn becomes an assistant
+# message with ``tool_calls``, so it is a supervised target like ``assistant``.
+_ASSISTANT_ROLES = ("assistant", "tool_call")
+
 # ShareGPT ``from`` -> chatml ``role`` mapping.
 _SHAREGPT_ROLE_MAP = {
     "system": "system",
@@ -144,20 +148,24 @@ def _sharegpt_to_chatml(conversations: List[Dict[str, Any]]) -> List[Dict[str, A
 
 
 def _has_assistant_message(example: Dict[str, Any]) -> bool:
-    """Return whether an example contains at least one assistant message."""
+    """Return whether an example contains at least one assistant message or tool call."""
     messages = example.get("messages")
     if isinstance(messages, list):
-        return any(message.get("role") == "assistant" for message in messages if isinstance(message, dict))
+        return any(message.get("role") in _ASSISTANT_ROLES for message in messages if isinstance(message, dict))
     conversations = example.get("conversations")
     if isinstance(conversations, list):
-        return any(turn.get("from") in ("assistant", "gpt") for turn in conversations if isinstance(turn, dict))
+        return any(
+            _SHAREGPT_ROLE_MAP.get(turn.get("from")) in _ASSISTANT_ROLES
+            for turn in conversations
+            if isinstance(turn, dict)
+        )
     return False
 
 
 def _trim_after_last_assistant(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Remove an incomplete trailing exchange after the final assistant message."""
+    """Remove an incomplete trailing exchange after the final assistant message or tool call."""
     last_assistant = max(
-        (idx for idx, message in enumerate(messages) if message.get("role") == "assistant"),
+        (idx for idx, message in enumerate(messages) if message.get("role") in _ASSISTANT_ROLES),
         default=-1,
     )
     return messages[: last_assistant + 1] if last_assistant >= 0 else messages
@@ -698,14 +706,14 @@ def make_agent_chat_dataset(
         revision: Optional Hugging Face dataset revision. Agent trace repositories
             may expose training-ready rows under ``refs/convert/parquet``.
         filter_no_assistant: If True, discard incomplete traces that contain no
-            assistant message and therefore have no supervised target.
+            assistant message or tool call and therefore have no supervised target.
         filter_overlong: If True, discard traces that still exceed ``seq_length``
             after whole-exchange history truncation. This avoids token-level
             truncation changing chat-template prefixes while answer-only loss
             masks are constructed.
         trim_incomplete_last_turn: If True, discard messages after the final
-            assistant message so an unfinished user turn cannot replace the
-            supervised target during history truncation.
+            assistant message or tool call so an unfinished user turn cannot
+            replace the supervised target during history truncation.
         chat_template: Optional Jinja template string or file path overriding
             ``tokenizer.chat_template``.
         seq_length: Optional max sequence length for the tokenizer.
@@ -854,11 +862,11 @@ class AgentChatConfig:
     revision: str | None = None
     """Optional Hugging Face dataset revision."""
     filter_no_assistant: bool = False
-    """If True, discard examples without an assistant message."""
+    """If True, discard examples without an assistant message or tool call."""
     filter_overlong: bool = False
     """If True, discard examples that remain longer than ``seq_length``."""
     trim_incomplete_last_turn: bool = False
-    """If True, discard an unfinished exchange after the final assistant message."""
+    """If True, discard an unfinished exchange after the final assistant message or tool call."""
     chat_template: str | None = None
     """Optional Jinja template string or file path overriding the tokenizer template."""
     seq_length: int | None = None

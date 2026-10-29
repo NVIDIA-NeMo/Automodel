@@ -31,8 +31,6 @@ def _restore_buffer():
     saved_hybridep = fused_a2a._hybrid_ep_buffer
     saved_hybridep_signature = fused_a2a._hybrid_ep_runtime_signature
     saved_hybridep_capacity = fused_a2a._hybrid_ep_initialized_capacity
-    saved_recorder = fused_a2a._hybridep_dispatch_replay_state.recorder
-    saved_mode = fused_a2a._hybridep_dispatch_replay_state.mode
     try:
         yield
     finally:
@@ -40,8 +38,6 @@ def _restore_buffer():
         fused_a2a._hybrid_ep_buffer = saved_hybridep
         fused_a2a._hybrid_ep_runtime_signature = saved_hybridep_signature
         fused_a2a._hybrid_ep_initialized_capacity = saved_hybridep_capacity
-        fused_a2a._hybridep_dispatch_replay_state.recorder = saved_recorder
-        fused_a2a._hybridep_dispatch_replay_state.mode = saved_mode
 
 
 def test_free_buffer_destroys_and_clears():
@@ -373,8 +369,8 @@ def test_hybridep_checkpoint_replay_preserves_selective_op_trace():
 def test_hybridep_replay_recorder_reads_extents_lazily_and_once():
     """finalize() only starts the extent read; take()/resolve() turn it into an int, idempotently."""
     recorder = fused_a2a.HybridEPDispatchReplayRecorder()
-    recorder.record("layout-a", torch.tensor([2, 3]))
-    recorder.record("layout-b", torch.tensor([1, 2]))
+    recorder.record(["layout-a", torch.tensor([2, 3]), None])
+    recorder.record(["layout-b", torch.tensor([1, 2]), None])
     recorder.finalize()
     recorder.resolve()
     recorder.resolve()  # a second resolve has nothing left to do
@@ -385,7 +381,7 @@ def test_hybridep_replay_recorder_reads_extents_lazily_and_once():
     assert recorder.take() is None and recorder.replay_misses == 1
     # take() without an explicit resolve() still yields a host integer
     lazy = fused_a2a.HybridEPDispatchReplayRecorder()
-    lazy.record("layout-c", torch.tensor([4]))
+    lazy.record(["layout-c", torch.tensor([4]), None])
     lazy.finalize()
     assert lazy.take()[2] == 4
 
@@ -395,7 +391,7 @@ def test_hybridep_replay_recorder_reads_extents_lazily_and_once():
 def test_hybridep_replay_recorder_copies_cuda_extents_asynchronously():
     """On CUDA, finalize() leaves a pinned scalar and an event in flight; resolve()/take() yield the int."""
     recorder = fused_a2a.HybridEPDispatchReplayRecorder()
-    recorder.record("layout-a", torch.tensor([2, 3], device="cuda"))
+    recorder.record(["layout-a", torch.tensor([2, 3], device="cuda"), None])
     recorder.finalize()
     entry = recorder._records[0]
     assert entry[2] is None
@@ -406,7 +402,7 @@ def test_hybridep_replay_recorder_copies_cuda_extents_asynchronously():
     assert recorder._copies[0] is None
     # take() without an explicit resolve() still yields a host integer
     lazy = fused_a2a.HybridEPDispatchReplayRecorder()
-    lazy.record("layout-b", torch.tensor([4], device="cuda"))
+    lazy.record(["layout-b", torch.tensor([4], device="cuda"), None])
     lazy.finalize()
     assert lazy.take()[2] == 4
 
@@ -415,9 +411,9 @@ def test_hybridep_recorder_keeps_a_host_extent_without_reducing_tokens_per_exper
     recorder = fused_a2a.HybridEPDispatchReplayRecorder()
     tokens_per_expert = mock.MagicMock(spec=torch.Tensor)
     # capacity mode: the forward already ran with a host-side extent
-    recorder.record("layout", tokens_per_expert, 24)
+    recorder.record(["layout", tokens_per_expert, 24])
     # blocking dispatch: the extent comes from the reduction, after the checkpoint context exits
-    recorder.record("layout", torch.tensor([2, 3]))
+    recorder.record(["layout", torch.tensor([2, 3]), None])
     recorder.finalize()
 
     assert recorder.take() == ["layout", tokens_per_expert, 24]
@@ -452,3 +448,174 @@ def test_hybridep_checkpoint_replay_reuses_the_forward_capacity_extent():
     assert buffer.cached_dispatches == 1
     # the recompute output must be sized like the forward's (capacity rows), not to this dispatch's token count
     assert buffer.replayed_num_permuted_tokens == 24
+
+
+# ---------------------------------------------------------------------------
+# BackendConfig.dispatcher_recompute_cache: the combine output of the checkpoint
+# forward is served in the recompute
+# ---------------------------------------------------------------------------
+
+
+class _CountingHybridEPBuffer(_DriftingHybridEPBuffer):
+    """Non-drifting buffer (the same layout on every full dispatch) that counts combines and makes each forward
+    combine's result depend on the call count, so a served cache is distinguishable from a recomputed combine."""
+
+    def __init__(self):
+        super().__init__()
+        self.combines = 0
+        self.grad_combines = 0
+        self.grad_dispatches = 0
+
+    def dispatch_with_permute(self, *, hidden, routing_map=None, probs=None, handle=None, **kwargs):
+        if handle is not None and probs is None:
+            # HybridEPCombine.backward: the gradient all-to-all through the saved handle (no probabilities).
+            self.grad_dispatches += 1
+            return torch.cat((hidden, hidden[:1]), dim=0), None, None, None, None
+        if handle is None:
+            # Full dispatch (forward and, without layout replay, the recompute): always the forward layout.
+            self.full_dispatches += 1
+            self.input_shape = hidden.shape
+            dispatched_hidden = torch.cat((hidden, hidden[:1]), dim=0)
+            dispatched_probs = torch.cat((probs[:, :1], probs[:1, :1]), dim=0)
+            return dispatched_hidden, dispatched_probs, None, torch.tensor([2, 3]), "forward-layout"
+        return super().dispatch_with_permute(
+            hidden=hidden, routing_map=routing_map, probs=probs, handle=handle, **kwargs
+        )
+
+    def combine_with_unpermute(self, *, hidden, probs=None, **kwargs):
+        combined_hidden, combined_probs = super().combine_with_unpermute(hidden=hidden, probs=probs, **kwargs)
+        if probs is not None:
+            # HybridEPDispatch.backward: the gradient combine through the saved handle, left untouched.
+            self.grad_combines += 1
+            return combined_hidden, combined_probs
+        self.combines += 1
+        # A recomputed forward combine sees different values; the cache must hide that.
+        return combined_hidden * float(self.combines), combined_probs
+
+
+def _run_checkpointed_hybridep_with_combine(context_fn, *, cache_output):
+    torch.manual_seed(0)
+    x = torch.randn(4, 3, requires_grad=True)
+    routing_map = torch.ones(4, 2, dtype=torch.bool)
+    probs = torch.full((4, 2), 0.5, requires_grad=True)
+
+    def block(hidden, token_probs):
+        dispatched_hidden, dispatched_probs, _, _, handle = fused_a2a.HybridEPDispatch.apply(
+            hidden, routing_map, token_probs, object(), 1, 24, 24, None, None, None, None, False
+        )
+        expert_out = dispatched_hidden.sin()
+        combined = fused_a2a.HybridEPCombine.apply(expert_out, handle, None, None, False, cache_output)
+        # A consumer that saves its input, like the decoder block's ops after the MoE: without one the
+        # non-reentrant checkpoint stops the recompute before the combine (early stop).
+        return combined.square().sum() + dispatched_probs.square().sum()
+
+    loss = checkpoint(block, x, probs, use_reentrant=False, context_fn=context_fn)
+    loss.backward()
+    return loss.detach(), x.grad.clone(), probs.grad.clone()
+
+
+def test_moe_recompute_cache_round_trip():
+    cache = fused_a2a.MoERecomputeCache()
+    assert not cache.has_next()
+    first, second = torch.ones(2), torch.zeros(2)
+    cache.record(first)
+    cache.record(second)
+    first.fill_(5.0)  # the cache keeps a clone, not an alias
+    assert cache.has_next()
+    assert torch.equal(cache.take(), torch.ones(2))
+    assert torch.equal(cache.take(), torch.zeros(2))
+    assert not cache.has_next()
+    assert cache.take() is None
+    assert cache.replay_misses == 1
+    cache.rewind()
+    assert cache.has_next()  # cursor rewound; entries already handed out are None
+    assert cache.take() is None
+
+
+def test_combine_cache_serves_the_forward_output_in_the_recompute_without_layout_replay():
+    """With the router recomputed (ignore_router_for_ac=False) there is no HybridEP layout replay and the
+    recompute runs a full dispatch -- the combine cache must still work on its own scope."""
+    from nemo_automodel.components.moe.parallelizer import _cache_moe_combine_on_recompute
+
+    results = {}
+    for cache_output in (False, True):
+        buffer = _CountingHybridEPBuffer()
+        fused_a2a._hybrid_ep_buffer = buffer
+        context_fn = _cache_moe_combine_on_recompute(lambda: (nullcontext(), nullcontext()))
+        results[cache_output] = (_run_checkpointed_hybridep_with_combine(context_fn, cache_output=cache_output), buffer)
+
+    plain_buffer, cached_buffer = results[False][1], results[True][1]
+    assert plain_buffer.full_dispatches == cached_buffer.full_dispatches == 2  # forward + recompute, no replay
+    assert plain_buffer.combines == 2  # forward + recompute
+    assert cached_buffer.combines == 1  # the recompute returned the cached forward output
+    assert plain_buffer.grad_combines == cached_buffer.grad_combines == 1  # dispatch backward unchanged
+    assert plain_buffer.grad_dispatches == cached_buffer.grad_dispatches == 1  # combine backward unchanged
+
+    loss_plain, dx_plain, dp_plain = results[False][0]
+    loss_cached, dx_cached, dp_cached = results[True][0]
+    assert torch.equal(loss_plain, loss_cached)
+    assert torch.equal(dp_plain, dp_cached)
+    # The non-checkpointed run's input gradient: the cached run reproduces it (the recompute saw the forward's
+    # combine values), the plain checkpointed run does not (its recompute saw the counting buffer's x2 values).
+    buffer = _CountingHybridEPBuffer()
+    fused_a2a._hybrid_ep_buffer = buffer
+    torch.manual_seed(0)
+    x = torch.randn(4, 3, requires_grad=True)
+    routing_map = torch.ones(4, 2, dtype=torch.bool)
+    probs = torch.full((4, 2), 0.5, requires_grad=True)
+    dispatched_hidden, dispatched_probs, _, _, handle = fused_a2a.HybridEPDispatch.apply(
+        x, routing_map, probs, object(), 1, 24, 24, None, None, None, None, False
+    )
+    combined = fused_a2a.HybridEPCombine.apply(dispatched_hidden.sin(), handle, None, None, False, False)
+    (combined.square().sum() + dispatched_probs.square().sum()).backward()
+    assert torch.equal(x.grad, dx_cached)
+    assert not torch.equal(x.grad, dx_plain)
+
+
+def test_combine_cache_composes_with_the_hybridep_layout_replay():
+    """ignore_router_for_ac=True: the layout replay and the cache stack; one full dispatch, one forward combine."""
+    from nemo_automodel.components.moe.parallelizer import (
+        _cache_moe_combine_on_recompute,
+        _replay_hybridep_dispatch_on_recompute,
+    )
+
+    buffer = _CountingHybridEPBuffer()
+    fused_a2a._hybrid_ep_buffer = buffer
+    context_fn = _cache_moe_combine_on_recompute(
+        _replay_hybridep_dispatch_on_recompute(lambda: (nullcontext(), nullcontext()))
+    )
+    _run_checkpointed_hybridep_with_combine(context_fn, cache_output=True)
+    assert buffer.full_dispatches == 1
+    assert buffer.cached_dispatches == 1
+    assert buffer.combines == 1
+
+
+def test_moe_recompute_phase_and_combine_cache_flag():
+    cache = fused_a2a.MoERecomputeCache()
+    assert fused_a2a.moe_recompute_phase() is None
+    assert fused_a2a.hybridep_combine_output_cached() is False
+    with fused_a2a.moe_combine_replay.scope(cache, "record"):
+        assert fused_a2a.moe_recompute_phase() == "record"
+        assert fused_a2a.hybridep_combine_output_cached() is False
+        cache.record(torch.ones(1))
+    with fused_a2a.moe_combine_replay.scope(cache, "replay"):
+        assert fused_a2a.moe_recompute_phase() == "replay"
+        assert fused_a2a.hybridep_combine_output_cached() is True
+        cache.take()
+        assert fused_a2a.hybridep_combine_output_cached() is False
+    assert fused_a2a.moe_recompute_phase() is None
+    with pytest.raises(ValueError, match="Unsupported MoE combine replay mode"):
+        with fused_a2a.moe_combine_replay.scope(cache, "forward"):
+            pass
+
+
+def test_hybridep_combine_without_cache_flag_ignores_the_bound_cache():
+    buffer = _CountingHybridEPBuffer()
+    fused_a2a._hybrid_ep_buffer = buffer
+    cache = fused_a2a.MoERecomputeCache()
+    x = torch.randn(3, 2)
+    with fused_a2a.moe_combine_replay.scope(cache, "record"):
+        buffer.input_shape = (3, 2)
+        fused_a2a.HybridEPCombine.apply(x, "handle", None, None, False, False)
+    assert not cache.has_next()
+    assert buffer.combines == 1

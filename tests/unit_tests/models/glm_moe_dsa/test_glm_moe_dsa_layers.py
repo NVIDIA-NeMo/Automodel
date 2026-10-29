@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+import inspect
 from unittest.mock import patch
 
 import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaIndexer as HFIndexer
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm_moe_dsa.config import (
@@ -29,6 +32,9 @@ from nemo_automodel.components.models.glm_moe_dsa.layers import (
     _rotate_activation,
     _to_additive_key_mask,
 )
+
+# HF 5.18 requires this unused compatibility argument; earlier releases omit it.
+_HF_INDEXER_KWARGS = {"position_ids": None} if "position_ids" in inspect.signature(HFIndexer.forward).parameters else {}
 
 
 @pytest.fixture
@@ -135,6 +141,37 @@ def test_rotate_activation_converts_to_bfloat16():
 
 
 class TestGlmMoeDsaIndexer:
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("seq_len", [1, 9])
+    @pytest.mark.parametrize("tied_keys", [False, True])
+    def test_dense_scores_select_hf_keys_from_strided_inputs(self, config, sdpa_backend, packed, seq_len, tied_keys):
+        torch.manual_seed(19)
+        indexer = GlmMoeDsaIndexer(config, sdpa_backend)
+        reference = HFIndexer(config, layer_idx=0)
+        reference.load_state_dict(indexer.state_dict())
+        batch = 2
+        x = torch.randn(batch, seq_len, config.hidden_size * 2)[..., ::2]
+        q_resid = torch.randn(batch, seq_len, config.q_lora_rank * 2)[..., ::2]
+        if tied_keys:
+            # Repeated keys exercise exact score ties without relying on tie-breaking
+            # being stable between unrelated top-k implementations.
+            x[:, 1:] = x[:, :1]
+        assert not x.is_contiguous()
+        assert not q_resid.is_contiguous()
+        freqs = _freqs(batch, seq_len, config.qk_rope_head_dim)
+        cos = torch.ones(batch, seq_len, config.qk_rope_head_dim)
+        sin = torch.zeros_like(cos)
+        causal = torch.zeros(seq_len, seq_len).masked_fill(
+            torch.ones(seq_len, seq_len, dtype=torch.bool).triu(1), float("-inf")
+        )
+        # HF 5.18 returns int32 indices; AutoModel's sparse-mask contract is int64.
+        expected = reference(x, q_resid, (cos, sin), causal, **_HF_INDEXER_KWARGS).to(torch.int64)
+        if packed:
+            actual = torch.stack([indexer(x[b], q_resid[b], freqs[b]) for b in range(batch)])
+        else:
+            actual = indexer(x, q_resid, freqs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     @pytest.mark.parametrize("packed", [False, True])
     @pytest.mark.parametrize("interleaved", [None, False, True])
     def test_checkpoint_rotary_layout_selects_expected_keys(self, config, sdpa_backend, packed, interleaved):
@@ -282,6 +319,58 @@ class TestGlmMoeDsaIndexer:
 
 
 class TestGlmMoeDsaMLA:
+    @pytest.mark.parametrize("checkpointed", [False, True])
+    def test_attention_outputs_and_gradients_match_hf_indexer(self, config, sdpa_backend, checkpointed):
+        torch.manual_seed(23)
+        actual = GlmMoeDsaMLA(config, sdpa_backend)
+        reference = copy.deepcopy(actual)
+        hf_indexer = HFIndexer(config, layer_idx=0)
+        hf_indexer.load_state_dict(reference.indexer.state_dict())
+        batch, seq_len = 2, 9
+        x = torch.randn(batch, seq_len, config.hidden_size, requires_grad=True)
+        reference_x = x.detach().clone().requires_grad_()
+        freqs = _freqs(batch, seq_len, config.qk_rope_head_dim)
+        cos = torch.ones(batch, seq_len, config.qk_rope_head_dim)
+        sin = torch.zeros_like(cos)
+        causal = torch.zeros(seq_len, seq_len).masked_fill(
+            torch.ones(seq_len, seq_len, dtype=torch.bool).triu(1), float("-inf")
+        )
+
+        def hf_topk(hidden_states, q_resid, freqs_cis, attention_mask=None, **kwargs):
+            """Select keys using HF's independent indexer.
+
+            Args:
+                hidden_states: Hidden tensor of shape [batch, sequence, hidden].
+                q_resid: Query residual of shape [batch, sequence, q_lora_rank].
+                freqs_cis: Identity complex RoPE of shape [batch, sequence, rope_dim / 2].
+                attention_mask: Unused optional key mask; this test uses causal attention.
+                **kwargs: Unused attention metadata.
+
+            Returns:
+                Selected indices of shape [batch, sequence, index_topk].
+            """
+            return hf_indexer(hidden_states, q_resid, (cos, sin), causal, **_HF_INDEXER_KWARGS).to(torch.int64)
+
+        with patch.object(reference.indexer, "forward", side_effect=hf_topk):
+            if checkpointed:
+                actual_out = torch.utils.checkpoint.checkpoint(actual, x, freqs, use_reentrant=False)
+                expected_out = torch.utils.checkpoint.checkpoint(reference, reference_x, freqs, use_reentrant=False)
+            else:
+                actual_out, expected_out = actual(x, freqs), reference(reference_x, freqs)
+            upstream = torch.randn_like(actual_out)
+            actual_out.backward(upstream)
+            expected_out.backward(upstream)
+        torch.testing.assert_close(actual_out, expected_out, rtol=0, atol=0)
+        torch.testing.assert_close(x.grad, reference_x.grad, rtol=0, atol=0)
+        for (name, parameter), (reference_name, reference_parameter) in zip(
+            actual.named_parameters(), reference.named_parameters()
+        ):
+            assert name == reference_name
+            if parameter.grad is None or reference_parameter.grad is None:
+                assert parameter.grad is None and reference_parameter.grad is None, name
+            else:
+                torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=0, atol=0, msg=name)
+
     def test_initialization_uses_upstream_latent_norm_epsilon(self, config, sdpa_backend):
         config.rms_norm_eps = 1e-5
 
@@ -359,6 +448,43 @@ class TestGlmMoeDsaMLA:
         assert sparse_mask.shape == (1, 2, 3, 3)
         assert sparse_mask[0, 0, 2, 2] == 0
         assert sparse_mask[0, 0, 0, 1] == torch.finfo(torch.float32).min
+
+    @pytest.mark.parametrize("qkv_format,union", [("bshd", False), ("bshd", True), ("thd", False)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("top_k", [2, 5])
+    def test_sparse_mask_matches_causal_selection_for_every_head(
+        self, config, sdpa_backend, qkv_format, union, dtype, top_k
+    ):
+        """Future selections remain masked even when top-k spans the full sequence."""
+        mla = GlmMoeDsaMLA(config, sdpa_backend)
+        seq_len, n_heads = 5, 3
+        bsz = 1 if qkv_format == "thd" else 2
+        torch.manual_seed(14)
+        indices = torch.rand(bsz, seq_len, seq_len).argsort(dim=-1)[..., :top_k]
+        topk_indices = indices[0] if qkv_format == "thd" else indices
+        actual = mla._build_sparse_mask(
+            topk_indices,
+            seq_len,
+            qkv_format,
+            bsz=bsz,
+            n_heads=n_heads,
+            dtype=dtype,
+            union_across_batches=union,
+        )
+
+        output_batches = 1 if union else bsz
+        expected = torch.full((output_batches, n_heads, seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype)
+        for batch in range(output_batches):
+            selected_batches = range(bsz) if union else [batch]
+            for query in range(seq_len):
+                selected_keys = {int(key) for source in selected_batches for key in indices[source, query]}
+                for key in selected_keys:
+                    if key <= query:
+                        expected[batch, :, query, key] = 0
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if union or qkv_format == "thd":
+            assert actual.is_contiguous()
 
     def test_shared_forward_requires_previous_topk(self, config, sdpa_backend):
         mla = GlmMoeDsaMLA(config, sdpa_backend, skip_topk=True)

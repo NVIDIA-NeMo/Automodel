@@ -1140,7 +1140,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     # Register in sys.modules and on parent package so imports succeed
     monkeypatch.setitem(sys.modules, "nemo_automodel.autonvtx", dummy_autonvtx)
     if "nemo_automodel" in sys.modules:
-        setattr(sys.modules["nemo_automodel"], "autonvtx", dummy_autonvtx)
+        monkeypatch.setattr(sys.modules["nemo_automodel"], "autonvtx", dummy_autonvtx, raising=False)
     # Also overwrite the real module's patch function if it exists
     monkeypatch.setattr("nemo_automodel.autonvtx.patch", patch_fn, raising=False)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.autonvtx", dummy_autonvtx, raising=False)

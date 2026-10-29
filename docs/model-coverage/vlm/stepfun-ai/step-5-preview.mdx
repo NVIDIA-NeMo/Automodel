@@ -1,13 +1,13 @@
 ---
-title: "Step-5-Preview"
-description: "Step-5-Preview vision-language architecture, packed context-parallel inputs, and current preprocessing scope in NeMo AutoModel."
+title: "Step-5-Preview-BF16"
+description: "Step-5-Preview-BF16 vision-language architecture, packed context-parallel inputs, and current preprocessing scope in NeMo AutoModel."
 slug: model-coverage/vision-language-models/stepfun-ai/Step-5-Preview
 ---
 
-The [Step 5 Preview](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
+The [Step-5-Preview-BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
 multimodal checkpoint declares `Step5ForConditionalGeneration` with model type
 `step5_vl`. It combines the
-[Step 5 language backbone](/model-coverage/large-language-models/stepfun-ai/Step-5-Preview)
+[Step 5 language backbone](/model-coverage/large-language-models/stepfun-ai/Step-5-Preview-BF16)
 with a perception encoder and an image-token projector.
 
 ## Model Reference
@@ -46,13 +46,13 @@ datasets need a compatible processor before training. This page does not
 provide a ready-to-run image SFT recipe.
 
 The full-depth H100 benchmark recipe on the
-[language model page](/model-coverage/large-language-models/stepfun-ai/Step-5-Preview#full-depth-h100-benchmark)
+[language model page](/model-coverage/large-language-models/stepfun-ai/Step-5-Preview-BF16#full-depth-h100-benchmark)
 covers the language backbone with mock text and excludes vision compute.
 
 ## Related Resources
 
-- [Step-5-Preview](https://huggingface.co/stepfun-ai/Step-5-Preview)
-- [Hugging Face checkpoint](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
-- [Language architecture, attention, and benchmark](/model-coverage/large-language-models/stepfun-ai/Step-5-Preview)
+- [Step-5-Preview-BF16](https://huggingface.co/stepfun-ai/Step-5-Preview-BF16)
+- [Language architecture, attention, and benchmark](/model-coverage/large-language-models/stepfun-ai/Step-5-Preview-BF16)
+- [Language SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml)
 - [Model implementation](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/step5/model.py)
 - [Multimodal dataset guide](/datasets/multi-modal-dataset)

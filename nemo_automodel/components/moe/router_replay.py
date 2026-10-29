@@ -37,10 +37,13 @@ Usage::
         model(batch)
     captured = RouterReplay.collect()  # one tensor per MoE layer, in layer order
 
-    # Replay it on the training forward over the same tokens.
+    # Replay it on the training forward over the same tokens. Keep the context open
+    # through ``backward()``: ``replay`` clears the mode and targets on exit, and with
+    # activation checkpointing the gate runs again during the backward recompute, which
+    # must see the same replayed selection as the checkpointed forward.
     with RouterReplay.replay(captured):
         loss = model(batch)
-    loss.backward()
+        loss.backward()
 
 Each :class:`Gate` constructed with routing replay enabled owns one
 :class:`RouterReplay` instance and registers it in a process-global list at
@@ -208,7 +211,15 @@ class RouterReplay:
         """Replay ``all_layers_indices`` (one tensor per layer) for the duration of the block.
 
         Target selections are cleared on exit so a stale replay never leaks into a
-        later forward pass.
+        later forward pass. The block must therefore span the whole training step for
+        these tokens, including ``loss.backward()``: under activation checkpointing the
+        gate is re-run during the backward recompute and must still see the replayed
+        selection, otherwise the recomputed dispatch no longer matches the checkpointed
+        forward.
+
+        Args:
+            all_layers_indices: One ``[num_tokens, topk]`` tensor per MoE layer, in
+                the same order the layers were constructed.
         """
         cls.set_replay_indices(all_layers_indices)
         cls.set_mode(RouterReplayMode.REPLAY)

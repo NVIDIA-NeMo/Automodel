@@ -102,6 +102,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  cluster_tag: h100
   vllm_deploy: true
   vllm_deploy_known_issue_id: DEP-596
   recipe_owner: akoumpa

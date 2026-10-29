@@ -60,6 +60,7 @@ except ImportError:
 # For these models, simple key renaming is not sufficient - they need WeightConverter
 # operations to merge individual expert weights into grouped format
 MODELS_REQUIRING_TENSOR_MERGING = {
+    "beam",
     "mixtral",
     "minimax",
     "phimoe",

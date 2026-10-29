@@ -21,6 +21,7 @@ import pytest
 import torch
 from transformers import LlamaConfig, PretrainedConfig
 
+from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.utils.flops_utils import llama2_flops
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
@@ -119,6 +120,7 @@ def mock_recipe(mock_config, monkeypatch):
     """Create a mock benchmarking recipe instance."""
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", MagicMock())
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", MagicMock())
+    monkeypatch.setattr(torch.cuda, "set_device", MagicMock())
     with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
         recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
         recipe.cfg = mock_config
@@ -323,6 +325,54 @@ class TestBenchmarkingRecipeInitialization:
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
 class TestBenchmarkingRecipeSetup:
     """Test setup method of BenchmarkingRecipeForNextTokenPrediction."""
+
+    @pytest.mark.parametrize(
+        "initialized,cuda_available,local_rank,current_device",
+        [(False, True, 3, 0), (True, True, 1, 3), (False, False, 3, 0)],
+    )
+    def test_setup_selects_device_before_timer(
+        self,
+        mock_recipe: BenchmarkingRecipeForNextTokenPrediction,
+        monkeypatch: pytest.MonkeyPatch,
+        initialized: bool,
+        cuda_available: bool,
+        local_rank: int,
+        current_device: int,
+    ) -> None:
+        events: list[tuple[str, int]] = []
+        mock_recipe.timers = Timers(log_level=2, log_option="minmax")
+        monkeypatch.setenv("LOCAL_RANK", str(local_rank))
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: initialized)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+
+        def select_device(device: int) -> None:
+            nonlocal current_device
+            current_device = device
+            events.append(("set_device", device))
+
+        def synchronize() -> None:
+            events.append(("synchronize", current_device))
+
+        def parent_setup() -> None:
+            events.append(("parent_setup", current_device))
+            raise RuntimeError("stop before constructing the model")
+
+        monkeypatch.setattr(torch.cuda, "set_device", select_device)
+        monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+        with patch(
+            "nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.setup",
+            side_effect=parent_setup,
+        ):
+            with pytest.raises(RuntimeError, match="stop before constructing the model"):
+                mock_recipe.setup()
+
+        expected_device = local_rank if cuda_available and not initialized else current_device
+        binding = [("set_device", local_rank)] if cuda_available and not initialized else []
+        assert events == binding + [
+            ("synchronize", expected_device),
+            ("parent_setup", expected_device),
+            ("synchronize", expected_device),
+        ]
 
     @pytest.mark.parametrize("scope", ["model", "text"])
     def test_setup_requires_explicit_text_scope_for_composite(

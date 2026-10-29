@@ -115,7 +115,7 @@ class RotaryEmbedding(torch.nn.Module):
     def _compute_cos_sin(self, num_tokens: int):
         concentration, inv_freq = self._compute_concentration_and_inv_freq()
         t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        freqs = torch.outer(t, inv_freq)
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
         return cos, sin
@@ -231,6 +231,21 @@ def position_ids_to_freqs_cis(
     for_fused_rope: bool = True,
     cp_size: int = 1,
 ) -> torch.Tensor:
+    """Build FP32 rotary angles or coefficients without autocast rounding.
+
+    Args:
+        rotary_emb: Rotary configuration and inverse-frequency owner.
+        position_ids: Integer tensor [batch, sequence] for BSHD or [tokens]
+            for packed THD. Fused THD uses sequential positions across CP ranks.
+        qkv_format: BSHD or packed THD tensor layout.
+        for_fused_rope: Whether to return raw angles for the fused kernel.
+        cp_size: Context-parallel world size for fused THD positions.
+
+    Returns:
+        FP32 angles [sequence, 1, 1, rotary_dim] for fused RoPE; otherwise
+        FP32 coefficients [batch, sequence, rotary_dim] or [tokens, rotary_dim]
+        with cosine and sine concatenated along the final dimension.
+    """
     if qkv_format == "thd":
         if for_fused_rope:
             # shape[0] is T for 1D [T] or batch for 2D [B, T].
@@ -244,7 +259,7 @@ def position_ids_to_freqs_cis(
     concentration, inv_freq = rotary_emb._compute_concentration_and_inv_freq()
     inv_freq = inv_freq.to(device=position_ids.device, dtype=torch.float32)
     # angles: (B, T, D/2)
-    angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), inv_freq)
+    angles = position_ids.to(dtype=torch.float32).unsqueeze(-1) * inv_freq
 
     if for_fused_rope:
         # TE fused rope expects [angles, angles]

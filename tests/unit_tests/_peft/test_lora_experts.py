@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -63,6 +65,88 @@ def moe_config():
         expert_activation="swiglu",
         dtype=torch.float32,
     )
+
+
+@pytest.mark.parametrize("expert_cls", [GroupedExperts, GroupedExpertsDeepEP])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_expert_construction_honors_storage_dtype(moe_config, expert_cls, dtype):
+    experts = expert_cls(replace(moe_config, dtype=dtype, expert_bias=True))
+    assert all(parameter.dtype == dtype for parameter in experts.parameters())
+
+
+@pytest.mark.parametrize("expert_cls", [GroupedExperts, GroupedExpertsDeepEP])
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("lora_dtype", [None, torch.float32])
+def test_lora_wrapping_preserves_base_storage(moe_config, expert_cls, device, dtype, bias, lora_dtype):
+    # The materialized dtype may differ from config; wrapping must preserve it.
+    config_dtype = torch.float32 if dtype == torch.bfloat16 else torch.bfloat16
+    with torch.device(device):
+        original = expert_cls(replace(moe_config, dtype=config_dtype, expert_bias=bias)).to(dtype)
+    with torch.no_grad():
+        for parameter in original.parameters():
+            parameter.fill_(0.125)
+    base_parameters = dict(original.named_parameters())
+
+    wrapped = patch_moe_module(original, dim=4, lora_dtype=lora_dtype)
+
+    for name, parameter in base_parameters.items():
+        assert wrapped.get_parameter(name) is parameter
+        assert parameter.dtype == dtype and parameter.device.type == device
+        assert not parameter.requires_grad
+        if device != "meta":
+            assert torch.all(parameter == 0.125)
+    adapters = [parameter for name, parameter in wrapped.named_parameters() if name.startswith("lora_")]
+    assert len(adapters) == 4
+    assert all(parameter.dtype == (lora_dtype or dtype) for parameter in adapters)
+    assert all(parameter.device.type == device and parameter.requires_grad for parameter in adapters)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Qwen rotary embedding construction requires CUDA")
+def test_qwen_moe_lora_preserves_bf16_base_storage(device):
+    from transformers import Qwen3MoeConfig
+
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+    from nemo_automodel.components.models.qwen3_moe.model import Qwen3MoeForCausalLM
+
+    config = Qwen3MoeConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        moe_intermediate_size=32,
+        num_experts=4,
+        num_experts_per_tok=1,
+        max_position_embeddings=32,
+        torch_dtype=torch.float32,
+    )
+    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", experts="torch", dispatcher="torch")
+    with torch.device("meta"):
+        # Loading in BF16 may leave the original model config specifying FP32.
+        model = Qwen3MoeForCausalLM(config, backend=backend).to(torch.bfloat16)
+        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["*"], dim=4))
+
+    assert any(isinstance(module, GroupedExpertsLoRA) for module in model.modules())
+    base_names = {name for name, _ in model.named_parameters() if "lora_" not in name}
+    assert base_names
+    # Check before initialization, whose final cast could hide wrapper promotion.
+    for name in base_names:
+        parameter = model.get_parameter(name)
+        assert not parameter.requires_grad, name
+        assert parameter.dtype == torch.bfloat16, name
+
+    Checkpointer.initialize_model_weights(model, device, peft_init_method="xavier")
+
+    for name in base_names:
+        parameter = model.get_parameter(name)
+        assert not parameter.requires_grad, name
+        assert parameter.device == device, name
+        assert parameter.dtype == torch.bfloat16, name
+        assert parameter.untyped_storage().nbytes() == parameter.numel() * 2, name
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -180,6 +264,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
         dispatcher_hybridep_num_blocks_unpermute=112,
         dispatcher_capacity_factor=1.5,
         dispatcher_equal_token_counts=True,
+        dispatcher_recompute_cache="combine",
     )
     orig_experts = GroupedExpertsDeepEP(
         moe_config,
@@ -205,6 +290,7 @@ def test_grouped_experts_deepep_lora_preserves_dispatcher_settings(moe_config):
     assert lora_experts.dispatcher_capacity_factor == 1.5
     assert lora_experts.dispatcher_equal_token_counts is True
     assert lora_experts.dispatch_rows_never_empty is True
+    assert lora_experts.dispatcher_recompute_cache == "combine"
     assert lora_experts.use_mxfp8 is True
 
 
@@ -266,6 +352,35 @@ def test_apply_lora_patching_logic(moe_config, device):
     assert count == 1
     assert isinstance(model.experts, GroupedExpertsLoRA)
     assert isinstance(model.linear, nn.Linear)  # Should not be patched
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_apply_lora_preserves_expert_registration(moe_config: MoEConfig, nested: bool) -> None:
+    """Replacing direct and ModuleList-nested experts must preserve checkpoint keys and base storage."""
+    model = nn.Module()
+    original = GroupedExperts(moe_config)
+    if nested:
+        model.layers = nn.ModuleList([nn.Module()])
+        model.layers[0].experts = original
+        path = "layers.0.experts"
+    else:
+        model.experts = original
+        path = "experts"
+
+    count = apply_lora_to_linear_modules(
+        model, PeftConfig(target_modules=[path], dim=4, use_memory_efficient_lora=False)
+    )
+
+    assert count == 1
+    adapter = model.get_submodule(path)
+    assert isinstance(adapter, GroupedExpertsLoRA)
+    assert adapter.gate_and_up_projs is original.gate_and_up_projs
+    assert adapter.down_projs is original.down_projs
+    state = model.state_dict()
+    assert state[f"{path}.gate_and_up_projs"].data_ptr() == original.gate_and_up_projs.data_ptr()
+    assert state[f"{path}.down_projs"].data_ptr() == original.down_projs.data_ptr()
+    assert f"{path}.lora_gate_and_up_A" in state
+    assert f"{path}.lora_down_B" in state
 
 
 class MockDeepEPDispatcher:
@@ -367,9 +482,114 @@ def test_grouped_experts_lora_forward(moe_config, device):
     assert not torch.isinf(out).any()
 
 
+_STD_SIGMAS = 6.0  # width of the accepted band around the expected std, in sampling-error sigmas
+
+
+def _std_tolerance(n_samples: int) -> float:
+    """Relative tolerance for the sample std of ``n_samples`` draws: ``_STD_SIGMAS`` times its sampling error.
+
+    For normal draws the relative standard error of the sample std is 1 / sqrt(2 n); uniform draws have a smaller
+    one, so the same band is conservative for kaiming. Six sigmas keep a false failure below 1e-8 per check without
+    depending on the RNG seed.
+    """
+    return _STD_SIGMAS / math.sqrt(2.0 * n_samples)
+
+
+def _stacked_tensor_init_std(lora_A: torch.Tensor, init_method: str) -> float:
+    """The std the previous initializer gave every expert: the fans torch reads off the whole [E, in, rank] stack."""
+    n_experts, in_features, rank = lora_A.shape
+    fan_in, fan_out = in_features * rank, n_experts * rank
+    if init_method == "xavier":
+        return math.sqrt(2.0 / (fan_in + fan_out))
+    return 1.0 / math.sqrt(3.0 * fan_in)  # kaiming_uniform_(a=sqrt(5)): bound 1/sqrt(fan_in), std bound/sqrt(3)
+
+
+def _assert_per_expert_std(lora_A: torch.Tensor, expected_std: float, init_method: str = "xavier") -> None:
+    """Every expert's [in, rank] slice has the std of one 2-D xavier/kaiming matrix, within a sample-size-derived band.
+
+    The band is wide enough to accept any valid draw and still rejects the stacked-tensor initializer: that std is
+    asserted to lie more than two band widths away, so the test keeps its negative control on the old behaviour.
+    """
+    n_experts, in_features, rank = lora_A.shape
+    tol = _std_tolerance(in_features * rank)
+    legacy_std = _stacked_tensor_init_std(lora_A, init_method)
+    assert abs(legacy_std - expected_std) > 2.0 * tol * expected_std, (legacy_std, expected_std, tol)
+    for expert in range(n_experts):
+        std = lora_A[expert].float().std().item()
+        assert std == pytest.approx(expected_std, rel=tol), (expert, std, expected_std, tol, legacy_std)
+
+
+def _assert_per_expert_uniform(lora_A: torch.Tensor, bound: float) -> None:
+    """Every expert's slice is uniform(-bound, bound): bounded, and with the std of that distribution per expert."""
+    assert lora_A.abs().max().item() <= bound
+    _assert_per_expert_std(lora_A, bound / math.sqrt(3.0), init_method="kaiming")
+
+
+def _wide_moe_config(moe_config, n_routed_experts: int):
+    """Wider per-expert matrices so the per-expert and the stacked-tensor scales are far apart, still CPU-sized."""
+    return replace(
+        moe_config,
+        n_routed_experts=n_routed_experts,
+        n_activated_experts=min(2, n_routed_experts),
+        dim=256,
+        inter_dim=128,
+        moe_inter_dim=128,
+    )
+
+
+@pytest.mark.parametrize("n_routed_experts", [2, 4, 8])
+def test_grouped_experts_lora_xavier_init_is_per_expert_scale(moe_config, n_routed_experts):
+    """xavier must be resolved from one expert's [in, rank] fans, independent of how many experts are stacked."""
+    config = _wide_moe_config(moe_config, n_routed_experts)
+    rank = 4
+    torch.manual_seed(0)
+    lora_experts = GroupedExpertsLoRA(GroupedExperts(config), lora_dim=rank, alpha=8, lora_A_init_method="xavier")
+    _assert_per_expert_std(lora_experts.lora_gate_and_up_A, math.sqrt(2.0 / (config.dim + rank)))
+    _assert_per_expert_std(lora_experts.lora_down_A, math.sqrt(2.0 / (config.moe_inter_dim + rank)))
+    assert torch.count_nonzero(lora_experts.lora_gate_and_up_B) == 0
+    assert torch.count_nonzero(lora_experts.lora_down_B) == 0
+
+
+def test_grouped_experts_lora_kaiming_init_is_per_expert_scale(moe_config):
+    """kaiming must use fan_in = in_features of one expert, not in_features * rank of the stack."""
+    config = _wide_moe_config(moe_config, 4)
+    torch.manual_seed(0)
+    lora_experts = GroupedExpertsLoRA(GroupedExperts(config), lora_dim=4, alpha=8, lora_A_init_method="kaiming")
+    _assert_per_expert_uniform(lora_experts.lora_gate_and_up_A, 1.0 / math.sqrt(config.dim))
+    _assert_per_expert_uniform(lora_experts.lora_down_A, 1.0 / math.sqrt(config.moe_inter_dim))
+
+
+def test_grouped_experts_lora_reinit_hook_keeps_per_expert_scale(moe_config):
+    """The framework re-initializes adapters through ``init_lora_weights`` after materialization; same scale."""
+    config = _wide_moe_config(moe_config, 4)
+    lora_experts = GroupedExpertsLoRA(GroupedExperts(config), lora_dim=4, alpha=8, lora_A_init_method="xavier")
+    with torch.no_grad():
+        lora_experts.lora_gate_and_up_A.zero_()
+        lora_experts.lora_down_A.zero_()
+    torch.manual_seed(1)
+    lora_experts.init_lora_weights("xavier")
+    _assert_per_expert_std(lora_experts.lora_gate_and_up_A, math.sqrt(2.0 / (config.dim + 4)))
+    _assert_per_expert_std(lora_experts.lora_down_A, math.sqrt(2.0 / (config.moe_inter_dim + 4)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_grouped_experts_deepep_lora_xavier_init_is_per_expert_scale(moe_config, device):
+    """The DeepEP wrapper initializes the same stacked tensors and must use the same per-expert scale."""
+    config = _wide_moe_config(moe_config, 4)
+    orig_experts = GroupedExpertsDeepEP(config).to(device)
+    with torch.no_grad():
+        orig_experts.init_weights(buffer_device=device)
+    torch.manual_seed(0)
+    lora_experts = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4, alpha=8, lora_A_init_method="xavier")
+    _assert_per_expert_std(lora_experts.lora_gate_and_up_A, math.sqrt(2.0 / (config.dim + 4)))
+    _assert_per_expert_std(lora_experts.lora_down_A, math.sqrt(2.0 / (config.moe_inter_dim + 4)))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_lora_weight_initialization_xavier(moe_config, device):
     """Test Xavier initialization for LoRA weights."""
+    moe_config = _wide_moe_config(moe_config, 4)  # enough elements per expert for a stable std estimate
+    torch.manual_seed(0)  # the std assertions below sample the initializer; do not inherit another test's RNG state
     orig_experts = GroupedExperts(moe_config).to(device)
     with torch.no_grad():
         orig_experts.init_weights(buffer_device=device)
@@ -380,14 +600,16 @@ def test_lora_weight_initialization_xavier(moe_config, device):
     assert torch.allclose(lora_experts.lora_gate_and_up_B, torch.zeros_like(lora_experts.lora_gate_and_up_B))
     assert torch.allclose(lora_experts.lora_down_B, torch.zeros_like(lora_experts.lora_down_B))
 
-    # Check that A matrices are not zero (xavier initialized)
-    assert not torch.allclose(lora_experts.lora_gate_and_up_A, torch.zeros_like(lora_experts.lora_gate_and_up_A))
-    assert not torch.allclose(lora_experts.lora_down_A, torch.zeros_like(lora_experts.lora_down_A))
+    # A matrices follow the per-expert xavier scale (one [in, rank] matrix per expert)
+    _assert_per_expert_std(lora_experts.lora_gate_and_up_A, math.sqrt(2.0 / (moe_config.dim + 4)))
+    _assert_per_expert_std(lora_experts.lora_down_A, math.sqrt(2.0 / (moe_config.moe_inter_dim + 4)))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_lora_weight_initialization_kaiming(moe_config, device):
     """Test Kaiming initialization for LoRA weights."""
+    moe_config = _wide_moe_config(moe_config, 4)  # enough elements per expert for a stable std estimate
+    torch.manual_seed(0)  # the std assertions below sample the initializer; do not inherit another test's RNG state
     orig_experts = GroupedExperts(moe_config).to(device)
     with torch.no_grad():
         orig_experts.init_weights(buffer_device=device)
@@ -398,9 +620,9 @@ def test_lora_weight_initialization_kaiming(moe_config, device):
     assert torch.allclose(lora_experts.lora_gate_and_up_B, torch.zeros_like(lora_experts.lora_gate_and_up_B))
     assert torch.allclose(lora_experts.lora_down_B, torch.zeros_like(lora_experts.lora_down_B))
 
-    # Check that A matrices are not zero (kaiming initialized)
-    assert not torch.allclose(lora_experts.lora_gate_and_up_A, torch.zeros_like(lora_experts.lora_gate_and_up_A))
-    assert not torch.allclose(lora_experts.lora_down_A, torch.zeros_like(lora_experts.lora_down_A))
+    # A matrices follow the per-expert kaiming bound 1 / sqrt(in_features)
+    _assert_per_expert_uniform(lora_experts.lora_gate_and_up_A, 1.0 / math.sqrt(moe_config.dim))
+    _assert_per_expert_uniform(lora_experts.lora_down_A, 1.0 / math.sqrt(moe_config.moe_inter_dim))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1214,3 +1436,32 @@ def test_moe_rank_scaling_output_equivalence(moe_config, device):
         out_lora = model(x, token_mask, weights, indices)
 
     assert torch.allclose(out_orig, out_lora, atol=1e-6)
+
+
+@pytest.mark.parametrize("use_torch_mm", [False, True])
+def test_lora_after_down_zero_tokens_keeps_routing_weights_attached(moe_config, device, use_torch_mm):
+    """A rank with no routed tokens still backpropagates into its routing weights.
+
+    Under expert parallelism the routing weights come from an all-gather whose backward is
+    a collective, so every rank must reach it, including ranks whose experts got no tokens.
+    """
+    config = replace(moe_config, apply_router_weight_after_down=True)
+    orig_experts = GroupedExperts(config).to(device)
+    with torch.no_grad():
+        orig_experts.gate_and_up_projs.normal_(0, 0.02)
+        orig_experts.down_projs.normal_(0, 0.02)
+    orig_experts.use_torch_mm = use_torch_mm
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8).to(device)
+
+    num_tokens = 10
+    x = torch.randn(num_tokens, config.dim, device=device)
+    token_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+    weights = torch.rand(num_tokens, config.n_activated_experts, device=device, requires_grad=True)
+    indices = torch.randint(0, config.n_routed_experts, (num_tokens, config.n_activated_experts), device=device)
+
+    out = lora_experts(x, token_mask, weights, indices)
+    out.sum().backward()
+
+    torch.testing.assert_close(out, torch.zeros_like(out))
+    assert weights.grad is not None
+    torch.testing.assert_close(weights.grad, torch.zeros_like(weights))

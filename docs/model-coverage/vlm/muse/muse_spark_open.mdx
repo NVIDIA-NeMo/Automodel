@@ -17,7 +17,7 @@ multimodal processor, and checkpoint adapter for
 | Property | Value |
 | --- | --- |
 | Model ID | [`meta-models/Muse-Spark-open-816B-A42B`](https://huggingface.co/meta-models/Muse-Spark-open-816B-A42B) |
-| Architecture | `MuseSpark1xOmniForCausalLM` |
+| Architecture | `MuseSparkForConditionalGeneration`, `MuseSpark1xOmniForCausalLM` |
 | Model type | `musespark1x_omni` |
 | Validated training inputs | Text and image-text |
 | Language backbone | 62 layers, hidden size 8192 |
@@ -39,13 +39,13 @@ scope of these examples.
 
 ## Choose a Workflow
 
-Run the commands below from [the linked recipe revision](https://github.com/NVIDIA-NeMo/Automodel/tree/17e49554c8a6ce5225489548de269b10f3870e32).
+Run the commands below from the AutoModel repository root on the `main` branch.
 
 | Goal | Recipe | Configuration |
 | --- | --- | --- |
-| Image-text SFT, non-packed 4K | [MedPix SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/17e49554c8a6ce5225489548de269b10f3870e32/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_ep64_pp4_100steps.yaml) | 256 H100 GPUs; EP64 / PP4 / CP1; 100 steps |
-| Image-text LoRA, non-packed 4K | [MedPix LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/17e49554c8a6ce5225489548de269b10f3870e32/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_lora_ep32.yaml) | 32 GB200 GPUs; EP32 / PP1 / CP1; rank 8 |
-| Text SFT, packed 128K | [Packed Tulu 3 with MagiAttention](https://github.com/NVIDIA-NeMo/Automodel/blob/17e49554c8a6ce5225489548de269b10f3870e32/examples/llm_finetune/muse_spark/muse_spark_open_tulu3_packed128k_ep32_pp2_cp32_magi.yaml) | 64 GB200 GPUs; EP32 / PP2 / CP32; 50 steps |
+| Image-text SFT, non-packed 4K | [MedPix SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_ep64_pp4_100steps.yaml) | 256 H100 GPUs; EP64 / PP4 / CP1; 100 steps |
+| Image-text LoRA, non-packed 4K | [MedPix LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/muse_spark/muse_spark_open_medpix_nonpacked4k_lora_ep32.yaml) | 32 GB200 GPUs; EP32 / PP1 / CP1; rank 8 |
+| Text SFT, packed 128K | [Packed Tulu 3 with MagiAttention](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/muse_spark/muse_spark_open_tulu3_packed128k_ep32_pp2_cp32_magi.yaml) | 64 GB200 GPUs; EP32 / PP2 / CP32; 50 steps |
 
 These distributed recipes instantiate the complete 62-layer model. The
 non-packed recipes pad or truncate each source sample to 4096 model tokens and
@@ -125,13 +125,13 @@ and audio inputs are not supported by that path.
 - Activation checkpointing and separate dense and MoE
   `reshard_after_forward` controls.
 - Transformer Engine and MagiAttention backends, TE linear layers, HybridEP
-  dispatch, and native `torch_mm` grouped experts.
+  dispatch, and native `torch_mm` or TE GroupedLinear (`experts: te`) grouped
+  experts.
 - Compiled normalization, QK-normalization/RoPE fusion, and
   output-normalization/gate fusion.
 - Fused LM head plus cross entropy with the checkpoint's logit soft cap of 20.
 
-Tensor parallelism greater than one and TE GroupedLinear experts are not
-supported for this architecture. Preserve each recipe's batch and parallelism
+Tensor parallelism greater than one is not supported for this architecture. Preserve each recipe's batch and parallelism
 relationships when adapting a launch.
 
 See the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared

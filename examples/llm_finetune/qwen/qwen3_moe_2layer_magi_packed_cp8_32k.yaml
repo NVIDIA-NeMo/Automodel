@@ -127,6 +127,7 @@ wandb:
   enable: false
 
 ci:
+  cluster_tag: h100
   recipe_owner: huiyingl
   time: "00:20:00"
   nodes: 1

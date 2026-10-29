@@ -127,6 +127,7 @@ wandb:
 
 # Release CI runs a short smoke test on one 8-GPU node.
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "00:30:00"
   nodes: 1

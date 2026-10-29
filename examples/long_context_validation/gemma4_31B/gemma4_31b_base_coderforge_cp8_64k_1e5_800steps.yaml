@@ -77,7 +77,7 @@ dataset:
   path_or_dataset_id: /path/to/coderforge_cache/togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /path/to/checkpoints/hf_gemma4_31b
+    pretrained_model_name_or_path: google/gemma-4-31B
   split: train
   seq_length: 65536
   padding: do_not_pad
@@ -118,3 +118,6 @@ wandb:
   entity: <your_wandb_entity>
   name: <your_wandb_name>
   dir: <your_wandb_save_dir>
+
+ci:
+  cluster_tag: h100

@@ -63,8 +63,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
-  # FusedLinearCrossEntropy consumes the final hidden states without materializing
-  # the full [batch, sequence, vocab] logits tensor (GitHub issue #3907).
+  # Feed final hidden states directly to the compiled projection and cross entropy.
   output_hidden_states: true
   config:
     _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
@@ -85,7 +84,12 @@ checkpoint:
   enabled: false
 
 loss_fn:
+  # Keep the hidden-state loss API introduced for the full-logits OOM in #3907.
+  # torch_compile recovers throughput but materializes BF16 logits before FP32 CE.
+  # NeMo-CI job 484242802 (cdd4f1d44, 8x H100 80GB) reports rank-0 peak allocated
+  # memory of 58.77 GiB, about 20 GiB below device capacity (not total CUDA usage).
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
@@ -108,5 +112,6 @@ optimizer:
 
 
 ci:
+  cluster_tag: h100
   time: "00:15:00"
   nodes: 1

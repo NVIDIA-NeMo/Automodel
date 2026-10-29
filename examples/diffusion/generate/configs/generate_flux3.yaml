@@ -1,6 +1,7 @@
-# FLUX.3 image-small, converted with the matching upstream Diffusers revision.
+# FLUX.3 Image Klein Base, with Diffusers modular components.
+# Requires Hugging Face access and a Diffusers revision with FLUX.3 support.
 model:
-  pretrained_model_name_or_path: PATH_TO_FLUX3_MODULAR_MODEL
+  pretrained_model_name_or_path: black-forest-labs/flux-3-image-klein-base
   lora_weights: null  # Set to the training checkpoint's model/ directory.
 
 inference:
@@ -17,3 +18,6 @@ output:
   output_dir: outputs/flux3
 
 seed: 42
+
+ci:
+  cluster_tag: h100
