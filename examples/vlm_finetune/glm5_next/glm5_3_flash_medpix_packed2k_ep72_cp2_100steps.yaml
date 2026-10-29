@@ -58,6 +58,7 @@ model:
     rms_norm: torch_fp32
     experts: torch_mm
     dispatcher: hybridep
+    compile_router_weight: true
     rope_fusion: false
     gate_precision: float32
     fake_balanced_gate: false
