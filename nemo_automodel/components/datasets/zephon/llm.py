@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Text tokenizer IDs, instruction preparation and encoded-document validation."""
+"""Text tokenizer IDs, instruction preparation and pretokenized-document validation."""
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -33,12 +32,9 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from nemo_automodel.components.datasets.zephon.config import (
-        ZephonEncodedTextSourceConfig,
         ZephonInstructionSourceConfig,
+        ZephonPretokenizedTextSourceConfig,
     )
-
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -117,10 +113,10 @@ def normalize_instruction_chat(payload: Mapping[str, Any], *, config: ZephonInst
     return {"messages": messages}
 
 
-def _validate_encoded_document(
+def _validate_pretokenized_document(
     payload: Mapping[str, Any],
     *,
-    config: ZephonEncodedTextSourceConfig,
+    config: ZephonPretokenizedTextSourceConfig,
     valid_token_ids: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Validate tokens and supervision without allocating the delivered payload.
@@ -131,13 +127,13 @@ def _validate_encoded_document(
     incompatible = {"labels", "positions", "position_ids", "cu_seqlens", "cu_seq_lens_q"}.intersection(payload)
     if incompatible:
         raise ValueError(
-            f"Encoded text expects unshifted unpacked documents; unsupported fields: {sorted(incompatible)}"
+            f"Pretokenized text expects unshifted unpacked documents; unsupported fields: {sorted(incompatible)}"
         )
     raw_tokens = payload[config.tokens_field]
     if not isinstance(raw_tokens, (Sequence, np.ndarray)) or isinstance(raw_tokens, (str, bytes)):
-        raise ValueError("Encoded tokens must be a one-dimensional integer sequence")
+        raise ValueError("Pretokenized tokens must be a one-dimensional integer sequence")
     tokens = np.asarray(raw_tokens)
-    invalid_ids = "Encoded tokens must be existing integer tokenizer vocabulary IDs"
+    invalid_ids = "Pretokenized tokens must be existing integer tokenizer vocabulary IDs"
     if tokens.ndim != 1 or (tokens.size and tokens.dtype.kind not in "iu"):
         raise ValueError(invalid_ids)
     if tokens.size:
@@ -153,51 +149,57 @@ def _validate_encoded_document(
         attention = np.asarray(payload["attention_mask"])
         if attention.shape != tokens.shape or not (attention == 1).all():
             raise ValueError(
-                "Encoded attention_mask must match token length and contain only ones; packing owns padding"
+                "Pretokenized attention_mask must match token length and contain only ones; packing owns padding"
             )
     mask = None
     if config.loss_mask_field is not None and config.loss_mask_field in payload:
         mask = np.asarray(payload[config.loss_mask_field])
         if mask.shape != tokens.shape or not ((mask == 0) | (mask == 1)).all():
-            raise ValueError("Encoded loss_mask must be binary and match unshifted token length")
-        if mask.size and mask[0] != 0:
-            raise ValueError("Encoded loss_mask must mask the first token to avoid cross-document supervision")
+            raise ValueError("Pretokenized loss_mask must be binary and match unshifted token length")
     return tokens, mask
 
 
-def normalize_encoded_document(
+def normalize_pretokenized_document(
     payload: Mapping[str, Any],
     *,
-    config: ZephonEncodedTextSourceConfig,
+    config: ZephonPretokenizedTextSourceConfig,
     valid_token_ids: np.ndarray,
-) -> dict[str, np.ndarray] | None:
-    """Return int64 tokens and uint8 supervision with shape [unshifted tokens].
+) -> dict[str, np.ndarray]:
+    """Adapt pretokenized fields while preserving IDs and supplied supervision.
 
-    Supplied masks must exclude the first token, as with Zephon chat encoding.
-    Missing masks retain pretraining semantics. Short or unsupervised documents
-    are dropped; shifted labels, packed boundaries and padding are rejected.
+    Uniform loss-mask fields keep supervision aligned when masked and unmasked
+    documents are packed together. Short and fully masked documents are retained;
+    document-boundary masking belongs to to_training's mask_segment_starts option.
+
+    Args:
+        payload: Unpacked document with token IDs of shape [tokens] and an
+            optional binary loss mask of shape [tokens], both before shifting.
+        config: Source field names; absent loss masks select all tokens.
+        valid_token_ids: Sorted vocabulary IDs of shape [vocab].
+
+    Returns:
+        int64 input_ids and uint8 loss_mask arrays, each of shape [tokens].
+        Values are preserved; a missing mask becomes all ones. Inputs are not mutated.
     """
-    tokens, mask = _validate_encoded_document(payload, config=config, valid_token_ids=valid_token_ids)
-    if tokens.size < 2:
-        logger.debug("Zephon encoded drop: fewer than two tokens")
-        return None
-    if mask is not None and not mask[1:].any():
-        logger.debug("Zephon encoded drop: no supervised targets")
-        return None
-    # Uniform fields preserve supervision when masked and unmasked documents mix.
+    tokens, mask = _validate_pretokenized_document(payload, config=config, valid_token_ids=valid_token_ids)
     return {
         "input_ids": tokens.astype(np.int64),
         "loss_mask": np.ones(tokens.shape, dtype=np.uint8) if mask is None else mask.astype(np.uint8),
     }
 
 
-def measure_encoded_document(
-    payload: Mapping[str, Any], *, config: ZephonEncodedTextSourceConfig, valid_token_ids: np.ndarray
-) -> int:
-    """Count delivered tokens without allocating normalized arrays or logging drops.
+def measure_pretokenized_document(payload: Mapping[str, Any], *, tokens_field: str) -> int:
+    """Count supplied token IDs for mixture calibration, including masked tokens.
 
-    Validation and drop conditions match delivery, so malformed inputs cannot
-    silently contribute to calibration and unsupervised documents count as zero.
+    Calibration reads the raw document before field normalization, so it needs
+    the configured token field. There is no tokenizer or filtering to replay;
+    delivery validates the payload and preserves the token count.
+
+    Args:
+        payload: Raw document containing token IDs of shape [tokens].
+        tokens_field: Field holding the unshifted token IDs.
+
+    Returns:
+        Number of supplied tokens, independent of their loss-mask values.
     """
-    tokens, mask = _validate_encoded_document(payload, config=config, valid_token_ids=valid_token_ids)
-    return tokens.size if tokens.size >= 2 and (mask is None or mask[1:].any()) else 0
+    return len(payload[tokens_field])
