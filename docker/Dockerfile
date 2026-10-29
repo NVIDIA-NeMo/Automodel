@@ -389,11 +389,14 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
 # C++20, torch._grouped_mm is unavailable, or a bundled native extension has
 # unresolved PyTorch/CUDA symbols. MoK links libcuda directly; use the toolkit's
 # stub only for this import check on builders without an NVIDIA driver.
+# Load installed pytest entry points too: system-site-packages can expose a
+# base-image plugin whose module is shadowed by an older venv dependency.
 RUN mkdir -p /tmp/cuda-driver-stubs && \
     ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-driver-stubs/libcuda.so.1 && \
     LD_LIBRARY_PATH=/tmp/cuda-driver-stubs:${LD_LIBRARY_PATH} \
         MAX_JOBS=2 python docker/common/verify_native_runtime.py && \
-    rm -rf /tmp/cuda-driver-stubs
+    rm -rf /tmp/cuda-driver-stubs && \
+    python -c "from _pytest.config import get_config; get_config().pluginmanager.load_setuptools_entrypoints('pytest11')"
 
 WORKDIR /opt/Automodel
 
