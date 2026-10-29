@@ -35,7 +35,6 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeGatedDeltaNet,
-    causal_conv1d_fn,
     causal_conv1d_update,
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
@@ -127,7 +126,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             from causal_conv1d import causal_conv1d_fn as fast_causal_conv1d_fn
             from causal_conv1d import causal_conv1d_update as fast_causal_conv1d_update
         except ImportError:
-            fast_causal_conv1d_fn = causal_conv1d_fn
+            fast_causal_conv1d_fn = None
             fast_causal_conv1d_update = causal_conv1d_update
 
         try:
@@ -143,6 +142,34 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         # HF created bare ``A_log``/``dt_bias`` in ``_parameters``; move them into a
         # native fp32 ``SSMGate`` submodule (built directly, not relocated at runtime).
         install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config))
+
+    def _causal_conv1d_reference(
+        self, hidden_states: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Run causal convolution with independent history for packed documents.
+
+        Args:
+            hidden_states: Tensor of shape [batch, channels, sequence].
+            cu_seqlens_cpu: Optional CPU tensor of shape [documents + 1] with
+                cumulative boundaries over the flattened batch of valid tokens.
+                None treats each batch item as one sequence.
+
+        Returns:
+            Activated tensor of shape [batch, channels, sequence], without
+            mutating or aliasing hidden_states.
+        """
+        batch, channels, sequence = hidden_states.shape
+        if cu_seqlens_cpu is None:
+            return F.silu(self.conv1d(hidden_states)[..., :sequence])
+        # The Transformers reference drops seq_idx, allowing convolution history
+        # to cross document boundaries. Convolve each document independently.
+        flattened = hidden_states.transpose(1, 2).reshape(-1, channels).T.unsqueeze(0)
+        boundaries = cu_seqlens_cpu.tolist()
+        documents = [
+            F.silu(self.conv1d(flattened[..., start:end])[..., : end - start])
+            for start, end in zip(boundaries[:-1], boundaries[1:])
+        ]
+        return torch.cat(documents, dim=-1).transpose(1, 2).reshape(batch, sequence, channels).transpose(1, 2)
 
     def _compute_gate(self, a: torch.Tensor) -> torch.Tensor:
         """Compute the gating value ``g`` via the fp32 ``SSMGate`` submodule.
@@ -274,7 +301,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                     seq_idx=seq_idx_for_conv,
                 )
             else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :eff_seq_len])
+                mixed_qkv = self._causal_conv1d_reference(mixed_qkv, cu_seqlens_cpu if is_packed else None)
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)

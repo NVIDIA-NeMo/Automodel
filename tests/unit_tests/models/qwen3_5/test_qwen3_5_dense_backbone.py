@@ -412,6 +412,32 @@ class TestDenseTextBackbone:
             assert parameter.grad is not None and expected is not None, name
             torch.testing.assert_close(parameter.grad, expected, rtol=1e-5, atol=1e-6)
 
+    def test_reference_convolution_resets_history_between_packed_documents(self):
+        torch.manual_seed(42)
+        cfg = _tiny_config(
+            layer_types=("linear_attention",),
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        model = CPAwareGatedDeltaNet(cfg, layer_idx=0).float()
+        hidden = torch.randn(2, model.conv1d.in_channels, 5, requires_grad=True)
+        boundaries = torch.tensor([0, 2, 5, 8, 10], dtype=torch.int32)
+        packed = model._causal_conv1d_reference(hidden, boundaries)
+        documents = [
+            model._causal_conv1d_reference(hidden[0:1, :, :2]),
+            model._causal_conv1d_reference(hidden[0:1, :, 2:]),
+            model._causal_conv1d_reference(hidden[1:2, :, :3]),
+            model._causal_conv1d_reference(hidden[1:2, :, 3:]),
+        ]
+        separate = torch.cat([torch.cat(documents[:2], dim=-1), torch.cat(documents[2:], dim=-1)], dim=0)
+        torch.testing.assert_close(packed, separate)
+        packed[0, :, 2:].sum().backward()
+        assert hidden.grad[0, :, :2].count_nonzero() == 0
+        assert hidden.grad[0, :, 2:].count_nonzero() > 0
+        assert hidden.grad[1].count_nonzero() == 0
+
     def test_forward_accepts_inputs_embeds(self):
         cfg = _tiny_config(layer_types=("full_attention",))
         backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
