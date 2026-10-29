@@ -188,7 +188,7 @@ def _image_height_width(image: object) -> tuple[int, int] | None:
     try:
         with Image.open(image) as opened:
             width, height = opened.size
-    except OSError:
+    except (OSError, Image.DecompressionBombError):
         return None
     return height, width
 

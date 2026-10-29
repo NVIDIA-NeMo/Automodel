@@ -719,6 +719,40 @@ class TestImageTokenCounter:
 
 
 class TestEstimateSampleLength:
+    @pytest.mark.parametrize("form", ["bytes", "path", "dict_bytes", "dict_path"])
+    def test_decompression_bomb_falls_back(self, form, tmp_path, monkeypatch, caplog):
+        data = _png_bytes(64, 64)
+        path = tmp_path / "image.png"
+        path.write_bytes(data)
+        image = {
+            "bytes": data,
+            "path": str(path),
+            "dict_bytes": {"bytes": data, "path": None},
+            "dict_path": {"bytes": None, "path": str(path)},
+        }[form]
+        processor = _qwen3_5_processor()
+        example = _image_example(image)
+        # Trigger Pillow's real protection with a tiny image, without large allocations.
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+        with pytest.raises(Image.DecompressionBombError):
+            Image.open(io.BytesIO(data))
+
+        estimate = _estimate_sample_length(example, count_image_tokens=_image_token_counter(processor))
+
+        assert estimate.media_tokens == 500
+        assert estimate.total_tokens == 502
+        assert estimate.unsized_media == 1
+        with caplog.at_level(logging.WARNING):
+            packed = NeatPackConfig(pack_size=1024).build(
+                dataset=_FakeDataset([_make_vlm_sample(4)]), padding_idx=0, ds_raw=[example], processor=processor
+            )
+
+        assert packed.bins == [[0]]
+        assert "1 media items have no mm_inputs_meta and no readable image size" in caplog.text
+        # Planning fallback must leave Pillow's rejection in force for later decoding.
+        with pytest.raises(Image.DecompressionBombError):
+            Image.open(io.BytesIO(data))
+
     @pytest.mark.parametrize("form", ["pil", "lazy_bytes", "decode_false_dict", "path"])
     def test_image_tokens_come_from_image_size(self, form, tmp_path):
         # Qwen3.5 resizes 280x560 to 288x576: (288 / 16) * (576 / 16) / 2**2 = 162 tokens.
