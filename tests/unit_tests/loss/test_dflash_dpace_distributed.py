@@ -14,6 +14,7 @@
 
 """Distributed optimizer-step parity for D-PACE normalization."""
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -21,6 +22,8 @@ from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+
+pytestmark = pytest.mark.cpu_only
 
 _BATCH = 2
 _BLOCKS = 3
