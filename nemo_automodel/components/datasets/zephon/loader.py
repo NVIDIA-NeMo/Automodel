@@ -51,12 +51,15 @@ def convert_text_batch(
     mask_segment_starts: bool,
     allow_cross_document_attention: bool,
     output_format: BatchOutputFormat = "batched",
+    pad_to_length: int | None = None,
+    pad_token_id: int | None = None,
 ) -> TrainingBatch:
     """Collate text, retaining boundaries independently of the model's positions.
 
     Args:
-        sample_batch: Packed documents with unshifted token IDs and scalar
-            subdocument-reset positions [sequence] in each payload.
+        sample_batch: Prepared documents with unshifted token IDs and scalar
+            subdocument-reset positions [sequence] in each payload. Positions
+            come from online packing, an offline export, or single-document defaults.
         packing_contract: Model-derived return requests; mask and gathered-token
             requests apply only to batched output.
         ignore_index: Loss exclusion value for shifted labels.
@@ -64,6 +67,9 @@ def convert_text_batch(
         allow_cross_document_attention: Allow earlier subdocuments as context
             and number each packed document continuously for RoPE.
         output_format: Batched mask/metadata route or native THD lengths.
+        pad_to_length: Unshifted target length when online packing is disabled.
+            Shorter supplied documents are padded, with padding excluded from loss.
+        pad_token_id: Resolved model padding ID, required with pad_to_length.
 
     Returns:
         Token IDs, labels, positions, padding and compact boundary/attention IDs
@@ -82,6 +88,8 @@ def convert_text_batch(
         mask_segment_starts=mask_segment_starts,
         return_padding_mask=True,
         return_document_ids=True,
+        pad_to_length=pad_to_length,
+        pad_token_id=pad_token_id,
         dtype=torch.long,
         rename_fields={"positions": "position_ids"},
         exclude_fields=("ids", "texts"),
