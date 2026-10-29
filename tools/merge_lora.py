@@ -78,8 +78,12 @@ import json
 import logging
 import os
 from dataclasses import fields
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from peft import PeftModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -277,6 +281,38 @@ def _clean_quantization_config(output_dir):
             json.dump(config_data, f, indent=2)
 
 
+def _untie_adapted_embeddings(model: "PeftModel") -> None:
+    """Separate tied input/output weights before independently merging their adapters.
+
+    Mutates the loaded model and its config so save/reload retains independent
+    weights. Unadapted tied embeddings keep their original parameter identity.
+
+    Args:
+        model: Loaded PEFT model whose embedding/output base weights have shape
+            [vocab, hidden]. Adapter deltas must affect only their targeted module.
+    """
+    from nemo_automodel.shared.import_utils import safe_import_from
+
+    _, LoraLayer = safe_import_from("peft.tuners.lora", "LoraLayer")
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings()
+    input_adapted = isinstance(input_embeddings, LoraLayer)
+    output_adapted = isinstance(output_embeddings, LoraLayer)
+    if not (input_adapted or output_adapted) or input_embeddings is None or output_embeddings is None:
+        return
+    input_base = input_embeddings.get_base_layer() if input_adapted else input_embeddings
+    output_base = output_embeddings.get_base_layer() if output_adapted else output_embeddings
+    if input_base.weight is not output_base.weight:
+        return
+
+    output_base.weight = torch.nn.Parameter(
+        output_base.weight.detach().clone(), requires_grad=output_base.weight.requires_grad
+    )
+    model.config.tie_word_embeddings = False
+    model.config.get_text_config().tie_word_embeddings = False
+    logger.info("Untied input/output embeddings to preserve independent LoRA updates during merge")
+
+
 def merge_lora(
     base_model: str,
     adapter_path: str,
@@ -344,6 +380,7 @@ def merge_lora(
     # --- Apply adapter and merge ---
     logger.info("Loading adapter from %s", adapter_path)
     model = PeftModel.from_pretrained(model, adapter_path)
+    _untie_adapted_embeddings(model)
 
     logger.info("Merging adapter into base model")
     model = model.merge_and_unload()
