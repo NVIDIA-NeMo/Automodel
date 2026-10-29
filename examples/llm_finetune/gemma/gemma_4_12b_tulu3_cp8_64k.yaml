@@ -1,0 +1,115 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Gemma4 Unified 12B SFT on Tulu-3 with 64K-token packed sequences under context parallelism (cp_size=8)
+# on one 8-GPU node.
+# Each rank keeps a contiguous 8K-token slice; the sliding-window layers run FlashAttention (the `fa`
+# extra) and the head_dim=512 full-attention ring chunks run the FFPA kernel (uv sync --extra ffpa).
+#
+# To run:
+#   automodel examples/llm_finetune/gemma/gemma_4_12b_tulu3_cp8_64k.yaml --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 2
+  local_batch_size: 1
+  max_steps: 20
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-12B
+  torch_dtype: bf16
+  # The CP ring attention runs in place of SDPA.
+  attn_implementation: sdpa
+  text_config:
+    cp_full_attn_backend: ffpa
+    cp_sliding_attn_backend: fa
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 8  # 65536 / 8 = 8192 tokens per rank
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: false
+
+# Fused linear CE: at 8K tokens per rank the materialized 262K-vocab logits alone need 4 GiB in bf16 plus
+# 8 GiB for the fp32 upcast, which does not fit next to the activations on an 80 GB GPU.
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  logit_softcapping: 30.0  # Gemma4's final_logit_softcapping
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 1234
+  seq_length: 65536
+  truncation: true
+  padding: false
+  # The base checkpoint ships no chat template; gemma-4-12B-it has the same vocabulary and one.
+  tokenizer:
+    pretrained_model_name_or_path: google/gemma-4-12B-it
+
+packed_sequence:
+  packing_strategy: thd
+  packed_sequence_size: 65536
+  max_packs: 40  # max_steps * global_batch_size
+  num_proc: 1
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  drop_last: true
+  shuffle: false
+
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: false
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+ci:
+  cluster_tag: h100
+  recipe_owner: khazic
+  time: "00:40:00"
+  nodes: 1
+  nproc_per_node: 8

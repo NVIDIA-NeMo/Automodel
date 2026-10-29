@@ -21,6 +21,7 @@ to SDPA (or eager for softcap) for other unsupported configurations.
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Any, Callable, cast
 
@@ -182,6 +183,75 @@ def _ffpa_varlen_fwd(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _ffpa_sm80_split_d_backward(device: torch.device, head_dim: int, head_dim_v: int) -> bool:
+    """Whether ffpa-attn runs its generic SM80 Split-D backward for this device and head dims.
+
+    That kernel accumulates dK/dV across tiles through an HBM buffer in the activation dtype, so
+    every partial sum loses bits to a bf16 round trip and the error grows with the chunk length
+    (measured on the SM80 path, head_dim 512: ~4e-3 relative L2 at 256 tokens, ~1e-2 at 2K, ~1.5e-2 at 4K,
+    three to four times the Flex ring). Its ``grad_kv_storage_dtype`` option widens that buffer
+    to fp32; the SM90/SM100 kernels accumulate in registers/TMEM and reject the option. Mirrors
+    the library's own dispatch so the two cannot disagree; if that dispatch cannot be imported,
+    the backward keeps the library defaults and says so once.
+    """
+    try:
+        from ffpa_attn.cute import _backward_impl_for_device, _ffpa_attn_backward_sm80
+    except ImportError as exc:
+        _warn_once(
+            "ffpa_backward_dispatch",
+            f"cannot inspect the ffpa-attn backward dispatch ({exc}); dK/dV keep the activation-dtype storage",
+            target="ffpa-attn defaults",
+        )
+        return False
+    return _backward_impl_for_device(device, head_dim, head_dim_v) is _ffpa_attn_backward_sm80
+
+
+def _ffpa_varlen_bwd_sm80(
+    grad_out_pack: torch.Tensor,
+    q_pack: torch.Tensor,
+    k_pack: torch.Tensor,
+    v_pack: torch.Tensor,
+    out_pack: torch.Tensor,
+    lse_pack: torch.Tensor,
+    bounds_q: list[int],
+    bounds_k: list[int],
+    *,
+    scale: float,
+    causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """SM80 varlen backward as per-document dense calls, so every segment gets the fp32 dK/dV
+    storage of :func:`_ffpa_dense_bwd`.
+
+    ffpa-attn's SM80 varlen backward is this same per-segment decomposition, but it allocates the
+    segment buffers in the activation dtype, so its storage-dtype option never reaches them.
+    """
+
+    def sdpa_layout(packed: torch.Tensor) -> torch.Tensor:  # [T, H, D] -> [1, H, T, D]
+        return packed.transpose(0, 1).unsqueeze(0)
+
+    dq = torch.zeros_like(q_pack)
+    dk = torch.zeros_like(k_pack)
+    dv = torch.zeros_like(v_pack)
+    for q0, q1, k0, k1 in zip(bounds_q[:-1], bounds_q[1:], bounds_k[:-1], bounds_k[1:]):
+        if q1 == q0 or k1 == k0:
+            continue
+        dq_seg, dk_seg, dv_seg = _ffpa_dense_bwd(
+            sdpa_layout(grad_out_pack[q0:q1]),
+            sdpa_layout(q_pack[q0:q1]),
+            sdpa_layout(k_pack[k0:k1]),
+            sdpa_layout(v_pack[k0:k1]),
+            sdpa_layout(out_pack[q0:q1]),
+            lse_pack[:, q0:q1].unsqueeze(0).contiguous(),
+            scale=scale,
+            causal=causal,
+        )
+        dq[q0:q1] = dq_seg[0].transpose(0, 1)
+        dk[k0:k1] = dk_seg[0].transpose(0, 1)
+        dv[k0:k1] = dv_seg[0].transpose(0, 1)
+    return dq, dk, dv
+
+
 def _ffpa_varlen_bwd(
     grad_out_pack: torch.Tensor,
     q_pack: torch.Tensor,
@@ -196,8 +266,13 @@ def _ffpa_varlen_bwd(
     *,
     scale: float,
     causal: bool,
+    cu_q_host: list[int] | None = None,
+    cu_k_host: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run FFPA CuTeDSL varlen backward with the caller's globally merged output and LSE.
+
+    On the generic SM80 path the per-document segments run through the dense op with fp32
+    dK/dV storage (see :func:`_ffpa_sm80_split_d_backward`).
 
     Args:
         grad_out_pack: Output-gradient tensor of shape [total_query_tokens, query_heads, value_head_dim] in
@@ -220,11 +295,20 @@ def _ffpa_varlen_bwd(
         max_k: Maximum key/value sequence length represented by ``cu_k``.
         scale: Pre-softmax scaling factor applied to query-key scores.
         causal: Whether to apply the tail-aligned causal mask within each packed sequence.
+        cu_q_host: Host-side copy of ``cu_q`` when the caller already holds one; spares the SM80 path a
+            device-to-host sync.
+        cu_k_host: Host-side copy of ``cu_k``, likewise.
 
     Returns:
         A ``(dq, dk, dv)`` tuple in packed THD layout. Each gradient has the shape, dtype, and device of its
         corresponding QKV input and does not alias an input.
     """
+    if _ffpa_sm80_split_d_backward(q_pack.device, q_pack.shape[-1], v_pack.shape[-1]):
+        bounds_q = cu_q.tolist() if cu_q_host is None else cu_q_host
+        bounds_k = cu_k.tolist() if cu_k_host is None else cu_k_host
+        return _ffpa_varlen_bwd_sm80(
+            grad_out_pack, q_pack, k_pack, v_pack, out_pack, lse_pack, bounds_q, bounds_k, scale=scale, causal=causal
+        )
     # Cast the dynamic torch op packet to the callable signature expected by the type checker.
     varlen_bwd_cute = cast(
         "Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]",
@@ -313,7 +397,12 @@ def _ffpa_dense_bwd(
     """
     from ffpa_attn.cute import _ffpa_attn_backward_cute
 
-    return _ffpa_attn_backward_cute(grad_out, q, k, v, out, lse, float(scale), bool(causal))
+    storage = (
+        {"grad_kv_storage_dtype": torch.float32}
+        if _ffpa_sm80_split_d_backward(q.device, q.shape[-1], v.shape[-1])
+        else {}
+    )
+    return _ffpa_attn_backward_cute(grad_out, q, k, v, out, lse, float(scale), bool(causal), **storage)
 
 
 def _get_ffpa_high_level() -> tuple[Callable, Any] | None:

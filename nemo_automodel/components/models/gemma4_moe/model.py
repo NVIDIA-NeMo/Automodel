@@ -98,7 +98,11 @@ from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
+from .cp_attention import (
+    apply_gemma4_cp_attention_backend_policy,
+    gemma4_vision_group_ids,
+    set_gemma4_cp_dense_metadata,
+)
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
 from .parallelization import PARALLELIZER
 from .sdpa_fp32 import enable_gemma4_sdpa_fp32
@@ -876,13 +880,113 @@ class Gemma4MoEModel(HFGemma4Model):
 
 
 # ---------------------------------------------------------------------------
-# Top-level conditional-generation model
+# Model-owned context parallelism (shared with Gemma4 Unified)
 # ---------------------------------------------------------------------------
-class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
-    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
-    supports_gradient_checkpointing = True
+class Gemma4ContextParallelMixin:
+    """Model-owned contiguous context parallelism for the Gemma4-family conditional-generation models.
+
+    The model owns CP batch sharding and its decoder-layer p2p attention ring. The recipe gets a
+    sharder-only :class:`ContextParallelSharder` from :meth:`prepare_model_inputs_for_cp`; its
+    ``shard_batch`` (:meth:`_cp_shard_batch_aux_only`) installs the ring on first use and records
+    ``cp_mesh``, and the model's forward embeds, splices vision and keeps this rank's contiguous slice.
+    """
+
     # Gemma4 owns CP batch sharding and its decoder-layer p2p attention ring.
     _owns_cp_attention = True
+    # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
+    # hands the model the CP submesh; None means the forward embeds/shards nothing
+    # for CP.
+    cp_mesh = None
+
+    def setup_cp_attention(self, cp_mesh) -> None:
+        """Install Gemma4's model-owned p2p ring CP attention (dense path).
+
+        Idempotent: flips the ``_cp_enabled`` flag the forward reads and installs
+        the ring on every self-attn module (each was given a per-module
+        ``setup_cp_attention`` by ``attach_gemma4_cp_ring_attention`` at
+        construction). Invoked from Gemma4's own batch-sharding callable
+        (``_cp_shard_batch_aux_only``) the first time the recipe hands it the CP
+        submesh, so the install is fully model-owned and needs no framework
+        dispatch.
+        """
+        if getattr(self, "_cp_enabled", False):
+            return
+        self._cp_enabled = True
+        for module in self.modules():
+            if module is self:
+                continue
+            module_setup = getattr(module, "setup_cp_attention", None)
+            if callable(module_setup):
+                module_setup(cp_mesh)
+
+    def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        """Gemma4-owned aux-only CP batch sharder that also self-installs the ring.
+
+        Exposed as ``ContextParallelSharder.shard_batch`` by the sharder-only
+        ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
+        submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
+        model-owned path (dense variants are not guaranteed to run the MoE
+        ``apply_cp``), so install the ring here (idempotent) and record
+        ``cp_mesh`` for the forward, which embeds, splices vision and keeps this
+        rank's contiguous slice per microbatch. Only the no-grad aux streams (and
+        the synthesized ``_packed_seq_ids``) are sharded here; ``input_ids`` /
+        ``pixel_values`` / ``mm_token_type_ids`` stay full for the forward.
+        """
+        self.setup_cp_attention(cp_mesh)
+        self.cp_mesh = cp_mesh
+        return make_contiguous_aux_only_shard_cp_batch_and_ctx(
+            cp_mesh,
+            tp_mesh,
+            batch,
+            loss_mask=loss_mask,
+            padding_token_id=padding_token_id,
+        )
+
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Return a sharder-only CP backend; embed + splice + slice happen in forward.
+
+        Sunk (Megatron-style per-microbatch) CP: the returned
+        :class:`ContextParallelSharder` contiguously shards only the no-grad
+        aux streams (labels/position_ids/loss_mask/padding_mask + the synthesized
+        ``_packed_seq_ids`` document map) via
+        :func:`make_contiguous_aux_only_shard_cp_batch_and_ctx` and leaves
+        ``input_ids`` / ``pixel_values`` / ``mm_token_type_ids`` full-length. The
+        forward then embeds, splices vision, builds the ``mm_token_type_ids`` /
+        ``_gemma4_vision_group_ids`` ring metadata (and dense Gemma4's
+        ``per_layer_inputs``) on the full sequence and keeps this rank's contiguous
+        slice, so the embeddings and vision tower are trainable under CP and the
+        PP×CP shared pre-embed graph no longer exists. Nothing is consumed here.
+        Defining this method is the opt-in signal the recipe checks
+        (``hasattr(model, "prepare_model_inputs_for_cp")``).
+
+        Args:
+            batch: The full-sequence batch; left intact (nothing consumed).
+            num_chunks: Accepted for hook-signature parity; unused (contiguous CP).
+        """
+        del num_chunks
+        if batch.get("input_ids") is None:
+            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=self._cp_shard_batch_aux_only,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
+
+
+# ---------------------------------------------------------------------------
+# Top-level conditional-generation model
+# ---------------------------------------------------------------------------
+class Gemma4ForConditionalGeneration(
+    Gemma4ContextParallelMixin, HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin
+):
+    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
+    supports_gradient_checkpointing = True
     # Whole-block activation checkpointing replays each decoder layer during backward.
     # E2B/E4B tolerate that for two separate reasons, one per kind of layer:
     #   * non-shared layers are the ones that call `past_key_values.update()`. A
@@ -907,10 +1011,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     # modules: they hold the vanilla-HF reference (ckpt_robustness tests) to the
     # same fp32 routing contract instead of letting it round the router to bf16.
     _keep_in_fp32_modules_strict = ["router.proj", "router.scale"]
-    # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
-    # hands the model the CP submesh; None means the forward embeds/shards nothing
-    # for CP.
-    cp_mesh = None
     """Gemma4 VL conditional generation model with NeMo MoE backend.
 
     When the checkpoint has ``enable_moe_block=True`` in its text config,
@@ -1004,68 +1104,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             enable_gemma4_sdpa_fp32()
         return cls.from_config(config, *model_args, **kwargs)
 
-    def setup_cp_attention(self, cp_mesh) -> None:
-        """Install Gemma4's model-owned p2p ring CP attention (dense path).
-
-        Idempotent: flips the ``_cp_enabled`` flag the forward reads and installs
-        the ring on every self-attn module (each was given a per-module
-        ``setup_cp_attention`` by ``attach_gemma4_cp_ring_attention`` at
-        construction). Invoked from Gemma4's own batch-sharding callable
-        (``_cp_shard_batch_aux_only``) the first time the recipe hands it the CP
-        submesh, so the install is fully model-owned -- no framework dispatch is
-        required.
-        """
-        if getattr(self, "_cp_enabled", False):
-            return
-        self._cp_enabled = True
-        for module in self.modules():
-            if module is self:
-                continue
-            module_setup = getattr(module, "setup_cp_attention", None)
-            if callable(module_setup):
-                module_setup(cp_mesh)
-
-    def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-        """Gemma4-owned aux-only CP batch sharder that also self-installs the ring.
-
-        Exposed as ``ContextParallelSharder.shard_batch`` by the sharder-only
-        ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
-        submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
-        model-owned path (dense variants are not guaranteed to run the MoE
-        ``apply_cp``) -- so install the ring here (idempotent) and record
-        ``cp_mesh`` for the forward, which embeds, splices vision and keeps this
-        rank's contiguous slice per microbatch. Only the no-grad aux streams (and
-        the synthesized ``_packed_seq_ids``) are sharded here; ``input_ids`` /
-        ``pixel_values`` / ``mm_token_type_ids`` stay full for the forward.
-        """
-        self.setup_cp_attention(cp_mesh)
-        self.cp_mesh = cp_mesh
-        return make_contiguous_aux_only_shard_cp_batch_and_ctx(
-            cp_mesh,
-            tp_mesh,
-            batch,
-            loss_mask=loss_mask,
-            padding_token_id=padding_token_id,
-        )
-
     def _apply_cp_attention_backend_policy(self) -> None:
         """Apply the model-owned CP attention backend policy to the final module tree."""
-        text_config = getattr(self.config, "text_config", self.config)
-        full_backend = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower()
-        sliding_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
-
-        if full_backend not in {"flex", "ffpa"}:
-            raise ValueError(f"Unsupported cp_full_attn_backend: {full_backend!r}")
-        if sliding_backend not in {"flex", "fa"}:
-            raise ValueError(f"Unsupported cp_sliding_attn_backend: {sliding_backend!r}")
-
-        for module in self.modules():
-            if isinstance(module, Gemma4Attention):
-                attach_gemma4_cp_ring_attention(
-                    module,
-                    use_ffpa=full_backend == "ffpa",
-                    sliding_backend=sliding_backend,
-                )
+        apply_gemma4_cp_attention_backend_policy(self, Gemma4Attention)
 
     def __init__(
         self,
@@ -1276,18 +1317,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 # mm_token_type_ids / _gemma4_vision_group_ids are the forward-sliced
                 # streams; _packed_seq_ids and padding_mask ride the aux-only sharder.
                 if cp_enabled:
-                    cp_meta = {
-                        "mm_token_type_ids": mm_token_type_ids,
-                        "padding_mask": padding_mask,
-                        "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
-                        "_gemma4_vision_group_ids": vision_group_ids_local,
-                        "_gemma4_has_vision_tokens": has_vision_tokens,
-                    }
-                    # Left set (not cleared) so the activation-checkpoint recompute in
-                    # backward sees the same metadata; each CP forward overwrites it.
-                    for _mod in self.modules():
-                        if getattr(_mod, "_cp_uses_attention_hook", False):
-                            _mod._cp_dense_metadata = cp_meta
+                    set_gemma4_cp_dense_metadata(
+                        self,
+                        mm_token_type_ids=mm_token_type_ids,
+                        padding_mask=padding_mask,
+                        packed_seq_ids=kwargs.get("_packed_seq_ids"),
+                        vision_group_ids=vision_group_ids_local,
+                        has_vision_tokens=has_vision_tokens,
+                    )
 
                 # FSDP2 copies plain dict inputs while casting layer arguments.
                 # This model-owned mapping preserves one KV store across all
@@ -1531,42 +1568,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if pad_token_id is None or pad_token_id < 0:
             raise ValueError("Gemma4 per-layer inputs require a valid pad_token_id.")
         return pad_token_id
-
-    def prepare_model_inputs_for_cp(
-        self,
-        batch: dict[str, Any],
-        *,
-        num_chunks: int = 1,
-    ) -> dict[str, Any]:
-        """Return a sharder-only CP backend; embed + splice + slice happen in forward.
-
-        Sunk (Megatron-style per-microbatch) CP: the returned
-        :class:`ContextParallelSharder` contiguously shards only the no-grad
-        aux streams (labels/position_ids/loss_mask/padding_mask + the synthesized
-        ``_packed_seq_ids`` document map) via
-        :func:`make_contiguous_aux_only_shard_cp_batch_and_ctx` and leaves
-        ``input_ids`` / ``pixel_values`` / ``mm_token_type_ids`` full-length. The
-        forward (:meth:`_cp_sunk_prepare_inputs`) then embeds, splices vision,
-        builds ``per_layer_inputs`` and the ``mm_token_type_ids`` /
-        ``_gemma4_vision_group_ids`` ring metadata on the full sequence and keeps
-        this rank's contiguous slice, so the embeddings and vision tower are
-        trainable under CP and the PP×CP shared pre-embed graph no longer exists.
-        Nothing is consumed here. Defining this method is the opt-in signal the
-        recipe checks (``hasattr(model, "prepare_model_inputs_for_cp")``).
-
-        Args:
-            batch: The full-sequence batch; left intact (nothing consumed).
-            num_chunks: Accepted for hook-signature parity; unused (contiguous CP).
-        """
-        del num_chunks
-        if batch.get("input_ids") is None:
-            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
-        return {
-            "cp_sharder": ContextParallelSharder(
-                shard_batch=self._cp_shard_batch_aux_only,
-                local_token_global_indices=contiguous_local_indices,
-            )
-        }
 
     def _cp_sunk_prepare_inputs(
         self,
