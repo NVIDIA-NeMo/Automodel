@@ -32,22 +32,22 @@ def convert_batch_output(batch: TrainingBatch, *, output_format: BatchOutputForm
     from the length metadata. Xdoc policy has already selected the attention IDs.
 
     Args:
-        batch: CPU token, label, padding and document tensors of shape
+        batch: Owned mapping of CPU token, label, padding and document tensors of shape
             [batch, sequence]. Positions have shape [batch, sequence] or
             [axes, batch, sequence]. Image tensors retain their processor layouts.
             Positive attention_document_ids delimit contiguous subdocuments;
             zero marks exclusions. Padding must be a trailing suffix in each
             packed document. Each packed document must contain a real token.
+            THD updates mapping entries in place without mutating existing tensors.
         output_format: "batched" preserves the mapping. "thd" selects the native
             seq_lens input route; it does not select a packing algorithm.
 
     Returns:
-        The input mapping for batched output, or a shallow copy for THD with
-        int64 seq_lens/seq_lens_padded [batch, max_subdocuments] (-1000 for unused
+        The same mapping. THD adds int64 seq_lens/seq_lens_padded [batch, max_subdocuments] (-1000 for unused
         entries) and qkv_format="thd". Real lengths exclude padding; physical
         lengths cover every token slot, attaching trailing padding to the last
-        subdocument. Original document IDs, labels, positions and media alias
-        their input tensors. No input mapping or tensor is mutated.
+        subdocument. Existing document IDs, labels, positions and media retain
+        their original tensors.
 
     Raises:
         ValueError: For unknown formats, non-suffix padding, noncontiguous
@@ -78,13 +78,12 @@ def convert_batch_output(batch: TrainingBatch, *, output_format: BatchOutputForm
         slots = counts.clone()
         slots[-1] += sequence_length - real_length
         physical_lengths.append(slots)
-    result = batch.copy()
     # Gathered-token metadata has different offsets; native THD prepares its own.
     for key in ("packed_token_indices", "cu_seqlens", "max_seqlen", "attention_mask"):
-        result.pop(key, None)
-    result.update(
+        batch.pop(key, None)
+    batch.update(
         seq_lens=pad_sequence(lengths, batch_first=True, padding_value=-1000),
         seq_lens_padded=pad_sequence(physical_lengths, batch_first=True, padding_value=-1000),
         qkv_format="thd",
     )
-    return result
+    return batch
