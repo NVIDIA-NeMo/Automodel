@@ -226,7 +226,7 @@ class ZephonInstructionSourceConfig:
             special_tokens=policy,
             bos_token_id=bos_token_id if policy in ("bos", "bos_eos") else None,
             eos_token_id=eos_token_id if policy in ("eos", "bos_eos") else None,
-            prefix_diff_include_header=self.use_hf_chat_template,
+            supervise_assistant_header=self.use_hf_chat_template and self.answer_only_loss_mask,
             loss_scope="all_assistant" if self.answer_only_loss_mask else "all_tokens",
             parallelism=options.workers.tokenize_parallelism,
         )
