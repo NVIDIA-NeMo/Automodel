@@ -37,7 +37,7 @@ class MistralLarge4Parallelizer(ModelParallelizer):
 
     _customizes_moe_fsdp = True
 
-    def parallelize(self, model: nn.Module, mesh_context: MeshContext, /) -> nn.Module:
+    def _prepare_mesh_context(self, model: nn.Module, mesh_context: MeshContext) -> MeshContext:
         """Validate the requested topology before changing parameter ownership."""
         if not isinstance(mesh_context.strategy_config, FSDP2Config):
             raise ValueError("Mistral Large 4 distributed execution currently requires FSDP2")
@@ -89,7 +89,7 @@ class MistralLarge4Parallelizer(ModelParallelizer):
             model.state_dict_adapter.expert_parallel_mesh = ep_mesh
         if mesh_context.cp_size > 1:
             model.cp_mesh = mesh_context.device_mesh["cp"]
-        return super().parallelize(model, mesh_context)
+        return mesh_context
 
     def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
         """Shared KV and index selections are explicit immutable block inputs."""

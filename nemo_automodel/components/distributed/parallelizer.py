@@ -191,7 +191,11 @@ class ModelParallelizer:
         """Apply every requested parallelism and return the parallelized model."""
         from nemo_automodel.components.distributed.model_parallelizer import _apply_model_parallelizer
 
-        return _apply_model_parallelizer(self, model, mesh_context)
+        return _apply_model_parallelizer(self, model, self._prepare_mesh_context(model, mesh_context))
+
+    def _prepare_mesh_context(self, model: nn.Module, mesh_context: "MeshContext") -> "MeshContext":
+        """Validate the topology and return the mesh context used for parallelization."""
+        return mesh_context
 
     def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
         """Apply the FSDP2 primitive used by this model sidecar."""
