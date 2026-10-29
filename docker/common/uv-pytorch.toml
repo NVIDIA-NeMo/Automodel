@@ -3,6 +3,7 @@ override-dependencies = [
     "pillow==13.0.0",
     # The 26.10 base registers platformdirs.pytest_plugin; an older venv copy
     # shadows its module while pytest still discovers the system entry point.
+    # Update this pin with the base image; remove once the regular lock is aligned.
     "platformdirs==4.12.4",
     # leptonai (via nemo-run) caps anyio<=4.9.0; retain the security floor
     "anyio>=4.14.2",

@@ -121,7 +121,7 @@ FROM update_base_container AS automodel_dep
 # Install TE
 ARG INSTALL_TE=True
 ARG TE_COMMIT=v2.20.2
-# TE 2.19 expands the 100 family target to 107a when CUDA 13.4+ is used.
+# TE 2.19+ expands the 100 family target to 107a when CUDA 13.4+ is used.
 ARG TE_CUDA_ARCHS="80;90;100;120"
 ARG TE_BUILD_MAX_JOBS=8
 ARG TE_BUILD_THREADS_PER_JOB=8

@@ -359,6 +359,8 @@ def _apply_fused_adam_cached_lists_patch() -> None:
     dropped on ``load_state_dict`` and ``add_param_group``; a group that can never take the cached
     path (FP8 parameters, fp16 moments or master weights, mixed fp16 + bf16) is remembered as such,
     so the original ``step`` runs for it without a per-parameter walk first.
+    Groups with more than 1024 parameters also use the original step, preserving TE 2.20.2's
+    bounded native tensor-handle allocation instead of bypassing its batched kernel calls.
 
     Deliberately *not* checked between steps: parameter dtype and shape, the identity of
     ``state["exp_avg"]`` / ``state["exp_avg_sq"]`` / ``state["master_param"]``, and the optimizer's
@@ -470,6 +472,10 @@ def _apply_fused_adam_cached_lists_patch() -> None:
         for index, group in enumerate(self.param_groups):
             if len(group["params"]) == 0:
                 continue
+            # TE 2.20.2 limits each Adam call to 1024 tensors to bound temporary native handles.
+            # Delegate larger groups before any update so TE owns that batching policy.
+            if len(group["params"]) > 1024:
+                return original_step(self, closure, grad_scaler)
             plan = plans[index]
             if plan is _FUSED_ADAM_NO_PLAN:
                 return original_step(self, closure, grad_scaler)  # remembered verdict: no walk
