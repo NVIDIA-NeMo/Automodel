@@ -38,14 +38,15 @@ def _batch():
 
 def test_thd_lengths_preserve_shifted_tokens_and_padding_even_when_pad_is_eos():
     batch = _batch()
+    original_tensors = tuple(batch.items())
     assert convert_batch_output(batch, output_format="batched") is batch
     result = convert_batch_output(batch, output_format="thd")
+    assert result is batch
     assert result["seq_lens"].tolist() == [[2, 3], [4, -1000]]
     assert result["seq_lens_padded"].tolist() == [[2, 4], [6, -1000]]
     assert result["qkv_format"] == "thd"
-    for key in ("input_ids", "labels", "position_ids", "padding_mask", "document_ids"):
-        assert result[key] is batch[key]
-    assert "qkv_format" not in batch
+    for key, tensor in original_tensors:
+        assert result[key] is tensor
     result["_packed_seq_ids"] = result["document_ids"]
     prepared = process_input_for_thd(result)
     torch.testing.assert_close(prepared["padding_mask"], batch["padding_mask"].flatten())
