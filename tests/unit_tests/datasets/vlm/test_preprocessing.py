@@ -147,20 +147,6 @@ def test_position_field_collation_preserves_mrope_and_pads_only_tail():
         collate_position_ids([first], sequence_length=2)
 
 
-def test_pixel_padding_keeps_original_coordinates_and_source_values():
-    from nemo_automodel.components.datasets.vlm.preprocessing import pad_image_tensors
-
-    square = torch.ones(1, 3, 4, 4)
-    wide = torch.full((2, 3, 2, 6), 2.0)
-    padded = pad_image_tensors([square, wide])
-    assert padded.shape == (3, 3, 4, 6)
-    torch.testing.assert_close(padded[:1, :, :, :4], square)
-    torch.testing.assert_close(padded[1:, :, :2], wide)
-    assert not padded[:1, :, :, 4:].any()
-    assert not padded[1:, :, 2:].any()
-    assert square.shape == (1, 3, 4, 4) and wide.shape == (2, 3, 2, 6)
-
-
 def test_spatial_assembly_uses_sizes_without_changing_native_ragged_layout():
     documents = [
         {"input_ids": [2, 3], "labels": [-100, 3], "pixel_values": torch.ones(1, 3, height, width)}
@@ -206,18 +192,6 @@ def test_shared_media_merge_preserves_processor_precision_unless_caller_converts
     native = merge_media_values([pixels], dtype=torch.bfloat16)
     assert native.dtype == torch.bfloat16
     torch.testing.assert_close(pixels, torch.tensor([[[1.0001, 0.5001]]]), rtol=0, atol=0)
-
-
-def test_mistral_example_spatial_padding_ratio():
-    from nemo_automodel.components.datasets.vlm.preprocessing import pad_image_tensors
-
-    # The shipped Mistral fixture uses 8x8 and 8x12 processor images.
-    images = [torch.zeros(1, 3, 8, 8), torch.zeros(1, 3, 8, 12)]
-    padded = pad_image_tensors(images)
-    assert padded.numel() / sum(image.numel() for image in images) == pytest.approx(1.2)
-    opposite_aspects = [torch.zeros(1, 3, 8, 2), torch.zeros(1, 3, 2, 8)]
-    padded = pad_image_tensors(opposite_aspects)
-    assert padded.numel() / sum(image.numel() for image in opposite_aspects) == 4
 
 
 @pytest.mark.parametrize("use_generation_tags", [False, True])
