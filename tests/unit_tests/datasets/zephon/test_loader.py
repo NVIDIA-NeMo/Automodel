@@ -24,8 +24,8 @@ from nemo_automodel.components.datasets.zephon.loader import ZephonDataLoader
 from nemo_automodel.recipes.base_recipe import is_dataloader, is_distributed_stateful
 
 
-@pytest.mark.parametrize("state", [{}, {"zephon": {}}, {"zephon": b"garbage"}])
-def test_checkpoint_rejects_missing_or_corrupt_state(state):
+@pytest.mark.parametrize("state", [{}, {"zephon": {}}, {"zephon": b""}])
+def test_checkpoint_rejects_missing_or_empty_bytes(state):
     pipeline = Mock()
     loader = ZephonDataLoader(
         pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
@@ -33,6 +33,32 @@ def test_checkpoint_rejects_missing_or_corrupt_state(state):
     with pytest.raises(ValueError):
         loader.load_state_dict(state)
     pipeline.restore.assert_not_called()
+
+
+def test_checkpoint_leaves_byte_validation_to_zephon():
+    from zephon import Pipeline
+
+    source = Mock()
+    loader = ZephonDataLoader(
+        pipeline=Pipeline(source), packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
+    )
+    with pytest.raises(ValueError, match="checkpoint byte format"):
+        loader.load_state_dict({"zephon": b"garbage"})
+    assert source.mock_calls == []
+
+
+def test_checkpoint_passes_opaque_bytes_without_reserialization():
+    checkpoint = b"opaque-zephon-checkpoint"
+    pipeline = Mock()
+    pipeline.checkpoint.return_value = checkpoint
+    loader = ZephonDataLoader(
+        pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
+    )
+    state = loader.state_dict()
+    assert state["zephon"] is checkpoint
+    pipeline.checkpoint.assert_called_once_with(as_bytes=True)
+    loader.load_state_dict(state)
+    pipeline.restore.assert_called_once_with(checkpoint)
 
 
 def test_actual_base_recipe_checkpoint_route():
@@ -55,7 +81,7 @@ def test_exhaustion_checkpoints_before_explicit_close():
 
     pipeline = MagicMock()
     pipeline.__iter__.return_value = (item for item in ())
-    pipeline.checkpoint.return_value = {"completed": True}
+    pipeline.checkpoint.return_value = b"terminal-checkpoint"
     loader = ZephonDataLoader(
         pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
     )
@@ -63,7 +89,7 @@ def test_exhaustion_checkpoints_before_explicit_close():
     assert list(loader) == []
     pipeline.close.assert_not_called()
     assert loader.state_dict()["zephon"]
-    pipeline.checkpoint.assert_called_once()
+    pipeline.checkpoint.assert_called_once_with(as_bytes=True)
     loader.close()
     pipeline.close.assert_called_once()
 
