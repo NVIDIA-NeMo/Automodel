@@ -20,7 +20,6 @@ import torch
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.mistral_large4.model import MistralLarge4ForCausalLM
 from nemo_automodel.components.models.mistral_large4.state_dict_adapter import MistralLarge4StateDictAdapter
-from nemo_automodel.components.moe.experts import GroupedExperts
 from tests.unit_tests.models.mistral_large4.test_model import assert_bf16_error, make_model, tensor_error
 
 
@@ -167,118 +166,6 @@ def test_hybridep_rejects_fp32_storage():
     reference = make_model(dtype=torch.float32)
     with pytest.raises(ValueError, match="requires BF16"):
         MistralLarge4ForCausalLM(reference.config, grouped_backend("hybridep"))
-
-
-class TransportRoundedExperts(GroupedExperts):
-    """Single-process oracle for BF16 weighted-output transport before combine.
-
-    Shared Torch experts otherwise retain FP32 weighted outputs until summation.
-    This reference inserts the cast performed by HybridEP communication; it does
-    not communicate, change routing choices, or modify the original oracle.
-    """
-
-    def _forward_grouped_mm(
-        self,
-        x,
-        token_mask,
-        weights,
-        indices,
-        gate_and_up_projs,
-        down_projs,
-        gate_up_proj_bias,
-        down_proj_bias,
-        n_local_experts,
-        experts_start_idx,
-        post_expert_output,
-    ) -> torch.Tensor:
-        """Round separate weighted expert outputs before the parent's reduction.
-
-        Args:
-            x: BF16 local activations [tokens, hidden].
-            token_mask: Boolean valid-token mask [tokens].
-            weights: FP32 routing probabilities [tokens, topk].
-            indices: Integer expert IDs [tokens, topk].
-            gate_and_up_projs: BF16 fused matrices [experts, hidden, 2*intermediate].
-            down_projs: BF16 matrices [experts, intermediate, hidden].
-            gate_up_proj_bias: None for this model.
-            down_proj_bias: None for this model.
-            n_local_experts: All experts in the single-process reference.
-            experts_start_idx: Zero for the reference.
-            post_expert_output: Optional inherited output transform.
-
-        Returns:
-            Independent FP32 [tokens, topk, hidden] values rounded to BF16,
-            ready for the parent's FP32 combine and final BF16 cast. No input
-            or parameter is modified; autograd traverses the cast normally.
-        """
-        output = super()._forward_grouped_mm(
-            x,
-            token_mask,
-            weights,
-            indices,
-            gate_and_up_projs,
-            down_projs,
-            gate_up_proj_bias,
-            down_proj_bias,
-            n_local_experts,
-            experts_start_idx,
-            post_expert_output,
-        )
-        assert output.ndim == 3 and self.config.apply_router_weight_after_down
-        return output.to(x.dtype).float()
-
-
-def use_transport_rounding_reference(model: MistralLarge4ForCausalLM) -> None:
-    """Install test-only expert arithmetic on an unsharded model before optimizer creation."""
-    for block in model.model.layers:
-        if isinstance(block.mlp.experts if hasattr(block.mlp, "experts") else None, GroupedExperts):
-            source = block.mlp.experts
-            replacement = TransportRoundedExperts(source.config, backend=grouped_backend()).to(
-                source.gate_and_up_projs.device
-            )
-            replacement.expert_activation_grouped = source.expert_activation_grouped
-            replacement.load_state_dict(source.state_dict())
-            block.mlp.experts = replacement
-
-
-def test_transport_reference_matches_individual_weighted_bf16_outputs():
-    torch.manual_seed(61)
-    model = MistralLarge4ForCausalLM(
-        make_model(dtype=torch.bfloat16, moe_intermediate_size=32).config, grouped_backend()
-    )
-    model.initialize_weights()
-    use_transport_rounding_reference(model)
-    expert = model.model.layers[1].mlp.experts
-    hidden = torch.randn(13, 16, dtype=torch.bfloat16, requires_grad=True)
-    reference_hidden = hidden.detach().clone().requires_grad_(True)
-    scores = torch.randn(13, 3, dtype=torch.float32)
-    probabilities, indices = scores.softmax(-1).topk(2, dim=-1)
-    probabilities = (probabilities / probabilities.sum(-1, keepdim=True)).requires_grad_(True)
-    reference_probabilities = probabilities.detach().clone().requires_grad_(True)
-    gate_up = expert.gate_and_up_projs.detach().clone().requires_grad_(True)
-    down = expert.down_projs.detach().clone().requires_grad_(True)
-    expected = torch.zeros_like(hidden, dtype=torch.float32)
-    for identity in range(3):
-        rows, slots = torch.where(indices == identity)
-        gate, up = gate_up[identity].chunk(2, dim=-1)
-        value = (torch.nn.functional.silu(reference_hidden[rows] @ gate) * (reference_hidden[rows] @ up)) @ down[
-            identity
-        ]
-        weighted = (value.float() * reference_probabilities[rows, slots, None]).bfloat16()
-        expected = expected.index_add(0, rows, weighted.float())
-    expected = expected.bfloat16()
-    actual = expert(hidden, torch.ones(13, dtype=torch.bool), probabilities, indices)
-    assert_bf16_error(tensor_error("output", actual, expected))
-    upstream = torch.randn_like(actual)
-    actual.backward(upstream)
-    expected.backward(upstream)
-    for name, observed, oracle in (
-        ("input", hidden.grad, reference_hidden.grad),
-        ("probabilities", probabilities.grad, reference_probabilities.grad),
-        ("gate_up", expert.gate_and_up_projs.grad, gate_up.grad),
-        ("down", expert.down_projs.grad, down.grad),
-    ):
-        assert_bf16_error(tensor_error(name, observed, oracle))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

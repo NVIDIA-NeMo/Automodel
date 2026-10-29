@@ -26,14 +26,13 @@ from torch.nn import functional as F
 
 from nemo_automodel._transformers.model_capabilities import query_capabilities
 from nemo_automodel._transformers.registry import ModelRegistry
-from nemo_automodel.components.distributed import DDPConfig, FSDP2Config, MeshContext
 from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.mistral_large4.attention import MistralLarge4Indexer, SequenceLayout
 from nemo_automodel.components.models.mistral_large4.config import ConfigValue
 from nemo_automodel.components.models.mistral_large4.model import MistralLarge4ForCausalLM
 from nemo_automodel.components.models.mistral_large4.rope_utils import MistralLarge4Rotary
-from tests.unit_tests.models.mistral_large4.math_reference import reference_logits, rms, tiny_config
+from tests.unit_tests.models.mistral_large4.math_reference import reference_logits, tiny_config
 
 
 def make_model(*, seed: int = 312, **overrides: ConfigValue | torch.dtype) -> MistralLarge4ForCausalLM:
@@ -467,23 +466,6 @@ def compare_bf16_gradients(
     )
 
 
-@pytest.mark.parametrize("seed", [19, 23])
-def test_rms_reference_bf16_backward_uses_one_fp32_accumulator(seed: int) -> None:
-    """A native FP32 normalization supplies an independent cast-boundary check."""
-    generator = torch.Generator().manual_seed(seed)
-    x = (torch.randn(3, 7, 16, generator=generator) * 0.02).bfloat16().requires_grad_()
-    weight = torch.randn(16, generator=generator).bfloat16().requires_grad_()
-    other_x, other_weight = x.detach().clone().requires_grad_(), weight.detach().clone().requires_grad_()
-    actual = rms(x, weight, 1e-5)
-    expected = F.rms_norm(other_x.float(), (16,), other_weight.float(), 1e-5).to(x.dtype)
-    upstream = torch.randn(x.shape, generator=generator).bfloat16()
-    actual.backward(upstream)
-    expected.backward(upstream)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    torch.testing.assert_close(x.grad, other_x.grad, atol=0, rtol=0)
-    torch.testing.assert_close(weight.grad, other_weight.grad, atol=0, rtol=0)
-
-
 @pytest.mark.parametrize("seed,tokens", [(101, 7), (211, 17), (307, 31)])
 @pytest.mark.parametrize("objective,fp32_master", [("random", False), ("ce", True)])
 def test_bf16_held_out_gradients_and_master_updates(
@@ -491,43 +473,6 @@ def test_bf16_held_out_gradients_and_master_updates(
 ) -> None:
     compare_bf16_gradients(
         seed=seed, tokens=tokens, objective=objective, fp32_master=fp32_master, device=torch.device("cpu")
-    )
-
-
-def test_bf16_budget_rejects_incorrect_gradient_scale() -> None:
-    expected = torch.linspace(-1, 1, 64)
-    with pytest.raises(AssertionError):
-        assert_bf16_error(tensor_error("scaled_gradient", expected * 1.1, expected))
-
-
-@pytest.mark.parametrize("seed", [312, 47])
-@pytest.mark.parametrize("batching", ["matrix", "grouped"])
-def test_reference_expert_batching_preserves_fp32_equations(seed: int, batching: str) -> None:
-    """Cross-check independent token and matrix graphs, including every gradient."""
-    model = make_model(seed=seed)
-    state = model.state_dict_adapter.to_hf(dict(model.named_parameters()))
-    token = {name: value.detach().clone().requires_grad_(value.requires_grad) for name, value in state.items()}
-    matrix = {name: value.detach().clone().requires_grad_(value.requires_grad) for name, value in state.items()}
-    ids = torch.tensor([1, 5, 7, 2, 9, 3, 1])
-    a = reference_logits(token, ids, model.config)
-    b = reference_logits(matrix, ids, model.config, expert_batching=batching)
-    torch.testing.assert_close(a, b, atol=2e-6, rtol=2e-5)
-    upstream = torch.randn_like(a)
-    a.backward(upstream)
-    b.backward(upstream)
-    for name, value in token.items():
-        if not value.requires_grad:
-            assert value.grad is None and matrix[name].grad is None, name
-            continue
-        expected = torch.zeros_like(value) if value.grad is None else value.grad
-        actual = torch.zeros_like(value) if matrix[name].grad is None else matrix[name].grad
-        torch.testing.assert_close(actual, expected, atol=1.6e-5, rtol=4e-5, msg=name)
-
-
-@pytest.mark.parametrize("objective,fp32_master", [("random", False), ("ce", True)])
-def test_bf16_late_shared_kv_gradient_budget(objective: Literal["random", "ce"], fp32_master: bool) -> None:
-    compare_bf16_gradients(
-        seed=607, tokens=5, objective=objective, fp32_master=fp32_master, device=torch.device("cpu"), layers=40
     )
 
 

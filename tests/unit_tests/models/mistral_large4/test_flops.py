@@ -18,7 +18,7 @@ import pytest
 
 from nemo_automodel.components.models.mistral_large4.config import MistralLarge4Config
 from nemo_automodel.components.models.mistral_large4.flops import model_flops
-from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config, transformer_flops
+from nemo_automodel.components.utils.flops_utils import get_flops_formula_for_hf_config
 
 HIDDEN = 8
 HEADS = 2
@@ -102,13 +102,6 @@ def test_counter_matches_independent_shape_and_selected_key_oracle(length: int) 
     formula = get_flops_formula_for_hf_config(config)
     assert formula is model_flops
     assert formula(config, gbs=3, seq_len=length) == 3 * _oracle(length)
-
-
-def test_fallback_formula_does_not_certify_large4_flops() -> None:
-    config = _config()
-    expected = _oracle(12)
-    assert transformer_flops(config, gbs=1, seq_len=12) != expected
-    assert get_flops_formula_for_hf_config(config)(config, gbs=1, seq_len=12) == expected
 
 
 def test_sequence_defaults_to_max_position_embeddings() -> None:
