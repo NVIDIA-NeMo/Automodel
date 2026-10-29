@@ -17,10 +17,6 @@
 from __future__ import annotations
 
 import logging
-
-# Zephon's established trusted-checkpoint wire format uses pickle. Keep this
-# narrow exception until its public API provides a replacement byte serializer.
-import pickle  # noqa: S403
 from collections import Counter
 from collections.abc import Callable, Generator, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, cast
@@ -198,23 +194,16 @@ class ZephonDataLoader(Iterator[TrainingBatch]):
 
     def state_dict(self) -> dict[str, bytes]:
         """Collect the complete aggregated state on every rank as one DCP value."""
-        return {"zephon": pickle.dumps(self._pipeline.checkpoint())}
+        return {"zephon": self._pipeline.checkpoint(as_bytes=True)}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore trusted training checkpoint bytes before consuming the stream."""
+        """Let Zephon validate and restore its checkpoint bytes before iteration."""
         if self._iterator is not None:
             raise RuntimeError("Restore Zephon before beginning iteration")
         checkpoint = state.get("zephon")
         if not isinstance(checkpoint, bytes) or not checkpoint:
             raise ValueError("Zephon checkpoint requires nonempty 'zephon' bytes")
-        try:
-            # Pickle can execute code; deserialize only trusted training checkpoints.
-            decoded = pickle.loads(checkpoint)  # noqa: S301
-        except (pickle.UnpicklingError, EOFError, AttributeError, ImportError, ValueError) as exc:
-            raise ValueError("Zephon checkpoint contains corrupt pickle") from exc
-        if not isinstance(decoded, dict):
-            raise ValueError("Zephon checkpoint payload must be a mapping")
-        self._pipeline.restore(decoded)
+        self._pipeline.restore(checkpoint)
         self._component_tokens.clear()
         self._closed = False
         self._exhausted = False
