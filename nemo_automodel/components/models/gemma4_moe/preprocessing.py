@@ -26,7 +26,7 @@ class Gemma4PositionState:
 
     Image patch coordinates come from the processor's ``image_position_ids``;
     text decoder positions are scalar offsets over the expanded token sequence.
-    Audio, MoE, per-layer embeddings and shared-KV variants are not certified.
+    Audio, MoE, per-layer embeddings and shared-KV variants are unsupported.
     """
 
     config: PreTrainedConfig
