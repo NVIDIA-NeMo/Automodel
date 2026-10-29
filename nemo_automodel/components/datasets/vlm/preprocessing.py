@@ -25,6 +25,8 @@ def merge_vlm_documents(
     padding_idx: int,
     has_mrope: bool = False,
     sequence_alignment: int = 1,
+    return_labels: bool = True,
+    return_attention_mask: bool = True,
 ) -> dict[str, object]:
     """Assemble ordered VLM documents without shifting or selecting bins.
 
@@ -44,9 +46,14 @@ def merge_vlm_documents(
         has_mrope: Concatenate supplied multi-axis positions along the sequence axis.
             Scalar positions are also preserved when supplied, otherwise reset per document.
         sequence_alignment: Pad each document to this multiple; mRoPE requires 1.
+        return_labels: Concatenate native target labels. Disable when a downstream
+            converter constructs labels from the original documents' loss masks.
+        return_attention_mask: Construct native indexed attention IDs. Disable when
+            a downstream converter derives document IDs from scalar positions.
 
     Returns:
-        Concatenated IDs, labels, indexed document mask and token types [tokens];
+        Concatenated IDs and token types [tokens]; labels and indexed document mask
+        [tokens] are included only when requested. Also returns
         positions [tokens] or [3, tokens]; real and padded subdocument lengths;
         media counts; and media fields concatenated along their leading axis.
         Variable-resolution tensors with image sizes are zero-padded to a common
@@ -81,15 +88,17 @@ def merge_vlm_documents(
 
     for seq_idx, sample in enumerate(samples, start=1):
         ids = torch.as_tensor(sample["input_ids"], dtype=torch.long)
-        labels = torch.as_tensor(sample["labels"], dtype=torch.long)
         seq_len = ids.numel()
         padded_seq_len = ((seq_len + sequence_alignment - 1) // sequence_alignment) * sequence_alignment
         pad = padded_seq_len - seq_len
         seq_lens.append(seq_len)
         seq_lens_padded.append(padded_seq_len)
         all_input_ids.append(torch.nn.functional.pad(ids, (0, pad), value=padding_idx))
-        all_labels.append(torch.nn.functional.pad(labels, (0, pad), value=-100))
-        all_attention_mask.append(ids.new_full((padded_seq_len,), seq_idx))
+        if return_labels:
+            labels = torch.as_tensor(sample["labels"], dtype=torch.long)
+            all_labels.append(torch.nn.functional.pad(labels, (0, pad), value=-100))
+        if return_attention_mask:
+            all_attention_mask.append(ids.new_full((padded_seq_len,), seq_idx))
 
         token_types = sample.get("mm_token_type_ids")
         token_types = ids.new_zeros(seq_len) if token_types is None else torch.as_tensor(token_types, dtype=torch.long)
@@ -132,16 +141,22 @@ def merge_vlm_documents(
     # No padding here — collater pads to batch-max for efficiency.
     packed = {
         "input_ids": torch.cat(all_input_ids) if all_input_ids else torch.empty(0, dtype=torch.long),
-        "labels": torch.cat(all_labels) if all_labels else torch.empty(0, dtype=torch.long),
-        "attention_mask": torch.cat(all_attention_mask) if all_attention_mask else torch.empty(0, dtype=torch.long),
-        "mm_token_type_ids": torch.cat(all_mm_token_type_ids)
+    }
+    if return_labels:
+        packed["labels"] = torch.cat(all_labels) if all_labels else torch.empty(0, dtype=torch.long)
+    if return_attention_mask:
+        packed["attention_mask"] = (
+            torch.cat(all_attention_mask) if all_attention_mask else torch.empty(0, dtype=torch.long)
+        )
+    packed.update(
+        mm_token_type_ids=torch.cat(all_mm_token_type_ids)
         if all_mm_token_type_ids
         else torch.empty(0, dtype=torch.long),
-        "seq_lens": seq_lens,
-        "seq_lens_padded": seq_lens_padded,
-        "n_images": n_images,
-        "n_videos": n_videos,
-    }
+        seq_lens=seq_lens,
+        seq_lens_padded=seq_lens_padded,
+        n_images=n_images,
+        n_videos=n_videos,
+    )
 
     if has_mrope and mrope_position_ids_list:
         packed["position_ids"] = torch.cat(mrope_position_ids_list, dim=1)
