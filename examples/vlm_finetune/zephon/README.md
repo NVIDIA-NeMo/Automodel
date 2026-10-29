@@ -7,6 +7,12 @@ introduces configuration, output formats, cross-document attention, and
 checkpointing. For Zephon concepts and API questions, see the
 [Zephon User Guide](https://docs.zephon.io/).
 
+Tokenization and packing are separate preparation stages: the text backend
+supports raw, pretokenized, and prepacked input. The image backend currently
+accepts raw conversations, with processor tokenization and image-placeholder
+expansion before whole-document bin packing. Pretokenized/prepacked image
+exports and `pack_algorithm: null` are not supported by this image path.
+
 ## Getting started
 
 With AutoModel and its VLM dependencies installed, run from the repository root:
