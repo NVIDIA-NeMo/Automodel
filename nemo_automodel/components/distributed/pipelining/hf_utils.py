@@ -67,8 +67,8 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
     """Build a stage's ``causal_mask_mapping``, caching it per stage when safe.
 
     Under pipeline parallelism the mask precomputed in the data pipeline only reaches
-    the first stage; non-first stages arrive with ``causal_mask_mapping=None`` and used
-    to recompute it on every microbatch (slow, and a torch.compile graph-break). When
+    the first stage; non-first stages arrive with ``causal_mask_mapping=None``.
+    Caching avoids repeated mask construction and torch.compile graph breaks. When
     neither an explicit mask nor caller-supplied positions is provided, the causal
     mask depends only on sequence length, dtype and device and can be reused.
     Explicit position resets can encode packed boundaries, so masks derived from
