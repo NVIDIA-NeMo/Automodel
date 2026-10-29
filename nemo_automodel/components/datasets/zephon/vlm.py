@@ -165,6 +165,15 @@ class _EncodeImageDocuments(BaseOp):
             if record.meta.is_sentinel:
                 output.append(record)
                 continue
+            # Reject unsupported media before decoding; these are not droppable media errors.
+            for message in record.payload["conversation"]:
+                content = message.get("content")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") not in (None, "text", "image"):
+                            raise ValueError(
+                                f"Zephon image conversations support only image and text content; got {item['type']!r}"
+                            )
             try:
                 document = encode_vlm_document(
                     record.payload, self._processor, inject_fake_images=self._config.inject_fake_images
@@ -256,8 +265,15 @@ def merge_image_documents(
     if fake_document is not None and not has_image:
         fake_length = len(fake_document["input_ids"])
         documents = [fake_document, *documents]
-    merged = merge_vlm_documents(documents, padding_idx=0, has_mrope=documents[0]["position_ids"].ndim == 2)
-    loss_mask = merged["labels"].ne(-100)
+    # Zephon constructs shifted targets and document IDs from loss masks and positions.
+    merged = merge_vlm_documents(
+        documents,
+        padding_idx=0,
+        has_mrope=documents[0]["position_ids"].ndim == 2,
+        return_labels=False,
+        return_attention_mask=False,
+    )
+    loss_mask = torch.cat([document["labels"].ne(-100) for document in documents])
     if fake_length:
         # Prepending synthetic context must not add a target that the normal shift discards.
         loss_mask[fake_length] = False
