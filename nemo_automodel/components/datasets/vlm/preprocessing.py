@@ -18,6 +18,8 @@ from collections.abc import Mapping, Sequence
 
 import torch
 
+from nemo_automodel.shared.vlm_media import pad_image_tensors
+
 
 def merge_vlm_documents(
     samples: Sequence[Mapping[str, object]],
@@ -198,27 +200,6 @@ def merge_vlm_documents(
     packed["second_per_grid_ts"] = torch.cat(second_per_grid_ts_list, dim=0) if second_per_grid_ts_list else None
 
     return packed
-
-
-def pad_image_tensors(values: Sequence[torch.Tensor]) -> torch.Tensor:
-    """Zero-pad processor images to a common spatial size without resizing.
-
-    Args:
-        values: Image tensors [images, channels, height, width], with matching
-            channel counts. Original unpadded sizes travel in `image_sizes`.
-
-    Returns:
-        Concatenated images [total_images, channels, max_height, max_width].
-        Pixels stay at their original top-left coordinates; inputs are unchanged.
-    """
-    if not values or any(value.ndim != 4 for value in values):
-        raise ValueError("Image padding requires nonempty [images, channels, height, width] tensors")
-    height = max(value.shape[-2] for value in values)
-    width = max(value.shape[-1] for value in values)
-    return torch.cat(
-        [torch.nn.functional.pad(value, (0, width - value.shape[-1], 0, height - value.shape[-2])) for value in values],
-        dim=0,
-    )
 
 
 def merge_media_values(
