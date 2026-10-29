@@ -2236,3 +2236,228 @@ def test_make_spider_dataset_joins_schema_and_collapses_query_whitespace(monkeyp
     )
     assert "How many perpetrators?" in user_turn["content"][0]["text"]
     assert assistant_turn["content"][0]["text"] == "SELECT count(*) FROM perpetrator"
+class TestPreTokenizedDatasetWrapperPretokenizedInput:
+    def test_passes_through_pretokenized_chat_sample(self):
+        sample = {
+            "input_ids": [10, 11, 12, 13],
+            "attention_mask": [1, 1, 1, 1],
+            "labels": [-100, -100, 12, 13],
+        }
+        wrapper = ds.PreTokenizedDatasetWrapper([sample], _FakeProcessor(), inject_fake_images=False)
+
+        result = wrapper[0]
+
+        assert result["input_ids"].tolist() == [10, 11, 12, 13]
+        assert result["attention_mask"].tolist() == [1, 1, 1, 1]
+        assert result["labels"].tolist() == [-100, -100, 12, 13]
+
+    def test_truncates_pretokenized_chat_sample(self):
+        sample = {
+            "input_ids": [10, 11, 12, 13],
+            "attention_mask": [1, 1, 1, 1],
+            "labels": [-100, -100, 12, 13],
+        }
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            [sample],
+            _FakeProcessor(),
+            max_length=3,
+            truncate=True,
+            inject_fake_images=False,
+        )
+
+        result = wrapper[0]
+
+        assert result["input_ids"].tolist() == [10, 11, 12]
+        assert result["attention_mask"].tolist() == [1, 1, 1]
+        assert result["labels"].tolist() == [-100, -100, 12]
+
+
+class TestPretokenizedOverlengthReplacementDeterminism:
+    """The pre-tokenized fast path must reuse the per-index replacement RNG.
+
+    Regression test for the review finding: this branch used the process-global
+    ``random`` module, so an over-long pre-tokenized sample substituted a
+    different document under different global seeds — and CP ranks with
+    diverged ``random`` streams materialized different tokens for the same
+    logical index, violating context-parallelism's shared-input requirement.
+    """
+
+    def _make_dataset(self):
+        # Index 0 is over-length (10 tokens > max_length 4); others are 4.
+        overlong = {
+            "input_ids": list(range(100, 110)),
+            "attention_mask": [1] * 10,
+            "labels": [-100] * 7 + [107, 108, 109],
+        }
+        rows = [overlong] + [
+            {
+                "input_ids": [i, i, i, i],
+                "attention_mask": [1, 1, 1, 1],
+                "labels": [-100, -100, i, i],
+            }
+            for i in range(1, 32)
+        ]
+        return rows
+
+    def test_substitute_is_independent_of_global_random_state(self):
+        import random
+
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            self._make_dataset(), _FakeProcessor(), max_length=4, truncate=False, inject_fake_images=False
+        )
+
+        random.seed(0)
+        first = wrapper[0]["input_ids"].tolist()
+        random.seed(5)
+        second = wrapper[0]["input_ids"].tolist()
+
+        assert first != list(range(100, 110)), "the over-long sample must have been replaced"
+        assert first == second, "the substitute must not depend on the process-global RNG state"
+        assert len(set(first)) == 1, "the replacement must be one of the short samples"
+        assert first[0] in range(1, 32)
+
+
+class TestChatDatasetSingleShiftContract:
+    """ChatDataset already applies the next-token shift; downstream VLM collators
+    must not shift a second time (review finding: supervising token t+2)."""
+
+    def test_chat_dataset_emits_already_shifted_pairs(self):
+        """A real-format ChatDataset sample arrives shifted: last input and first
+        label removed, prompt positions masked with -100."""
+        from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset, vlm_chat_collater
+
+        class _FixedVocabProcessor:
+            """Minimal real-shaped processor producing 5-token sequences with an
+            assistant mask over the last 3 positions, like _package_tokenized_example
+            would emit from a chat template."""
+
+            def apply_chat_template(self, conversations, tokenize=False):
+                return conversations
+
+            def __call__(self, **kwargs):
+                import torch
+
+                ids = [10, 11, 12, 13, 14]
+                return {
+                    "input_ids": torch.tensor([ids]),
+                    "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+                    # ChatDataset.__getitem__ consumes the processor output; a
+                    # pre-shifted sample (as ChatDataset emits) arrives here.
+                }
+
+        # Direct oracle on the collator: hand it what ChatDataset actually emits —
+        # input_ids already missing the last token, labels already missing the
+        # first, prompt positions -100.
+        chat_sample = {
+            "input_ids": [10, 11, 12, 13],
+            "attention_mask": [1, 1, 1, 1],
+            "labels": [-100, 12, 13, 14],
+        }
+        batch = vlm_chat_collater([chat_sample])
+
+        assert batch["input_ids"].shape[-1] == 4, "collator must not shift already-shifted input_ids"
+        assert batch["input_ids"][0].tolist() == [10, 11, 12, 13]
+        assert batch["labels"][0].tolist() == [-100, 12, 13, 14], "collator must not shift labels again"
+
+
+class TestChatDatasetSingleShiftThroughConsumers:
+    """ChatDataset output must keep exactly one shift through the padded and
+    packed VLM consumers (second review finding: the wrapper passthrough fed
+    already-shifted ChatDataset labels to consumers that shift again).
+
+    The oracle uses a real ``PreTrainedTokenizerFast`` with a chat template so
+    the inputs are actual ``ChatDataset.__getitem__`` emissions, not
+    hand-written unshifted samples.
+    """
+
+    @pytest.fixture()
+    def chat_tokenizer(self):
+        from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+        from transformers import PreTrainedTokenizerFast
+
+        special = ["[UNK]", "[PAD]", "<|im_start|>", "<|im_end|>"]
+        backend = Tokenizer(models.BPE(unk_token="[UNK]"))
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        backend.train_from_iterator(
+            ["alpha beta gamma delta epsilon zeta eta theta"],
+            trainers.BpeTrainer(vocab_size=64, special_tokens=special),
+        )
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            eos_token="<|im_end|>",
+        )
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n"
+            "{% endfor %}"
+        )
+        return tokenizer
+
+    @pytest.fixture()
+    def chat_rows(self, tmp_path, chat_tokenizer):
+        rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": "alpha beta"},
+                    {"role": "assistant", "content": "gamma delta epsilon"},
+                ]
+            }
+        ]
+        path = tmp_path / "chat.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows))
+        return str(path)
+
+    def _chat_dataset_sample(self, chat_rows, chat_tokenizer):
+        from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
+
+        chat_ds = ChatDataset(chat_rows, chat_tokenizer)
+        return dict(chat_ds[0])
+
+    def test_wrapper_passthrough_flags_already_shifted(self, chat_rows, chat_tokenizer):
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            [self._chat_dataset_sample(chat_rows, chat_tokenizer)], _FakeProcessor(), inject_fake_images=False
+        )
+        out = wrapper[0]
+        assert out[vlm_utils.ALREADY_SHIFTED_KEY] is True
+
+    def test_pad_collate_fn_single_shift_on_real_chatdataset_output(self, chat_rows, chat_tokenizer):
+        from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
+
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            [self._chat_dataset_sample(chat_rows, chat_tokenizer)], _FakeProcessor(), inject_fake_images=False
+        )
+        direct = dict(wrapper[0])
+        batch = pad_collate_fn([dict(wrapper[0])], _FakeProcessor())
+
+        assert batch["input_ids"][0].tolist() == direct["input_ids"].tolist(), "padded path must not shift again"
+        assert batch["labels"][0].tolist() == direct["labels"].tolist(), "padded path must not shift labels again"
+        assert batch["input_ids"].shape[-1] == batch["labels"].shape[-1]
+
+    def test_packed_wrapper_single_shift_on_real_chatdataset_output(self, chat_rows, chat_tokenizer):
+        from nemo_automodel.components.datasets.vlm.neat_packing_vlm import PackedDatasetWrapper
+
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            [self._chat_dataset_sample(chat_rows, chat_tokenizer)], _FakeProcessor(), inject_fake_images=False
+        )
+        direct = dict(wrapper[0])
+        packed = PackedDatasetWrapper(wrapper, bins=[[0]], pack_size=4096)
+
+        out = packed[0]
+        assert out["input_ids"].tolist()[: len(direct["input_ids"])] == direct["input_ids"].tolist()
+        assert out["labels"].tolist()[: len(direct["labels"])] == direct["labels"].tolist()
+
+    def test_raw_vlm_samples_keep_their_single_shift(self):
+        import torch
+
+        from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _shift_sample
+
+        raw = {
+            "input_ids": torch.tensor([10, 11, 12, 13, 14]),
+            "attention_mask": torch.ones(5, dtype=torch.long),
+            "labels": torch.tensor([-100, 12, 13, 14, 14]),
+        }
+        shifted = _shift_sample(raw)
+        assert shifted["input_ids"].tolist() == [10, 11, 12, 13]
+        assert shifted["labels"].tolist() == [12, 13, 14, 14]

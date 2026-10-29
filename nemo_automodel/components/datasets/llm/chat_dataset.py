@@ -34,6 +34,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     _validate_chat_template_kwargs,
     format_chat_template,
 )
+from nemo_automodel.components.datasets.utils import default_collater
 
 
 def _is_hf_repo_id(val: str) -> bool:
@@ -464,6 +465,10 @@ class ChatDataset(Dataset):
             raise ValueError("Tokenizer is required")
         chat_template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
 
+        # VLM recipes pass the runtime processor to tokenizer-aware datasets.
+        # Plain chat formatting only needs the processor's text tokenizer.
+        tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+
         # Enforce chat-template availability for tool-calling data
         if chat_template is not None:
             tokenizer.chat_template = _resolve_chat_template(chat_template)
@@ -576,3 +581,23 @@ class ChatDataset(Dataset):
             if "labels" in sample:
                 self._keep_last_supervised_run(sample["labels"], -100)
         return sample
+
+
+def vlm_chat_collater(
+    examples: List[Dict[str, List[int]]],
+    processor: Any = None,
+    pad_seq_len_divisible: int | None = None,
+):
+    """Batch pre-tokenized chat samples for the VLM training recipe.
+
+    ``ChatDataset`` (``unshifted=False``, the default) already applies the
+    next-token shift in ``_package_tokenized_example``: it returns
+    ``input_ids[:-1]`` with ``labels[1:]``. This collator must therefore only
+    batch — shifting again would supervise token t+2. Raw VLM samples entering
+    the packed pipeline keep their existing single shift in
+    ``PackedDatasetWrapper._shift_sample``; this path skips it by emitting
+    already-shifted pairs. ``processor`` is accepted because the typed VLM
+    loader injects it into configured collators.
+    """
+    del processor
+    return default_collater(examples, pad_seq_len_divisible=pad_seq_len_divisible)

@@ -53,6 +53,7 @@ from nemo_automodel.components.datasets.vlm.samplers import (
     _smart_resize_image,
     _smart_resize_video,
 )
+from nemo_automodel.components.datasets.vlm.utils import ALREADY_SHIFTED_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +219,17 @@ def _estimate_sample_length(
         return_media_tokens: If True, return ``(total_tokens, media_tokens)``
             instead of just ``total_tokens``.
     """
+    # Tokenizer-aware datasets may already expose exact tokenized samples.
+    # Prefer that length over character heuristics so knapsack planning and
+    # materialization agree for text-only ChatDataset packing.
+    tokenized = example.get("input_ids")
+    if tokenized is not None:
+        tokenized = torch.as_tensor(tokenized)
+        text_tokens = int(tokenized.shape[-1])
+        if return_media_tokens:
+            return text_tokens, 0
+        return text_tokens
+
     # Text tokens
     precomputed = example.get("_text_tokens")
     if precomputed is not None:
@@ -341,7 +353,17 @@ def _compute_mrope_position_ids(
 
 
 def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
-    """Apply per-sample autoregressive shift before concatenation."""
+    """Apply per-sample autoregressive shift before concatenation.
+
+    Samples flagged with ``ALREADY_SHIFTED_KEY`` (e.g. ChatDataset output from
+    ``PreTokenizedDatasetWrapper``'s passthrough) already carry the next-token
+    shift; they are passed through unchanged so exactly one shift is applied
+    per document. Raw VLM samples keep the shift applied here.
+    """
+    if sample.get(ALREADY_SHIFTED_KEY, False):
+        out = {k: v for k, v in sample.items() if k != ALREADY_SHIFTED_KEY}
+        return out
+
     out = {}
     out["input_ids"] = sample["input_ids"][:-1]
     out["labels"] = sample["labels"][1:]
@@ -826,7 +848,13 @@ def neat_pack_dataset_vlm(
                 video_cfg=video_cfg,
                 return_media_tokens=True,
             )
-            est_len = _aligned_length(max(est_len - 1, 0), sequence_alignment)  # -1 for shift
+            # -1 accounts for the autoregressive shift's dropped token. Samples
+            # flagged with ALREADY_SHIFTED_KEY (ChatDataset passthrough) report
+            # their post-shift length here, so the -1 does not apply — planning
+            # and materialization must consume the same length.
+            if not ds_raw[i].get(ALREADY_SHIFTED_KEY, False):
+                est_len = max(est_len - 1, 0)
+            est_len = _aligned_length(est_len, sequence_alignment)
             if est_len > pack_size:
                 if drop_long_samples:
                     dropped_count += 1
