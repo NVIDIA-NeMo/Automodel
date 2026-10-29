@@ -436,7 +436,7 @@ def test_joined_segmentation_allows_mtp_targets_across_original_documents():
         [[20, 21, 22, 30, IGNORE, IGNORE]],
     ]
     # mask_segment_starts is a separate label policy: masking b1 does not
-    # silently prohibit a later auxiliary target b2 across the old boundary.
+    # silently prohibit a later auxiliary target b2 across the subdocument boundary.
     labels[0, 2] = IGNORE
     masked_joined = _run_capture(labels=labels, seq_idx=torch.ones((1, 6), dtype=torch.long))
     assert masked_joined[0].tolist() == [[12, IGNORE, 21, 22, 30, IGNORE]]
