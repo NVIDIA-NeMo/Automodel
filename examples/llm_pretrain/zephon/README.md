@@ -112,8 +112,14 @@ This example reads the `prompt` and `completion` fields of each document.
 AutoModel normalizes the columns, and Zephon's `tokenize_chat()` performs chat
 tokenization and loss masking. The tokenizer's chat template supplies the
 conversation format. Set `use_hf_chat_template: false` for plain prompt/completion
-formatting. AutoModel's existing `ColumnMappedTextInstructionDatasetConfig` is
-also accepted with the same formatting options.
+formatting.
+
+You can use `ZephonInstructionSourceConfig` directly, as above. AutoModel's
+`ColumnMappedTextInstructionDatasetConfig` is an optional compatibility input:
+its supported fields are translated into `ZephonInstructionSourceConfig`.
+With the same preparation settings, both build the same Zephon instruction
+pipeline. In Python, you can pass a `ZephonInstructionSourceConfig` instance as
+`ZephonDataloaderConfig.dataset_config`.
 
 The local example uses plain formatting and Flash Attention:
 
@@ -143,15 +149,15 @@ them into batches. Zephon's `to_training()` handles shifting, padding, and
 collation. A small adapter then presents that result in the format expected by
 AutoModel's existing recipe and model.
 
-With Zephon selected, AutoModel's `dataset` section describes document
-preparation rather than constructing a native dataset object. The integration
-translates supported settings into Zephon pipeline options. For example,
-`ColumnMappedTextInstructionDatasetConfig` supplies the column mapping,
-chat-template choice, and loss-mask policy for Zephon's instruction tokenizer. Zephon
-reads `dataloader.zephon.sources` and owns mixing, tokenization, packing, and
-batching. Configure source traversal and packing under `dataloader.zephon`;
-arbitrary native dataset types and their sampling, truncation, or collator
-behavior are not automatically converted.
+With Zephon selected, AutoModel's `dataset` section configures document
+preparation. Use a Zephon integration source config directly, or a supported
+native config that the integration translates into its Zephon equivalent.
+These preparation configs are separate from `zephon.io.Dataset` objects, which
+describe data sources and are constructed from `dataloader.zephon.sources`.
+Zephon owns reading, mixing, tokenization, packing, and batching. Configure
+source traversal and packing under `dataloader.zephon`; arbitrary native dataset
+types and their sampling, truncation, or collator behavior are not automatically
+converted.
 
 `dataloader.output_format` selects the model input layout. The default,
 `batched`, uses ordinary `[batch, sequence]` inputs. `thd` supplies the sequence
@@ -183,11 +189,6 @@ seed, and global batch size across resumes. See
 [distributed training](https://docs.zephon.io/pipelines/distributed_training.html)
 and [checkpointing and resuming](https://docs.zephon.io/pipelines/checkpointing_and_resuming.html)
 for the underlying Zephon guarantees.
-
-For distributed runs over finite sources, set
-`dataloader.zephon.runtime.mtp_mode: false` to avoid a known end-of-data
-checkpointing hang. See the [Zephon fix](https://github.com/datologyai/zephon/pull/91)
-for its status.
 
 DP, TP, and PP follow AutoModel's model and backend capabilities. Context
 parallelism is not supported by this integration. Zephon currently supplies
