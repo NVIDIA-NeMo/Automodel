@@ -28,67 +28,14 @@ from pathlib import Path
 
 from PIL import Image
 
-PROVIDER_ORGS = {
-    "allenai": "allenai",
-    "baai": "BAAI",
-    "baichuan-inc": "baichuan-inc",
-    "baidu": "baidu",
-    "bigcode": "bigcode",
-    "black-forest-labs": "black-forest-labs",
-    "bytedance-seed": "ByteDance-Seed",
-    "cohere": "CohereForAI",
-    "coherelabs": "CohereLabs",
-    "deepseek-ai": "deepseek-ai",
-    "diffusers": "diffusers",
-    "eleutherai": "EleutherAI",
-    "google": "google",
-    "google-t5": "google-t5",
-    "gsai-ml": "GSAI-ML",
-    "huggingfacetb": "HuggingFaceTB",
-    "hunyuanvideo-community": "hunyuanvideo-community",
-    "ibm": "ibm-granite",
-    "ibm-ai-platform": "ibm-ai-platform",
-    "inceptionai": "inceptionai",
-    "inclusionai": "inclusionAI",
-    "internlm": "internlm",
-    "lgai-exaone": "LGAI-EXAONE",
-    "lightricks": "Lightricks",
-    "llava-hf": "llava-hf",
-    "lmms-lab": "lmms-lab",
-    "meta": "meta-llama",
-    "microsoft": "microsoft",
-    "MiniMaxAI": "MiniMaxAI",
-    "mistralai": "mistralai",
-    "moonshotai": "moonshotai",
-    "nanbeige": "Nanbeige",
-    "meta-models": "meta-models",
-    "nvidia": "nvidia",
-    "openai": "openai",
-    "openai-community": "openai-community",
-    "openbmb": "openbmb",
-    "opengvlab": "OpenGVLab",
-    "orionstar": "OrionStarAI",
-    "parasail-ai": "parasail-ai",
-    "poolside": "poolside",
-    "qwen": "Qwen",
-    "recursivesi": "RecursiveSI",
-    "reflection": "reflection",
-    "stabilityai": "stabilityai",
-    "stepfun-ai": "stepfun-ai",
-    "tencent": "tencent",
-    "thinkingmachines": "thinkingmachines",
-    "thudm": "zai-org",
-    "tiiuae": "tiiuae",
-    "upstage": "upstage",
-    "wan-ai": "Wan-AI",
-    "xiaomimimo": "XiaomiMiMo",
-    "z-lab": "z-lab",
-}
+from tools.docs.catalog import (
+    MAX_TOTAL_ENCODED_BYTES,
+    PROVIDER_ORGS,
+)
 
 AVATAR_PATTERN = re.compile(rb"cdn-avatars\.huggingface\.co/[^\"&]+")
 USER_AGENT = "nemo-automodel-docs/1.0"
 ICON_SIZE = 20
-MAX_TOTAL_ENCODED_BYTES = 256 * 1024
 DATA_URI_PATTERN = re.compile(r'href="data:image/webp;base64,([A-Za-z0-9+/=]+)"')
 
 
@@ -219,7 +166,7 @@ def _check(navigation_path: Path, legacy_dir: Path, legacy_sprite: Path) -> list
 
 def main() -> int:
     """Fetch or validate the checked-in provider icon set."""
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--navigation",

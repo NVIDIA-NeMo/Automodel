@@ -30,7 +30,7 @@ from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 
 # Actual DCP save/load and cold model imports exceed the default 5-second budget.
-pytestmark = pytest.mark.timeout(120)
+pytestmark = [pytest.mark.timeout(120), pytest.mark.cpu_only]
 
 
 def _make_model(*, freeze_router: bool) -> DeepseekV4ForCausalLM:

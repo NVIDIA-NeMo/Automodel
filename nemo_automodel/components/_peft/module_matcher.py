@@ -14,7 +14,6 @@
 
 import re
 from dataclasses import dataclass, field
-from typing import List
 
 import torch.nn as nn
 
@@ -27,12 +26,12 @@ logger = logging.getLogger(__name__)
 from functools import lru_cache
 
 
-def _is_linear_module(module):
+def _is_linear_module(module: nn.Module) -> bool:
     return isinstance(module, nn.Linear) or (HAS_TE and isinstance(module, transformer_engine.pytorch.Linear))
 
 
 @lru_cache(maxsize=1000)
-def _compile_wildcard_pattern(pattern):
+def _compile_wildcard_pattern(pattern: str) -> re.Pattern[str]:
     # "*" and ".*" are both wildcards. A ".*" right after a complete dotted segment (text that starts the
     # pattern or begins with ".") or after a numeric index (".1") keeps its dot as a separator, matching
     # that segment's children or nothing, so "*.layers.1.*" and "*layers.1.*" do not also match
@@ -51,7 +50,7 @@ def _compile_wildcard_pattern(pattern):
     return re.compile("^" + regex + "$")
 
 
-def wildcard_match(pattern, key):
+def wildcard_match(pattern: str, key: str | None) -> bool:
     """
     Return whether the pattern (target module to add LoRA) matches the key (model weight name).
 
@@ -75,13 +74,13 @@ class ModuleMatcher:
     Matches Modules to apply PEFT adapters on.
 
     Args:
-        target_modules (List[str], optional): A list of module names to apply LoRA to.
+        target_modules (list[str], optional): A list of module names to apply LoRA to.
             Defaults to an empty list.
             If empty and no other parameter is provided it will match to "*_proj".
             Target modules can also contain wildcards (e.g. "*.layers.0.*.linear_qkv"). For example, you can specify
                 target_modules=['*.layers.0.*.linear_qkv', '*.layers.1.*.linear_qkv'] to add LoRA to only linear_qkv
                 on the first two layers.
-        exclude_modules (List[str], optional): A list of module names to exclude from applying LoRA to.
+        exclude_modules (list[str], optional): A list of module names to exclude from applying LoRA to.
             Defaults to an empty list.
             Exclude modules can also contain wildcards (e.g. "*.lm_head"). For example, you can specify
                 exclude_modules=['*.lm_head'] to exclude the lm_head.
@@ -91,12 +90,12 @@ class ModuleMatcher:
         is_causal_lm (bool, optional): Whether the model is a causal language model.
     """
 
-    target_modules: List[str] = field(default_factory=list)
-    exclude_modules: List[str] = field(default_factory=list)
+    target_modules: list[str] | str | None = field(default_factory=list)
+    exclude_modules: list[str] | str | None = field(default_factory=list)
     match_all_linear: bool = field(default=False)
     is_causal_lm: bool = field(default=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """
         Input validation.
         """
@@ -140,10 +139,11 @@ class ModuleMatcher:
     # --------------------------------------------------------------------- #
     # Public API                                                            #
     # --------------------------------------------------------------------- #
-    def match(self, m: nn.Module, name: str = None, prefix: str = None):
+    def match(self, m: nn.Module, name: str | None = None, prefix: str | None = None) -> bool:
         """
-        Return (pattern, full_name) if the module matches; otherwise None.
+        Return whether the module matches the configured inclusion and exclusion rules.
         """
+        assert isinstance(self.target_modules, list) and isinstance(self.exclude_modules, list)
         full_name = f"{prefix}.{name}" if prefix else name
 
         # 1. matching by layer type takes absolute precedence

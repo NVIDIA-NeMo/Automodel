@@ -153,10 +153,11 @@ class _DeepseekV41DSparkAttention(DeepseekV41Attention):
                 scale=self.head_dim**-0.5,
             ).transpose(1, 2)
         else:
-            logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
-            probabilities = (logits + bias).softmax(dim=-1)
-            probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
-            attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
+            with torch.autocast(device_type=query.device.type, enabled=False):
+                logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
+                probabilities = (logits + bias).softmax(dim=-1)
+                probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
+                attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
         valid_tokens = torch.ones(batch, draft_sequence, dtype=torch.bool, device=hidden_states.device)
         return self._project_output(attended, draft_angles, valid_tokens)
 
@@ -207,7 +208,8 @@ class _DeepseekV41DSparkConfidenceHead(nn.Module):
         """
         if hidden_states.shape[:-1] != markov_embeddings.shape[:-1]:
             raise ValueError("DSpark hidden states and Markov embeddings must have matching leading dimensions")
-        return self.proj(torch.cat((hidden_states.float(), markov_embeddings.float()), dim=-1)).squeeze(-1)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            return self.proj(torch.cat((hidden_states.float(), markov_embeddings.float()), dim=-1)).squeeze(-1)
 
 
 class _DeepseekV41DSparkBlock(nn.Module):
@@ -664,7 +666,8 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         Returns:
             FP32 tensor of shape [batch, sequence, vocab].
         """
-        return F.linear(hidden_states.float(), self.lm_head.weight.float())
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            return F.linear(hidden_states.float(), self.lm_head.weight.float())
 
     def forward(
         self,
