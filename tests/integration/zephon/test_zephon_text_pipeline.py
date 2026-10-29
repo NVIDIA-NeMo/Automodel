@@ -16,6 +16,7 @@
 
 from contextlib import closing
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
@@ -23,6 +24,7 @@ from transformers import PreTrainedTokenizerFast
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
@@ -234,3 +236,27 @@ def test_document_id_model_consumes_real_loader_and_respects_xdoc(config, tokeni
             assert torch.isfinite(loss)
             assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
             model.zero_grad()
+
+
+def test_raw_text_without_packing_keeps_documents_separate_and_pads(
+    config: ZephonDataloaderConfig, tokenizer: PreTrainedTokenizerFast
+) -> None:
+    selected = replace(
+        config,
+        zephon=replace(
+            config.zephon,
+            packing=replace(config.zephon.packing, pack_algorithm=None, seq_len=None),
+            source=replace(config.zephon.source, chunk_size=1),
+        ),
+    )
+    contract = PackingCapabilities("block_causal", max_sequence_length=7)
+    with closing(selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, packing_contract=contract)) as loader:
+        batch = next(loader)
+        assert batch["input_ids"].tolist() == [[2, 3, 4, 1, 1, 1, 1], [3, 4, 5, 1, 1, 1, 1]]
+        assert batch["labels"].tolist() == [[3, 4, 1, -100, -100, -100, -100], [4, 5, 1, -100, -100, -100, -100]]
+        assert batch["_packed_seq_ids"].tolist() == [[1, 1, 1, 1, 0, 0, 0]] * 2
+    assert selected.zephon.packing.seq_len is None
+    Path(config.zephon.sources[0].path, "text.jsonl").write_text('{"text":"w0 w1 w2 w3 w4 w5 w6 w7 w8"}\n' * 2)
+    with closing(selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, packing_contract=contract)) as loader:
+        with pytest.raises((ValueError, RuntimeError), match=r"exceeding seq_len\+1"):
+            next(loader)
