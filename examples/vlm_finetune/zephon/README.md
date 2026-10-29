@@ -82,10 +82,17 @@ Store each document on one line in the actual JSONL file. Absolute image paths
 avoid dependence on the workers' working directory. Documents may contain
 multiple images, images of different resolutions, or text only.
 
-The processor and chat template determine tokenization and assistant loss
-masking. Packing uses the length after image placeholders have been expanded
-into image tokens. Use `first_fit` or `best_fit`: images and their documents
-must stay whole. Oversized documents are dropped by default; set
+The processor applies the selected chat template and expands image placeholders.
+The template and processor own BOS/EOS and turn markers; the integration does not
+append additional special tokens. Assistant target regions contribute to the
+next-token loss, while user/system prompts and their images provide context.
+This is AutoModel's conversation-based supervision; using caption data this way
+does not require a separate packing mode.
+
+Packing measures the fully expanded token sequence. VLM recipes default to
+`first_fit`; `best_fit` is also supported. Online bin packing keeps images and
+their documents whole. Wrapping and disabling packing are not supported on this
+path. Oversized documents are dropped by default; set
 `packing.drop_oversized: false` to raise instead. Images are never truncated to
 fit a bin. See [Zephon's packing guide](https://docs.zephon.io/pipelines/packing.html)
 for bin-packing options.
@@ -102,7 +109,8 @@ segment when packing, reducing the available document length. Set
 `dataset.inject_fake_images: false` only when your model and parallel setup
 permit skipping the vision tower.
 
-`dataset.on_media_error: drop` skips unreadable media and image-token mismatches;
+Video, audio, and other unsupported content types are rejected before media
+decoding. `dataset.on_media_error: drop` skips unreadable images and image-token mismatches;
 the default, `raise`, stops on these errors. Malformed conversations and other
 processor errors still raise. `workers.tokenize_parallelism` controls the
 processor stage, including image decoding. Tune it for the CPU and memory
