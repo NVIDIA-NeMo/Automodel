@@ -94,7 +94,7 @@ You can also place the data settings in a TOML file and reference it with
 `dataloader.zephon.data_config`. Inline YAML values override that file; relative
 source, cache, and checkpoint paths in TOML are resolved relative to the TOML file.
 
-### Instruction tuning and encoded text
+### Instruction tuning and pretokenized text
 
 For question/answer data, select `ZephonInstructionSourceConfig`:
 
@@ -125,16 +125,19 @@ uv run automodel examples/llm_pretrain/zephon/sft.yaml --nproc-per-node 1
 Install the matching Flash Attention dependencies, or select SDPA with
 `--model.attn_implementation sdpa`.
 
-For documents you have already tokenized, choose `ZephonEncodedTextSourceConfig`.
+For documents you have already tokenized, choose `ZephonPretokenizedTextSourceConfig`.
 Its `tokens_field` defaults to `input_ids`, and its optional `loss_mask_field`
 defaults to `loss_mask`. Supply unshifted, unpadded token lists from the model's
-tokenizer; Zephon still packs them and constructs training batches. This input
-format does not import already packed batches or shifted labels. Token-aware
-mixing is available for raw text, instruction data, and encoded text.
+tokenizer. The adapter validates fields, preserves supplied token IDs and binary
+loss masks, and adds an all-ones mask only when absent. It does not retokenize or
+filter short or fully masked documents. Zephon still packs documents and shifts
+labels; `mask_segment_starts` controls boundary masking. This input format does
+not import prepacked batches or shifted labels. Token-aware mixing counts the
+supplied tokens, including tokens excluded from loss, using `tokens_field`.
 
 ## How the integration works
 
-The dataset config selects text, chat, or already encoded input. The Zephon
+The dataset config selects text, chat, or pretokenized input. The Zephon
 pipeline reads and mixes sources, prepares documents, packs them, and groups
 them into batches. Zephon's `to_training()` handles shifting, padding, and
 collation. A small adapter then presents that result in the format expected by
