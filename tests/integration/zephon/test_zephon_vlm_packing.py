@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU integration spike: real image processor -> Zephon bins -> to_training."""
+"""CPU image encoding, whole-document Zephon packing and training-batch conversion."""
 
 import json
 from contextlib import closing

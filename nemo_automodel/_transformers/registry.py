@@ -41,7 +41,7 @@ _IMAGE_POSITION_STATE_FACTORIES = {
 def resolve_image_position_state(model: nn.Module) -> "ImagePositionState":
     """Build model-owned, configuration-only image preprocessing state.
 
-    The registry selects a certified factory from the actual built model config.
+    The registry selects a supported factory from the actual built model config.
     Only that configuration enters workers; no bound model method is serialized.
     """
     model = getattr(model, "module", model)

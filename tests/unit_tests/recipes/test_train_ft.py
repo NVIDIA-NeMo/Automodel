@@ -4179,7 +4179,7 @@ def test_recipe_saves_terminal_state_at_closed_pass_frontier() -> None:
 
 @pytest.mark.parametrize("attention_backend", ["sdpa", "eager"])
 def test_zephon_setup_preserves_requested_attention_backend(monkeypatch, tmp_path, attention_backend):
-    """Zephon supplies masks without selecting the native flash packing preload flag."""
+    """Zephon setup preserves the configured SDPA or eager attention backend."""
     from nemo_automodel._transformers.kernel_patches import _apply_preload_overrides
     from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig, ZephonOptions, ZephonSource
 

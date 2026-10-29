@@ -53,9 +53,11 @@ class TokenIds:
 def resolve_token_ids(tokenizer: PreTrainedTokenizerBase, *, pad_token_id: int | None) -> TokenIds:
     """Resolve PAD/BOS/EOS using the effective AutoModel tokenizer.
 
-    Explicit padding may not contradict a declared tokenizer padding ID.
-    The fallback order follows TorchTitan: named pad, reserved special, UNK,
-    then EOS. Padding is always masked by position, even when PAD equals EOS.
+    Honor the declared tokenizer padding ID or a compatible explicit override.
+    Otherwise prefer a named padding token, a reserved special token, UNK, then
+    EOS. Reusing an existing ID avoids resizing model embeddings; preferring a
+    non-EOS ID keeps padding distinct from document ends when possible. Padding
+    is masked by position, including when PAD equals EOS.
     """
     vocab = tokenizer.get_vocab()
     valid_ids = set(vocab.values())
