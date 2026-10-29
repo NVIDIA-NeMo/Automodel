@@ -158,7 +158,7 @@ def test_pipeline_input_limit_uses_smallest_declared_stage_limit():
 
 
 class TestConfigurePacking:
-    def test_flash_hook_targets_decoder_inside_compiled_hf_model(self):
+    def test_flash_metadata_precedes_root_input_transfer_inside_compiled_hf_model(self):
         from transformers import LlamaConfig, LlamaForCausalLM
 
         model = LlamaForCausalLM(
@@ -172,14 +172,24 @@ class TestConfigurePacking:
                 attn_implementation="sdpa",
             )
         )
+        seen = []
+
+        def input_transfer(module, args, kwargs):
+            # FSDP's root hook transfers every nested tensor to its device.
+            # Flash offsets must already exist before that hook runs.
+            seen.append(kwargs["_packed_flash_kwargs"]["cu_seq_lens_q"].tolist())
+            assert "cu_seq_lens_q" not in kwargs
+
+        model.register_forward_pre_hook(input_transfer, with_kwargs=True)
         compiled = torch.compile(model, backend="eager")
         configure_packing("flash_attention_2", model=compiled)
         configure_packing("flash_attention_2", model=model)
         decoder = model.get_decoder()
         assert "_packed_attention_hook_handle" in decoder.__dict__
-        assert "_packed_attention_hook_handle" not in model.__dict__
+        assert "_packed_flash_preparation_hook_handle" in model.__dict__
         assert "_packed_attention_hook_handle" not in compiled.__dict__
-        assert len(decoder._forward_pre_hooks) == 1
+        model(torch.ones(1, 4, dtype=torch.long), _packed_seq_ids=torch.tensor([[1, 1, 2, 2]]))
+        assert seen == [[0, 2, 4]]
 
     def test_flash_attention_map_is_resolved_after_microbatch_split(self):
         class Capture(torch.nn.Module):
