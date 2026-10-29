@@ -96,6 +96,63 @@ class TestGetAttnImplementation:
 
 
 # ---------------------------------------------------------------------------
+# Model input-token limits
+# ---------------------------------------------------------------------------
+
+
+def test_input_token_limit_uses_decoder_config_inside_model_wrappers():
+    from transformers import LlamaConfig, PreTrainedConfig
+
+    model = torch.nn.Module()
+    model.config = PreTrainedConfig(
+        max_position_embeddings=64,
+        text_encoder=LlamaConfig(max_position_embeddings=16384),
+        text_config=LlamaConfig(max_position_embeddings=8192),
+        vision_config=PreTrainedConfig(max_position_embeddings=256),
+    )
+    compiled = torch.nn.Module()
+    compiled._orig_mod = model
+    distributed = torch.nn.Module()
+    distributed.module = compiled
+
+    assert get_packing_capabilities("sdpa", model=distributed).max_sequence_length == 8192
+    assert not model._forward_pre_hooks
+
+
+def test_input_token_limit_does_not_apply_rope_scaling_twice():
+    from transformers import LlamaConfig
+
+    model = torch.nn.Module()
+    model.config = LlamaConfig(
+        max_position_embeddings=32768,
+        rope_parameters={"rope_type": "linear", "factor": 4.0, "rope_theta": 10000.0},
+    )
+
+    assert get_packing_capabilities("sdpa", model=model).max_sequence_length == 32768
+
+
+@pytest.mark.parametrize("limit", [None, 0, -1, True, "4096", float("inf")])
+def test_missing_or_invalid_model_input_limit_stays_unknown(limit):
+    from transformers import PreTrainedConfig
+
+    model = torch.nn.Module()
+    model.config = PreTrainedConfig(max_position_embeddings=limit)
+
+    assert get_packing_capabilities("sdpa", model=model).max_sequence_length is None
+
+
+def test_pipeline_input_limit_uses_smallest_declared_stage_limit():
+    from transformers import LlamaConfig
+
+    stages = [torch.nn.Module(), torch.nn.Module(), torch.nn.Module()]
+    stages[0].config = LlamaConfig(max_position_embeddings=8192)
+    stages[1].config = LlamaConfig(max_position_embeddings=4096)
+
+    assert get_packing_capabilities_for_models(stages).max_sequence_length == 4096
+    assert get_packing_capabilities_for_models([stages[2]]).max_sequence_length is None
+
+
+# ---------------------------------------------------------------------------
 # configure_packing
 # ---------------------------------------------------------------------------
 
