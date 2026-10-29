@@ -524,6 +524,11 @@ def _prepare_packed_attention_at_model_entry(
         attention. Existing masks, public Flash metadata and THD inputs pass
         through. No input tensor is mutated.
     """
+    flash_kwargs = kwargs.get("_packed_flash_kwargs")
+    if flash_kwargs is not None:
+        kwargs.pop("_packed_flash_kwargs")
+        kwargs.update(flash_kwargs)
+        return args, kwargs
     document_ids = kwargs.get("_packed_seq_ids")
     if document_ids is None or kwargs.get("qkv_format") == "thd":
         return None
@@ -582,6 +587,40 @@ def _prepare_packed_attention_at_model_entry(
             )
     else:
         raise ValueError(f"Unsupported compact attention contract: {packed_mask_type}")
+    return args, updated
+
+
+def _prepare_flash_metadata_before_input_transfer(
+    module: torch.nn.Module,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    attn_implementation: str,
+) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+    """Prepare host offsets before FSDP moves the document map to CUDA.
+
+    PP has already selected the microbatch. Keep text Flash kwargs bundled until
+    the decoder hook consumes them: VLM vision towers have their own boundaries
+    and must not receive the text offsets through forwarded keyword arguments.
+
+    Args:
+        module: Outer model or pipeline stage, before its FSDP input-transfer hook.
+        args: Token IDs [batch, sequence] or hidden states [batch, sequence, hidden].
+        kwargs: Forward inputs with CPU attention document IDs [batch, sequence].
+        attn_implementation: Configured FlashAttention backend.
+
+    Returns:
+        Prepared inputs with device-local document IDs and privately bundled
+        int32 cumulative lengths [documents + 1] plus integer maximum lengths,
+        or None when an explicit mask/Flash representation is already present.
+    """
+    prepared = _prepare_packed_attention_at_model_entry(
+        module, args, kwargs, packed_mask_type="flash_varlen", attn_implementation=attn_implementation
+    )
+    if prepared is None:
+        return None
+    args, updated = prepared
+    updated["_packed_flash_kwargs"] = {key: updated.pop(key) for key in FLASH_VARLEN_KWARGS}
     return args, updated
 
 
@@ -691,7 +730,9 @@ def configure_packing(
 
     HF attention accepts public masks/varlen kwargs or a CPU batch-major
     attention document map. Maps are materialized at the model-owned entry point
-    (HF decoder by default) without modifying Transformers globals. Native FA4 receives batch-major metadata
+    (HF decoder by default) without modifying Transformers globals. Flash offsets
+    are prepared before FSDP input transfer and exposed only to the text consumer.
+    Native FA4 receives batch-major metadata
     flattened at model entry after microbatch splitting. Other consumers strip
     unused native metadata so it cannot accidentally select their THD path.
 
@@ -748,6 +789,17 @@ def configure_packing(
                 ),
                 with_kwargs=True,
             )
+        flash_handle = getattr(uncompiled, "_packed_flash_preparation_hook_handle", None)
+        if capabilities.packed_mask_type == "flash_varlen" and flash_handle is None:
+            # FSDP transfers CPU tensor kwargs before entering the text decoder.
+            uncompiled._packed_flash_preparation_hook_handle = uncompiled.register_forward_pre_hook(
+                partial(_prepare_flash_metadata_before_input_transfer, attn_implementation=attn_implementation),
+                with_kwargs=True,
+                prepend=True,
+            )
+        elif capabilities.packed_mask_type != "flash_varlen" and flash_handle is not None:
+            flash_handle.remove()
+            del uncompiled._packed_flash_preparation_hook_handle
     return capabilities
 
 
