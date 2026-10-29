@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility imports for the RNG utilities now shared with data construction.
+"""Compatibility imports for shared training and data-construction RNG utilities.
 
 Keep this module path available for existing callers and legacy RNGState pickles.
 """

@@ -385,7 +385,7 @@ _OPTION_GROUPS = {
 
 
 def _group_recipe_options(values: dict[str, Any]) -> dict[str, Any]:
-    """Accept grouped settings and the reference integrations' flat TOML spelling.
+    """Accept grouped settings or flat setting names, rejecting duplicates.
 
     A setting may occur only once per input. The caller merges TOML and YAML
     after grouping so inline overrides replace individual settings, not groups.
