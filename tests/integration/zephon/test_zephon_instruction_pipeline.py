@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Built-in SFT tokenization and encoded-source replay through real CPU pipelines."""
+"""Built-in SFT tokenization and pretokenized-source replay through real CPU pipelines."""
 
 import json
 from contextlib import closing
@@ -26,7 +26,7 @@ from transformers import PreTrainedTokenizerFast
 
 from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
-    ZephonEncodedTextSourceConfig,
+    ZephonPretokenizedTextSourceConfig,
     ZephonInstructionSourceConfig,
 )
 from tests.utils.zephon_text_fixtures import config as config
@@ -121,7 +121,7 @@ def test_sft_explicit_ids_override_bracketing_without_changing_template_or_token
     assert tokenizer.chat_template == TAGGED
 
 
-def test_prompt_worker_and_encoded_tokens_have_identical_delivery_and_replay(config, tokenizer):
+def test_prompt_worker_and_pretokenized_tokens_have_identical_delivery_and_replay(config, tokenizer):
     payloads = [{"q": f"w{i} w{i + 1}", "a": f"w{i + 2} w{i + 3}"} for i in range(10)]
     config = _instruction_config(config, payloads)
     config = replace(
@@ -132,20 +132,20 @@ def test_prompt_worker_and_encoded_tokens_have_identical_delivery_and_replay(con
             workers=replace(config.zephon.workers, map_parallelism=2, tokenize_parallelism=2, pack_parallelism=2),
         ),
     )
-    encoded_path = Path(config.zephon.sources[0].path).parent / "encoded"
-    encoded_path.mkdir()
-    (encoded_path / "tokens.jsonl").write_text(
+    pretokenized_path = Path(config.zephon.sources[0].path).parent / "pretokenized"
+    pretokenized_path.mkdir()
+    (pretokenized_path / "tokens.jsonl").write_text(
         "".join(
             json.dumps({"tokens": [i + 2, i + 3, i + 4, i + 5], "loss_mask": [0, 0, 1, 1]}) + "\n" for i in range(10)
         )
     )
-    encoded_config = replace(
+    pretokenized_config = replace(
         config,
-        dataset_config=ZephonEncodedTextSourceConfig(tokens_field="tokens"),
-        zephon=replace(config.zephon, sources=(replace(config.zephon.sources[0], path=str(encoded_path)),)),
+        dataset_config=ZephonPretokenizedTextSourceConfig(tokens_field="tokens"),
+        zephon=replace(config.zephon, sources=(replace(config.zephon.sources[0], path=str(pretokenized_path)),)),
     )
     raw = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
-    tokens = encoded_config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+    tokens = pretokenized_config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
     resumed = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
     try:
         torch.testing.assert_close(next(tokens), next(raw))
@@ -244,7 +244,7 @@ def test_instruction_mixture_uses_builtin_token_calibration(config, tokenizer, t
         assert 0 < total < 5000
 
 
-def test_encoded_measurement_allocates_tokens_and_finite_repeat_cap(config, tokenizer, tmp_path):
+def test_pretokenized_measurement_allocates_tokens_and_finite_repeat_cap(config, tokenizer, tmp_path):
     from nemo_automodel.components.datasets.zephon.config import ZephonSource
 
     sources = []
@@ -253,10 +253,10 @@ def test_encoded_measurement_allocates_tokens_and_finite_repeat_cap(config, toke
         path.mkdir()
         (path / "data.jsonl").write_text((json.dumps({"tokens": tokens}) + "\n") * 64)
         sources.append(ZephonSource(name=name, path=str(path), fmt="jsonl"))
-    encoded = replace(
+    pretokenized = replace(
         config,
         batch_size=1,
-        dataset_config=ZephonEncodedTextSourceConfig(tokens_field="tokens"),
+        dataset_config=ZephonPretokenizedTextSourceConfig(tokens_field="tokens"),
         zephon=replace(
             config.zephon,
             sources=tuple(sources),
@@ -270,7 +270,7 @@ def test_encoded_measurement_allocates_tokens_and_finite_repeat_cap(config, toke
             ),
         ),
     )
-    with closing(encoded.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(pretokenized.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
         short = total = 0
         for batch in loader:
             tokens = torch.cat((batch["input_ids"], batch["labels"][:, -1:]), dim=1)
@@ -281,18 +281,20 @@ def test_encoded_measurement_allocates_tokens_and_finite_repeat_cap(config, toke
         assert list(loader) == []
 
 
-def test_encoded_mixed_supervision_preserves_all_targets(config, tokenizer):
+def test_pretokenized_mixed_supervision_preserves_all_targets(config, tokenizer):
     path = Path(config.zephon.sources[0].path) / "text.jsonl"
     path.write_text(
-        json.dumps({"input_ids": [2, 3, 1], "loss_mask": [0, 0, 1]})
+        json.dumps({"input_ids": [2], "loss_mask": [0]})
         + "\n"
-        + json.dumps({"input_ids": [4, 5, 1]})
+        + json.dumps({"input_ids": [3, 4], "loss_mask": [0, 0]})
+        + "\n"
+        + json.dumps({"input_ids": [5, 6, 1]})
         + "\n"
     )
     config = replace(
         config,
         batch_size=1,
-        dataset_config=ZephonEncodedTextSourceConfig(),
+        dataset_config=ZephonPretokenizedTextSourceConfig(),
         zephon=replace(
             config.zephon,
             packing=replace(config.zephon.packing, seq_len=5),
@@ -301,6 +303,6 @@ def test_encoded_mixed_supervision_preserves_all_targets(config, tokenizer):
     )
     with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
         batch = next(loader)
-        assert batch["input_ids"].tolist() == [[2, 3, 1, 4, 5]]
-        assert batch["labels"].tolist() == [[-100, 1, 4, 5, 1]]
-        assert batch["position_ids"].tolist() == [[0, 1, 2, 0, 1]]
+        assert batch["input_ids"].tolist() == [[2, 3, 4, 5, 6]]
+        assert batch["labels"].tolist() == [[-100, -100, 5, 6, 1]]
+        assert batch["position_ids"].tolist() == [[0, 0, 1, 0, 1]]
