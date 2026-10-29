@@ -73,7 +73,7 @@ classifiers = [
 ]
 dependencies = [
     # Pin the public Zephon API used by the training data integration.
-    "zephon @ git+https://github.com/datologyai/zephon.git@2bdeef7a6a5516abbb05a259f52942d22f9a0931",
+    "zephon @ git+https://github.com/datologyai/zephon.git@5bebdff766734b17c76730ec531368f6bf358f4c",
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]",
