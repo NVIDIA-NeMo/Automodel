@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contiguous context parallelism for the V4.1 text backbone."""
+"""Contiguous context parallelism for packed V4.1 text and image tokens."""
 
 import contextlib
 from collections.abc import Callable
@@ -81,8 +81,8 @@ def shard_cp_batch(
         Packed layouts retain original-to-aligned token coordinates [batch, original_sequence].
         Token tensors have independent storage; input tensor storage is never modified.
     """
-    if batch.get("pixel_values") is not None or batch.get("inputs_embeds") is not None:
-        raise ValueError("DeepSeek V4.1 context parallelism currently supports text input_ids only")
+    if batch.get("inputs_embeds") is not None:
+        raise ValueError("DeepSeek V4.1 CP requires input_ids and model-owned image fusion")
     padding_token_id = 0 if padding_token_id is None else padding_token_id
     packed = batch.get("seq_lens") is not None
     if not packed and (batch.get("cu_seqlens") is not None or batch.get("qkv_format") == "thd"):
@@ -103,7 +103,12 @@ def shard_cp_batch(
             minimum_length=int(length),
         )
         input_positions = layout.input_positions
-        for key, fill in (("input_ids", padding_token_id), ("labels", -100), ("loss_mask", 0)):
+        for key, fill in (
+            ("input_ids", padding_token_id),
+            ("labels", -100),
+            ("loss_mask", 0),
+            ("vision_token_types", -1),
+        ):
             if key in batch:
                 batch[key] = layout.pack(batch[key], fill=fill)
         if loss_mask is not None:
@@ -131,8 +136,8 @@ def shard_cp_batch(
             loss_mask=loss_mask,
             padding_token_id=padding_token_id,
             pad_multiple=pad_multiple,
-            extra_seq_keys={"packed_seq_ids": 1} if packed else None,
-            extra_pad_values={"packed_seq_ids": 0} if packed else None,
+            extra_seq_keys={"packed_seq_ids": 1, "vision_token_types": 1},
+            extra_pad_values={"packed_seq_ids": 0, "vision_token_types": -1},
         )
     if input_positions is not None:
         layout = ShardLayout(

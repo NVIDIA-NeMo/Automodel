@@ -25,12 +25,13 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, TypedDict
 
 import torch
 import torch.utils.data
 from datasets import Dataset, load_dataset
 from datasets import Image as HfImage
+from datasets import Sequence as HfSequence
 from PIL import Image
 from transformers import ProcessorMixin
 
@@ -227,6 +228,109 @@ def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="
         }
 
     return dataset.with_transform(transform)
+
+
+class _SourceBlock(TypedDict):
+    type: str
+    text: str | None
+    index: int | None
+
+
+class _SourceMessage(TypedDict):
+    role: str
+    content: list[_SourceBlock]
+
+
+class _EncodedImage(TypedDict):
+    bytes: bytes | None
+    path: str | None
+
+
+class _SourceBatch(TypedDict):
+    messages: list[list[_SourceMessage]]
+    images: list[list[_EncodedImage]]
+
+
+class _TextBlock(TypedDict):
+    type: str
+    text: str
+
+
+class _ImageBlock(TypedDict):
+    type: str
+    image: Image.Image
+
+
+class _ConversationMessage(TypedDict):
+    role: str
+    content: list[_TextBlock | _ImageBlock]
+
+
+class _ConversationBatch(TypedDict):
+    conversation: list[list[_ConversationMessage]]
+
+
+def _image_conversations(batch: _SourceBatch) -> _ConversationBatch:
+    """Resolve indexed image blocks in a Hugging Face transform batch.
+
+    Image bytes stay compressed until the VLM processor loads each image.
+    This lets the pack planner read chat lengths without decoding all images.
+
+    Args:
+        batch: HF rows batched into lists; each row contains messages with
+            typed text/image blocks and an images list of encoded image records.
+
+    Returns:
+        A conversation list with PIL image objects opened lazily from the
+        embedded bytes or paths. Source messages and blocks are not mutated.
+    """
+    conversations: list[list[_ConversationMessage]] = []
+    for messages, images in zip(batch["messages"], batch["images"], strict=True):
+        conversation: list[_ConversationMessage] = []
+        used = set()
+        for message in messages:
+            content: list[_TextBlock | _ImageBlock] = []
+            for block in message["content"]:
+                if block["type"] == "text":
+                    if not isinstance(block["text"], str):
+                        raise ValueError("Text blocks require a string")
+                    content.append({"type": "text", "text": block["text"]})
+                elif block["type"] == "image":
+                    index = block["index"]
+                    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(images):
+                        raise ValueError(f"Invalid image index {index!r} for {len(images)} images")
+                    record = images[index]
+                    image = (
+                        Image.open(io.BytesIO(record["bytes"]))
+                        if record["bytes"] is not None
+                        else Image.open(record["path"])
+                    )
+                    content.append({"type": "image", "image": image})
+                    used.add(index)
+                else:
+                    raise ValueError(f"Unsupported HF chat content type: {block['type']!r}")
+            conversation.append({"role": message["role"], "content": content})
+        if used != set(range(len(images))):
+            raise ValueError("Every supplied image must be referenced by a conversation block")
+        conversations.append(conversation)
+    return {"conversation": conversations}
+
+
+@dataclass
+class HfImageConversationDatasetConfig:
+    """HF messages plus embedded images, shuffled deterministically before packing."""
+
+    path_or_dataset: str = "HuggingFaceH4/llava-instruct-mix-vsft"
+    split: str = "train"
+    revision: str | None = None
+    seed: int = 1234
+
+    def build(self) -> Dataset:
+        """Load Arrow-backed image/chat rows without eagerly decoding the images."""
+        dataset = load_dataset(self.path_or_dataset, split=self.split, revision=self.revision)
+        dataset = dataset.cast_column("images", HfSequence(HfImage(decode=False)))
+        dataset = dataset.shuffle(seed=self.seed)
+        return dataset.with_transform(_image_conversations)
 
 
 @dataclass
@@ -1703,10 +1807,12 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     "pixel_values",
                     "pixel_values_videos",
                     "image_grid_thw",
+                    "image_grid_hws",
                     "video_grid_thw",
                     "second_per_grid_ts",
                     "image_position_ids",
                     "mm_token_type_ids",
+                    "vision_token_types",
                 ):
                     if key in result and result[key] is not None:
                         output[key] = result[key]

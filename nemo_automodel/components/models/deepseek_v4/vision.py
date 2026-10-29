@@ -107,13 +107,21 @@ class DeepseekV4VisionAttention(nn.Module):
         self.wqkv = nn.Linear(vision_dim, 3 * vision_dim, bias=True, dtype=dtype)
         self.wo = nn.Linear(vision_dim, vision_dim, bias=True, dtype=dtype)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """Attend over one image.
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        patch_lengths: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        """Attend independently within each image while batching the projections.
 
         Args:
             x: Patch states with layout ``[patches, vision_dim]``.
             cos: Cosine table with layout ``[patches, 1, head_dim / 2]``.
             sin: Sine table with layout ``[patches, 1, head_dim / 2]``.
+            patch_lengths: Positive per-image patch counts summing to patches.
+                None treats all patches as one image.
 
         Returns:
             Attention output with layout ``[patches, vision_dim]``.
@@ -122,8 +130,21 @@ class DeepseekV4VisionAttention(nn.Module):
         q, k, v = (tensor.view(n_patches, self.n_heads, self.head_dim) for tensor in self.wqkv(x).chunk(3, dim=-1))
         q = apply_vision_rotary(q, cos, sin)
         k = apply_vision_rotary(k, cos, sin)
-        output = F.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
-        return self.wo(output.transpose(0, 1).reshape(n_patches, -1))
+        if patch_lengths is None:
+            patch_lengths = (n_patches,)
+        if any(length <= 0 for length in patch_lengths) or sum(patch_lengths) != n_patches:
+            raise ValueError("patch_lengths must partition all patches into nonempty images")
+        # No padded image batch or quadratic block mask. Every image retains
+        # its original bidirectional SDPA; FSDP-owned projections run once.
+        outputs = [
+            F.scaled_dot_product_attention(qi.transpose(0, 1), ki.transpose(0, 1), vi.transpose(0, 1))
+            .transpose(0, 1)
+            .reshape(length, -1)
+            for qi, ki, vi, length in zip(
+                q.split(patch_lengths), k.split(patch_lengths), v.split(patch_lengths), patch_lengths, strict=True
+            )
+        ]
+        return self.wo(torch.cat(outputs) if len(outputs) > 1 else outputs[0])
 
 
 class DeepseekV4VisionMLP(nn.Module):
@@ -153,9 +174,25 @@ class DeepseekV4VisionBlock(nn.Module):
         self.norm2 = DeepseekV4VisionRMSNorm(int(config.vision_dim))
         self.mlp = DeepseekV4VisionMLP(config)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """Transform patch states with layout ``[patches, vision_dim]``."""
-        x = x + self.attn(self.norm1(x), cos, sin)
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        patch_lengths: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        """Transform independent images with a single call to each FSDP unit.
+
+        Args:
+            x: Concatenated image states [patches, vision_dim].
+            cos: Per-image rotary cosines [patches, 1, head_dim / 2].
+            sin: Per-image rotary sines [patches, 1, head_dim / 2].
+            patch_lengths: Per-image patch counts, or None for one image.
+
+        Returns:
+            Updated states [patches, vision_dim], in the original image order.
+        """
+        x = x + self.attn(self.norm1(x), cos, sin, patch_lengths)
         return x + self.mlp(self.norm2(x))
 
 
