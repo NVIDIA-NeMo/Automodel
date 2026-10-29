@@ -597,3 +597,42 @@ class TestDispatcherRecomputeCache:
             BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="moe_tail")
         # the combine cache alone does not care about the expert kernel
         assert BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="combine")
+
+
+class TestBackendConfigWholeStepCudaGraph:
+    def test_default_mode_is_partial(self):
+        config = BackendConfig()
+        assert config.cuda_graph.mode == "partial"
+        assert config.cuda_graph.validate_whole_step is False
+
+    def test_unknown_mode_is_rejected(self):
+        with pytest.raises(ValueError, match=r"cuda_graph\.mode must be"):
+            CudaGraphConfig(mode="full_iteration")
+
+    def test_whole_step_mode_rejects_partial_modules(self):
+        with pytest.raises(ValueError, match=r"cuda_graph\.modules must be empty"):
+            CudaGraphConfig(mode="whole_step", modules=["attn"])
+
+    def test_validate_requires_whole_step_mode(self):
+        with pytest.raises(ValueError, match="requires cuda_graph.mode='whole_step'"):
+            CudaGraphConfig(validate_whole_step=True)
+        with pytest.raises(TypeError, match="must be a bool"):
+            CudaGraphConfig(mode="whole_step", validate_whole_step="yes")
+        assert CudaGraphConfig(mode="whole_step", validate_whole_step=True).validate_whole_step is True
+
+    def test_whole_step_with_hybridep_requires_capacity_factor(self):
+        with pytest.raises(ValueError, match="requires dispatcher_capacity_factor"):
+            BackendConfig(dispatcher="hybridep", experts="torch_mm", cuda_graph={"mode": "whole_step"})
+
+    def test_whole_step_with_hybridep_capacity_factor_is_valid(self):
+        config = BackendConfig(
+            dispatcher="hybridep",
+            experts="torch_mm",
+            dispatcher_capacity_factor=1.0,
+            cuda_graph={"mode": "whole_step"},
+        )
+        assert config.cuda_graph == CudaGraphConfig(mode="whole_step")
+
+    def test_whole_step_without_hybridep_does_not_require_capacity_factor(self):
+        config = BackendConfig(dispatcher="torch", experts="torch_mm", cuda_graph=CudaGraphConfig(mode="whole_step"))
+        assert config.cuda_graph.mode == "whole_step"

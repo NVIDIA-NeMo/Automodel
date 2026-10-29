@@ -30,6 +30,7 @@ import inspect
 import logging
 import pathlib
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -63,7 +64,7 @@ from nemo_automodel._transformers.infrastructure import (
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
+from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager, WholeStepGraph
 from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
@@ -508,6 +509,48 @@ def _build_partial_cuda_graph_manager(
     )
 
 
+def _build_whole_step_graph(
+    model_parts: list[nn.Module],
+    *,
+    step_fn: Callable[[list[dict[str, torch.Tensor]]], list[torch.Tensor]],
+    device: torch.device,
+    pipeline_parallel: bool,
+    partial_graphs_enabled: bool,
+) -> WholeStepGraph | None:
+    """Build whole-step CUDA-graph state only when a model backend selects that mode.
+
+    Args:
+        model_parts: Fully initialized model roots.
+        step_fn: Forward/loss/backward over all microbatches of one optimizer step,
+            taking device-resident microbatches and returning per-microbatch losses.
+        device: CUDA device that holds the graph's static inputs.
+        pipeline_parallel: Whether pipeline parallelism is enabled.
+        partial_graphs_enabled: Whether per-layer partial graphs are armed.
+
+    Returns:
+        An un-captured graph when the backend selects ``cuda_graph.mode="whole_step"``,
+        otherwise ``None``.
+    """
+    enabled = any(
+        model_part.backend.cuda_graph.mode == "whole_step"
+        for model_part in model_parts
+        if getattr(model_part, "backend", None) is not None
+    )
+    if not enabled:
+        return None
+    if pipeline_parallel:
+        raise ValueError("cuda_graph.mode='whole_step' does not support pipeline parallelism")
+    if partial_graphs_enabled:
+        raise ValueError("cuda_graph.mode='whole_step' cannot be combined with partial cuda_graph.modules")
+    if len(model_parts) != 1:
+        raise ValueError("cuda_graph.mode='whole_step' requires a single model part")
+    if hasattr(model_parts[0], "update_moe_gate_bias"):
+        # The gate-bias update consumes per-step expert loads that the gate rebinds in
+        # Python on every forward; a replayed graph never runs that Python.
+        raise NotImplementedError("cuda_graph.mode='whole_step' does not support models with update_moe_gate_bias")
+    return WholeStepGraph(step_fn, list(model_parts[0].named_parameters()), device=device)
+
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -524,6 +567,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # (e.g. unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
     domain_mixture = None
+    # Whole-step graph state is read by _run_train_optim_step; these defaults keep
+    # recipes constructed without setup() (unit tests) on the eager path.
+    whole_step_graph: WholeStepGraph | None = None
+    _whole_step_graph_validate_pending = False
+    _whole_step_num_label_tokens: torch.Tensor | None = None
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -539,6 +587,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # eager optimizer step has supplied representative runtime inputs.
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
+        # Whole-step graphs capture after the first complete eager optimizer step
+        # and normalize the loss by a device-resident label-token count.
+        self.whole_step_graph: WholeStepGraph | None = None
+        self._whole_step_graph_capture_pending = False
+        self._whole_step_graph_validate_pending = False
+        self._whole_step_num_label_tokens: torch.Tensor | None = None
 
     # ------------------ build phase ------------------
     def _create_distributed_setup(self) -> DistributedSetup:
@@ -989,6 +1043,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         if self.partial_cuda_graph_manager is not None:
             self._partial_cuda_graph_capture_pending = True
+        self.whole_step_graph = _build_whole_step_graph(
+            self.model_parts,
+            step_fn=self._forward_backward_microbatches_for_graph,
+            device=self.dist_env.device,
+            pipeline_parallel=bool(self.pp_enabled),
+            partial_graphs_enabled=self.partial_cuda_graph_manager is not None,
+        )
+        if self.whole_step_graph is not None:
+            self._whole_step_graph_capture_pending = True
+            self._whole_step_graph_validate_pending = self.model_parts[0].backend.cuda_graph.validate_whole_step
+            self._whole_step_num_label_tokens = torch.zeros((), dtype=torch.float32, device=self.dist_env.device)
         torch.cuda.empty_cache()
 
         # Log step scheduler details
@@ -1135,6 +1200,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
                         self.partial_cuda_graph_manager.capture()
                         self._partial_cuda_graph_capture_pending = False
+                    # The whole-step graph records this step's shapes; the label-token
+                    # buffer still holds this step's count, so the warmup matches it.
+                    if self.whole_step_graph is not None and self._whole_step_graph_capture_pending:
+                        self.whole_step_graph.capture(batches)
+                        self._whole_step_graph_capture_pending = False
                     # Collect MoE load balance metrics (all ranks participate in all-reduce)
                     self._collect_moe_load_balance()
                     # log
@@ -1199,6 +1269,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.partial_cuda_graph_manager.close()
             self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
+        if self.whole_step_graph is not None:
+            self.whole_step_graph.reset()
+            self.whole_step_graph = None
+        self._whole_step_graph_capture_pending = False
+        self._whole_step_graph_validate_pending = False
 
     # ------------------ helpers ------------------
     def _forward_backward_step(
@@ -1223,10 +1298,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 _packed_seq_ids [batch, sequence] supplied by the native model
                 sharder from physical seq_lens_padded [batch, num_sequences].
             loss_buffer: List receiving the detached scalar loss.
-            num_label_tokens: Global supervised-token count for loss normalization.
+            num_label_tokens: Global supervised-token count for loss normalization,
+                as a host int or a scalar device tensor. The tensor form keeps the
+                normalization on the device so the step can be captured in a CUDA
+                graph; the loss functions then receive no count and the summed
+                loss is divided once here.
             num_batches: Number of microbatches in the accumulation window.
             is_train: Whether to backpropagate the combined main and MTP loss.
         """
+        loss_normalizer: int | None = None if isinstance(num_label_tokens, torch.Tensor) else num_label_tokens
         # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
         batch = {
             k: (
@@ -1399,7 +1479,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     model=model,
                     hidden_states=get_final_hidden_states(out),
                     lm_weight=shared_lm_weight,
-                    num_label_tokens=num_label_tokens,
+                    num_label_tokens=loss_normalizer,
                     **loss_distributed_kwargs,
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
@@ -1431,7 +1511,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         labels=labels,
                         model=model,
                         scaling_factor=scaling_factor,
-                        num_label_tokens=num_label_tokens,
+                        num_label_tokens=loss_normalizer,
                         ignore_index=ignore_index,
                         # MTP shifts index physical token slots, including internal THD padding.
                         cu_seqlens=mtp_cu_seqlens,
@@ -1442,9 +1522,84 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # output container and auxiliary aliases before backward so
                 # unused full-vocabulary logits do not overlap its allocations.
                 del out, mtp_per_depth_h, mtp_per_depth_logits
+                if isinstance(num_label_tokens, torch.Tensor):
+                    # Mirror the loss functions' integer division: divide in fp32 and
+                    # round back to the loss dtype, so both paths report the same value.
+                    local_loss = (local_loss.float() / num_label_tokens).to(local_loss.dtype)
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+
+    def _forward_backward_microbatches(
+        self,
+        batches: list[dict[str, torch.Tensor]],
+        *,
+        num_label_tokens: int | torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Run forward, loss, and backward for every microbatch of one optimizer step.
+
+        Args:
+            batches: Microbatches of the accumulation window; each maps input names to
+                tensors of shape [batch, sequence] (plus any model-specific inputs).
+            num_label_tokens: Global supervised-token count as a host int or a scalar
+                device tensor; see ``_forward_backward_step``.
+
+        Returns:
+            One detached scalar loss tensor per microbatch.
+        """
+        num_batches = len(batches)
+        loss_buffer: list[torch.Tensor] = []
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+        for i, batch in enumerate(batches):
+            if i == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+            self._forward_backward_step(
+                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+            )
+            if i == 0:
+                prepare_after_first_microbatch()
+        return loss_buffer
+
+    def _forward_backward_microbatches_for_graph(self, batches: list[dict[str, torch.Tensor]]) -> list[torch.Tensor]:
+        """Step function recorded by the whole-step CUDA graph.
+
+        Args:
+            batches: Device-resident microbatches owned by the graph, with the same
+                layout as in ``_forward_backward_microbatches``.
+
+        Returns:
+            One detached scalar loss tensor per microbatch, normalized by the
+            device-resident label-token buffer.
+        """
+        if self._whole_step_num_label_tokens is None:
+            raise RuntimeError("Whole-step graph step function requires the label-token buffer")
+        return self._forward_backward_microbatches(batches, num_label_tokens=self._whole_step_num_label_tokens)
+
+    def _validate_whole_step_graph(self, batches: list[dict[str, torch.Tensor]]) -> None:
+        """Check the first replay against eager and fail when the graph deviates.
+
+        Args:
+            batches: The microbatches just replayed, with tensors of shape
+                [batch, sequence] per input name.
+        """
+        report = self.whole_step_graph.validate(batches)
+        logger.info(
+            "Whole-step graph validation at step %d: gradients=%d max_relative_rmse=%.3e (%s) "
+            "eager_repeat_relative_rmse=%.3e max_abs_loss_difference=%.3e finite=%s",
+            self.step_scheduler.step,
+            report.num_gradients,
+            report.max_relative_rmse,
+            report.worst_gradient,
+            report.max_eager_repeat_relative_rmse,
+            report.max_abs_loss_difference,
+            report.all_finite,
+        )
+        tolerance = max(1e-4, 10.0 * report.max_eager_repeat_relative_rmse)
+        if not report.all_finite or report.max_relative_rmse > tolerance:
+            raise AssertionError(
+                f"Whole-step graph gradients deviate from eager: max_relative_rmse={report.max_relative_rmse:.3e} "
+                f"exceeds tolerance {tolerance:.3e} (eager repeat noise {report.max_eager_repeat_relative_rmse:.3e})"
+            )
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
@@ -1466,6 +1621,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        if self._whole_step_num_label_tokens is not None:
+            # A zero count means every label is ignored and the summed loss is
+            # already zero; clamp so the device division never produces NaN.
+            self._whole_step_num_label_tokens.fill_(max(num_label_tokens, 1))
 
         domain_label_counts = None
         if self.domain_mixture is not None:
@@ -1504,8 +1663,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
-        loss_buffer = []
-
         # number of tokens in the batch, excluding any tail padding.
         num_tokens_in_batch = torch.tensor(
             sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
@@ -1513,18 +1670,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
-
-        for i, batch in enumerate(batches):
-            if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
-
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+        if self.whole_step_graph is not None and self.whole_step_graph.captured:
+            loss_buffer = self.whole_step_graph.replay(batches)
+            if self._whole_step_graph_validate_pending:
+                self._validate_whole_step_graph(batches)
+                self._whole_step_graph_validate_pending = False
+        elif self._whole_step_num_label_tokens is not None:
+            # Eager steps before capture use the same device normalization the
+            # graph will record, so the captured step reproduces them exactly.
+            loss_buffer = self._forward_backward_microbatches(
+                batches, num_label_tokens=self._whole_step_num_label_tokens
             )
-
-            if i == 0:
-                prepare_after_first_microbatch()
+        else:
+            loss_buffer = self._forward_backward_microbatches(batches, num_label_tokens=num_label_tokens)
 
         synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
         grad_norm = scale_grads_and_clip_grad_norm(

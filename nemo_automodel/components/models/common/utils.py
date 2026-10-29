@@ -283,20 +283,39 @@ class TEFp8Config:
 
 @dataclass(kw_only=True)
 class CudaGraphConfig:
-    """Configuration for scoped partial CUDA graphs.
+    """Configuration for CUDA graphs around the training step.
 
     Attributes:
+        mode: ``"partial"`` captures the per-layer scopes listed in ``modules``
+            with Transformer Engine. ``"whole_step"`` captures every
+            microbatch's forward, loss, and backward of one optimizer step as a
+            single graph; the optimizer, gradient clipping, and logging stay
+            eager. Whole-step capture needs fixed input shapes, no pipeline
+            parallelism, and a dispatcher that never reads device values on the
+            host (HybridEP requires ``dispatcher_capacity_factor``).
         modules: Per-layer modules to capture with Transformer Engine, following
             Megatron Core's module names. AutoModel supports whole ``attn``,
             ``moe_router``, and ``moe_preprocess`` scopes, plus the
             AutoModel-specific narrow ``te_dpa`` scope. An empty list disables
-            CUDA graphs.
+            partial CUDA graphs. Only valid with ``mode="partial"``.
+        validate_whole_step: Compare the first whole-step replay against two eager
+            reruns on the same weights and inputs, log the gradient statistics,
+            and fail when the graph deviates beyond the eager run-to-run noise.
+            Costs one extra gradient set on the device plus host copies.
     """
 
+    mode: Literal["partial", "whole_step"] = "partial"
     modules: list[Literal["attn", "te_dpa", "moe_router", "moe_preprocess"]] = field(default_factory=list)
+    validate_whole_step: bool = False
 
     def __post_init__(self) -> None:
         """Validate the declarative CUDA-graph configuration."""
+        if self.mode not in ("partial", "whole_step"):
+            raise ValueError(f"cuda_graph.mode must be 'partial' or 'whole_step', got {self.mode!r}")
+        if not isinstance(self.validate_whole_step, bool):
+            raise TypeError("cuda_graph.validate_whole_step must be a bool")
+        if self.validate_whole_step and self.mode != "whole_step":
+            raise ValueError("cuda_graph.validate_whole_step requires cuda_graph.mode='whole_step'")
         if not isinstance(self.modules, list):
             raise TypeError("cuda_graph.modules must be a list")
         if not all(isinstance(module, str) for module in self.modules):
@@ -314,6 +333,8 @@ class CudaGraphConfig:
             raise ValueError("cuda_graph.modules cannot contain both 'attn' and 'te_dpa'")
         if "moe_preprocess" in self.modules and "moe_router" not in self.modules:
             raise ValueError("'moe_preprocess' in cuda_graph.modules requires 'moe_router'")
+        if self.mode == "whole_step" and self.modules:
+            raise ValueError("cuda_graph.mode='whole_step' captures the entire step; cuda_graph.modules must be empty")
 
 
 class _MoKFunctionalConfig(Protocol):
@@ -540,7 +561,7 @@ class BackendConfig:
             microbatch's values, removing recurring host-sync stalls on the hot
             path. Never enable with a learned gate: cached metadata would go
             stale and silently corrupt expert dispatch.
-        cuda_graph: Scoped partial CUDA-graph configuration.
+        cuda_graph: Partial or whole-step CUDA-graph configuration.
     """
 
     attn: AttentionBackend = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -744,6 +765,17 @@ class BackendConfig:
             raise ValueError("'moe_router' in cuda_graph.modules requires the learned Gate (fake_balanced_gate=False)")
         if "moe_preprocess" in graph_modules and self.dispatcher != "hybridep":
             raise ValueError("'moe_preprocess' in cuda_graph.modules requires dispatcher='hybridep'")
+        if (
+            self.cuda_graph.mode == "whole_step"
+            and self.dispatcher == "hybridep"
+            and self.dispatcher_capacity_factor is None
+        ):
+            # Without a capacity the HybridEP dispatch reads the permuted row count on the
+            # host after every dispatch, which CUDA graph capture forbids.
+            raise ValueError(
+                "cuda_graph.mode='whole_step' with dispatcher='hybridep' requires dispatcher_capacity_factor "
+                "(the default dispatch reads the permuted token count on the host)"
+            )
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(
