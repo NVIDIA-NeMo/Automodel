@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Thin iterable adapter with the reference aggregated opaque checkpoint protocol."""
+"""Checkpointable Zephon stream with all-rank aggregation of opaque loader state."""
 
 from __future__ import annotations
 
@@ -100,8 +100,9 @@ class ZephonDataLoader(Iterator[TrainingBatch]):
     """One owned stream; iteration never reconstructs the work source.
 
     ``use_distributed_checkpointing`` selects BaseRecipe's all-rank auxiliary
-    state path. Deliberately does not subclass StatefulDataLoader, whose route
-    checkpoints only data-owning ranks.
+    state path so TP/PP peers participate in Zephon checkpoint collectives as
+    well as data-owning ranks. StatefulDataLoader checkpoint routing saves only
+    data-owning ranks and cannot provide that participation.
 
     The original SampleBatch keeps Zephon replay/accounting metadata unchanged.
     The consumer calls to_training and applies lightweight model-input adaptations.
@@ -177,9 +178,8 @@ class ZephonDataLoader(Iterator[TrainingBatch]):
             if iterator is not None:
                 iterator.close()
         finally:
-            # Older Zephon exposes iterator cleanup only; fresh DCP templates
-            # do not start a runtime. Also release checkpoint-only runtimes
-            # when the optional public pipeline cleanup API is available.
+            # Fresh DCP templates do not start a runtime. Release any additional
+            # pipeline-owned checkpoint runtime when its public cleanup API is available.
             close_pipeline = getattr(self._pipeline, "close", None)
             if close_pipeline is not None:
                 close_pipeline()
@@ -200,7 +200,7 @@ class ZephonDataLoader(Iterator[TrainingBatch]):
         if not isinstance(checkpoint, bytes) or not checkpoint:
             raise ValueError("Zephon checkpoint requires nonempty 'zephon' bytes")
         try:
-            # Only load trusted training checkpoints, as in the reference integration.
+            # Pickle can execute code; deserialize only trusted training checkpoints.
             decoded = pickle.loads(checkpoint)  # noqa: S301
         except (pickle.UnpicklingError, EOFError, AttributeError, ImportError, ValueError) as exc:
             raise ValueError("Zephon checkpoint contains corrupt pickle") from exc

@@ -321,7 +321,7 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
 
     # Packing does not select a kernel: SDPA/eager consume masks and Flash consumes
     # cumulative lengths. Model-aware packing/CP checks run after construction;
-    # the historical packing flag must not override the selected backend.
+    # the packing flag must not override the selected backend.
     del has_packed_sequence
     return attn_implementation, use_liger_kernel
 
