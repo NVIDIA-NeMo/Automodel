@@ -1012,3 +1012,48 @@ def test_grouped_compressor_guard_rejects_inputs_with_optional_parameter_partici
         with pytest.raises(ValueError, match="complete local window"):
             model.model(input_ids=torch.ones(1, length, dtype=torch.long), position_ids=positions, **kwargs)
         assert not called
+
+
+@pytest.mark.parametrize("group_has_window", [False, True])
+def test_hca_capture_reuses_warmed_group_decision(monkeypatch: pytest.MonkeyPatch, group_has_window: bool) -> None:
+    """Fixed-shape capture preserves the remote-peer decision without host sync."""
+    from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4Compressor
+
+    config = _tiny_config()
+    compressor = DeepseekV4Compressor(config, 128, config.head_dim, backend=BackendConfig())
+    compressor._set_hca_param_sync_group(object())
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    calls = []
+
+    def all_reduce(
+        flag: torch.Tensor,
+        *,
+        op: torch.distributed.ReduceOp.RedOpType,
+        group: object,
+    ) -> None:
+        """Write the simulated peer result in place.
+
+        Args:
+            flag: CPU int32 tensor of shape [], mutated to the group-wide flag.
+            op: Reduction operator requested by the compressor.
+            group: Test process-group sentinel.
+        """
+        calls.append(True)
+        flag.fill_(int(group_has_window))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    actual = compressor._compute_fsdp_group_has_complete_hca_window(False, torch.device("cpu"))
+    assert actual is group_has_window
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    actual = compressor._compute_fsdp_group_has_complete_hca_window(False, torch.device("cuda"))
+    assert actual is group_has_window
+    assert len(calls) == 1
+    with pytest.raises(RuntimeError, match="changed since graph warmup"):
+        compressor._compute_fsdp_group_has_complete_hca_window(True, torch.device("cuda"))
+
+    compressor._set_hca_param_sync_group(object())
+    with pytest.raises(RuntimeError, match="requires an eager warmup"):
+        compressor._compute_fsdp_group_has_complete_hca_window(False, torch.device("cuda"))
