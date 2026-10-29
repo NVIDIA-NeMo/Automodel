@@ -753,6 +753,34 @@ class TestEstimateSampleLength:
         with pytest.raises(Image.DecompressionBombError):
             Image.open(io.BytesIO(data))
 
+    @pytest.mark.parametrize("height, width", [(6432, 32), (32, 6432)])
+    def test_image_the_processor_rejects_falls_back(self, height, width, caplog):
+        processor = _qwen3_5_processor()
+        rejected = Image.new("RGB", (width, height))
+        ds_raw = [_image_example(Image.new("RGB", (280, 280))), _image_example(rejected)]
+        # Qwen rejects aspect ratios above 200, both when counting tokens and when tokenizing.
+        with pytest.raises(ValueError, match="aspect ratio must be smaller than 200"):
+            processor._get_num_multimodal_tokens(image_sizes=[(height, width)])
+
+        estimate = _estimate_sample_length(ds_raw[1], count_image_tokens=_image_token_counter(processor))
+
+        assert estimate.media_tokens == 500
+        assert estimate.total_tokens == 502
+        assert estimate.unsized_media == 1
+        with caplog.at_level(logging.WARNING):
+            packed = NeatPackConfig(pack_size=1024).build(
+                dataset=_FakeDataset([_make_vlm_sample(83), _make_vlm_sample(4)]),
+                padding_idx=0,
+                ds_raw=ds_raw,
+                processor=processor,
+            )
+
+        assert [sorted(bin_indices) for bin_indices in packed.bins] == [[0, 1]]
+        assert "1 media items have no mm_inputs_meta and no readable image size" in caplog.text
+        # Planning fallback must leave the rejection to tokenization, which replaces the sample.
+        with pytest.raises(ValueError, match="aspect ratio must be smaller than 200"):
+            processor.image_processor(images=rejected, return_tensors="pt")
+
     @pytest.mark.parametrize("form", ["pil", "lazy_bytes", "decode_false_dict", "path"])
     def test_image_tokens_come_from_image_size(self, form, tmp_path):
         # Qwen3.5 resizes 280x560 to 288x576: (288 / 16) * (576 / 16) / 2**2 = 162 tokens.
@@ -778,6 +806,29 @@ class TestEstimateSampleLength:
     def test_unreadable_image_falls_back(self):
         estimate = _estimate_sample_length(
             _image_example("https://example.com/image.png"),
+            count_image_tokens=_image_token_counter(_qwen3_5_processor()),
+        )
+
+        assert estimate.media_tokens == 500
+        assert estimate.unsized_media == 1
+
+    def test_malformed_image_header_falls_back(self):
+        data = b"P6\n3\x807 23\n255\n"
+        # Pillow's PPM parser raises ValueError, not OSError, for the non-numeric width.
+        with pytest.raises(ValueError):
+            Image.open(io.BytesIO(data))
+
+        estimate = _estimate_sample_length(
+            _image_example(data), count_image_tokens=_image_token_counter(_qwen3_5_processor())
+        )
+
+        assert estimate.media_tokens == 500
+        assert estimate.unsized_media == 1
+
+    @pytest.mark.parametrize("height, width", [(0, 64), (64, 0)])
+    def test_image_without_pixels_falls_back(self, height, width):
+        estimate = _estimate_sample_length(
+            _image_example(Image.new("RGB", (width, height))),
             count_image_tokens=_image_token_counter(_qwen3_5_processor()),
         )
 

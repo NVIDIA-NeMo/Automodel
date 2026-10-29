@@ -160,7 +160,8 @@ class _SampleLengthEstimate(NamedTuple):
     Attributes:
         total_tokens: Text plus media tokens.
         media_tokens: Image and video tokens.
-        unsized_media: Media items counted as ``_FALLBACK_MEDIA_TOKENS`` because their size is unknown.
+        unsized_media: Media items counted as ``_FALLBACK_MEDIA_TOKENS`` because their size is unknown
+            or the processor cannot count tokens for it.
     """
 
     total_tokens: int
@@ -188,7 +189,8 @@ def _image_height_width(image: object) -> tuple[int, int] | None:
     try:
         with Image.open(image) as opened:
             width, height = opened.size
-    except (OSError, Image.DecompressionBombError):
+    except (OSError, ValueError, Image.DecompressionBombError):
+        # Some Pillow parsers raise ValueError for a malformed header, e.g. a non-numeric PPM width.
         return None
     return height, width
 
@@ -246,24 +248,36 @@ def _estimate_video_tokens(vid_meta, video_cfg: dict) -> int:
     return grid_t * (resized_h // video_cfg["patch_size"]) * (resized_w // video_cfg["patch_size"]) // merge_length
 
 
-def _image_token_counter(processor) -> Callable[[int, int], int] | None:
+def _image_token_counter(processor) -> Callable[[int, int], int | None] | None:
     """Return ``(height, width) -> image tokens`` from the processor, or ``None`` when it cannot count them.
 
     Uses ``_get_num_multimodal_tokens``, the per-image token count that Hugging Face
     VLM processors expose for serving engines, so each processor applies its own
-    resize, patching and token merging.
+    resize, patching and token merging. The counter returns ``None`` for an image
+    without pixels and for a size the processor rejects, such as an aspect ratio
+    above Qwen's limit of 200. Processing that image fails again at tokenization,
+    where ``PreTokenizedDatasetWrapper`` replaces the sample.
     """
     get_num_multimodal_tokens = getattr(processor, "_get_num_multimodal_tokens", None)
     if get_num_multimodal_tokens is None:
         return None
-    return lambda height, width: get_num_multimodal_tokens(image_sizes=[(height, width)]).num_image_tokens[0]
+
+    def count_image_tokens(height: int, width: int) -> int | None:
+        if height < 1 or width < 1:
+            return None
+        try:
+            return get_num_multimodal_tokens(image_sizes=[(height, width)]).num_image_tokens[0]
+        except ValueError:
+            return None
+
+    return count_image_tokens
 
 
 def _estimate_sample_length(
     example: dict,
     image_cfg: dict | None = None,
     video_cfg: dict | None = None,
-    count_image_tokens: Callable[[int, int], int] | None = None,
+    count_image_tokens: Callable[[int, int], int | None] | None = None,
 ) -> _SampleLengthEstimate:
     """Estimate token count from raw conversation without tokenization.
 
@@ -272,7 +286,8 @@ def _estimate_sample_length(
     estimated via ``smart_resize`` from ``mm_inputs_meta`` sizes when processor
     configs are provided. Without metadata, images are sized from their pixels
     and ``count_image_tokens(height, width)`` converts each size to tokens.
-    Media of unknown size, or without a counter, count as ``_FALLBACK_MEDIA_TOKENS``.
+    Media whose size is unknown or that the counter returns ``None`` for, and all
+    media without a counter, count as ``_FALLBACK_MEDIA_TOKENS``.
     """
     # Text tokens
     precomputed = example.get("_text_tokens")
@@ -317,14 +332,16 @@ def _estimate_sample_length(
     else:
         media_tokens = 0
         for item in media_items:
-            size = None
+            image_tokens = None
             if item["type"] == "image" and count_image_tokens is not None:
                 size = _image_height_width(item.get("image"))
-            if size is None:
+                if size is not None:
+                    image_tokens = count_image_tokens(*size)
+            if image_tokens is None:
                 media_tokens += _FALLBACK_MEDIA_TOKENS
                 unsized_media += 1
             else:
-                media_tokens += count_image_tokens(*size)
+                media_tokens += image_tokens
 
     return _SampleLengthEstimate(text_tokens + media_tokens, media_tokens, unsized_media)
 
