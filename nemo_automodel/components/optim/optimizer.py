@@ -50,7 +50,7 @@ from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.optim.dion import _get_dion_mesh, build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
@@ -362,8 +362,12 @@ class _DionConfigBase(OptimizerConfig):
 
     # Dion optimizers are incompatible with Megatron-FSDP optimizer sharding.
     supports_megatron_fsdp_sharding: ClassVar[bool] = False
-    supports_batched_matrices: ClassVar[bool] = False
     use_matrix_layout: ClassVar[bool] = False
+
+    @property
+    def supports_batched_matrices(self) -> bool:
+        """Whether 3D+ weights go to the matrix optimizer; Dion treats them as scalars."""
+        return False
 
     lr: float = 5e-4
     weight_decay: float = 0.0
@@ -568,7 +572,7 @@ class MuonConfig(_DionConfigBase):
             foreign_matrix_shards = [
                 placement.dim
                 for i, placement in enumerate(param.placements)
-                if placement.is_shard()
+                if isinstance(placement, Shard)
                 and placement.dim % param.ndim >= param.ndim - 2
                 and param.device_mesh.size(i) > 1
                 and param.device_mesh.get_group(i) != process_group
@@ -633,8 +637,12 @@ class MuonConfig(_DionConfigBase):
 class MuownConfig(_DionConfigBase):
     """Muown: per-neuron Adam magnitudes and Dion Muon directions, including MoE."""
 
-    supports_batched_matrices: ClassVar[bool] = True
     use_matrix_layout: ClassVar[bool] = True
+
+    @property
+    def supports_batched_matrices(self) -> bool:
+        """Muown updates every expert of a grouped weight as its own matrix."""
+        return True
 
     lr: float = 3e-4
     mu: float = 0.95

@@ -32,7 +32,10 @@ class _DionFamilyConfig(Protocol):
     scalar_opt: str
     scalar_betas: tuple[float, float]
     scalar_eps: float
-    supports_batched_matrices: ClassVar[bool]
+
+    @property
+    def supports_batched_matrices(self) -> bool: ...
+
     use_matrix_layout: ClassVar[bool]
 
 
