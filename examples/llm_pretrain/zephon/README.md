@@ -141,11 +141,6 @@ seed, and global batch size across resumes. See
 and [checkpointing and resuming](https://docs.zephon.io/pipelines/checkpointing_and_resuming.html)
 for the underlying Zephon guarantees.
 
-For distributed runs over finite sources, set
-`dataloader.zephon.runtime.mtp_mode: false` to avoid a known end-of-data
-checkpointing hang. See the [Zephon fix](https://github.com/datologyai/zephon/pull/91)
-for its status.
-
 DP, TP, and PP follow AutoModel's model and backend capabilities. Context
 parallelism is not supported by this integration. Zephon currently supplies
 training data only; AutoModel's existing validation loaders remain available.
