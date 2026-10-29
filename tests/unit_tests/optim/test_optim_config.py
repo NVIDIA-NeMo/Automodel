@@ -387,7 +387,7 @@ class TestDionFamilyConfigs:
         assert len(opt.param_groups) >= 2  # matrix group + scalar/embed group(s)
 
     @pytest.mark.parametrize("adjust_lr", ["spectral_norm", "rms_norm"])
-    def test_muon_transposed_experts_match_independent_matrices(self, adjust_lr):
+    def test_muon_transposed_experts_match_independent_matrices(self, adjust_lr, eager_dion):
         # Grouped experts store [expert, in, out]; Muon must update each expert like plain dion.Muon on its
         # [out, in] transpose, including the shape-dependent LR scale and decoupled weight decay.
         dion = pytest.importorskip("dion")
@@ -421,14 +421,13 @@ class TestDionFamilyConfigs:
             nesterov=False,
             epsilon=1e-8,
         )
-        with torch.compiler.set_stance("force_eager"):
-            for _ in range(3):
-                for param, matrices in zip(experts, references):
-                    param.grad = torch.randn_like(param)
-                    for matrix, grad in zip(matrices, param.grad):
-                        matrix.grad = grad.mT.clone()
-                opt.step()
-                reference_opt.step()
+        for _ in range(3):
+            for param, matrices in zip(experts, references):
+                param.grad = torch.randn_like(param)
+                for matrix, grad in zip(matrices, param.grad):
+                    matrix.grad = grad.mT.clone()
+            opt.step()
+            reference_opt.step()
         for param, before, matrices in zip(experts, initial, references):
             assert not torch.allclose(param.detach(), before)
             torch.testing.assert_close(param.detach(), torch.stack([m.detach().mT for m in matrices]))
