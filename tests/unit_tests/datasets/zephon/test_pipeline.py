@@ -105,3 +105,22 @@ def test_numeric_overrides_reject_unknown_vocabulary_ids_before_source_start(
         with pytest.raises(ValueError, match="eos_token_id=9999 is not an existing tokenizer vocabulary ID"):
             create_text_pipeline(config, tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
         create_source.assert_not_called()
+
+
+@pytest.mark.parametrize("answer_only", [False, True])
+def test_chat_header_supervision_only_applies_to_assistant_loss(
+    config: ZephonDataloaderConfig, tokenizer: PreTrainedTokenizerFast, answer_only: bool
+) -> None:
+    tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    config = replace(
+        config,
+        dataset_config=ZephonInstructionSourceConfig(
+            column_mapping={"question": "q", "answer": "a"},
+            use_hf_chat_template=True,
+            answer_only_loss_mask=answer_only,
+        ),
+    )
+    with patch.object(Pipeline, "tokenize_chat", autospec=True, side_effect=Pipeline.tokenize_chat) as chat:
+        create_text_pipeline(config, tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+    assert chat.call_args.kwargs["supervise_assistant_header"] is answer_only
+    assert chat.call_args.kwargs["loss_scope"] == ("all_assistant" if answer_only else "all_tokens")
