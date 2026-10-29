@@ -25,9 +25,9 @@ The nightly and v0.4 trees were byte-for-byte identical at the moment 0.4.0 ship
 
 Fern has no native way to source a version train's prose from another git ref: `fern generate --docs` reads the single local working tree, and publish is a full-site snapshot (a train missing from the tree is *unpublished*). So frozen GA pages are kept off `main` on the **`docs-archive` branch** and restored before every Fern build.
 
-- **The registry** lives inline in each `fern-docs-*` workflow as `archived-versions: |` lines of `<version-dir>=<git-ref>` (today: `v0.4=docs-archive`). The `<git-ref>` is opaque: a **branch** (default — all frozen versions in one place, easy back-ports) or a **tag** like `docs/v0.4.0` (immutable snapshot). `latest` is an alias of an existing pages tree and needs **no** entry.
-- **The mechanism** is the `.github/actions/stitch-fern-versions` composite action: `git fetch --depth=1 origin <ref>` then `git restore --source=FETCH_HEAD -- docs/fern/versions/<vdir>/pages`. It runs in `publish-fern-docs.yml`, `fern-docs-ci.yml`, and `fern-docs-preview-build.yml`. `docs.yml` + the nav YAMLs always come from the live checkout, never the archive ref, so frozen prose can't drift into the wrong train.
-- **Locally**, `make docs` / `docs-check` / `docs-preview` depend on `make docs-stitch`, which does the same restore. Override the ref with `make docs-check ARCHIVE_REF=docs/v0.4.0`.
+- **The registry** for checking and publishing lives in the Makefile's `docs-stitch` target, invoked by `tools/docs/check_docs.py`. Archived preview builds declare their archive inputs in their workflow. The `<git-ref>` is opaque: a **branch** (default — all frozen versions in one place, easy back-ports) or a **tag** like `docs/v0.4.0` (immutable snapshot). `latest` is an alias of an existing pages tree and needs **no** entry.
+- **The mechanism** is the `.github/actions/stitch-fern-versions` composite action in archived preview builds, or the equivalent Makefile `docs-stitch` target in local checks, CI checks, and publishing: `git fetch --depth=1 origin <ref>` then `git restore --source=FETCH_HEAD -- docs/fern/versions/<vdir>/pages`. `docs.yml` + the nav YAMLs always come from the live checkout, never the archive ref, so frozen prose can't drift into the wrong train.
+- **Locally**, `make docs` / `docs-preview` and the shared checker use `make docs-stitch`, which does the same restore. Override the check's archive ref with `ARCHIVE_REF=docs/v0.4.0 uv run --script tools/docs/check_docs.py`.
 - The restored path is gitignored on `main`, so a local stitch won't show the pages as untracked.
 
 **Sidebar fidelity rule.** Section captions, page titles, and Model Coverage child ordering must match the **published v0.4.0 sidebar at docs.nvidia.com/nemo/automodel/latest** verbatim. Don't silently shorten a title or reorder siblings — the docs PM and content engineers diff against the published site and any drift is treated as a regression. If you want a shorter sidebar label, change the toctree-derived display name in the source — never just retitle in the MDX.
@@ -87,7 +87,7 @@ docs/fern/versions/v0.4/pages/get-started/installation.mdx     /latest/get-start
      slug: <short-url-segment>
    ```
 
-4. `make docs-check` (runs `fern check`) and verify URL resolves on `make docs` preview. There is no `nightly.yml` ↔ `latest.yml` alias-sync step under this layout — `latest.yml` mounts the frozen v0.4 tree, not nightly, so it's intentionally out of sync.
+4. Run `uv run --script tools/docs/check_docs.py` from the repository root and verify the URL resolves on `make docs` preview. There is no `nightly.yml` ↔ `latest.yml` alias-sync step under this layout — `latest.yml` mounts the frozen v0.4 tree, not nightly, so it's intentionally out of sync.
 
 ### Update a page
 
@@ -95,7 +95,26 @@ docs/fern/versions/v0.4/pages/get-started/installation.mdx     /latest/get-start
 2. **Content only** — edit the single MDX file at `docs/<...>.mdx`.
 3. **Title change** — update the frontmatter `title:` and update the `- page:` entry's display label in `docs/fern/versions/nightly.yml`.
 4. **Section move** — `git mv` the file within `docs/`, update `path:` in `nightly.yml`, fix incoming links.
-5. **Slug change** — change `slug:` in the YAML (or rename the file and let the default slug update). Add a `redirects:` entry in `docs/fern/docs.yml` so the old URL keeps working.
+5. **Slug change** — set an explicit `slug:` while keeping the source filename stable. For model cards, set the full route in MDX frontmatter; keep the navigation `path:` pointing to that file. Add a `redirects:` entry in `docs/fern/docs.yml` so the old published URL keeps working.
+
+### Model repository name becomes public
+
+Keep the existing model-card filename and directory when the released checkpoint
+name differs from the original MDX name. Update its frontmatter `title`, `description`, and
+explicit `slug`, Hugging Face links, and linked recipe checkpoint IDs to the
+released identity. Update the sidebar label and provider-index link, leaving the
+navigation `path` pointed at the original MDX file. For example, an existing
+`preview-name.mdx` can use:
+
+```yaml
+title: "Released-Model-7B"
+slug: model-coverage/large-language-models/org/Released-Model-7B
+```
+
+The source filename does not determine the public model name or route. Do not
+rename, move, or duplicate the card to match the release name. Add redirects for
+previously published docs-site routes, and preserve existing compatibility copies.
+Run the shared docs check to validate the metadata, navigation, and recipe identity.
 
 ### Redirect quirks
 
@@ -137,7 +156,7 @@ Request: *"Add a fine-tuning guide for Qwen3.6 under Recipes & E2E Examples."*
      slug: qwen3-6-finetune
    ```
 
-3. `make docs-check` then `make docs` to preview at `http://localhost:3002/nightly/recipes-e2e-examples/qwen3-6-finetune`.
+3. Run `uv run --script tools/docs/check_docs.py` from the repository root, then `make docs` in `docs/fern/` to preview at `http://localhost:3002/nightly/recipes-e2e-examples/qwen3-6-finetune`.
 
 ### Worked example: rename a slug with a redirect
 
@@ -211,13 +230,33 @@ For cross-repo references (yaml configs, Python source), use absolute GitHub URL
 
 ## Validate
 
+The only docs-check entry point for contributors, agents, and CI is
+`tools/docs/check_docs.py`. Run it from the repository root before committing or
+opening a PR:
+
 ```bash
-make docs-check          # MDX syntax validation + `fern check`
+uv run --script tools/docs/check_docs.py
 ```
 
-Run from `docs/fern/` (`cd docs/fern && make docs-check`) or anywhere with `make -C docs/fern docs-check`.
+This validates documentation sources before generation, then runs the MDX and
+Fern checks with the pinned Fern CLI. It installs only the isolated docs
+dependencies (PyYAML), requires Node.js 20 and `make`, and cleans generated tables
+and styles after validation, including on failure.
 
-`make docs-check` must pass before commit. It runs a no-secret MDX parser before `fern check`, so raw HTML must be valid JSX (for example, use `<img ... />`, not `<img ...>`). The dev server's broken-link warnings for version-prefixed routes (e.g. `/latest/get-started/installation` from MDX that uses `/get-started/installation`) are **false positives** — Fern's strict validator doesn't resolve version-agnostic links. The published site renders them correctly. The URLMap-based `validate_fern_internal_links.py` (under the convert-to-fern toolkit) is authoritative.
+Add validation steps to the script so local checks and CI stay in sync.
+Keep source validation implementations in `tools/docs/`; pytest provides
+regression tests for the tools instead of owning documentation rules.
+Mirror the `checks/`, `build/`, and `assets/` layout under
+`tests/unit_tests/tools/docs/`; shared metadata belongs in `catalog.py`.
+The Makefile's `docs-check` and `docs-mdx-check` targets forward to the script
+for compatibility; `_docs-check` is internal to the script.
+
+Publishing invokes the same script with `--keep-generated` to retain validated
+model-coverage tables for deployment. The script owns table generation; the
+publish workflow must not invoke the generator separately. Failures always
+clean up generated tables.
+
+The shared check must pass before commit. It runs a no-secret MDX parser before `fern check`, so raw HTML must be valid JSX (for example, use `<img ... />`, not `<img ...>`). The dev server's broken-link warnings for version-prefixed routes (e.g. `/latest/get-started/installation` from MDX that uses `/get-started/installation`) are **false positives** — Fern's strict validator doesn't resolve version-agnostic links. The published site renders them correctly. The URLMap-based `validate_fern_internal_links.py` (under the convert-to-fern toolkit) is authoritative.
 
 To regenerate the autodoc library reference (gitignored under `docs/fern/product-docs/`):
 
@@ -232,18 +271,18 @@ make docs                # runs `fern docs md generate` then `fern docs dev`
 | Goal | Command |
 |---|---|
 | Local preview at `http://localhost:3002` | `make docs` |
-| Validation only (no server) | `make docs-check` |
+| Validate before pushing (no server; run at repo root) | `uv run --script tools/docs/check_docs.py` |
 | Shared preview URL on `*.docs.buildwithfern.com` (needs `DOCS_FERN_TOKEN`) | `make docs-preview` |
 | Trigger production publish workflow on `origin/main` | `make docs-publish` |
 
 PRs that touch `docs/**` get an automatic Fern preview URL posted as a 🌿 comment by `fern-docs-preview-comment.yml`. No manual step.
 
-Every job below first runs the `stitch-fern-versions` action to restore the archived
-backward-version pages (the `docs-archive` branch) into the working copy — the frozen
-trees are not on `main`.
+Check and publish workflows use the shared script's Makefile target to restore
+archived pages; previews restore archives in their own trusted build steps.
+Frozen backward-version trees live on `docs-archive`, not on `main`.
 
 ```
-                    ┌─ fern-docs-ci.yml                  → stitch → MDX syntax → fern check (push to pull-request/<n>)
+                    ┌─ fern-docs-ci.yml                  → tools/docs/check_docs.py (push to pull-request/<n>)
 PR (touches docs/) ─┼─ fern-docs-preview-build.yml       → stitch → upload docs/ artifact (no secrets)
                     └─ fern-docs-preview-comment.yml     → 🌿 preview URL comment (consumes artifact)
 
@@ -263,7 +302,7 @@ When NeMo AutoModel ships a new GA (e.g. `v0.5`):
 3. Update `docs/fern/versions/latest.yml` to point at the new train: `cp docs/fern/versions/v0.5.yml docs/fern/versions/latest.yml`. (`latest` is the auto-bumping GA alias.)
 4. In `docs/fern/docs.yml` `versions:`, add a new frozen-pin entry (`display-name: "0.5.0 · 26.07"`, `slug: v0.5`, `availability: stable`) and keep the previous pin (`v0.4`) for permalink stability.
 5. **Archive the frozen tree off `main`** (see *Archived backward versions*): commit `docs/fern/versions/v0.5/pages/` onto the `docs-archive` branch and push it, then `git rm -r docs/fern/versions/v0.5/pages` from `main` and add that path to `.gitignore`. The `v0.5.yml`/`latest.yml`/`docs.yml` config stays on `main`.
-6. Add `v0.5=docs-archive` to the `archived-versions:` registry in `publish-fern-docs.yml`, `fern-docs-ci.yml`, and `fern-docs-preview-build.yml` (and the `.gitignore` line). `docs/` keeps moving forward as the bleeding-edge tree; the new frozen snapshot only changes via deliberate back-port on `docs-archive`.
+6. Add the new version to the archive inputs in preview workflows, the shared `docs-stitch` target in `docs/fern/Makefile`, and `.gitignore`. `docs/` keeps moving forward as the bleeding-edge tree; the new frozen snapshot only changes via deliberate back-port on `docs-archive`.
 7. Promote `nightly` to `availability: stable` if and when its content tree gets cut over.
 8. Tag `docs/v0.5.0` and push to publish.
 
@@ -291,7 +330,7 @@ If sign-off is missing on a recent commit, amend with `git commit --amend -s`. P
 | Image not rendering | Use relative path (`./image.png`) for page-scoped images, not root-relative (`/image.png`) |
 | Sidebar caption looks shortened vs published site | Compare against `docs.nvidia.com/nemo/automodel/latest` and restore the verbatim title in `docs/fern/versions/nightly.yml` |
 | `path: ../../foo.mdx` doesn't resolve | Confirm the MDX file is at `docs/foo.mdx` (top level), not still under `docs/fern/versions/nightly/pages/` — that legacy tree no longer exists |
-| `fern check` fatals on missing `./v0.4/pages/...` paths | The frozen v0.4 tree isn't checked out. Run `make docs-stitch` (or `make docs-check`, which depends on it) to restore it from the `docs-archive` branch |
+| `fern check` fatals on missing archived page paths | Run `uv run --script tools/docs/check_docs.py` from the repository root; it restores the frozen trees from `docs-archive` before validation |
 | `archive ref '...' does not contain '...'` in CI | The `stitch-fern-versions` action couldn't find the version's pages on its registry ref. Confirm the `docs-archive` branch (or the configured tag) still holds `docs/fern/versions/<vdir>/pages` |
 
 ## Key references

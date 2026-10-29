@@ -46,7 +46,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
-pytestmark = pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required")
+pytestmark = [pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required"), pytest.mark.cpu_only]
 
 MAX_NORM = 1.0
 _WORLD = 4

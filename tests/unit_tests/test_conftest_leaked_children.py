@@ -26,7 +26,7 @@ import pytest
 pytest_plugins = ["pytester"]
 
 # The inner pytest subprocess imports torch from scratch and needs a few seconds beyond the 5s fallback.
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 _CONFTEST_SOURCE = Path(__file__).with_name("conftest.py").read_text()
 
