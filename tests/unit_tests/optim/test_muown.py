@@ -35,10 +35,9 @@ from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
 
 @pytest.fixture(autouse=True)
-def eager_optimizer():
+def eager_optimizer(eager_dion):
     # Compilation has a separate GPU smoke test; keep CPU unit tests inexpensive.
-    with torch._dynamo.config.patch(disable=True):
-        yield
+    yield
 
 
 @pytest.mark.parametrize("shape", [(3, 8, 12), (2, 24, 8)])
