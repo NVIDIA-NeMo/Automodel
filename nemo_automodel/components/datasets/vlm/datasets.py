@@ -1561,10 +1561,7 @@ def encode_vlm_document(
         ValueError: Expanded tokens exceed the configured limit. Other processor or
             template errors propagate without being classified as corrupt media.
     """
-    from nemo_automodel.components.datasets.vlm.collate_fns import (
-        _extract_media_from_conversations,
-        build_labels_from_template,
-    )
+    from nemo_automodel.components.datasets.vlm.collate_fns import build_labels_from_template
     from nemo_automodel.components.datasets.vlm.fake_image import (
         _conversation_has_media,
         inject_fake_image_into_conversation,
@@ -1615,22 +1612,16 @@ def encode_vlm_document(
     )
     chat_template = resolve_chat_template_string(chat_template)
     template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
-    if template_has_generation_kwd:
-        result = processor.apply_chat_template(
-            [conversation],
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            return_assistant_tokens_mask=True,
-            processor_kwargs=processor_kwargs,
-            **template_kwargs,
-        )
-    else:
-        text = processor.apply_chat_template([conversation], tokenize=False, **template_kwargs)
-        if isinstance(text, list):
-            text = text[0]
-        images, videos = _extract_media_from_conversations([conversation])
-        result = processor(text=[text], images=images, videos=videos, return_tensors="pt", **processor_kwargs)
+    # The processor owns media expansion and special-token handling in either path.
+    result = processor.apply_chat_template(
+        [conversation],
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        return_assistant_tokens_mask=template_has_generation_kwd,
+        processor_kwargs=processor_kwargs,
+        **template_kwargs,
+    )
     if post_tokenize_hook is not None:
         result = post_tokenize_hook(result, processor)
 
