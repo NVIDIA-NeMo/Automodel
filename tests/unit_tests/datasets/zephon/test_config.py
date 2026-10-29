@@ -358,3 +358,27 @@ def test_disabled_packing_defaults_and_incompatible_options() -> None:
     for length in (0, -1, True, 1.5):
         with pytest.raises(ValueError, match="seq_len must be positive"):
             ZephonPackingOptions(seq_len=length)
+
+
+def test_pretokenized_recipe_selects_optional_packing(tmp_path: Path) -> None:
+    from nemo_automodel.components.datasets.zephon import ZephonPretokenizedTextSourceConfig
+
+    for algorithm in ("wrap", None):
+        values = {
+            "dataset": {
+                "_target_": "nemo_automodel.components.datasets.zephon.ZephonPretokenizedTextSourceConfig",
+                "tokens_field": "tokens",
+            },
+            "dataloader": {
+                "_target_": "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
+                "zephon": {
+                    "sources": [{"name": "tokens", "path": str(tmp_path)}],
+                    "packing": {"seq_len": 7, "pack_algorithm": algorithm},
+                },
+            },
+            "step_scheduler": {"max_steps": 2},
+        }
+        loader = RecipeConfig(ConfigNode(values)).dataloader
+        assert isinstance(loader.dataset_config, ZephonPretokenizedTextSourceConfig)
+        assert loader.dataset_config.tokens_field == "tokens"
+        assert loader.zephon.packing.pack_algorithm == algorithm

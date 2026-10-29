@@ -14,9 +14,13 @@
 
 """Local token resolution and source normalization contracts."""
 
+import numpy as np
 import pytest
 
+from nemo_automodel.components.datasets.zephon.config import ZephonPretokenizedTextSourceConfig
 from nemo_automodel.components.datasets.zephon.llm import (
+    measure_pretokenized_document,
+    normalize_pretokenized_document,
     resolve_token_ids,
 )
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
@@ -36,3 +40,73 @@ def test_pad_override_and_eos_collision(tokenizer):
 def test_padding_id_requires_an_integer(tokenizer, pad_id):
     with pytest.raises(ValueError, match="existing tokenizer vocabulary ID"):
         resolve_token_ids(tokenizer, pad_token_id=pad_id)
+
+
+def test_pretokenized_schema_preserves_unshifted_tokens_and_masks():
+    config = ZephonPretokenizedTextSourceConfig(tokens_field="tokens")
+    actual = normalize_pretokenized_document(
+        {"tokens": [2, 3, 1], "loss_mask": [0, 1, 1]}, config=config, valid_token_ids=np.arange(6, dtype=np.int64)
+    )
+    assert actual["input_ids"].tolist() == [2, 3, 1]
+    assert actual["loss_mask"].tolist() == [0, 1, 1]
+    unmasked = normalize_pretokenized_document(
+        {"tokens": [2, 3, 1]}, config=config, valid_token_ids=np.arange(6, dtype=np.int64)
+    )
+    assert unmasked["loss_mask"].tolist() == [1, 1, 1]
+    for malformed in (
+        {"tokens": [2.0, 3.0]},
+        {"tokens": [2, 3], "labels": [3, 1]},
+        {"tokens": [2, 3], "positions": [0, 1]},
+        {"tokens": [2, 3], "loss_mask": [0]},
+        {"tokens": [2, 3], "attention_mask": [1, 0]},
+        {"tokens": [2, 3], "attention_mask": []},
+        {"tokens": [2, 3], "attention_mask": [2, 1]},
+        {"tokens": [2.0]},
+    ):
+        with pytest.raises(ValueError):
+            normalize_pretokenized_document(malformed, config=config, valid_token_ids=np.arange(6, dtype=np.int64))
+
+
+def test_pretokenized_validation_preserves_vocabulary_holes_and_signed_range():
+    config = ZephonPretokenizedTextSourceConfig()
+    valid = np.array([0, 2, 5, np.iinfo(np.int64).max], dtype=np.int64)
+    for tokens in ([2, 5], np.array([2, 5], dtype=np.uint64), [2, np.iinfo(np.int64).max]):
+        actual = normalize_pretokenized_document({"input_ids": tokens}, config=config, valid_token_ids=valid)
+        assert actual["input_ids"].tolist() == list(tokens)
+        assert measure_pretokenized_document({"input_ids": tokens}, tokens_field="input_ids") == 2
+    for tokens in ([1, 2], [-1, 2], np.array([2**63, 2], dtype=np.uint64), [2.0], [True]):
+        with pytest.raises(ValueError, match="integer tokenizer vocabulary IDs"):
+            normalize_pretokenized_document({"input_ids": tokens}, config=config, valid_token_ids=valid)
+
+
+def test_pretokenized_short_and_unsupervised_documents_are_retained():
+    config = ZephonPretokenizedTextSourceConfig(tokens_field="tokens")
+    valid = np.arange(6, dtype=np.int64)
+    for payload in (
+        {"tokens": []},
+        {"tokens": [2]},
+        {"tokens": [2, 3], "loss_mask": [0, 0]},
+        {"tokens": [2, 3], "loss_mask": [1, 1]},
+    ):
+        actual = normalize_pretokenized_document(payload, config=config, valid_token_ids=valid)
+        assert actual["input_ids"].tolist() == payload["tokens"]
+        assert actual["loss_mask"].tolist() == payload.get("loss_mask", [1] * len(payload["tokens"]))
+        assert actual["input_ids"].dtype == np.int64
+        assert actual["loss_mask"].dtype == np.uint8
+        assert measure_pretokenized_document(payload, tokens_field="tokens") == len(payload["tokens"])
+    with pytest.raises(ValueError, match="binary"):
+        normalize_pretokenized_document({"tokens": [2, 3], "loss_mask": [0, 2]}, config=config, valid_token_ids=valid)
+
+
+def test_pretokenized_positions_preserve_only_valid_offline_boundaries() -> None:
+    config = ZephonPretokenizedTextSourceConfig()
+    payload = {"input_ids": [2, 3, 4, 5], "positions": [0, 1, 0, 1]}
+    kwargs = {"config": config, "valid_token_ids": np.arange(6, dtype=np.int64)}
+    actual = normalize_pretokenized_document(payload, preserve_positions=True, **kwargs)
+    assert actual["positions"].tolist() == payload["positions"]
+    assert payload == {"input_ids": [2, 3, 4, 5], "positions": [0, 1, 0, 1]}
+    with pytest.raises(ValueError, match="require pack_algorithm=null"):
+        normalize_pretokenized_document(payload, **kwargs)
+    for positions in ([0], [1, 2, 3, 4], [0, 2, 3, 4], [0, 1, -1, 0], [0.0, 1.0, 0.0, 1.0]):
+        with pytest.raises(ValueError, match="resetting at subdocument starts"):
+            normalize_pretokenized_document({**payload, "positions": positions}, preserve_positions=True, **kwargs)
