@@ -102,6 +102,14 @@ them into batches. Zephon's `to_training()` handles shifting, padding, and
 collation. A small adapter then presents that result in the format expected by
 AutoModel's existing recipe and model.
 
+With Zephon selected, AutoModel's `dataset` section describes document
+preparation rather than constructing a native dataset object. The integration
+translates supported settings into Zephon pipeline options. Zephon
+reads `dataloader.zephon.sources` and owns mixing, tokenization, packing, and
+batching. Configure source traversal and packing under `dataloader.zephon`;
+arbitrary native dataset types and their sampling, truncation, or collator
+behavior are not automatically converted.
+
 `dataloader.output_format` selects the model input layout. The default,
 `batched`, uses ordinary `[batch, sequence]` inputs. `thd` supplies the sequence
 length metadata used by compatible native variable-length attention backends.
