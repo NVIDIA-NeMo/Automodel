@@ -44,7 +44,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, kw_only=True)
 class ZephonVlmSourceConfig:
-    """Raw AutoModel conversations containing image paths and assistant answers."""
+    """Raw image conversations using processor-owned tokens and assistant supervision.
+
+    The processor's chat template controls special tokens and turn boundaries.
+    Only assistant target regions contribute to loss; prompts and images provide
+    context. This is the native conversation objective, independent of packing.
+    """
 
     chat_template: str | None = None
     inject_fake_images: bool = True
@@ -84,6 +89,8 @@ class ZephonVlmDataloaderConfig(ZephonLoaderConfig):
                 "Zephon VLM requires dataset._target_=nemo_automodel.components.datasets.zephon.ZephonVlmSourceConfig"
             )
         values = resolve_zephon_recipe_settings(loader_values)
+        # Image documents stay whole; the text default, wrap, is not applicable.
+        values.setdefault("packing", {}).setdefault("pack_algorithm", "first_fit")
         validate_zephon_dataset_fields(dataset_values, config_type=ZephonVlmSourceConfig)
         return cls(
             dataset_config=ZephonVlmSourceConfig(**dataset_values),

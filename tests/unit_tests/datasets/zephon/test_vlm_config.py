@@ -60,6 +60,23 @@ def test_recipe_routes_images_and_inherits_processor_settings():
     assert not config.dataset_config.inject_fake_images
 
 
+def test_image_recipe_defaults_to_whole_document_packing_without_mutating_input():
+    values = _recipe()
+    del values["dataloader"]["zephon"]["pack_algorithm"]
+    config = RecipeConfig(ConfigNode(values)).vlm_dataloader
+    assert config.zephon.packing.pack_algorithm == "first_fit"
+    assert "packing" not in values["dataloader"]["zephon"]
+    assert "pack_algorithm" not in values["dataloader"]["zephon"]
+
+
+@pytest.mark.parametrize("algorithm", [None, "wrap", "best_fit_wrap"])
+def test_image_recipe_rejects_explicit_non_image_packing(algorithm):
+    values = _recipe()
+    values["dataloader"]["zephon"]["pack_algorithm"] = algorithm
+    with pytest.raises(ValueError, match="first_fit or best_fit"):
+        RecipeConfig(ConfigNode(values)).vlm_dataloader
+
+
 def test_image_example_config_resolves():
     path = Path(__file__).resolve().parents[4] / "examples/vlm_finetune/zephon/qwen2_5_vl.yaml"
     recipe = RecipeConfig(ConfigNode(yaml.safe_load(path.read_text())))

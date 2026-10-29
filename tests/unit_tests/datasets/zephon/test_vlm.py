@@ -257,6 +257,35 @@ def test_media_token_mismatch_has_a_narrow_droppable_type(processor):
         encode_vlm_document(document, processor, max_length=4, truncate=True)
 
 
+@pytest.mark.parametrize("media_type", ["video", "audio"])
+def test_unsupported_media_is_rejected_before_encoding_even_with_drop_policy(inputs, monkeypatch, media_type):
+    from nemo_automodel.components.datasets.zephon import vlm
+
+    processor_path, _ = inputs
+    operator = VlmEncoderConfig(on_media_error="drop").build(
+        pretrained_model_name_or_path=processor_path, positions=Qwen2_5_VLPositionState(tiny_vlm_config())
+    )
+    operator.setup(OpContext({}))
+
+    def must_not_encode(*args, **kwargs):
+        raise AssertionError("unsupported media reached decoding/processor execution")
+
+    monkeypatch.setattr(vlm, "encode_vlm_document", must_not_encode)
+    document = {
+        "conversation": [
+            {"role": "user", "content": [{"type": "image", "image": "unreadable.png"}]},
+            {"role": "user", "content": [{"type": media_type, media_type: "unsupported"}]},
+        ]
+    }
+    record = SampleRecord(meta=SampleMeta(sample_id=(0, 0, 0), lane_id=0, chunk_id=0), payload=document)
+    try:
+        with pytest.raises(ValueError, match=f"only image and text.*{media_type}"):
+            operator.process_one(record)
+        assert record.payload is document
+    finally:
+        operator.teardown()
+
+
 @pytest.mark.parametrize("output_format", ["batched", "thd"])
 def test_image_batch_uses_gathered_metadata_request_only_for_batched_output(output_format):
     from nemo_automodel.components.datasets.zephon.output import convert_batch_output
