@@ -48,21 +48,12 @@ The MedPix recipe also freezes the vision tower; the Tulu3 recipe builds only th
 W&B is opt-in: set `wandb.enable: true` and configure your entity and project when launching.
 With TP1, the data-parallel degree for batch accounting is `world_size / (PP * CP)`.
 
-## Prepare the Checkpoint
+## Checkpoint
 
-The native checkpoint contains `params.json`, `tekken.json`, `chat_template.jinja`,
-`consolidated.safetensors.index.json` and the weight shards. Create a metadata view for
-image-text training; the FP8 shards are linked, not copied:
-
-```bash
-uv run python tools/checkpoint/prepare_mistral_large4.py \
-  /path/to/checkpoint /path/to/prepared-mistral-large4 --multimodal
-```
-
-Set `model.pretrained_model_name_or_path` and `processor.pretrained_model_name_or_path` to the
-prepared directory. `checkpoint.dequantize_base_checkpoint: true` reconstructs the FP8 payloads in
-FP32 and stores the weights in BF16. Router, LeRoPE and indexer-normalization state stays in FP32.
-FP8 indexer and KV-cache execution are disabled for training.
+The recipes load `mistralai/Mistral-Large-4-1T-A52B` directly.
+`checkpoint.dequantize_base_checkpoint: true` reconstructs the FP8 payloads in FP32 and stores the
+weights in BF16. Router, LeRoPE and indexer-normalization state stays in FP32. FP8 indexer and
+KV-cache execution are disabled for training.
 
 ## Prepare Packed Tulu3 Data
 

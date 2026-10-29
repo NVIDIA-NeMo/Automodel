@@ -31,6 +31,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: mistralai/Mistral-Large-4-1T-A52B
+  architectures: [MistralLarge4ForCausalLM]
   dtype: bfloat16
   attn_implementation: sdpa
   use_liger_kernel: false

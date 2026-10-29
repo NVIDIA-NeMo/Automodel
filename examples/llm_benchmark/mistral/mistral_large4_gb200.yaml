@@ -95,7 +95,7 @@ model:
     tie_word_embeddings: false
     dtype: bfloat16
     # nope_layer_flags, kv_source_layers, index_sharing and indexer_nope_layer_flags
-    # are omitted: the class defaults are identical to params.json (nope "rope,rope,rope,nope",
+    # are omitted: the class defaults equal the released config (NoPE every fourth layer,
     # KV source 35 for layers 39+ with i%4==3, shared indexer for i>=17 with i%4 in (1,2)).
   torch_dtype: bfloat16
   trust_remote_code: false

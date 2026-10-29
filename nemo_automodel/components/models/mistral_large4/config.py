@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for the Mistral Large 4 Mistral Large 4 text backbone."""
+"""Configuration for Mistral Large 4."""
 
 import copy
-import json
-from pathlib import Path
 from typing import TypeAlias
 
 from transformers import PretrainedConfig
@@ -28,9 +26,9 @@ ConfigValue: TypeAlias = bool | int | float | str | list["ConfigValue"] | dict[s
 
 
 class MistralLarge4Config(PretrainedConfig):
-    """Native Large 4 contract with explicit source precision metadata.
+    """Native Large 4 contract read from the released Transformers config.
 
-    Native vision metadata is consumed by the conditional-generation class.
+    Vision settings are consumed by the conditional-generation class.
     The causal class remains text-only; draft execution is not enabled.
     """
 
@@ -78,9 +76,7 @@ class MistralLarge4Config(PretrainedConfig):
         routed_scaling_factor: float = 1.0,
         norm_topk_prob: bool = True,
         tie_word_embeddings: bool = False,
-        source_quantization: dict[str, ConfigValue] | None = None,
         vision_config: dict[str, ConfigValue] | None = None,
-        mtp_config: dict[str, ConfigValue] | None = None,
         **kwargs: ConfigValue,
     ) -> None:
         kwargs.setdefault("architectures", ["MistralLarge4ForCausalLM"])
@@ -147,9 +143,7 @@ class MistralLarge4Config(PretrainedConfig):
         self.moe_intermediate_size = moe_intermediate_size
         self.routed_scaling_factor = routed_scaling_factor
         self.norm_topk_prob = norm_topk_prob
-        self.source_quantization = copy.deepcopy(source_quantization)
         self.vision_config = copy.deepcopy(vision_config)
-        self.mtp_config = copy.deepcopy(mtp_config)
         self.q_lora_rank = None
         self.scoring_func = "softmax"
         self.head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -203,139 +197,116 @@ class MistralLarge4Config(PretrainedConfig):
                 raise ValueError(f"Layer {layer} and its KV source must use the same rotary layout")
 
     @classmethod
-    def from_native(cls, path: str | Path) -> "MistralLarge4Config":
-        """Read params.json without modifying the source checkpoint."""
-        source = Path(path)
-        if source.is_dir():
-            source = source / "params.json"
-        return _config_from_params(json.loads(source.read_text()))
+    def from_dict(
+        cls, config_dict: dict[str, ConfigValue], **kwargs: ConfigValue
+    ) -> "MistralLarge4Config | tuple[MistralLarge4Config, dict[str, ConfigValue]]":
+        """Read either the released Transformers config or a saved native config.
+
+        Args:
+            config_dict: ``config.json`` contents. The released checkpoint nests
+                text and vision settings under ``text_config``/``vision_config``;
+                configs saved by this class use the flat native fields.
+            **kwargs: Existing ``PretrainedConfig.from_dict`` overrides.
+
+        Returns:
+            The configuration, plus unused kwargs when requested by the caller.
+        """
+        if "text_config" in config_dict:
+            config_dict = _config_from_hf(config_dict)
+        return super().from_dict(config_dict, **kwargs)
 
 
-def _section(params: dict[str, ConfigValue], name: str) -> dict[str, ConfigValue]:
-    """Resolve a native JSON object at the checkpoint-format boundary."""
-    value = params.get(name)
+def _section(config: dict[str, ConfigValue], name: str) -> dict[str, ConfigValue]:
+    """Resolve a nested JSON object at the checkpoint-format boundary."""
+    value = config.get(name)
     if value is None:
         return {}
     if not isinstance(value, dict):
-        raise ValueError(f"params.{name} must be an object")
+        raise ValueError(f"config.{name} must be an object")
     return value
 
 
-def _pattern(value: ConfigValue, depth: int, default: str) -> list[str]:
-    """Expand native comma-separated patterns exactly as the vendor converter."""
-    if value is None:
-        return [default] * depth
-    if not isinstance(value, str) or not value or any(not x for x in value.split(",")):
-        raise ValueError("Per-layer patterns must be nonempty comma-separated strings")
-    parts = value.split(",")
-    return (parts * ((depth + len(parts) - 1) // len(parts)))[:depth]
+_TEXT_FIELDS = (
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "vocab_size",
+    "kv_lora_rank",
+    "qk_nope_head_dim",
+    "qk_rope_head_dim",
+    "v_head_dim",
+    "rms_norm_eps",
+    "max_position_embeddings",
+    "final_logit_softcapping",
+    "index_topk",
+    "index_n_heads",
+    "index_head_dim",
+    "first_k_dense_replace",
+    "n_routed_experts",
+    "n_shared_experts",
+    "num_experts_per_tok",
+    "moe_intermediate_size",
+    "routed_scaling_factor",
+    "tie_word_embeddings",
+    "bos_token_id",
+    "eos_token_id",
+    "pad_token_id",
+)
+_VISION_FIELDS = (
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_channels",
+    "patch_size",
+    "image_size",
+)
 
 
-def _config_from_params(params: dict[str, ConfigValue]) -> MistralLarge4Config:
-    """Convert the released native configuration with explicit unsupported-setting checks."""
-    depth = int(params["n_layers"])
-    if depth <= 0:
-        raise ValueError("n_layers must be positive")
-    if (
-        params.get("q_lora_rank") is not None
-        or params.get("ragged_attention") is not None
-        or params.get("llama_4_scaling") is not None
-    ):
-        raise ValueError("Mistral Large 4 backbone requires direct queries and full causal MLA")
-    if params.get("n_kv_heads", params["n_heads"]) != params["n_heads"]:
-        raise ValueError("Mistral Large 4 MLA expects equal query and expanded KV head counts")
-    dsa, moe, yarn = (_section(params, key) for key in ("dsa", "moe", "yarn"))
-    quant = _section(params, "quantization")
-    if quant and (
-        quant.get("qscheme_act") != "BLOCK"
-        or not quant.get("qdynamic_act")
-        or not quant.get("use_ue8m0_for_qscales")
-        or quant.get("qformat_weight") != "fp8_e4m3"
-        or quant.get("block_size_out") != 128
-        or quant.get("block_size_in") != 128
-        or quant.get("qscheme_weight") != "BLOCK"
-        or quant.get("quantize_kv_a", False)
-    ):
-        raise ValueError("Only E4M3 128x128 block weights with unquantized KV-A are supported")
-    if yarn.get("apply_scale", False):
-        raise ValueError("Mistral Large 4 does not support YaRN magnitude scaling")
-    if moe.get("num_expert_groups", 1) != 1 or moe.get("num_expert_groups_per_tok", 1) != 1:
+def _config_from_hf(config: dict[str, ConfigValue]) -> dict[str, ConfigValue]:
+    """Map the released Transformers composite config onto the native fields."""
+    text, vision = _section(config, "text_config"), _section(config, "vision_config")
+    rope = _section(text, "rope_parameters")
+    depth = int(text["num_hidden_layers"])
+    dense = int(text.get("first_k_dense_replace", 0))
+    if rope.get("rope_type") != "yarn" or rope.get("attention_factor", 1.0) != 1.0:
+        raise ValueError("Mistral Large 4 uses YaRN frequencies without magnitude scaling")
+    if text.get("n_group", 1) != 1 or text.get("topk_group", 1) != 1:
         raise ValueError("Mistral Large 4 uses ungrouped softmax top-k routing")
-    rope_dim = int(params["qk_rope_head_dim"])
-    if dsa.get("rope_head_dim", rope_dim) not in (rope_dim, -1):
-        raise ValueError("Indexer rotary dimension must match MLA's rotary dimension")
-    if dsa.get("nope", False):
-        raise ValueError("Use dsa.match_nope for per-layer indexer NoPE")
-    nope = _pattern(params.get("nope"), depth, "rope")
-    if set(nope) - {"rope", "nope"}:
-        raise ValueError("nope pattern accepts only rope/nope")
-    sources = _section(params, "kv_sharing").get("source_layers_str")
-    if sources is not None and not isinstance(sources, str):
-        raise ValueError("kv_sharing.source_layers_str must be comma-separated integers")
-    mapping = {
-        "dim": "hidden_size",
-        "hidden_dim": "intermediate_size",
-        "n_layers": "num_hidden_layers",
-        "n_heads": "num_attention_heads",
-        "norm_eps": "rms_norm_eps",
-        "softmax_tanh_gating": "final_logit_softcapping",
-        "tied_embeddings": "tie_word_embeddings",
-    }
-    values = {
-        mapping.get(k, k): params[k]
-        for k in (
-            "dim",
-            "hidden_dim",
-            "n_layers",
-            "n_heads",
-            "norm_eps",
-            "vocab_size",
-            "kv_lora_rank",
-            "qk_nope_head_dim",
-            "qk_rope_head_dim",
-            "v_head_dim",
-            "rope_theta",
-            "max_position_embeddings",
-            "lerope",
-            "ssmax_scaling",
-            "softmax_tanh_gating",
-            "tied_embeddings",
-        )
-        if k in params
-    }
+    if text.get("attention_bias", False):
+        raise ValueError("Mistral Large 4 attention projections have no bias")
+    if set(text.get("layer_types", ["indexed_attention"])) != {"indexed_attention"}:
+        raise ValueError("Mistral Large 4 uses indexed sparse attention in every layer")
+    if text.get("mlp_layer_types", ["dense"] * dense + ["sparse"] * (depth - dense)) != (
+        ["dense"] * dense + ["sparse"] * (depth - dense)
+    ):
+        raise ValueError("mlp_layer_types must be dense for exactly the first first_k_dense_replace layers")
+    rope_layers = text["no_rope_layers"]
+    if not isinstance(rope_layers, list) or set(rope_layers) - {0, 1}:
+        raise ValueError("no_rope_layers must list 1 for RoPE layers and 0 for NoPE layers")
+    values = {name: text[name] for name in _TEXT_FIELDS if name in text}
     values.update(
-        nope_layer_flags=[x == "nope" for x in nope],
-        kv_source_layers=list(map(int, sources.split(","))) if sources else list(range(depth)),
-        index_sharing=_pattern(dsa.get("sharing"), depth, "full"),
-        indexer_nope_layer_flags=[x == "nope" for x in nope] if dsa.get("match_nope", False) else [False] * depth,
-        index_topk=dsa["topk"],
-        index_n_heads=dsa["n_heads"],
-        index_head_dim=dsa["head_dim"],
-        indexer_norm_eps=dsa.get("norm_eps", 1e-6),
-        indexer_ssmax_scaling=dsa.get("ssmax_scaling", False),
-        fp8_indexer=dsa.get("fp8_indexer", True),
-        fp8_kv_cache=dsa.get("fp8_kv_cache", False),
-        first_k_dense_replace=moe.get("first_k_dense_replace", 0),
-        moe_layer_freq=moe.get("route_every_n", 1),
-        n_routed_experts=moe["num_experts"],
-        n_shared_experts=moe.get("num_shared_experts", 0),
-        num_experts_per_tok=moe["num_experts_per_tok"],
-        moe_intermediate_size=moe["expert_hidden_dim"],
-        routed_scaling_factor=moe.get("routed_scale", 1.0),
-        norm_topk_prob=True,
-        yarn_factor=yarn.get("factor", 1.0),
-        yarn_original_max_position_embeddings=yarn.get(
-            "original_max_position_embeddings", params["max_position_embeddings"]
-        ),
-        yarn_beta_fast=yarn.get("beta", 32.0),
-        yarn_beta_slow=yarn.get("alpha", 1.0),
-        dtype="bfloat16",
+        rope_theta=rope["rope_theta"],
+        yarn_factor=rope["factor"],
+        yarn_original_max_position_embeddings=rope["original_max_position_embeddings"],
+        yarn_beta_fast=rope["beta_fast"],
+        yarn_beta_slow=rope["beta_slow"],
+        nope_layer_flags=[flag == 0 for flag in rope_layers],
+        kv_source_layers=text["kv_source_layers"],
+        index_sharing=text["indexer_types"],
     )
-    if quant:
-        values["source_quantization"] = quant
-        # Existing initialization detection selects bounded adapter load parts.
-        # The shared loader already bypasses this metadata on native resume.
-        values["quantization_config"] = {"quant_method": "fp8", "weight_block_size": [128, 128]}
-    values["vision_config"] = _section(params, "vision_encoder")
-    values["mtp_config"] = _section(params, "mtp")
-    return MistralLarge4Config(**values)
+    for name in ("architectures", "dtype", "quantization_config", "transformers_weights"):
+        if name in config:
+            values[name] = config[name]
+    if vision:
+        settings = {name: vision[name] for name in _VISION_FIELDS if name in vision}
+        settings.update(
+            max_image_size=vision["image_size"],
+            rope_theta=_section(vision, "rope_parameters")["rope_theta"],
+            spatial_merge_size=config["spatial_merge_size"],
+            adapter_bias=config.get("multimodal_projector_bias", False),
+            image_token_id=config["image_token_index"],
+        )
+        values["vision_config"] = settings
+    return values

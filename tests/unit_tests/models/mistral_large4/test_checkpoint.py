@@ -32,10 +32,10 @@ from nemo_automodel.components.models.mistral_large4.state_dict_adapter import (
     MistralLarge4StateDictAdapter,
     _decode_into,
 )
+from nemo_automodel.components.models.mistral_large4.vision import MistralLarge4VisionConfig
 from nemo_automodel.components.training.rng import StatefulRNG
 from tests.unit_tests.models.mistral_large4.math_reference import tiny_config
 from tests.unit_tests.models.mistral_large4.test_model import make_model
-from tools.checkpoint.prepare_mistral_large4 import prepare_checkpoint
 
 
 def step(
@@ -428,39 +428,43 @@ def test_real_dcp_populates_parts(tmp_path):
     torch.testing.assert_close(state["lm_head.weight"], dense, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("multimodal", [False, True])
-def test_preparation_refuses_existing_output(tmp_path, multimodal):
-    # Native metadata fixture is tiny and contains no released weights or tokenizer.
-    source = tmp_path / "source"
-    source.mkdir()
-    params = json.loads((Path(__file__).parent / "params.json").read_text())
-    (source / "params.json").write_text(json.dumps(params))
-    (source / "consolidated.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
-    (source / "tekken.json").write_text("{}")
-    (source / "chat_template.jinja").write_text("{{ messages }}")
-    destination = tmp_path / "prepared"
-    before = {p.name: p.read_bytes() for p in source.iterdir()}
-    prepare_checkpoint(source, destination, multimodal=multimodal)
-    restored = AutoConfig.from_pretrained(destination, local_files_only=True)
-    assert restored.architectures == (
-        ["MistralLarge4ForConditionalGeneration"] if multimodal else ["MistralLarge4ForCausalLM"]
-    )
-    assert restored.source_quantization["block_size_out"] == 128
-    assert restored.quantization_config == {"quant_method": "fp8", "weight_block_size": [128, 128]}
-    assert restored.vision_config["patch_size"] == 14
-    assert restored.mtp_config["n_layers"] == 3
-    assert (destination / "model.safetensors.index.json").resolve() == source / "consolidated.safetensors.index.json"
-    with pytest.raises(FileExistsError):
-        prepare_checkpoint(source, destination)
-    assert {p.name: p.read_bytes() for p in source.iterdir()} == before
+def _released_config() -> dict:
+    # Released Transformers config.json; it contains no weights or tokenizer.
+    return json.loads((Path(__file__).parent / "config.json").read_text())
 
 
-def test_native_invalid_variant_is_rejected(tmp_path):
-    params = json.loads((Path(__file__).parent / "params.json").read_text())
-    for changes in ({"q_lora_rank": 8}, {"tied_embeddings": True}, {"nope": "garbage"}):
-        changed = copy.deepcopy(params)
-        changed.update(changes)
-        path = tmp_path / "params.json"
-        path.write_text(json.dumps(changed))
-        with pytest.raises(ValueError):
-            MistralLarge4Config.from_native(path)
+def test_released_config_maps_to_native_fields(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps(_released_config()))
+    config = AutoConfig.from_pretrained(tmp_path, local_files_only=True)
+    assert isinstance(config, MistralLarge4Config)
+    assert config.architectures == ["MistralLarge4ForConditionalGeneration"]
+    assert config.nope_layer_flags == [layer % 4 == 3 for layer in range(72)]
+    assert config.indexer_nope_layer_flags == config.nope_layer_flags
+    assert config.kv_source_layers == [35 if layer >= 39 and layer % 4 == 3 else layer for layer in range(72)]
+    assert config.index_sharing == ["shared" if layer >= 17 and layer % 4 in (1, 2) else "full" for layer in range(72)]
+    assert (config.yarn_factor, config.yarn_original_max_position_embeddings) == (2048, 512)
+    assert (config.n_routed_experts, config.first_k_dense_replace, config.head_dim) == (128, 1, 128)
+    assert config.quantization_config["quant_method"] == "fp8"
+    assert config.transformers_weights == "consolidated.safetensors.index.json"
+    assert MistralLarge4VisionConfig(**config.vision_config) == MistralLarge4VisionConfig()
+    config.save_pretrained(tmp_path / "saved")
+    restored = AutoConfig.from_pretrained(tmp_path / "saved", local_files_only=True).to_dict()
+    assert {**restored, "_name_or_path": None} == {**config.to_dict(), "_name_or_path": None}
+
+
+@pytest.mark.parametrize(
+    "section,changes",
+    [
+        ("text_config", {"rope_parameters": {"rope_type": "default", "rope_theta": 10000.0}}),
+        ("text_config", {"n_group": 8}),
+        ("text_config", {"attention_bias": True}),
+        ("text_config", {"mlp_layer_types": ["sparse"] * 72}),
+        ("text_config", {"no_rope_layers": [2] * 72}),
+        ("text_config", {"tie_word_embeddings": True}),
+    ],
+)
+def test_released_config_rejects_unsupported_variants(section, changes):
+    config = _released_config()
+    config[section].update(changes)
+    with pytest.raises(ValueError):
+        MistralLarge4Config.from_dict(config)
