@@ -25,33 +25,22 @@ from pathlib import Path
 
 import yaml
 
-TABLE_ROW_COUNT = 10
-# Preserve model-card source paths used by marketing and published blog posts.
-# Keep compatibility copies on disk, but catalog only their canonical cards.
-MODEL_CARD_PATH_ALIASES = {
-    "docs/model-coverage/llm/moonshotai/kimi-linear.mdx": (
-        "docs/model-coverage/llm/moonshotai/kimi-linear-48b-a3b-instruct.mdx"
-    ),
-    "docs/model-coverage/diffusion/black-forest-labs/flux3-image-klein.mdx": (
-        "docs/model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base.mdx"
-    ),
-    "docs/model-coverage/llm/flint/flint.mdx": "docs/model-coverage/llm/recursivesi/flint.mdx",
-    "docs/model-coverage/vlm/meta-models/muse_spark_open.mdx": (
-        "docs/model-coverage/vlm/meta-models/muse-spark-open-816b-a42b.mdx"
-    ),
-    "docs/model-coverage/vlm/muse/muse_spark_open.mdx": (
-        "docs/model-coverage/vlm/meta-models/muse-spark-open-816b-a42b.mdx"
-    ),
-    "docs/model-coverage/vlm/stepfun-ai/step-5-preview.mdx": (
-        "docs/model-coverage/vlm/stepfun-ai/step-5-preview-bf16.mdx"
-    ),
-}
-HOMEPAGE_START_MARKER = "{/* BEGIN GENERATED LATEST MODEL SUPPORT */}"
-HOMEPAGE_END_MARKER = "{/* END GENERATED LATEST MODEL SUPPORT */}"
-SUPPORT_LOG_START_MARKER = "{/* BEGIN GENERATED MODEL SUPPORT LOG */}"
-SUPPORT_LOG_END_MARKER = "{/* END GENERATED MODEL SUPPORT LOG */}"
-REGISTRY_START_MARKER = "{/* BEGIN GENERATED MODEL ARCHITECTURES */}"
-REGISTRY_END_MARKER = "{/* END GENERATED MODEL ARCHITECTURES */}"
+from tools.docs.cards import _frontmatter_slug, _model_card_aliases, _model_card_paths
+from tools.docs.catalog import (
+    DATED_MODEL_TABLE_HEADER,
+    DATED_SUPPORT_TABLE_HEADER,
+    GENERATED_MARKER_PAIRS,
+    HOMEPAGE_END_MARKER,
+    HOMEPAGE_START_MARKER,
+    MODEL_TYPE_OVERVIEW_PATHS,
+    MODEL_TYPE_ROUTE_CATEGORIES,
+    REGISTRY_END_MARKER,
+    REGISTRY_START_MARKER,
+    SUPPORT_LOG_END_MARKER,
+    SUPPORT_LOG_START_MARKER,
+    TABLE_ROW_COUNT,
+)
+
 HF_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DOCS_PAGE_PATTERN = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._/-]*$")
 MARKDOWN_UNSAFE_PATTERN = re.compile(r"[\[\]|<>`\r\n]")
@@ -59,34 +48,6 @@ REPOSITORY_URL = "https://github.com/NVIDIA-NeMo/Automodel/blob/main"
 RECIPE_LINK_PATTERN = re.compile(
     r"https://github\.com/NVIDIA-NeMo/Automodel/blob/(?:main|[0-9a-f]{40})/"
     r"(examples/[A-Za-z0-9_./-]+\.yaml)"
-)
-DATED_SUPPORT_TABLE_HEADER = "| Date | Type | Model | Recipe |"
-DATED_MODEL_TABLE_HEADER = "| Date | Model | Architectures | Recipe |"
-MODEL_TYPE_OVERVIEW_PATHS = (
-    ("LLM", "llm/index.mdx"),
-    ("VLM", "vlm/index.mdx"),
-    ("Multimodal", "multimodal/index.mdx"),
-    ("Omni", "omni/index.mdx"),
-    ("dLLM", "dllm/index.mdx"),
-    ("Diffusion", "diffusion/index.mdx"),
-    ("Embedding", "embedding/index.mdx"),
-    ("Reranking", "reranker/index.mdx"),
-)
-MODEL_TYPE_ROUTE_CATEGORIES = {
-    "LLM": "large-language-models",
-    "Encoder-Decoder": "large-language-models",
-    "VLM": "vision-language-models",
-    "Multimodal": "multimodal",
-    "Omni": "omni",
-    "dLLM": "dllm",
-    "Diffusion": "diffusion",
-    "Embedding": "embedding-models",
-    "Reranking": "reranking-models",
-}
-GENERATED_MARKER_PAIRS = (
-    (HOMEPAGE_START_MARKER, HOMEPAGE_END_MARKER),
-    (SUPPORT_LOG_START_MARKER, SUPPORT_LOG_END_MARKER),
-    (REGISTRY_START_MARKER, REGISTRY_END_MARKER),
 )
 COMPACT_TABLE_STYLE = """<style>{`
   .compact-model-tables .fern-table-root {
@@ -206,7 +167,7 @@ def _collect_documented_recipe_urls(repo_root: Path, documented_models: list[_Mo
     recipe_urls: dict[str, str] = {}
     errors: list[str] = []
     source_paths = dict.fromkeys(model.source_path for model in documented_models)
-    source_paths.update((alias, None) for alias in MODEL_CARD_PATH_ALIASES if (repo_root / alias).is_file())
+    source_paths.update((path.relative_to(repo_root).as_posix(), None) for path in _model_card_paths(repo_root))
     urls_by_source: dict[str, str] = {}
     for source_path in source_paths:
         try:
@@ -474,63 +435,55 @@ def _model_type_for_recipe(recipe: Path, hf_model_id: str) -> str | None:
 def _load_model_doc_catalog(
     docs_root: Path,
 ) -> tuple[dict[str, list[_ModelDoc]], set[str], list[_ModelDoc]]:
-    directory_types = {
-        "llm": "LLM",
-        "vlm": "VLM",
-        "multimodal": "Multimodal",
-        "omni": "Omni",
-        "dllm": "dLLM",
-        "diffusion": "Diffusion",
-        "embedding": "Embedding",
-        "reranker": "Reranking",
-    }
+    route_types = {category: model_type for model_type, category in MODEL_TYPE_ROUTE_CATEGORIES.items()}
+    route_types["large-language-models"] = "LLM"
     model_docs: dict[str, list[_ModelDoc]] = {}
     architectures = set()
     documented_models = []
-    model_coverage_root = docs_root / "model-coverage"
-    for directory, model_type in directory_types.items():
-        for path in sorted((model_coverage_root / directory).glob("*/*.mdx")):
-            canonical = MODEL_CARD_PATH_ALIASES.get(path.relative_to(docs_root.parent).as_posix())
-            # Trusted tooling can run against a PR that predates the canonical copy.
-            if path.name == "index.mdx" or (canonical is not None and (docs_root.parent / canonical).is_file()):
-                continue
-            document = path.read_text(encoding="utf-8")
-            slug_match = re.search(r'^slug: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
-            if slug_match is None:
-                raise ValueError(f"Model coverage page is missing a slug: {path}")
-            docs_page = f"/{slug_match.group(1)}"
-            if not DOCS_PAGE_PATTERN.fullmatch(docs_page):
-                raise ValueError(f"Model coverage page has an invalid slug: {path}")
-            architecture_match = re.search(r"^\| \*\*Architecture\*\* \| ([^|]+) \|$", document, flags=re.MULTILINE)
-            architecture_display = architecture_match.group(1).strip() if architecture_match else ""
-            page_architectures = (
-                tuple(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", architecture_match.group(1)))
-                if architecture_match
-                else ()
-            )
-            page_architectures = tuple(
-                architecture for architecture in page_architectures if architecture != "trust_remote_code"
-            )
-            architectures.update(page_architectures)
-            page_model_type = (
-                "Encoder-Decoder" if directory == "llm" and path.parent.name == "google-t5" else model_type
-            )
-            title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
-            if title_match is None:
-                raise ValueError(f"Model coverage page is missing a title: {path}")
-            model_doc = _ModelDoc(
-                page_model_type,
-                docs_page,
-                page_architectures,
-                title_match.group(1),
-                str(path.relative_to(docs_root.parent)),
-                architecture_display,
-            )
-            documented_models.append(model_doc)
-            for hf_model_id in re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document):
-                docs = model_docs.setdefault(hf_model_id, [])
-                if model_doc not in docs:
-                    docs.append(model_doc)
+    aliases = _model_card_aliases(docs_root.parent)
+    for path in _model_card_paths(docs_root.parent):
+        if path in aliases:
+            continue
+        document = path.read_text(encoding="utf-8")
+        slug = _frontmatter_slug(path)
+        if slug is None:
+            raise ValueError(f"Model coverage page is missing a slug: {path}")
+        docs_page = f"/{slug}"
+        parts = slug.split("/")
+        if (
+            not DOCS_PAGE_PATTERN.fullmatch(docs_page)
+            or len(parts) != 4
+            or parts[0] != "model-coverage"
+            or parts[1] not in route_types
+        ):
+            raise ValueError(f"Model coverage page has an invalid slug: {path}")
+        model_type = route_types[parts[1]]
+        architecture_match = re.search(r"^\| \*\*Architecture\*\* \| ([^|]+) \|$", document, flags=re.MULTILINE)
+        architecture_display = architecture_match.group(1).strip() if architecture_match else ""
+        page_architectures = (
+            tuple(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", architecture_match.group(1))) if architecture_match else ()
+        )
+        page_architectures = tuple(
+            architecture for architecture in page_architectures if architecture != "trust_remote_code"
+        )
+        architectures.update(page_architectures)
+        page_model_type = "Encoder-Decoder" if model_type == "LLM" and parts[2] == "google-t5" else model_type
+        title_match = re.search(r'^title: "?([^"\r\n]+)"?$', document, flags=re.MULTILINE)
+        if title_match is None:
+            raise ValueError(f"Model coverage page is missing a title: {path}")
+        model_doc = _ModelDoc(
+            page_model_type,
+            docs_page,
+            page_architectures,
+            title_match.group(1),
+            str(path.relative_to(docs_root.parent)),
+            architecture_display,
+        )
+        documented_models.append(model_doc)
+        for hf_model_id in re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document):
+            docs = model_docs.setdefault(hf_model_id, [])
+            if model_doc not in docs:
+                docs.append(model_doc)
     return model_docs, architectures, documented_models
 
 
@@ -851,7 +804,7 @@ def _generate_tables(repo_root: Path, *, validate_model_cards: bool = True) -> d
     homepage_path = repo_root / "docs" / "index.mdx"
     overview_path = repo_root / "docs" / "model-coverage" / "overview.mdx"
     registry_path = repo_root / "nemo_automodel" / "_transformers" / "registry.py"
-    aliases_path = repo_root / "tests" / "unit_tests" / "_transformers" / "test_doc_coverage.py"
+    aliases_path = repo_root / "tools" / "docs" / "catalog.py"
 
     support_log = support_log_path.read_text(encoding="utf-8")
     typed_overview_paths = {

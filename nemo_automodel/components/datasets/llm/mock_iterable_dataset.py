@@ -34,6 +34,8 @@ class MockIterableDatasetConfig:
     """Batch size to yield (1 for unbatched samples)."""
     exclude_token_ids: tuple[int, ...] | list[int] | None = None
     """Token ids never emitted in ``input_ids`` (e.g. the model's ``pad_token_id``)."""
+    include_position_ids: bool = True
+    """Whether batches carry ``position_ids``; omit them to let the model build canonical positions."""
 
     def build(self) -> "MockIterableDataset":
         """Build a :class:`MockIterableDataset` from this :class:`MockIterableDatasetConfig`."""
@@ -43,6 +45,7 @@ class MockIterableDatasetConfig:
             num_samples=self.num_samples,
             batch_size=self.batch_size,
             exclude_token_ids=self.exclude_token_ids,
+            include_position_ids=self.include_position_ids,
         )
 
 
@@ -60,6 +63,7 @@ class MockIterableDataset(IterableDataset):
         num_samples: int = 1000000,
         batch_size: int = 1,
         exclude_token_ids: tuple[int, ...] | list[int] | None = None,
+        include_position_ids: bool = True,
     ):
         """Initialize the mock dataset.
 
@@ -73,12 +77,16 @@ class MockIterableDataset(IterableDataset):
                 that embedding row at zero, so a randomly placed padding token is a zero vector at
                 arbitrary positions (including sequence starts) — a shape real data never has.
                 Sampling stays uniform over the remaining ids.
+            include_position_ids: Whether each batch carries ``position_ids`` (default: True).
+                Set False for models that only take a canonical-position fast path when
+                ``position_ids`` is omitted; the positions are always ``arange(seq_len)`` anyway.
         """
         super().__init__()
         self.vocab_size = vocab_size
         self.seq_len = seq_len
         self.num_samples = num_samples
         self.batch_size = batch_size
+        self.include_position_ids = include_position_ids
         self.exclude_token_ids = tuple(sorted(set(int(t) for t in exclude_token_ids))) if exclude_token_ids else ()
         for token_id in self.exclude_token_ids:
             if not 0 <= token_id < vocab_size:
@@ -107,14 +115,10 @@ class MockIterableDataset(IterableDataset):
             # Create labels by shifting tokens and padding last position with -100
             labels = torch.cat([tokens[:, 1:], torch.full((self.batch_size, 1), -100, dtype=tokens.dtype)], dim=1)
 
-            # Create position ids
-            position_ids = torch.arange(self.seq_len).unsqueeze(0).expand(self.batch_size, -1)
-
-            yield {
-                "input_ids": tokens,
-                "labels": labels,
-                "position_ids": position_ids,
-            }
+            batch = {"input_ids": tokens, "labels": labels}
+            if self.include_position_ids:
+                batch["position_ids"] = torch.arange(self.seq_len).unsqueeze(0).expand(self.batch_size, -1)
+            yield batch
 
     def __len__(self):
         """Return the number of samples."""

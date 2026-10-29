@@ -169,8 +169,10 @@ class DeepseekV32Indexer(nn.Module):
         Args:
             x: Hidden states [B, S, hidden] or [T, hidden] for thd format
             q_resid: Q lora residual from MLA [B, S, q_lora_rank] or [T, q_lora_rank]
-            freqs_cis: RoPE frequencies
-            attention_mask: Optional attention mask
+            freqs_cis: Complex RoPE tensor [B, S, rope_head_dim / 2] or packed
+                [T, rope_head_dim / 2].
+            attention_mask: Optional additive tensor [B, 1, S, S] for BSHD,
+                or [T, T] or [1, 1, T, T] for packed THD.
             **attn_kwargs: Additional attention kwargs (cu_seqlens, etc.)
 
         Returns:
@@ -229,7 +231,8 @@ class DeepseekV32Indexer(nn.Module):
             q = q.transpose(0, 1)
             k = k.transpose(0, 1)
             # scores: [H, T, T]
-            scores = torch.bmm(q.float(), k.float().transpose(-2, -1))
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                scores = torch.bmm(q.float(), k.float().transpose(-2, -1))
             # Apply ReLU activation (per training implementation)
             scores = torch.relu(scores)
             # Apply per-head weights: [T, H] -> [H, T, 1]
@@ -242,7 +245,8 @@ class DeepseekV32Indexer(nn.Module):
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             # scores: [B, H, S, S]
-            scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
             # Apply ReLU activation (per training implementation)
             scores = torch.relu(scores)
             # Apply per-head weights: [B, S, H] -> [B, H, S, 1]
