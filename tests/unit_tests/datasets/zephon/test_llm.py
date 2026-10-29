@@ -145,3 +145,17 @@ def test_native_named_template_uses_selected_string_for_masks_and_every_render(t
         format_chat_template(tokenizer, messages, eos_token_id=1, pad_token_id=1, tools=[], answer_only_loss_mask=True)
         == expected
     )
+
+
+def test_pretokenized_positions_preserve_only_valid_offline_boundaries() -> None:
+    config = ZephonPretokenizedTextSourceConfig()
+    payload = {"input_ids": [2, 3, 4, 5], "positions": [0, 1, 0, 1]}
+    kwargs = {"config": config, "valid_token_ids": np.arange(6, dtype=np.int64)}
+    actual = normalize_pretokenized_document(payload, preserve_positions=True, **kwargs)
+    assert actual["positions"].tolist() == payload["positions"]
+    assert payload == {"input_ids": [2, 3, 4, 5], "positions": [0, 1, 0, 1]}
+    with pytest.raises(ValueError, match="require pack_algorithm=null"):
+        normalize_pretokenized_document(payload, **kwargs)
+    for positions in ([0], [1, 2, 3, 4], [0, 2, 3, 4], [0, 1, -1, 0], [0.0, 1.0, 0.0, 1.0]):
+        with pytest.raises(ValueError, match="resetting at subdocument starts"):
+            normalize_pretokenized_document({**payload, "positions": positions}, preserve_positions=True, **kwargs)
