@@ -47,7 +47,7 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Required, TypedDict
 
 import torch
 from torch.distributed.tensor import DTensor, Shard
@@ -515,6 +515,29 @@ class _DionConfigBase(OptimizerConfig):
         return result + overridden
 
 
+class _DionParamGroup(TypedDict, total=False):
+    """Parameter group handed to a Dion-family optimizer.
+
+    ``params`` is always present. Layout groups built by
+    :func:`~nemo_automodel.components.optim.dion._separate_param_groups` carry ``matrix_transposed``; scalar groups
+    carry ``algorithm`` with their own ``lr``, ``weight_decay`` and Adam/Lion hyperparameters.
+    :meth:`_DionConfigBase._apply_param_group_overrides` adds ``lr_mult`` / ``wd_mult`` and
+    :meth:`MuonConfig._spectral_norm_groups` sets ``adjust_lr``.
+    """
+
+    params: Required[list[torch.Tensor]]
+    algorithm: str
+    lr: float
+    weight_decay: float
+    beta1: float
+    beta2: float
+    epsilon: float
+    matrix_transposed: bool
+    adjust_lr: str | None
+    lr_mult: float
+    wd_mult: float
+
+
 @dataclass
 class MuonConfig(_DionConfigBase):
     """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D.
@@ -590,10 +613,11 @@ class MuonConfig(_DionConfigBase):
         from dion import Muon
 
         if self.adjust_lr == "spectral_norm":
-            param_groups = [split for group in param_groups for split in self._spectral_norm_groups(group)]
+            # torch's ParamsT takes plain dicts, so the typed groups are copied at this boundary.
+            param_groups = [dict(split) for group in param_groups for split in self._spectral_norm_groups(group)]
         return Muon(param_groups, **ctor_kwargs)
 
-    def _spectral_norm_groups(self, group: dict[str, Any]) -> list[dict[str, Any]]:
+    def _spectral_norm_groups(self, group: _DionParamGroup) -> list[_DionParamGroup]:
         """Split a transposed ``[..., in, out]`` matrix group by shape and fold the spectral-norm scale into its LR.
 
         dion.Muon would scale by ``sqrt(shape[-2] / shape[-1])``, the inverse of the correct ``sqrt(out / in)`` for
@@ -612,19 +636,15 @@ class MuonConfig(_DionConfigBase):
             return [group]
         by_shape: dict[tuple[int, int], list[torch.Tensor]] = {}
         for param in group["params"]:
-            by_shape.setdefault(tuple(param.shape[-2:]), []).append(param)
+            fan_in, fan_out = param.shape[-2:]
+            by_shape.setdefault((fan_in, fan_out), []).append(param)
         lr = group.get("lr", self.lr)
         weight_decay = group.get("weight_decay", self.weight_decay)
-        splits = []
+        splits: list[_DionParamGroup] = []
         for (fan_in, fan_out), params in by_shape.items():
             scale = math.sqrt(fan_out / fan_in)
-            split = {
-                **group,
-                "params": params,
-                "adjust_lr": None,
-                "lr": lr * scale,
-                "weight_decay": weight_decay / scale,
-            }
+            split = group.copy()
+            split.update(params=params, adjust_lr=None, lr=lr * scale, weight_decay=weight_decay / scale)
             if "lr_mult" in group:
                 split["lr_mult"] = group["lr_mult"] * scale
             if "wd_mult" in group:
