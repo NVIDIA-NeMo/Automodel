@@ -27,8 +27,11 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonOptions,
     ZephonPackingOptions,
     ZephonSource,
+    ZephonTrainingOptions,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
+from tests.utils.vlm_fixtures import processor as processor
 
 
 def _recipe():
@@ -114,6 +117,80 @@ def test_cheap_vlm_build_validation_precedes_position_factory(batch_size, pp_n_m
             pp_n_microbatches=pp_n_microbatches,
             position_state_factory=must_not_run,
         )
+
+
+@pytest.mark.parametrize("allow_xdoc", [False, True])
+def test_vlm_input_limit_is_checked_before_position_state_and_processor(allow_xdoc):
+    config = ZephonVlmDataloaderConfig(
+        zephon=ZephonOptions(
+            sources=(ZephonSource(name="images", path="unused"),),
+            packing=ZephonPackingOptions(seq_len=129, pack_algorithm="first_fit"),
+            training=ZephonTrainingOptions(allow_cross_document_attention=allow_xdoc),
+        )
+    )
+
+    def must_not_run():
+        raise AssertionError("position factory ran before input-limit validation")
+
+    with pytest.raises(ValueError, match="seq_len=129 exceeds.*128"):
+        config.build(
+            pretrained_model_name_or_path="unused",
+            dp_rank=0,
+            dp_world_size=1,
+            batch_size=1,
+            position_state_factory=must_not_run,
+            packing_contract=PackingCapabilities("block_causal", max_sequence_length=128),
+        )
+
+
+def test_vlm_requires_explicit_length_when_model_limit_is_unknown():
+    config = ZephonVlmDataloaderConfig(
+        zephon=ZephonOptions(
+            sources=(ZephonSource(name="images", path="unused"),),
+            packing=ZephonPackingOptions(pack_algorithm="first_fit"),
+        )
+    )
+
+    def must_not_run():
+        raise AssertionError("position factory ran before length resolution")
+
+    with pytest.raises(ValueError, match="Set dataloader.zephon.packing.seq_len"):
+        config.build(
+            pretrained_model_name_or_path="unused",
+            dp_rank=0,
+            dp_world_size=1,
+            batch_size=1,
+            position_state_factory=must_not_run,
+        )
+
+
+def test_inferred_vlm_length_reserves_expanded_fake_image_segment(tmp_path, processor):
+    from nemo_automodel.components.datasets.zephon.vlm import prepare_fake_image_document
+    from nemo_automodel.components.models.qwen2_5_vl.preprocessing import Qwen2_5_VLPositionState
+    from tests.utils.vlm_fixtures import tiny_vlm_config
+
+    processor.image_processor.size["longest_edge"] = 256
+    processor.save_pretrained(tmp_path)
+    positions = Qwen2_5_VLPositionState(tiny_vlm_config())
+    fake_length = len(prepare_fake_image_document(processor, positions)["input_ids"])
+    model_limit = fake_length - 1
+    config = ZephonVlmDataloaderConfig(
+        zephon=ZephonOptions(
+            sources=(ZephonSource(name="images", path="unused"),),
+            packing=ZephonPackingOptions(pack_algorithm="first_fit"),
+        )
+    )
+
+    with pytest.raises(ValueError, match=f"reserved fake-image segment length.*got seq_len={model_limit}"):
+        config.build(
+            pretrained_model_name_or_path=str(tmp_path),
+            dp_rank=0,
+            dp_world_size=1,
+            batch_size=1,
+            position_state_factory=lambda: positions,
+            packing_contract=PackingCapabilities("block_causal", max_sequence_length=model_limit),
+        )
+    assert config.zephon.packing.seq_len is None
 
 
 def test_vlm_rejects_native_packing_and_unsized_run_without_cap():

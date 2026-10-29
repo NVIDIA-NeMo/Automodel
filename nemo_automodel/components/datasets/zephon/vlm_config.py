@@ -142,6 +142,7 @@ class ZephonVlmDataloaderConfig(ZephonLoaderConfig):
             raise ValueError("VLM pipeline microbatches must evenly divide the local batch size")
         if position_state_factory is None:
             raise ValueError("Zephon VLM requires a parent position_state_factory")
+        sequence_length = self.resolve_sequence_length(packing_contract=packing_contract)
         positions = position_state_factory()
         from nemo_automodel.components.datasets.zephon.llm import resolve_token_ids
         from nemo_automodel.components.datasets.zephon.loader import ZephonDataLoader
@@ -164,11 +165,12 @@ class ZephonVlmDataloaderConfig(ZephonLoaderConfig):
             )
         options = self.zephon
         fake_length = 0 if fake_document is None else len(fake_document["input_ids"])
-        pack_length = options.packing.seq_len + 1 - fake_length
+        # Expanded image tokens and the optional fake segment share the input budget.
+        pack_length = sequence_length + 1 - fake_length
         if pack_length < 1:
             raise ValueError(
                 f"seq_len + 1 must exceed the reserved fake-image segment length ({fake_length}); "
-                f"got seq_len={options.packing.seq_len}"
+                f"got seq_len={sequence_length}"
             )
         max_documents = options.packing.max_num_documents
         if max_documents is not None and options.packing.max_num_documents_scope == "batch":
@@ -200,7 +202,7 @@ class ZephonVlmDataloaderConfig(ZephonLoaderConfig):
             convert_batch=partial(
                 convert_image_batch,
                 output_format=self.output_format,
-                sequence_length=options.packing.seq_len,
+                sequence_length=sequence_length,
                 pad_token_id=ids.pad,
                 packing_contract=packing_contract,
                 ignore_index=ignore_index,

@@ -126,10 +126,22 @@ def _validate_pretokenized_document(
     ``valid_token_ids`` is a sorted int64 vocabulary array constructed once per
     pipeline. Exact vectorized membership preserves holes in tokenizer IDs.
     """
-    incompatible = {"labels", "positions", "position_ids", "cu_seqlens", "cu_seq_lens_q"}.intersection(payload)
+    incompatible = {
+        "labels",
+        "position_ids",
+        "document_ids",
+        "padding_mask",
+        "_packed_seq_ids",
+        "cu_seqlens",
+        "cu_seq_lens_q",
+        "cu_seq_lens_k",
+        "seq_lens",
+        "seq_lens_padded",
+    }.intersection(payload)
     if incompatible:
         raise ValueError(
-            f"Pretokenized text expects unshifted unpacked documents; unsupported fields: {sorted(incompatible)}"
+            f"Pretokenized text expects unshifted tokens; unsupported fields: {sorted(incompatible)}. "
+            "Supply optional boundaries as Zephon positions with pack_algorithm=null"
         )
     raw_tokens = payload[config.tokens_field]
     if not isinstance(raw_tokens, (Sequence, np.ndarray)) or isinstance(raw_tokens, (str, bytes)):
@@ -151,7 +163,7 @@ def _validate_pretokenized_document(
         attention = np.asarray(payload["attention_mask"])
         if attention.shape != tokens.shape or not (attention == 1).all():
             raise ValueError(
-                "Pretokenized attention_mask must match token length and contain only ones; packing owns padding"
+                "Pretokenized attention_mask must match token length and contain only ones; supply unpadded tokens"
             )
     mask = None
     if config.loss_mask_field is not None and config.loss_mask_field in payload:
@@ -166,6 +178,7 @@ def normalize_pretokenized_document(
     *,
     config: ZephonPretokenizedTextSourceConfig,
     valid_token_ids: np.ndarray,
+    preserve_positions: bool = False,
 ) -> dict[str, np.ndarray]:
     """Adapt pretokenized fields while preserving IDs and supplied supervision.
 
@@ -174,20 +187,70 @@ def normalize_pretokenized_document(
     document-boundary masking belongs to to_training's mask_segment_starts option.
 
     Args:
-        payload: Unpacked document with token IDs of shape [tokens] and an
+        payload: Document with token IDs of shape [tokens] and an
             optional binary loss mask of shape [tokens], both before shifting.
+            Offline packs may include zero-based reset ``positions`` [tokens].
         config: Source field names; absent loss masks select all tokens.
         valid_token_ids: Sorted vocabulary IDs of shape [vocab].
+        preserve_positions: Accept offline boundaries when online packing is off.
 
     Returns:
         int64 input_ids and uint8 loss_mask arrays, each of shape [tokens].
-        Values are preserved; a missing mask becomes all ones. Inputs are not mutated.
+        Values are preserved; a missing mask becomes all ones. Optional positions
+        remain int64 [tokens]. Inputs are not mutated.
     """
     tokens, mask = _validate_pretokenized_document(payload, config=config, valid_token_ids=valid_token_ids)
-    return {
+    result = {
         "input_ids": tokens.astype(np.int64),
         "loss_mask": np.ones(tokens.shape, dtype=np.uint8) if mask is None else mask.astype(np.uint8),
     }
+    if "positions" in payload:
+        if not preserve_positions:
+            raise ValueError(
+                "Pretokenized positions require pack_algorithm=null; online packing creates its own boundaries"
+            )
+        positions = np.asarray(payload["positions"])
+        if (
+            positions.shape != tokens.shape
+            or (positions.size and positions.dtype.kind not in "iu")
+            or (positions.size and positions[0] != 0)
+            or (positions.size and ((positions < 0) | (positions > tokens.size)).any())
+            or ((positions[1:] != 0) & (positions[1:] != positions[:-1] + 1)).any()
+        ):
+            raise ValueError(
+                "Pretokenized positions must match tokens and count from zero, resetting at subdocument starts"
+            )
+        result["positions"] = positions.astype(np.int64)
+    return result
+
+
+def prepare_text_document_without_packing(payload: dict[str, Any], *, max_length: int) -> dict[str, Any]:
+    """Supply boundaries when packing is off, without guessing from token values.
+
+    to_training needs scalar reset positions to derive document IDs and boundary
+    loss masks. Offline exports can supply those positions; absent metadata means
+    exactly one document, even when the tokens contain multiple EOS markers.
+
+    Args:
+        payload: Tokenized document with input_ids [tokens], optional aligned
+            loss_mask [tokens], and optional validated positions [tokens].
+        max_length: Unshifted token budget, including the final prediction target.
+
+    Returns:
+        The input mapping when it already has positions, otherwise a new mapping
+        with int64 positions [tokens]. Existing arrays are never changed.
+
+    Raises:
+        ValueError: When the document exceeds the configured input/target budget.
+    """
+    length = len(payload["input_ids"])
+    if length > max_length:
+        raise ValueError(
+            f"Document has {length} unshifted tokens, exceeding seq_len+1={max_length} with online packing disabled"
+        )
+    if "positions" in payload:
+        return payload
+    return {**payload, "positions": np.arange(length, dtype=np.int64)}
 
 
 def measure_pretokenized_document(payload: Mapping[str, Any], *, tokens_field: str) -> int:

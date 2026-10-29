@@ -84,6 +84,12 @@ must stay whole. Oversized documents are dropped by default; set
 fit a bin. See [Zephon's packing guide](https://docs.zephon.io/pipelines/packing.html)
 for bin-packing options.
 
+`packing.seq_len` is optional. When omitted, it uses the text decoder's
+configured input-token limit. Set a smaller value for shorter training inputs;
+values above a known model limit are rejected in either cross-document attention
+mode. Expanded image tokens count toward this limit. If the model does not
+declare a limit, set `packing.seq_len` explicitly.
+
 By default, all-text packs include an ignored synthetic image segment so the
 vision tower still participates in training. The loader reserves space for that
 segment when packing, reducing the available document length. Set
