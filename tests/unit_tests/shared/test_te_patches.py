@@ -734,15 +734,35 @@ class TestFusedAdamCachedListsPatch:
         assert all(torch.equal(value, p.grad) for value, p in zip(grads_step3, params[:2]))
 
     @pytest.mark.parametrize("count", [1024, 1025])
-    def test_large_parameter_groups_preserve_the_native_batching_path(
-        self, monkeypatch: pytest.MonkeyPatch, count: int
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_cached_calls_bound_tensor_batches_without_losing_or_repeating_parameters(
+        self, monkeypatch: pytest.MonkeyPatch, count: int, dtype: torch.dtype
     ) -> None:
         _, FusedAdam, calls = self._patched_module(monkeypatch)
-        params = [torch.nn.Parameter(torch.ones(1)) for _ in range(count)]
+        params = [torch.nn.Parameter(torch.ones(1, dtype=dtype)) for _ in range(count)]
         optimizer = FusedAdam(params)
-        self._run(optimizer, params, 3, calls)
-        assert optimizer.original_calls == (1 if count == 1024 else 3)
+        steps = self._run(optimizer, params, 3, calls)
+        assert optimizer.original_calls == 1
         assert optimizer.param_groups[0]["step"] == 3
+        for step in steps[1:]:
+            assert len(step) == (1 if count == 1024 else 2)
+            assert all(len(column) <= 1024 for _, _, columns in step for column in columns)
+            assert [ptr for _, _, columns in step for ptr, _ in columns[1]] == [param.data_ptr() for param in params]
+
+    def test_mixed_small_and_large_groups_update_each_parameter_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _, FusedAdam, calls = self._patched_module(monkeypatch)
+        small = _fake_params()
+        large = [torch.nn.Parameter(torch.ones(1)) for _ in range(1025)]
+        optimizer = FusedAdam(small)
+        optimizer.add_param_group({**optimizer.param_groups[0], "params": large})
+        steps = self._run(optimizer, small + large, 3, calls)
+        assert optimizer.original_calls == 1
+        assert [group["step"] for group in optimizer.param_groups] == [3, 3]
+        for step in steps[1:]:
+            assert len(step) == 4
+            assert [ptr for _, _, columns in step for ptr, _ in columns[1]] == [
+                param.data_ptr() for param in small + large
+            ]
 
     def test_missing_gradient_falls_back_and_rebuilds(self, monkeypatch):
         _, FusedAdam, calls = self._patched_module(monkeypatch)
@@ -926,7 +946,9 @@ def test_cached_fused_adam_matches_native_updates(count: int) -> None:
     """Compare cached and native CUDA updates, including large and empty parameter groups."""
     module = pytest.importorskip("transformer_engine.pytorch.optimizers.fused_adam")
     optimizer_type = module.FusedAdam
-    original_step = optimizer_type.step
+    # Recipe setup tests may already have installed this wrapper on the real TE class.
+    original_step = getattr(optimizer_type.step, "_nemo_original_step", optimizer_type.step)
+    native_step = MagicMock(wraps=original_step)
     torch.manual_seed(123)
     params = [torch.nn.Parameter(torch.randn(4, device="cuda", dtype=torch.bfloat16)) for _ in range(count)]
     reference_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
@@ -947,12 +969,12 @@ def test_cached_fused_adam_matches_native_updates(count: int) -> None:
     # Restore all three methods changed by the compatibility patch after this test.
     with (
         torch.no_grad(),
-        patch.object(optimizer_type, "step", original_step),
+        patch.object(optimizer_type, "step", native_step),
         patch.object(optimizer_type, "load_state_dict", optimizer_type.load_state_dict),
         patch.object(optimizer_type, "add_param_group", optimizer_type.add_param_group),
     ):
         _apply_fused_adam_cached_lists_patch()
-        assert optimizer_type.step is not original_step
+        assert optimizer_type.step is not native_step
         for step in range(4):
             for index, (param, reference_param) in enumerate(zip(params, reference_params)):
                 grad = None if step == 2 and index == 0 else torch.randn_like(param)
@@ -970,3 +992,4 @@ def test_cached_fused_adam_matches_native_updates(count: int) -> None:
                 )
             assert [group["step"] for group in optimizer.param_groups] == [step + 1, step + 1]
             assert [group["step"] for group in reference.param_groups] == [step + 1, step + 1]
+        native_step.assert_called_once()  # First step initializes state; the other three use the cache.
