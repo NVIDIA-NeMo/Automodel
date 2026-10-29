@@ -75,8 +75,11 @@ describe token proportions rather than document proportions. See
 [mixing datasets](https://docs.zephon.io/worksources/mixing_datasets.html) for
 calibration and sampling behavior.
 
-`packing.seq_len` is the model input length. Zephon prepares one extra token for
-next-token prediction and handles the input/target shift. `wrap` can split long
+`packing.seq_len` is the model input length. When omitted, it uses the effective
+model config's input-token limit. Set it explicitly for shorter training inputs
+or when the model has no known limit. A length above a known model limit is
+rejected, including when positions reset between subdocuments. Zephon prepares
+one extra token for next-token prediction and handles the input/target shift. `wrap` can split long
 text documents; `first_fit` and `best_fit` keep documents whole. With bin packing,
 oversized documents are dropped by default; `drop_oversized: false` raises an
 error instead. See the [packing guide](https://docs.zephon.io/pipelines/packing.html)
@@ -131,21 +134,60 @@ uv run automodel examples/llm_pretrain/zephon/sft.yaml --nproc-per-node 1
 Install the matching Flash Attention dependencies, or select SDPA with
 `--model.attn_implementation sdpa`.
 
-For documents you have already tokenized, choose `ZephonPretokenizedTextSourceConfig`.
-Its `tokens_field` defaults to `input_ids`, and its optional `loss_mask_field`
-defaults to `loss_mask`. Supply unshifted, unpadded token lists from the model's
-tokenizer. The adapter validates fields, preserves supplied token IDs and binary
-loss masks, and adds an all-ones mask only when absent. It does not retokenize or
-filter short or fully masked documents. Zephon still packs documents and shifts
-labels; `mask_segment_starts` controls boundary masking. This input format does
-not import prepacked batches or shifted labels. Token-aware mixing counts the
-supplied tokens, including tokens excluded from loss, using `tokens_field`.
+Tokenization and online packing are independent choices:
+
+| Supplied data | Dataset config | `packing.pack_algorithm` | Online preparation |
+| --- | --- | --- | --- |
+| Raw text | `ZephonTextSourceConfig` | `wrap`, `first_fit`, `best_fit`, or `best_fit_wrap` | Tokenize and pack |
+| Raw instructions | `ZephonInstructionSourceConfig` | A packing algorithm | Chat tokenize and pack |
+| Pretokenized documents | `ZephonPretokenizedTextSourceConfig` | A packing algorithm | Pack only |
+| Pretokenized, prepacked sequences | `ZephonPretokenizedTextSourceConfig` | `null` | Preserve supplied sequences |
+| Raw text or instructions | The matching raw dataset config | `null` | Tokenize each document separately |
+
+For pretokenized data, `tokens_field` defaults to `input_ids`, and the optional
+`loss_mask_field` defaults to `loss_mask`. Supply unshifted, unpadded token lists
+from the model's tokenizer. The adapter validates fields, preserves supplied IDs
+and binary loss masks, and adds an all-ones mask only when absent. It does not
+retokenize or filter short or fully masked documents. Token-aware mixing counts
+the supplied tokens, including tokens excluded from loss, using `tokens_field`.
+
+For prepacked text, use the same source config and explicitly disable packing:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonPretokenizedTextSourceConfig
+  # Keep the model tokenizer configuration here for vocabulary validation.
+dataloader:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
+  zephon:
+    sources:
+    - {name: offline-packs, path: /data/prepacked, fmt: jsonl}
+    packing:
+      pack_algorithm: null
+      seq_len: 2048
+```
+
+Each supplied token sequence is one document unless it includes Zephon's
+`positions` field: a token-aligned integer list starting at zero and increasing
+by one, resetting to zero at every subdocument start. For example,
+`{"input_ids": [2, 3, 4, 5], "positions": [0, 1, 0, 1]}` retains two subdocuments.
+Without `positions`, even an internal EOS token does not imply a boundary.
+Supplied positions require `pack_algorithm: null`, since the online packer
+creates its own boundaries.
+
+With packing disabled, each sequence must contain at most `seq_len + 1` tokens.
+`to_training()` pads shorter sequences and shifts labels exactly once; padding
+is excluded from attention and loss even when PAD equals EOS. Oversized inputs
+raise instead of being truncated. `training.mask_segment_starts` still controls
+boundary-target masking. This is a flat token-sequence format, not an importer
+for framework cache files, source padding, cumulative-length tensors, or already
+shifted labels. The same `batched` and `thd` output formats remain available.
 
 ## How the integration works
 
 The dataset config selects text, chat, or pretokenized input. The Zephon
 pipeline reads and mixes sources, prepares documents, packs them, and groups
-them into batches. Zephon's `to_training()` handles shifting, padding, and
+them into batches; online packing can be disabled. Zephon's `to_training()` handles shifting, padding, and
 collation. A small adapter then presents that result in the format expected by
 AutoModel's existing recipe and model.
 

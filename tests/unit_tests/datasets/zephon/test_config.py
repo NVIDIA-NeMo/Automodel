@@ -14,7 +14,9 @@
 
 """Declarative recipe configuration and validation without pipeline execution."""
 
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -28,6 +30,7 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonTextSourceConfig,
     ZephonWorkerOptions,
 )
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
@@ -374,3 +377,44 @@ def test_grouped_options_reject_unknown_misplaced_or_duplicate_fields():
     ):
         with pytest.raises(ValueError, match=message):
             zephon_options_from_recipe({"sources": sources, **settings}, seed=42)
+
+
+def test_model_input_limit_resolves_length_without_mutating_recipe(tmp_path: Path) -> None:
+    config = ZephonDataloaderConfig(zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),)))
+    contract = PackingCapabilities(packed_mask_type="block_causal", max_sequence_length=32)
+    assert config.resolve_sequence_length(packing_contract=contract) == 32
+    assert config.packed_sequence_length == 0 and config.zephon.packing.seq_len is None
+    smaller = replace(config, zephon=replace(config.zephon, packing=ZephonPackingOptions(seq_len=16)))
+    assert smaller.resolve_sequence_length(packing_contract=contract) == 16
+    assert smaller.packed_sequence_length == 16
+    unknown = replace(contract, max_sequence_length=None)
+    assert smaller.resolve_sequence_length(packing_contract=unknown) == 16
+    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_text_pipeline") as create:
+        with pytest.raises(ValueError, match="no known input-token limit"):
+            config.build(tokenizer=object(), dp_rank=0, dp_world_size=1, packing_contract=unknown)
+        for xdoc in (False, True):
+            oversized = replace(
+                smaller,
+                zephon=replace(
+                    smaller.zephon, training=replace(smaller.zephon.training, allow_cross_document_attention=xdoc)
+                ),
+            )
+            with pytest.raises(ValueError, match="exceeds the model input-token limit"):
+                oversized.build(
+                    tokenizer=object(),
+                    dp_rank=0,
+                    dp_world_size=1,
+                    packing_contract=replace(contract, max_sequence_length=8),
+                )
+        create.assert_not_called()
+
+
+def test_disabled_packing_defaults_and_incompatible_options() -> None:
+    options = ZephonPackingOptions(pack_algorithm=None)
+    assert options.drop_oversized is False and options.shuffle_after_pack is False
+    for invalid in ({"pack_num_bins": 2}, {"max_num_documents": 2}, {"drop_oversized": True}):
+        with pytest.raises(ValueError, match="require online packing"):
+            ZephonPackingOptions(pack_algorithm=None, **invalid)
+    for length in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="seq_len must be positive"):
+            ZephonPackingOptions(seq_len=length)
