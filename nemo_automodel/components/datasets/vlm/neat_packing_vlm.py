@@ -40,6 +40,8 @@ from typing import TYPE_CHECKING, Callable, Literal
 import torch
 import torch.utils.data
 
+from nemo_automodel.shared.vlm_media import pad_image_tensors
+
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
@@ -62,6 +64,7 @@ MEDIA_KEYS = (
     "num_patches",
     "image_grid_thw",
     "image_position_ids",
+    "image_sizes",
     "pixel_values_videos",
     "video_grid_thw",
     "second_per_grid_ts",
@@ -392,6 +395,7 @@ def _build_packed_vlm_sample(
     num_patches_list: list[torch.Tensor] = []
     image_grid_thw_list: list[torch.Tensor] = []
     image_position_ids_list: list[torch.Tensor] = []
+    image_sizes_list: list[torch.Tensor] = []
     pixel_values_videos_list: list[torch.Tensor] = []
     video_grid_thw_list: list[torch.Tensor] = []
     second_per_grid_ts_list: list[torch.Tensor] = []
@@ -436,6 +440,10 @@ def _build_packed_vlm_sample(
         if "image_grid_thw" in sample and sample["image_grid_thw"] is not None:
             n_images += sample["image_grid_thw"].shape[0]
             image_grid_thw_list.append(sample["image_grid_thw"])
+        if sample.get("image_sizes") is not None:
+            image_sizes_list.append(sample["image_sizes"])
+            if sample.get("image_grid_thw") is None:
+                n_images += sample["image_sizes"].shape[0]
         if "image_position_ids" in sample and sample["image_position_ids"] is not None:
             image_position_ids_list.append(sample["image_position_ids"])
         if "pixel_values_videos" in sample and sample["pixel_values_videos"] is not None:
@@ -463,7 +471,13 @@ def _build_packed_vlm_sample(
     else:
         packed["position_ids"] = torch.tensor(all_position_ids_1d, dtype=torch.long)
 
-    if pixel_values_list and all(isinstance(value, torch.Tensor) for value in pixel_values_list):
+    if (
+        image_sizes_list
+        and pixel_values_list
+        and all(isinstance(value, torch.Tensor) and value.ndim == 4 for value in pixel_values_list)
+    ):
+        packed["pixel_values"] = pad_image_tensors(pixel_values_list)
+    elif pixel_values_list and all(isinstance(value, torch.Tensor) for value in pixel_values_list):
         if all(value.shape[1:] == pixel_values_list[0].shape[1:] for value in pixel_values_list):
             packed["pixel_values"] = torch.cat(pixel_values_list, dim=0)
         else:
@@ -477,6 +491,8 @@ def _build_packed_vlm_sample(
         raise TypeError("Packed VLM pixel_values must be consistently tensors or variable-resolution lists.")
     else:
         packed["pixel_values"] = None
+    if image_sizes_list:
+        packed["image_sizes"] = torch.cat(image_sizes_list, dim=0)
     if patch_pixel_values_list:
         packed["patch_pixel_values"] = torch.cat(patch_pixel_values_list, dim=0)
     if num_patches_list:
