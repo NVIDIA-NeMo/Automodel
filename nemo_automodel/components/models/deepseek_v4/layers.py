@@ -1338,7 +1338,8 @@ class DeepseekV4HyperConnection(nn.Module):
             combination logits of shape [batch, sequence, input_streams, output_streams].
         """
         flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
-        mix = torch.nn.functional.linear(_rms_norm_last_dim(flat, norm_eps), fn.float())
+        with torch.autocast(device_type=hidden_streams.device.type, enabled=False):
+            mix = torch.nn.functional.linear(_rms_norm_last_dim(flat, norm_eps), fn.float())
         pre_scale, post_scale, comb_scale = scale.float().unbind(0)
 
         # ``pre`` and ``post`` have DIFFERENT formulas in the released DSV4-Flash
@@ -1470,8 +1471,17 @@ class DeepseekV4HyperHead(nn.Module):
         nn.init.ones_(self.hc_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Collapse residual streams using FP32 mixing coefficients.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hc_mult, hidden].
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden] in the input dtype.
+        """
         flat = x.flatten(2).float()
-        mixes = torch.nn.functional.linear(_rms_norm_last_dim(flat, self.norm_eps), self.hc_fn.float())
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            mixes = torch.nn.functional.linear(_rms_norm_last_dim(flat, self.norm_eps), self.hc_fn.float())
         pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
 

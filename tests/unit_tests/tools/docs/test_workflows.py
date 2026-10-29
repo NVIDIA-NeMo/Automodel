@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import base64
 import json
 import os
@@ -23,7 +24,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-_WORKFLOWS = Path(__file__).resolve().parents[3] / ".github/workflows"
+_WORKFLOWS = Path(__file__).resolve().parents[4] / ".github/workflows"
 # RecursiveSI's generated 20x20 logo from PR #4461, absent from trusted navigation.
 _PROVIDER_WEBP = (
     "UklGRg4BAABXRUJQVlA4TAIBAAAvE8AEEHU4biRJkc5/d+97UhwNeVC9GAHHtrVjz2/bZmfbtm3/HWJO"  # pragma: allowlist secret
@@ -282,3 +283,85 @@ def test_lint_gate_accepts_only_success_or_intentional_docs_skip(
         text=True,
     )
     assert result.returncode == expected, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+@pytest.mark.parametrize("symlink", [None, "tools", "tools/docs", "tools/docs/build/coverage_tables.py"])
+def test_preview_generator_uses_trusted_docs_tool_and_rejects_symlinks(
+    tmp_path: Path, symlink: str | None, legacy: bool
+) -> None:
+    relative = "tests/ci_tests/utils/sync_model_coverage_tables.py" if legacy else "tools/docs/build/coverage_tables.py"
+    trusted = tmp_path / f"trusted-source/{relative}"
+    trusted.parent.mkdir(parents=True)
+    trusted.write_text(
+        "def _sync_tables(root, *, check):\n"
+        "    assert check is False\n"
+        "    (root / 'generated').write_text('trusted generator')\n"
+    )
+    pr = tmp_path / "pr-source"
+    for directory in ("tests", "examples", "nemo_automodel/_transformers", "docs"):
+        (pr / directory).mkdir(parents=True)
+    if not symlink:
+        catalog = pr / "tools/docs/catalog.py"
+        catalog.parent.mkdir(parents=True, exist_ok=True)
+        catalog.write_text('_DOC_ARCH_ALIASES = {"Example": "ExampleArchitecture"}\n')
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sync_model_coverage_tables.py"
+    sentinel.write_text("original outside file")
+    if symlink:
+        link = pr / symlink
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(sentinel if link.suffix == ".py" else outside)
+    else:
+        proposed = pr / "tools/docs/build/coverage_tables.py"
+        proposed.parent.mkdir(parents=True, exist_ok=True)
+        proposed.write_text("raise RuntimeError('untrusted generator must not execute')\n")
+
+    workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["preview"]["steps"]
+        if step["name"] == "Generate model coverage tables with trusted tooling"
+    )
+    result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=tmp_path, capture_output=True, text=True)
+
+    assert sentinel.read_text() == "original outside file"
+    if symlink:
+        assert result.returncode != 0
+        assert not (pr / "generated").exists()
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (pr / "generated").read_text() == "trusted generator"
+        if legacy:
+            assert (pr / "tests/unit_tests/_transformers/test_doc_coverage.py").read_text() == catalog.read_text()
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_preview_styles_use_trusted_tool_across_directory_migration(tmp_path: Path, legacy: bool) -> None:
+    relative = "tools/apply_fern_code_styles.py" if legacy else "tools/docs/build/code_styles.py"
+    trusted = tmp_path / f"trusted-source/{relative}"
+    trusted.parent.mkdir(parents=True)
+    trusted.write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "assert sys.argv[1] == '--repo-root'\n"
+        "(Path(sys.argv[2]) / 'styled').write_text('trusted styles')\n"
+    )
+    preview = tmp_path / "runner/fern-preview"
+    preview.mkdir(parents=True)
+    workflow = yaml.safe_load((_WORKFLOWS / "fern-docs-preview.yml").read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["preview"]["steps"]
+        if step["name"] == "Style generated pages with trusted tooling"
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "RUNNER_TEMP": str(tmp_path / "runner")},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (preview / "styled").read_text() == "trusted styles"

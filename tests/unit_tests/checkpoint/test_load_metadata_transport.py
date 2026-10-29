@@ -33,6 +33,8 @@ from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_load_metadata_transport_defaults_to_existing_group() -> None:
     assert CheckpointingConfig(save_consolidated=False).load_metadata_with_gloo is False
