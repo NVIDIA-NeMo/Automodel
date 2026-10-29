@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING
 
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonDataloaderConfig,
-    ZephonEncodedTextSourceConfig,
     ZephonInstructionSourceConfig,
+    ZephonPretokenizedTextSourceConfig,
     ZephonTextSourceConfig,
 )
 
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ZephonDataloaderConfig",
-    "ZephonEncodedTextSourceConfig",
+    "ZephonPretokenizedTextSourceConfig",
     "ZephonInstructionSourceConfig",
     "ZephonTextSourceConfig",
     "ZephonVlmDataloaderConfig",

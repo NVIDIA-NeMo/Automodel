@@ -251,7 +251,7 @@ def test_packing_defaults_are_resolved_once(algorithm, expected):
     "target,kwargs",
     [
         ("ZephonTextSourceConfig", {}),
-        ("ZephonEncodedTextSourceConfig", {}),
+        ("ZephonPretokenizedTextSourceConfig", {}),
         ("ZephonInstructionSourceConfig", {"column_mapping": {"question": "q", "answer": "a"}}),
     ],
 )
