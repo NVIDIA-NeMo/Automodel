@@ -23,7 +23,7 @@ from zephon import Pipeline
 
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonDataloaderConfig,
-    ZephonEncodedTextSourceConfig,
+    ZephonPretokenizedTextSourceConfig,
     ZephonInstructionSourceConfig,
     ZephonTextSourceConfig,
 )
@@ -32,14 +32,14 @@ from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
 
-@pytest.mark.parametrize("source_kind", ["text", "instruction", "encoded"])
+@pytest.mark.parametrize("source_kind", ["text", "instruction", "pretokenized"])
 def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, source_kind):
     if source_kind == "instruction":
         config = replace(
             config, dataset_config=ZephonInstructionSourceConfig(column_mapping={"question": "q", "answer": "a"})
         )
-    elif source_kind == "encoded":
-        config = replace(config, dataset_config=ZephonEncodedTextSourceConfig())
+    elif source_kind == "pretokenized":
+        config = replace(config, dataset_config=ZephonPretokenizedTextSourceConfig())
     config = replace(
         config,
         zephon=replace(
