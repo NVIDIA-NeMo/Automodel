@@ -59,10 +59,8 @@ def require_supported_packing_contract(contract: PackedSequenceContract) -> None
     cu_seqlens [batch, boundaries] (-1 at unused entries), and max_seqlen. These
     describe the stream after gathering non-padding tokens. AutoModel's FA4 and
     recurrent/hybrid models use it for kernel layouts and recurrent-state resets.
-    It is not a request for generic document boundaries, which Zephon does supply.
-
-    Zephon's cu_seqlens includes physical padding segments, so renaming it would
-    be incorrect. The final batch map uses AutoModel's existing
+    Zephon's cu_seqlens instead describes physical offsets including padding.
+    The final batch map computes the gathered-token offsets with AutoModel's
     ``build_packed_sequence_metadata`` on the selected attention document IDs.
     Xdoc therefore joins both attention and recurrent-state boundaries; MTP
     uses those same selected boundaries. Keeping this bundle batch-major

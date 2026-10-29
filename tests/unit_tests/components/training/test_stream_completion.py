@@ -116,7 +116,7 @@ def test_config_infers_stream_capability_and_preserves_explicit_override():
     native = config.build(_Stream(2), 1, 1)
     assert "stream_exhausted" not in native.state_dict()
 
-    # Direct construction retains its pre-existing explicit opt-in contract.
+    # Direct construction requires explicit opt-in to coordinated stream completion.
     from nemo_automodel.components.training.step_scheduler import StepScheduler
 
     direct = StepScheduler(1, 1, 1, source, max_steps=3, preemption_signal=None)
