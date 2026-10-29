@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Built-in SFT tokenization and pretokenized-source replay through real CPU pipelines."""
+"""Built-in SFT tokenization, supervision and replay through real CPU pipelines."""
 
 import json
 from contextlib import closing
@@ -24,7 +24,6 @@ import torch
 from tokenizers import Tokenizer, models, pre_tokenizers, processors, trainers
 from transformers import PreTrainedTokenizerFast
 
-from nemo_automodel.components.datasets.packing import BatchOutputFormat
 from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonPretokenizedTextSourceConfig,
@@ -243,116 +242,6 @@ def test_instruction_mixture_uses_builtin_token_calibration(config, tokenizer, t
             total += tokens.numel()
         assert 0.42 < short / total < 0.58
         assert 0 < total < 5000
-
-
-def test_pretokenized_measurement_allocates_tokens_and_finite_repeat_cap(config, tokenizer, tmp_path):
-    from nemo_automodel.components.datasets.zephon.config import ZephonSource
-
-    sources = []
-    for name, tokens in (("short", [2, 1]), ("long", [3] * 7 + [1])):
-        path = tmp_path / name
-        path.mkdir()
-        (path / "data.jsonl").write_text((json.dumps({"tokens": tokens}) + "\n") * 64)
-        sources.append(ZephonSource(name=name, path=str(path), fmt="jsonl"))
-    pretokenized = replace(
-        config,
-        batch_size=1,
-        dataset_config=ZephonPretokenizedTextSourceConfig(tokens_field="tokens"),
-        zephon=replace(
-            config.zephon,
-            sources=tuple(sources),
-            packing=replace(config.zephon.packing, seq_len=31),
-            source=replace(
-                config.zephon.source,
-                chunk_size=8,
-                exhausted_policy="repeat",
-                stop_after_passes=4,
-                token_estimation={"calibration_samples": 8, "calibration_shards_min": 1, "calibration_shards_max": 1},
-            ),
-        ),
-    )
-    with closing(pretokenized.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
-        short = total = 0
-        for batch in loader:
-            tokens = torch.cat((batch["input_ids"], batch["labels"][:, -1:]), dim=1)
-            short += 2 * int(tokens.eq(2).sum())
-            total += tokens.numel()
-        assert 0.42 < short / total < 0.58
-        assert 0 < total < 5000
-        assert list(loader) == []
-
-
-def test_pretokenized_mixed_supervision_preserves_all_targets(config, tokenizer):
-    path = Path(config.zephon.sources[0].path) / "text.jsonl"
-    path.write_text(
-        json.dumps({"input_ids": [2], "loss_mask": [0]})
-        + "\n"
-        + json.dumps({"input_ids": [3, 4], "loss_mask": [0, 0]})
-        + "\n"
-        + json.dumps({"input_ids": [5, 6, 1]})
-        + "\n"
-    )
-    config = replace(
-        config,
-        batch_size=1,
-        dataset_config=ZephonPretokenizedTextSourceConfig(),
-        zephon=replace(
-            config.zephon,
-            packing=replace(config.zephon.packing, seq_len=5),
-            source=replace(config.zephon.source, chunk_size=1),
-        ),
-    )
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
-        batch = next(loader)
-        assert batch["input_ids"].tolist() == [[2, 3, 4, 5, 6]]
-        assert batch["labels"].tolist() == [[-100, -100, 5, 6, 1]]
-        assert batch["position_ids"].tolist() == [[0, 0, 1, 0, 1]]
-
-
-@pytest.mark.parametrize("output_format", ["batched", "thd"])
-def test_prepacked_boundaries_and_single_document_fallback(
-    config: ZephonDataloaderConfig, tokenizer: PreTrainedTokenizerFast, output_format: BatchOutputFormat
-) -> None:
-    path = Path(config.zephon.sources[0].path, "text.jsonl")
-    path.write_text(
-        json.dumps({"input_ids": [2, 3, 4, 5, 6, 1], "positions": [0, 1, 2, 0, 1, 2]})
-        + "\n"
-        + json.dumps({"input_ids": [7, 1, 8, 1]})
-        + "\n"
-    )
-    selected = replace(
-        config,
-        dataset_config=ZephonPretokenizedTextSourceConfig(),
-        output_format=output_format,
-        zephon=replace(
-            config.zephon,
-            packing=replace(config.zephon.packing, pack_algorithm=None),
-            runtime=replace(config.zephon.runtime, runner="process" if output_format == "batched" else "threads"),
-            source=replace(config.zephon.source, chunk_size=1),
-            training=replace(config.zephon.training, mask_segment_starts=True),
-        ),
-    )
-    for xdoc in (False, True):
-        selected = replace(
-            selected,
-            zephon=replace(
-                selected.zephon, training=replace(selected.zephon.training, allow_cross_document_attention=xdoc)
-            ),
-        )
-        with closing(selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
-            batch = next(loader)
-            assert batch["input_ids"].tolist() == [[2, 3, 4, 5, 6, 1, 1], [7, 1, 8, 1, 1, 1, 1]]
-            assert batch["labels"].tolist() == [[3, 4, -100, 6, 1, -100, -100], [1, 8, 1, -100, -100, -100, -100]]
-            assert batch["_packed_seq_ids"].tolist() == [
-                [1, 1, 1, 1 if xdoc else 2, 1 if xdoc else 2, 1 if xdoc else 2, 0],
-                [1, 1, 1, 1, 0, 0, 0],
-            ]
-            assert batch["position_ids"][0, :6].tolist() == ([0, 1, 2, 3, 4, 5] if xdoc else [0, 1, 2, 0, 1, 2])
-            # EOS inside the second supplied sequence never implies a boundary.
-            assert batch["position_ids"][1, :4].tolist() == [0, 1, 2, 3]
-            if output_format == "thd":
-                assert batch["seq_lens"][0].tolist() == ([6] if xdoc else [3, 3])
-                assert batch["seq_lens_padded"][0].tolist() == ([7] if xdoc else [3, 4])
 
 
 def test_instruction_tokenization_without_packing_keeps_answer_supervision(
