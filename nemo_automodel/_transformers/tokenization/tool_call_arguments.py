@@ -19,7 +19,7 @@ mapping. Automodel's chat datasets store arguments as JSON strings (the OpenAI w
 Arrow-backed datasets keep intact). ``wrap_tokenizer`` makes a tokenizer instance's ``apply_chat_template`` parse
 such strings back into dicts first, which is also what the serving stacks pass to those templates.
 ``DictToolArgumentsTokenizer`` is registered in ``TokenizerRegistry`` for the model types whose templates need it
-(Beam, DeepSeek-V4.1); other models are unaffected, and the tokenizer class (and hence ``save_pretrained`` output)
+(Beam, DeepSeek-V4.1, Nemotron-H); other models are unaffected, and the tokenizer class (and hence ``save_pretrained`` output)
 is unchanged.
 """
 

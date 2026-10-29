@@ -28,6 +28,8 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Cfg:
     def __init__(self, **values):
