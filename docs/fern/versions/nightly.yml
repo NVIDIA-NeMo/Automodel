@@ -608,6 +608,8 @@ navigation:
                 path: ../../model-coverage/vlm/mistralai/ministral3-vl.mdx
               - page: "Ministral-3-8B-Reasoning-2512"
                 path: ../../model-coverage/vlm/mistralai/ministral-3-8b-reasoning-2512.mdx
+              - page: "Mistral-Large-4-1T-A52B"
+                path: ../../model-coverage/vlm/mistralai/mistral-large-4.mdx
               - page: "Mistral-Medium-3.5-128B"
                 path: ../../model-coverage/vlm/mistralai/mistral-medium-3-5-128b.mdx
               - page: "Mistral-Small-4-119B-2603"

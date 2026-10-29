@@ -32,6 +32,8 @@ from nemo_automodel.recipes.llm.train_ft import (
     _maybe_downgrade_loss_fn,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def ddp_group(tmp_path):
