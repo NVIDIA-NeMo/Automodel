@@ -27,6 +27,7 @@ from nemo_automodel.components.datasets.packing import (
     build_packed_sequence_metadata,
     resolve_packing_contract,
 )
+from nemo_automodel.shared.vlm_media import pad_image_tensors
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -1739,9 +1740,23 @@ def neat_packed_vlm_collater(
     for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = _merge_media_values(tensors)
+            if (
+                key == "pixel_values"
+                and any(item.get("image_sizes") is not None for item in batch)
+                and all(isinstance(value, torch.Tensor) and value.ndim == 4 for value in tensors)
+            ):
+                result[key] = pad_image_tensors(tensors).to(torch.bfloat16)
+            else:
+                result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
+    for key in (
+        "image_grid_thw",
+        "image_position_ids",
+        "video_grid_thw",
+        "second_per_grid_ts",
+        "num_patches",
+        "image_sizes",
+    ):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
@@ -1878,9 +1893,23 @@ def packed_sequence_thd_vlm_collater(
     for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
-            result[key] = _merge_media_values(tensors)
+            if (
+                key == "pixel_values"
+                and any(item.get("image_sizes") is not None for item in batch)
+                and all(isinstance(value, torch.Tensor) and value.ndim == 4 for value in tensors)
+            ):
+                result[key] = pad_image_tensors(tensors).to(torch.bfloat16)
+            else:
+                result[key] = _merge_media_values(tensors)
 
-    for key in ("image_grid_thw", "image_position_ids", "video_grid_thw", "second_per_grid_ts", "num_patches"):
+    for key in (
+        "image_grid_thw",
+        "image_position_ids",
+        "video_grid_thw",
+        "second_per_grid_ts",
+        "num_patches",
+        "image_sizes",
+    ):
         tensors = [x[key] for x in batch if key in x and x[key] is not None]
         if tensors:
             result[key] = torch.cat(tensors, dim=0)
