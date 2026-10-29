@@ -32,6 +32,12 @@ are dropped.
 
 ## Configuring your data
 
+The source config chooses tokenization: raw text or instructions are tokenized
+online, while pretokenized input keeps its supplied token IDs. Independently,
+select a `packing.pack_algorithm` to pack online or set it to `null` to preserve
+each supplied sequence. This supports online tokenization and packing, offline
+tokenization with online packing, and fully prepacked input.
+
 Choose a dataset config for the kind of documents you have, then use the Zephon
 dataloader config in your usual AutoModel recipe. For raw text:
 
@@ -97,42 +103,7 @@ You can also place the data settings in a TOML file and reference it with
 `dataloader.zephon.data_config`. Inline YAML values override that file; relative
 source, cache, and checkpoint paths in TOML are resolved relative to the TOML file.
 
-### Instruction tuning and pretokenized text
-
-For question/answer data, select `ZephonInstructionSourceConfig`:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonInstructionSourceConfig
-  column_mapping: {question: prompt, answer: completion}
-  answer_only_loss_mask: true
-  use_hf_chat_template: true
-  tokenizer:
-    pretrained_model_name_or_path: /path/to/model-or-tokenizer
-```
-
-This example reads the `prompt` and `completion` fields of each document.
-AutoModel normalizes the columns, and Zephon's `tokenize_chat()` performs chat
-tokenization and loss masking. The tokenizer's chat template supplies the
-conversation format. Set `use_hf_chat_template: false` for plain prompt/completion
-formatting.
-
-You can use `ZephonInstructionSourceConfig` directly, as above. AutoModel's
-`ColumnMappedTextInstructionDatasetConfig` is an optional compatibility input:
-its supported fields are translated into `ZephonInstructionSourceConfig`.
-With the same preparation settings, both build the same Zephon instruction
-pipeline. In Python, you can pass a `ZephonInstructionSourceConfig` instance as
-`ZephonDataloaderConfig.dataset_config`.
-
-The local example uses plain formatting and Flash Attention:
-
-```bash
-uv run python examples/llm_pretrain/zephon/prepare_tiny.py
-uv run automodel examples/llm_pretrain/zephon/sft.yaml --nproc-per-node 1
-```
-
-Install the matching Flash Attention dependencies, or select SDPA with
-`--model.attn_implementation sdpa`.
+### Pretokenized and prepacked text
 
 Tokenization and online packing are independent choices:
 
@@ -182,6 +153,43 @@ raise instead of being truncated. `training.mask_segment_starts` still controls
 boundary-target masking. This is a flat token-sequence format, not an importer
 for framework cache files, source padding, cumulative-length tensors, or already
 shifted labels. The same `batched` and `thd` output formats remain available.
+
+### Instruction tuning
+
+For question/answer data, select `ZephonInstructionSourceConfig`:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonInstructionSourceConfig
+  column_mapping: {question: prompt, answer: completion}
+  answer_only_loss_mask: true
+  use_hf_chat_template: true
+  tokenizer:
+    pretrained_model_name_or_path: /path/to/model-or-tokenizer
+```
+
+This example reads the `prompt` and `completion` fields of each document.
+AutoModel normalizes the columns, and Zephon's `tokenize_chat()` performs chat
+tokenization and loss masking. The tokenizer's chat template supplies the
+conversation format. Set `use_hf_chat_template: false` for plain prompt/completion
+formatting.
+
+You can use `ZephonInstructionSourceConfig` directly, as above. AutoModel's
+`ColumnMappedTextInstructionDatasetConfig` is an optional compatibility input:
+its supported fields are translated into `ZephonInstructionSourceConfig`.
+With the same preparation settings, both build the same Zephon instruction
+pipeline. In Python, you can pass a `ZephonInstructionSourceConfig` instance as
+`ZephonDataloaderConfig.dataset_config`.
+
+The local example uses plain formatting and Flash Attention:
+
+```bash
+uv run python examples/llm_pretrain/zephon/prepare_tiny.py
+uv run automodel examples/llm_pretrain/zephon/sft.yaml --nproc-per-node 1
+```
+
+Install the matching Flash Attention dependencies, or select SDPA with
+`--model.attn_implementation sdpa`.
 
 ## How the integration works
 
