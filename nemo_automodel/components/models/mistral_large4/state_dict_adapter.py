@@ -219,8 +219,6 @@ class MistralLarge4StateDictAdapter(StateDictAdapter):
         self.grouped_experts = grouped_experts
         self.n_routed_experts = n_routed_experts
         self.dtype = dtype
-        self.expert_parallel_mesh: DeviceMesh | None = None
-        self.pipeline_parallel_mesh: DeviceMesh | None = None
         self._grouped_load_views: dict[str, tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]] = {}
 
     def iter_checkpoint_load_parts(
@@ -238,26 +236,25 @@ class MistralLarge4StateDictAdapter(StateDictAdapter):
 
         Returns:
             Parts covering every model key exactly once. PP groups at most
-            ceil(local_key_count / minimum_PP_peer_key_count) destinations per
+            ceil(local_key_count / minimum_rank_key_count) destinations per
             part, otherwise one. Each quantized destination stages its local FP8 matrices and replicated
             FP32 scale grids (one grouped parameter bank for grouped experts). Decoding is
             sequential with at most two 1024x1024 FP32 temporaries.
         """
         del device_mesh
         parts = self._iter_individual_load_parts(model_state_dict)
-        if self.pipeline_parallel_mesh is None:
+        if not dist.is_initialized() or dist.get_world_size() == 1:
             yield from parts
             return
-        mesh = self.pipeline_parallel_mesh
         count = len(model_state_dict)
-        minimum = torch.tensor(count, device=mesh.device_type, dtype=torch.long)
-        dist.all_reduce(minimum, op=dist.ReduceOp.MIN, group=mesh.get_group())
+        minimum = torch.tensor(count, device=next(iter(model_state_dict.values())).device, dtype=torch.long)
+        dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
         groups = int(minimum.item())
         if groups == 0:
-            raise ValueError("Mistral Large 4 PP cannot load a stage without parameters")
-        # All PP peers enter exactly `groups` DCP collectives. Each rank uses
+            raise ValueError("Mistral Large 4 cannot load a rank without parameters")
+        # All ranks enter exactly `groups` DCP collectives. Each rank uses
         # one or ceil(local_tensor_count / groups) destinations per collective.
-        # Balanced EP subsets have equal counts within each physical PP rank.
+        # Without PP every rank has the same count, so each part stays one tensor.
         for index in range(groups):
             size = count // groups + int(index < count % groups)
             group = list(islice(parts, size))
@@ -395,9 +392,7 @@ class MistralLarge4StateDictAdapter(StateDictAdapter):
             [E, intermediate, hidden] down. Gate precedes up. Grouped storage
             is independent; other values alias state. EP uses Shard(0).
         """
-        mesh = (
-            state_dict_utils.get_submesh(device_mesh, ("ep",)) if device_mesh is not None else self.expert_parallel_mesh
-        )
+        mesh = state_dict_utils.get_submesh(device_mesh, ("ep",)) if device_mesh is not None else None
         first, stop = state_dict_utils.get_expert_range_for_rank_from_mesh(mesh, self.n_routed_experts)
         pattern = re.compile(r"(.*\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
         prefixes = {match.group(1) for key in state if (match := pattern.fullmatch(key))}
@@ -439,7 +434,7 @@ class MistralLarge4StateDictAdapter(StateDictAdapter):
                 optionally EP Shard(0) and expert-FSDP Shard(1) DTensors.
             exclude_key_regex: Existing checkpoint API filter on model names.
             quantization: Unsupported; source FP8 is decoded on import, training saves floating weights.
-            device_mesh: Existing export hook; EP ownership is set by the model sidecar.
+            device_mesh: Existing export hook; DTensors carry their EP ownership.
             v4_compatible: Existing hook; released names have one layout.
             legacy_paramwrapper_layout: Existing hook; this model has no grouped ParamWrapper.
             for_checkpoint_load: Existing hook; floating destinations always alias model storage.

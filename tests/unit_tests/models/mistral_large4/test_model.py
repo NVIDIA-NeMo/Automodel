@@ -538,25 +538,6 @@ def test_layer_discovery_uses_decoder_stack_when_experts_outnumber_layers() -> N
     assert model.model.layers[1].mlp.experts.gate_and_up_projs.shape[0] == 128
 
 
-@pytest.mark.parametrize(
-    "strategy,checkpointing,match",
-    [
-        (DDPConfig(), False, "requires FSDP2"),
-        (FSDP2Config(enable_compile=True), False, "enable_compile=False"),
-        (FSDP2Config(sequence_parallel=True), False, "sequence_parallel=False"),
-        (FSDP2Config(), "selective", "full activation checkpointing"),
-    ],
-)
-def test_invalid_policy_rejected_before_parameter_surgery(strategy, checkpointing, match) -> None:
-    with torch.device("meta"):
-        model = MistralLarge4ForCausalLM(tiny_config())
-    before = dict(model.named_parameters())
-    context = MeshContext(strategy_config=strategy, activation_checkpointing=checkpointing)
-    with pytest.raises(ValueError, match=match):
-        model.parallelizer.parallelize(model, context)
-    assert all(parameter is before[name] for name, parameter in model.named_parameters())
-
-
 def test_unsharded_thd_selects_model_owned_batch_preparation() -> None:
     with torch.device("meta"):
         model = MistralLarge4ForCausalLM(tiny_config())

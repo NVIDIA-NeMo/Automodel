@@ -16,80 +16,37 @@
 
 from dataclasses import replace
 
-import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
-from nemo_automodel.components.moe.layers import MoE
 
 
 class MistralLarge4Parallelizer(ModelParallelizer):
     """Use existing FSDP machinery while preserving Large 4 precision and sharing.
 
     Expert ownership and dispatch use the common MoE parallelizer.
-    PP composes with EP and contiguous CP; tensor parallelism remains disabled.
     """
 
     _customizes_moe_fsdp = True
 
-    def _prepare_mesh_context(self, model: nn.Module, mesh_context: MeshContext) -> MeshContext:
-        """Validate the requested topology before changing parameter ownership."""
-        if not isinstance(mesh_context.strategy_config, FSDP2Config):
-            raise ValueError("Mistral Large 4 distributed execution currently requires FSDP2")
-        grouped = [module for module in model.modules() if isinstance(module, MoE)]
-        if mesh_context.pp_size > 1:
-            if hasattr(model, "state_dict_adapter"):
-                model.state_dict_adapter.pipeline_parallel_mesh = mesh_context.device_mesh["pp"]
-        if mesh_context.pp_size > 1 or grouped:
-            # PP carries FP32 LeRoPE tables; grouped experts receive FP32 router weights.
-            # Preserve each tensor's dtype across both root and block boundaries.
-            policy = replace(mesh_context.strategy_config.mp_policy, cast_forward_inputs=False, output_dtype=None)
-            mesh_context = replace(
-                mesh_context, strategy_config=replace(mesh_context.strategy_config, mp_policy=policy)
-            )
-        if any(module.backend.dispatcher == "hybridep" for module in grouped) and mesh_context.ep_size <= 1:
-            raise ValueError("Mistral HybridEP requires ep_size > 1; use dispatcher='torch' for a single EP rank")
-        config = mesh_context.strategy_config
-        if grouped and mesh_context.moe_parallel_config is not None:
-            moe_policy = mesh_context.moe_parallel_config.mp_policy
-            if moe_policy is not None:
-                mesh_context = replace(
-                    mesh_context,
-                    moe_parallel_config=replace(
-                        mesh_context.moe_parallel_config,
-                        mp_policy=replace(moe_policy, cast_forward_inputs=False, output_dtype=None),
-                    ),
-                )
-        if any(module.backend.dispatcher == "hybridep" for module in grouped):
-            policy = (
-                mesh_context.moe_parallel_config.mp_policy
-                if mesh_context.moe_parallel_config is not None
-                and mesh_context.moe_parallel_config.mp_policy is not None
-                else config.mp_policy
-            )
-            if policy.param_dtype not in (None, torch.bfloat16):
-                raise ValueError("Mistral HybridEP requires BF16 expert compute in the FSDP policy")
-        if config.sequence_parallel or config.enable_compile:
-            raise ValueError("Mistral Large 4 FSDP baseline requires sequence_parallel=False and enable_compile=False")
-        if mesh_context.activation_checkpointing not in (False, True, "full"):
-            raise ValueError("Mistral Large 4 supports full activation checkpointing only")
-        if mesh_context.ep_size > 1:
-            if not hasattr(model, "state_dict_adapter"):
-                raise ValueError("Large 4 EP requires enable_hf_state_dict_adapter=True")
-            if mesh_context.dp_replicate_size not in (None, 1):
-                raise ValueError("Mistral Large 4 EP does not yet compose with HSDP replication")
-            ep_mesh = mesh_context.moe_mesh["ep"]
-            if any(module.n_routed_experts % ep_mesh.size() for module in grouped):
-                raise ValueError("The expert count must be divisible by ep_size")
-            model.state_dict_adapter.expert_parallel_mesh = ep_mesh
-        if mesh_context.cp_size > 1:
-            model.cp_mesh = mesh_context.device_mesh["cp"]
-        return mesh_context
+    def _apply(self, model: nn.Module, device_mesh: DeviceMesh, **kwargs) -> nn.Module:
+        """Apply the inherited FSDP flow and retain the CP token mesh.
+
+        Args:
+            model: Native full model or pruned PP stage.
+            device_mesh: Resolved shared mesh, including its named CP axis.
+            **kwargs: Existing shared FSDP/AC/compile policies, passed unchanged.
+
+        Returns:
+            Parallelized model with its optional CP mesh.
+        """
+        result = super()._apply(model, device_mesh, **kwargs)
+        cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
+        model.cp_mesh = cp_mesh if cp_mesh is not None and cp_mesh.size() > 1 else None
+        return result
 
     def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
         """Shared KV and index selections are explicit immutable block inputs."""
@@ -121,6 +78,9 @@ class MistralLarge4Parallelizer(ModelParallelizer):
             Same module, with global-shaped DTensor parameters sharded on their
             leading axis; HSDP replicates across its first mesh dimension.
         """
+        # FP32 LeRoPE tables and router weights cross unit boundaries unchanged.
+        if mp_policy is not None:
+            mp_policy = replace(mp_policy, cast_forward_inputs=False, output_dtype=None)
         # The generic dtype grouper traverses descendants, including existing
         # FSDP units. Exclude their parameters before grouping this boundary.
         owned = set(ignored_params or ())
