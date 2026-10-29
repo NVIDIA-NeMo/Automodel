@@ -600,7 +600,7 @@ class ConfigNode:
         Convert configuration to a YAML-ready dictionary:
         - Preserves typed scalars (ints, floats, bools)
         - Converts callables/classes/methods (e.g., _target_, *_fn) to dotted path strings
-        - Recurses through nested ConfigNodes and lists
+        - Recurses through nested ConfigNodes and lists, emitting tuples as lists
 
         Args:
             resolve_env: If True, resolve `${oc.env:VAR}` interpolations in the returned dict.

@@ -86,11 +86,11 @@ Run the **same** command on every node, varying only `--node-rank`; node 0 is th
 rendezvous master and `<NODE0_IP>` is its address reachable from the other nodes:
 
 ```
-torchrun --nnodes=2 --node-rank=0 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/deepseek_v4_flash_dspark.yaml
+torchrun --nnodes=2 --node-rank=0 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.speculative_decoding.train_dspark -c examples/speculative/dspark/deepseek_v4_flash_dspark.yaml
 ```
 
 ```
-torchrun --nnodes=2 --node-rank=1 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/deepseek_v4_flash_dspark.yaml
+torchrun --nnodes=2 --node-rank=1 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.speculative_decoding.train_dspark -c examples/speculative/dspark/deepseek_v4_flash_dspark.yaml
 ```
 
 For 4 nodes, set `ep_size: 32` in the YAML and `--nnodes=4` with `--node-rank` 0..3.

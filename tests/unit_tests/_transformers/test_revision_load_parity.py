@@ -45,7 +45,7 @@ def test_target_builder_keeps_selected_checkpoint(hf_config_hub, monkeypatch, bu
     """Actual target config loaders must not route B's build to A's cached weights."""
     from huggingface_hub import constants
 
-    from nemo_automodel.recipes.llm import _dspark_target_build as target_build
+    from nemo_automodel.recipes.speculative_decoding import _dspark_target_build as target_build
 
     root, cache, ref, _ = hf_config_hub
     monkeypatch.setattr(constants, "HF_HUB_CACHE", str(root))

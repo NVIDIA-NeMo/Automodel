@@ -180,8 +180,11 @@ cli/app.py           -- resolves the config's recipe target and launches it
 recipes/             -- main training / eval entry points
   llm/
   vlm/
+  multimodal/
   diffusion/
+  dllm/
   retrieval/
+  speculative_decoding/
     |
     v
 components/          -- modular building blocks

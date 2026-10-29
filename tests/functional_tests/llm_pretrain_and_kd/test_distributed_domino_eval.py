@@ -24,7 +24,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nemo_automodel.components.speculative.dflash.core import NoValidAnchorsError
-from nemo_automodel.recipes.llm.train_domino import TrainDominoRecipe
+from nemo_automodel.recipes.speculative_decoding.train_domino import TrainDominoRecipe
 
 
 def _distributed_domino_eval_worker(rank: int, world_size: int, init_file: str, output_dir: str) -> None:
