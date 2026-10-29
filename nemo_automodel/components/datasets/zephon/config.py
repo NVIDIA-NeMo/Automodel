@@ -233,11 +233,12 @@ class ZephonInstructionSourceConfig:
 
 
 @dataclass(frozen=True, kw_only=True)
-class ZephonEncodedTextSourceConfig:
+class ZephonPretokenizedTextSourceConfig:
     """Unshifted, unpadded tokens; an optional aligned loss mask selects targets.
 
-    The adapter skips encoding and uses the normal flat packer and to_training
-    shift. Already shifted labels and prepacked boundary fields are rejected.
+    The adapter preserves supplied IDs and masks, adding an all-ones loss mask
+    only when absent. It does not tokenize or filter documents. Zephon owns
+    packing and label shifting; shifted labels and prepacked fields are rejected.
     """
 
     tokens_field: str = "input_ids"
@@ -245,7 +246,7 @@ class ZephonEncodedTextSourceConfig:
 
     def __post_init__(self) -> None:
         if not self.tokens_field or self.tokens_field == self.loss_mask_field:
-            raise ValueError("Encoded text needs distinct nonempty token and loss-mask fields")
+            raise ValueError("Pretokenized text needs distinct nonempty token and loss-mask fields")
 
     def build(
         self,
@@ -256,10 +257,13 @@ class ZephonEncodedTextSourceConfig:
         dp_rank: int,
         dp_world_size: int,
     ) -> Pipeline:
-        """Build exact token validation and share its vocabulary with calibration."""
+        """Validate pretokenized fields and calibrate from their original token counts."""
         import numpy as np
 
-        from nemo_automodel.components.datasets.zephon.llm import measure_encoded_document, normalize_encoded_document
+        from nemo_automodel.components.datasets.zephon.llm import (
+            measure_pretokenized_document,
+            normalize_pretokenized_document,
+        )
         from nemo_automodel.components.datasets.zephon.pipeline import create_source_pipeline
 
         del ids
@@ -268,10 +272,10 @@ class ZephonEncodedTextSourceConfig:
             options,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
-            measure=partial(measure_encoded_document, config=self, valid_token_ids=valid_ids),
+            measure=partial(measure_pretokenized_document, tokens_field=self.tokens_field),
         )
         return pipeline.map_transform(
-            partial(normalize_encoded_document, config=self, valid_token_ids=valid_ids),
+            partial(normalize_pretokenized_document, config=self, valid_token_ids=valid_ids),
             parallelism=options.workers.map_parallelism,
         )
 
@@ -610,7 +614,7 @@ def zephon_options_from_recipe(values: dict[str, Any], *, seed: int) -> ZephonOp
 class ZephonDataloaderConfig(ZephonLoaderConfig):
     """Own construction of the Zephon training stream."""
 
-    dataset_config: ZephonTextSourceConfig | ZephonInstructionSourceConfig | ZephonEncodedTextSourceConfig = field(
+    dataset_config: ZephonTextSourceConfig | ZephonInstructionSourceConfig | ZephonPretokenizedTextSourceConfig = field(
         default_factory=ZephonTextSourceConfig
     )
     batch_size: int = 1
@@ -657,10 +661,10 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
                 if key in values:
                     dataset_values.setdefault(key, values.pop(key))
         elif dataset_target in (
-            ZephonEncodedTextSourceConfig,
-            "nemo_automodel.components.datasets.zephon.ZephonEncodedTextSourceConfig",
+            ZephonPretokenizedTextSourceConfig,
+            "nemo_automodel.components.datasets.zephon.ZephonPretokenizedTextSourceConfig",
         ):
-            config_type = ZephonEncodedTextSourceConfig
+            config_type = ZephonPretokenizedTextSourceConfig
             if "tokens_field" in values:
                 dataset_values.setdefault("tokens_field", values.pop("tokens_field"))
         elif dataset_target in (
@@ -686,7 +690,7 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
                     )
         else:
             raise ValueError(
-                "Unsupported Zephon dataset target; select text, encoded tokens, or column-mapped instructions"
+                "Unsupported Zephon dataset target; select text, pretokenized tokens, or column-mapped instructions"
             )
         validate_zephon_dataset_fields(dataset_values, config_type=config_type)
         return cls(
