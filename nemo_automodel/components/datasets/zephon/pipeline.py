@@ -17,11 +17,12 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch.distributed as dist
 
-from nemo_automodel.components.datasets.zephon.llm import resolve_token_ids
+from nemo_automodel.components.datasets.zephon.llm import prepare_text_document_without_packing, resolve_token_ids
 from nemo_automodel.shared.import_utils import safe_import
 
 if TYPE_CHECKING:
@@ -161,8 +162,11 @@ def create_text_pipeline(
     dp_rank: int,
     dp_world_size: int,
 ) -> Pipeline:
-    """Materialize text mixtures with public token estimation, packing and batching."""
+    """Materialize text mixtures with token estimation, optional packing and batching."""
     options = config.zephon
+    sequence_length = options.packing.seq_len
+    if sequence_length is None:
+        raise ValueError("Resolve Zephon seq_len from the model before building the text pipeline")
     if tokenizer is None:
         raise ValueError("Zephon requires the resolved model tokenizer")
     ids = resolve_token_ids(tokenizer, pad_token_id=options.packing.pad_token_id)
@@ -176,22 +180,28 @@ def create_text_pipeline(
     pipeline = config.dataset_config.build(
         tokenizer=tokenizer, options=options, ids=ids, dp_rank=dp_rank, dp_world_size=dp_world_size
     )
-    pipeline.pack_flat(
-        max_length=options.packing.seq_len + 1,
-        algorithm=options.packing.pack_algorithm,
-        num_bins=num_bins,
-        max_sequences_per_bin=max_documents,
-        pad_token_id=ids.pad,
-        drop_oversized=options.packing.drop_oversized,
-        emit_positions=True,
-        parallelism=options.workers.pack_parallelism,
-    )
+    if options.packing.pack_algorithm is not None:
+        pipeline.pack_flat(
+            max_length=sequence_length + 1,
+            algorithm=options.packing.pack_algorithm,
+            num_bins=num_bins,
+            max_sequences_per_bin=max_documents,
+            pad_token_id=ids.pad,
+            drop_oversized=options.packing.drop_oversized,
+            emit_positions=True,
+            parallelism=options.workers.pack_parallelism,
+        )
+    else:
+        pipeline.map_transform(
+            partial(prepare_text_document_without_packing, max_length=sequence_length + 1),
+            parallelism=options.workers.map_parallelism,
+        )
     finalize_pipeline(pipeline, options, batch_size=config.batch_size, dp_rank=dp_rank, dp_world_size=dp_world_size)
     logger.info(
-        "Zephon stages: %s -> pack_flat(%s, %s) -> batch(%s); token_estimation=%s; sources=%s",
+        "Zephon stages: %s -> packing=%s (seq_len=%s) -> batch(%s); token_estimation=%s; sources=%s",
         type(config.dataset_config).__name__,
         options.packing.pack_algorithm,
-        options.packing.seq_len + 1,
+        sequence_length,
         config.batch_size,
         options.source.token_estimation,
         [(source.name, source.weight) for source in options.sources],

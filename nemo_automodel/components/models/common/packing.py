@@ -52,12 +52,15 @@ class PackingCapabilities:
     batched packed inputs. THD derives kernel metadata from lengths instead.
     ``return_document_ids`` requests original membership in either format.
     ``uses_native_fa4`` is model setup information, not an emitted batch field.
+    ``max_sequence_length`` is the configured decoder input-token limit per packed
+    document, before batch flattening; it applies to either output format.
     """
 
     packed_mask_type: PackedMaskType
     return_packed_sequence_metadata: bool = False
     uses_native_fa4: bool = False
     return_document_ids: bool = False
+    max_sequence_length: int | None = None
 
 
 @runtime_checkable
@@ -173,9 +176,17 @@ def get_packing_capabilities(
         Loader return requests plus model-owned native FA4 setup information.
         Mask representation and gathered-token requests are batched-only;
         original document membership can be requested in either format.
+        The input-token limit comes from the decoder's configured
+        ``max_position_embeddings``, independently of attention layout.
     """
     model = getattr(model, "module", model)
     model = getattr(model, "_orig_mod", model)
+    config = getattr(model, "config", None)
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config(decoder=True) if callable(get_text_config) else config
+    max_sequence_length = getattr(text_config, "max_position_embeddings", None)
+    if isinstance(max_sequence_length, bool) or not isinstance(max_sequence_length, int) or max_sequence_length <= 0:
+        max_sequence_length = None
     requires_metadata = isinstance(model, PackingMetadataConsumer) and model.requires_packed_sequence_metadata
     model_mask_type = model.packed_mask_type if isinstance(model, PackedMaskConsumer) else None
     uses_native_fa4 = attn_implementation == "fa4" and isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
@@ -191,6 +202,7 @@ def get_packing_capabilities(
         return_packed_sequence_metadata=requires_metadata or uses_native_fa4,
         return_document_ids=isinstance(model, DocumentAttentionMaskConsumer),
         uses_native_fa4=uses_native_fa4,
+        max_sequence_length=max_sequence_length,
     )
 
 
@@ -204,7 +216,8 @@ def get_packing_capabilities_for_models(models: Sequence[torch.nn.Module]) -> Pa
         models: Nonempty sequence of built local stages consuming the same batch.
 
     Returns:
-        The first stage's mask interface and the union of optional return requests.
+        The first stage's mask interface, the union of optional return requests,
+        and the smallest declared input-token limit across local stages.
 
     Raises:
         ValueError: If no model stages were supplied.
@@ -217,6 +230,10 @@ def get_packing_capabilities_for_models(models: Sequence[torch.nn.Module]) -> Pa
         return_packed_sequence_metadata=any(contract.return_packed_sequence_metadata for contract in contracts),
         return_document_ids=any(contract.return_document_ids for contract in contracts),
         uses_native_fa4=any(contract.uses_native_fa4 for contract in contracts),
+        max_sequence_length=min(
+            (contract.max_sequence_length for contract in contracts if contract.max_sequence_length is not None),
+            default=None,
+        ),
     )
 
 

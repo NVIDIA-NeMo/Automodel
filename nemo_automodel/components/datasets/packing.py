@@ -34,6 +34,8 @@ class PackedSequenceContract(Protocol):
     metadata from lengths instead. ``return_document_ids`` requests optional
     original membership in either format; effective segmentation always remains
     available separately. Unpacked native loaders ignore packing-only requests.
+    ``max_sequence_length`` is the model's input-token limit per packed document,
+    before batch flattening, and applies to both batched and THD output.
     """
 
     @property
@@ -67,6 +69,11 @@ class PackedSequenceContract(Protocol):
         """
         ...
 
+    @property
+    def max_sequence_length(self) -> int | None:
+        """Decoder input-token limit, or None when the model does not declare one."""
+        ...
+
 
 @dataclass(frozen=True)
 class _DefaultPackedSequenceContract:
@@ -75,6 +82,7 @@ class _DefaultPackedSequenceContract:
     packed_mask_type: PackedMaskType = "block_causal"
     return_packed_sequence_metadata: bool = False
     return_document_ids: bool = False
+    max_sequence_length: int | None = None
 
 
 DEFAULT_PACKED_SEQUENCE_CONTRACT: Final[PackedSequenceContract] = _DefaultPackedSequenceContract()
