@@ -1920,7 +1920,9 @@ class TestRobustDatasetWrapperFakeImageInjection:
 class _FakeProcessor:
     """Minimal processor stand-in for PreTokenizedDatasetWrapper tests."""
 
-    def apply_chat_template(self, conversations, tokenize=False):
+    def apply_chat_template(self, conversations, tokenize=False, **kwargs):
+        if tokenize:
+            return self()
         return ["rendered text"]
 
     def __call__(self, **kwargs):
@@ -2116,8 +2118,9 @@ class _LengthByTextProcessor:
     """Processor whose token count depends on the rendered text: ``LONG`` -> 10 tokens
     (over the test max_length), anything else -> 4 tokens whose ids encode the sample."""
 
-    def apply_chat_template(self, conversations, tokenize=False):
-        return [conversations[0][0]["content"][0]["text"]]
+    def apply_chat_template(self, conversations, tokenize=False, **kwargs):
+        text = [conversations[0][0]["content"][0]["text"]]
+        return self(text=text) if tokenize else text
 
     def __call__(self, **kwargs):
         import torch
