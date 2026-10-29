@@ -95,16 +95,6 @@ These training measurements do not close the numerical gates listed below.
 | CP2/PP2/EP2 with HybridEP (BF16) | Identical logits; aggregate gradient relative L2 0.45% |
 | TileLang sparse MLA (CP1, CP2) vs. FP32 oracle | Output relative L2 0.24%; query/KV/value-weight gradients 0.31% / 0.28% / 0.24% |
 
-## Known Limitations
-
-- Tensor parallelism is not supported.
-- HybridEP supports full fine-tuning; expert LoRA uses the Torch dispatcher.
-- Packed context parallelism requires `backend.attn: tilelang`.
-- The DSA indexer is frozen.
-- In BF16, some comparisons exceed a 0.5% relative L2 gate: TileLang sparse MLA vs. SDPA logits
-  (0.57%), packed CP2 pixel gradients (0.95%), packed PP2/CP2/EP2 HybridEP gradients (0.57%), and
-  40-layer gradients vs. an independent reference (0.75% to 1.02%).
-
 ## Model Reference
 
 ### Model Architecture
