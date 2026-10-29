@@ -17,8 +17,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
 
@@ -39,10 +40,12 @@ def create_source_pipeline(
     *,
     dp_rank: int,
     dp_world_size: int,
+    measure: Callable[[Any], int] | None = None,
 ) -> Pipeline:
     """Create the shared source/runtime backbone before objective-specific stages.
 
-    Raw text uses Zephon's built-in tokenizer counting.
+    ``measure`` is an adapter-owned token counter for pretokenized or multimodal
+    documents. Raw text and SFT use Zephon's built-in tokenizer counting.
     """
     available, zephon = safe_import("zephon")
     if not available:
@@ -64,9 +67,9 @@ def create_source_pipeline(
     if estimation is None:
         estimation = len(options.sources) > 1
     token_estimation = (
-        work.TokenEstimation(**estimation)
+        work.TokenEstimation(measure=measure, **estimation)
         if isinstance(estimation, dict)
-        else (work.TokenEstimation() if estimation else None)
+        else (work.TokenEstimation(measure=measure) if estimation else None)
     )
     source = work.StaticMixtureWorkSource(
         datasets=datasets,

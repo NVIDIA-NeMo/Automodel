@@ -14,6 +14,14 @@
 
 """Zephon data backend for AutoModel recipes."""
 
-from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig, ZephonTextSourceConfig
+from nemo_automodel.components.datasets.zephon.config import (
+    ZephonDataloaderConfig,
+    ZephonPretokenizedTextSourceConfig,
+    ZephonTextSourceConfig,
+)
 
-__all__ = ["ZephonDataloaderConfig", "ZephonTextSourceConfig"]
+__all__ = [
+    "ZephonDataloaderConfig",
+    "ZephonPretokenizedTextSourceConfig",
+    "ZephonTextSourceConfig",
+]
