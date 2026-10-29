@@ -72,6 +72,40 @@ def test_fake_image_slots_keep_attention_and_supervision_exclusions(processor):
     assert encoded["labels"][encoded["labels"] != -100].tolist() == [6, 7, 4]
 
 
+@pytest.mark.parametrize("generation_mask", [False, True])
+def test_processor_template_owns_multiturn_special_tokens_and_supervision(processor, generation_mask):
+    from tokenizers.processors import TemplateProcessing
+
+    # Tokenizer postprocessing would duplicate template markers if applied twice.
+    processor.tokenizer.bos_token = "<user>"
+    processor.tokenizer._tokenizer.post_processor = TemplateProcessing(
+        single="<user> $A <turn_end>", special_tokens=[("<user>", 2), ("<turn_end>", 4)]
+    )
+    if not generation_mask:
+        processor.chat_template = processor.chat_template.replace("{% generation %}", "").replace(
+            "{% endgeneration %}", ""
+        )
+    document = _document(())
+    document["conversation"] += [
+        {"role": "user", "content": [{"type": "text", "text": "Describe image"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "the answer"}]},
+    ]
+    expected = processor.apply_chat_template(
+        [document["conversation"]], tokenize=True, return_dict=True, return_tensors="pt"
+    )
+    encoded = encode_vlm_document(document, processor, inject_fake_images=False)
+    torch.testing.assert_close(encoded["input_ids"], expected["input_ids"][0], rtol=0, atol=0)
+    assert encoded["input_ids"].eq(processor.tokenizer.eos_token_id).sum() == 2
+    assert encoded["labels"][encoded["labels"] != -100].tolist() == [6, 7, 4, 6, 7, 4]
+
+
+def test_processor_template_without_eos_is_not_augmented(processor):
+    processor.chat_template = processor.chat_template.replace(" <turn_end>", "")
+    encoded = encode_vlm_document(_document(()), processor, inject_fake_images=False)
+    assert not encoded["input_ids"].eq(processor.tokenizer.eos_token_id).any()
+    assert encoded["labels"][encoded["labels"] != -100].tolist() == [6, 7]
+
+
 def test_unshifted_assembly_retains_terminal_targets(processor):
     documents = [
         encode_vlm_document(_document(sizes), processor, inject_fake_images=False)
@@ -85,6 +119,20 @@ def test_unshifted_assembly_retains_terminal_targets(processor):
     assert merged["labels"][merged["labels"] != -100].tolist() == [6, 7, 4, 6, 7, 4]
     torch.testing.assert_close(merged["image_grid_thw"], torch.tensor([[1, 6, 4], [1, 4, 8], [1, 4, 4]]))
     torch.testing.assert_close(merged["pixel_values"], torch.cat([d["pixel_values"] for d in documents]))
+
+
+def test_document_assembly_can_omit_native_targets_and_attention_ids():
+    documents = [
+        {"input_ids": torch.tensor([2, 3]), "position_ids": torch.arange(2), "pixel_values": torch.ones(1, 3, 2, 2)},
+        {"input_ids": torch.tensor([4, 5, 6]), "position_ids": torch.arange(3)},
+    ]
+    # Labels are deliberately absent: this consumer supplies loss masks separately.
+    merged = merge_vlm_documents(documents, padding_idx=0, return_labels=False, return_attention_mask=False)
+    assert "labels" not in merged and "attention_mask" not in merged
+    assert merged["input_ids"].tolist() == [2, 3, 4, 5, 6]
+    assert merged["position_ids"].tolist() == [0, 1, 0, 1, 2]
+    assert merged["seq_lens"] == merged["seq_lens_padded"] == [2, 3]
+    torch.testing.assert_close(merged["pixel_values"], documents[0]["pixel_values"])
 
 
 def test_position_field_collation_preserves_mrope_and_pads_only_tail():
