@@ -19,7 +19,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from numbers import Integral
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -80,3 +82,32 @@ def resolve_token_ids(tokenizer: PreTrainedTokenizerBase, *, pad_token_id: int |
     raise ValueError(
         "No padding ID is available; set dataloader.zephon.packing.pad_token_id to an existing vocabulary ID"
     )
+
+
+def prepare_text_document_without_packing(payload: dict[str, Any], *, max_length: int) -> dict[str, Any]:
+    """Supply boundaries when packing is off, without guessing from token values.
+
+    to_training needs scalar reset positions to derive document IDs and boundary
+    loss masks. Offline exports can supply those positions; absent metadata means
+    exactly one document, even when the tokens contain multiple EOS markers.
+
+    Args:
+        payload: Tokenized document with input_ids [tokens], optional aligned
+            loss_mask [tokens], and optional validated positions [tokens].
+        max_length: Unshifted token budget, including the final prediction target.
+
+    Returns:
+        The input mapping when it already has positions, otherwise a new mapping
+        with int64 positions [tokens]. Existing arrays are never changed.
+
+    Raises:
+        ValueError: When the document exceeds the configured input/target budget.
+    """
+    length = len(payload["input_ids"])
+    if length > max_length:
+        raise ValueError(
+            f"Document has {length} unshifted tokens, exceeding seq_len+1={max_length} with online packing disabled"
+        )
+    if "positions" in payload:
+        return payload
+    return {**payload, "positions": np.arange(length, dtype=np.int64)}

@@ -20,7 +20,7 @@ import math
 import tomllib
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
@@ -134,7 +134,7 @@ class ZephonTextSourceConfig:
             tokenizer=tokenizer,
             field=self.text_field,
             add_attention_mask=False,
-            max_length=options.packing.seq_len + 1 if wrapping else None,
+            max_length=options.packing.seq_len + 1 if wrapping and options.packing.seq_len is not None else None,
             split_long_samples=wrapping,
             special_tokens=self.tokenize_special_tokens,
             bos_token_id=bos_token_id if self.tokenize_special_tokens in ("bos", "bos_eos") else None,
@@ -180,10 +180,14 @@ class ZephonSourceOptions:
 
 @dataclass(frozen=True, kw_only=True)
 class ZephonPackingOptions:
-    """Document packing and post-pack shuffling; length includes shifted inputs only."""
+    """Optional online packing; seq_len bounds shifted model inputs.
 
-    seq_len: int = 2048
-    pack_algorithm: Literal["wrap", "first_fit", "best_fit", "best_fit_wrap"] = "wrap"
+    Omitted lengths use the model's input-token limit. ``pack_algorithm=None``
+    keeps supplied documents separate and lets to_training pad shorter inputs.
+    """
+
+    seq_len: int | None = None
+    pack_algorithm: Literal["wrap", "first_fit", "best_fit", "best_fit_wrap"] | None = "wrap"
     pack_num_bins: int | None = None
     max_num_documents: int | None = None
     max_num_documents_scope: Literal["batch", "bin"] = "batch"
@@ -193,15 +197,24 @@ class ZephonPackingOptions:
     shuffle_buffer_size: int | None = None
 
     def __post_init__(self) -> None:
-        if self.seq_len <= 0:
+        if self.seq_len is not None and (
+            isinstance(self.seq_len, bool) or not isinstance(self.seq_len, int) or self.seq_len <= 0
+        ):
             raise ValueError("Zephon seq_len must be positive")
-        if self.pack_algorithm not in ("wrap", "first_fit", "best_fit", "best_fit_wrap"):
-            raise ValueError("Use an existing Zephon pack_algorithm: wrap, first_fit, best_fit or best_fit_wrap")
+        if self.pack_algorithm not in (None, "wrap", "first_fit", "best_fit", "best_fit_wrap"):
+            raise ValueError(
+                "Use pack_algorithm=null or an existing Zephon algorithm: wrap, first_fit, best_fit, best_fit_wrap"
+            )
+        packing_enabled = self.pack_algorithm is not None
+        if not packing_enabled and (
+            self.pack_num_bins is not None or self.max_num_documents is not None or self.drop_oversized
+        ):
+            raise ValueError("pack_num_bins, max_num_documents and drop_oversized require online packing")
         wrapping = self.pack_algorithm in ("wrap", "best_fit_wrap")
         if self.drop_oversized is None:
-            object.__setattr__(self, "drop_oversized", not wrapping)
+            object.__setattr__(self, "drop_oversized", packing_enabled and not wrapping)
         if self.shuffle_after_pack is None:
-            object.__setattr__(self, "shuffle_after_pack", not wrapping)
+            object.__setattr__(self, "shuffle_after_pack", packing_enabled and not wrapping)
         if wrapping and self.pack_num_bins is not None:
             raise ValueError("pack_num_bins is only used by first_fit and best_fit")
         if wrapping and self.drop_oversized is True:
@@ -317,8 +330,25 @@ class ZephonLoaderConfig:
 
     @property
     def is_packed(self) -> bool:
-        """All supported objectives emit packed documents."""
+        """Delivery carries document metadata, including for offline-packed input."""
         return True
+
+    def resolve_sequence_length(self, *, packing_contract: PackedSequenceContract) -> int:
+        """Resolve the shifted input limit before starting source workers.
+
+        The effective model config supplies the default, not a tokenizer's
+        possibly sentinel model_max_length. Explicit shorter training lengths
+        remain valid. Position resets do not change the total input-token limit.
+        """
+        model_limit = packing_contract.max_sequence_length
+        sequence_length = self.zephon.packing.seq_len
+        if sequence_length is None:
+            if model_limit is None:
+                raise ValueError("Set dataloader.zephon.packing.seq_len: the model has no known input-token limit")
+            sequence_length = model_limit
+        if model_limit is not None and sequence_length > model_limit:
+            raise ValueError(f"Zephon seq_len={sequence_length} exceeds the model input-token limit {model_limit}")
+        return sequence_length
 
     def validate_parallelism(self, *, cp_size: int) -> None:
         """DP shards input; TP/PP peers share input, and CP remains unsupported."""
@@ -526,8 +556,8 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
 
     @property
     def packed_sequence_length(self) -> int:
-        """Shifted input length emitted by Zephon's final converter."""
-        return self.zephon.packing.seq_len
+        """Explicit shifted length, or zero until the model-derived limit is known."""
+        return self.zephon.packing.seq_len or 0
 
     def build(
         self,
@@ -545,12 +575,13 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
     ) -> ZephonDataLoader:
         """Construct the checkpointable stream without mutating this config.
 
-        Runtime arguments match the native text builder. Zephon packs documents and
+        Runtime arguments match the native text builder. Zephon optionally packs documents and
         ``to_training`` owns collation and shifting in the loader consumer; cheap
         AutoModel adaptations then select the output representation. Native PP collator wrappers do not apply. ``dataset_build_context``
         is deliberately not entered: source initialization may involve all ranks.
         ``cp_size`` is validated; ``ignore_index`` controls Zephon's shifted labels.
         """
+        from nemo_automodel.components.datasets.zephon.llm import resolve_token_ids
         from nemo_automodel.components.datasets.zephon.loader import ZephonDataLoader, convert_text_batch
         from nemo_automodel.components.datasets.zephon.pipeline import create_text_pipeline
 
@@ -560,8 +591,14 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
         if tokenizer is None:
             raise ValueError("Zephon requires the resolved model tokenizer")
         self.validate_build(batch_size=self.batch_size, cp_size=cp_size, packing_contract=packing_contract)
+        sequence_length = self.resolve_sequence_length(packing_contract=packing_contract)
+        resolved = replace(
+            self, zephon=replace(self.zephon, packing=replace(self.zephon.packing, seq_len=sequence_length))
+        )
+        ids = resolve_token_ids(tokenizer, pad_token_id=self.zephon.packing.pad_token_id)
+        no_packing = self.zephon.packing.pack_algorithm is None
         return ZephonDataLoader(
-            pipeline=create_text_pipeline(self, tokenizer=tokenizer, dp_rank=dp_rank, dp_world_size=dp_world_size),
+            pipeline=create_text_pipeline(resolved, tokenizer=tokenizer, dp_rank=dp_rank, dp_world_size=dp_world_size),
             packing_contract=packing_contract,
             convert_batch=partial(
                 convert_text_batch,
@@ -570,6 +607,8 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
                 ignore_index=ignore_index,
                 mask_segment_starts=self.zephon.training.mask_segment_starts,
                 allow_cross_document_attention=self.zephon.training.allow_cross_document_attention,
+                pad_to_length=sequence_length + 1 if no_packing else None,
+                pad_token_id=ids.pad if no_packing else None,
             ),
             output_format=self.output_format,
         )

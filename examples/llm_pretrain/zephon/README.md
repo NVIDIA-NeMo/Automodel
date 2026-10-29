@@ -75,12 +75,21 @@ describe token proportions rather than document proportions. See
 [mixing datasets](https://docs.zephon.io/worksources/mixing_datasets.html) for
 calibration and sampling behavior.
 
-`packing.seq_len` is the model input length. Zephon prepares one extra token for
-next-token prediction and handles the input/target shift. `wrap` can split long
+`packing.seq_len` is the model input length. When omitted, it uses the effective
+model config's input-token limit. Set it explicitly for shorter training inputs
+or when the model has no known limit. A length above a known model limit is
+rejected, including when positions reset between subdocuments. Zephon prepares
+one extra token for next-token prediction and handles the input/target shift. `wrap` can split long
 text documents; `first_fit` and `best_fit` keep documents whole. With bin packing,
 oversized documents are dropped by default; `drop_oversized: false` raises an
 error instead. See the [packing guide](https://docs.zephon.io/pipelines/packing.html)
 for the algorithms and their options.
+
+Set `packing.pack_algorithm: null` to tokenize each supplied document without
+packing it with others. `to_training()` pads shorter documents to the configured
+length and shifts labels once. Oversized documents raise; tokens are never
+silently truncated.
+
 
 The `source`, `packing`, `training`, `workers`, `runtime`, `cache`, and `checkpoint`
 groups keep related options together. For example, `workers.tokenize_parallelism`
@@ -98,7 +107,7 @@ source, cache, and checkpoint paths in TOML are resolved relative to the TOML fi
 
 The dataset config selects the text field and tokenizer settings. The Zephon
 pipeline reads and mixes sources, tokenizes documents, packs them, and groups
-them into batches. Zephon's `to_training()` handles shifting, padding, and
+them into batches; online packing can be disabled. Zephon's `to_training()` handles shifting, padding, and
 collation. A small adapter then presents that result in the format expected by
 AutoModel's existing recipe and model.
 
