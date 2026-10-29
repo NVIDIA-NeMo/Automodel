@@ -32,7 +32,7 @@ from nemo_automodel.recipes.vlm import finetune
 @pytest.mark.parametrize("backend", ["sdpa", "flash_attention_2"])
 def test_recipe_preserves_backend_and_reports_packed_inputs(recipe, wrapper, backend, monkeypatch):
     # Replace expensive weight/device construction; exercise recipe config dispatch
-    # and the real preload policy that previously replaced SDPA with Flash.
+    # and verify that preload policy preserves the configured attention backend.
     def load_model(*, attn_implementation, has_packed_sequence, **kwargs):
         assert has_packed_sequence is True
         resolved, _ = _apply_preload_overrides(1, 1, has_packed_sequence, attn_implementation, False)

@@ -14,9 +14,9 @@
 
 """Image-document encoding and field callbacks for Zephon's final converter.
 
-This module does not select attention policy or implement another collator.
-The pipeline chooses whole-document bins; ``SampleBatch.to_training`` owns
-padding, token/label tensor construction and the next-token shift.
+Field callbacks assemble image tensors and model positions for whole-document
+packs. ``SampleBatch.to_training`` owns padding, token/label tensor construction
+and the next-token shift; attention policy is applied after collation.
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ class VlmEncoderConfig:
     on_media_error: Literal["raise", "drop"] = "raise"
 
     def build(self, *, pretrained_model_name_or_path: str, positions: ImagePositionState) -> BaseOp:
-        """Build a ZUG operator from declarative processor settings and plain state."""
+        """Build a Zephon operator with worker-local processor state."""
         if self.parallelism < 1:
             raise ValueError("VLM encoder parallelism must be positive.")
         if self.on_media_error not in ("raise", "drop"):
