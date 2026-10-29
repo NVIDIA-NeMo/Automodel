@@ -49,6 +49,34 @@ class BlendedDataset(torch.utils.data.Dataset):
         RuntimeError: When the dataset has fewer or more samples than 'size' post-initialization
     """
 
+    def __getstate__(self) -> dict[str, object]:
+        """Serialize cached blend indices by path, leaving parent mappings open.
+
+        Returns:
+            Instance state with read-only dataset_index and dataset_sample_index
+            arrays [samples] replaced by their .npy paths. Child GPT datasets
+            retain their own worker serialization contract.
+        """
+        state = self.__dict__.copy()
+        for name in ("dataset_index", "dataset_sample_index"):
+            value = state[name]
+            if isinstance(value, numpy.memmap) and value.mode == "r":
+                state[name] = value.filename
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        """Reopen process-local read-only blend indices in a worker.
+
+        Args:
+            state: Instance state from __getstate__, with paths to numeric
+                dataset_index and dataset_sample_index arrays [samples].
+        """
+        for name in ("dataset_index", "dataset_sample_index"):
+            value = state[name]
+            if isinstance(value, (str, os.PathLike)):
+                state[name] = numpy.load(value, allow_pickle=False, mmap_mode="r")
+        self.__dict__.update(state)
+
     def __init__(
         self,
         datasets: List[GPTDataset],
