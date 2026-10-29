@@ -292,6 +292,10 @@ dataset:
 ```
 See the detailed [pretraining guide](/recipes-e2e-examples/pretraining), which uses MegatronPretraining data.
 
+<Tip>
+When a dataset's `tokenizer` block loads a BPE tokenizer through `NeMoAutoTokenizer.from_pretrained`, you can accelerate plain-text tokenization with the optional gigatoken backend by adding `use_gigatoken: true`. See [Accelerate Tokenization with gigatoken](/get-started/hf-compatibility#accelerate-tokenization-with-gigatoken-optional) for the supported routes and limitations.
+</Tip>
+
 ## Streaming Datasets
 
 Streaming datasets enable processing very large datasets without loading them entirely into memory. This is particularly useful when working with datasets that exceed available RAM or when you want to start training immediately without waiting for the full dataset to download.
