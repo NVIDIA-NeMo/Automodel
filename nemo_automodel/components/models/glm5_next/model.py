@@ -267,7 +267,6 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     """Trainable GLM-5.3 VLM with PP, EP and contiguous packed CP support."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-    _skip_init_weights_on_load = True
     _owns_cp_attention = True
     _owns_packed_attention = True
     _packed_cp_attn_backends = ("sdpa", "cudnn")

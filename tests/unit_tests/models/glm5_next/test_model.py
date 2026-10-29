@@ -6,13 +6,17 @@ import pytest
 import torch
 
 from nemo_automodel._transformers.capabilities import ModelSupports
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.models.glm5_next import layers as glm5_next_layers
 from nemo_automodel.components.models.glm5_next.cp import Glm5NextPackedContext
 from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextLinearAttention,
     Glm5NextSparseAttention,
 )
-from nemo_automodel.components.models.glm5_next.model import build_glm5_next_moe_config
+from nemo_automodel.components.models.glm5_next.model import (
+    Glm5NextForConditionalGeneration,
+    build_glm5_next_moe_config,
+)
 from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config, tiny_glm5_next_model
 
 
@@ -86,6 +90,30 @@ def test_tiny_hybrid_packed_forward_backward_is_finite():
     assert torch.isfinite(logits).all()
     assert model.model.language_model.layers["0"].self_attn.q_proj.weight.grad is not None
     assert model.model.language_model.layers["3"].self_attn.q_a_proj.weight.grad is not None
+
+
+def test_checkpointer_initializes_checkpoint_free_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The native initializer must populate weights without a checkpoint load."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    torch.manual_seed(17)
+    model = Glm5NextForConditionalGeneration(tiny_glm5_next_config(), backend=tiny_backend())
+    # Poison storage so skipping initialization cannot pass due to allocator reuse.
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(float("nan"))
+
+    Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+    for name, parameter in model.named_parameters():
+        assert torch.isfinite(parameter).all(), name
+    gate = model.model.language_model.layers["3"].mlp.gate
+    assert gate.weight.std() > 0
+    logits = model(input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]])).logits
+    assert torch.isfinite(logits).all()
+    logits.square().mean().backward()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    assert gradients
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
 def test_torch_kda_decay_scales_the_key_dimension():
