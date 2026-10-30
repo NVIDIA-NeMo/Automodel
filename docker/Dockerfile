@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.08-py3
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.10-cuda13.4-devel-ubuntu24.04
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -120,11 +120,11 @@ FROM update_base_container AS automodel_dep
 
 # Install TE
 ARG INSTALL_TE=True
-ARG TE_COMMIT=v2.19.0
+ARG TE_COMMIT=v2.20.2
 # CI enables NCCL-EP on the PyTorch image, which supplies NCCL >= 2.30.4
 # and the private symmetric-memory headers absent from public torch wheels.
 ARG TE_WITH_NCCL_EP=0
-# TE 2.19 expands the 100 family target to 107a when CUDA 13.4+ is used.
+# TE 2.19+ expands the 100 family target to 107a when CUDA 13.4+ is used.
 ARG TE_CUDA_ARCHS="80;90;100;120"
 ARG TE_BUILD_MAX_JOBS=8
 ARG TE_BUILD_THREADS_PER_JOB=8
@@ -132,7 +132,7 @@ ARG TE_BUILD_THREADS_PER_JOB=8
 # binding is already compatible. Otherwise rebuild it against the exact
 # PyTorch/CUDA stack in this image to avoid carrying a stale native extension.
 RUN if [ "$INSTALL_TE" = "True" ] || [ "$TE_WITH_NCCL_EP" = "1" ] || \
-        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.19.0'); import transformer_engine.pytorch"; then \
+        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.20.2'); import transformer_engine.pytorch"; then \
     pip uninstall -y transformer-engine transformer-engine-cu12 transformer-engine-cu13 transformer-engine-torch && \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
@@ -158,12 +158,17 @@ RUN if [ "$INSTALL_TE" = "True" ] || [ "$TE_WITH_NCCL_EP" = "1" ] || \
 # instead of forcing C++17 (PyTorch's Rubin builds require C++20).
 # deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
 # Remove the configs.cuh/ibgda_device.cuh hunks when the pinned revision includes that fix.
+# The pinned revision includes https://github.com/deepseek-ai/DeepEP/pull/750,
+# which falls back to DMA-BUF when legacy ibv_reg_mr registration fails.
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
+ARG DEEPEP_COMMIT=96e3d1fc77be942438673e88b07be21d454af8a9
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
-RUN ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
+RUN apt-get update && apt-get install -y --allow-change-held-packages \
+        rdma-core libibverbs-dev && \
+    apt-get clean && \
+    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH) && \
     test -f /usr/lib/${ARCH_LIB}/libmlx5.so || \
         ln -sf /usr/lib/${ARCH_LIB}/libmlx5.so.1 /usr/lib/${ARCH_LIB}/libmlx5.so && \
     mkdir -p ${RDMA_CORE_HOME} && \
@@ -292,13 +297,13 @@ RUN pip install "aiohttp>=3.14.3" \
         "black>=26.3.1" \
         "GitPython>=3.1.59" \
         "jaraco-context>=6.1.0" \
-        "jupyter-server>=2.20.0" \
+        "jupyter-server>=2.21.1" \
         "jupyterlab>=4.5.10" \
         "mistune>=3.3.0" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
         "onnx>=1.22.0" \
-        "pillow>=12.3.0" \
+        "pillow>=13.0.0" \
         "protobuf>=6.33.5" \
         "setuptools>=83.0.0" \
         "tornado>=6.5.5" \
@@ -359,6 +364,19 @@ ARG RUNTIME_GID=65532
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
 
+# On Google Cloud A3 Ultra, A4, A4X and A4X Max machines, the NGC PyTorch base image's shell
+# init (/etc/shinit_v2) enables Google's NCCL profiler plugin (CoMMA), which by default uploads
+# NCCL telemetry to Google. Turn the telemetry off and do not load the plugin. The shell init
+# runs in every bash process and would set NCCL_PROFILER_PLUGIN=gcp again, so make it keep a
+# value that is already set. Run with NCCL_PROFILER_PLUGIN=gcp NCCL_TELEMETRY_MODE=3 to opt in.
+ENV NCCL_TELEMETRY_MODE=0 \
+    NCCL_PROFILER_PLUGIN=none
+RUN if [ -f /opt/gcp/nccl-plugins/lib64/libnccl-profiler-gcp.so ]; then \
+        sed -i 's/^\( *\)export NCCL_PROFILER_PLUGIN=gcp$/\1export NCCL_PROFILER_PLUGIN=${NCCL_PROFILER_PLUGIN:-gcp}/' /etc/shinit_v2 && \
+        grep -qF 'export NCCL_PROFILER_PLUGIN=${NCCL_PROFILER_PLUGIN:-gcp}' /etc/shinit_v2 || \
+        { echo "Update the NCCL_PROFILER_PLUGIN patch for this base image's /etc/shinit_v2" >&2; exit 1; }; \
+    fi
+
 COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} . /opt/Automodel
 
 # The checkout is owned by RUNTIME_UID but the image still runs as root by default,
@@ -371,15 +389,32 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi
 
+# Backport PyTorch #198292: the optional NVGEMM probe must tolerate CUTLASS
+# operators that cannot import against the FA4/FFPA-compatible CuTe DSL version.
+# This preserves torch.compile's other GEMM backends and all compiled tests.
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        torch_dir=$(python -c "from pathlib import Path; import torch; print(Path(torch.__file__).parent)") && \
+        patch_file=/opt/Automodel/docker/common/pytorch-nvgemm-availability.patch && \
+        if git -C "$torch_dir" apply --check "$patch_file" 2>/dev/null; then \
+            git -C "$torch_dir" apply "$patch_file"; \
+        else \
+            git -C "$torch_dir" apply --reverse --check "$patch_file"; \
+        fi && \
+        python -c "from torch._inductor.utils import ensure_nv_universal_gemm_available; ensure_nv_universal_gemm_available()"; \
+    fi
+
 # Fail the image build before publication if PyTorch headers cannot compile as
 # C++20, torch._grouped_mm is unavailable, or a bundled native extension has
 # unresolved PyTorch/CUDA symbols. MoK links libcuda directly; use the toolkit's
 # stub only for this import check on builders without an NVIDIA driver.
+# Load installed pytest entry points too: system-site-packages can expose a
+# base-image plugin whose module is shadowed by an older venv dependency.
 RUN mkdir -p /tmp/cuda-driver-stubs && \
     ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-driver-stubs/libcuda.so.1 && \
     LD_LIBRARY_PATH=/tmp/cuda-driver-stubs:${LD_LIBRARY_PATH} \
-        MAX_JOBS=2 python docker/common/verify_native_runtime.py --nccl-ep="$TE_WITH_NCCL_EP" && \
-    rm -rf /tmp/cuda-driver-stubs
+        MAX_JOBS=2 python docker/common/verify_native_runtime.py --base-image "$BASE_IMAGE" --nccl-ep="$TE_WITH_NCCL_EP" && \
+    rm -rf /tmp/cuda-driver-stubs && \
+    python -c "from _pytest.config import get_config; get_config().pluginmanager.load_setuptools_entrypoints('pytest11')"
 
 WORKDIR /opt/Automodel
 

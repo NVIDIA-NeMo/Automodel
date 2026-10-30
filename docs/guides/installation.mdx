@@ -133,7 +133,7 @@ Install directly in WSL2 Ubuntu environment (follow Debian instructions).
 ## Prerequisites
 
 ### System Requirements
-- **Python**: 3.10 or higher
+- **Python**: 3.11 or higher
 - **GPU runtime**: The current source lock selects PyTorch `cu130` wheels on Linux, while the current container build uses a CUDA 13.2 development image. These are separate installation artifacts, not a blanket CUDA 11.8+ requirement
 - **NVIDIA driver**: For GPU execution, the host driver must support the CUDA runtime shipped by the selected PyTorch wheel or container
 - **CUDA toolkit**: A host toolkit is not required for prebuilt wheels or containers. Install one only when building CUDA extensions from source, and match it to the selected PyTorch or container runtime

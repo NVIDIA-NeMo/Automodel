@@ -95,6 +95,7 @@ optimizer:
   weight_decay: 0.0
 
 ci:
+  cluster_tag: h100
   recipe_owner: akoumpa
   time: "00:15:00"
   nodes: 1

@@ -1,5 +1,11 @@
 # Contributing To NeMo-Automodel
 
+## Coding guidelines
+
+Follow the [coding guidelines](CODING_GUIDELINES.md) when adding or modifying code.
+Existing code is being refactored incrementally and may not yet comply. Agents
+must also follow [AGENTS.md](AGENTS.md) and applicable contributor skills.
+
 ## Environment setup for Automodel
 
 Common workflows used for setting up Automodel environment:
@@ -190,6 +196,36 @@ The check covers the same paths as Bandit (`app.py`, `nemo_automodel/`, `example
 python tools/lint_no_globals.py
 ```
 
+## Python annotation coverage
+
+Every pull request, including documentation-only changes, runs the **Python type
+coverage** workflow. Open its **Python annotation coverage** job summary for
+package-wide and per-area coverage, plus changes from the PR's merge-base.
+The same report is printed in the **Report annotation coverage** step's log.
+The `type-coverage` artifact contains the summary and JSON with per-function
+annotations and exclusion reasons.
+
+Raw coverage counts signatures with all parameters and the return annotated.
+Strict coverage also excludes `Any`, `object`, nullable unions (`T | None` and
+`Optional[T]`), `None` parameter defaults, bare generics, `Callable[..., T]`,
+casts, type-checker suppressions, and `no_type_check`. A return of `-> None`
+counts as typed. These conservative exclusions can include valid contracts;
+the metric measures annotation syntax, not type soundness. Signature and local
+variable annotations, module-local aliases, and quoted annotations are inspected;
+cross-module aliases and inferred types are not resolved.
+
+The report includes tracked Python source under `nemo_automodel/`, including
+nested functions, kernels, and vendored code. It excludes tests and examples.
+It reports coverage without enforcing a minimum. Run it locally with Python
+3.11 or newer; no package dependencies are needed:
+
+```bash
+python tools/type_coverage.py --head HEAD --base origin/main --output-dir /tmp/type-coverage
+```
+
+Both revisions use the same reporter. Only committed source is measured;
+working-tree changes are excluded.
+
 ## Unit-test runtime
 
 Unit-test time limits are enforced at **three times the configured value** to
@@ -222,6 +258,27 @@ locally). Set `AUTOMODEL_RUNTIME_BUDGET_BASE=<commit>` to explicitly select a ba
 when reproducing a CI result. CPU and GPU unit-test jobs both limit host math
 libraries to one thread per process to avoid oversubscription by spawned ranks.
 
+## GPU unit-test shards
+
+`L0_Unit_Tests_CPU` runs every unit test. The GPU shards skip tests marked
+`cpu_only` and split the remaining tests by whole file, balanced by the per-file
+seconds in `tests/unit_tests/gpu_shard_durations.json`.
+
+Mark a module with `pytestmark = pytest.mark.cpu_only`, or a single test with
+`@pytest.mark.cpu_only`, when it never uses CUDA, for example Gloo ranks on CPU
+tensors. Tests under `tests/unit_tests/ci_tests/` and `tests/unit_tests/tools/`
+are marked automatically. The marker only affects the GPU shards; local runs
+still collect these tests.
+
+A test file without a recorded duration counts as the median file. When the
+shards drift apart, rebuild the durations from the GPU shard logs of a green run:
+
+```bash
+gh run view <run-id> --repo NVIDIA-NeMo/Automodel --log --job <shard-1-job-id> > shard1.log
+gh run view <run-id> --repo NVIDIA-NeMo/Automodel --log --job <shard-2-job-id> > shard2.log
+python tools/update_gpu_shard_durations.py shard1.log shard2.log --source "run <run-id>"
+```
+
 ## Pre-commit
 
 We recommand to use [prek](https://github.com/j178/prek) to ensure code quality. It is a faster and more modern alternative to [pre-commit](https://github.com/pre-commit/pre-commit).
@@ -244,7 +301,71 @@ prek run --all-files
 
 After installing the git hooks, `git commit` will automatically run incremental checks.
 
+## Recipe checks
+
+Before pushing example recipe or recipe CI changes, run:
+
+```bash
+git fetch origin main
+uv run --script tools/recipes/check_recipes.py
+```
+
+This is the same entry point used by recipe CI. It checks example YAMLs,
+nightly recipe references, every CI folder/scope combination, and required
+`ci:` metadata on added recipes. It installs only PyYAML and ruamel.yaml in an
+isolated Python 3.12 environment; no training stack or GPUs are needed.
+
+By default, added recipes are detected against the merge base of `origin/main`
+and `HEAD`, including staged, unstaged, and untracked additions. Use
+`--base-ref <ref>` for a different base. For a committed PR range, pass
+`--base-ref <base-sha> --head-ref <head-sha>`; this excludes uncommitted additions
+from the new-recipe metadata check. Both refs and their history must be available
+locally. Every validator reads files from the current checkout.
+
 ## Adding Documentation
+
+Before pushing documentation changes, run the same check used by CI from the
+repository root:
+
+```bash
+uv run --script tools/docs/check_docs.py
+```
+
+`tools/docs/check_docs.py` is the only docs-check entry point for contributors,
+agents, and CI. Add validation steps to that tool to keep local checks and CI
+in sync. The existing `make -C docs/fern docs-check` and `docs-mdx-check`
+targets forward to it.
+
+Install `uv`, Node.js 20 (including `npm`/`npx`), Git, and `make` first. The
+script creates an isolated Python 3.12 environment with only the docs test
+dependencies and uses the Fern CLI version pinned in `docs/fern/fern.config.json`.
+Use a full Git checkout with `origin/main` available; the check fetches archived
+documentation from `docs-archive` through `origin`.
+
+The command validates documentation sources, generates model-coverage
+tables, restores archived pages, and validates MDX and Fern configuration.
+Generated tables and styles are cleaned up after validation, including on
+failure. A nonzero exit status identifies a failed check.
+
+Publishing uses `uv run --script tools/docs/check_docs.py --keep-generated` to retain
+validated model-coverage tables for deployment. Failures still clean them up.
+
+Validation rules and generation scripts live in `tools/docs/` (see its
+[layout guide](tools/docs/README.md)). Pytest tests under
+`tests/unit_tests/tools/docs/` mirror the `checks/`, `build/`, and `assets/`
+modules. They run separately in CI to test the tools and their failure cases.
+The checker itself needs only PyYAML; Pillow is used by the asset tool and
+its regression tests.
+
+Keep previously shared model-card source paths stable, even if the file is in
+the wrong directory. The explicit MDX `slug` determines its public category,
+provider, and checkpoint route. Put its sidebar entry under the correct section
+in `docs/fern/versions/nightly.yml`, with `path` pointing to the original file.
+Update its title, description, checkpoint links, and provider-index link to match;
+add redirects in `docs/fern/docs.yml` when changing a published docs-site URL.
+Existing files sharing a slug are compatibility copies: navigation must select
+exactly one canonical source, and all copies must stay byte-identical. No
+per-file alias registration in `tools/docs/catalog.py` is needed.
 
 If your contribution involves documentation changes, please refer to the [Fern docs maintenance guide](.agents/contributor-skills/fern-docs/SKILL.md) guide for detailed instructions on building and serving the documentation.
 

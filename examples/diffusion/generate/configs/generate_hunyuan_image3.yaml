@@ -45,3 +45,6 @@ distributed:
     ep_size: 8
 
 seed: 42
+
+ci:
+  cluster_tag: h100

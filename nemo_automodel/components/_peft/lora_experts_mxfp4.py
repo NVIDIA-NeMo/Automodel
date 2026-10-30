@@ -14,9 +14,11 @@
 
 """MXFP4-resident expert LoRA implementations."""
 
+from collections.abc import Callable
+
 import torch
-import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_f
+from torch.distributed import ProcessGroup, ReduceOp
 from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components._peft.lora_experts import (
@@ -68,12 +70,21 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
         self._init_mxfp4_storage()
 
     def forward(
-        self, x: torch.Tensor, token_mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Forward pass with mxfp4 base weights and LoRA injection.
 
         Preserves the tensor and EP contract of GroupedExperts.forward, replacing the base grouped GEMMs with
-        MXFP4GroupedMM over the packed weights.
+        MXFP4GroupedMM over the packed weights. ``x`` is [tokens, hidden],
+        ``token_mask`` is [tokens], and ``weights`` / ``indices`` are [tokens, topk].
+        ``post_expert_output`` preserves [routed_tokens, hidden] after the down
+        projection and before combining tokens. After-down router weighting
+        is rejected by the packed storage constructor.
         """
         assert not isinstance(x, DTensor)
         input_dtype = x.dtype
@@ -91,9 +102,13 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
 
         assert self.n_routed_experts % ep_size == 0
 
+        ep_group: ProcessGroup | None = None
+        gathered_lens: list[int] = []
+
+        local_num_tokens = x.size(0)
         if ep_size > 1:
+            assert ep_mesh is not None
             ep_group = ep_mesh.get_group()
-            local_num_tokens = x.size(0)
             x, weights, indices, token_mask, gathered_lens = self._gather_ep_inputs(
                 x, token_mask, weights, indices, ep_group=ep_group, ep_size=ep_size
             )
@@ -101,14 +116,17 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
         n_local_experts = self.n_routed_experts // ep_size
         experts_start_idx = ep_rank * n_local_experts
 
-        y = self._forward_grouped_mm_mxfp4(x, token_mask, weights, indices, n_local_experts, experts_start_idx)
+        y = self._forward_grouped_mm_mxfp4(
+            x, token_mask, weights, indices, n_local_experts, experts_start_idx, post_expert_output
+        )
 
         if ep_size > 1:
             # Keep the differentiable all-gather path attached to x without materializing a full-size zero tensor.
             y.add_(x.sum(dtype=torch.float32) * 0.0)
 
             # Reduce and narrow to the original per-rank token boundaries.
-            y = dist_nn_f.all_reduce(y, op=dist.ReduceOp.SUM, group=ep_group)
+            assert ep_group is not None
+            y = dist_nn_f.all_reduce(y, op=ReduceOp.SUM, group=ep_group)
             start = sum(gathered_lens[:ep_rank])
             y = y.narrow(0, start, local_num_tokens).contiguous()
 
@@ -122,6 +140,7 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
         indices: torch.Tensor,
         n_local_experts: int,
         experts_start_idx: int,
+        post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Compute the local experts' contribution with a packed base and trainable adapters.
 
@@ -132,6 +151,8 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             indices: Integer tensor of shape [tokens, top_k] with global expert IDs.
             n_local_experts: Number of experts on this rank.
             experts_start_idx: First global expert ID on this rank.
+            post_expert_output: Optional transform preserving [routed_tokens, hidden],
+                applied after the down projection and before combining tokens.
 
         Returns:
             FP32 tensor of shape [tokens, hidden], before the EP reduction.
@@ -159,7 +180,11 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
 
+            gate_up_proj_bias: torch.Tensor | None = None
+            down_proj_bias: torch.Tensor | None = None
             if self.expert_bias:
+                assert self.gate_up_proj_bias is not None
+                assert self.down_proj_bias is not None
                 gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
                 down_proj_bias = _to_local(self.down_proj_bias)
 
@@ -170,6 +195,7 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             output1 = output1 + lora_out1 * self.scale
 
             if self.expert_bias:
+                assert gate_up_proj_bias is not None
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
             output1 = self.expert_activation_grouped(output1, permuted_probs)
@@ -181,8 +207,11 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             output2 = output2 + lora_out2 * self.scale
 
             if self.expert_bias:
+                assert down_proj_bias is not None
                 output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
 
+            if post_expert_output is not None:
+                output2 = post_expert_output(output2)
             scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
             y.scatter_add_(0, scatter_ids, output2.float())
         else:
@@ -197,6 +226,8 @@ class GroupedExpertsLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsLoRA):
             output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
             output2 = torch.matmul(output1_, down_w0)
             output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
+            if post_expert_output is not None:
+                output2 = post_expert_output(output2) * 0
             y[0] += output2[0]
 
         return y
@@ -241,20 +272,16 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
         token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
+        post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Forward with mxfp4 base weights, DeepEP dispatch, and LoRA injection.
 
         Preserves the tensor and EP contract of GroupedExpertsDeepEP.forward, replacing the base
-        grouped GEMMs with ``MXFP4GroupedMM`` over the packed weights.
-
-        Args:
-            x: Tensor of shape [local_tokens, hidden].
-            token_mask: Boolean tensor of shape [local_tokens], marking valid tokens.
-            weights: Routing probabilities of shape [local_tokens, top_k].
-            indices: Global expert IDs of shape [local_tokens, top_k].
-
-        Returns:
-            Combined expert output of shape [local_tokens, hidden].
+        grouped GEMMs with ``MXFP4GroupedMM`` over the packed weights. ``x`` is
+        [local_tokens, hidden], ``token_mask`` is [local_tokens], and ``weights`` /
+        ``indices`` are [local_tokens, topk]. ``post_expert_output`` preserves
+        [routed_tokens, hidden] after the down projection and before unpermutation.
+        After-down router weighting is rejected by the packed storage constructor.
         """
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0
@@ -285,6 +312,8 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
             output1 = output1 + lora_out1 * self.scale
 
             if self.expert_bias:
+                assert self.gate_up_proj_bias is not None
+                assert self.down_proj_bias is not None
                 output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
 
             output1 = self.expert_activation(output1, permuted_probs)
@@ -296,6 +325,8 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
             output2 = output2 + lora_out2 * self.scale
 
             if self.expert_bias:
+                assert self.gate_up_proj_bias is not None
+                assert self.down_proj_bias is not None
                 output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
         else:
             # Preserve the dispatch backward edge; dequantize only expert 0.
@@ -311,5 +342,8 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
             output2 = torch.matmul(output1_, down_w0)
             output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
 
+        if post_expert_output is not None:
+            output2 = post_expert_output(output2)
+        assert self.token_dispatcher is not None
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

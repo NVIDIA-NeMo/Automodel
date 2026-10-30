@@ -557,14 +557,14 @@ class Gate(nn.Module):
         Forward pass for the gating mechanism.
 
         Args:
-            x (torch.Tensor): Input tensor.
-            token_mask (torch.Tensor): Boolean mask indicating valid tokens.
+            x: Tensor of shape [tokens, hidden] containing local token states.
+            token_mask: Boolean tensor of shape [tokens] indicating valid tokens.
             cp_mesh (Optional[DeviceMesh]): Device mesh for context parallel computation.
 
         Returns:
-            weights (torch.Tensor): Routing weights for the selected experts.
-            indices (torch.Tensor): Indices of the selected experts.
-            aux_loss (Optional[torch.Tensor]): Auxiliary loss for load balancing.
+            weights: Tensor of shape [tokens, topk] with selected routing weights.
+            indices: Integer tensor of shape [tokens, topk] with expert indices.
+            aux_loss: Scalar auxiliary load-balancing loss, or None.
         """
         original_dtype = x.dtype
 
@@ -577,7 +577,9 @@ class Gate(nn.Module):
             weight = self.weight.to(dtype=x.dtype)
             bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
 
-        scores = F.linear(x_compute, weight, bias=bias)
+        # Explicit gate precision must override an enclosing model autocast.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            scores = F.linear(x_compute, weight, bias=bias)
         if self.use_routing_core:
             weights, indices, original_scores = self.routing_core(scores, self)
         else:
@@ -1008,7 +1010,8 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
 
     with torch.device(buffer_device):
         if isinstance(module, Gate):
-            to_local(module.weight).normal_(mean=0.0, std=init_std)
+            # Preserve DTensor RNG offsets so FSDP shards do not repeat router rows.
+            nn.init.normal_(module.weight, mean=0.0, std=init_std)
             if module.e_score_correction_bias is not None:
                 to_local(module.e_score_correction_bias).zero_()
             if module.bias is not None:

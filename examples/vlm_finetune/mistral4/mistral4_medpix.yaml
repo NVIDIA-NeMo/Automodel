@@ -116,6 +116,7 @@ wandb:
   name: mistral4-medpix
 
 ci:
+  cluster_tag: h100
   recipe_owner: akoumpa
   nodes: 4
   # Checkpoint robustness reaches resume close to 30 minutes on EOS.

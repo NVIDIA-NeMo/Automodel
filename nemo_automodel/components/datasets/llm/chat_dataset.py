@@ -31,6 +31,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
     _has_chat_template,
     _resolve_chat_template,
+    _validate_chat_template_kwargs,
     format_chat_template,
 )
 
@@ -85,7 +86,8 @@ def _load_openai_messages(
     through to ``load_dataset`` as-is (no default override).
 
     For local files, we manually parse JSONL/JSON to avoid pyarrow type
-    inference issues (e.g., heterogeneous field types under `tools`).
+    inference issues (e.g., heterogeneous field types under `tools`).  A
+    slice in *split* is applied to the parsed rows in file order.
 
     Args:
         path_or_dataset_id: HF dataset ID or local file path(s).
@@ -184,6 +186,12 @@ def _load_openai_messages(
 
     for f in files:
         _read_file(f)
+
+    # Honor a split slice such as ``train[:1024]`` like the HF and Parquet
+    # branches do. Local rows are not shuffled, so the slice is in file order.
+    _, sl = _parse_split_slice(split)
+    if sl is not None:
+        rows = rows[sl]
 
     return rows
 
@@ -354,6 +362,8 @@ class ChatDatasetConfig:
     mask_generation_prompt: bool = False
     """If ``True``, exclude the template-supplied prefix of each assistant turn (role header and any
     empty reasoning block such as ``<think></think>``) from the loss mask."""
+    chat_template_kwargs: dict[str, Any] | None = None
+    """Extra chat template variables (e.g. ``{enable_thinking: false}``) for every render."""
 
     def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "ChatDataset":
         """Build a :class:`ChatDataset` from this :class:`ChatDatasetConfig` and a runtime tokenizer."""
@@ -367,6 +377,7 @@ class ChatDatasetConfig:
             truncation=self.truncation,
             start_of_turn_token=self.start_of_turn_token,
             chat_template=self.chat_template,
+            chat_template_kwargs=self.chat_template_kwargs,
             shuffle_seed=self.shuffle_seed,
             mask_reasoning_content=self.mask_reasoning_content,
             mask_generation_prompt=self.mask_generation_prompt,
@@ -405,6 +416,7 @@ class ChatDataset(Dataset):
         unshifted: bool = False,
         skip_invalid_samples: bool = False,
         mask_generation_prompt: bool = False,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> None:
         """Load OpenAI-format chat rows and tokenize via the chat template.
 
@@ -438,9 +450,19 @@ class ChatDataset(Dataset):
                 the generation prompt, so no tag strings are hardcoded. Only a generation prompt the
                 template appends to the unchanged conversation prefix, and that the rendered turn
                 reproduces in full, is removed; anything else leaves the turn supervised.
+            chat_template_kwargs: Extra chat template variables (for example ``{"enable_thinking": False}``
+                or DeepSeek-V4.1's ``{"thinking_mode": "thinking"}``), passed to every render, including the
+                ones that build the loss masks. Names the formatting code sets itself, such as ``tools`` or
+                ``add_generation_prompt``, are rejected.
+
+        Raises:
+            TypeError: If ``chat_template_kwargs`` is not a mapping.
+            ValueError: If ``tokenizer`` is missing or has no chat template, or if ``chat_template_kwargs``
+                names an argument the formatting code sets itself.
         """
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
+        chat_template_kwargs = _validate_chat_template_kwargs(chat_template_kwargs)
 
         # Enforce chat-template availability for tool-calling data
         if chat_template is not None:
@@ -456,6 +478,7 @@ class ChatDataset(Dataset):
         self.start_of_turn_token = start_of_turn_token
         self.mask_reasoning_content = mask_reasoning_content
         self.mask_generation_prompt = mask_generation_prompt
+        self.chat_template_kwargs = chat_template_kwargs
         self.mask_history = mask_history
         self.unshifted = unshifted
         self.skip_invalid_samples = skip_invalid_samples
@@ -470,7 +493,9 @@ class ChatDataset(Dataset):
 
         # Ensure pad token presence for downstream padding
         eos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
-        self.pad_token_id = _add_pad_token(self.tokenizer) or eos_token_id
+        self.pad_token_id = _add_pad_token(self.tokenizer)
+        if self.pad_token_id is None:
+            self.pad_token_id = eos_token_id
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -539,6 +564,7 @@ class ChatDataset(Dataset):
             mask_reasoning_content=self.mask_reasoning_content,
             unshifted=self.unshifted,
             mask_generation_prompt=self.mask_generation_prompt,
+            chat_template_kwargs=self.chat_template_kwargs,
         )
         if self.mask_history:
             # Collapse multi-turn supervision to the final assistant turn so the

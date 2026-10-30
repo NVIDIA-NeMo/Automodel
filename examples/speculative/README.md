@@ -19,6 +19,7 @@ inference engine (SGLang or vLLM). The training code lives in
 | **EAGLE-2** | Same training objective as EAGLE-1 (it differs only in the inference-time tree policy), so the recipe is a thin subclass. | `TrainEagle2Recipe` | `eagle2/` |
 | **EAGLE-3** | Draft with its own `lm_head` over a (optionally compressed) draft vocab, fed three auxiliary target hidden states, trained with a **test-time-training (TTT)** unroll. | `TrainEagle3Recipe` | `eagle3/` |
 | **EAGLE-3.1** | EAGLE-3 with two drafter toggles (`fc_norm`, `norm_output`), matching the vLLM EAGLE-3.1 architecture. | `TrainEagle3Recipe` | `eagle3_1/` |
+| **EAGLE-4** | EAGLE-3.1 with a sliding-window draft layer and a low-rank candidate head over the full vocabulary, trained in two stages (draft, then candidate head) and exported to the `LlamaForCausalLMEagle4` layout. | `TrainEagle3Recipe` (`eagle4:`) | `eagle4/` |
 | **P-EAGLE** | Parallel-drafting EAGLE-3: predicts all `num_depths` tokens in one forward over a COD-subsampled sequence instead of the TTT unroll. Serves on vLLM only. | `TrainEagle3Recipe` (`parallel_drafting: true`) | `p-eagle/` |
 | **DFlash** | Block-parallel drafting: drafts a whole block of `block_size` tokens in one non-causal "denoising" forward over `[anchor, MASK, MASK, ...]`. | `TrainDFlashRecipe` (LLM) / `DiffusionLMSFTRecipe` (DLLM SFT) | `dflash/`, `../dllm_sft/*dflash*` |
 | **DFlash 2** | DFlash backbone plus a two-tap dynamic convolution around every draft sublayer (kills suffix decay) and a pairwise path selector that walks one coherent path through each position's top-k candidates. | `TrainDFlash2Recipe` | `dflash/qwen3_dflash2.yaml`, `dflash/qwen3_8_27b_dflash2.yaml` |
@@ -581,6 +582,7 @@ such caveat.
 | Draft | SGLang | vLLM |
 |---|---|---|
 | EAGLE-1/2/3, EAGLE-3.1 | yes | yes |
+| EAGLE-4 | through the EAGLE-4 engine plugin, after `export_eagle4` (stock SGLang has no EAGLE-4 runtime) | through the EAGLE-4 engine plugin, after `export_eagle4` (stock vLLM has no EAGLE-4 runtime) |
 | P-EAGLE | no (tracked upstream) | yes (parallel-drafting runtime, >= 0.16) |
 | DFlash, JetSpec | no | yes (`dflash` method, >= 0.20) |
 | DFlash 2 | not yet wired here (`--speculative-algorithm DFLASH` upstream) | not yet wired here (`dflash` method upstream) |
@@ -650,6 +652,7 @@ checkpoint cadence: `ckpt_every_steps`, `save_checkpoint_every_epoch`.
 | `aux_layer_ids` | EAGLE-3 | Override the default low/mid/high recipe `[1, n//2-1, n-4]`. |
 | `draft_attn_implementation` | EAGLE-3 | `eager` (default) or `flash_attention_2`. |
 | `fc_norm`, `norm_output` | EAGLE-3.1 | Both default false; either alone is a valid intermediate config. |
+| `eagle4.sliding_window`, `eagle4.candidate_head.{rank,num_candidates}` | EAGLE-4 | `candidate_head` selects stage 2 and needs `draft_weights_path`; leave `draft_vocab_size` unset. |
 | `draft_weights_path` | EAGLE-3 | Warm-start the draft from a consolidated safetensors export (file or directory); required for meaningful LoRA adaptation. |
 | `target_model_backend`, `remote_urls`, `remote_timeout`, `remote_max_retries` | EAGLE-3 / DSpark remote | See [Target Backends](#target-backends). `target_prefetch_depth` is EAGLE-3 only. |
 | `cached_target_path` | EAGLE-3 / DSpark offline | Path to a cache produced by `precompute_eagle3.py`, `precompute_dspark.py`, or (large sharded targets) `precompute_dspark_dist.py`. |
@@ -669,7 +672,7 @@ The following tree shows the configs in this folder:
 
 ```
 examples/speculative/
-  eagle1/    eagle2/    eagle3/    eagle3_1/    p-eagle/
+  eagle1/    eagle2/    eagle3/    eagle3_1/    eagle4/    p-eagle/
   dflash/                     # DFlash + DFlash 2 (qwen3_dflash2.yaml,
                               #   qwen3_8_27b_dflash2.yaml)
                               #   + Domino (qwen3_domino.yaml) configs

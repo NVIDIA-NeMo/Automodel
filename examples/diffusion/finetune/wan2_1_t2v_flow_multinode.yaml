@@ -77,3 +77,6 @@ checkpoint:
   save_consolidated: final
   diffusers_compatible: true
   restore_from: null
+
+ci:
+  cluster_tag: h100

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -27,6 +28,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.moe import swiglu_triton
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.moe.megatron.fused_a2a import hybridep_combine_output_cached
 from nemo_automodel.components.moe.megatron.moe_utils import (
     weighted_bias_geglu_impl,
     weighted_bias_swiglu_impl,
@@ -40,6 +42,7 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 from nemo_automodel.shared.import_utils import is_te_min_version, safe_import
+from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 from nemo_automodel.shared.nccl_ep import NcclEpConfig
 
 _HAVE_TRITON, triton = safe_import("triton")
@@ -726,7 +729,7 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None, reuse_input
     return (flat_value + expanded_bias).view(shape).to(value.dtype)
 
 
-class GroupedExperts(nn.Module):
+class GroupedExperts(TransposedMatrixModule, nn.Module):
     """
     Sparse MoE implementation using all-gather/reduce-scatter primitives.
 
@@ -1450,7 +1453,7 @@ def _checkpointed_chunked_expert_mlp(
     return output
 
 
-class GroupedExpertsDeepEP(nn.Module):
+class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
     """
     Sparse MoE implementation using grouped GEMM with DeepEP token dispatch.
 
@@ -1526,6 +1529,18 @@ class GroupedExpertsDeepEP(nn.Module):
         # count_nonzero host read in forward is skipped as well (rows are never empty).
         self.dispatcher_capacity_factor = backend.dispatcher_capacity_factor if backend is not None else None
         self.dispatcher_equal_token_counts = backend.dispatcher_equal_token_counts if backend is not None else False
+        # BackendConfig.dispatcher_recompute_cache (validated there: HybridEP only): under block activation
+        # checkpointing the combine output of the checkpoint forward is served in the recompute ("combine");
+        # "moe_tail" also skips the down projection's GEMM there (_DownProjGroupedMM), which is only sound when
+        # nothing reads that output: the router weight must be applied inside the activation.
+        self.dispatcher_recompute_cache = (
+            str(getattr(backend, "dispatcher_recompute_cache", "none")) if backend is not None else "none"
+        )
+        if self.dispatcher_recompute_cache == "moe_tail" and config.apply_router_weight_after_down:
+            raise ValueError(
+                "dispatcher_recompute_cache='moe_tail' requires apply_router_weight_after_down=False: the deferred "
+                "down projection's output is never materialised in the recompute"
+            )
         # One flag for the four expert classes' forward: with static routing (forced balance, no noise)
         # every expert receives tokens by construction, and capacity mode never dispatches an empty
         # buffer, so the count_nonzero device-to-host read (one per microbatch, and again per
@@ -1587,6 +1602,7 @@ class GroupedExpertsDeepEP(nn.Module):
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
             moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
             moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
+            moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -1775,6 +1791,10 @@ class GroupedExpertsDeepEP(nn.Module):
                     activation_probs,
                     self.expert_activation,
                     use_mxfp8=self.use_mxfp8,
+                    # moe_tail skips the down projection's GEMM in a recompute whose combine is cached — sound
+                    # only while nothing reads that output. A post-expert callback does, and would save an
+                    # uninitialised tensor for its own backward, so it keeps the GEMM (review of #4395).
+                    defer_down_proj=self.dispatcher_recompute_cache == "moe_tail" and post_expert_output is None,
                 )
         else:
             # Preserve the dispatch autograd edge even when this rank receives no
@@ -1809,6 +1829,38 @@ class GroupedExpertsDeepEP(nn.Module):
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
+class _DownProjGroupedMM(torch.autograd.Function):
+    """``torch._grouped_mm`` for the expert down projection whose forward is skipped in a checkpoint recompute.
+
+    Under ``BackendConfig.dispatcher_recompute_cache="moe_tail"`` the HybridEP combine that consumes this output
+    is served from the forward's cache during the backward recompute, so no op reads the recomputed
+    down-projection values: the forward then only allocates the output and records the node. The backward is
+    the grouped-GEMM derivative PyTorch applies itself (dgrad = grad x W^T, wgrad = X^T x grad, both grouped by
+    ``offs``), so the gradients match the plain path bit for bit, and the saved tensors are the same three as
+    the native node, which keeps the checkpoint's saved-tensor stream identical in forward and recompute.
+    ``torch._grouped_mm`` has no autocast rule, and neither has this node: dtypes are used as given and a mix is
+    rejected by the op, under autocast or not. The recompute-only allocation is kept out of selective
+    checkpointing's op-stream accounting (``apply_ac`` registers ``aten.new_empty.default`` in
+    ``SAC_IGNORED_OPS`` when the cache is in use); the caller keeps the GEMM when a post-expert callback reads
+    the output.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(x, w, offs)
+        if hybridep_combine_output_cached():
+            return x.new_empty((x.shape[0], w.shape[-1]))
+        return torch._grouped_mm(x, w, offs)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
+        x, w, offs = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        grad_x = torch._grouped_mm(grad_output, w.transpose(-2, -1), offs) if ctx.needs_input_grad[0] else None
+        grad_w = torch._grouped_mm(x.t(), grad_output, offs) if ctx.needs_input_grad[1] else None
+        return grad_x, grad_w, None
+
+
 def _torch_mm_experts_fwd(
     hidden_states,
     gate_and_up_projs,
@@ -1817,6 +1869,7 @@ def _torch_mm_experts_fwd(
     permuted_probs,
     activation_fn,
     use_mxfp8=False,
+    defer_down_proj=False,
 ):
     # torchao's MXFP8 quantizer (mx_tensor.to_mx) strictly asserts is_contiguous() on each
     # operand it quantizes, unlike torch._grouped_mm. select_grouped_mm returns a wrapper
@@ -1826,7 +1879,11 @@ def _torch_mm_experts_fwd(
     grouped_mm = select_grouped_mm(use_mxfp8)
     output1 = grouped_mm(hidden_states, gate_and_up_projs, offs)
     output1 = activation_fn(output1, permuted_probs)
-    output2 = grouped_mm(output1, down_projs, offs)
+    if defer_down_proj and not use_mxfp8:
+        # dispatcher_recompute_cache="moe_tail": the GEMM is skipped in a recompute whose combine is cached.
+        output2 = _DownProjGroupedMM.apply(output1, down_projs, offs)
+    else:
+        output2 = grouped_mm(output1, down_projs, offs)
     return output2
 
 
@@ -1868,16 +1925,6 @@ class GroupedExpertsTE(nn.Module):
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
-        if config.apply_router_weight_after_down:
-            # GroupedExperts and GroupedExpertsDeepEP fold the router weight in after the
-            # down projection; this backend applies it inside the activation instead, which
-            # silently changes the numerics the flag exists to preserve. Fail loudly rather
-            # than train a model on the wrong reduction order.
-            raise ValueError(
-                "apply_router_weight_after_down is not supported by GroupedExpertsTE. "
-                "Use BackendConfig(experts='torch_mm') or the DeepEP expert backend."
-            )
-
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
         _patch_te_modules()
@@ -1901,6 +1948,8 @@ class GroupedExpertsTE(nn.Module):
         # first-microbatch copy, since forced-balanced routing makes it constant.
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self._static_m_splits: list | None = None
+        if backend is not None and backend.compile_router_weight:
+            _compile_router_weight_cores()
         self.nccl_ep = backend.nccl_ep if backend is not None else NcclEpConfig()
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
@@ -1923,6 +1972,13 @@ class GroupedExpertsTE(nn.Module):
         )
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
+        )
+
+        # BackendConfig.dispatcher_recompute_cache: the HybridEP combine output of a checkpoint forward is served
+        # in the recompute ("combine"); "moe_tail" is refused by BackendConfig for this backend (no deferred GEMM
+        # here). The dispatcher config below carries it, so the requested mode survives this constructor.
+        self.dispatcher_recompute_cache = (
+            str(getattr(backend, "dispatcher_recompute_cache", "none")) if backend is not None else "none"
         )
 
         self._init_grouped_layers(self.num_local_experts)
@@ -2227,6 +2283,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
             moe_benchmark_static_routing=self.static_routing,
         )
 
@@ -2260,6 +2317,7 @@ class GroupedExpertsTE(nn.Module):
         token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
+        post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Forward pass using TE's GroupedLinear with native FP8 support.
@@ -2269,6 +2327,9 @@ class GroupedExpertsTE(nn.Module):
             token_mask: Boolean tensor of shape [tokens] marking valid tokens.
             weights: Tensor of shape [tokens, top_k] with routing probabilities.
             indices: Integer tensor of shape [tokens, top_k] with global expert IDs.
+            post_expert_output: Optional operation applied to dispatched expert
+                outputs with shape ``[routed_tokens, expert_dim]`` after the
+                down projection and before token combine.
 
         Returns:
             Tensor of shape [tokens, hidden], local to this EP rank.
@@ -2291,6 +2352,14 @@ class GroupedExpertsTE(nn.Module):
         if not weights.requires_grad:
             permuted_probs = permuted_probs.detach()
         permuted_probs = permuted_probs.unsqueeze(-1)
+        # With apply_router_weight_after_down the expert MLP runs unweighted and the
+        # router weight scales its output after the down projection and
+        # post_expert_output, in fp32, as GroupedExpertsDeepEP does. router_probs keeps
+        # the unpadded [routed_tokens, 1] weights for that multiply.
+        router_probs = permuted_probs
+        compute_dtype = permuted_local_hidden_states.dtype
+        if self.config.apply_router_weight_after_down:
+            permuted_probs = torch.ones_like(permuted_probs)
 
         m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
         if self.static_routing and self._static_m_splits is None:
@@ -2336,9 +2405,21 @@ class GroupedExpertsTE(nn.Module):
                 if self.use_grouped_tensor
                 else m_splits
             )
-            output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
+            # No FSDP mixed-precision wrapper casts EP-local experts when ep_shard is 1, so
+            # FP32 master weights meet BF16 dispatched tokens here. TE accepts parameters
+            # in another dtype only under torch.autocast, which casts them per GEMM like
+            # GroupedExpertsDeepEP's ``.to(compute_dtype)``. An outer autocast already does.
+            cast_weights = (
+                torch.autocast("cuda", dtype=compute_dtype)
+                if next(self.gate_up_linear.parameters()).dtype != compute_dtype
+                and not torch.is_autocast_enabled("cuda")
+                else nullcontext()
+            )
+            with cast_weights:
+                output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
             output1 = self.expert_activation(output1, permuted_probs)
-            output2 = self.down_linear(output1, grouped_m_splits)
+            with cast_weights:
+                output2 = self.down_linear(output1, grouped_m_splits)
             # The down-projection bias must be weighted by the per-token routing probability
             # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
             # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
@@ -2346,8 +2427,9 @@ class GroupedExpertsTE(nn.Module):
             # top-k expert contributions carries a full prob-independent bias that is then
             # summed in the combine step, producing a large systematic offset (e.g. gpt-oss-20b
             # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
-            # so the net down-bias contribution becomes prob * down_bias.
-            if self.expert_bias:
+            # so the net down-bias contribution becomes prob * down_bias. After-down weighting
+            # scales the biased output below, giving (expert_out + down_bias) * prob.
+            if self.expert_bias and not self.config.apply_router_weight_after_down:
                 down_bias = self._get_stacked_bias(self.down_linear)
                 if down_bias is not None:
                     splits_t = torch.as_tensor(m_splits, device=output2.device)
@@ -2369,10 +2451,11 @@ class GroupedExpertsTE(nn.Module):
                     return tensor
 
             # Empty dispatched rows retain the collective backward edge and also
-            # work when the local input itself has zero rows.
-            output1 = torch.matmul(permuted_local_hidden_states, to_local(self.gate_up_linear.weight0).T)
+            # work when the local input itself has zero rows. Cast like the TE path
+            # above: FP32 master weights meet BF16 tokens here too.
+            output1 = torch.matmul(permuted_local_hidden_states, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
             output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
+            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).to(x.dtype).T)
             all_expert_dependency = output2.new_zeros(())
             for grouped_linear in (self.gate_up_linear, self.down_linear):
                 for parameter in grouped_linear.parameters():
@@ -2385,6 +2468,11 @@ class GroupedExpertsTE(nn.Module):
 
         if fp8_active and actual_m_splits is not None:
             output2 = unpadding(output2, actual_m_splits)
+
+        if post_expert_output is not None:
+            output2 = post_expert_output(output2)
+        if self.config.apply_router_weight_after_down:
+            output2 = _apply_router_weight_fp32(output2, router_probs, compute_dtype)
 
         y = self.token_dispatcher.token_unpermutation(output2)
         return y

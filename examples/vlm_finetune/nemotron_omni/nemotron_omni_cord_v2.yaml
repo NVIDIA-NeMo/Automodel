@@ -106,3 +106,6 @@ optimizer:
   bias_correction: true
   master_weights: true
   master_weight_dtype: torch.float32
+
+ci:
+  cluster_tag: h100

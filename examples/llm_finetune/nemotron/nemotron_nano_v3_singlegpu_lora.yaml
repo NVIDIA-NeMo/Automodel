@@ -84,6 +84,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  cluster_tag: h100
   time: "00:15:00"
   nproc_per_node: 1
   env_vars:

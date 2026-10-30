@@ -51,6 +51,7 @@ from nemo_automodel.components.distributed.config import (
     MegatronFSDPConfig,
     MoEParallelizerConfig,
 )
+from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.megatron_fsdp import (
     restore_distributed_param_attrs,
@@ -69,6 +70,7 @@ from nemo_automodel.components.models.common.utils import (
     cast_frozen_modules_to_compute_dtype,
     prepare_frozen_parameters_for_sharding,
 )
+from nemo_automodel.components.moe.experts import GroupedExpertsTE
 from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
@@ -86,6 +88,7 @@ from nemo_automodel.components.utils.model_utils import (
     parse_freeze_config,
     print_trainable_parameters,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -482,6 +485,50 @@ def _apply_trainability_policy(
     freeze_minimax_m3_indexer_params(model)
 
 
+def _prepare_trainability_before_sharding(
+    model: torch.nn.Module,
+    *,
+    peft_enabled: bool,
+    freeze_config: FreezeConfig | None,
+    frozen_compute_dtype: torch.dtype | None,
+    strict: bool,
+) -> None:
+    """Resolve trainability and prepare parameter-freezing storage before FSDP capture."""
+    _apply_trainability_policy(model, peft_enabled=peft_enabled, freeze_config=freeze_config, strict=strict)
+    if (
+        freeze_config is not None
+        and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
+        and frozen_compute_dtype is not None
+    ):
+        prepare_frozen_parameters_for_sharding(model, frozen_compute_dtype)
+
+
+def _validate_parameter_freezing_backend(
+    model: torch.nn.Module, mesh: MeshContext, freeze_config: FreezeConfig | None
+) -> None:
+    """Reject exact parameter exclusions across unsupported TE expert renumbering."""
+    if freeze_config is None:
+        return
+    selected_names = set(freeze_config.freeze_parameters or ()) | set(freeze_config.unfreeze_parameters or ())
+    if not selected_names:
+        return
+    if mesh.ep_size <= 1:
+        return
+    frozen_ids = {
+        id(parameter)
+        for name, parameter in model.named_parameters(remove_duplicate=False)
+        if canonical_parameter_fqn(name).replace("_orig_mod.", "") in selected_names
+    }
+    for module in model.modules():
+        if isinstance(module, GroupedExpertsTE) and any(
+            id(parameter) in frozen_ids for parameter in module.parameters()
+        ):
+            raise ValueError(
+                "freeze_config exact parameter selectors cannot name TE expert parameters with expert parallelism; "
+                "select their owning module instead"
+            )
+
+
 def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
     """Return the typed strategy from a context or legacy compatibility wrapper."""
     if isinstance(model_wrapper, MeshContext):
@@ -584,6 +631,15 @@ def apply_model_infrastructure(
         mesh = MeshContext()
     strategy_config = _get_strategy_config(model_wrapper)
 
+    freeze_config = parse_freeze_config(_kwargs.get("freeze_config"))
+    _validate_parameter_freezing_backend(model, mesh, freeze_config)
+    fsdp2_active = (
+        isinstance(strategy_config, FSDP2Config)
+        and mesh.device_mesh is not None
+        and fsdp2_sharding_enabled(mesh.device_mesh)
+    )
+    frozen_compute_dtype = _get_frozen_storage_compute_dtype(strategy_config, mesh) if fsdp2_active else None
+
     # Create a checkpointer for loading base weights only. Keep consolidation disabled
     # so load-only infrastructure does not emit save/export warnings.
     ckpt_config = CheckpointingConfig(
@@ -621,6 +677,16 @@ def apply_model_infrastructure(
         from nemo_automodel._transformers.te_attention import inject_te_attention as _inject_te
 
         _inject_te(model)
+
+    # Resolve exact parameter names while the complete, unwrapped model is still present.
+    # Storage must be prepared before either loading branch can copy checkpoint values.
+    _prepare_trainability_before_sharding(
+        model,
+        peft_enabled=peft_config is not None,
+        freeze_config=freeze_config,
+        frozen_compute_dtype=frozen_compute_dtype,
+        strict=True,
+    )
 
     # When no PP and no TP, load checkpoint first (unwrapped model) so weights and dtypes come from
     # the checkpoint; then apply FSDP. With TP>1 we must shard first and load after so all ranks
@@ -679,21 +745,14 @@ def apply_model_infrastructure(
             if not key.endswith("_extra_state")
         ]
 
-    # Validate selectors on the complete pre-parallelization hierarchy. The
-    # same policy is rebound after model surgery and before DDP/FSDP capture.
-    freeze_config = parse_freeze_config(_kwargs.get("freeze_config"))
-    _apply_trainability_policy(
-        model,
-        peft_enabled=peft_config is not None,
-        freeze_config=freeze_config,
-        strict=True,
-    )
+    # Rebind trainability after model surgery and before DDP/FSDP capture.
     if isinstance(strategy_config, FSDP2Config) and peft_config is not None and quantization_config is None:
         prepare_frozen_parameters_for_sharding(model, _get_frozen_storage_compute_dtype(strategy_config, mesh))
     reapply_trainability = partial(
-        _apply_trainability_policy,
+        _prepare_trainability_before_sharding,
         peft_enabled=peft_config is not None,
         freeze_config=freeze_config,
+        frozen_compute_dtype=frozen_compute_dtype,
         strict=False,
     )
 
@@ -805,7 +864,7 @@ def apply_model_infrastructure(
     else:
         trainability_models = [model]
     for mp in trainability_models:
-        reapply_trainability(mp)
+        _apply_trainability_policy(mp, peft_enabled=peft_config is not None, freeze_config=freeze_config, strict=False)
     if peft_config is not None or freeze_config is not None:
         if not any(param.requires_grad for mp in trainability_models for param in mp.parameters()):
             logger.warning(
@@ -897,6 +956,14 @@ def apply_model_infrastructure(
     if mp_policy is None:
         mp_policy = getattr(model_wrapper, "mp_policy", None)
     compute_dtype = getattr(mp_policy, "param_dtype", None)
+    # One-rank FSDP2 has no mixed-precision wrappers: retain uniform storage for
+    # explicit parameter freezes instead of introducing a plain-tensor dtype seam.
+    if (
+        freeze_config is not None
+        and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
+        and not fsdp2_active
+    ):
+        compute_dtype = None
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:
             cast_frozen_modules_to_compute_dtype(mp, compute_dtype)

@@ -199,9 +199,10 @@ def test_formula_matches_executed_forward_backward(ratios: list[int], length: in
         logits = model(torch.arange(length).unsqueeze(0) % config.vocab_size).logits
         logits.backward(torch.ones_like(logits))
 
-    # The dense reference executes masked-out pairs and RoPE frequency outer
-    # products. Remove those to compare with the documented useful-FLOPs scope.
-    excluded = 2 * config.qk_rope_head_dim * length  # Two model-level RoPE calls.
+    # The dense reference executes masked-out pairs. Remove those to compare
+    # with the documented useful-FLOPs scope. RoPE frequency tables are an
+    # elementwise outer product, which the counter does not count.
+    excluded = 0
     local = sum(min(query + 1, config.sliding_window) for query in range(length))
     for layer, ratio in zip(model.model.layers.values(), ratios):
         pooled = length // ratio if ratio else 0
@@ -214,11 +215,9 @@ def test_formula_matches_executed_forward_backward(ratios: list[int], length: in
             compressor = layer.self_attn.compressor
             assert (compressor.wkv.weight.grad is not None) == (length >= ratio)
             assert (compressor.wgate.weight.grad is not None) == (length >= ratio)
-            excluded += config.qk_rope_head_dim * pooled
         if ratio == 4:
             # Hard top-k disconnects the entire indexer from backpropagation.
             assert all(parameter.grad is None for parameter in compressor.indexer.parameters())
             causal = sum((query + 1) // ratio for query in range(length))
             excluded += 2 * config.index_n_heads * config.index_head_dim * (length * pooled - causal)
-            excluded += config.qk_rope_head_dim * pooled  # Indexer's RoPE call.
     assert model_flops(config, seq_len=length) == counter.get_total_flops() - excluded
