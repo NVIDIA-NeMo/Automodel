@@ -262,6 +262,23 @@ def test_split_experts_weights_dtensor_shard_uses_uneven_expert_distribution(
     assert adapter._last_expert_ids == expected_ids
 
 
+@pytest.mark.parametrize(("rank", "expected_ids"), [(2, [6, 7, 8]), (3, [9])])
+def test_split_experts_weights_dtensor_shard_follows_torch_chunk_layout(adapter, monkeypatch, rank, expected_ids):
+    """FSDP2 shards 10 experts over 4 ranks as 3, 3, 3, 1 (torch.chunk), not 3, 3, 2, 2."""
+    _patch_fake_dtensor(monkeypatch)
+    local_tensor = torch.arange(len(expected_ids) * 2, dtype=torch.float32).reshape(len(expected_ids), 2)
+    weight = _FakeDTensor(
+        local_tensor=local_tensor,
+        placement=Shard(0),
+        mesh=_FakeMesh(rank=rank, size=4, names=("dp_shard_cp",)),
+    )
+
+    split = adapter._split_experts_weights(weight, n_experts=10)
+
+    assert torch.equal(torch.stack(split), local_tensor)
+    assert adapter._last_expert_ids == expected_ids
+
+
 def test_split_experts_weights_dtensor_shard_uses_active_ep_submesh(adapter, monkeypatch):
     _patch_fake_dtensor(monkeypatch)
     active_mesh = _FakeMesh(rank=0, size=99, names=("dp", "ep"))

@@ -30,6 +30,28 @@ def get_submesh(device_mesh: DeviceMesh, dims: tuple[str, ...]) -> DeviceMesh:
     return device_mesh[dims]
 
 
+def get_sharded_expert_range(n_experts: int, world_size: int, rank: int) -> tuple[int, int]:
+    """Return the ``[start, end)`` experts that an existing ``Shard(0)`` expert tensor holds on ``rank``.
+
+    FSDP2 and DTensor ``Shard(0)`` split the expert dimension like ``torch.chunk``: leading ranks hold
+    ``ceil(n_experts / world_size)`` experts and trailing ranks hold the remainder, which can be none
+    (for example 64 experts over 24 ranks leaves the last two empty). This mirrors that layout so a
+    rank can label the experts it already holds. It does not choose a partition: do not use it to
+    decide how experts are placed, where an empty rank would be a bug.
+
+    Args:
+        n_experts: Global number of experts along dim 0.
+        world_size: Number of ranks the expert dimension is sharded over.
+        rank: This rank's index along that dimension.
+
+    Returns:
+        ``(start, end)`` expert indices; ``start == end`` when the rank holds no experts.
+    """
+    experts_per_rank = -(-n_experts // world_size)
+    start = min(rank * experts_per_rank, n_experts)
+    return start, min(start + experts_per_rank, n_experts)
+
+
 def _get_expert_mesh_dim_index(dtensor: DTensor) -> int | None:
     """Find the device-mesh dimension that partitions a grouped expert tensor.
 
@@ -93,20 +115,7 @@ def get_expert_slice_for_rank(experts_tensor: torch.Tensor, n_experts: int) -> t
         current_rank = expert_mesh.get_local_rank()
         world_size = expert_mesh.size()
 
-        # Calculate expert range for this rank
-        experts_per_rank = n_experts // world_size
-        remainder = n_experts % world_size
-
-        if current_rank < remainder:
-            # First `remainder` ranks get one extra expert
-            experts_on_rank = experts_per_rank + 1
-            start_expert = current_rank * experts_on_rank
-        else:
-            # Remaining ranks get standard number of experts
-            experts_on_rank = experts_per_rank
-            start_expert = remainder * (experts_per_rank + 1) + (current_rank - remainder) * experts_per_rank
-
-        end_expert = start_expert + experts_on_rank
+        start_expert, end_expert = get_sharded_expert_range(n_experts, world_size, current_rank)
         return local_tensor, start_expert, end_expert
     elif isinstance(placement, Replicate):
         # Tensor is replicated - all ranks have full data
