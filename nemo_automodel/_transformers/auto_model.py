@@ -423,6 +423,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
         load_metadata_with_gloo = kwargs.pop("load_metadata_with_gloo", False)
+        logits_dtype = kwargs.pop("logits_dtype", None)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
         if isinstance(pretrained_model_name_or_path_or_config, str):
             # Hub loaders need the cache location; from_config constructors do not.
@@ -437,6 +438,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 "has_packed_sequence": has_packed_sequence,
                 "freeze_config": freeze_config,
                 "load_metadata_with_gloo": load_metadata_with_gloo,
+                "logits_dtype": logits_dtype,
                 "cache_dir": cache_dir,
             }
             return cls._build_model(
@@ -664,6 +666,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             weights_already_loaded=weights_already_loaded,
             inject_te_attention=inject_te_attention,
             load_metadata_with_gloo=load_metadata_with_gloo,
+            logits_dtype=logits_dtype,
         )
 
         return model
@@ -746,6 +749,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 - cache_dir (str): Cache directory for model weights.
                 - load_metadata_with_gloo (bool): Use a CPU process group for checkpoint
                   load planning while retaining the training group. Default: False.
+                - logits_dtype (str | torch.dtype): ``float32`` makes the LM-head GEMM write
+                  FP32 logits from BF16/FP16 operands, for models declaring
+                  ``supports_fp32_logits``. Default: None (model default).
 
         Returns:
             transformers.PreTrainedModel: The loaded (and possibly patched)

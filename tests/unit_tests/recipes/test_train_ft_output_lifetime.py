@@ -96,6 +96,7 @@ def test_recipe_releases_unused_outputs_before_backward(output_kind, dtype, reco
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
+        lm_head_projection_dtype=None,
         te_fp8=None,
         cfg=SimpleNamespace(mtp=SimpleNamespace(scaling_factor=None)),
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
