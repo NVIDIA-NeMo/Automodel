@@ -217,11 +217,84 @@ class MetricLoggerDist(MetricLogger):
         self.close()
 
 
+class TensorBoardMetricLogger(MetricLogger):
+    """JSONL metric logger that mirrors numeric metrics to TensorBoard."""
+
+    def __init__(
+        self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = DEFAULT_BUFFER_SIZE
+    ) -> None:
+        super().__init__(filepath, flush=flush, append=append, buffer_size=buffer_size)
+        from torch.utils.tensorboard import SummaryWriter
+
+        log_dir = os.environ.get("TENSORBOARD_LOG_DIR") or os.path.join(os.path.dirname(self.filepath), "tensorboard")
+        # Preserve the stream identity of each JSONL file in the tag prefix:
+        # the LLM recipe creates ``validation_<dataset>.jsonl`` loggers (one per
+        # dataset) plus a weighted aggregate, each emitting the same unprefixed
+        # keys (e.g. ``val_loss``) at the same step. Collapsing all of them to
+        # one shared ``validation`` prefix would fuse distinct datasets into a
+        # single misleading curve, so the dataset part of the filename rides
+        # along with the stream.
+        stem = os.path.splitext(os.path.basename(self.filepath))[0]
+        if stem.startswith("validation"):
+            dataset_part = stem[len("validation") :].lstrip("_-")
+            stream = "validation" if not dataset_part else f"validation_{dataset_part}"
+        else:
+            stream = "train"
+        self._tb_prefix = stream
+        self._writer = SummaryWriter(log_dir=log_dir)
+
+    def log(self, record: MetricsSample) -> None:
+        values = stack_and_move_tensor_metrics_to_cpu([record])[0]
+        for name, value in values.metrics.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self._writer.add_scalar(f"{self._tb_prefix}/{name}", value, values.step)
+        super().log(values)
+
+    def close(self) -> None:
+        super().close()
+        self._writer.flush()
+        self._writer.close()
+
+
+class TensorBoardMetricLoggerDist(TensorBoardMetricLogger):
+    """Rank-zero JSONL + TensorBoard logger."""
+
+    def __init__(
+        self, filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = DEFAULT_BUFFER_SIZE
+    ) -> None:
+        self.rank = dist.get_rank()
+        if self.rank == 0:
+            super().__init__(filepath, flush=flush, append=append, buffer_size=buffer_size)
+
+    def log(self, record: MetricsSample) -> None:
+        if self.rank == 0:
+            super().log(record)
+
+    def flush(self) -> None:
+        if self.rank != 0:
+            return
+        super().flush()
+
+    def close(self) -> None:
+        if self.rank == 0:
+            super().close()
+
+    def __enter__(self) -> "TensorBoardMetricLoggerDist":
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any) -> None:
+        if self.rank != 0:
+            return
+        self.close()
+
+
 def build_metric_logger(
     filepath: str, *, flush: bool = False, append: bool = True, buffer_size: int = DEFAULT_BUFFER_SIZE
 ) -> MetricLogger:
-    """Build a local or distributed metric logger depending on distributed state."""
+    """Build a JSONL logger, optionally mirrored to TensorBoard via TENSORBOARD_LOG_DIR."""
+    tensorboard_enabled = bool(os.environ.get("TENSORBOARD_LOG_DIR"))
     if dist.is_initialized():
-        return MetricLoggerDist(filepath, flush=flush, append=append, buffer_size=buffer_size)
+        cls = TensorBoardMetricLoggerDist if tensorboard_enabled else MetricLoggerDist
     else:
-        return MetricLogger(filepath, flush=flush, append=append, buffer_size=buffer_size)
+        cls = TensorBoardMetricLogger if tensorboard_enabled else MetricLogger
+    return cls(filepath, flush=flush, append=append, buffer_size=buffer_size)
