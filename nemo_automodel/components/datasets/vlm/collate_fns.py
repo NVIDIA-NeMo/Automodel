@@ -468,6 +468,12 @@ def build_labels_from_template(
     processor_type = type(processor).__name__
     tokenizer = getattr(processor, "tokenizer", processor)
 
+    # MistralCommonBackend owns the HF token API; its .tokenizer is the vendor
+    # encoder, not another HF tokenizer. [/INST] delimits each assistant turn.
+    if processor_type == "MistralCommonBackend":
+        assistant_marker = [processor.convert_tokens_to_ids("[/INST]")]
+        return _build_labels_from_markers(input_ids_batch, assistant_marker, processor.eos_token_id)
+
     # Inkling closes an assistant message before emitting a separate sampling
     # terminator. Label through the first sampling terminator, which also keeps
     # subsequent padding (using the same token id) masked.

@@ -247,8 +247,16 @@ class _CompressorLinear(nn.Linear):
     """Keep pooling weights in FP32 while selecting compute from the input dtype."""
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
-        """Project [..., input] into [..., output] with the input's compute dtype."""
-        return F.linear(values, self.weight.to(values.dtype))
+        """Project using the input's explicit compute dtype.
+
+        Args:
+            values: Tensor of shape [..., input] with arbitrary leading dimensions.
+
+        Returns:
+            Tensor of shape [..., output] in the input dtype.
+        """
+        with torch.autocast(device_type=values.device.type, enabled=False):
+            return F.linear(values, self.weight.to(values.dtype))
 
 
 class _Compressor(nn.Module):
@@ -283,7 +291,8 @@ class _Compressor(nn.Module):
             return self.norm(self.wkv(hidden_states))
         length = hidden_states.shape[1] // self.ratio * self.ratio
         values = self.wkv(hidden_states[:, :length].float())
-        scores = self.wgate(hidden_states[:, :length].float())
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            scores = self.wgate(hidden_states[:, :length].float())
         values = values.unflatten(1, (-1, self.ratio))
         scores = scores.unflatten(1, (-1, self.ratio))
         pooled = (values * scores.softmax(dim=2)).sum(dim=2).to(hidden_states.dtype)
@@ -913,10 +922,11 @@ class DeepseekV41Attention(nn.Module):
                     scale=self.head_dim**-0.5,
                 ).transpose(1, 2)
             else:
-                logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
-                probabilities = (logits + bias).softmax(dim=-1)
-                probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
-                attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
+                with torch.autocast(device_type=query.device.type, enabled=False):
+                    logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
+                    probabilities = (logits + bias).softmax(dim=-1)
+                    probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
+                    attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
         if produces and replay is not None and replay[1] == "record":
             replay[0].record(
                 _SelectionRecord(
