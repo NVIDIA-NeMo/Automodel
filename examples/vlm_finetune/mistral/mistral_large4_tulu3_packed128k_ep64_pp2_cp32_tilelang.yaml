@@ -5,14 +5,13 @@
 # 32 GB200 nodes / 128 GPUs: EP64 / PP2 / CP32 / TP1 / DP2 / expert shard1.
 # GBS8 = DP2 x LBS4 x GA1; PP microbatch1; 1F1B with two 36-layer stages.
 #
-# Prepare the packs with prepare_tulu3_packed.py in this directory and set
-# dataset.dataset_path to its output. Labels are assistant-only; documents and
-# packs are shuffled with seed 1234.
+# Tulu3 is tokenized and THD-packed online; labels are assistant-only. The
+# vision tower is frozen and unused because Tulu3 is text-only.
 #
 # Attention uses backend.attn=tilelang (sparse MLA); the DSA indexer is frozen.
 # FusedAdam keeps BF16 model and moments with FP32 master weights. Logit cap is 30.
 
-recipe: TrainFinetuneRecipeForNextTokenPrediction
+recipe: FinetuneRecipeForVLM
 seed: 1234
 step_scheduler:
   global_batch_size: 8
@@ -29,7 +28,7 @@ dist_env:
   backend: nccl
   timeout_minutes: 60
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: mistralai/Mistral-Large-4-1T-A52B
   dtype: bfloat16
   attn_implementation: sdpa
@@ -44,11 +43,8 @@ model:
     rope_fusion: false
     experts: torch_mm
     dispatcher: hybridep
-    gate_precision: float32
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: false
-  fp8_indexer: false
-  fp8_kv_cache: false
 distributed:
   strategy: fsdp2
   dp_size: none
@@ -73,6 +69,10 @@ distributed:
     patch_causal_lm_model: false
     pp_seq_len: 131072
     pp_recv_buffer_pool: false
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/mistral-large4-tulu3-packed128k-tilelang-ep64pp2cp32
@@ -90,27 +90,31 @@ loss_fn:
   reduction: sum
   impl: cce
   logit_softcapping: 30.0
+processor:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: mistralai/Mistral-Large-4-1T-A52B
+  mode: finetuning
+  padding_side: right
 dataset:
-  _target_: datasets.load_from_disk
-  dataset_path: data/mistral_large4_tulu3_packed128k/train
-  tokenizer:
-    _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: mistralai/Mistral-Large-4-1T-A52B
-    mode: finetuning
-    padding_side: right
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
+  path_or_dataset: allenai/tulu-3-sft-mixture
+  split: train
+  truncate: true
+  inject_fake_images: false
 packed_sequence:
-  packed_sequence_size: 131072
-  packing_strategy: thd
-  prepacked: true
-  pad_to_multiple_of: 64
+  pretokenize: true
+  packing_format: thd
+  max_length: 131072
+  pack_size: 131072
+  collate_max_length: 131072
+  packing_ratio: 0.9
+  drop_long_samples: true
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 4
   num_workers: 0
   pin_memory: true
   drop_last: true
-  shuffle: false
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
 validation_dataset: none
 validation_dataloader: none
 optimizer:
