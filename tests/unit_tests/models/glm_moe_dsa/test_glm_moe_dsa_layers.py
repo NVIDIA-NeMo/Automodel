@@ -516,3 +516,30 @@ class TestGlmMoeDsaMLA:
             mla.init_weights(torch.device("cpu"), init_std=0.01)
 
         assert trunc_normal.call_count == 5
+
+
+def _plain_linear(linear_impl, in_features, out_features, bias=False, device=None, dtype=torch.bfloat16):
+    return torch.nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
+
+
+def test_indexer_weights_proj_stays_plain_linear_with_fp32_matmul_under_te_linear(config, sdpa_backend):
+    # wq_b / wk follow backend.linear (FP8 under te_fp8, like the checkpoint); weights_proj never
+    # goes through the backend helper because its output picks the attended keys.
+    sdpa_backend.linear = "te"
+    with patch(
+        "nemo_automodel.components.models.glm_moe_dsa.layers.initialize_linear_module", side_effect=_plain_linear
+    ) as helper:
+        indexer = GlmMoeDsaIndexer(config, sdpa_backend)
+
+    assert [call.kwargs["linear_impl"] for call in helper.call_args_list] == ["te", "te"]
+    assert [call.kwargs["out_features"] for call in helper.call_args_list] == [
+        config.index_n_heads * config.index_head_dim,
+        config.index_head_dim,
+    ]
+    assert type(indexer.weights_proj) is torch.nn.Linear
+
+    indexer.weights_proj.to(torch.bfloat16)  # bf16 compute weight, as under the FSDP2 mixed-precision policy
+    x = torch.randn(6, config.hidden_size).to(torch.bfloat16)
+    weights = indexer._head_weights(x)
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(weights, x.float() @ indexer.weights_proj.weight.float().T)

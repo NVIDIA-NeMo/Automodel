@@ -23,7 +23,6 @@ from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaC
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -388,9 +387,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_overrides=moe_overrides,
         )
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        # Plain torch Linear on purpose: the GLM-5.3 checkpoint keeps lm_head in bf16
+        # (``modules_to_not_convert``) and so do the RL trainer and SGLang, so it must stay out of
+        # the TE FP8 autocast that ``backend.linear='te'`` + ``te_fp8`` would otherwise apply to it.
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GlmMoeDsaStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
