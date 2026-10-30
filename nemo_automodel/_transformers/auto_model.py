@@ -65,6 +65,7 @@ from nemo_automodel.components.utils.model_utils import (  # noqa: E402
     init_empty_weights,
     resolve_trust_remote_code,
 )
+from nemo_automodel.shared import telemetry  # noqa: E402
 from nemo_automodel.shared.utils import dtype_from_str  # noqa: E402
 
 if TYPE_CHECKING:
@@ -669,6 +670,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         return model
 
     @classmethod
+    @telemetry.traced(telemetry.MODEL_INIT, "automodel.model.from_pretrained")
     def from_pretrained(
         cls,
         pretrained_model_name_or_path,
@@ -828,6 +830,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
 
     @classmethod
+    @telemetry.traced(telemetry.MODEL_INIT, "automodel.model.from_config")
     def from_config(
         cls,
         config,

@@ -1115,6 +1115,9 @@ navigation:
       - page: "SwanLab Logging"
         path: ../../guides/swanlab-logging.mdx
         slug: swanlab-logging
+      - page: "OpenTelemetry Observability"
+        path: ../../guides/observability.mdx
+        slug: observability
       - page: "Breaking Changes"
         path: ../../breaking-changes.mdx
         slug: breaking-changes

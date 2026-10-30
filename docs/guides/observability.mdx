@@ -1,0 +1,191 @@
+---
+title: "OpenTelemetry Observability"
+description: "Export OpenTelemetry spans and metrics that show where a NeMo AutoModel job spends its time, on every rank."
+position: 6
+---
+
+NeMo AutoModel can export OpenTelemetry spans and metrics through the optional
+[NeMo Lens](https://github.com/NVIDIA-NeMo/Lens) package. They describe how a job runs: how long it
+spends loading the model, waiting for data, running each optimizer step, evaluating, and reading and
+writing checkpoints, measured separately on every rank.
+
+This is application telemetry. It complements experiment tracking with
+[MLflow](/development/mlflow-logging) or Weights & Biases, which records loss curves and
+hyperparameters; it does not replace it.
+
+## Install the Telemetry Extra
+
+Install the `telemetry` extra from a source checkout with `uv`:
+
+```bash
+uv sync --extra telemetry
+```
+
+The NeMo AutoModel container already includes it.
+
+<Note>
+The extra pins nemo-lens to a Git commit through `[tool.uv.sources]`. A plain `pip install
+"nemo-automodel[telemetry]"` ignores that pin and resolves nemo-lens from PyPI, whose only release
+does not support this version of NeMo AutoModel. Install the extra with `uv`.
+
+</Note>
+
+Without the extra, every instrumentation site is inert and NeMo AutoModel runs unchanged.
+
+## Enable Telemetry
+
+Telemetry is off by default. Turn it on with the `telemetry:` block of the recipe YAML:
+
+```yaml
+telemetry:
+  enabled: true
+  exporter: console      # or otlp
+  span_groups: default   # or per_step, all, or a comma-separated list
+```
+
+Or override the same keys on the command line:
+
+```bash
+uv run automodel examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml \
+  --telemetry.enabled true --telemetry.exporter console --telemetry.span_groups per_step
+```
+
+As with every NeMo AutoModel config section, the YAML and its command-line overrides are the only
+sources of these values. To take a value from the environment, interpolate it in the YAML:
+
+```yaml
+telemetry:
+  enabled: ${NEMO_LENS_ENABLED,false}
+```
+
+When `enabled` is `true` and nemo-lens is not installed, the recipe stops at startup with an error
+that names the missing extra.
+
+### Send Telemetry to a Collector
+
+The default `otlp` exporter sends spans and metrics to an OpenTelemetry collector. Configure the
+connection with the standard OpenTelemetry environment variables, which the OpenTelemetry SDK reads
+directly:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example.com:4317
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"
+```
+
+The Slurm launcher passes the environment to every rank. For SkyPilot and NeMo-Run, list these
+variables in the launcher's `env_vars` so that they reach the remote ranks.
+
+### Configuration Reference
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Install OpenTelemetry providers on every rank and record spans and metrics. |
+| `exporter` | `otlp` | `otlp` sends to an OTLP endpoint. `console` writes one JSON object per span or metric batch to standard output. |
+| `span_groups` | `default` | Span groups to record: a preset, a group name, or a comma-separated list of both. |
+| `service_name` | `nemo-automodel` | The `service.name` resource attribute. |
+| `run_id` | Unset | Identifier shared by every rank of the job, exported as `nemo.run.id`. |
+| `traces_enabled` | `true` | Export spans. |
+| `metrics_enabled` | `true` | Export metrics. |
+
+When `run_id` is unset, NeMo AutoModel uses the Slurm job ID. Outside Slurm, rank 0 generates an ID
+at startup and broadcasts it, so all ranks of a job share one `nemo.run.id`. Set `run_id` from a CLI
+override or an interpolated variable, not in a committed YAML file: every run of that file would
+otherwise reuse the same ID.
+
+## Span Groups and Spans
+
+Every span belongs to a span group. `span_groups` selects which groups are recorded.
+
+| Group | Spans | How Often |
+|-------|-------|-----------|
+| `model_init` | `automodel.model.from_pretrained`, `automodel.model.from_config`, `automodel.model.download`, `automodel.model.infrastructure` | Once per model |
+| `load_checkpoint` | `automodel.checkpoint.load`, `automodel.checkpoint.load.model`, `automodel.checkpoint.load.optimizer` | Once per resume, plus base-model weight loading |
+| `checkpoint` | `automodel.checkpoint.save`, `automodel.checkpoint.save.model`, `automodel.checkpoint.save.optimizer`, `automodel.checkpoint.wait.staging.*`, `automodel.checkpoint.wait.upload.*` | Once per checkpoint |
+| `evaluate` | `automodel.evaluate` | Once per validation dataset per validation step |
+| `first_iteration` | `automodel.train.first_step` | Once: the first optimizer step of the process |
+| `step` | `automodel.train.step` | Every optimizer step |
+| `forward_backward` | `automodel.train.forward_backward` | Every optimizer step |
+| `optimizer` | `automodel.train.optimizer` | Every optimizer step |
+| `data_loading` | `automodel.data.wait` | Every optimizer step |
+
+The presets are:
+
+- `default`: `model_init`, `load_checkpoint`, `checkpoint`, `evaluate`, and `first_iteration`. These
+  groups record a bounded number of spans per job.
+- `per_step`: Everything in `default` plus `step`, `forward_backward`, `optimizer`, and
+  `data_loading`.
+- `all`: Every registered group.
+
+The asynchronous checkpoint wait spans appear only while an asynchronous save is in flight.
+
+Spans carry these attributes where they apply:
+
+| Attribute | On | Meaning |
+|-----------|----|---------|
+| `dl.iteration` | Step, data-wait, evaluation, and checkpoint-save spans | The optimizer step the span belongs to |
+| `automodel.train.num_microbatches` | `automodel.train.forward_backward` | Microbatches accumulated in the step |
+| `automodel.data.batches` | `automodel.data.wait` | Batches fetched; fewer on the last window of an epoch, and 0 when the dataloader was already exhausted |
+| `automodel.validation.name` | `automodel.evaluate` | Name of the validation dataset |
+| `automodel.checkpoint.async` | `automodel.checkpoint.save` | Whether the save is asynchronous |
+
+`automodel.train.step` ends after the reporting loss is copied to the host, so its duration includes
+the GPU work of the step. The spans inside it, `forward_backward` and `optimizer`, time host-side
+dispatch: GPU work is asynchronous until that copy.
+
+## Metrics
+
+| Metric | Type | Unit | Recorded by |
+|--------|------|------|-------------|
+| `automodel.train.step.duration` | Histogram | `ms` | Every rank, every optimizer step |
+| `automodel.train.throughput` | Gauge | `{token}/s` | The main rank, every optimizer step |
+
+Loss, learning rate, and gradient norm are experiment data. Record them with an experiment tracker.
+
+## Resource Attributes
+
+Every span and metric carries attributes that are fixed for the life of the process:
+
+| Attribute | Value |
+|-----------|-------|
+| `service.name` | `service_name` |
+| `service.version` | NeMo AutoModel version |
+| `nemo.run.id` | The job's run ID |
+| `nv.dl.rank`, `nv.dl.world_size`, `nv.dl.local_rank` | Rank, world size, and local rank |
+| `service.instance.id` | `<run id>-rank<rank>` |
+| `dl.data_parallel.size`, `dl.tensor_parallel.size`, `dl.pipeline_parallel.size`, `dl.context_parallel.size`, `dl.expert_parallel.size` | Parallel layout |
+| `nemo.automodel.recipe` | Recipe class |
+| `nemo.automodel.model` | Hugging Face model ID. A local model path is never recorded. |
+
+nemo-lens adds host, Slurm, and Kubernetes attributes when they apply.
+
+## Recipes and Distributed Runs
+
+The LLM recipe (`TrainFinetuneRecipeForNextTokenPrediction`) and the VLM recipe
+(`FinetuneRecipeForVLM`) initialize telemetry, together with the recipes that build on them, such as
+knowledge distillation. Other recipes do not initialize telemetry yet, so the `telemetry:` block has
+no effect on them.
+
+Every rank exports its own spans and metrics. To narrow the data to some ranks, filter on
+`nv.dl.rank` in the collector. With the `console` exporter, all ranks write to the same standard
+output, so lines from different ranks can interleave. Use the `otlp` exporter for multi-rank jobs.
+
+To count the spans each rank recorded in a single-process run with the `console` exporter, run the following commands:
+
+```bash
+uv run automodel <config.yaml> --telemetry.enabled true --telemetry.exporter console > run.log
+grep '^{"name"' run.log | jq -r '[.resource.attributes["nv.dl.rank"], .name] | @tsv' | sort | uniq -c
+```
+
+## Use AutoModel Inside Another Application
+
+When another application, such as NeMo RL, calls NeMo AutoModel components directly, NeMo AutoModel
+never installs OpenTelemetry providers; the application owns them. The model-loading and checkpoint
+spans of those components are recorded under the application's providers whenever the application
+enables a span group of the same name, such as `model_init` or `checkpoint`.
+
+## Overhead
+
+When a span group is disabled, an instrumentation site creates no span and costs a set lookup:
+about 80 ns with nemo-lens installed and 40 ns without it, measured on an AMD Ryzen
+Threadripper PRO 5975WX. The `per_step` preset adds about five sites to each optimizer step. Importing nemo-lens
+adds about 45 ms to startup when the `telemetry` extra is installed.

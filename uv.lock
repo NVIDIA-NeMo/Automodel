@@ -2238,7 +2238,7 @@ name = "grpcio"
 version = "1.81.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.14'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/15/f3/23f47b24f8d8c2028eba501db3acfbb2f592cbb5995eaa6e363a627b74d7/grpcio-1.81.0.tar.gz", hash = "sha256:a5acd7efd3b1fe9b4eb0bcaaa1507eed68a0ad0678b654c3f7b464df9ba9dca5", size = 13032272, upload-time = "2026-06-01T05:56:22.827Z" }
 wheels = [
@@ -3922,6 +3922,9 @@ swanlab = [
     { name = "swanlab" },
     { name = "wandb" },
 ]
+telemetry = [
+    { name = "nemo-lens", extra = ["sdk"] },
+]
 tracking = [
     { name = "alembic" },
     { name = "mlflow-skinny" },
@@ -4054,6 +4057,7 @@ requires-dist = [
     { name = "nemo-automodel", extras = ["vlm-media"], marker = "extra == 'media'" },
     { name = "nemo-automodel", extras = ["wandb"], marker = "extra == 'swanlab'" },
     { name = "nemo-automodel", extras = ["wandb"], marker = "extra == 'tracking'" },
+    { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'telemetry'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=7bcc03ce3565d2be6858b819b049bcc4c3ec05b4" },
     { name = "nemo-run", marker = "extra == 'cli'" },
     { name = "ninja" },
     { name = "numba", marker = "extra == 'vlm'" },
@@ -4093,7 +4097,7 @@ requires-dist = [
     { name = "transformers", specifier = "==5.18.0" },
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.30.0" },
 ]
-provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "ffpa", "fla", "delta-databricks", "moe", "mok", "vlm", "cli", "s3", "msc", "vlm-media", "diffusion-media", "media", "mlflow", "mlflow-full", "wandb", "trackio", "swanlab", "tracking", "msa", "all"]
+provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "ffpa", "fla", "delta-databricks", "moe", "mok", "vlm", "cli", "s3", "msc", "vlm-media", "diffusion-media", "media", "mlflow", "mlflow-full", "wandb", "trackio", "swanlab", "tracking", "telemetry", "msa", "all"]
 
 [package.metadata.requires-dev]
 build = [
@@ -4139,6 +4143,21 @@ test = [
     { name = "sentence-transformers", specifier = ">=5.6.0" },
     { name = "swanlab", specifier = ">=0.10.2,<0.11" },
     { name = "wandb", specifier = ">=0.30.0" },
+]
+
+[[package]]
+name = "nemo-lens"
+version = "0.2.0+7bcc03c"
+source = { git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=7bcc03ce3565d2be6858b819b049bcc4c3ec05b4#7bcc03ce3565d2be6858b819b049bcc4c3ec05b4" }
+dependencies = [
+    { name = "opentelemetry-api" },
+]
+
+[package.optional-dependencies]
+sdk = [
+    { name = "opentelemetry-exporter-otlp-proto-grpc" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
 ]
 
 [[package]]
@@ -4950,6 +4969,24 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/61/09/4d717852c1cf3f854b76c7110a5d00883bc3c99288b9b0dbcbeb9e306eb6/opentelemetry_exporter_otlp_proto_common-1.44.0.tar.gz", hash = "sha256:dc87a5a5bc58f149a56d1547e4691588fa12994cdc3bc039a694ccb3375862ac", size = 20202, upload-time = "2026-07-16T15:25:37.658Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5e/71/65fd9d54c10b860f87c045ccee1264cab7011268895d3528818a29c1172a/opentelemetry_exporter_otlp_proto_common-1.44.0-py3-none-any.whl", hash = "sha256:9a9fe61bba73d802904bc989f1d6b4a7b1ee40f06c40e98d6f85af65aaebb694", size = 17045, upload-time = "2026-07-16T15:25:18.201Z" },
+]
+
+[[package]]
+name = "opentelemetry-exporter-otlp-proto-grpc"
+version = "1.44.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-common" },
+    { name = "opentelemetry-proto" },
+    { name = "opentelemetry-sdk" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1f/47/80d9e9d468dc5de3af5096f5ccdb065fa4dd1470f74495cc53e59e397f47/opentelemetry_exporter_otlp_proto_grpc-1.44.0.tar.gz", hash = "sha256:40d1ae9e03fcc36de3cbac610cc99f35894938bff9cfd90fc4ec68bd85448463", size = 27225, upload-time = "2026-07-16T15:25:38.308Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/29/6ae42ba32b153ae0a44ae125f0caff2188bbe62d99c82d1768da30864e72/opentelemetry_exporter_otlp_proto_grpc-1.44.0-py3-none-any.whl", hash = "sha256:6a1a645ea182a2f59440c51fa8301d309f3324a8f9d65f8395584b064b67ee4e", size = 19624, upload-time = "2026-07-16T15:25:19.096Z" },
 ]
 
 [[package]]

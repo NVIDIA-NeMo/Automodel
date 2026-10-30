@@ -1700,3 +1700,60 @@ def test_model_owned_metadata_reads_keep_explicit_revision(hf_config_hub, monkey
     assert is_custom
     assert model.width == config.n_embd == 64
     assert ref.read_text() == "a" * 40
+
+
+# ---------------------------------------------------------------------------
+# Telemetry: the weight-download span
+# ---------------------------------------------------------------------------
+
+from tests.utils.telemetry import lens_capture  # noqa: E402, F401
+
+
+class _AbortingFirstRankPerNode:
+    """Mirror FirstRankPerNode on a multi-rank job: an error inside becomes SystemExit(1)."""
+
+    def __init__(self, group=None):
+        pass
+
+    def __enter__(self):
+        return True
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            raise SystemExit(1) from exc_val
+        return False
+
+
+def test_download_span_records_a_hub_error_before_it_becomes_system_exit(lens_capture, monkeypatch):
+    import nemo_automodel._transformers.model_init as model_init
+
+    capture = lens_capture("model_init")
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr("nemo_automodel.components.distributed.utils.FirstRankPerNode", _AbortingFirstRankPerNode)
+    monkeypatch.setattr(model_init, "snapshot_download", MagicMock(side_effect=OSError("hub unreachable")))
+
+    with pytest.raises(SystemExit):
+        model_init._download_model_weights(MagicMock(), "org/model")
+
+    (download,) = capture.span_named("automodel.model.download")
+    assert download.status.status_code.name == "ERROR"
+    assert download.events[0].attributes["exception.type"] == "OSError"
+
+
+def test_download_span_only_when_weights_are_fetched(lens_capture, monkeypatch, tmp_path):
+    import nemo_automodel._transformers.model_init as model_init
+
+    capture = lens_capture("model_init")
+    fetch = MagicMock()
+    monkeypatch.setattr(model_init, "snapshot_download", fetch)
+
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    model_init._download_model_weights(MagicMock(), "org/model")
+    model_init._download_model_weights(MagicMock(), str(tmp_path))
+    assert capture.spans() == []
+
+    monkeypatch.delenv("HF_HUB_OFFLINE")
+    model_init._download_model_weights(MagicMock(), "org/model", revision="abc")
+    fetch.assert_called_once_with("org/model", revision="abc")
+    (download,) = capture.span_named("automodel.model.download")
+    assert download.status.status_code.name == "UNSET"

@@ -103,6 +103,7 @@ from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _support
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared import telemetry
 from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
@@ -519,6 +520,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.moe_parallel_config,
             self.activation_checkpointing,
         ) = self._distributed_setup_attributes(self._create_distributed_setup())
+        self.telemetry_handle = self.cfg.telemetry.build(
+            rank=self.dist_env.rank,
+            world_size=self.dist_env.world_size,
+            resource_attributes=self._telemetry_resource_attributes(),
+        )
         self.cp_vision_frame_sharding = (
             self.distributed_config.multimodal.vision.frame_sharding
             if isinstance(self.distributed_config, FSDP2Config)
@@ -772,11 +778,28 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.timestamp = time.perf_counter()
 
         pbar = self._make_progress_bar()
+        is_first_step = True
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
                 for batch_idx, batches in enumerate(self.step_scheduler):
-                    log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    step_start = time.perf_counter()
+                    with (
+                        telemetry.span(telemetry.FIRST_ITERATION, "automodel.train.first_step")
+                        if is_first_step
+                        else nullcontext(),
+                        telemetry.span(telemetry.STEP, "automodel.train.step") as step_span,
+                    ):
+                        if step_span is not None:
+                            step_span.set_attribute(telemetry.semconv.DL_ITERATION, self.step_scheduler.step)
+                        log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    is_first_step = False
+                    if self.telemetry_handle is not None:
+                        telemetry.record_train_step(
+                            self.telemetry_handle,
+                            step_duration_ms=(time.perf_counter() - step_start) * 1e3,
+                            tokens_per_second=log_data.metrics["tps"] if self.dist_env.is_main else None,
+                        )
                     # log
                     self.log_train_metrics(log_data)
                     self._update_progress_bar(pbar, log_data.metrics)
@@ -786,7 +809,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         if self.pp_enabled:
                             logger.warning("Validation is not supported for pipeline parallelism")
                         else:
-                            val_log_data = self._run_validation_epoch(self.val_dataloader)
+                            with telemetry.span(telemetry.EVALUATE, "automodel.evaluate") as eval_span:
+                                if eval_span is not None:
+                                    eval_span.set_attribute(telemetry.semconv.DL_ITERATION, self.step_scheduler.step)
+                                val_log_data = self._run_validation_epoch(self.val_dataloader)
                             val_loss["val_loss"] = val_log_data.metrics["val_loss"]
                             self.log_val_metrics(val_log_data)
                         for mp in self.model_parts:
@@ -1199,51 +1225,57 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         loss_buffer = []
 
-        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+        # Spans inside a step time host-side dispatch: GPU work is asynchronous until the
+        # reporting loss is synchronized at the end of the step.
+        with telemetry.span(telemetry.FORWARD_BACKWARD, "automodel.train.forward_backward") as fb_span:
+            if fb_span is not None:
+                fb_span.set_attribute("automodel.train.num_microbatches", num_batches)
+            prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
-        for i, batch in enumerate(batches):
-            if i == num_batches - 1:
-                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+            for i, batch in enumerate(batches):
+                if i == num_batches - 1:
+                    prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-            self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                self._forward_backward_step(
+                    i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                )
+
+                if i == 0:
+                    prepare_after_first_microbatch()
+
+        with telemetry.span(telemetry.OPTIMIZER, "automodel.train.optimizer"):
+            synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
+            grad_norm = scale_grads_and_clip_grad_norm(
+                max_grad_norm=max_grad_norm,
+                model_parts=self.model_parts,
+                norm_type=2.0,
+                pp_enabled=self.pp_enabled,
+                device_mesh=self.device_mesh,
+                moe_mesh=self.moe_mesh,
+                ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+                pp_axis_name="pp" if self.pp_enabled else None,
+                foreach=True,
+                num_label_tokens=num_label_tokens,
+                dp_group_size=self._get_dp_group_size(include_cp=True),
+                expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+                grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
             )
 
-            if i == 0:
-                prepare_after_first_microbatch()
+            # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
+            # self.model.finish_grad_sync()
 
-        synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
-        grad_norm = scale_grads_and_clip_grad_norm(
-            max_grad_norm=max_grad_norm,
-            model_parts=self.model_parts,
-            norm_type=2.0,
-            pp_enabled=self.pp_enabled,
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
-            pp_axis_name="pp" if self.pp_enabled else None,
-            foreach=True,
-            num_label_tokens=num_label_tokens,
-            dp_group_size=self._get_dp_group_size(include_cp=True),
-            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
-            grad_norm_backend=self.cfg.get("clip_grad_norm.backend", "triton"),
-        )
+            self.checkpointer.maybe_wait_for_staging()
+            for opt in self.optimizer:
+                opt.step()
+                opt.zero_grad(set_to_none=True)
 
-        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
-        # self.model.finish_grad_sync()
+            if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+                for mp in self.model_parts:
+                    mp.update_moe_gate_bias()
 
-        self.checkpointer.maybe_wait_for_staging()
-        for opt in self.optimizer:
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-
-        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
-            for mp in self.model_parts:
-                mp.update_moe_gate_bias()
-
-        if self.lr_scheduler is not None:
-            for scheduler in self.lr_scheduler:
-                scheduler.step(1)
+            if self.lr_scheduler is not None:
+                for scheduler in self.lr_scheduler:
+                    scheduler.step(1)
 
         # Precompute FP8 scales
         fp8_config = self.cfg.get("fp8", None)

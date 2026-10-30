@@ -77,6 +77,7 @@ from nemo_automodel.components.models.common.utils import (
     restore_pretrained_generation_config,
 )
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
+from nemo_automodel.shared import telemetry
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -445,13 +446,16 @@ def _download_model_weights(
             )
         # Import via module reference (vs bound name) so unit tests can patch
         # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
+        # The span sits inside FirstRankPerNode, which turns an error on the first rank into
+        # SystemExit; a span outside it would end without recording that error.
         with dist_utils.FirstRankPerNode(group=process_group):
             download_kwargs = {
                 key: kwargs[key]
                 for key in ("cache_dir", "revision", "token", "local_files_only", "force_download")
                 if key in kwargs
             }
-            snapshot_download(pretrained_model_name_or_path, **download_kwargs)
+            with telemetry.span(telemetry.MODEL_INIT, "automodel.model.download"):
+                snapshot_download(pretrained_model_name_or_path, **download_kwargs)
 
 
 def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=None):

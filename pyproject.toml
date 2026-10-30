@@ -222,6 +222,10 @@ tracking = [
     "nemo-automodel[trackio]",
     "nemo-automodel[wandb]",
 ]
+# OpenTelemetry traces and metrics through nemo-lens, enabled by the YAML `telemetry:` block.
+# Kept out of `all`: PyPI has only nemo-lens 0.1.0, which needs Python >= 3.13, and pip ignores the
+# [tool.uv.sources] pin below, so a pip install of the extra would not resolve on Python 3.11 or 3.12.
+telemetry = ["nemo-lens[sdk]"]
 # Official MSA (Linux + SM100); the model-private patch supplies the CuTe DSL 4.6.2 fmax fix.
 msa = [
     "fmha-sm100; sys_platform == 'linux'",
@@ -402,6 +406,10 @@ magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev 
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 fmha-sm100 = { git = "https://github.com/MiniMax-AI/MSA.git", rev = "80434d7f67877c6570ca19cac444b84bc9855dac" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
+# nemo-lens v0.3.0. Every NeMo library that shares an environment must pin the same revision: two
+# git revisions of nemo-lens in one resolution do not resolve. Replace with a version range once a
+# release that supports Python 3.11 is on PyPI.
+nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "7bcc03ce3565d2be6858b819b049bcc4c3ec05b4" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
   { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
