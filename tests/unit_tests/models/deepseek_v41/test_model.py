@@ -51,7 +51,7 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 
 # Over the default 5s budget on purpose: this module runs full-model forwards and distributed FSDP checks.
 # Shrink the model fixtures and process startup before lowering this further.
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 
 def _tiny_config() -> DeepseekV41Config:

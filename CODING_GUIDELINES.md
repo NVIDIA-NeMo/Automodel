@@ -11,7 +11,7 @@ not yet comply; use these guidelines to guide changes within your task's scope.
   Keep cohesive algorithms together; do not extract helpers based on line count alone.
 - **Keep argument lists short.** Pass only necessary inputs; group related settings in typed configs.
 - **Use explicit contracts for variation.** Prefer typed attributes, capabilities, and existing interfaces
-  over repeated runtime introspection, ad-hoc string dispatch, or untyped parameter bags.
+  over runtime introspection, ad-hoc string dispatch, or untyped parameter bags.
   Use narrow, typed callbacks or model-owned hooks when they express a necessary operation;
   document when they run and who owns their state.
 - **Avoid globals.** Keep mutable state with its owner and pass dependencies explicitly.
@@ -28,6 +28,12 @@ not yet comply; use these guidelines to guide changes within your task's scope.
 - **Keep shared components as infrastructure.** Shared components must not branch on model names, families,
   or model-specific module paths to select behavior. Expose generic typed contracts and let model-owned
   implementations supply the policy. Keep recipes as thin orchestration.
+- **Do not use `nemo_automodel/shared` as an escape hatch.** Placing code there to get past the import-linter
+  contracts between components leaves the coupling in place, hidden from the linter and from reviewers. Keep the
+  code with the component that owns it and declare a `Protocol` in the consuming component for what it uses; the
+  owner satisfies it structurally without importing the consumer, and the code that composes both, such as the
+  recipe, passes the implementation in. Reserve `shared` for small utilities with no component or model knowledge,
+  such as `safe_import()`. Existing escape-hatch modules there are not precedent; do not extend them.
 - **Stop YAML at the typed-config boundary.** Parse and validate YAML into typed configs at the configuration
   boundary. Components must consume typed configs and explicit typed runtime arguments, never YAML or `ConfigNode`
   objects. Converting a `ConfigNode` into a plain dictionary, nested mapping, or `**kwargs` bag and passing it into
@@ -54,6 +60,14 @@ not yet comply; use these guidelines to guide changes within your task's scope.
 - **Type annotations still apply to excluded files.** Add types to new and modified
   signatures even when `pyproject.toml` excludes the file or relaxes its type checks.
 - **Avoid `Any`.** It effectively bypasses type checking for affected values and hides errors.
+- **Avoid reflection.** Do not access members by string name or choose behavior by inspecting objects at runtime,
+  as with `getattr`, `hasattr`, `setattr`, `isinstance` or `type()` dispatch, `inspect.signature`, `__dict__`, or
+  `vars()`. Reflection hides contracts from type checking, and a renamed member silently changes behavior instead
+  of failing. Express the variation in types instead: an attribute or method every implementation provides, or a
+  parameter typed as a `Protocol`. Checking `isinstance` against a `runtime_checkable` Protocol or catching
+  `AttributeError` only renames the probe. Use reflection only when absolutely necessary, such as for an external
+  library that exposes no API for the information, and confine it to one adapter at that boundary with a comment
+  explaining why.
 - **Use contracts where applicable.** Define interfaces with typed signatures, dataclasses, or `Protocol`;
   document assumptions, ownership, and failure modes.
 - **Document tensor contracts.** State shapes, axis order, relevant dtype/device requirements, and distributed placements.

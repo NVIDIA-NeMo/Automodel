@@ -43,6 +43,8 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from tests.unit_tests.models.flint.conftest import checkpoint_style_config, cpu_loader
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _config(**overrides: object) -> FlintConfig:
     """Cover dense/full, MoE/sliding and MoE/full in a very small architecture."""

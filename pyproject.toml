@@ -76,7 +76,7 @@ dependencies = [
     "zephon @ git+https://github.com/datologyai/zephon.git@5bebdff766734b17c76730ec531368f6bf358f4c",
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
-    "mistral-common[audio,hf-hub,sentencepiece]",
+    "mistral-common[audio,hf-hub,sentencepiece]>=1.13.0",
     "ninja",
     "pyyaml",
     "tiktoken",
@@ -163,7 +163,7 @@ mok = [
 ]
 vlm = [
     "backoff",
-    "mistral_common>=1.11.0",
+    "mistral_common>=1.13.0",
     "numpy",
     "numba",
     "open-clip-torch",
@@ -286,7 +286,7 @@ test = [
 dev = [
     "cut-cross-entropy",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
-    "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+    "dion @ git+https://github.com/microsoft/dion.git@7452a5823cf9655b93c3f1d8020b4ebb2535239b; platform_machine == 'x86_64' and platform_system != 'Darwin'",
 ]
 magi = [
     "magi_attention",
@@ -706,6 +706,7 @@ allowed-unresolved-imports = [
     "deep_ep",
     "deep_ep.**",
     "dion",
+    "dion.**",
     "fast_hadamard_transform",
     "ffpa_attn",
     "ffpa_attn.**",

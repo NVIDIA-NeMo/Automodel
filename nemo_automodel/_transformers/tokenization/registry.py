@@ -113,16 +113,18 @@ def _register_default_tokenizers():
     TokenizerRegistry.register("mistral", mistral_common)
     TokenizerRegistry.register("pixtral", mistral_common)
     TokenizerRegistry.register("mistral3", mistral_common)
+    TokenizerRegistry.register("mistral_large4", mistral_common)
     TokenizerRegistry.register("ministral3", mistral_common)
     TokenizerRegistry.register(
         "kimi_k3",
         "nemo_automodel.components.models.kimi_k3.tokenization:TikTokenTokenizer",
     )
-    # Beam's and DeepSeek-V4.1's chat templates render each tool-call argument as its own field, so they need
+    # These models' chat templates render each tool-call argument as its own field, so they need
     # the arguments as dicts; datasets store them as JSON strings.
     dict_tool_arguments = "nemo_automodel._transformers.tokenization.tool_call_arguments:DictToolArgumentsTokenizer"
     TokenizerRegistry.register("beam", dict_tool_arguments)
     TokenizerRegistry.register("deepseek_v41", dict_tool_arguments)
+    TokenizerRegistry.register("nemotron_h", dict_tool_arguments)
 
 
 # Register defaults on module load
