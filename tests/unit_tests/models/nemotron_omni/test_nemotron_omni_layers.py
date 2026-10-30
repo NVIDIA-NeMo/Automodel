@@ -223,6 +223,7 @@ def test_initialize_weights_preserves_sharded_mamba_fp32(tmp_path):
     try:
         model = object.__new__(NemotronOmniForConditionalGeneration)
         torch.nn.Module.__init__(model)
+        model._native_transformers = False
         model.language_model = TinyLanguageModel()
         model.vision_model = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
         mesh = init_device_mesh("cpu", (1,))

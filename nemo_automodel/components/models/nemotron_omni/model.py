@@ -30,9 +30,10 @@ from typing import Any, List, Tuple, Union
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, RadioModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.models.nemotron_h_omni.configuration_nemotron_h_omni import NemotronH_Omni_Reasoning_V3_Config
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
@@ -392,7 +393,9 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         Returns:
             NemotronOmniForConditionalGeneration instance
         """
-        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path, trust_remote_code=kwargs.pop("trust_remote_code", False)
+        )
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
@@ -416,9 +419,16 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # ---------------------------------------------------------------
         # Extract sub-configs
         # ---------------------------------------------------------------
-        llm_config = config.llm_config
+        # This boundary accepts the native Super schema and the legacy Nano
+        # remote-code schema; the rest of the model uses the resolved fields.
+        self._native_transformers = isinstance(config, NemotronH_Omni_Reasoning_V3_Config)
         vision_config = config.vision_config
-        sound_config = getattr(config, "sound_config", None)
+        if self._native_transformers:
+            llm_config = config.text_config
+            sound_config = config.audio_config
+        else:
+            llm_config = config.llm_config
+            sound_config = getattr(config, "sound_config", None)
 
         # Store key VLM parameters
         self.force_image_size = getattr(config, "force_image_size", 512)
@@ -429,12 +439,21 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         self.video_context_token_id = getattr(config, "video_context_token_id", 131081)
         self.sound_context_token_id = getattr(config, "sound_context_token_id", 27)
 
+        if self._native_transformers:
+            self.patch_size = vision_config.patch_size
+            self.force_image_size = config.force_image_size or vision_config.image_size
+            self.img_context_token_id = config.image_token_id
+            self.video_context_token_id = config.video_token_id
+            self.sound_context_token_id = config.audio_token_id
+
         self.num_image_token = int((self.force_image_size // self.patch_size) ** 2 * (self.downsample_ratio**2))
         logger.info(f"NemotronOmni: num_image_token={self.num_image_token}")
         logger.info(f"NemotronOmni: ps_version={self.ps_version}")
         logger.info(f"NemotronOmni: img_context_token_id={self.img_context_token_id}")
 
-        vit_hidden_size = getattr(config, "vit_hidden_size", 1280)
+        vit_hidden_size = (
+            config.vision_hidden_size if self._native_transformers else getattr(config, "vit_hidden_size", 1280)
+        )
         projector_hidden_size = getattr(config, "projector_hidden_size", 20480)
         llm_hidden_size = llm_config.hidden_size
 
@@ -453,34 +472,38 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # ---------------------------------------------------------------
         logger.info("NemotronOmni: Creating RADIO vision encoder from HF config...")
         dtype = get_dtype(getattr(llm_config, "torch_dtype", None), torch.bfloat16)
-        # FIX: Force timm to use eager (math) attention instead of fused SDPA
-        # for the RADIO ViT. This ensures numerical parity with the HF model
-        # which also uses eager attention. The timm Attention class reads this
-        # global flag at __init__ time, so it must be set BEFORE model creation.
-        from timm.layers.config import set_fused_attn as _timm_set_fused_attn
+        if self._native_transformers:
+            # The image processor owns normalization, as in the native HF wrapper.
+            self.vision_model = RadioModel(vision_config)
+        else:
+            # FIX: Force timm to use eager (math) attention instead of fused SDPA
+            # for the RADIO ViT. This ensures numerical parity with the HF model
+            # which also uses eager attention. The timm Attention class reads this
+            # global flag at __init__ time, so it must be set BEFORE model creation.
+            from timm.layers.config import set_fused_attn as _timm_set_fused_attn
 
-        _timm_set_fused_attn(False)
-        # Resolve RadioModel directly from THIS checkpoint's own remote-code module rather
-        # than through the generic `AutoModel.from_config(..., trust_remote_code=True)`
-        # factory. That factory dispatches on `model_type` ("radio") through a *global*
-        # registry: with multiple RADIO/omni checkpoints' remote code cached under the same
-        # $HF_HOME (each with its own "radio" registration -- e.g. a legacy timm-based
-        # implementation for NemotronH_Nano_Omni_Reasoning_V3 vs. the newer
-        # transformers-native embeddings/encoder RadioModel some checkpoints ship, such as
-        # NemotronH_Omni_Reasoning_V3), whichever module happened to register "radio" first
-        # in this process wins -- nondeterministically resolving the wrong class/module tree
-        # for the checkpoint actually being loaded. Explicit dynamic-module resolution is
-        # deterministic and always matches the checkpoint's own weights.
-        try:
-            from transformers.dynamic_module_utils import get_class_from_dynamic_module
+            _timm_set_fused_attn(False)
+            # Resolve RadioModel directly from THIS checkpoint's own remote-code module rather
+            # than through the generic `AutoModel.from_config(..., trust_remote_code=True)`
+            # factory. That factory dispatches on `model_type` ("radio") through a *global*
+            # registry: with multiple RADIO/omni checkpoints' remote code cached under the same
+            # $HF_HOME (each with its own "radio" registration -- e.g. a legacy timm-based
+            # implementation for NemotronH_Nano_Omni_Reasoning_V3 vs. the newer
+            # transformers-native embeddings/encoder RadioModel some checkpoints ship, such as
+            # NemotronH_Omni_Reasoning_V3), whichever module happened to register "radio" first
+            # in this process wins -- nondeterministically resolving the wrong class/module tree
+            # for the checkpoint actually being loaded. Explicit dynamic-module resolution is
+            # deterministic and always matches the checkpoint's own weights.
+            try:
+                from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-            radio_model_cls = get_class_from_dynamic_module("modeling_radio.RadioModel", config.name_or_path)
-            self.vision_model = radio_model_cls(vision_config)
-        except (ImportError, OSError, AttributeError):
-            # Checkpoints that don't ship a "modeling_radio.RadioModel" module/class under
-            # this exact name/path fall back to the generic, registry-based resolution.
-            self.vision_model = AutoModel.from_config(vision_config, trust_remote_code=True)
-        _timm_set_fused_attn(True)  # Restore default for any subsequent timm usage
+                radio_model_cls = get_class_from_dynamic_module("modeling_radio.RadioModel", config.name_or_path)
+                self.vision_model = radio_model_cls(vision_config)
+            except (ImportError, OSError, AttributeError):
+                # Checkpoints that don't ship a "modeling_radio.RadioModel" module/class under
+                # this exact name/path fall back to the generic, registry-based resolution.
+                self.vision_model = AutoModel.from_config(vision_config, trust_remote_code=True)
+            _timm_set_fused_attn(True)  # Restore default for any subsequent timm usage
         # WAR for transformers issue 38358
         if hasattr(self.vision_model, "model") and hasattr(self.vision_model.model, "_init_weights"):
             self.vision_model.model._initialize_weights = self.vision_model.model._init_weights
@@ -636,6 +659,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 # "radio_model")`, e.g. NemotronH_Nano_Omni_Reasoning_V3) already match the
                 # checkpoint's native layout and need no remap.
                 vision_uses_native_radio=not hasattr(self.vision_model, "radio_model"),
+                native_transformers=self._native_transformers,
             )
             logger.info("NemotronOmni: State dict adapter created")
 
@@ -766,6 +790,34 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         return self.vision_projector(
             vit_embeds, patch_grid_shapes=[(H // patch_size, W // patch_size)], ps_version=self.ps_version
         )
+
+    def extract_feature_packed(self, pixel_values: torch.Tensor, image_grid_hw: torch.Tensor) -> torch.Tensor:
+        """Encode native processor patches without mixing image boundaries.
+
+        Args:
+            pixel_values: Concatenated patches [total_patches, channels * patch_size**2].
+            image_grid_hw: Per-image patch grids [num_images, 2].
+
+        Returns:
+            Projected image tokens [total_image_tokens, language_hidden_size].
+        """
+        grids = image_grid_hw.tolist()
+        if sum(h * w for h, w in grids) != pixel_values.shape[0]:
+            raise ValueError("image_grid_hw does not match the number of image patches")
+        merge_size = int(1 / self.downsample_ratio)
+        if any(h <= 0 or w <= 0 or h % merge_size or w % merge_size for h, w in grids):
+            raise ValueError("Image patch grids must be positive multiples of the spatial merge size")
+        was_training = self.vision_model.training
+        try:
+            self.vision_model.eval()
+            features = self.vision_model(
+                pixel_values.to(dtype=self.vision_model.dtype), image_grid_hw=image_grid_hw
+            ).features
+        finally:
+            self.vision_model.train(was_training)
+        return self.vision_projector(
+            features.unsqueeze(0), patch_grid_shapes=grids, ps_version=self.ps_version
+        ).squeeze(0)
 
     def extract_feature_dynamic(
         self,
@@ -1068,6 +1120,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         position_ids: torch.LongTensor | None = None,
         image_flags: torch.LongTensor | None = None,
         imgs_sizes: torch.LongTensor | None = None,
+        image_grid_hw: torch.Tensor | None = None,
         past_key_values: List[torch.FloatTensor] | None = None,
         labels: torch.LongTensor | None = None,
         sound_features: torch.FloatTensor | None = None,
@@ -1091,11 +1144,13 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         5. Compute loss if labels provided
 
         Args:
-            pixel_values: Image pixel values [num_tiles, C, H, W]
+            pixel_values: Image tiles [num_tiles, C, H, W], or native flattened patches
+                [total_patches, C * patch_size**2] with image_grid_hw.
             input_ids: Input token IDs [batch, seq_len]
             attention_mask: Attention mask [batch, seq_len]
             position_ids: Position IDs (ignored by the RoPE-free backbone; forwarded to the MTP head)
             image_flags: Flags indicating real images vs padding [num_tiles, 1]
+            image_grid_hw: Native processor patch grids [num_images, 2].
             labels: Token IDs for loss computation [batch, seq_len]
             inputs_embeds: Pre-computed input embeddings (optional)
             use_cache: Whether to use caching (not used in training)
@@ -1114,10 +1169,9 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         """
         return_dict = return_dict if return_dict is not None else True
         # Resolve from the text/decoder sub-config (the top-level NemotronOmni
-        # config has no output_hidden_states; the recipe toggles it on llm_config).
+        # config has no output_hidden_states; the recipe toggles it on the text config).
         if output_hidden_states is None:
-            llm_config = getattr(getattr(self, "config", None), "llm_config", None)
-            output_hidden_states = getattr(llm_config, "output_hidden_states", False)
+            output_hidden_states = self.language_model.config.output_hidden_states
 
         # Caller pre-supplied inputs_embeds (CP path: prepare_model_inputs_for_cp
         # ran the multimodal scatter on the un-sharded sequence before
@@ -1177,7 +1231,21 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         #
         # When both are None (or pixel_values is None), we skip image
         # injection and run the LM path on text embeddings only.
-        if not _embeds_pre_built and pixel_values is not None and imgs_sizes is not None:
+        if not _embeds_pre_built and pixel_values is not None and image_grid_hw is not None:
+            embeds_shape = inputs_embeds.shape
+            hidden_size = embeds_shape[-1]
+            inputs_embeds = inputs_embeds.reshape(-1, hidden_size)
+            selected = input_ids.reshape(-1) == self.img_context_token_id
+            with cp_dispatcher_suspended(self.cp_mesh):
+                vit_embeds = self.extract_feature_packed(pixel_values, image_grid_hw)
+            vit_embeds = _local_media(vit_embeds, _global_image_mask, selected)
+            if int(selected.sum()) != vit_embeds.shape[0]:
+                raise ValueError(
+                    f"Image placeholders ({int(selected.sum())}) do not match image features ({vit_embeds.shape[0]})"
+                )
+            inputs_embeds[selected] = vit_embeds.to(inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.reshape(embeds_shape)
+        elif not _embeds_pre_built and pixel_values is not None and imgs_sizes is not None:
             _embeds_shape = inputs_embeds.shape  # [B, N, C] or THD-flattened [T, C]
             C = _embeds_shape[-1]
             inputs_embeds = inputs_embeds.reshape(-1, C)
@@ -1266,6 +1334,8 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # Image and video both expand to `img_context_token_id` in the prompt, so a
         # single sample can carry only one of `pixel_values` / `pixel_values_videos`.
         if not _embeds_pre_built and pixel_values_videos is not None:
+            if self._native_transformers and self.config.video_pruning_rate != 0:
+                raise ValueError("Video training requires video_pruning_rate=0; token pruning is not supported")
             assert pixel_values is None, "pixel_values and pixel_values_videos are mutually exclusive"
             _embeds_shape_v = inputs_embeds.shape
             C_v = _embeds_shape_v[-1]
@@ -1438,6 +1508,14 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         with buffer_device:
             # Initialize LLM weights
             self.language_model.initialize_weights(buffer_device=buffer_device, dtype=dtype)
+
+        if self._native_transformers:
+            # summary_idxs is non-persistent: the checkpoint loader materializes
+            # meta buffers, but no checkpoint tensor will populate this index.
+            with torch.no_grad():
+                self.vision_model.summary_idxs.copy_(
+                    torch.tensor(self.config.vision_config.summary_idxs, device=buffer_device, dtype=torch.long)
+                )
 
         # Vision model and projectors are loaded from checkpoint
         # Cast everything to target dtype

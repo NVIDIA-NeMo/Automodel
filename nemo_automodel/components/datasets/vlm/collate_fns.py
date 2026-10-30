@@ -2019,6 +2019,7 @@ def nemotron_omni_collate_fn(
     all_input_ids: List[torch.Tensor] = []
     all_attention_masks: List[torch.Tensor] = []
     sample_pixel_values: Dict[int, Any] = {}
+    sample_image_grid_hw: dict[int, torch.Tensor] = {}
     sample_pixel_values_videos: Dict[int, Any] = {}
     sample_sound_clips: Dict[int, Any] = {}
 
@@ -2040,6 +2041,8 @@ def nemotron_omni_collate_fn(
 
         if batch_i.get("pixel_values") is not None:
             sample_pixel_values[i] = batch_i["pixel_values"]
+        if batch_i.get("image_grid_hw") is not None:
+            sample_image_grid_hw[i] = batch_i["image_grid_hw"]
         if batch_i.get("pixel_values_videos") is not None:
             sample_pixel_values_videos[i] = batch_i["pixel_values_videos"]
         if batch_i.get("sound_clips") is not None:
@@ -2069,6 +2072,7 @@ def nemotron_omni_collate_fn(
                     seq_len,
                 )
                 sample_pixel_values.pop(i, None)
+                sample_image_grid_hw.pop(i, None)
                 sample_pixel_values_videos.pop(i, None)
                 input_ids = input_ids.masked_fill(input_ids == image_token_id, pad_token_id)
         if seq_len < target_len:
@@ -2102,14 +2106,22 @@ def nemotron_omni_collate_fn(
                 flat.extend(pv)
         return flat
 
-    flat_images = _flatten_pv(sample_pixel_values)
-    if flat_images:
-        if all(t.shape == flat_images[0].shape for t in flat_images):
-            result["pixel_values"] = torch.stack(flat_images).to(torch.bfloat16)
-        else:
-            # Variable shapes — extract_feature handles list input.
-            result["pixel_values"] = [t.to(torch.bfloat16) for t in flat_images]
-        result["image_flags"] = torch.ones(len(flat_images), 1, dtype=torch.long)
+    if sample_image_grid_hw:
+        if sample_image_grid_hw.keys() != sample_pixel_values.keys():
+            raise ValueError("Each packed image patch tensor requires image_grid_hw")
+        # Native RADIO consumes concatenated patches, with explicit per-image
+        # boundaries. Preserve processor precision until the model casts inputs.
+        result["pixel_values"] = torch.cat(list(sample_pixel_values.values()))
+        result["image_grid_hw"] = torch.cat(list(sample_image_grid_hw.values()))
+    else:
+        flat_images = _flatten_pv(sample_pixel_values)
+        if flat_images:
+            if all(t.shape == flat_images[0].shape for t in flat_images):
+                result["pixel_values"] = torch.stack(flat_images).to(torch.bfloat16)
+            else:
+                # Variable shapes — extract_feature handles list input.
+                result["pixel_values"] = [t.to(torch.bfloat16) for t in flat_images]
+            result["image_flags"] = torch.ones(len(flat_images), 1, dtype=torch.long)
 
     flat_video_frames = _flatten_pv(sample_pixel_values_videos)
     if flat_video_frames:
@@ -2147,10 +2159,8 @@ def nemotron_omni_collate_fn(
     labels = build_labels(result["input_ids"], conversations, processor)
     result["labels"] = labels[:, 1:]
 
-    input_shape = result["input_ids"].shape
-    for key, value in list(result.items()):
-        if isinstance(value, torch.Tensor) and value.shape == input_shape:
-            result[key] = value[:, :-1]
+    for key in ("input_ids", "attention_mask"):
+        result[key] = result[key][:, :-1]
 
     return result
 
