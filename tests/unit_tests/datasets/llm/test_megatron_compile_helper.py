@@ -27,6 +27,8 @@ from nemo_automodel.components.datasets.llm.megatron import megatron_utils
 from nemo_automodel.components.datasets.llm.megatron.helpers import build_sample_idx
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(scope="module")
 def helpers(tmp_path_factory):
