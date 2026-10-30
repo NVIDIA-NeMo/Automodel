@@ -564,6 +564,27 @@ def test_save_checkpoint_optionally_waits_for_async_staging(tmp_path, wait_for_s
     assert recipe_inst.checkpointer.staging_waits == int(wait_for_staging)
 
 
+def test_save_checkpoint_skips_optimizer_when_disabled(tmp_path):
+    """checkpoint.save_optimizer=False must skip writing optimizer state entirely."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.checkpointer.config.save_optimizer = False
+
+    recipe_inst.save_checkpoint(epoch=0, step=0, train_loss=1.0)
+
+    assert not (tmp_path / "epoch_0_step_0" / "optim").exists()
+    # Model saving is unaffected.
+    assert (tmp_path / "epoch_0_step_0" / "model").exists()
+
+
+def test_save_checkpoint_writes_optimizer_by_default(tmp_path):
+    """Default behavior (save_optimizer=True) is unchanged: optim/ is still written."""
+    recipe_inst = _ToyRecipe(tmp_path)
+
+    recipe_inst.save_checkpoint(epoch=0, step=0, train_loss=1.0)
+
+    assert (tmp_path / "epoch_0_step_0" / "optim").exists()
+
+
 def test_untrack_state_removes_state_from_checkpoint_tracking(tmp_path):
     """untrack_state lets recipes opt out of automatic checkpoint tracking."""
     recipe_inst = _ToyRecipe(tmp_path)

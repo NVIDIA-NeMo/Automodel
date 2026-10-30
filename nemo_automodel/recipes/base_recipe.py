@@ -379,18 +379,19 @@ class BaseRecipe:
                     is_final_checkpoint=is_final_checkpoint,
                 )
 
-        # Sync before checkpointing for Dion
-        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
-        for opt in optimizers:
-            if hasattr(opt, "synchronize_for_checkpoint"):
-                opt.synchronize_for_checkpoint()
-        self.checkpointer.save_optimizer(
-            optimizer,
-            model,
-            path,
-            scheduler,
-            optimizer_part_ids=self._get_optimizer_checkpoint_part_ids(),
-        )
+        if self.checkpointer.config.save_optimizer:
+            # Sync before checkpointing for Dion
+            optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+            for opt in optimizers:
+                if hasattr(opt, "synchronize_for_checkpoint"):
+                    opt.synchronize_for_checkpoint()
+            self.checkpointer.save_optimizer(
+                optimizer,
+                model,
+                path,
+                scheduler,
+                optimizer_part_ids=self._get_optimizer_checkpoint_part_ids(),
+            )
         save_config(config.to_yaml_dict(use_orig_values=True), path)
         if is_dist_initialized:
             _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
