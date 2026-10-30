@@ -360,7 +360,7 @@ def _apply_fused_adam_cached_lists_patch() -> None:
     dropped on ``load_state_dict`` and ``add_param_group``; a group that can never take the cached
     path (FP8 parameters, fp16 moments or master weights, mixed fp16 + bf16) is remembered as such,
     so the original ``step`` runs for it without a per-parameter walk first.
-    Cached kernel calls use batches of at most 1024 tensors, preserving TE 2.20.2's bounded
+    Cached kernel calls use batches of at most 1024 parameters per tensor list, preserving TE 2.20.2's bounded
     native tensor-handle allocation while retaining the cache for larger parameter groups.
 
     Deliberately *not* checked between steps: parameter dtype and shape, the identity of

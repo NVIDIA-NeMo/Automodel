@@ -597,8 +597,8 @@ def _create_mtp_model(config, backend, device):
     """Create a synchronized causal LM with its native Nemotron MTP head."""
     from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
 
-    # Each fixture model owns a separate replay registry. Selection replay is
-    # inactive unless the parity test explicitly records/replays a forward.
+    # Register only the new fixture in the process-global replay registry. The
+    # baseline has finished before the CP fixture replaces its registrations.
     RouterReplay.clear_registry()
     model = NemotronHForCausalLM(config, backend=backend, moe_overrides={"enable_routing_replay": True}).to(
         device=device, dtype=torch.bfloat16
