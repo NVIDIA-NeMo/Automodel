@@ -31,6 +31,7 @@ from torch.distributed.tensor import DTensor, Shard
 from transformers import PreTrainedTokenizerFast
 
 import nemo_automodel.components.models.deepseek_v41.engram as v41_engram
+from nemo_automodel.components.checkpoint.checkpointing import to_empty_parameters_only
 from nemo_automodel.components.distributed.multimodal_fsdp import ignored_params_for_root
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import (
@@ -552,3 +553,36 @@ def _empty_requester_worker(rank: int, rendezvous: str) -> None:
 @pytest.mark.runtime_budget(30, reason="spawns two Gloo workers")
 def test_empty_requester_takes_the_peers_validation_path(tmp_path: Path) -> None:
     mp.spawn(_empty_requester_worker, args=(str(tmp_path / "rendezvous-empty"),), nprocs=2, join=True)
+
+
+def _materialized_owner_worker(rank: int, rendezvous: str) -> None:
+    """Keep owner normalization after native PP skips random initialization."""
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        mesh = DeviceMesh.from_group(dist.group.WORLD, device_type="cpu", mesh_dim_names=("dp_shard_cp",))
+        model = _owner_model((113, 253))
+        model._nemo_prepare_model_owned_dtensors(mesh)
+        for layer_id in (1, 4):
+            module = model.model.layers[str(layer_id)].engram
+            saved = {name: parameter.detach().clone() for name, parameter in module.named_parameters()}
+            # The native loader materializes Parameters and copies checkpoint
+            # values without calling initialize_weights() on pretrained PP parts.
+            to_empty_parameters_only(module, device=torch.device("cpu"))
+            with torch.no_grad():
+                for name, parameter in module.named_parameters():
+                    parameter.copy_(saved[name])
+            assert not hasattr(module.embed.weight, "_nemo_model_owned_grad_divisor")
+            hidden = torch.randn(1, 3, module.hc_mult, module.hidden_size)
+            ids = torch.zeros(1, 3, module.hash_heads, dtype=torch.long)
+            module(hidden, ids)
+            assert module.embed.weight._nemo_model_owned_grad_divisor == 2.0
+            for empty in (False, True):
+                module.zero_grad(set_to_none=True)
+                _owner_gradient_case(model, layer_id, empty_requester=empty)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_materialized_pretrained_owner_gradients_norm_and_update(tmp_path: Path) -> None:
+    mp.spawn(_materialized_owner_worker, args=(str(tmp_path / "materialized_owner"),), nprocs=2, join=True)
