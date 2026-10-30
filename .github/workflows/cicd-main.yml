@@ -489,11 +489,12 @@ jobs:
             cpu-only: true
             # The full CPU suite takes 28-30 minutes before teardown and coverage finish.
             timeout: 40
+          # The GPU shards split whole test files by tests/unit_tests/gpu_shard_durations.json
+          # and skip cpu_only tests, which L0_Unit_Tests_CPU runs.
           - test-name: L0_Unit_Tests_GPU_1_of_2
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             is-unit-test: true
             cpu-only: false
-            # Shard 1 takes ~40 minutes before process exit and coverage finish.
             timeout: 45
             shard-id: 0
             num-shards: 2
@@ -537,8 +538,10 @@ jobs:
         with:
           timeout: ${{ matrix.timeout || 10 }}
           # Keep one confirmation for runner failures without allowing a stuck
-          # unit-test shard to consume three consecutive 20-30m attempts.
+          # unit-test shard to consume three consecutive 20-30m attempts. The retry
+          # gets 15 more minutes, so a suite that just overran its timeout can finish.
           max-attempts: "2"
+          retry-extra-timeout: "15"
           is-unit-test: ${{ matrix.is-unit-test }}
           test-folder: ${{ matrix.test-folder }}
           cpu-only: ${{ matrix.cpu-only || false }}
@@ -611,10 +614,11 @@ jobs:
           # moe + parallelism merged (2.8 + 5.8 = 8.6 min median) to fit `max-parallel: 10`.
           # Each parity test in `parallelism` runs the proxy twice (1-rank baseline +
           # 2-rank parallel), so the budget is roughly double a single smoke test.
-          # A 30-minute timeout leaves more than 2x measured-runtime headroom.
+          # The merged pytest run takes about 30 minutes, so a 45-minute timeout
+          # leaves room for slow runners without letting a hung test retry for long.
           - test-name: L2_Distributed
-            test-folder: moe,parallelism
-            timeout: 30
+            test-folder: moe,parallelism,optim
+            timeout: 45
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
     needs: [pre-flight, cicd-unit-tests]
@@ -695,10 +699,10 @@ jobs:
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20
-          # moe + parallelism merged (2.1 + 4.1 = 6.2 min median), mirroring cicd-e2e-tests.
+          # moe + parallelism merged, mirroring cicd-e2e-tests (about 30 minutes of pytest).
           - test-name: L2_Distributed
-            test-folder: moe,parallelism
-            timeout: 30
+            test-folder: moe,parallelism,optim
+            timeout: 45
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
     name: gb200_${{ matrix.test-name }}

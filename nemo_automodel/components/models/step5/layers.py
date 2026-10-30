@@ -579,9 +579,10 @@ class Step5Attention(nn.Module):
                     allowed = allowed & (ids.gather(-1, slots) == targets)
                 mask = allowed.reshape(batch * groups, 1, stop - start, key_length)
                 if self.backend.attn == "eager":
-                    logits = torch.matmul(local_q.float(), key.float().transpose(-1, -2)) * dim**-0.5
-                    probabilities = logits.masked_fill(~mask, float("-inf")).softmax(-1).nan_to_num(0.0)
-                    out = torch.matmul(probabilities, value.float()).to(hidden.dtype)
+                    with torch.autocast(device_type=hidden.device.type, enabled=False):
+                        logits = torch.matmul(local_q.float(), key.float().transpose(-1, -2)) * dim**-0.5
+                        probabilities = logits.masked_fill(~mask, float("-inf")).softmax(-1).nan_to_num(0.0)
+                        out = torch.matmul(probabilities, value.float()).to(hidden.dtype)
                 else:
                     out = F.scaled_dot_product_attention(local_q, key, value, attn_mask=mask, enable_gqa=True)
                 out = out.view(batch, groups, heads, stop - start, dim).permute(0, 3, 1, 2, 4)
