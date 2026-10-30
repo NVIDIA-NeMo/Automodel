@@ -35,7 +35,7 @@ import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal, Protocol, runtime_checkable
 
 import torch
 import torch.utils.data
@@ -43,7 +43,7 @@ import torch.utils.data
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
-    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
+    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper, _ConversationMessage
 
 from nemo_automodel.components.datasets.llm.neat_packing import (
     greedy_knapsack,
@@ -67,6 +67,23 @@ MEDIA_KEYS = (
     "video_grid_thw",
     "second_per_grid_ts",
 )
+
+
+@runtime_checkable
+class _PackedTokenCounter(Protocol):
+    """Processor capability for planning image packs without decoding pixels."""
+
+    def estimate_packed_tokens(self, conversation: Sequence[_ConversationMessage]) -> tuple[int, int]:
+        """Count the processor's complete token expansion without loading pixels.
+
+        Args:
+            conversation: Ordered chat messages containing text and image blocks.
+
+        Returns:
+            Unshifted sequence length and the number of media tokens, including
+            any image delimiters or row separators emitted by the processor.
+        """
+
 
 # ---------------------------------------------------------------------------
 # Visual-token-balanced greedy knapsack
@@ -815,7 +832,7 @@ def neat_pack_dataset_vlm(
 
     # A processor may count its own token expansion exactly using image headers.
     # Keep the generic resize/character heuristic for processors without it.
-    token_counter = getattr(processor, "estimate_packed_tokens", None)
+    token_counter = processor.estimate_packed_tokens if isinstance(processor, _PackedTokenCounter) else None
     # Extract processor configs for accurate media token estimation
     image_cfg = LengthGroupedSampler._extract_image_config(processor) if processor is not None else None
     video_cfg = LengthGroupedSampler._extract_video_config(processor) if processor is not None else None
