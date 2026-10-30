@@ -38,6 +38,8 @@ from nemo_automodel.components.models.hunyuan_image3.rope import (
     text_positions,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 IMAGE_ID = 290
 PAD_ID = 299
 TIMESTEP_ID = 280

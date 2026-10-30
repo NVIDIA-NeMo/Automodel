@@ -38,7 +38,7 @@ from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSpa
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
 # Keep a hard watchdog for spawned workers; each distributed test declares its runtime budget below.
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 _WORLD_SIZE = 2
 

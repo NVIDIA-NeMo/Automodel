@@ -33,6 +33,8 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, Che
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _model(path: Path) -> Qwen3_5MoeForCausalLM:
     config = Qwen3_5MoeTextConfig(

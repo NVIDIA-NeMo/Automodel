@@ -28,6 +28,8 @@ from transformers import PreTrainedTokenizerFast
 from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import ContextAwareRetrievalDatasetConfig
 from nemo_automodel.components.models.qwen3_reranker.collator import Qwen3ContextAwareRerankerCollator
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def tokenizer():
