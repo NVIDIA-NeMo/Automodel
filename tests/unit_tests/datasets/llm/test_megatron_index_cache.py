@@ -17,11 +17,42 @@
 import pickle
 from types import SimpleNamespace
 
+import multiprocess
 import numpy as np
 import pytest
 
 from nemo_automodel.components.datasets.llm.megatron.builder import BlendedDataset
 from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDataset, Split
+
+
+def _read_worker_indices(dataset, names):
+    """Read reopened numeric indices and report their mapping contract in a worker."""
+    return [
+        (isinstance(getattr(dataset, name), np.memmap), getattr(dataset, name).mode, getattr(dataset, name).tolist())
+        for name in names
+    ]
+
+
+@pytest.mark.parametrize(
+    "dataset_class,names",
+    [
+        (GPTDataset, ("document_index", "sample_index", "shuffle_index")),
+        (BlendedDataset, ("dataset_index", "dataset_sample_index")),
+    ],
+)
+def test_worker_reopens_cached_indices(tmp_path, dataset_class, names):
+    dataset = dataset_class.__new__(dataset_class)
+    for name in names:
+        path = tmp_path / f"{name}.npy"
+        values = np.arange(4, dtype=np.int32)
+        if name == "sample_index":
+            values = values.reshape(2, 2)
+        np.save(path, values, allow_pickle=False)
+        setattr(dataset, name, np.load(path, allow_pickle=False, mmap_mode="r"))
+    with multiprocess.Pool(1) as pool:
+        result = pool.apply(_read_worker_indices, (dataset, names))
+    assert result == [(True, "r", [[0, 1], [2, 3]] if name == "sample_index" else [0, 1, 2, 3]) for name in names]
+    assert _read_worker_indices(dataset, names) == result
 
 
 @pytest.mark.parametrize("poisoned_suffix", ["document_index", "sample_index", "shuffle_index"])

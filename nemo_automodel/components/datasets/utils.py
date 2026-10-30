@@ -266,15 +266,18 @@ def default_collater(
         batch: Local examples. A list-valued field has shape ``[S_i]`` for example ``i``, where ``S_i`` is its
             sequence length, and becomes ``[B, S]`` after padding, where ``B`` is the number of examples and
             ``S`` is the padded maximum. A tensor-valued field is already batched as ``[B_i, ...]`` with
-            arbitrary trailing axes and becomes ``[sum_i(B_i), ...]``. The optional
+            arbitrary trailing axes and becomes ``[sum_i(B_i), ...]``. Additive floating-point
+            attention masks of shape [B_i, sequence, sequence] gain a singleton head axis
+            and become [sum_i(B_i), 1, sequence, sequence]. The optional
             ``___PAD_TOKEN_IDS___`` entry is removed from the first input mapping in place. Apart from
             that removal, the input examples and their tensors are left unmodified.
         pad_seq_len_divisible: If set, round padded ``S`` up to a multiple of this value.
 
     Returns:
         Mapping of fields to tensors. List-valued inputs become ``torch.int64`` tensors shaped ``[B, S]``;
-        tensor-valued inputs preserve dtype/device and trailing layout. When ``attention_mask`` or
-        ``input_ids`` is present with shape ``[B, S]``, ``padding_mask`` is a boolean ``[B, S]`` tensor.
+        tensor-valued inputs preserve dtype/device and trailing layout except for the attention-mask
+        head axis described above. For these additive masks, ``padding_mask`` is derived from
+        ``input_ids`` when present. Other attention masks retain the existing padding-mask conversion.
     """
     pad_token_ids = batch[0].pop("___PAD_TOKEN_IDS___", None)
     # ans contains a dict with:
@@ -282,6 +285,7 @@ def default_collater(
     # value: list[list[int]] (e.g., [[1, 2, 3], [4, 5, 6]])
     ans = {}
     scalar_keys = set()
+    additive_attention_mask = False
     for key in batch[0].keys():
         values = extract_key_from_dicts(batch, key)
         if all(isinstance(v, torch.Tensor) and v.ndim > 0 for v in values):
@@ -290,7 +294,11 @@ def default_collater(
             # These tensors belong to the caller's examples, so add the batch axis
             # out-of-place: ``batchify`` unsqueezes 1-D input in place, which would
             # reshape the dataset's own sample from [S] to [1, S] as a side effect.
-            ans[key] = torch.cat([v.unsqueeze(0) if v.ndim == 1 else v for v in values], dim=0)
+            if key == "attention_mask" and all(v.ndim == 3 and v.is_floating_point() for v in values):
+                ans[key] = torch.cat([v.unsqueeze(1) for v in values], dim=0)
+                additive_attention_mask = True
+            else:
+                ans[key] = torch.cat([v.unsqueeze(0) if v.ndim == 1 else v for v in values], dim=0)
         elif all(is_scalar_field(v) for v in values):
             # One scalar per example (e.g. dataset_id from a blended dataset):
             # stack to [B]. Padding this as a ragged sequence raises, and
@@ -310,11 +318,13 @@ def default_collater(
         for k, v in ans.items()
     }
 
-    # Add padding_mask. Prefer the real attention_mask: matching the pad token *value*
+    # Add padding_mask. The additive block masks handled above do not describe
+    # token padding; retain the existing conversion for all other attention masks.
+    # Matching the pad token *value*
     # (input_ids == pad_token_id) misclassifies real tokens as padding whenever pad_token_id
     # collides with a content token (e.g. pad_token_id == eos_token_id), which masks real
     # eos/separator tokens out of the MoE experts -> near-random outputs on chat data.
-    if "attention_mask" in result:
+    if "attention_mask" in result and not additive_attention_mask:
         result["padding_mask"] = ~result["attention_mask"].bool()
     elif "input_ids" in result:
         input_ids_pad_token = get_pad_token_from_key("input_ids", pad_token_ids) or 0
@@ -342,10 +352,11 @@ def packed_sequence_thd_collater(batch):
     - Padding and stacking seq_lens and seq_lens_padded with sentinel value -1000
     - Including 'qkv_format': 'thd' in the output to indicate THD format
 
-    When batch items lack packed-sequence metadata (seq_lens, seq_lens_padded, position_ids),
-    such as samples from ChatDataset, this collater synthesizes the missing fields so that each
-    sample is treated as a single-sequence "pack". Variable-length sequences are padded to the
-    longest length in the batch. This enables using THD format with TE context parallelism
+    When batch items lack seq_lens, this collater synthesizes length metadata so each sample
+    is treated as a single-sequence "pack". Supplied position_ids are preserved; otherwise they
+    default to consecutive indices. Variable-length sequences are padded to the longest length
+    in the batch, with padding positions using their physical token indices. Input records and
+    their tensors are not modified. This enables using THD format with TE context parallelism
     without requiring the dataset to perform actual sequence packing.
 
     Args:
@@ -359,8 +370,9 @@ def packed_sequence_thd_collater(batch):
             - 'seq_lens_padded': List[int] - Sequence lengths including identifier/padding tokens
 
             For non-packed data (e.g. ChatDataset), each dictionary needs only:
-            - 'input_ids': List[int] - Token IDs (variable length across batch)
-            - 'labels': List[int] - Labels (same length as input_ids)
+            - 'input_ids': List[int] or 1D tensor [sequence] - Token IDs (variable length across batch)
+            - 'labels': List[int] or 1D tensor [sequence] - Labels (same length as input_ids)
+            - 'position_ids': List[int] or 1D tensor [sequence] - Optional positions matching input_ids
             - 'attention_mask': List[int] - (optional) 1 for real tokens, 0 for padding
 
             Example batch with 2 packed examples, both with 6 total tokens:
@@ -393,6 +405,7 @@ def packed_sequence_thd_collater(batch):
         Note: seq_lens and seq_lens_padded are padded with -1000 to handle variable number of
         packed sequences per example. These sentinel values should be filtered out before use.
     """
+    batch = [dict(item) for item in batch]
     # Extract and remove padding token metadata if present
     pad_token_ids = None
     if len(batch) > 0 and "___PAD_TOKEN_IDS___" in batch[0]:
@@ -423,7 +436,18 @@ def packed_sequence_thd_collater(batch):
             # seq_lens_padded must cover the full padded length so that
             # cu_seqlens_padded[-1] == total_tokens in the downstream THD pipeline.
             item["seq_lens_padded"] = [max_len]
-            item["position_ids"] = list(range(max_len))
+            position_ids = list(range(max_len))
+            if "position_ids" in item:
+                if item["position_ids"] is None:
+                    raise ValueError("position_ids must be a 1D sequence matching input_ids, got None")
+                supplied_positions = torch.as_tensor(item["position_ids"])
+                if supplied_positions.ndim != 1 or supplied_positions.numel() != cur_len:
+                    raise ValueError(
+                        f"position_ids must have shape ({cur_len},) matching input_ids, "
+                        f"got {tuple(supplied_positions.shape)}"
+                    )
+                position_ids[:cur_len] = supplied_positions.tolist()
+            item["position_ids"] = position_ids
 
             if pad_amount > 0:
                 item["input_ids"] = list(item["input_ids"]) + [input_ids_pad] * pad_amount

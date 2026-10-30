@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
+
 import pytest
+import torch
 from datasets import Dataset
 
 from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset, tokenize_dataset_parallel
@@ -117,6 +120,36 @@ def test_position_id_wrapping(base_dataset):
     """Test position ID generation with wrapping"""
     packed_ds = pack_dataset(base_dataset, split="train", packed_sequence_size=5, max_packs=None)
     assert packed_ds[0]["position_ids"] == [0, 1, 2, 3, 4]
+
+
+def test_packing_preserves_tensor_fields_and_inputs():
+    backing = torch.tensor([99, 11, 99, 12])
+    samples = [
+        {
+            "input_ids": backing[:-1],
+            "labels": backing[1:],
+            "loss_mask": torch.tensor([0, 1, 0]),
+            "position_ids": torch.tensor([0, 0, 1]),
+        },
+        {"input_ids": [12, 13], "labels": [13, 14], "loss_mask": []},
+    ]
+    original = deepcopy(samples)
+    packed = pack_dataset(samples, split=None, packed_sequence_size=8, cp_size=2)[0]
+
+    assert packed["seq_lens"] == [3, 2]
+    assert packed["position_ids"] == [0, 0, 1, 3, 0, 1, 2, 3]
+    assert packed["seq_lens_padded"] == [4, 4]
+    assert packed["input_ids"] == [99, 11, 99, 0, 12, 13, 0, 0]
+    assert packed["labels"] == [-100, 99, -100, -100, 13, 14, -100, -100]
+    torch.testing.assert_close(samples, original, rtol=0, atol=0)
+    assert backing.tolist() == [99, 11, 99, 12]
+
+
+@pytest.mark.parametrize("positions", [None, [0], [[0, 0, 1]]])
+def test_packing_rejects_invalid_positions(positions):
+    samples = [{"input_ids": [99, 11, 12], "labels": [11, 12, 13], "position_ids": positions}]
+    with pytest.raises(ValueError, match="position_ids"):
+        pack_dataset(samples, split=None, packed_sequence_size=4)
 
 
 def test_exact_fit():

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -419,6 +420,44 @@ def test_create_causal_mask_mapping_uses_inputs_embeds_keyword() -> None:
 
 class TestPackedSequenceTHDCollater:
     """Tests for packed_sequence_thd_collater function."""
+
+    def test_synthesis_preserves_positions_and_inputs(self):
+        backing = torch.tensor([99, 11, 12, 99, 13])
+        batch = [
+            {
+                "input_ids": backing[:-1],
+                "labels": backing[1:],
+                "position_ids": torch.tensor([0, 0, 1, 2]),
+                "attention_mask": [1, 1, 1, 1],
+                "___PAD_TOKEN_IDS___": {"input_ids": 0},
+            },
+            {"input_ids": [99, 10, 11], "labels": [10, 11, 12], "position_ids": [0, 0, 1]},
+            {"input_ids": [20, 21, 22, 23, 24, 25], "labels": [21, 22, 23, 24, 25, 26]},
+        ]
+        original = deepcopy(batch)
+        result = sftp.packed_sequence_thd_collater(batch)
+        assert result["position_ids"].tolist() == [[0, 0, 1, 2, 4, 5], [0, 0, 1, 3, 4, 5], [0, 1, 2, 3, 4, 5]]
+        assert result["labels"][0].tolist() == [11, 12, 99, 13, -100, -100]
+        assert result["input_ids"][0].tolist() == [99, 11, 12, 99, 0, 0]
+        assert result["labels"][1].tolist() == [10, 11, 12, -100, -100, -100]
+        assert result["seq_lens"].tolist() == [[4], [3], [6]]
+        assert result["seq_lens_padded"].tolist() == [[6], [6], [6]]
+        assert result["qkv_format"] == "thd"
+        torch.testing.assert_close(batch, original, rtol=0, atol=0)
+        assert backing.tolist() == [99, 11, 12, 99, 13]
+
+    @pytest.mark.parametrize("positions", [None, [0], torch.tensor([[0, 0, 1, 2]])])
+    def test_synthesis_rejects_invalid_positions(self, positions):
+        """Reject malformed supplied positions rather than generating defaults.
+
+        Args:
+            positions: Invalid positions; the required layout is [sequence=4].
+        """
+        batch = [{"input_ids": [99, 11, 12, 99], "labels": [11, 12, 99, 13], "position_ids": positions}]
+        original = deepcopy(batch)
+        with pytest.raises(ValueError, match="position_ids"):
+            sftp.packed_sequence_thd_collater(batch)
+        torch.testing.assert_close(batch, original, rtol=0, atol=0)
 
     def test_empty_batch(self):
         """Test that empty batch returns empty dict."""

@@ -106,14 +106,19 @@ def _build_packed_sample(
     """Concatenate multiple samples into a single packed sample.
 
     Args:
-        samples: List of sample dicts, each with ``input_ids`` and ``labels``
-            (already autoregressive-shifted by the dataset).
+        samples: List of sample dicts with integer lists or tensors ``input_ids``
+            and ``labels`` of shape [sequence] (already autoregressive-shifted).
+            Optional ``position_ids`` must have the same one-dimensional layout
+            and are preserved. Missing positions default to range(sequence).
+            Each sample is one attention segment; intra-sample masks are not preserved.
         pack_size: Target packed sequence length (pad to this).
         padding_idx: Token ID used for padding ``input_ids``.
 
     Returns:
         Dict with ``input_ids``, ``labels``, ``attention_mask``,
-        ``position_ids`` — all tensors of shape ``[pack_size]``.
+        ``position_ids`` — independent int64 tensors of shape [pack_size].
+        Attention masks contain sample IDs; padding has mask/positions 0 and
+        ignored labels. Input positions are not mutated.
     """
     all_input_ids: list[int] = []
     all_labels: list[int] = []
@@ -133,7 +138,17 @@ def _build_packed_sample(
         all_input_ids.extend(ids)
         all_labels.extend(labs)
         all_attention_mask.extend([seq_idx] * seq_len)
-        all_position_ids.extend(range(seq_len))
+        positions = sample.get("position_ids")
+        if positions is None:
+            all_position_ids.extend(range(seq_len))
+        else:
+            positions = torch.as_tensor(positions)
+            if positions.ndim != 1 or positions.numel() != seq_len:
+                raise ValueError(
+                    f"position_ids must be one-dimensional with one value per input token; "
+                    f"expected {seq_len} values, got shape {tuple(positions.shape)}"
+                )
+            all_position_ids.extend(positions.tolist())
 
     # Pad to pack_size
     current_len = len(all_input_ids)
@@ -164,7 +179,10 @@ def neat_pack_dataset(
     """Pack a dataset using greedy knapsack for better utilization.
 
     Args:
-        dataset: HuggingFace dataset or dataset dict.
+        dataset: HuggingFace dataset or dataset dict. Samples contain input_ids
+            and labels of shape [sequence], plus optional position_ids of the
+            same shape. Supplied positions are preserved; otherwise they start
+            at zero for each sample.
         split: Dataset split key (e.g. ``"train"``).
         pack_size: Target packed sequence length.
         max_packs: Optional cap on number of packs to create.
