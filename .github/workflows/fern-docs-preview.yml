@@ -58,9 +58,8 @@ jobs:
               - docs/**
               - nemo_automodel/_transformers/registry.py
               - examples/**
-              - tests/unit_tests/_transformers/test_doc_coverage.py
-              - tests/ci_tests/utils/sync_model_coverage_tables.py
-              - tools/apply_fern_code_styles.py
+              - tools/docs/**
+              - tests/unit_tests/tools/docs/**
               - .github/workflows/fern-docs-ci.yml
               - .github/workflows/fern-docs-preview.yml
       - name: Report docs preview gate
@@ -133,14 +132,37 @@ jobs:
       - name: Generate model coverage tables with trusted tooling
         run: |
           set -euo pipefail
-          # Replace the helper, not the PR model/document data it inspects.
+          # Execute trusted code against PR data, without importing PR modules.
           # Only inspect coverage inputs; unrelated source documentation may be symlinked.
           test ! -L pr-source/nemo_automodel
+          test ! -L pr-source/tools
+          test ! -L pr-source/tools/docs
+          if test -d pr-source/tools/docs; then
+            test -z "$(find pr-source/tools/docs -type l -print -quit)"
+          fi
           test -z "$(find pr-source/tests pr-source/examples pr-source/nemo_automodel/_transformers -type l -print -quit)"
           test -z "$(find pr-source/docs -type l -print -quit)"
-          cp trusted-source/tests/ci_tests/utils/sync_model_coverage_tables.py \
-            pr-source/tests/ci_tests/utils/sync_model_coverage_tables.py
-          python3 -I pr-source/tests/ci_tests/utils/sync_model_coverage_tables.py
+          python3 -I - <<'PY'
+          from pathlib import Path
+          import runpy
+          import sys
+
+          # Isolated Python may import packages only from the trusted checkout.
+          sys.path.insert(0, str(Path("trusted-source").resolve()))
+          repo_root = Path("pr-source").resolve()
+          tool = Path("trusted-source/tools/docs/build/coverage_tables.py")
+          # Remove the fallback once tools/docs is present on main.
+          if not tool.is_file():
+              tool = Path("trusted-source/tests/ci_tests/utils/sync_model_coverage_tables.py")
+              # Old trusted tooling reads literal alias data from the former test path.
+              catalog = repo_root / "tools/docs/catalog.py"
+              if catalog.is_file():
+                  aliases = repo_root / "tests/unit_tests/_transformers/test_doc_coverage.py"
+                  aliases.parent.mkdir(parents=True, exist_ok=True)
+                  aliases.write_text(catalog.read_text(encoding="utf-8"), encoding="utf-8")
+          helpers = runpy.run_path(str(tool))
+          helpers["_sync_tables"](repo_root, check=False)
+          PY
 
       - name: Prepare preview docs
         run: |
@@ -307,7 +329,14 @@ jobs:
         run: '"$RUNNER_TEMP/fern-cli/node_modules/.bin/fern" docs md generate'
 
       - name: Style generated pages with trusted tooling
-        run: python3 -I trusted-source/tools/apply_fern_code_styles.py --repo-root "$RUNNER_TEMP/fern-preview"
+        run: |
+          set -euo pipefail
+          TOOL=trusted-source/tools/docs/build/code_styles.py
+          # Remove the fallback once tools/docs is present on main.
+          if ! test -f "$TOOL"; then
+            TOOL=trusted-source/tools/apply_fern_code_styles.py
+          fi
+          python3 -I "$TOOL" --repo-root "$RUNNER_TEMP/fern-preview"
 
       - name: Generate preview
         env:

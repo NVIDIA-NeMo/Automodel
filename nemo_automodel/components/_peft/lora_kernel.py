@@ -512,7 +512,7 @@ def db_autotune_configs() -> list[triton.Config]:
 
 @triton.autotune(
     configs=db_autotune_configs() if HAVE_TRITON else list(),
-    key=["S", "M", "K"],
+    key=["M", "K"],
 )
 @triton.jit
 def lora_db_kernel(

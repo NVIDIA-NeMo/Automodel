@@ -75,6 +75,7 @@ def _worker(rank: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.cpu_only
 def test_mamba_fp32_selection_keeps_fused_kernel_weights_in_block_unit(tmp_path: Path) -> None:
     """Whole-block and block-norm-only FP32 selections keep Mamba fused-kernel weights in the block's FSDP unit."""
     mp.spawn(_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)

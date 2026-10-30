@@ -44,6 +44,8 @@ from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConf
 from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def one_visible_gpu(monkeypatch):
