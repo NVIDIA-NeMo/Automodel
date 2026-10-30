@@ -1684,11 +1684,18 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 mp.eval()
             # Native MTP forwards gate on self.training; models that expose compute_mtp_in_eval
             # (today: nemotron_v3) opt eval back in so mtp_per_depth_h/_logits are actually produced.
-            mtp_eval_flags = [
-                (mp, mp.compute_mtp_in_eval) for mp in self.model_parts if hasattr(mp, "compute_mtp_in_eval")
+            # DDP wraps the real model in a new object (unlike FSDP2, which mutates in place), so
+            # hasattr/setattr must target .module or the toggle silently no-ops under DDP.
+            mtp_eval_targets = [
+                mp.module if isinstance(mp, nn.parallel.DistributedDataParallel) else mp for mp in self.model_parts
             ]
-            for mp, _ in mtp_eval_flags:
-                mp.compute_mtp_in_eval = True
+            mtp_eval_flags = [
+                (target, target.compute_mtp_in_eval)
+                for target in mtp_eval_targets
+                if hasattr(target, "compute_mtp_in_eval")
+            ]
+            for target, _ in mtp_eval_flags:
+                target.compute_mtp_in_eval = True
 
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
@@ -1711,8 +1718,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
 
-            for mp, prev in mtp_eval_flags:
-                mp.compute_mtp_in_eval = prev
+            for target, prev in mtp_eval_flags:
+                target.compute_mtp_in_eval = prev
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(

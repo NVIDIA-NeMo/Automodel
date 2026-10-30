@@ -3073,6 +3073,42 @@ def test_run_validation_epoch_toggles_compute_mtp_in_eval(monkeypatch):
     assert model.compute_mtp_in_eval is False
 
 
+def test_run_validation_epoch_toggles_compute_mtp_in_eval_under_ddp(monkeypatch, tmp_path):
+    """DDP wraps the real model in a new object (unlike FSDP2, which mutates in place): the
+    toggle must reach ``.module`` or it silently no-ops, leaking a dead attribute onto the
+    DDP wrapper while the real model's flag never flips.
+    """
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    from nemo_automodel.components.distributed.config import FSDP2Config
+
+    dist.init_process_group("gloo", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1)
+    try:
+        model = nn.Module()
+        model.lin = nn.Linear(2, 2)  # DDP refuses to wrap a module with no trainable parameters.
+        model.compute_mtp_in_eval = False
+        wrapped = DDP(model)
+        recipe = _make_eval_recipe(FSDP2Config(), evaluator=None)
+        recipe.model_parts = [wrapped]
+
+        seen = []
+
+        def fake_forward_backward_step(idx, batch, *, loss_buffer, num_label_tokens, num_batches, is_train):
+            del idx, batch, num_label_tokens, num_batches, is_train
+            seen.append(model.compute_mtp_in_eval)
+            loss_buffer.append(torch.tensor(0.0))
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", fake_forward_backward_step)
+        _run_validation_epoch_cpu(recipe, monkeypatch, [{"labels": torch.tensor([[1, 2, 3]])}])
+
+        assert seen == [True], "the real model's flag must flip, not just a shadow attribute on the DDP wrapper"
+        assert model.compute_mtp_in_eval is False
+        assert "compute_mtp_in_eval" not in wrapped.__dict__, "the toggle must not leak a dead attribute onto DDP"
+    finally:
+        dist.destroy_process_group()
+
+
 def _make_mtp_forward_backward_recipe(model, monkeypatch, *, calculate_mtp_loss=None):
     """Build a minimal real ``_forward_backward_step`` harness around ``model``.
 
