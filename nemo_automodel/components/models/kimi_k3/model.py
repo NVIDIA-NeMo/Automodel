@@ -1211,7 +1211,8 @@ class KimiK3Gate(Gate):
             [tokens, activated_experts], and ``None`` for auxiliary loss.
         """
         del token_mask, cp_mesh
-        logits = F.linear(hidden_states.float(), self.weight.float(), None)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            logits = F.linear(hidden_states.float(), self.weight.float(), None)
         if self.score_func == "sigmoid_with_bias":
             scores = logits.sigmoid()
         elif self.score_func == "softmax_with_bias":

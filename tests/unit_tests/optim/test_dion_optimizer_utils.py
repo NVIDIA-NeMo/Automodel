@@ -125,6 +125,135 @@ class TestSeparateParamGroups:
         assert groups[3]["algorithm"] == "adamw"
         assert groups[3]["weight_decay"] == 0.0
 
+    @pytest.mark.parametrize("use_matrix_layout", [False, True])
+    def test_transposed_matrix_modules_get_their_own_group(self, use_matrix_layout):
+        from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
+
+        class Experts(TransposedMatrixModule, nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_and_up_projs = nn.Parameter(torch.randn(2, 4, 8))
+                self.lora_down_A = nn.Parameter(torch.randn(2, 4, 2))
+                self.gate_up_proj_bias = nn.Parameter(torch.randn(2, 8))
+
+        class PlainBatched(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(2, 8, 4))
+
+        model = TinyModel(with_bias=True)
+        model.experts = Experts()
+        model.plain = PlainBatched()
+        groups = self._call(
+            model=model,
+            base_lr=1e-3,
+            scalar_opt="adamw",
+            weight_decay=0.0,
+            supports_batched_matrices=True,
+            use_matrix_layout=use_matrix_layout,
+        )
+        transposed = [g for g in groups if g.get("matrix_transposed")]
+        matrix_ids = {id(p) for p in groups[0]["params"]}
+        expert_matrices = {id(model.experts.gate_and_up_projs), id(model.experts.lora_down_A)}
+        if use_matrix_layout:
+            (group,) = transposed
+            assert {id(p) for p in group["params"]} == expert_matrices, "every expert matrix, LoRA factors included"
+            assert not expert_matrices & matrix_ids
+        else:
+            assert not transposed
+            assert expert_matrices <= matrix_ids
+        # Only the marker class selects the transposed group; shape alone does not.
+        assert id(model.plain.weight) in matrix_ids
+        # Expert biases are not matrices.
+        assert id(model.experts.gate_up_proj_bias) in {id(p) for p in groups[1]["params"]}
+
+    def test_grouped_expert_classes_declare_transposed_storage(self):
+        from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
+        from nemo_automodel.components.moe.config import MoEConfig
+        from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
+        from nemo_automodel.components.moe.quantized_experts import GroupedExpertsDeepEPMXFP4, GroupedExpertsMXFP4
+        from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
+
+        for cls in (
+            GroupedExperts,
+            GroupedExpertsDeepEP,
+            GroupedExpertsLoRA,
+            GroupedExpertsDeepEPLoRA,
+            GroupedExpertsMXFP4,
+            GroupedExpertsDeepEPMXFP4,
+        ):
+            assert issubclass(cls, TransposedMatrixModule), cls.__name__
+        # TE GroupedLinear keeps nn.Linear's [output, input] per-expert weights.
+        assert not issubclass(GroupedExpertsTE, TransposedMatrixModule)
+
+        config = MoEConfig(
+            n_routed_experts=4,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=1,
+            n_limited_groups=1,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            dim=16,
+            inter_dim=32,
+            moe_inter_dim=32,
+            norm_topk_prob=False,
+            expert_activation="swiglu",
+            dtype=torch.float32,
+        )
+        # The contract is [experts, input, output] for every trainable matrix, so the input
+        # dimension of each projection chain must equal the previous output dimension.
+        experts = GroupedExpertsLoRA(GroupedExperts(config), lora_dim=4, alpha=8)
+        chains = (
+            ("gate_and_up_projs", "lora_gate_and_up_A", "lora_gate_and_up_B"),
+            ("down_projs", "lora_down_A", "lora_down_B"),
+        )
+        for base, lora_a, lora_b in chains:
+            weight, a, b = (getattr(experts, name) for name in (base, lora_a, lora_b))
+            assert weight.ndim == a.ndim == b.ndim == 3
+            assert a.shape[1] == weight.shape[1], "LoRA A consumes the projection input"
+            assert b.shape[2] == weight.shape[2], "LoRA B produces the projection output"
+            assert a.shape[2] == b.shape[1] == 4
+
+    @pytest.mark.parametrize("supports_batched_matrices", [False, True])
+    def test_2d_bias_routing_follows_optimizer_capability(self, supports_batched_matrices):
+        model = TinyModel(with_bias=True)
+        model.score_bias = nn.Parameter(torch.randn(4, 8))
+        groups = self._call(
+            model=model,
+            base_lr=1e-3,
+            scalar_opt="adamw",
+            weight_decay=0.0,
+            supports_batched_matrices=supports_batched_matrices,
+        )
+        matrix_ids = {id(p) for p in groups[0]["params"]}
+        scalar_ids = {id(p) for p in groups[1]["params"]}
+        # Without batched-matrix support the grouping is the plain ndim == 2 rule, so a 2D bias stays a matrix.
+        assert (id(model.score_bias) in matrix_ids) != supports_batched_matrices
+        assert (id(model.score_bias) in scalar_ids) == supports_batched_matrices
+
+    @pytest.mark.parametrize("supports_batched_matrices", [False, True])
+    def test_grouped_experts_follow_optimizer_capability(self, supports_batched_matrices):
+        model = TinyModel(with_bias=True)
+        model.experts = nn.Parameter(torch.randn(4, 8, 16))
+        groups = self._call(
+            model=model,
+            base_lr=1e-3,
+            scalar_opt="adamw",
+            weight_decay=0.0,
+            supports_batched_matrices=supports_batched_matrices,
+        )
+        matrix_ids = {id(p) for p in groups[0]["params"]}
+        scalar_ids = {id(p) for p in groups[1]["params"]}
+        assert (id(model.experts) in matrix_ids) == supports_batched_matrices
+        assert (id(model.experts) in scalar_ids) != supports_batched_matrices
+        assert id(model.linear.bias) in scalar_ids
+        assert id(model.embed_tokens.weight) not in matrix_ids
+        assert id(model.lm_head.weight) not in matrix_ids
+
     def test_no_lm_head(self):
         model = TinyModel(with_lm_head=False)
         groups = self._call(model=model, base_lr=1e-3, scalar_opt="adamw", weight_decay=0.01)
@@ -314,6 +443,9 @@ class FakeDionConfig:
     ``build_dion_optimizer`` reads settings off the config via attribute access,
     so any object exposing the same attributes works.
     """
+
+    supports_batched_matrices = False
+    use_matrix_layout = False
 
     def __init__(
         self,
