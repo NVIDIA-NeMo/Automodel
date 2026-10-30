@@ -57,12 +57,16 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections.abc import Callable
 from functools import partial
-from typing import Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Shard
+
+if TYPE_CHECKING:
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
@@ -160,8 +164,8 @@ def _split_weight_scale(required: frozenset[str]) -> tuple[str, str]:
 def _finish_part_loads(
     adapter_dtype: torch.dtype,
     generic: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool], ...],
-    engrams: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int], ...],
-    experts: tuple[tuple[torch.Tensor, int, str, torch.Tensor, torch.Tensor, int], ...],
+    engrams: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, Callable[[torch.Tensor], torch.Tensor]], ...],
+    experts: tuple[tuple[torch.Tensor, int, str, torch.Tensor, torch.Tensor, int, int, int], ...],
 ) -> None:
     """Install one load part's FP8 tensors into final model storage.
 
@@ -547,7 +551,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: "DeviceMesh" | None = None,
-        checkpoint_metadata: "Mapping[str, Any] | None" = None,
+        checkpoint_metadata: "Mapping[str, TensorStorageMetadata] | None" = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load the released V4.1 FP8 checkpoint in bounded per-layer parts.
 
@@ -641,8 +645,8 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                     )
                     return None
                 weight_key, _ = _split_weight_scale(required)
-                size = getattr(checkpoint_metadata[weight_key], "size", None)
-                if not isinstance(target, DTensor) and tuple(size or ()) != tuple(target.shape):
+                size = checkpoint_metadata[weight_key].size
+                if not isinstance(target, DTensor) and tuple(size) != tuple(target.shape):
                     # Plain rank-local destinations (FSDP2 state dicts) need the full-state
                     # path's mesh-planned reads; only DTensor or exact-shape targets are served.
                     logging.info(
@@ -681,7 +685,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         model_key: str,
         expert_range: tuple[int, int],
         n_experts: int,
-        checkpoint_metadata: "Mapping[str, Any]",
+        checkpoint_metadata: "Mapping[str, TensorStorageMetadata]",
     ) -> tuple[str, frozenset[str]] | None:
         """Classify one model key against the checkpoint and list its required checkpoint keys.
 
@@ -740,8 +744,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             return None
         scale_key = released[: -len(".weight")] + ".scale" if released.endswith(".weight") else None
         if scale_key is not None and scale_key not in checkpoint_metadata:
-            properties = getattr(checkpoint_metadata[released], "properties", None)
-            if getattr(properties, "dtype", None) in (torch.float8_e4m3fn, torch.int8):
+            if checkpoint_metadata[released].properties.dtype in (torch.float8_e4m3fn, torch.int8):
                 raise ValueError(f"Quantized checkpoint weight {released} is missing its scale tensor {scale_key}")
         if scale_key is not None and scale_key in checkpoint_metadata:
             if ".engram.embed." in model_key:
@@ -754,7 +757,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         model_state_dict: dict[str, torch.Tensor],
         expert_range: tuple[int, int],
         n_experts: int,
-        checkpoint_metadata: "Mapping[str, Any]",
+        checkpoint_metadata: "Mapping[str, TensorStorageMetadata]",
     ) -> Iterator[CheckpointLoadPart]:
         """Build per-layer load parts after :meth:`iter_checkpoint_load_parts` validated the inputs.
 
@@ -777,17 +780,13 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             groups.setdefault(group, []).append(model_key)
 
         def _checkpoint_size(key: str) -> tuple[int, int]:
-            size = getattr(checkpoint_metadata[key], "size", None)
-            if size is None or len(size) != 2:
+            size = checkpoint_metadata[key].size
+            if len(size) != 2:
                 raise ValueError(f"Checkpoint metadata for {key} lacks a two-dimensional size")
             return int(size[0]), int(size[1])
 
         def _checkpoint_dtype(key: str) -> torch.dtype:
-            properties = getattr(checkpoint_metadata[key], "properties", None)
-            dtype = getattr(properties, "dtype", None)
-            if not isinstance(dtype, torch.dtype):
-                raise ValueError(f"Checkpoint metadata for {key} lacks a tensor dtype")
-            return dtype
+            return checkpoint_metadata[key].properties.dtype
 
         def _checkpoint_temp(key: str, device: torch.device) -> torch.Tensor:
             """Allocate a temporary destination at the checkpoint tensor's exact shape and dtype."""
@@ -797,7 +796,7 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             checkpoint_tensors: dict[str, torch.Tensor] = {}
             temporary_keys: set[str] = set()
             generic: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]] = []
-            engrams: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]] = []
+            engrams: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]] = []
             experts: list[tuple[torch.Tensor, int, str, torch.Tensor, torch.Tensor, int, int, int]] = []
             for model_key in group_keys:
                 target = model_state_dict[model_key]

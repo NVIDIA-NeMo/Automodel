@@ -48,6 +48,7 @@ import torch
 from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
 
 if TYPE_CHECKING:
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
     from torch.distributed.device_mesh import DeviceMesh
 
 logger = logging.getLogger(__name__)
@@ -311,7 +312,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: "DeviceMesh" | None = None,
-        checkpoint_metadata: Mapping[str, Any] | None = None,
+        checkpoint_metadata: Mapping[str, "TensorStorageMetadata"] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load Mistral3 FP8 weights in bounded decoder-layer groups.
 

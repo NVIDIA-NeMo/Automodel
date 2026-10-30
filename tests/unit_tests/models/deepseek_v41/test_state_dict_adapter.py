@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -27,6 +26,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 from safetensors.torch import save_file
+from torch.distributed.checkpoint.metadata import TensorProperties, TensorStorageMetadata
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 from transformers import PreTrainedModel
@@ -594,7 +594,9 @@ def test_iter_checkpoint_load_parts_decodes_into_final_storage() -> None:
     }
 
     def _entry(rows: int, columns: int, dtype=torch.float8_e8m0fnu):
-        return SimpleNamespace(size=torch.Size((rows, columns)), properties=SimpleNamespace(dtype=dtype))
+        return TensorStorageMetadata(
+            size=torch.Size((rows, columns)), properties=TensorProperties(dtype=dtype), chunks=[]
+        )
 
     checkpoint_metadata = {
         "norm.weight": _entry(dim, 1),
@@ -648,7 +650,11 @@ def test_iter_checkpoint_load_parts_requires_checkpoint_ground_truth() -> None:
     """Without checkpoint metadata the adapter declines; absent model keys keep init."""
     adapter = _adapter()
     model_state = {"model.norm.weight": torch.ones(32)}
-    metadata = {"norm.weight": SimpleNamespace(size=torch.Size((32,)))}
+    metadata = {
+        "norm.weight": TensorStorageMetadata(
+            size=torch.Size((32,)), properties=TensorProperties(dtype=torch.float32), chunks=[]
+        )
+    }
     assert adapter.iter_checkpoint_load_parts(model_state, None, None) is None
     parts = adapter.iter_checkpoint_load_parts(model_state, None, metadata)
     assert parts is not None
@@ -672,25 +678,25 @@ def test_iter_checkpoint_load_parts_rejects_corrupt_quantized_checkpoints() -> N
 
     def _metadata(
         with_experts: bool, with_dense_scale: bool, with_dense_weight: bool = True
-    ) -> dict[str, SimpleNamespace]:
-        metadata: dict[str, SimpleNamespace] = {}
+    ) -> dict[str, TensorStorageMetadata]:
+        metadata: dict[str, TensorStorageMetadata] = {}
         if with_experts:
             for expert in range(2):
                 for projection in ("w1", "w3", "w2"):
                     base = f"layers.1.ffn.experts.{expert}.{projection}"
-                    metadata[base + ".weight"] = SimpleNamespace(
-                        size=torch.Size((16, 16)), properties=SimpleNamespace(dtype=torch.int8)
+                    metadata[base + ".weight"] = TensorStorageMetadata(
+                        size=torch.Size((16, 16)), properties=TensorProperties(dtype=torch.int8), chunks=[]
                     )
-                    metadata[base + ".scale"] = SimpleNamespace(
-                        size=torch.Size((16, 1)), properties=SimpleNamespace(dtype=torch.float8_e8m0fnu)
+                    metadata[base + ".scale"] = TensorStorageMetadata(
+                        size=torch.Size((16, 1)), properties=TensorProperties(dtype=torch.float8_e8m0fnu), chunks=[]
                     )
         if with_dense_scale:
-            metadata["layers.1.attn.wq_a.scale"] = SimpleNamespace(
-                size=torch.Size((1, 1)), properties=SimpleNamespace(dtype=torch.float8_e8m0fnu)
+            metadata["layers.1.attn.wq_a.scale"] = TensorStorageMetadata(
+                size=torch.Size((1, 1)), properties=TensorProperties(dtype=torch.float8_e8m0fnu), chunks=[]
             )
         if with_dense_weight:
-            metadata["layers.1.attn.wq_a.weight"] = SimpleNamespace(
-                size=torch.Size((32, 32)), properties=SimpleNamespace(dtype=torch.float8_e4m3fn)
+            metadata["layers.1.attn.wq_a.weight"] = TensorStorageMetadata(
+                size=torch.Size((32, 32)), properties=TensorProperties(dtype=torch.float8_e4m3fn), chunks=[]
             )
         return metadata
 
@@ -744,15 +750,15 @@ def _stacked_expert_storage_worker(rank: int, rendezvous: str) -> None:
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
     try:
         model_state = {"model.layers.1.ffn.experts.gate_and_up_projs": torch.zeros(2, 32, 64)}
-        metadata: dict[str, SimpleNamespace] = {}
+        metadata: dict[str, TensorStorageMetadata] = {}
         for expert in range(2):
             for projection in ("w1", "w3", "w2"):
                 base = f"layers.1.ffn.experts.{expert}.{projection}"
-                metadata[base + ".weight"] = SimpleNamespace(
-                    size=torch.Size((32, 16)), properties=SimpleNamespace(dtype=torch.int8)
+                metadata[base + ".weight"] = TensorStorageMetadata(
+                    size=torch.Size((32, 16)), properties=TensorProperties(dtype=torch.int8), chunks=[]
                 )
-                metadata[base + ".scale"] = SimpleNamespace(
-                    size=torch.Size((32, 1)), properties=SimpleNamespace(dtype=torch.float8_e8m0fnu)
+                metadata[base + ".scale"] = TensorStorageMetadata(
+                    size=torch.Size((32, 1)), properties=TensorProperties(dtype=torch.float8_e8m0fnu), chunks=[]
                 )
         te = _adapter(experts="te", dispatcher="hybridep")
         assert te.iter_checkpoint_load_parts(model_state, None, metadata) is None, (

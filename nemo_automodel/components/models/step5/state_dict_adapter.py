@@ -16,7 +16,10 @@
 
 import re
 from collections.abc import Iterator, Mapping
-from typing import Any, cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -75,7 +78,7 @@ class Step5StateDictAdapter(Step3p5StateDictAdapter):
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,
-        checkpoint_metadata: Mapping[str, Any] | None = None,
+        checkpoint_metadata: Mapping[str, "TensorStorageMetadata"] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load in bounded parts unless this rank holds only part of the decoder.
 

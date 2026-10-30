@@ -35,7 +35,10 @@ import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -411,7 +414,7 @@ class MiniMaxM3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,
-        checkpoint_metadata: Mapping[str, Any] | None = None,
+        checkpoint_metadata: Mapping[str, "TensorStorageMetadata"] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load M3.1 mixed quantized weights into bounded model-owned parts.
 
@@ -765,7 +768,7 @@ class MiniMaxM3VLStateDictAdapter(StateDictAdapter):
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: DeviceMesh | None = None,
-        checkpoint_metadata: Mapping[str, Any] | None = None,
+        checkpoint_metadata: Mapping[str, "TensorStorageMetadata"] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Stream text quantization while loading native vision storage directly.
 

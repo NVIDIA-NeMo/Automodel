@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 
 if TYPE_CHECKING:
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
     from torch.distributed.device_mesh import DeviceMesh
 
 FP4_VALUES = [
@@ -129,7 +130,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: Optional["DeviceMesh"] = None,
-        checkpoint_metadata: Mapping[str, Any] | None = None,
+        checkpoint_metadata: Mapping[str, "TensorStorageMetadata"] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load a single-GPU GPT-OSS MXFP4 checkpoint one decoder layer at a time.
 

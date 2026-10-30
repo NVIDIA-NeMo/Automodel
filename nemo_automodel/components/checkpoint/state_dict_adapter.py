@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 if TYPE_CHECKING:
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
     from torch.distributed.device_mesh import DeviceMesh
 
 
@@ -82,7 +83,7 @@ class StateDictAdapter(ABC):
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: Optional["DeviceMesh"] = None,
-        checkpoint_metadata: Mapping[str, Any] | None = None,
+        checkpoint_metadata: Mapping[str, "TensorStorageMetadata"] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Optionally load and finish a quantized checkpoint in small parts.
 
@@ -95,10 +96,11 @@ class StateDictAdapter(ABC):
                 checkpoint must populate. Tensors retain their model-specific shapes, axis orders, dtypes, devices,
                 strides, distributed placements, and storage.
             device_mesh: Optional device mesh describing distributed model storage.
-            checkpoint_metadata: Checkpoint names mapped to their DCP storage metadata
-                (entries expose ``.size``). Adapters that need ground truth about scale
-                siblings or checkpoint-side shapes require this and return ``None`` when
-                it is absent.
+            checkpoint_metadata: Checkpoint names mapped to their DCP tensor storage
+                metadata (``TensorStorageMetadata``, exposing ``.size`` and
+                ``.properties.dtype``); non-tensor entries are filtered by the loader.
+                Adapters that need ground truth about scale siblings or checkpoint-side
+                shapes require this and return ``None`` when it is absent.
 
         Returns:
             An iterator of dependency-complete load parts, or ``None`` when the adapter does not support this path.

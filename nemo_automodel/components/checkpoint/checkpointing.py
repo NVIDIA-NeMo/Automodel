@@ -1143,12 +1143,18 @@ class Checkpointer:
                 candidate_state_dict = {
                     key: value for key, value in model_state.state_dict().items() if isinstance(value, torch.Tensor)
                 }
+                # The validated tensor-only boundary: adapters consume concrete
+                # tensor storage metadata, so non-tensor (bytes) entries are filtered here.
                 candidate_parts = state_dict_adapter.iter_checkpoint_load_parts(
                     candidate_state_dict,
                     device_mesh=self.moe_mesh,
-                    checkpoint_metadata=_get_checkpoint_metadata(
-                        model_path, candidate_storage_reader
-                    ).state_dict_metadata,
+                    checkpoint_metadata={
+                        key: value
+                        for key, value in _get_checkpoint_metadata(
+                            model_path, candidate_storage_reader
+                        ).state_dict_metadata.items()
+                        if isinstance(value, TensorStorageMetadata)
+                    },
                 )
                 if candidate_parts is not None:
                     part_loaded_model_state_dict = candidate_state_dict
