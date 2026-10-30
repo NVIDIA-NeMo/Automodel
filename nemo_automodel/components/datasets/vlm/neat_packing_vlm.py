@@ -31,14 +31,17 @@ tokenization + media loading is distributed across ``num_workers``.
 from __future__ import annotations
 
 import inspect
+import io
 import logging
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal, NamedTuple
 
 import torch
 import torch.utils.data
+from PIL import Image
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
@@ -149,6 +152,50 @@ def greedy_knapsack_vt_balanced(
 # ---------------------------------------------------------------------------
 
 
+_FALLBACK_MEDIA_TOKENS = 500
+
+
+class _SampleLengthEstimate(NamedTuple):
+    """Estimated token counts for one raw sample.
+
+    Attributes:
+        total_tokens: Text plus media tokens.
+        media_tokens: Image and video tokens.
+        unsized_media: Media items counted as ``_FALLBACK_MEDIA_TOKENS`` because their size is unknown
+            or the processor cannot count tokens for it.
+    """
+
+    total_tokens: int
+    media_tokens: int
+    unsized_media: int
+
+
+def _image_height_width(image: object) -> tuple[int, int] | None:
+    """Read the ``(height, width)`` of a conversation image without decoding its pixels.
+
+    Handles the forms VLM datasets put in conversations: PIL images (including lazy
+    ``Image.open`` handles), raw bytes, ``Image(decode=False)`` ``{"bytes", "path"}``
+    dicts and local file paths. Returns ``None`` when the size cannot be read locally,
+    for example for URLs or unreadable files.
+    """
+    if isinstance(image, dict):
+        image = image.get("bytes") or image.get("path")
+    if isinstance(image, Image.Image):
+        width, height = image.size
+        return height, width
+    if isinstance(image, bytes):
+        image = io.BytesIO(image)
+    elif not (isinstance(image, str) and os.path.isfile(image)):
+        return None
+    try:
+        with Image.open(image) as opened:
+            width, height = opened.size
+    except (OSError, ValueError, Image.DecompressionBombError):
+        # Some Pillow parsers raise ValueError for a malformed header, e.g. a non-numeric PPM width.
+        return None
+    return height, width
+
+
 def _estimate_image_tokens(img_meta, image_cfg: dict) -> int:
     """Estimate token count for one image from its ``[height, width]`` metadata."""
     height, width = int(img_meta[0]), int(img_meta[1])
@@ -202,22 +249,46 @@ def _estimate_video_tokens(vid_meta, video_cfg: dict) -> int:
     return grid_t * (resized_h // video_cfg["patch_size"]) * (resized_w // video_cfg["patch_size"]) // merge_length
 
 
+def _image_token_counter(processor) -> Callable[[int, int], int | None] | None:
+    """Return ``(height, width) -> image tokens`` from the processor, or ``None`` when it cannot count them.
+
+    Uses ``_get_num_multimodal_tokens``, the per-image token count that Hugging Face
+    VLM processors expose for serving engines, so each processor applies its own
+    resize, patching and token merging. The counter returns ``None`` for an image
+    without pixels and for a size the processor rejects, such as an aspect ratio
+    above Qwen's limit of 200. Processing that image fails again at tokenization,
+    where ``PreTokenizedDatasetWrapper`` replaces the sample.
+    """
+    get_num_multimodal_tokens = getattr(processor, "_get_num_multimodal_tokens", None)
+    if get_num_multimodal_tokens is None:
+        return None
+
+    def count_image_tokens(height: int, width: int) -> int | None:
+        if height < 1 or width < 1:
+            return None
+        try:
+            return get_num_multimodal_tokens(image_sizes=[(height, width)]).num_image_tokens[0]
+        except ValueError:
+            return None
+
+    return count_image_tokens
+
+
 def _estimate_sample_length(
     example: dict,
     image_cfg: dict | None = None,
     video_cfg: dict | None = None,
-    return_media_tokens: bool = False,
-) -> int | tuple[int, int]:
+    count_image_tokens: Callable[[int, int], int | None] | None = None,
+) -> _SampleLengthEstimate:
     """Estimate token count from raw conversation without tokenization.
 
     Uses pre-computed ``_text_tokens`` (from ``precompute_tokens.py``) when
     available, otherwise falls back to ``chars // 3``.  Media tokens are
-    estimated via ``smart_resize`` when processor configs are provided,
-    otherwise falls back to 500 per media item.
-
-    Args:
-        return_media_tokens: If True, return ``(total_tokens, media_tokens)``
-            instead of just ``total_tokens``.
+    estimated via ``smart_resize`` from ``mm_inputs_meta`` sizes when processor
+    configs are provided. Without metadata, images are sized from their pixels
+    and ``count_image_tokens(height, width)`` converts each size to tokens.
+    Media whose size is unknown or that the counter returns ``None`` for, and all
+    media without a counter, count as ``_FALLBACK_MEDIA_TOKENS``.
     """
     # Text tokens
     precomputed = example.get("_text_tokens")
@@ -236,14 +307,15 @@ def _estimate_sample_length(
         text_tokens = total_chars // 3
 
     # Media tokens
-    media_count = 0
+    media_items = []
     for msg in example.get("conversation", []):
         content = msg.get("content", [])
         if isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and item.get("type") in ("image", "video"):
-                    media_count += 1
+                    media_items.append(item)
 
+    unsized_media = 0
     mm_meta = example.get("mm_inputs_meta")
     if mm_meta is not None and (image_cfg is not None or video_cfg is not None):
         media_tokens = 0
@@ -259,12 +331,20 @@ def _estimate_sample_length(
                 if vid_meta is not None:
                     media_tokens += _estimate_video_tokens(vid_meta, video_cfg)
     else:
-        media_tokens = media_count * 500
+        media_tokens = 0
+        for item in media_items:
+            image_tokens = None
+            if item["type"] == "image" and count_image_tokens is not None:
+                size = _image_height_width(item.get("image"))
+                if size is not None:
+                    image_tokens = count_image_tokens(*size)
+            if image_tokens is None:
+                media_tokens += _FALLBACK_MEDIA_TOKENS
+                unsized_media += 1
+            else:
+                media_tokens += image_tokens
 
-    total = text_tokens + media_tokens
-    if return_media_tokens:
-        return total, media_tokens
-    return total
+    return _SampleLengthEstimate(text_tokens + media_tokens, media_tokens, unsized_media)
 
 
 # ---------------------------------------------------------------------------
@@ -494,20 +574,21 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
         total = 0
         kept: list[dict] = []
         for s in shifted_samples:
-            slen = s["input_ids"].shape[0]
-            aligned_slen = _aligned_length(slen, self.sequence_alignment)
+            aligned_slen = _aligned_length(s["input_ids"].shape[0], self.sequence_alignment)
             if total + aligned_slen <= self.pack_size:
                 kept.append(s)
                 total += aligned_slen
-            else:
-                logger.debug(
-                    "Pack %d: dropping overflow sample (%d real, %d aligned tokens, %d/%d used).",
-                    pack_idx,
-                    slen,
-                    aligned_slen,
-                    total,
-                    self.pack_size,
-                )
+        if len(kept) < len(shifted_samples):
+            # Dropped samples are lost training data, so surface them above DEBUG.
+            logger.warning(
+                "Pack %d: dropped %d of %d samples that did not fit pack_size %d after tokenization "
+                "(%d tokens kept); their estimated lengths were too small.",
+                pack_idx,
+                len(shifted_samples) - len(kept),
+                len(shifted_samples),
+                self.pack_size,
+                total,
+            )
 
         if not kept:
             # Fallback: return a padding-only pack
@@ -665,6 +746,7 @@ def neat_pack_dataset_vlm(
     # Extract processor configs for accurate media token estimation
     image_cfg = LengthGroupedSampler._extract_image_config(processor) if processor is not None else None
     video_cfg = LengthGroupedSampler._extract_video_config(processor) if processor is not None else None
+    count_image_tokens = _image_token_counter(processor)
     if image_cfg is not None or video_cfg is not None:
         logger.info("Neat packing VLM: using processor configs for media token estimation.")
     else:
@@ -693,17 +775,16 @@ def neat_pack_dataset_vlm(
         estimated_lengths: list[int] = []
         valid_indices: list[int] = []
         dropped_count = 0
+        unsized_media = 0
         log_interval = max(1, N // 10)  # log every 10%
         t0 = time.perf_counter()
 
         for i in range(N):
-            est_len, media_toks = _estimate_sample_length(
-                ds_raw[i],
-                image_cfg=image_cfg,
-                video_cfg=video_cfg,
-                return_media_tokens=True,
+            estimate = _estimate_sample_length(
+                ds_raw[i], image_cfg=image_cfg, video_cfg=video_cfg, count_image_tokens=count_image_tokens
             )
-            est_len = _aligned_length(max(est_len - 1, 0), sequence_alignment)  # -1 for shift
+            unsized_media += estimate.unsized_media
+            est_len = _aligned_length(max(estimate.total_tokens - 1, 0), sequence_alignment)  # -1 for shift
             if est_len > pack_size:
                 if drop_long_samples:
                     dropped_count += 1
@@ -711,7 +792,7 @@ def neat_pack_dataset_vlm(
                 # Keep it — real length might be shorter; __getitem__ will handle overflow
             est_len = min(est_len, knapsack_capacity)
             estimated_lengths.append(est_len)
-            estimated_media_tokens.append(media_toks)
+            estimated_media_tokens.append(estimate.media_tokens)
             valid_indices.append(i)
 
             if (i + 1) % log_interval == 0 or (i + 1) == N:
@@ -735,6 +816,13 @@ def neat_pack_dataset_vlm(
             dropped_count,
             n_visual,
         )
+        if unsized_media:
+            logger.warning(
+                "Neat packing VLM: %d media items have no mm_inputs_meta and no readable image size the processor "
+                "can count tokens for, and were estimated at %d tokens each, so packs may be over- or under-filled.",
+                unsized_media,
+                _FALLBACK_MEDIA_TOKENS,
+            )
     else:
         # No raw dataset — use dataset length, assume uniform distribution
         N = len(dataset)
