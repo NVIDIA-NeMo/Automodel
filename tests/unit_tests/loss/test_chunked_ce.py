@@ -335,3 +335,92 @@ def test_transformed_head_rejected_before_training():
         _maybe_downgrade_loss_fn(ChunkedCrossEntropy(compile=False), model, False)
     torch.testing.assert_close(model.lm_head.weight, original_weight)
     assert model.lm_head.weight.grad is None
+
+
+@pytest.mark.parametrize("chunk_len", [4, 64])
+def test_fp32_projection_reproduces_the_fp32_logits_head(chunk_len):
+    from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
+
+    torch.manual_seed(71)
+    model = torch.nn.Module()
+    model.lm_head = Float32LogitsLinear.from_linear(torch.nn.Linear(24, 53, bias=False, dtype=torch.bfloat16))
+    hidden = torch.randn(2, 9, 24, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(53, (2, 9))
+    labels[0, 3] = -100
+    logits = model.lm_head(hidden)
+    expected = F.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum")
+
+    actual = calculate_loss(
+        ChunkedCrossEntropy(chunk_len, compile=False),
+        model=model,
+        hidden_states=hidden,
+        logits=logits,
+        labels=labels,
+        projection_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-5)
+    actual_grads = torch.autograd.grad(actual, (hidden, model.lm_head.weight), retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (hidden, model.lm_head.weight))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        assert actual_grad.dtype == torch.bfloat16
+        # Chunks round their BF16 weight gradients before the FP32 cross-chunk sum.
+        assert (actual_grad.float() - expected_grad.float()).norm() <= 1e-2 * expected_grad.float().norm()
+    reference = F.cross_entropy(
+        (hidden.double() @ model.lm_head.weight.double().t()).flatten(0, 1), labels.flatten(), reduction="sum"
+    )
+    bf16_projection = ChunkedCrossEntropy(chunk_len, compile=False)(hidden, labels, model.lm_head.weight)
+    assert (actual.double() - reference).abs() * 10 < (bf16_projection.double() - reference).abs()
+
+
+def test_projection_dtype_must_match_the_head():
+    from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
+
+    plain = torch.nn.Linear(4, 8, bias=False)
+    fp32_head = Float32LogitsLinear.from_linear(torch.nn.Linear(4, 8, bias=False))
+
+    assert ChunkedCrossEntropy.validate_lm_head(plain) is plain
+    assert ChunkedCrossEntropy.validate_lm_head(fp32_head, projection_dtype=torch.float32) is fp32_head
+    with pytest.raises(ValueError, match="Float32LogitsLinear output head"):
+        ChunkedCrossEntropy.validate_lm_head(plain, projection_dtype=torch.float32)
+    with pytest.raises(ValueError, match="plain bias-free nn.Linear"):
+        ChunkedCrossEntropy.validate_lm_head(fp32_head)
+    with pytest.raises(ValueError, match="projection_dtype must be None or torch.float32"):
+        ChunkedCrossEntropy.validate_lm_head(plain, projection_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="projection_dtype must be None or torch.float32"):
+        ChunkedCrossEntropy(4, compile=False)(
+            torch.randn(3, 4), torch.zeros(3, dtype=torch.long), plain.weight, projection_dtype=torch.float16
+        )
+
+
+def test_recipe_checks_linear_losses_against_the_fp32_logits_head():
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = Float32LogitsLinear.from_linear(torch.nn.Linear(7, 13, bias=False))
+
+        def forward(self, input_ids, logits_to_keep=0):
+            """Fail if setup runs the model.
+
+            Args:
+                input_ids: Token IDs of shape [batch, sequence].
+                logits_to_keep: Number of token positions to project.
+            """
+            raise AssertionError("setup must not run the model")
+
+    model = Model()
+    chunked = ChunkedCrossEntropy(compile=False)
+    fused = FusedLinearCrossEntropy(impl="cce")
+
+    assert _maybe_downgrade_loss_fn(chunked, model, False, projection_dtype=torch.float32) is chunked
+    assert _maybe_downgrade_loss_fn(fused, model, False, projection_dtype=torch.float32) is fused
+    with pytest.raises(ValueError, match="plain bias-free nn.Linear"):
+        _maybe_downgrade_loss_fn(chunked, model, False)
+    with pytest.raises(ValueError, match="rounds logits to BF16"):
+        _maybe_downgrade_loss_fn(
+            FusedLinearCrossEntropy(impl="torch_compile"), model, False, projection_dtype=torch.float32
+        )

@@ -82,6 +82,7 @@ from nemo_automodel.components.loggers.mlflow_utils import (
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
@@ -120,6 +121,7 @@ from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_con
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
+from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -175,8 +177,25 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
     return getattr(model_config, "model_type", None) not in ("deepseek_v4", "glm_moe_dsa")
 
 
-def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
-    """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+def _maybe_downgrade_loss_fn(
+    loss_fn: nn.Module,
+    probe_module: nn.Module,
+    pp_enabled: bool,
+    *,
+    projection_dtype: torch.dtype | None = None,
+) -> nn.Module:
+    """Downgrade to MaskedCrossEntropy when the requested loss cannot run.
+
+    Args:
+        loss_fn: Configured training loss.
+        probe_module: Model or first pipeline stage whose forward, head and config are probed.
+        pp_enabled: Whether the model is split into pipeline stages.
+        projection_dtype: LM-head projection output dtype; ``torch.float32`` for a model
+            built with ``logits_dtype=float32``, whose logits linear losses must reproduce.
+
+    Returns:
+        ``loss_fn``, or a ``MaskedCrossEntropy`` replacement when it cannot run.
+    """
     # Probe the wrapped model's signature, head, and config; training still calls DDP.
     if isinstance(probe_module, nn.parallel.DistributedDataParallel):
         probe_module = probe_module.module
@@ -203,10 +222,17 @@ def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_ena
             ignore_index=_get_loss_ignore_index(loss_fn),
             reduction=getattr(loss_fn, "reduction", "sum"),
         )
+    if projection_dtype == torch.float32 and isinstance(loss_fn, FusedLinearCrossEntropy) and loss_fn.impl != "cce":
+        raise ValueError(
+            f"FusedLinearCrossEntropy(impl={loss_fn.impl!r}) rounds logits to BF16 and cannot honor "
+            "model.logits_dtype=float32; use impl='cce', ChunkedCrossEntropy or MaskedCrossEntropy."
+        )
     if isinstance(loss_fn, ChunkedCrossEntropy):
         lm_head = _get_lm_head_module(probe_module)
         if lm_head is not None or not pp_enabled:
-            loss_fn.validate_lm_head(lm_head, model_config=getattr(probe_module, "config", None))
+            loss_fn.validate_lm_head(
+                lm_head, model_config=getattr(probe_module, "config", None), projection_dtype=projection_dtype
+            )
     return loss_fn
 
 
@@ -524,6 +550,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # (e.g. unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
     domain_mixture = None
+    # setup() resolves this from model.logits_dtype; the default keeps linear losses
+    # on the plain head projection when setup() is skipped.
+    lm_head_projection_dtype: torch.dtype | None = None
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -798,8 +827,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         enable_mok_mxfp8_optimizer_step_cache(self.model_parts, self.optimizer)
 
+        # Linear losses reproduce the LM-head projection; model.logits_dtype selects its output dtype.
+        logits_dtype = self.cfg.get("model.logits_dtype", None)
+        self.lm_head_projection_dtype = None if logits_dtype is None else dtype_from_str(logits_dtype)
+
         # Loss-function capability check
-        self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
+        self.loss_fn = _maybe_downgrade_loss_fn(
+            self.loss_fn,
+            self.model_parts[0],
+            self.pp is not None,
+            projection_dtype=self.lm_head_projection_dtype,
+        )
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
@@ -1384,10 +1422,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         self.loss_fn,
                         model,
                         grad_reduce_group=grad_reduce_group,
+                        projection_dtype=self.lm_head_projection_dtype,
                     )
                     loss_distributed_kwargs["grad_reduce_group"] = grad_reduce_group
                     if isinstance(self.loss_fn, ChunkedCrossEntropy):
                         loss_distributed_kwargs["logits_dtype"] = out.logits.dtype
+                        if self.lm_head_projection_dtype is not None:
+                            loss_distributed_kwargs["projection_dtype"] = self.lm_head_projection_dtype
                 # Only forward the domain-mixture weights when configured, so
                 # loss paths that predate them keep their original signature.
                 if loss_weights is not None:
