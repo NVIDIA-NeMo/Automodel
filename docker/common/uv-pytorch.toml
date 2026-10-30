@@ -7,6 +7,7 @@ override-dependencies = [
     "platformdirs==4.12.4",
     # Match the 26.10 base and TE 2.20.2's >=1.29 requirement; keep the venv
     # from shadowing the system frontend with the regular lock's older version.
+    # Update this pin with the base image.
     "nvidia-cudnn-frontend==1.30.0",
     # leptonai (via nemo-run) caps anyio<=4.9.0; retain the security floor
     "anyio>=4.14.2",

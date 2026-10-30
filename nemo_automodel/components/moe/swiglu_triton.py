@@ -23,7 +23,8 @@ GB200 (0.7 ms for a 1.1 GB pass at the 16-node shape). These kernels do one pass
 * backward: one program per block of rows looping over the columns, writing ``d_gate`` / ``d_up`` straight into
   the two halves of ``grad_x`` and accumulating the per-row probability gradient in registers.
 
-Clamp gradients follow ``torch.clamp`` (inclusive range masks on the input values). The dispatcher in
+Clamp gradients follow the installed scalar ``torch.clamp`` subgradient: inclusive before PyTorch 2.15,
+and zero at exact bounds from 2.15 onward. The dispatcher in
 ``experts.swiglu_clamped_deepep`` uses these kernels on contiguous CUDA inputs when Triton is importable and
 falls back to the compiled version otherwise.
 """
@@ -200,7 +201,8 @@ def _backward(
     """Return fused SwiGLU gradients with the runtime's scalar-clamp subgradient.
 
     Args:
-        x: Contiguous input tensor of shape [rows, 2 * inter], gate followed by up.
+        x: Contiguous input tensor of shape [rows, 2 * inter], where rows counts routed tokens
+            and inter is the expert intermediate width; gate is followed by up.
         probs: FP32 probability tensor of shape [rows] or [rows, 1].
         grad_y: Upstream gradient tensor of shape [rows, inter].
         limit: Scalar clamp limit.
