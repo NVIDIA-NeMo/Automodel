@@ -41,7 +41,6 @@ distributed:
     patch_inner_model: false
     patch_causal_lm_model: false
     layers_per_stage: 2
-    dtype: bf16  # stage I/O + HybridEP warm-up tensors follow the bf16 compute dtype, not the fp32 master weights
 
   moe:
     reshard_after_forward: true
