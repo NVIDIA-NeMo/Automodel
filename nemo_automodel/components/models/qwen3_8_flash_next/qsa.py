@@ -276,7 +276,8 @@ def select_qsa_token_ids(
                 sparse_start = min(max(first_sparse_position - first_position, 0), rows)
                 if sparse_start < rows:
                     sparse_queries = index_queries[batch_idx, query_start + sparse_start : query_end].float()
-                    scores = torch.einsum("qhd,pd->qhp", sparse_queries, keys)
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        scores = torch.einsum("qhd,pd->qhp", sparse_queries, keys)
                     scores = torch.relu(scores).sum(dim=1) / score_scale
                     block_ids = torch.arange(available_blocks, device=device)
                     sparse_visible = visible_blocks[sparse_start:]
@@ -341,11 +342,12 @@ def _gathered_qsa_gqa_attention_chunk(
     # [B, Q, K, Hkv, D] -> [B, Q, Hkv, K, D].
     gathered_key = key[batch_ids, safe_ids].permute(0, 1, 3, 2, 4)
     gathered_value = value[batch_ids, safe_ids].permute(0, 1, 3, 2, 4)
-    scores = torch.einsum(
-        "bqhgd,bqhkd->bqhgk",
-        grouped_query.float(),
-        gathered_key.float(),
-    )
+    with torch.autocast(device_type=grouped_query.device.type, enabled=False):
+        scores = torch.einsum(
+            "bqhgd,bqhkd->bqhgk",
+            grouped_query.float(),
+            gathered_key.float(),
+        )
     scores = scores * softmax_scale
     score_valid = valid[:, :, None, None, :]
     scores = scores.masked_fill(~score_valid, -torch.inf)
@@ -355,11 +357,12 @@ def _gathered_qsa_gqa_attention_chunk(
     has_tokens = valid.any(dim=-1)
     scores = torch.where(has_tokens[:, :, None, None, None], scores, torch.zeros_like(scores))
     probabilities = torch.softmax(scores, dim=-1).masked_fill(~score_valid, 0.0)
-    chunk_output = torch.einsum(
-        "bqhgk,bqhkd->bqhgd",
-        probabilities,
-        gathered_value.float(),
-    )
+    with torch.autocast(device_type=grouped_query.device.type, enabled=False):
+        chunk_output = torch.einsum(
+            "bqhgk,bqhkd->bqhgd",
+            probabilities,
+            gathered_value.float(),
+        )
     return chunk_output.flatten(2, 3).to(grouped_query.dtype)
 
 
