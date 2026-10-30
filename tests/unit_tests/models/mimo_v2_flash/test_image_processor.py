@@ -37,6 +37,8 @@ from nemo_automodel.components.models.mimo_v2_flash.processing import (
     smart_resize,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 

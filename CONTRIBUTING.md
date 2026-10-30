@@ -258,6 +258,27 @@ locally). Set `AUTOMODEL_RUNTIME_BUDGET_BASE=<commit>` to explicitly select a ba
 when reproducing a CI result. CPU and GPU unit-test jobs both limit host math
 libraries to one thread per process to avoid oversubscription by spawned ranks.
 
+## GPU unit-test shards
+
+`L0_Unit_Tests_CPU` runs every unit test. The GPU shards skip tests marked
+`cpu_only` and split the remaining tests by whole file, balanced by the per-file
+seconds in `tests/unit_tests/gpu_shard_durations.json`.
+
+Mark a module with `pytestmark = pytest.mark.cpu_only`, or a single test with
+`@pytest.mark.cpu_only`, when it never uses CUDA, for example Gloo ranks on CPU
+tensors. Tests under `tests/unit_tests/ci_tests/` and `tests/unit_tests/tools/`
+are marked automatically. The marker only affects the GPU shards; local runs
+still collect these tests.
+
+A test file without a recorded duration counts as the median file. When the
+shards drift apart, rebuild the durations from the GPU shard logs of a green run:
+
+```bash
+gh run view <run-id> --repo NVIDIA-NeMo/Automodel --log --job <shard-1-job-id> > shard1.log
+gh run view <run-id> --repo NVIDIA-NeMo/Automodel --log --job <shard-2-job-id> > shard2.log
+python tools/update_gpu_shard_durations.py shard1.log shard2.log --source "run <run-id>"
+```
+
 ## Pre-commit
 
 We recommand to use [prek](https://github.com/j178/prek) to ensure code quality. It is a faster and more modern alternative to [pre-commit](https://github.com/pre-commit/pre-commit).
