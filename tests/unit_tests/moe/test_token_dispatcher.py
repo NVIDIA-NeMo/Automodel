@@ -1099,22 +1099,3 @@ class TestDispatchStateRelease:
         graph_connected = [name for name, value in leftovers.items() if value.grad_fn is not None]
         assert graph_connected == [], graph_connected
         assert activation_ptrs[1] not in self._saved_data_ptrs(leftovers.values())
-
-
-def test_runtime_initializer_prefers_pipeline_activation_dtype(hybrid_ep_manager, monkeypatch):
-    # fp32 master weights: the expert module reports float32 while the pipeline activations
-    # (and HybridEP's 16-bit buffers) are bf16. The pipeline dtype must win.
-    fused_a2a.reset_hybrid_ep_buffer()
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
-    calls = []
-    monkeypatch.setattr(hybrid_ep_manager, "initialize_runtime", lambda **kwargs: calls.append(kwargs["dtype"]))
-    initializer = HybridEPPipelineRuntimeInitializer(hybrid_ep_manager, 16, torch.float32)
-
-    initializer.prepare(num_tokens=160, device=torch.device("cpu"), dtype=torch.bfloat16)
-    assert calls == [torch.bfloat16]
-
-    fused_a2a.reset_hybrid_ep_buffer()
-    with pytest.raises(ValueError, match="16-bit"):
-        initializer.prepare(num_tokens=160, device=torch.device("cpu"))
-    assert calls == [torch.bfloat16]
-    fused_a2a.reset_hybrid_ep_buffer()

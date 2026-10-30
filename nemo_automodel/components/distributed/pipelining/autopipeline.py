@@ -256,8 +256,6 @@ class AutoPipeline:
                 # and MoE dispatch are local. Reuse the stage metadata's token count.
                 num_tokens=self._pp_runtime_num_tokens,
                 device=self.device,
-                # Stage activations carry the pipeline tensor dtype, not the parameter dtype.
-                dtype=self.dtype,
             )
 
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:

@@ -1122,8 +1122,8 @@ class TestAutoPipelineUpdateSeqLen:
 
         class RecordingInitializer:
             @staticmethod
-            def prepare(*, num_tokens, device, dtype):
-                events.append(("prepare", num_tokens, device, dtype))
+            def prepare(*, num_tokens, device):
+                events.append(("prepare", num_tokens, device))
 
         ap = AutoPipeline(
             world_mesh=FakeDeviceMesh(),
@@ -1132,7 +1132,6 @@ class TestAutoPipelineUpdateSeqLen:
             pp_microbatch_size=2,
             pp_batch_size=4,
             device=torch.device("cpu"),
-            dtype=torch.bfloat16,
         )
         ap._model_config = object()
         ap._info.schedule = object()
@@ -1155,10 +1154,10 @@ class TestAutoPipelineUpdateSeqLen:
 
         assert events == [
             ("reset", 8),
-            ("prepare", 16, torch.device("cpu"), torch.bfloat16),
-            ("prepare", 16, torch.device("cpu"), torch.bfloat16),
+            ("prepare", 16, torch.device("cpu")),
+            ("prepare", 16, torch.device("cpu")),
             ("reset", 16),
-            ("prepare", 32, torch.device("cpu"), torch.bfloat16),
+            ("prepare", 32, torch.device("cpu")),
             ("reset", 4),
-            ("prepare", 8, torch.device("cpu"), torch.bfloat16),
+            ("prepare", 8, torch.device("cpu")),
         ]
