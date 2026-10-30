@@ -1,11 +1,11 @@
 ---
 title: "Mistral-Large-4-1T-A52B"
-description: "Fine-tune Mistral-Large-4-1T-A52B with NeMo AutoModel on MedPix and packed Tulu3 data using HybridEP, pipeline parallelism and context parallelism."
+description: "Fine-tune Mistral-Large-4-1T-A52B with NeMo AutoModel on MedPix and packed Tulu3 data using HybridEP, pipeline parallelism, and context parallelism."
 slug: model-coverage/vision-language-models/mistralai/Mistral-Large-4-1T-A52B
 ---
 
 [Mistral Large 4](https://huggingface.co/mistralai/Mistral-Large-4-1T-A52B) is Mistral AI's
-1T-parameter (52B active) multimodal MoE model. NeMo AutoModel provides native text
+1T-parameter (52B active) multimodal Mixture-of-Experts (MoE) model. NeMo AutoModel provides native text
 (`MistralLarge4ForCausalLM`) and image-text (`MistralLarge4ForConditionalGeneration`)
 implementations.
 
@@ -52,7 +52,7 @@ With TP1, the data-parallel degree for batch accounting is `world_size / (PP * C
 
 The recipes load `mistralai/Mistral-Large-4-1T-A52B` directly.
 `checkpoint.dequantize_base_checkpoint: true` reconstructs the FP8 payloads in FP32 and stores the
-weights in BF16. Router, LeRoPE and indexer-normalization state stays in FP32. FP8 indexer and
+weights in BF16. Router, LeRoPE, and indexer-normalization state stays in FP32. FP8 indexer and
 KV-cache execution are disabled for training.
 
 ## Prepare Packed Tulu3 Data
@@ -98,14 +98,14 @@ These training measurements do not close the numerical gates listed below.
 | Language model | 72 layers, hidden size 6,144, vocabulary 204,800 |
 | Attention | MLA with sparse DSA selection (top-k 2,048) and IndexShare; 64 heads, 512-dimensional KV latent |
 | Experts | 128 routed (top-4) and one shared; the first layer uses a dense FFN |
-| Positions | Trainable LeRoPE/YaRN, periodic NoPE layers, SSMax, cross-layer KV sharing from layer 35 |
+| Positions | Trainable LeRoPE/YaRN, periodic no-positional-embedding (NoPE) layers, SSMax, cross-layer KV sharing from layer 35 |
 | Vision | 30 layers, hidden size 2,048, 16 heads, patch size 14, 2x2 patch merger |
 | Output | Logit soft cap 30 |
 | Checkpoint precision | FP8 linear and expert weights with FP32 scales; BF16 vision and projector |
 
 ### Available Models
 
-| Model | HF ID |
+| Model | Hugging Face ID |
 |---|---|
 | Mistral Large 4 | [`mistralai/Mistral-Large-4-1T-A52B`](https://huggingface.co/mistralai/Mistral-Large-4-1T-A52B) |
 
