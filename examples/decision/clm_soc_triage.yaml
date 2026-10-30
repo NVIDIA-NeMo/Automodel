@@ -1,0 +1,96 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Post-train Contrastive-LM CLM-v0.1-8B decision heads on the SOC alert-triage dataset.
+#
+# The Qwen3-8B encoder stays frozen (CLM is encoder-locked); every state / option text is embedded once, sharded over
+# all GPUs, and cached. Only the ~20M-parameter projection heads are trained.
+#
+#   # before: evaluate the released heads
+#   automodel examples/decision/clm_soc_triage.yaml --nproc-per-node 8 --mode eval --output_dir runs/clm/base
+#   # SFT
+#   automodel examples/decision/clm_soc_triage.yaml --nproc-per-node 8 --mode train --loss.mode sft \
+#       --output_dir runs/clm/sft
+#   # RL from the SFT heads
+#   automodel examples/decision/clm_soc_triage.yaml --nproc-per-node 8 --mode train --loss.mode rl \
+#       --heads.init_checkpoint runs/clm/sft/heads.pt --optimizer.lr 1.0e-4 --train.epochs 10 --output_dir runs/clm/rl
+
+recipe: nemo_automodel.recipes.decision.train_clm_heads.TrainCLMHeadsRecipe
+
+mode: train            # eval | train
+seed: 1234
+output_dir: runs/clm/sft
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+# Frozen encoder: last-token pooling + L2 normalisation, matches the pooling/input contract of `vllm serve Qwen/Qwen3-8B --runner pooling`.
+encoder:
+  _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+  revision: b968826d9c46dd6066d109eabc6255188de91218
+  pooling: last
+  l2_normalize: true
+  is_causal: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+
+encode:
+  max_length: 2048     # CLM's encoder window (vLLM `truncate_prompt_tokens`, keeps the last tokens)
+  batch_size: 16
+  cache_dir: runs/clm/embedding_cache
+
+heads:
+  init_checkpoint: null   # null -> released Contrastive-LM/CLM-v0.1-8B heads; or a path to a heads.pt
+
+data:
+  train: data/soc_triage/train.jsonl
+  validation: data/soc_triage/validation.jsonl
+  test: data/soc_triage/test.jsonl
+  slice_keys: [evidence, verdict, family]
+
+train:
+  epochs: 20
+  batch_size: 64          # records per step (x5 questions)
+  grad_clip: 1.0
+  patience: 5
+  eval_metric: accuracy  # accuracy | exact_match | reward (use reward for the RL stage)
+  train_logit_scale: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-4              # CLM `finetune.py` choice-task default
+  weight_decay: 0.0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  # null derives warmup from the complete optimizer-step count (10%, capped at 1000).
+  lr_warmup_steps: null
+  init_lr: 0.0
+  min_lr: 0.0
+
+loss:
+  _target_: nemo_automodel.components.loss.decision.DecisionLossConfig
+  mode: sft               # sft | rl
+  label_smoothing: 0.05
+  brier_weight: 1.0
+  ordinal_weight: 0.5
+  rl_objective: expected_reward   # expected_reward | grpo
+  num_samples: 8
+  kl_coef: 0.05
+  anchor_weight: 0.1
+
+ci:
+  cluster_tag: h100

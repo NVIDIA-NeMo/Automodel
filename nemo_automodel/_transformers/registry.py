@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
+            "Lfm2VlForConditionalGeneration",
+            ("nemo_automodel.components.models.d1.vl_model", "Lfm2VlForConditionalGeneration"),
+        ),
+        ("D1OmniModel", ("nemo_automodel.components.models.d1.model", "D1OmniModel")),
+        (
             "BagelForUnifiedMultimodal",
             (
                 "nemo_automodel.components.models.bagel.model",
@@ -223,6 +228,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "MistralLarge4ForConditionalGeneration",
+            ("nemo_automodel.components.models.mistral_large4.multimodal", "MistralLarge4ForConditionalGeneration"),
+        ),
+        (
+            "MistralLarge4ForCausalLM",
+            ("nemo_automodel.components.models.mistral_large4.model", "MistralLarge4ForCausalLM"),
+        ),
+        (
             "Mistral4ForCausalLM",
             ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
         ),
@@ -404,6 +417,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "d1_omni": ("nemo_automodel.components.models.d1.config", "D1OmniConfig"),
     "step5": ("nemo_automodel.components.models.step5.configuration", "Step5Config"),
     "step5_vl": ("nemo_automodel.components.models.step5.configuration", "Step5VLConfig"),
     "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
@@ -440,6 +454,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
         "Mistral3BidirectionalConfig",
     ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "mistral_large4": ("nemo_automodel.components.models.mistral_large4.config", "MistralLarge4Config"),
     "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),
     "muse_spark": (
         "nemo_automodel.components.models.muse_spark.configuration_muse_spark",

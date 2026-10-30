@@ -348,6 +348,8 @@ def test_exact_pack_length_uses_headers_without_decoding(mode: str, size: tuple[
 
     from PIL import Image
 
+    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
+    from nemo_automodel.components.datasets.vlm.neat_packing_vlm import neat_pack_dataset_vlm
     from nemo_automodel.components.models.deepseek_v41.processing import DeepseekV41Processor
     from tests.unit_tests.models.deepseek_v41.test_vision import _tokenizer as vision_tokenizer
 
@@ -359,9 +361,25 @@ def test_exact_pack_length_uses_headers_without_decoding(mode: str, size: tuple[
         {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": "one two"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "tail"}]},
     ]
+    raw = [{"conversation": messages}, {"conversation": messages}]
+    dataset = PreTokenizedDatasetWrapperConfig(inject_fake_images=False).build(dataset=raw, processor=processor)
     with monkeypatch.context() as patch:
         patch.setattr(image, "load", lambda *a, **k: pytest.fail("Length estimation decoded image pixels"))
         expected_length, expected_media = processor.estimate_packed_tokens(messages)
+        aligned_length = ((expected_length - 1 + 5) // 6) * 6
+        packed = neat_pack_dataset_vlm(
+            dataset,
+            ds_raw=raw,
+            processor=processor,
+            pack_size=2 * aligned_length,
+            sequence_alignment=6,
+        )
     result = processor.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
     assert result["input_ids"].numel() == expected_length
     assert int((result["vision_token_types"] >= 0).sum()) == expected_media
+    assert len(packed) == 1
+    assert sorted(packed.bins[0]) == [0, 1]
+    pack = packed[0]
+    assert pack["input_ids"].numel() == 2 * aligned_length
+    assert int((pack["vision_token_types"] >= 0).sum()) == 2 * expected_media
+    assert pack["image_grid_hws"].shape[0] == 2
