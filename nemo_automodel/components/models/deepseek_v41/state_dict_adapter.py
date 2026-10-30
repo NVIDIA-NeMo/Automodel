@@ -581,9 +581,10 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
 
         Raises:
             ValueError: The checkpoint holds an expert layer's projections only partially,
-                or a quantized weight without its scale companion. Corrupt checkpoints
-                reject here instead of loading silently wrong values; the full-state
-                path raises equivalent errors for the same checkpoints.
+                a quantized weight without its scale companion, or an orphan scale whose
+                weight is absent. Corrupt checkpoints reject here instead of loading
+                silently wrong values; the full-state path raises equivalent errors for
+                the same checkpoints.
         """
         if checkpoint_metadata is None:
             logging.info("%s: part loading declined (no checkpoint metadata)", type(self).__name__)
@@ -698,10 +699,10 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
 
         Raises:
             ValueError: The layer's expert projections are only partially present in the
-                checkpoint, or a quantized checkpoint weight lacks its scale companion.
-                Both are corrupt checkpoints and must reject exactly like the full-state
-                conversion instead of silently keeping initialization or installing raw
-                payload values.
+                checkpoint, a quantized checkpoint weight lacks its scale companion, or a
+                checkpoint scale lacks its companion weight. All are corrupt checkpoints
+                and must reject exactly like the full-state conversion instead of
+                silently keeping initialization or installing raw payload values.
         """
         fused = _FUSED_EXPERT_KEY.match(model_key)
         if fused is not None:
@@ -730,6 +731,12 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
             return ("fused", frozenset(required))
         released = _released_key(model_key)
         if released not in checkpoint_metadata:
+            # An orphan scale means its companion weight was expected: reject like the
+            # full-state conversion instead of treating the projection as legitimately
+            # absent and silently keeping its initialization.
+            orphan_scale_key = released.removesuffix(".weight") + ".scale"
+            if released.endswith(".weight") and orphan_scale_key in checkpoint_metadata:
+                raise ValueError(f"Checkpoint scale {orphan_scale_key} has no matching weight")
             return None
         scale_key = released[: -len(".weight")] + ".scale" if released.endswith(".weight") else None
         if scale_key is not None and scale_key not in checkpoint_metadata:

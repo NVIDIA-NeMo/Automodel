@@ -664,12 +664,15 @@ def test_iter_checkpoint_load_parts_rejects_corrupt_quantized_checkpoints() -> N
     """Partially served expert groups and scale-less quantized weights reject, not load.
 
     A missing expert scale used to count the whole grouped destination as absent (it
-    kept its initialization while the part reported completion) and a missing dense FP8
-    scale fell through to a direct copy of raw payload values. Both must raise like the
-    full-state conversion does.
+    kept its initialization while the part reported completion), a missing dense FP8
+    scale fell through to a direct copy of raw payload values, and an orphan scale
+    whose weight is absent silently kept the projection at its initialization. All
+    must raise like the full-state conversion does.
     """
 
-    def _metadata(with_experts: bool, with_dense_scale: bool) -> dict[str, SimpleNamespace]:
+    def _metadata(
+        with_experts: bool, with_dense_scale: bool, with_dense_weight: bool = True
+    ) -> dict[str, SimpleNamespace]:
         metadata: dict[str, SimpleNamespace] = {}
         if with_experts:
             for expert in range(2):
@@ -685,9 +688,10 @@ def test_iter_checkpoint_load_parts_rejects_corrupt_quantized_checkpoints() -> N
             metadata["layers.1.attn.wq_a.scale"] = SimpleNamespace(
                 size=torch.Size((1, 1)), properties=SimpleNamespace(dtype=torch.float8_e8m0fnu)
             )
-        metadata["layers.1.attn.wq_a.weight"] = SimpleNamespace(
-            size=torch.Size((32, 32)), properties=SimpleNamespace(dtype=torch.float8_e4m3fn)
-        )
+        if with_dense_weight:
+            metadata["layers.1.attn.wq_a.weight"] = SimpleNamespace(
+                size=torch.Size((32, 32)), properties=SimpleNamespace(dtype=torch.float8_e4m3fn)
+            )
         return metadata
 
     adapter = _adapter()
@@ -705,12 +709,29 @@ def test_iter_checkpoint_load_parts_rejects_corrupt_quantized_checkpoints() -> N
     with pytest.raises(ValueError, match="expert projections for layer 1 are incomplete"):
         adapter.iter_checkpoint_load_parts(model_state, None, partial_experts)
 
+    orphan_expert_scale = _metadata(with_experts=True, with_dense_scale=True)
+    del orphan_expert_scale["layers.1.ffn.experts.0.w1.weight"]
+    with pytest.raises(ValueError, match="expert projections for layer 1 are incomplete"):
+        adapter.iter_checkpoint_load_parts(model_state, None, orphan_expert_scale)
+
     missing_dense_scale = _metadata(with_experts=True, with_dense_scale=False)
     with pytest.raises(ValueError, match="missing its scale tensor"):
         adapter.iter_checkpoint_load_parts(model_state, None, missing_dense_scale)
 
-    # A layer whose experts are entirely absent from the checkpoint is not corrupt: the
-    # grouped tensors keep their initialization and the remaining keys still load in parts.
+    orphan_dense_scale = _metadata(with_experts=True, with_dense_scale=True, with_dense_weight=False)
+    with pytest.raises(ValueError, match="no matching weight"):
+        adapter.iter_checkpoint_load_parts(model_state, None, orphan_dense_scale)
+
+    # A projection whose weight and scale are both absent, like a layer whose experts
+    # are entirely absent from the checkpoint, is not corrupt: the tensors keep their
+    # initialization and the remaining keys still load in parts.
+    absent_projection = _metadata(with_experts=False, with_dense_scale=False, with_dense_weight=False)
+    parts = list(adapter.iter_checkpoint_load_parts(model_state, None, absent_projection))
+    covered = set().union(*(part.model_keys for part in parts))
+    assert covered == set(model_state)
+    assert all("layers.1.attn.wq_a.weight" not in part.checkpoint_tensors for part in parts)
+    assert all(".ffn.experts." not in key for part in parts for key in part.checkpoint_tensors)
+
     no_experts = _metadata(with_experts=False, with_dense_scale=True)
     parts = list(adapter.iter_checkpoint_load_parts(model_state, None, no_experts))
     covered = set().union(*(part.model_keys for part in parts))
