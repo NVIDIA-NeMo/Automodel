@@ -247,7 +247,10 @@ class MistralLarge4StateDictAdapter(StateDictAdapter):
             yield from parts
             return
         count = len(model_state_dict)
-        minimum = torch.tensor(count, device=next(iter(model_state_dict.values())).device, dtype=torch.long)
+        # The default group's backend sets the device, not parameter residency (CPU offload).
+        use_cuda = dist.get_backend() == "nccl"
+        device = torch.device("cuda", torch.cuda.current_device()) if use_cuda else torch.device("cpu")
+        minimum = torch.tensor(count, device=device, dtype=torch.long)
         dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
         groups = int(minimum.item())
         if groups == 0:

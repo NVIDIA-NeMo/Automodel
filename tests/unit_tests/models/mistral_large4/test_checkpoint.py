@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
 from safetensors.torch import load_file, save_file
 from transformers import AutoConfig
 
@@ -426,6 +427,30 @@ def test_real_dcp_populates_parts(tmp_path):
     assert pointers == {k: v.data_ptr() for k, v in state.items()}
     torch.testing.assert_close(state["model.layers.0.self_attn.q_proj.weight"], expected.bfloat16(), rtol=0, atol=0)
     torch.testing.assert_close(state["lm_head.weight"], dense, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("backend", "resident", "expected"),
+    [
+        ("gloo", "meta", "cpu"),
+        pytest.param(
+            "nccl",
+            "cpu",
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="NCCL reduction needs CUDA"),
+        ),
+    ],
+)
+def test_load_part_count_reduction_uses_process_group_device(monkeypatch, backend, resident, expected):
+    """CPU-offloaded destinations must not place the NCCL count reduction on CPU."""
+    devices = []
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(dist, "get_backend", lambda group=None: backend)
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, op=None, group=None: devices.append(tensor.device.type))
+    state = {"lm_head.weight": torch.empty(4, 4, device=resident)}
+    next(iter(MistralLarge4StateDictAdapter().iter_checkpoint_load_parts(state)))
+    assert devices == [expected]
 
 
 def _released_config() -> dict:
