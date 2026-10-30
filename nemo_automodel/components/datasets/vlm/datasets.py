@@ -1632,6 +1632,11 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         return_assistant_tokens_mask=True,
                         processor_kwargs=processor_kwargs,
                     )
+                elif type(self.processor).__name__ == "MistralCommonBackend":
+                    # MistralCommonBackend owns the HF token API and takes no media kwargs.
+                    result = self.processor.apply_chat_template(
+                        [conversation], tokenize=True, return_dict=True, return_tensors="pt"
+                    )
                 else:
                     text = self.processor.apply_chat_template([conversation], tokenize=False)
                     if isinstance(text, list):
