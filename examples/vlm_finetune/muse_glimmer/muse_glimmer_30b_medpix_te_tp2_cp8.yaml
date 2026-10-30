@@ -92,7 +92,9 @@ packed_sequence:
   max_length: 2048
   pack_size: 4096
   collate_max_length: 4096
-  packing_ratio: 0.9
+  # Image tokens are now counted from image sizes rather than a flat 500 per image, so the
+  # same ratio packs more samples; 0.6 keeps the pack fill this recipe was tuned with.
+  packing_ratio: 0.6
   drop_long_samples: true
   balance_media_tokens: true
   packing_format: thd

@@ -1613,15 +1613,19 @@ def encode_vlm_document(
     chat_template = resolve_chat_template_string(chat_template)
     template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
     # The processor owns media expansion and special-token handling in either path.
-    result = processor.apply_chat_template(
-        [conversation],
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-        return_assistant_tokens_mask=template_has_generation_kwd,
-        processor_kwargs=processor_kwargs,
-        **template_kwargs,
-    )
+    if type(processor).__name__ == "MistralCommonBackend":
+        # MistralCommonBackend owns the HF token API and takes no media kwargs.
+        result = processor.apply_chat_template([conversation], tokenize=True, return_dict=True, return_tensors="pt")
+    else:
+        result = processor.apply_chat_template(
+            [conversation],
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            return_assistant_tokens_mask=template_has_generation_kwd,
+            processor_kwargs=processor_kwargs,
+            **template_kwargs,
+        )
     if post_tokenize_hook is not None:
         result = post_tokenize_hook(result, processor)
 

@@ -23,6 +23,10 @@ inputs:
     description: "Maximum attempts when the test command reaches the job timeout"
     required: false
     default: "3"
+  retry-extra-timeout:
+    description: "Minutes added to the timeout of each retry attempt"
+    required: false
+    default: "0"
   test-folder:
     description: "Comma-separated names of folders containing test suites"
     required: false
@@ -39,11 +43,11 @@ inputs:
     required: false
     default: "false"
   shard-id:
-    description: "0-based pytest-shard index for splitting a suite across runners"
+    description: "0-based shard index for splitting the unit suite across runners by test file"
     required: false
     default: ""
   num-shards:
-    description: "Total number of pytest-shard chunks the suite is split into"
+    description: "Total number of shards the unit suite is split into"
     required: false
     default: ""
   full-moe-matrix:
@@ -119,12 +123,12 @@ runs:
           --env NEMO_MOE_TEST_FULL_MATRIX=${{ inputs.full-moe-matrix }} \
           --volume ${{ inputs.test-data-path }}:/home/TestData \
           ${{ inputs.container-image }} \
-          bash -c "sleep $(( ${{ inputs.timeout }} * 60 + 60 ))"
+          bash -c "sleep \${1:?container lifetime in seconds}"
         RUN_TEST_EOF
         )
 
         echo "$cmd" | tee "retry_job.sh"
-        bash retry_job.sh
+        bash retry_job.sh $(( ${{ inputs.timeout }} * 60 + 60 ))
         echo "::endgroup::"
 
     - name: Create run-script
@@ -157,7 +161,6 @@ runs:
         RUN_TEST_EOF
         )
 
-        echo "timeout_in_seconds=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
         echo "$cmd" | tee "job.sh"
         echo "::endgroup::"
 
@@ -171,16 +174,45 @@ runs:
         echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
 
     - name: Run main script
-      uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3
       id: run-main-script
+      shell: bash
       continue-on-error: ${{ inputs.is-optional == 'true' }}
-      with:
-        timeout_seconds: ${{ steps.create.outputs.timeout_in_seconds }}
-        max_attempts: ${{ inputs.max-attempts }}
-        shell: bash
-        retry_on: timeout
-        command: /bin/bash job.sh
-        on_retry_command: /bin/bash retry_job.sh
+      env:
+        TIMEOUT_MINUTES: ${{ inputs.timeout }}
+        RETRY_EXTRA_TIMEOUT_MINUTES: ${{ inputs.retry-extra-timeout }}
+        MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+      run: |
+        # Retry only attempts that hit their timeout, in a fresh container. Each retry gets
+        # RETRY_EXTRA_TIMEOUT_MINUTES more, so a suite that just overran its first attempt can finish.
+        exit_code=1
+        trap 'echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"' EXIT
+        for (( attempt = 1; attempt <= MAX_ATTEMPTS; attempt++ )); do
+          minutes=$TIMEOUT_MINUTES
+          if (( attempt > 1 )); then
+            minutes=$(( TIMEOUT_MINUTES + RETRY_EXTRA_TIMEOUT_MINUTES ))
+            /bin/bash retry_job.sh $(( minutes * 60 + 60 )) || echo "::warning::Could not restart the test container."
+          fi
+          echo "::group::Attempt $attempt (timeout $minutes minutes)"
+          start=$SECONDS
+          exit_code=0
+          timeout --kill-after=30 $(( minutes * 60 )) /bin/bash job.sh || exit_code=$?
+          echo "::endgroup::"
+          if (( exit_code == 0 )); then
+            echo "Command completed after $attempt attempt(s)."
+            break
+          fi
+          if (( exit_code != 124 && exit_code != 137 )) || (( SECONDS - start < minutes * 60 )); then
+            echo "::error::Attempt $attempt failed with exit code $exit_code."
+            break
+          fi
+          exit_code=1
+          if (( attempt == MAX_ATTEMPTS )); then
+            echo "::error::Final attempt failed. Timeout of $minutes minutes hit."
+          else
+            echo "::warning::Attempt $attempt failed. Reason: Timeout of $minutes minutes hit."
+          fi
+        done
+        exit "$exit_code"
 
     - name: Check result
       id: check

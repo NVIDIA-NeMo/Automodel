@@ -14,9 +14,12 @@
 
 from __future__ import annotations
 
+from typing import TypedDict, Unpack
+
 import torch
 from torch import nn
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
 _DSV4_CLASS_NAMES = {
     "DeepseekV4ForCausalLM",
@@ -232,7 +235,20 @@ def _attach_hca_param_sync_group(module: nn.Module, mesh) -> None:
             setter(process_group)
 
 
-def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=None, **fsdp_kwargs):
+class DeepseekV4FSDPKwargs(TypedDict, total=False):
+    """Optional ``fully_shard`` arguments forwarded by :func:`fully_shard_deepseek_v4`."""
+
+    reshard_after_forward: bool | int | None
+    ignored_params: set[nn.Parameter] | None
+
+
+def fully_shard_deepseek_v4(
+    module: nn.Module | list[nn.Module],
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy,
+    offload_policy: OffloadPolicy | None = None,
+    **fsdp_kwargs: Unpack[DeepseekV4FSDPKwargs],
+) -> FSDPModule | list[FSDPModule]:
     """Apply FSDP2 to DeepSeek-V4 without mixing fp32 and bf16 params in one unit.
 
     This is intentionally model-specific.  DeepSeek-V4 keeps a small set of
@@ -244,7 +260,31 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
     policy requests bf16 compute.  In that case, preserve fp32 compute only for
     the explicitly listed reference-sensitive islands and let the parent block
     use the caller's bf16 policy.
+
+    Args:
+        module: One module, or a list of modules sharded together as one
+            cross-block FSDP unit under the caller's explicit policy.
+        mesh: Data-parallel shard mesh.
+        mp_policy: Caller's mixed-precision policy for the parent unit.
+        offload_policy: Optional CPU offload policy.
+        **fsdp_kwargs: Remaining ``fully_shard`` options, forwarded unchanged
+            except that ``ignored_params`` is filtered per FP32 island.
+
+    Returns:
+        The sharded module, or the list of sharded modules for a group input.
     """
+    if isinstance(module, list):
+        # Cross-block groups arrive with the helper's explicit FP32 policy.
+        # All members must preserve their natural output dtype, including the
+        # raw sink parameters that are consumed after their holder returns.
+        return fully_shard(
+            module,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            **fsdp_kwargs,
+        )
+
     is_dsv4 = _is_deepseek_v4_module(module)
     if is_dsv4:
         _attach_hca_param_sync_group(module, mesh)
