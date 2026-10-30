@@ -1066,6 +1066,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
                 build=lambda **k: "dl",
                 dataset_builds_on_all_ranks=False,
                 seed=42,
+                packing=None,
             )
         ),
     )
@@ -2204,6 +2205,24 @@ def test_log_train_metrics_sends_metrics_and_moe_loads_to_trackio(monkeypatch):
     trainer.metric_logger_train.log.assert_called_once_with(log_data)
 
 
+@pytest.mark.parametrize(
+    ("pack_fill", "expected"),
+    [(0.75, "loss 1.5000 | pack_fill 0.750 | grad_norm 0.5000"), (None, "loss 1.5000 | grad_norm 0.5000")],
+)
+def test_log_train_metrics_shows_pack_fill_next_to_loss(monkeypatch, caplog, pack_fill, expected):
+    from nemo_automodel.components.loggers.metric_logger import MetricsSample
+
+    trainer = _make_trainer_for_trackio(monkeypatch)
+    metrics = {"loss": 1.5, "grad_norm": 0.5, "lr": 1e-4, "mem": 1.0, "tps": 10.0, "tps_per_gpu": 10.0}
+    if pack_fill is not None:
+        metrics["pack_fill"] = pack_fill
+
+    with caplog.at_level(logging.INFO):
+        trainer.log_train_metrics(MetricsSample(step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8}))
+
+    assert expected in caplog.text
+
+
 @pytest.mark.parametrize(("val_name", "key"), [("default", "val_loss"), ("squad", "val_squad/val_loss")])
 def test_log_val_metrics_sends_metrics_to_trackio(monkeypatch, val_name, key):
     from nemo_automodel.components.loggers.metric_logger import MetricsSample
@@ -2601,6 +2620,27 @@ class TestRunTrainOptimStepSetsMoEScale:
         tps = metrics.metrics["tps"]
         assert tps > 0
         assert metrics.metrics["tps_per_gpu"] == pytest.approx(tps / 16)
+
+    def test_pack_fill_divides_tokens_by_pack_capacity(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=1)
+        object.__setattr__(recipe, "pack_size", 4)
+        # Three 4-token packs over two microbatches. Trailing -100 labels are padding; the
+        # interior -100 is a masked prompt token, which still fills its pack.
+        batches = [
+            {"labels": torch.tensor([[1, -100, 3, -100], [4, 5, -100, -100]])},
+            {"labels": torch.tensor([[6, 7, 8, 9]])},
+        ]
+
+        metrics = recipe._run_train_optim_step(batches)
+
+        assert metrics.metrics["pack_fill"] == pytest.approx((3 + 2 + 4) / (3 * 4))
+
+    def test_pack_fill_is_absent_without_packing(self, monkeypatch):
+        recipe = self._make_recipe(monkeypatch, pp_enabled=False, dp_group_size=1)
+
+        metrics = recipe._run_train_optim_step([{"labels": torch.tensor([[1, 2, 3, -100]])}])
+
+        assert "pack_fill" not in metrics.metrics
 
 
 # -----------------------------------------------------------------------------

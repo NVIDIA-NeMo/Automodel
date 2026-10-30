@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import sys
 import types
 from contextlib import nullcontext
@@ -712,6 +713,53 @@ def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
     assert metrics.metrics["num_label_tokens"] == 4
     assert metrics.metrics["loss"] == pytest.approx(8.0 / 4)
     assert MoEAuxLossAutoScaler.main_loss_backward_scale.item() == pytest.approx(2.0)
+
+
+@pytest.mark.cuda(False)
+@pytest.mark.parametrize(("pack_size", "expected"), [(8, pytest.approx((6 + 4) / (2 * 8))), (None, None)])
+def test_run_train_step_reports_pack_fill_against_pack_size(monkeypatch, pack_size, expected):
+    """Packs are collated only to the longest pack, so pack_fill divides by pack_size, not the padded width."""
+    recipe, _ = _build_pp_recipe_for_optim_step(num_label_tokens_in_batch=0)
+    recipe.pack_size = pack_size
+    # Two packs padded to the longer one's 6 tokens. Trailing -100 labels are padding; the
+    # interior -100s are masked prompt tokens, which still fill their pack.
+    batches = [
+        {
+            "labels": torch.tensor([[1, -100, 2, 3, 4, 5], [6, -100, 7, 8, -100, -100]]),
+            "input_ids": torch.ones(2, 6, dtype=torch.long),
+        }
+    ]
+
+    def fake_forward_backward_step(idx, batch, loss_buffer, num_label_tokens, num_batches):
+        loss_buffer.append(torch.tensor(1.0))
+
+    recipe._forward_backward_step = fake_forward_backward_step
+    _patch_pp_optim_step_dependencies(monkeypatch)
+
+    metrics = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
+
+    assert metrics.metrics.get("pack_fill") == expected
+
+
+@pytest.mark.cuda(False)
+@pytest.mark.parametrize(
+    ("pack_fill", "expected"),
+    [(0.625, "loss 1.2500 | pack_fill 0.625 | grad_norm 0.5000"), (None, "loss 1.2500 | grad_norm 0.5000")],
+)
+def test_log_train_metrics_shows_pack_fill_next_to_loss(monkeypatch, caplog, pack_fill, expected):
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(is_main=True)
+    recipe.step_scheduler = SimpleNamespace(step=7, is_remote_logging_step=False)
+    recipe.metric_logger_train = SimpleNamespace(log=lambda log_data: None)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)  # CPU-only test
+    metrics = {"loss": 1.25, "grad_norm": 0.5, "lr": 1e-4, "mem": 1.0, "tps": 10.0, "tps_per_gpu": 10.0}
+    if pack_fill is not None:
+        metrics["pack_fill"] = pack_fill
+
+    with caplog.at_level(logging.INFO):
+        recipe.log_train_metrics(MetricsSample(step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8}))
+
+    assert expected in caplog.text
 
 
 # -----------------------------------------------------------------------------
