@@ -654,6 +654,68 @@ class TestGate:
         # All selected expert indices should be valid
         assert (indices >= 0).all() and (indices < moe_config.n_routed_experts).all()
 
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize("score_func", ["sigmoid", "softmax_with_bias", "sigmoid_with_bias"])
+    @pytest.mark.parametrize("correction_bias", [-2.0, 0.125, None], ids=["negative", "positive", "no_bias"])
+    @pytest.mark.parametrize("normalize", [False, True], ids=["unnormalized", "normalized"])
+    def test_group_routing_excludes_dropped_groups(
+        self, moe_config: MoEConfig, score_func: str, correction_bias: float | None, normalize: bool
+    ) -> None:
+        """Dropped groups cannot win top-k, even when retained scores are negative."""
+        moe_config.dim = 4
+        moe_config.n_routed_experts = 4
+        moe_config.n_activated_experts = 2
+        moe_config.n_expert_groups = 2
+        moe_config.n_limited_groups = 1
+        moe_config.score_func = score_func
+        moe_config.norm_topk_prob = normalize
+        moe_config.route_scale = 1.5
+        moe_config.gate_bias_update_factor = 0.0
+        moe_config.aux_loss_coeff = 0.0
+        moe_config.force_e_score_correction_bias = correction_bias is not None
+        moe_config.dtype = torch.float32
+        gate = Gate(moe_config)
+        with torch.no_grad():
+            gate.weight.copy_(torch.eye(4))
+            if correction_bias is not None:
+                gate.e_score_correction_bias.fill_(correction_bias)
+
+        # Identity projection: token 0 prefers group {0, 1}, token 1 prefers
+        # group {2, 3}. A uniform correction preserves that ordering; -2 makes
+        # every corrected score negative, so zero-masked groups would win.
+        inputs = torch.tensor([[3.0, 1.0, 0.0, -2.0], [-2.0, 0.0, 1.0, 3.0]], requires_grad=True)
+        token_mask = torch.ones(2, dtype=torch.bool)
+        weights, indices, aux_loss = gate(inputs, token_mask, cp_mesh=None)
+        sorted_indices, order = indices.sort(dim=-1)
+        torch.testing.assert_close(sorted_indices, torch.tensor([[0, 1], [2, 3]]))
+        assert aux_loss is None
+        weights = weights.gather(1, order)
+
+        # The oracle uses the independently known retained experts, not another
+        # implementation of the group-selection or masking algorithm.
+        reference_inputs = inputs.detach().clone().requires_grad_(True)
+        reference_projection = torch.eye(4, requires_grad=True)
+        reference_logits = F.linear(reference_inputs, reference_projection)
+        if score_func == "softmax_with_bias":
+            reference_scores = reference_logits.softmax(dim=-1)
+        else:
+            reference_scores = reference_logits.sigmoid()
+        expected_weights = torch.stack((reference_scores[0, :2], reference_scores[1, 2:]))
+        if normalize:
+            expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+        expected_weights = expected_weights * moe_config.route_scale
+        torch.testing.assert_close(weights, expected_weights, rtol=1e-6, atol=1e-7)
+
+        # A nonuniform upstream gradient exercises the selected route weights;
+        # discrete group/expert IDs do not carry gradients through selection.
+        upstream_gradient = torch.tensor([[0.7, -1.3], [1.1, 0.2]])
+        actual_gradients = torch.autograd.grad(weights, (inputs, gate.weight), upstream_gradient)
+        expected_gradients = torch.autograd.grad(
+            expected_weights, (reference_inputs, reference_projection), upstream_gradient
+        )
+        for actual, expected in zip(actual_gradients, expected_gradients):
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+
     def test_gate_forward_softmax_with_bias_no_correction_bias(self, moe_config, device):
         """Test softmax_with_bias without e_score_correction_bias falls back to unbiased selection."""
         moe_config.score_func = "softmax_with_bias"
