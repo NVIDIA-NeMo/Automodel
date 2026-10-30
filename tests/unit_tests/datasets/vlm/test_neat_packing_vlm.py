@@ -12,14 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+import logging
+from types import SimpleNamespace
+
 import pytest
 import torch
+from PIL import Image
 
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     NeatPackConfig,
     _build_packed_vlm_sample,
     _compute_mrope_position_ids,
+    _estimate_sample_length,
+    _image_token_counter,
     _shift_sample,
     neat_pack_dataset_vlm,
 )
@@ -679,3 +686,255 @@ def test_image_sizes_and_ownership_survive_native_packing_and_collation():
     torch.testing.assert_close(media["image_grid_hws"][1], documents[1]["image_sizes"])
     assert documents[0]["pixel_values"].shape == (2, 3, 8, 8)
     assert documents[1]["pixel_values"].shape == (1, 3, 12, 4)
+
+
+# Qwen2-VL-style processor geometry: 14px patches merged 2x2, i.e. 28px per token side.
+_QWEN_STYLE_IMAGE_CFG = {
+    "patch_size": 14,
+    "merge_size": 2,
+    "factor": 28,
+    "min_pixels": 56 * 56,
+    "max_pixels": 28 * 28 * 1280,
+}
+
+
+def _processor(processor_cls, image_processor):
+    """A real ``processor_cls`` token-count contract over ``image_processor``, without loading a tokenizer."""
+    processor = processor_cls.__new__(processor_cls)
+    processor.image_processor = image_processor
+    return processor
+
+
+def _qwen3_5_processor():
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+
+    # Qwen3.5 geometry: 16px patches merged 2x2, resized to 64Ki-16Mi pixels.
+    image_processor = Qwen2VLImageProcessor(
+        patch_size=16, merge_size=2, temporal_patch_size=2, size={"shortest_edge": 65536, "longest_edge": 16777216}
+    )
+    return _processor(Qwen3VLProcessor, image_processor)
+
+
+def _gemma4_processor():
+    gemma4_image_processing = pytest.importorskip("transformers.models.gemma4.image_processing_gemma4")
+    from transformers.models.gemma4.processing_gemma4 import Gemma4Processor
+
+    return _processor(Gemma4Processor, gemma4_image_processing.Gemma4ImageProcessor())
+
+
+def _png_bytes(height, width):
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _image_example(image, text="abcdef"):
+    """Raw conversation with one image; ``"abcdef"`` estimates to 6 // 3 = 2 text tokens."""
+    content = [{"type": "image", "image": image}, {"type": "text", "text": text}]
+    return {"conversation": [{"role": "user", "content": content}]}
+
+
+class TestImageTokenCounter:
+    @pytest.mark.parametrize("height, width", [(64, 64), (100, 300), (280, 560), (1000, 3000), (5000, 4000)])
+    def test_matches_qwen3_5_processor_output(self, height, width):
+        processor = _qwen3_5_processor()
+        grid_thw = processor.image_processor(images=Image.new("RGB", (width, height)), return_tensors="pt")[
+            "image_grid_thw"
+        ]
+
+        assert _image_token_counter(processor)(height, width) == int(grid_thw.prod()) // 2**2
+
+    @pytest.mark.parametrize("height, width", [(64, 64), (100, 300), (280, 560), (1000, 3000)])
+    def test_matches_gemma4_processor_output(self, height, width):
+        processor = _gemma4_processor()
+        outputs = processor.image_processor(images=Image.new("RGB", (width, height)), return_tensors="pt")
+
+        assert _image_token_counter(processor)(height, width) == int(outputs["num_soft_tokens_per_image"][0])
+
+    def test_processor_without_token_count(self):
+        assert _image_token_counter(None) is None
+        assert _image_token_counter(SimpleNamespace(image_processor=SimpleNamespace(patch_size=14))) is None
+
+
+class TestEstimateSampleLength:
+    @pytest.mark.parametrize("form", ["bytes", "path", "dict_bytes", "dict_path"])
+    def test_decompression_bomb_falls_back(self, form, tmp_path, monkeypatch, caplog):
+        data = _png_bytes(64, 64)
+        path = tmp_path / "image.png"
+        path.write_bytes(data)
+        image = {
+            "bytes": data,
+            "path": str(path),
+            "dict_bytes": {"bytes": data, "path": None},
+            "dict_path": {"bytes": None, "path": str(path)},
+        }[form]
+        processor = _qwen3_5_processor()
+        example = _image_example(image)
+        # Trigger Pillow's real protection with a tiny image, without large allocations.
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+        with pytest.raises(Image.DecompressionBombError):
+            Image.open(io.BytesIO(data))
+
+        estimate = _estimate_sample_length(example, count_image_tokens=_image_token_counter(processor))
+
+        assert estimate.media_tokens == 500
+        assert estimate.total_tokens == 502
+        assert estimate.unsized_media == 1
+        with caplog.at_level(logging.WARNING):
+            packed = NeatPackConfig(pack_size=1024).build(
+                dataset=_FakeDataset([_make_vlm_sample(4)]), padding_idx=0, ds_raw=[example], processor=processor
+            )
+
+        assert packed.bins == [[0]]
+        assert "1 media items have no mm_inputs_meta and no readable image size" in caplog.text
+        # Planning fallback must leave Pillow's rejection in force for later decoding.
+        with pytest.raises(Image.DecompressionBombError):
+            Image.open(io.BytesIO(data))
+
+    @pytest.mark.parametrize("height, width", [(6432, 32), (32, 6432)])
+    def test_image_the_processor_rejects_falls_back(self, height, width, caplog):
+        processor = _qwen3_5_processor()
+        rejected = Image.new("RGB", (width, height))
+        ds_raw = [_image_example(Image.new("RGB", (280, 280))), _image_example(rejected)]
+        # Qwen rejects aspect ratios above 200, both when counting tokens and when tokenizing.
+        with pytest.raises(ValueError, match="aspect ratio must be smaller than 200"):
+            processor._get_num_multimodal_tokens(image_sizes=[(height, width)])
+
+        estimate = _estimate_sample_length(ds_raw[1], count_image_tokens=_image_token_counter(processor))
+
+        assert estimate.media_tokens == 500
+        assert estimate.total_tokens == 502
+        assert estimate.unsized_media == 1
+        with caplog.at_level(logging.WARNING):
+            packed = NeatPackConfig(pack_size=1024).build(
+                dataset=_FakeDataset([_make_vlm_sample(83), _make_vlm_sample(4)]),
+                padding_idx=0,
+                ds_raw=ds_raw,
+                processor=processor,
+            )
+
+        assert [sorted(bin_indices) for bin_indices in packed.bins] == [[0, 1]]
+        assert "1 media items have no mm_inputs_meta and no readable image size" in caplog.text
+        # Planning fallback must leave the rejection to tokenization, which replaces the sample.
+        with pytest.raises(ValueError, match="aspect ratio must be smaller than 200"):
+            processor.image_processor(images=rejected, return_tensors="pt")
+
+    @pytest.mark.parametrize("form", ["pil", "lazy_bytes", "decode_false_dict", "path"])
+    def test_image_tokens_come_from_image_size(self, form, tmp_path):
+        # Qwen3.5 resizes 280x560 to 288x576: (288 / 16) * (576 / 16) / 2**2 = 162 tokens.
+        data = _png_bytes(280, 560)
+        if form == "pil":
+            image = Image.new("RGB", (560, 280))
+        elif form == "lazy_bytes":
+            image = Image.open(io.BytesIO(data))
+        elif form == "decode_false_dict":
+            image = {"bytes": data, "path": None}
+        else:
+            path = tmp_path / "image.png"
+            path.write_bytes(data)
+            image = str(path)
+
+        count_image_tokens = _image_token_counter(_qwen3_5_processor())
+        estimate = _estimate_sample_length(_image_example(image), count_image_tokens=count_image_tokens)
+
+        assert estimate.media_tokens == 162
+        assert estimate.total_tokens == 164
+        assert estimate.unsized_media == 0
+
+    def test_unreadable_image_falls_back(self):
+        estimate = _estimate_sample_length(
+            _image_example("https://example.com/image.png"),
+            count_image_tokens=_image_token_counter(_qwen3_5_processor()),
+        )
+
+        assert estimate.media_tokens == 500
+        assert estimate.unsized_media == 1
+
+    def test_malformed_image_header_falls_back(self):
+        data = b"P6\n3\x807 23\n255\n"
+        # Pillow's PPM parser raises ValueError, not OSError, for the non-numeric width.
+        with pytest.raises(ValueError):
+            Image.open(io.BytesIO(data))
+
+        estimate = _estimate_sample_length(
+            _image_example(data), count_image_tokens=_image_token_counter(_qwen3_5_processor())
+        )
+
+        assert estimate.media_tokens == 500
+        assert estimate.unsized_media == 1
+
+    @pytest.mark.parametrize("height, width", [(0, 64), (64, 0)])
+    def test_image_without_pixels_falls_back(self, height, width):
+        estimate = _estimate_sample_length(
+            _image_example(Image.new("RGB", (width, height))),
+            count_image_tokens=_image_token_counter(_qwen3_5_processor()),
+        )
+
+        assert estimate.media_tokens == 500
+        assert estimate.unsized_media == 1
+
+    def test_missing_token_count_falls_back(self):
+        estimate = _estimate_sample_length(
+            _image_example(Image.new("RGB", (560, 280))), image_cfg=_QWEN_STYLE_IMAGE_CFG
+        )
+
+        assert estimate.media_tokens == 500
+        assert estimate.unsized_media == 1
+
+    def test_mm_inputs_meta_takes_precedence(self):
+        example = _image_example(Image.new("RGB", (560, 280)))
+        example["mm_inputs_meta"] = {"images_meta": [[560, 560]]}  # (40 * 40) / 4 = 400 tokens
+
+        estimate = _estimate_sample_length(
+            example, image_cfg=_QWEN_STYLE_IMAGE_CFG, count_image_tokens=_image_token_counter(_qwen3_5_processor())
+        )
+
+        assert estimate.media_tokens == 400
+        assert estimate.unsized_media == 0
+
+
+class TestNeatPackingFill:
+    def test_packs_use_real_image_sizes(self):
+        # Each sample estimates to 81 image + 2 text tokens, so four fit one 1024-token pack.
+        # The 500-token fallback would need two packs.
+        ds_raw = [_image_example(Image.new("RGB", (280, 280))) for _ in range(4)]
+        dataset = _FakeDataset([_make_vlm_sample(83) for _ in range(4)])
+
+        packed = neat_pack_dataset_vlm(dataset, pack_size=1024, ds_raw=ds_raw, processor=_qwen3_5_processor())
+
+        assert len(packed) == 1
+        assert sorted(packed.bins[0]) == [0, 1, 2, 3]
+
+    def test_packs_count_tokens_with_the_processors_own_resize(self):
+        # Gemma4 turns a 64x64 image into 256 tokens, so 258-token samples fit three to a 1024-token
+        # pack. Qwen2-VL resize arithmetic would count 4 tokens and over-fill one pack with all four.
+        ds_raw = [_image_example(Image.new("RGB", (64, 64))) for _ in range(4)]
+        dataset = _FakeDataset([_make_vlm_sample(258) for _ in range(4)])
+
+        packed = neat_pack_dataset_vlm(dataset, pack_size=1024, ds_raw=ds_raw, processor=_gemma4_processor())
+
+        assert sorted(len(bin_indices) for bin_indices in packed.bins) == [1, 3]
+
+    def test_warns_when_media_size_unknown(self, caplog):
+        ds_raw = [_image_example("https://example.com/image.png") for _ in range(2)]
+        dataset = _FakeDataset([_make_vlm_sample(4) for _ in range(2)])
+
+        with caplog.at_level(logging.WARNING):
+            neat_pack_dataset_vlm(dataset, pack_size=2048, ds_raw=ds_raw, processor=_qwen3_5_processor())
+
+        assert "2 media items have no mm_inputs_meta and no readable image size" in caplog.text
+
+    def test_warns_when_overflow_drops_samples(self, caplog):
+        # Text-only estimates of 1 token put both samples in one bin, but each really
+        # shifts to 4 tokens, so the second cannot fit the 6-token pack.
+        ds_raw = [{"conversation": [{"role": "user", "content": "abcdef"}]} for _ in range(2)]
+        dataset = _FakeDataset([_make_vlm_sample(5) for _ in range(2)])
+        packed = neat_pack_dataset_vlm(dataset, pack_size=6, ds_raw=ds_raw)
+        assert len(packed) == 1
+
+        with caplog.at_level(logging.WARNING):
+            pack = packed[0]
+
+        assert len(pack["input_ids"]) == 4
+        assert "Pack 0: dropped 1 of 2 samples that did not fit pack_size 6" in caplog.text

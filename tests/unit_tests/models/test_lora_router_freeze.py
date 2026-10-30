@@ -34,6 +34,8 @@ from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Conf
 from nemo_automodel.components.models.deepseek_v32.model import DeepseekV32ForCausalLM
 from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM
 
+pytestmark = pytest.mark.cpu_only
+
 MODEL_TYPES = [
     pytest.param(DeepseekV3Config, DeepseekV3ForCausalLM, id="deepseek-v3"),
     pytest.param(DeepseekV32Config, DeepseekV32ForCausalLM, id="deepseek-v32"),

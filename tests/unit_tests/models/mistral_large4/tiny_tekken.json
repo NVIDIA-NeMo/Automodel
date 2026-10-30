@@ -1,0 +1,6314 @@
+{
+  "config": {
+    "pattern": "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}{1,3}(?=(?:\\p{N}{3})*(?!\\p{N}))|\\p{N}{1,2}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    "num_vocab_tokens": 1256,
+    "default_vocab_size": 1256,
+    "default_num_special_tokens": 1000,
+    "version": "v15"
+  },
+  "vocab": [
+    {
+      "rank": 0,
+      "token_bytes": "AA==",
+      "token_str": "\u0000"
+    },
+    {
+      "rank": 1,
+      "token_bytes": "AQ==",
+      "token_str": "\u0001"
+    },
+    {
+      "rank": 2,
+      "token_bytes": "Ag==",
+      "token_str": "\u0002"
+    },
+    {
+      "rank": 3,
+      "token_bytes": "Aw==",
+      "token_str": "\u0003"
+    },
+    {
+      "rank": 4,
+      "token_bytes": "BA==",
+      "token_str": "\u0004"
+    },
+    {
+      "rank": 5,
+      "token_bytes": "BQ==",
+      "token_str": "\u0005"
+    },
+    {
+      "rank": 6,
+      "token_bytes": "Bg==",
+      "token_str": "\u0006"
+    },
+    {
+      "rank": 7,
+      "token_bytes": "Bw==",
+      "token_str": "\u0007"
+    },
+    {
+      "rank": 8,
+      "token_bytes": "CA==",
+      "token_str": "\b"
+    },
+    {
+      "rank": 9,
+      "token_bytes": "CQ==",
+      "token_str": "\t"
+    },
+    {
+      "rank": 10,
+      "token_bytes": "Cg==",
+      "token_str": "\n"
+    },
+    {
+      "rank": 11,
+      "token_bytes": "Cw==",
+      "token_str": "\u000b"
+    },
+    {
+      "rank": 12,
+      "token_bytes": "DA==",
+      "token_str": "\f"
+    },
+    {
+      "rank": 13,
+      "token_bytes": "DQ==",
+      "token_str": "\r"
+    },
+    {
+      "rank": 14,
+      "token_bytes": "Dg==",
+      "token_str": "\u000e"
+    },
+    {
+      "rank": 15,
+      "token_bytes": "Dw==",
+      "token_str": "\u000f"
+    },
+    {
+      "rank": 16,
+      "token_bytes": "EA==",
+      "token_str": "\u0010"
+    },
+    {
+      "rank": 17,
+      "token_bytes": "EQ==",
+      "token_str": "\u0011"
+    },
+    {
+      "rank": 18,
+      "token_bytes": "Eg==",
+      "token_str": "\u0012"
+    },
+    {
+      "rank": 19,
+      "token_bytes": "Ew==",
+      "token_str": "\u0013"
+    },
+    {
+      "rank": 20,
+      "token_bytes": "FA==",
+      "token_str": "\u0014"
+    },
+    {
+      "rank": 21,
+      "token_bytes": "FQ==",
+      "token_str": "\u0015"
+    },
+    {
+      "rank": 22,
+      "token_bytes": "Fg==",
+      "token_str": "\u0016"
+    },
+    {
+      "rank": 23,
+      "token_bytes": "Fw==",
+      "token_str": "\u0017"
+    },
+    {
+      "rank": 24,
+      "token_bytes": "GA==",
+      "token_str": "\u0018"
+    },
+    {
+      "rank": 25,
+      "token_bytes": "GQ==",
+      "token_str": "\u0019"
+    },
+    {
+      "rank": 26,
+      "token_bytes": "Gg==",
+      "token_str": "\u001a"
+    },
+    {
+      "rank": 27,
+      "token_bytes": "Gw==",
+      "token_str": "\u001b"
+    },
+    {
+      "rank": 28,
+      "token_bytes": "HA==",
+      "token_str": "\u001c"
+    },
+    {
+      "rank": 29,
+      "token_bytes": "HQ==",
+      "token_str": "\u001d"
+    },
+    {
+      "rank": 30,
+      "token_bytes": "Hg==",
+      "token_str": "\u001e"
+    },
+    {
+      "rank": 31,
+      "token_bytes": "Hw==",
+      "token_str": "\u001f"
+    },
+    {
+      "rank": 32,
+      "token_bytes": "IA==",
+      "token_str": " "
+    },
+    {
+      "rank": 33,
+      "token_bytes": "IQ==",
+      "token_str": "!"
+    },
+    {
+      "rank": 34,
+      "token_bytes": "Ig==",
+      "token_str": "\""
+    },
+    {
+      "rank": 35,
+      "token_bytes": "Iw==",
+      "token_str": "#"
+    },
+    {
+      "rank": 36,
+      "token_bytes": "JA==",
+      "token_str": "$"
+    },
+    {
+      "rank": 37,
+      "token_bytes": "JQ==",
+      "token_str": "%"
+    },
+    {
+      "rank": 38,
+      "token_bytes": "Jg==",
+      "token_str": "&"
+    },
+    {
+      "rank": 39,
+      "token_bytes": "Jw==",
+      "token_str": "'"
+    },
+    {
+      "rank": 40,
+      "token_bytes": "KA==",
+      "token_str": "("
+    },
+    {
+      "rank": 41,
+      "token_bytes": "KQ==",
+      "token_str": ")"
+    },
+    {
+      "rank": 42,
+      "token_bytes": "Kg==",
+      "token_str": "*"
+    },
+    {
+      "rank": 43,
+      "token_bytes": "Kw==",
+      "token_str": "+"
+    },
+    {
+      "rank": 44,
+      "token_bytes": "LA==",
+      "token_str": ","
+    },
+    {
+      "rank": 45,
+      "token_bytes": "LQ==",
+      "token_str": "-"
+    },
+    {
+      "rank": 46,
+      "token_bytes": "Lg==",
+      "token_str": "."
+    },
+    {
+      "rank": 47,
+      "token_bytes": "Lw==",
+      "token_str": "/"
+    },
+    {
+      "rank": 48,
+      "token_bytes": "MA==",
+      "token_str": "0"
+    },
+    {
+      "rank": 49,
+      "token_bytes": "MQ==",
+      "token_str": "1"
+    },
+    {
+      "rank": 50,
+      "token_bytes": "Mg==",
+      "token_str": "2"
+    },
+    {
+      "rank": 51,
+      "token_bytes": "Mw==",
+      "token_str": "3"
+    },
+    {
+      "rank": 52,
+      "token_bytes": "NA==",
+      "token_str": "4"
+    },
+    {
+      "rank": 53,
+      "token_bytes": "NQ==",
+      "token_str": "5"
+    },
+    {
+      "rank": 54,
+      "token_bytes": "Ng==",
+      "token_str": "6"
+    },
+    {
+      "rank": 55,
+      "token_bytes": "Nw==",
+      "token_str": "7"
+    },
+    {
+      "rank": 56,
+      "token_bytes": "OA==",
+      "token_str": "8"
+    },
+    {
+      "rank": 57,
+      "token_bytes": "OQ==",
+      "token_str": "9"
+    },
+    {
+      "rank": 58,
+      "token_bytes": "Og==",
+      "token_str": ":"
+    },
+    {
+      "rank": 59,
+      "token_bytes": "Ow==",
+      "token_str": ";"
+    },
+    {
+      "rank": 60,
+      "token_bytes": "PA==",
+      "token_str": "<"
+    },
+    {
+      "rank": 61,
+      "token_bytes": "PQ==",
+      "token_str": "="
+    },
+    {
+      "rank": 62,
+      "token_bytes": "Pg==",
+      "token_str": ">"
+    },
+    {
+      "rank": 63,
+      "token_bytes": "Pw==",
+      "token_str": "?"
+    },
+    {
+      "rank": 64,
+      "token_bytes": "QA==",
+      "token_str": "@"
+    },
+    {
+      "rank": 65,
+      "token_bytes": "QQ==",
+      "token_str": "A"
+    },
+    {
+      "rank": 66,
+      "token_bytes": "Qg==",
+      "token_str": "B"
+    },
+    {
+      "rank": 67,
+      "token_bytes": "Qw==",
+      "token_str": "C"
+    },
+    {
+      "rank": 68,
+      "token_bytes": "RA==",
+      "token_str": "D"
+    },
+    {
+      "rank": 69,
+      "token_bytes": "RQ==",
+      "token_str": "E"
+    },
+    {
+      "rank": 70,
+      "token_bytes": "Rg==",
+      "token_str": "F"
+    },
+    {
+      "rank": 71,
+      "token_bytes": "Rw==",
+      "token_str": "G"
+    },
+    {
+      "rank": 72,
+      "token_bytes": "SA==",
+      "token_str": "H"
+    },
+    {
+      "rank": 73,
+      "token_bytes": "SQ==",
+      "token_str": "I"
+    },
+    {
+      "rank": 74,
+      "token_bytes": "Sg==",
+      "token_str": "J"
+    },
+    {
+      "rank": 75,
+      "token_bytes": "Sw==",
+      "token_str": "K"
+    },
+    {
+      "rank": 76,
+      "token_bytes": "TA==",
+      "token_str": "L"
+    },
+    {
+      "rank": 77,
+      "token_bytes": "TQ==",
+      "token_str": "M"
+    },
+    {
+      "rank": 78,
+      "token_bytes": "Tg==",
+      "token_str": "N"
+    },
+    {
+      "rank": 79,
+      "token_bytes": "Tw==",
+      "token_str": "O"
+    },
+    {
+      "rank": 80,
+      "token_bytes": "UA==",
+      "token_str": "P"
+    },
+    {
+      "rank": 81,
+      "token_bytes": "UQ==",
+      "token_str": "Q"
+    },
+    {
+      "rank": 82,
+      "token_bytes": "Ug==",
+      "token_str": "R"
+    },
+    {
+      "rank": 83,
+      "token_bytes": "Uw==",
+      "token_str": "S"
+    },
+    {
+      "rank": 84,
+      "token_bytes": "VA==",
+      "token_str": "T"
+    },
+    {
+      "rank": 85,
+      "token_bytes": "VQ==",
+      "token_str": "U"
+    },
+    {
+      "rank": 86,
+      "token_bytes": "Vg==",
+      "token_str": "V"
+    },
+    {
+      "rank": 87,
+      "token_bytes": "Vw==",
+      "token_str": "W"
+    },
+    {
+      "rank": 88,
+      "token_bytes": "WA==",
+      "token_str": "X"
+    },
+    {
+      "rank": 89,
+      "token_bytes": "WQ==",
+      "token_str": "Y"
+    },
+    {
+      "rank": 90,
+      "token_bytes": "Wg==",
+      "token_str": "Z"
+    },
+    {
+      "rank": 91,
+      "token_bytes": "Ww==",
+      "token_str": "["
+    },
+    {
+      "rank": 92,
+      "token_bytes": "XA==",
+      "token_str": "\\"
+    },
+    {
+      "rank": 93,
+      "token_bytes": "XQ==",
+      "token_str": "]"
+    },
+    {
+      "rank": 94,
+      "token_bytes": "Xg==",
+      "token_str": "^"
+    },
+    {
+      "rank": 95,
+      "token_bytes": "Xw==",
+      "token_str": "_"
+    },
+    {
+      "rank": 96,
+      "token_bytes": "YA==",
+      "token_str": "`"
+    },
+    {
+      "rank": 97,
+      "token_bytes": "YQ==",
+      "token_str": "a"
+    },
+    {
+      "rank": 98,
+      "token_bytes": "Yg==",
+      "token_str": "b"
+    },
+    {
+      "rank": 99,
+      "token_bytes": "Yw==",
+      "token_str": "c"
+    },
+    {
+      "rank": 100,
+      "token_bytes": "ZA==",
+      "token_str": "d"
+    },
+    {
+      "rank": 101,
+      "token_bytes": "ZQ==",
+      "token_str": "e"
+    },
+    {
+      "rank": 102,
+      "token_bytes": "Zg==",
+      "token_str": "f"
+    },
+    {
+      "rank": 103,
+      "token_bytes": "Zw==",
+      "token_str": "g"
+    },
+    {
+      "rank": 104,
+      "token_bytes": "aA==",
+      "token_str": "h"
+    },
+    {
+      "rank": 105,
+      "token_bytes": "aQ==",
+      "token_str": "i"
+    },
+    {
+      "rank": 106,
+      "token_bytes": "ag==",
+      "token_str": "j"
+    },
+    {
+      "rank": 107,
+      "token_bytes": "aw==",
+      "token_str": "k"
+    },
+    {
+      "rank": 108,
+      "token_bytes": "bA==",
+      "token_str": "l"
+    },
+    {
+      "rank": 109,
+      "token_bytes": "bQ==",
+      "token_str": "m"
+    },
+    {
+      "rank": 110,
+      "token_bytes": "bg==",
+      "token_str": "n"
+    },
+    {
+      "rank": 111,
+      "token_bytes": "bw==",
+      "token_str": "o"
+    },
+    {
+      "rank": 112,
+      "token_bytes": "cA==",
+      "token_str": "p"
+    },
+    {
+      "rank": 113,
+      "token_bytes": "cQ==",
+      "token_str": "q"
+    },
+    {
+      "rank": 114,
+      "token_bytes": "cg==",
+      "token_str": "r"
+    },
+    {
+      "rank": 115,
+      "token_bytes": "cw==",
+      "token_str": "s"
+    },
+    {
+      "rank": 116,
+      "token_bytes": "dA==",
+      "token_str": "t"
+    },
+    {
+      "rank": 117,
+      "token_bytes": "dQ==",
+      "token_str": "u"
+    },
+    {
+      "rank": 118,
+      "token_bytes": "dg==",
+      "token_str": "v"
+    },
+    {
+      "rank": 119,
+      "token_bytes": "dw==",
+      "token_str": "w"
+    },
+    {
+      "rank": 120,
+      "token_bytes": "eA==",
+      "token_str": "x"
+    },
+    {
+      "rank": 121,
+      "token_bytes": "eQ==",
+      "token_str": "y"
+    },
+    {
+      "rank": 122,
+      "token_bytes": "eg==",
+      "token_str": "z"
+    },
+    {
+      "rank": 123,
+      "token_bytes": "ew==",
+      "token_str": "{"
+    },
+    {
+      "rank": 124,
+      "token_bytes": "fA==",
+      "token_str": "|"
+    },
+    {
+      "rank": 125,
+      "token_bytes": "fQ==",
+      "token_str": "}"
+    },
+    {
+      "rank": 126,
+      "token_bytes": "fg==",
+      "token_str": "~"
+    },
+    {
+      "rank": 127,
+      "token_bytes": "fw==",
+      "token_str": "\u007f"
+    },
+    {
+      "rank": 128,
+      "token_bytes": "gA==",
+      "token_str": null
+    },
+    {
+      "rank": 129,
+      "token_bytes": "gQ==",
+      "token_str": null
+    },
+    {
+      "rank": 130,
+      "token_bytes": "gg==",
+      "token_str": null
+    },
+    {
+      "rank": 131,
+      "token_bytes": "gw==",
+      "token_str": null
+    },
+    {
+      "rank": 132,
+      "token_bytes": "hA==",
+      "token_str": null
+    },
+    {
+      "rank": 133,
+      "token_bytes": "hQ==",
+      "token_str": null
+    },
+    {
+      "rank": 134,
+      "token_bytes": "hg==",
+      "token_str": null
+    },
+    {
+      "rank": 135,
+      "token_bytes": "hw==",
+      "token_str": null
+    },
+    {
+      "rank": 136,
+      "token_bytes": "iA==",
+      "token_str": null
+    },
+    {
+      "rank": 137,
+      "token_bytes": "iQ==",
+      "token_str": null
+    },
+    {
+      "rank": 138,
+      "token_bytes": "ig==",
+      "token_str": null
+    },
+    {
+      "rank": 139,
+      "token_bytes": "iw==",
+      "token_str": null
+    },
+    {
+      "rank": 140,
+      "token_bytes": "jA==",
+      "token_str": null
+    },
+    {
+      "rank": 141,
+      "token_bytes": "jQ==",
+      "token_str": null
+    },
+    {
+      "rank": 142,
+      "token_bytes": "jg==",
+      "token_str": null
+    },
+    {
+      "rank": 143,
+      "token_bytes": "jw==",
+      "token_str": null
+    },
+    {
+      "rank": 144,
+      "token_bytes": "kA==",
+      "token_str": null
+    },
+    {
+      "rank": 145,
+      "token_bytes": "kQ==",
+      "token_str": null
+    },
+    {
+      "rank": 146,
+      "token_bytes": "kg==",
+      "token_str": null
+    },
+    {
+      "rank": 147,
+      "token_bytes": "kw==",
+      "token_str": null
+    },
+    {
+      "rank": 148,
+      "token_bytes": "lA==",
+      "token_str": null
+    },
+    {
+      "rank": 149,
+      "token_bytes": "lQ==",
+      "token_str": null
+    },
+    {
+      "rank": 150,
+      "token_bytes": "lg==",
+      "token_str": null
+    },
+    {
+      "rank": 151,
+      "token_bytes": "lw==",
+      "token_str": null
+    },
+    {
+      "rank": 152,
+      "token_bytes": "mA==",
+      "token_str": null
+    },
+    {
+      "rank": 153,
+      "token_bytes": "mQ==",
+      "token_str": null
+    },
+    {
+      "rank": 154,
+      "token_bytes": "mg==",
+      "token_str": null
+    },
+    {
+      "rank": 155,
+      "token_bytes": "mw==",
+      "token_str": null
+    },
+    {
+      "rank": 156,
+      "token_bytes": "nA==",
+      "token_str": null
+    },
+    {
+      "rank": 157,
+      "token_bytes": "nQ==",
+      "token_str": null
+    },
+    {
+      "rank": 158,
+      "token_bytes": "ng==",
+      "token_str": null
+    },
+    {
+      "rank": 159,
+      "token_bytes": "nw==",
+      "token_str": null
+    },
+    {
+      "rank": 160,
+      "token_bytes": "oA==",
+      "token_str": null
+    },
+    {
+      "rank": 161,
+      "token_bytes": "oQ==",
+      "token_str": null
+    },
+    {
+      "rank": 162,
+      "token_bytes": "og==",
+      "token_str": null
+    },
+    {
+      "rank": 163,
+      "token_bytes": "ow==",
+      "token_str": null
+    },
+    {
+      "rank": 164,
+      "token_bytes": "pA==",
+      "token_str": null
+    },
+    {
+      "rank": 165,
+      "token_bytes": "pQ==",
+      "token_str": null
+    },
+    {
+      "rank": 166,
+      "token_bytes": "pg==",
+      "token_str": null
+    },
+    {
+      "rank": 167,
+      "token_bytes": "pw==",
+      "token_str": null
+    },
+    {
+      "rank": 168,
+      "token_bytes": "qA==",
+      "token_str": null
+    },
+    {
+      "rank": 169,
+      "token_bytes": "qQ==",
+      "token_str": null
+    },
+    {
+      "rank": 170,
+      "token_bytes": "qg==",
+      "token_str": null
+    },
+    {
+      "rank": 171,
+      "token_bytes": "qw==",
+      "token_str": null
+    },
+    {
+      "rank": 172,
+      "token_bytes": "rA==",
+      "token_str": null
+    },
+    {
+      "rank": 173,
+      "token_bytes": "rQ==",
+      "token_str": null
+    },
+    {
+      "rank": 174,
+      "token_bytes": "rg==",
+      "token_str": null
+    },
+    {
+      "rank": 175,
+      "token_bytes": "rw==",
+      "token_str": null
+    },
+    {
+      "rank": 176,
+      "token_bytes": "sA==",
+      "token_str": null
+    },
+    {
+      "rank": 177,
+      "token_bytes": "sQ==",
+      "token_str": null
+    },
+    {
+      "rank": 178,
+      "token_bytes": "sg==",
+      "token_str": null
+    },
+    {
+      "rank": 179,
+      "token_bytes": "sw==",
+      "token_str": null
+    },
+    {
+      "rank": 180,
+      "token_bytes": "tA==",
+      "token_str": null
+    },
+    {
+      "rank": 181,
+      "token_bytes": "tQ==",
+      "token_str": null
+    },
+    {
+      "rank": 182,
+      "token_bytes": "tg==",
+      "token_str": null
+    },
+    {
+      "rank": 183,
+      "token_bytes": "tw==",
+      "token_str": null
+    },
+    {
+      "rank": 184,
+      "token_bytes": "uA==",
+      "token_str": null
+    },
+    {
+      "rank": 185,
+      "token_bytes": "uQ==",
+      "token_str": null
+    },
+    {
+      "rank": 186,
+      "token_bytes": "ug==",
+      "token_str": null
+    },
+    {
+      "rank": 187,
+      "token_bytes": "uw==",
+      "token_str": null
+    },
+    {
+      "rank": 188,
+      "token_bytes": "vA==",
+      "token_str": null
+    },
+    {
+      "rank": 189,
+      "token_bytes": "vQ==",
+      "token_str": null
+    },
+    {
+      "rank": 190,
+      "token_bytes": "vg==",
+      "token_str": null
+    },
+    {
+      "rank": 191,
+      "token_bytes": "vw==",
+      "token_str": null
+    },
+    {
+      "rank": 192,
+      "token_bytes": "wA==",
+      "token_str": null
+    },
+    {
+      "rank": 193,
+      "token_bytes": "wQ==",
+      "token_str": null
+    },
+    {
+      "rank": 194,
+      "token_bytes": "wg==",
+      "token_str": null
+    },
+    {
+      "rank": 195,
+      "token_bytes": "ww==",
+      "token_str": null
+    },
+    {
+      "rank": 196,
+      "token_bytes": "xA==",
+      "token_str": null
+    },
+    {
+      "rank": 197,
+      "token_bytes": "xQ==",
+      "token_str": null
+    },
+    {
+      "rank": 198,
+      "token_bytes": "xg==",
+      "token_str": null
+    },
+    {
+      "rank": 199,
+      "token_bytes": "xw==",
+      "token_str": null
+    },
+    {
+      "rank": 200,
+      "token_bytes": "yA==",
+      "token_str": null
+    },
+    {
+      "rank": 201,
+      "token_bytes": "yQ==",
+      "token_str": null
+    },
+    {
+      "rank": 202,
+      "token_bytes": "yg==",
+      "token_str": null
+    },
+    {
+      "rank": 203,
+      "token_bytes": "yw==",
+      "token_str": null
+    },
+    {
+      "rank": 204,
+      "token_bytes": "zA==",
+      "token_str": null
+    },
+    {
+      "rank": 205,
+      "token_bytes": "zQ==",
+      "token_str": null
+    },
+    {
+      "rank": 206,
+      "token_bytes": "zg==",
+      "token_str": null
+    },
+    {
+      "rank": 207,
+      "token_bytes": "zw==",
+      "token_str": null
+    },
+    {
+      "rank": 208,
+      "token_bytes": "0A==",
+      "token_str": null
+    },
+    {
+      "rank": 209,
+      "token_bytes": "0Q==",
+      "token_str": null
+    },
+    {
+      "rank": 210,
+      "token_bytes": "0g==",
+      "token_str": null
+    },
+    {
+      "rank": 211,
+      "token_bytes": "0w==",
+      "token_str": null
+    },
+    {
+      "rank": 212,
+      "token_bytes": "1A==",
+      "token_str": null
+    },
+    {
+      "rank": 213,
+      "token_bytes": "1Q==",
+      "token_str": null
+    },
+    {
+      "rank": 214,
+      "token_bytes": "1g==",
+      "token_str": null
+    },
+    {
+      "rank": 215,
+      "token_bytes": "1w==",
+      "token_str": null
+    },
+    {
+      "rank": 216,
+      "token_bytes": "2A==",
+      "token_str": null
+    },
+    {
+      "rank": 217,
+      "token_bytes": "2Q==",
+      "token_str": null
+    },
+    {
+      "rank": 218,
+      "token_bytes": "2g==",
+      "token_str": null
+    },
+    {
+      "rank": 219,
+      "token_bytes": "2w==",
+      "token_str": null
+    },
+    {
+      "rank": 220,
+      "token_bytes": "3A==",
+      "token_str": null
+    },
+    {
+      "rank": 221,
+      "token_bytes": "3Q==",
+      "token_str": null
+    },
+    {
+      "rank": 222,
+      "token_bytes": "3g==",
+      "token_str": null
+    },
+    {
+      "rank": 223,
+      "token_bytes": "3w==",
+      "token_str": null
+    },
+    {
+      "rank": 224,
+      "token_bytes": "4A==",
+      "token_str": null
+    },
+    {
+      "rank": 225,
+      "token_bytes": "4Q==",
+      "token_str": null
+    },
+    {
+      "rank": 226,
+      "token_bytes": "4g==",
+      "token_str": null
+    },
+    {
+      "rank": 227,
+      "token_bytes": "4w==",
+      "token_str": null
+    },
+    {
+      "rank": 228,
+      "token_bytes": "5A==",
+      "token_str": null
+    },
+    {
+      "rank": 229,
+      "token_bytes": "5Q==",
+      "token_str": null
+    },
+    {
+      "rank": 230,
+      "token_bytes": "5g==",
+      "token_str": null
+    },
+    {
+      "rank": 231,
+      "token_bytes": "5w==",
+      "token_str": null
+    },
+    {
+      "rank": 232,
+      "token_bytes": "6A==",
+      "token_str": null
+    },
+    {
+      "rank": 233,
+      "token_bytes": "6Q==",
+      "token_str": null
+    },
+    {
+      "rank": 234,
+      "token_bytes": "6g==",
+      "token_str": null
+    },
+    {
+      "rank": 235,
+      "token_bytes": "6w==",
+      "token_str": null
+    },
+    {
+      "rank": 236,
+      "token_bytes": "7A==",
+      "token_str": null
+    },
+    {
+      "rank": 237,
+      "token_bytes": "7Q==",
+      "token_str": null
+    },
+    {
+      "rank": 238,
+      "token_bytes": "7g==",
+      "token_str": null
+    },
+    {
+      "rank": 239,
+      "token_bytes": "7w==",
+      "token_str": null
+    },
+    {
+      "rank": 240,
+      "token_bytes": "8A==",
+      "token_str": null
+    },
+    {
+      "rank": 241,
+      "token_bytes": "8Q==",
+      "token_str": null
+    },
+    {
+      "rank": 242,
+      "token_bytes": "8g==",
+      "token_str": null
+    },
+    {
+      "rank": 243,
+      "token_bytes": "8w==",
+      "token_str": null
+    },
+    {
+      "rank": 244,
+      "token_bytes": "9A==",
+      "token_str": null
+    },
+    {
+      "rank": 245,
+      "token_bytes": "9Q==",
+      "token_str": null
+    },
+    {
+      "rank": 246,
+      "token_bytes": "9g==",
+      "token_str": null
+    },
+    {
+      "rank": 247,
+      "token_bytes": "9w==",
+      "token_str": null
+    },
+    {
+      "rank": 248,
+      "token_bytes": "+A==",
+      "token_str": null
+    },
+    {
+      "rank": 249,
+      "token_bytes": "+Q==",
+      "token_str": null
+    },
+    {
+      "rank": 250,
+      "token_bytes": "+g==",
+      "token_str": null
+    },
+    {
+      "rank": 251,
+      "token_bytes": "+w==",
+      "token_str": null
+    },
+    {
+      "rank": 252,
+      "token_bytes": "/A==",
+      "token_str": null
+    },
+    {
+      "rank": 253,
+      "token_bytes": "/Q==",
+      "token_str": null
+    },
+    {
+      "rank": 254,
+      "token_bytes": "/g==",
+      "token_str": null
+    },
+    {
+      "rank": 255,
+      "token_bytes": "/w==",
+      "token_str": null
+    }
+  ],
+  "special_tokens": [
+    {
+      "rank": 0,
+      "token_str": "<unk>",
+      "is_control": true
+    },
+    {
+      "rank": 1,
+      "token_str": "<s>",
+      "is_control": true
+    },
+    {
+      "rank": 2,
+      "token_str": "</s>",
+      "is_control": true
+    },
+    {
+      "rank": 3,
+      "token_str": "[INST]",
+      "is_control": true
+    },
+    {
+      "rank": 4,
+      "token_str": "[/INST]",
+      "is_control": true
+    },
+    {
+      "rank": 5,
+      "token_str": "[AVAILABLE_TOOLS]",
+      "is_control": true
+    },
+    {
+      "rank": 6,
+      "token_str": "[/AVAILABLE_TOOLS]",
+      "is_control": true
+    },
+    {
+      "rank": 7,
+      "token_str": "[TOOL_RESULTS]",
+      "is_control": true
+    },
+    {
+      "rank": 8,
+      "token_str": "[/TOOL_RESULTS]",
+      "is_control": true
+    },
+    {
+      "rank": 9,
+      "token_str": "[TOOL_CALLS]",
+      "is_control": true
+    },
+    {
+      "rank": 10,
+      "token_str": "[IMG]",
+      "is_control": true
+    },
+    {
+      "rank": 11,
+      "token_str": "<pad>",
+      "is_control": true
+    },
+    {
+      "rank": 12,
+      "token_str": "[IMG_BREAK]",
+      "is_control": true
+    },
+    {
+      "rank": 13,
+      "token_str": "[IMG_END]",
+      "is_control": true
+    },
+    {
+      "rank": 14,
+      "token_str": "[PREFIX]",
+      "is_control": true
+    },
+    {
+      "rank": 15,
+      "token_str": "[MIDDLE]",
+      "is_control": true
+    },
+    {
+      "rank": 16,
+      "token_str": "[SUFFIX]",
+      "is_control": true
+    },
+    {
+      "rank": 17,
+      "token_str": "[SYSTEM_PROMPT]",
+      "is_control": true
+    },
+    {
+      "rank": 18,
+      "token_str": "[/SYSTEM_PROMPT]",
+      "is_control": true
+    },
+    {
+      "rank": 19,
+      "token_str": "[TOOL_CONTENT]",
+      "is_control": true
+    },
+    {
+      "rank": 20,
+      "token_str": "<SPECIAL_20>",
+      "is_control": true
+    },
+    {
+      "rank": 21,
+      "token_str": "<SPECIAL_21>",
+      "is_control": true
+    },
+    {
+      "rank": 22,
+      "token_str": "<SPECIAL_22>",
+      "is_control": true
+    },
+    {
+      "rank": 23,
+      "token_str": "<SPECIAL_23>",
+      "is_control": true
+    },
+    {
+      "rank": 24,
+      "token_str": "[AUDIO]",
+      "is_control": true
+    },
+    {
+      "rank": 25,
+      "token_str": "[BEGIN_AUDIO]",
+      "is_control": true
+    },
+    {
+      "rank": 26,
+      "token_str": "<SPECIAL_26>",
+      "is_control": true
+    },
+    {
+      "rank": 27,
+      "token_str": "<SPECIAL_27>",
+      "is_control": true
+    },
+    {
+      "rank": 28,
+      "token_str": "<SPECIAL_28>",
+      "is_control": true
+    },
+    {
+      "rank": 29,
+      "token_str": "<SPECIAL_29>",
+      "is_control": true
+    },
+    {
+      "rank": 30,
+      "token_str": "<SPECIAL_30>",
+      "is_control": true
+    },
+    {
+      "rank": 31,
+      "token_str": "<SPECIAL_31>",
+      "is_control": true
+    },
+    {
+      "rank": 32,
+      "token_str": "[ARGS]",
+      "is_control": true
+    },
+    {
+      "rank": 33,
+      "token_str": "[CALL_ID]",
+      "is_control": true
+    },
+    {
+      "rank": 34,
+      "token_str": "[THINK]",
+      "is_control": false
+    },
+    {
+      "rank": 35,
+      "token_str": "[/THINK]",
+      "is_control": false
+    },
+    {
+      "rank": 36,
+      "token_str": "[MODEL_SETTINGS]",
+      "is_control": true
+    },
+    {
+      "rank": 37,
+      "token_str": "[/MODEL_SETTINGS]",
+      "is_control": true
+    },
+    {
+      "rank": 38,
+      "token_str": "<SPECIAL_38>",
+      "is_control": true
+    },
+    {
+      "rank": 39,
+      "token_str": "<SPECIAL_39>",
+      "is_control": true
+    },
+    {
+      "rank": 40,
+      "token_str": "<SPECIAL_40>",
+      "is_control": true
+    },
+    {
+      "rank": 41,
+      "token_str": "<SPECIAL_41>",
+      "is_control": true
+    },
+    {
+      "rank": 42,
+      "token_str": "<SPECIAL_42>",
+      "is_control": true
+    },
+    {
+      "rank": 43,
+      "token_str": "<SPECIAL_43>",
+      "is_control": true
+    },
+    {
+      "rank": 44,
+      "token_str": "<SPECIAL_44>",
+      "is_control": true
+    },
+    {
+      "rank": 45,
+      "token_str": "<SPECIAL_45>",
+      "is_control": true
+    },
+    {
+      "rank": 46,
+      "token_str": "<SPECIAL_46>",
+      "is_control": true
+    },
+    {
+      "rank": 47,
+      "token_str": "<SPECIAL_47>",
+      "is_control": true
+    },
+    {
+      "rank": 48,
+      "token_str": "<SPECIAL_48>",
+      "is_control": true
+    },
+    {
+      "rank": 49,
+      "token_str": "<SPECIAL_49>",
+      "is_control": true
+    },
+    {
+      "rank": 50,
+      "token_str": "<SPECIAL_50>",
+      "is_control": true
+    },
+    {
+      "rank": 51,
+      "token_str": "<SPECIAL_51>",
+      "is_control": true
+    },
+    {
+      "rank": 52,
+      "token_str": "<SPECIAL_52>",
+      "is_control": true
+    },
+    {
+      "rank": 53,
+      "token_str": "<SPECIAL_53>",
+      "is_control": true
+    },
+    {
+      "rank": 54,
+      "token_str": "<SPECIAL_54>",
+      "is_control": true
+    },
+    {
+      "rank": 55,
+      "token_str": "<SPECIAL_55>",
+      "is_control": true
+    },
+    {
+      "rank": 56,
+      "token_str": "<SPECIAL_56>",
+      "is_control": true
+    },
+    {
+      "rank": 57,
+      "token_str": "<SPECIAL_57>",
+      "is_control": true
+    },
+    {
+      "rank": 58,
+      "token_str": "<SPECIAL_58>",
+      "is_control": true
+    },
+    {
+      "rank": 59,
+      "token_str": "<SPECIAL_59>",
+      "is_control": true
+    },
+    {
+      "rank": 60,
+      "token_str": "<SPECIAL_60>",
+      "is_control": true
+    },
+    {
+      "rank": 61,
+      "token_str": "<SPECIAL_61>",
+      "is_control": true
+    },
+    {
+      "rank": 62,
+      "token_str": "<SPECIAL_62>",
+      "is_control": true
+    },
+    {
+      "rank": 63,
+      "token_str": "<SPECIAL_63>",
+      "is_control": true
+    },
+    {
+      "rank": 64,
+      "token_str": "<SPECIAL_64>",
+      "is_control": true
+    },
+    {
+      "rank": 65,
+      "token_str": "<SPECIAL_65>",
+      "is_control": true
+    },
+    {
+      "rank": 66,
+      "token_str": "<SPECIAL_66>",
+      "is_control": true
+    },
+    {
+      "rank": 67,
+      "token_str": "<SPECIAL_67>",
+      "is_control": true
+    },
+    {
+      "rank": 68,
+      "token_str": "<SPECIAL_68>",
+      "is_control": true
+    },
+    {
+      "rank": 69,
+      "token_str": "<SPECIAL_69>",
+      "is_control": true
+    },
+    {
+      "rank": 70,
+      "token_str": "<SPECIAL_70>",
+      "is_control": true
+    },
+    {
+      "rank": 71,
+      "token_str": "<SPECIAL_71>",
+      "is_control": true
+    },
+    {
+      "rank": 72,
+      "token_str": "<SPECIAL_72>",
+      "is_control": true
+    },
+    {
+      "rank": 73,
+      "token_str": "<SPECIAL_73>",
+      "is_control": true
+    },
+    {
+      "rank": 74,
+      "token_str": "<SPECIAL_74>",
+      "is_control": true
+    },
+    {
+      "rank": 75,
+      "token_str": "<SPECIAL_75>",
+      "is_control": true
+    },
+    {
+      "rank": 76,
+      "token_str": "<SPECIAL_76>",
+      "is_control": true
+    },
+    {
+      "rank": 77,
+      "token_str": "<SPECIAL_77>",
+      "is_control": true
+    },
+    {
+      "rank": 78,
+      "token_str": "<SPECIAL_78>",
+      "is_control": true
+    },
+    {
+      "rank": 79,
+      "token_str": "<SPECIAL_79>",
+      "is_control": true
+    },
+    {
+      "rank": 80,
+      "token_str": "<SPECIAL_80>",
+      "is_control": true
+    },
+    {
+      "rank": 81,
+      "token_str": "<SPECIAL_81>",
+      "is_control": true
+    },
+    {
+      "rank": 82,
+      "token_str": "<SPECIAL_82>",
+      "is_control": true
+    },
+    {
+      "rank": 83,
+      "token_str": "<SPECIAL_83>",
+      "is_control": true
+    },
+    {
+      "rank": 84,
+      "token_str": "<SPECIAL_84>",
+      "is_control": true
+    },
+    {
+      "rank": 85,
+      "token_str": "<SPECIAL_85>",
+      "is_control": true
+    },
+    {
+      "rank": 86,
+      "token_str": "<SPECIAL_86>",
+      "is_control": true
+    },
+    {
+      "rank": 87,
+      "token_str": "<SPECIAL_87>",
+      "is_control": true
+    },
+    {
+      "rank": 88,
+      "token_str": "<SPECIAL_88>",
+      "is_control": true
+    },
+    {
+      "rank": 89,
+      "token_str": "<SPECIAL_89>",
+      "is_control": true
+    },
+    {
+      "rank": 90,
+      "token_str": "<SPECIAL_90>",
+      "is_control": true
+    },
+    {
+      "rank": 91,
+      "token_str": "<SPECIAL_91>",
+      "is_control": true
+    },
+    {
+      "rank": 92,
+      "token_str": "<SPECIAL_92>",
+      "is_control": true
+    },
+    {
+      "rank": 93,
+      "token_str": "<SPECIAL_93>",
+      "is_control": true
+    },
+    {
+      "rank": 94,
+      "token_str": "<SPECIAL_94>",
+      "is_control": true
+    },
+    {
+      "rank": 95,
+      "token_str": "<SPECIAL_95>",
+      "is_control": true
+    },
+    {
+      "rank": 96,
+      "token_str": "<SPECIAL_96>",
+      "is_control": true
+    },
+    {
+      "rank": 97,
+      "token_str": "<SPECIAL_97>",
+      "is_control": true
+    },
+    {
+      "rank": 98,
+      "token_str": "<SPECIAL_98>",
+      "is_control": true
+    },
+    {
+      "rank": 99,
+      "token_str": "<SPECIAL_99>",
+      "is_control": true
+    },
+    {
+      "rank": 100,
+      "token_str": "<SPECIAL_100>",
+      "is_control": true
+    },
+    {
+      "rank": 101,
+      "token_str": "<SPECIAL_101>",
+      "is_control": true
+    },
+    {
+      "rank": 102,
+      "token_str": "<SPECIAL_102>",
+      "is_control": true
+    },
+    {
+      "rank": 103,
+      "token_str": "<SPECIAL_103>",
+      "is_control": true
+    },
+    {
+      "rank": 104,
+      "token_str": "<SPECIAL_104>",
+      "is_control": true
+    },
+    {
+      "rank": 105,
+      "token_str": "<SPECIAL_105>",
+      "is_control": true
+    },
+    {
+      "rank": 106,
+      "token_str": "<SPECIAL_106>",
+      "is_control": true
+    },
+    {
+      "rank": 107,
+      "token_str": "<SPECIAL_107>",
+      "is_control": true
+    },
+    {
+      "rank": 108,
+      "token_str": "<SPECIAL_108>",
+      "is_control": true
+    },
+    {
+      "rank": 109,
+      "token_str": "<SPECIAL_109>",
+      "is_control": true
+    },
+    {
+      "rank": 110,
+      "token_str": "<SPECIAL_110>",
+      "is_control": true
+    },
+    {
+      "rank": 111,
+      "token_str": "<SPECIAL_111>",
+      "is_control": true
+    },
+    {
+      "rank": 112,
+      "token_str": "<SPECIAL_112>",
+      "is_control": true
+    },
+    {
+      "rank": 113,
+      "token_str": "<SPECIAL_113>",
+      "is_control": true
+    },
+    {
+      "rank": 114,
+      "token_str": "<SPECIAL_114>",
+      "is_control": true
+    },
+    {
+      "rank": 115,
+      "token_str": "<SPECIAL_115>",
+      "is_control": true
+    },
+    {
+      "rank": 116,
+      "token_str": "<SPECIAL_116>",
+      "is_control": true
+    },
+    {
+      "rank": 117,
+      "token_str": "<SPECIAL_117>",
+      "is_control": true
+    },
+    {
+      "rank": 118,
+      "token_str": "<SPECIAL_118>",
+      "is_control": true
+    },
+    {
+      "rank": 119,
+      "token_str": "<SPECIAL_119>",
+      "is_control": true
+    },
+    {
+      "rank": 120,
+      "token_str": "<SPECIAL_120>",
+      "is_control": true
+    },
+    {
+      "rank": 121,
+      "token_str": "<SPECIAL_121>",
+      "is_control": true
+    },
+    {
+      "rank": 122,
+      "token_str": "<SPECIAL_122>",
+      "is_control": true
+    },
+    {
+      "rank": 123,
+      "token_str": "<SPECIAL_123>",
+      "is_control": true
+    },
+    {
+      "rank": 124,
+      "token_str": "<SPECIAL_124>",
+      "is_control": true
+    },
+    {
+      "rank": 125,
+      "token_str": "<SPECIAL_125>",
+      "is_control": true
+    },
+    {
+      "rank": 126,
+      "token_str": "<SPECIAL_126>",
+      "is_control": true
+    },
+    {
+      "rank": 127,
+      "token_str": "<SPECIAL_127>",
+      "is_control": true
+    },
+    {
+      "rank": 128,
+      "token_str": "<SPECIAL_128>",
+      "is_control": true
+    },
+    {
+      "rank": 129,
+      "token_str": "<SPECIAL_129>",
+      "is_control": true
+    },
+    {
+      "rank": 130,
+      "token_str": "<SPECIAL_130>",
+      "is_control": true
+    },
+    {
+      "rank": 131,
+      "token_str": "<SPECIAL_131>",
+      "is_control": true
+    },
+    {
+      "rank": 132,
+      "token_str": "<SPECIAL_132>",
+      "is_control": true
+    },
+    {
+      "rank": 133,
+      "token_str": "<SPECIAL_133>",
+      "is_control": true
+    },
+    {
+      "rank": 134,
+      "token_str": "<SPECIAL_134>",
+      "is_control": true
+    },
+    {
+      "rank": 135,
+      "token_str": "<SPECIAL_135>",
+      "is_control": true
+    },
+    {
+      "rank": 136,
+      "token_str": "<SPECIAL_136>",
+      "is_control": true
+    },
+    {
+      "rank": 137,
+      "token_str": "<SPECIAL_137>",
+      "is_control": true
+    },
+    {
+      "rank": 138,
+      "token_str": "<SPECIAL_138>",
+      "is_control": true
+    },
+    {
+      "rank": 139,
+      "token_str": "<SPECIAL_139>",
+      "is_control": true
+    },
+    {
+      "rank": 140,
+      "token_str": "<SPECIAL_140>",
+      "is_control": true
+    },
+    {
+      "rank": 141,
+      "token_str": "<SPECIAL_141>",
+      "is_control": true
+    },
+    {
+      "rank": 142,
+      "token_str": "<SPECIAL_142>",
+      "is_control": true
+    },
+    {
+      "rank": 143,
+      "token_str": "<SPECIAL_143>",
+      "is_control": true
+    },
+    {
+      "rank": 144,
+      "token_str": "<SPECIAL_144>",
+      "is_control": true
+    },
+    {
+      "rank": 145,
+      "token_str": "<SPECIAL_145>",
+      "is_control": true
+    },
+    {
+      "rank": 146,
+      "token_str": "<SPECIAL_146>",
+      "is_control": true
+    },
+    {
+      "rank": 147,
+      "token_str": "<SPECIAL_147>",
+      "is_control": true
+    },
+    {
+      "rank": 148,
+      "token_str": "<SPECIAL_148>",
+      "is_control": true
+    },
+    {
+      "rank": 149,
+      "token_str": "<SPECIAL_149>",
+      "is_control": true
+    },
+    {
+      "rank": 150,
+      "token_str": "<SPECIAL_150>",
+      "is_control": true
+    },
+    {
+      "rank": 151,
+      "token_str": "<SPECIAL_151>",
+      "is_control": true
+    },
+    {
+      "rank": 152,
+      "token_str": "<SPECIAL_152>",
+      "is_control": true
+    },
+    {
+      "rank": 153,
+      "token_str": "<SPECIAL_153>",
+      "is_control": true
+    },
+    {
+      "rank": 154,
+      "token_str": "<SPECIAL_154>",
+      "is_control": true
+    },
+    {
+      "rank": 155,
+      "token_str": "<SPECIAL_155>",
+      "is_control": true
+    },
+    {
+      "rank": 156,
+      "token_str": "<SPECIAL_156>",
+      "is_control": true
+    },
+    {
+      "rank": 157,
+      "token_str": "<SPECIAL_157>",
+      "is_control": true
+    },
+    {
+      "rank": 158,
+      "token_str": "<SPECIAL_158>",
+      "is_control": true
+    },
+    {
+      "rank": 159,
+      "token_str": "<SPECIAL_159>",
+      "is_control": true
+    },
+    {
+      "rank": 160,
+      "token_str": "<SPECIAL_160>",
+      "is_control": true
+    },
+    {
+      "rank": 161,
+      "token_str": "<SPECIAL_161>",
+      "is_control": true
+    },
+    {
+      "rank": 162,
+      "token_str": "<SPECIAL_162>",
+      "is_control": true
+    },
+    {
+      "rank": 163,
+      "token_str": "<SPECIAL_163>",
+      "is_control": true
+    },
+    {
+      "rank": 164,
+      "token_str": "<SPECIAL_164>",
+      "is_control": true
+    },
+    {
+      "rank": 165,
+      "token_str": "<SPECIAL_165>",
+      "is_control": true
+    },
+    {
+      "rank": 166,
+      "token_str": "<SPECIAL_166>",
+      "is_control": true
+    },
+    {
+      "rank": 167,
+      "token_str": "<SPECIAL_167>",
+      "is_control": true
+    },
+    {
+      "rank": 168,
+      "token_str": "<SPECIAL_168>",
+      "is_control": true
+    },
+    {
+      "rank": 169,
+      "token_str": "<SPECIAL_169>",
+      "is_control": true
+    },
+    {
+      "rank": 170,
+      "token_str": "<SPECIAL_170>",
+      "is_control": true
+    },
+    {
+      "rank": 171,
+      "token_str": "<SPECIAL_171>",
+      "is_control": true
+    },
+    {
+      "rank": 172,
+      "token_str": "<SPECIAL_172>",
+      "is_control": true
+    },
+    {
+      "rank": 173,
+      "token_str": "<SPECIAL_173>",
+      "is_control": true
+    },
+    {
+      "rank": 174,
+      "token_str": "<SPECIAL_174>",
+      "is_control": true
+    },
+    {
+      "rank": 175,
+      "token_str": "<SPECIAL_175>",
+      "is_control": true
+    },
+    {
+      "rank": 176,
+      "token_str": "<SPECIAL_176>",
+      "is_control": true
+    },
+    {
+      "rank": 177,
+      "token_str": "<SPECIAL_177>",
+      "is_control": true
+    },
+    {
+      "rank": 178,
+      "token_str": "<SPECIAL_178>",
+      "is_control": true
+    },
+    {
+      "rank": 179,
+      "token_str": "<SPECIAL_179>",
+      "is_control": true
+    },
+    {
+      "rank": 180,
+      "token_str": "<SPECIAL_180>",
+      "is_control": true
+    },
+    {
+      "rank": 181,
+      "token_str": "<SPECIAL_181>",
+      "is_control": true
+    },
+    {
+      "rank": 182,
+      "token_str": "<SPECIAL_182>",
+      "is_control": true
+    },
+    {
+      "rank": 183,
+      "token_str": "<SPECIAL_183>",
+      "is_control": true
+    },
+    {
+      "rank": 184,
+      "token_str": "<SPECIAL_184>",
+      "is_control": true
+    },
+    {
+      "rank": 185,
+      "token_str": "<SPECIAL_185>",
+      "is_control": true
+    },
+    {
+      "rank": 186,
+      "token_str": "<SPECIAL_186>",
+      "is_control": true
+    },
+    {
+      "rank": 187,
+      "token_str": "<SPECIAL_187>",
+      "is_control": true
+    },
+    {
+      "rank": 188,
+      "token_str": "<SPECIAL_188>",
+      "is_control": true
+    },
+    {
+      "rank": 189,
+      "token_str": "<SPECIAL_189>",
+      "is_control": true
+    },
+    {
+      "rank": 190,
+      "token_str": "<SPECIAL_190>",
+      "is_control": true
+    },
+    {
+      "rank": 191,
+      "token_str": "<SPECIAL_191>",
+      "is_control": true
+    },
+    {
+      "rank": 192,
+      "token_str": "<SPECIAL_192>",
+      "is_control": true
+    },
+    {
+      "rank": 193,
+      "token_str": "<SPECIAL_193>",
+      "is_control": true
+    },
+    {
+      "rank": 194,
+      "token_str": "<SPECIAL_194>",
+      "is_control": true
+    },
+    {
+      "rank": 195,
+      "token_str": "<SPECIAL_195>",
+      "is_control": true
+    },
+    {
+      "rank": 196,
+      "token_str": "<SPECIAL_196>",
+      "is_control": true
+    },
+    {
+      "rank": 197,
+      "token_str": "<SPECIAL_197>",
+      "is_control": true
+    },
+    {
+      "rank": 198,
+      "token_str": "<SPECIAL_198>",
+      "is_control": true
+    },
+    {
+      "rank": 199,
+      "token_str": "<SPECIAL_199>",
+      "is_control": true
+    },
+    {
+      "rank": 200,
+      "token_str": "<SPECIAL_200>",
+      "is_control": true
+    },
+    {
+      "rank": 201,
+      "token_str": "<SPECIAL_201>",
+      "is_control": true
+    },
+    {
+      "rank": 202,
+      "token_str": "<SPECIAL_202>",
+      "is_control": true
+    },
+    {
+      "rank": 203,
+      "token_str": "<SPECIAL_203>",
+      "is_control": true
+    },
+    {
+      "rank": 204,
+      "token_str": "<SPECIAL_204>",
+      "is_control": true
+    },
+    {
+      "rank": 205,
+      "token_str": "<SPECIAL_205>",
+      "is_control": true
+    },
+    {
+      "rank": 206,
+      "token_str": "<SPECIAL_206>",
+      "is_control": true
+    },
+    {
+      "rank": 207,
+      "token_str": "<SPECIAL_207>",
+      "is_control": true
+    },
+    {
+      "rank": 208,
+      "token_str": "<SPECIAL_208>",
+      "is_control": true
+    },
+    {
+      "rank": 209,
+      "token_str": "<SPECIAL_209>",
+      "is_control": true
+    },
+    {
+      "rank": 210,
+      "token_str": "<SPECIAL_210>",
+      "is_control": true
+    },
+    {
+      "rank": 211,
+      "token_str": "<SPECIAL_211>",
+      "is_control": true
+    },
+    {
+      "rank": 212,
+      "token_str": "<SPECIAL_212>",
+      "is_control": true
+    },
+    {
+      "rank": 213,
+      "token_str": "<SPECIAL_213>",
+      "is_control": true
+    },
+    {
+      "rank": 214,
+      "token_str": "<SPECIAL_214>",
+      "is_control": true
+    },
+    {
+      "rank": 215,
+      "token_str": "<SPECIAL_215>",
+      "is_control": true
+    },
+    {
+      "rank": 216,
+      "token_str": "<SPECIAL_216>",
+      "is_control": true
+    },
+    {
+      "rank": 217,
+      "token_str": "<SPECIAL_217>",
+      "is_control": true
+    },
+    {
+      "rank": 218,
+      "token_str": "<SPECIAL_218>",
+      "is_control": true
+    },
+    {
+      "rank": 219,
+      "token_str": "<SPECIAL_219>",
+      "is_control": true
+    },
+    {
+      "rank": 220,
+      "token_str": "<SPECIAL_220>",
+      "is_control": true
+    },
+    {
+      "rank": 221,
+      "token_str": "<SPECIAL_221>",
+      "is_control": true
+    },
+    {
+      "rank": 222,
+      "token_str": "<SPECIAL_222>",
+      "is_control": true
+    },
+    {
+      "rank": 223,
+      "token_str": "<SPECIAL_223>",
+      "is_control": true
+    },
+    {
+      "rank": 224,
+      "token_str": "<SPECIAL_224>",
+      "is_control": true
+    },
+    {
+      "rank": 225,
+      "token_str": "<SPECIAL_225>",
+      "is_control": true
+    },
+    {
+      "rank": 226,
+      "token_str": "<SPECIAL_226>",
+      "is_control": true
+    },
+    {
+      "rank": 227,
+      "token_str": "<SPECIAL_227>",
+      "is_control": true
+    },
+    {
+      "rank": 228,
+      "token_str": "<SPECIAL_228>",
+      "is_control": true
+    },
+    {
+      "rank": 229,
+      "token_str": "<SPECIAL_229>",
+      "is_control": true
+    },
+    {
+      "rank": 230,
+      "token_str": "<SPECIAL_230>",
+      "is_control": true
+    },
+    {
+      "rank": 231,
+      "token_str": "<SPECIAL_231>",
+      "is_control": true
+    },
+    {
+      "rank": 232,
+      "token_str": "<SPECIAL_232>",
+      "is_control": true
+    },
+    {
+      "rank": 233,
+      "token_str": "<SPECIAL_233>",
+      "is_control": true
+    },
+    {
+      "rank": 234,
+      "token_str": "<SPECIAL_234>",
+      "is_control": true
+    },
+    {
+      "rank": 235,
+      "token_str": "<SPECIAL_235>",
+      "is_control": true
+    },
+    {
+      "rank": 236,
+      "token_str": "<SPECIAL_236>",
+      "is_control": true
+    },
+    {
+      "rank": 237,
+      "token_str": "<SPECIAL_237>",
+      "is_control": true
+    },
+    {
+      "rank": 238,
+      "token_str": "<SPECIAL_238>",
+      "is_control": true
+    },
+    {
+      "rank": 239,
+      "token_str": "<SPECIAL_239>",
+      "is_control": true
+    },
+    {
+      "rank": 240,
+      "token_str": "<SPECIAL_240>",
+      "is_control": true
+    },
+    {
+      "rank": 241,
+      "token_str": "<SPECIAL_241>",
+      "is_control": true
+    },
+    {
+      "rank": 242,
+      "token_str": "<SPECIAL_242>",
+      "is_control": true
+    },
+    {
+      "rank": 243,
+      "token_str": "<SPECIAL_243>",
+      "is_control": true
+    },
+    {
+      "rank": 244,
+      "token_str": "<SPECIAL_244>",
+      "is_control": true
+    },
+    {
+      "rank": 245,
+      "token_str": "<SPECIAL_245>",
+      "is_control": true
+    },
+    {
+      "rank": 246,
+      "token_str": "<SPECIAL_246>",
+      "is_control": true
+    },
+    {
+      "rank": 247,
+      "token_str": "<SPECIAL_247>",
+      "is_control": true
+    },
+    {
+      "rank": 248,
+      "token_str": "<SPECIAL_248>",
+      "is_control": true
+    },
+    {
+      "rank": 249,
+      "token_str": "<SPECIAL_249>",
+      "is_control": true
+    },
+    {
+      "rank": 250,
+      "token_str": "<SPECIAL_250>",
+      "is_control": true
+    },
+    {
+      "rank": 251,
+      "token_str": "<SPECIAL_251>",
+      "is_control": true
+    },
+    {
+      "rank": 252,
+      "token_str": "<SPECIAL_252>",
+      "is_control": true
+    },
+    {
+      "rank": 253,
+      "token_str": "<SPECIAL_253>",
+      "is_control": true
+    },
+    {
+      "rank": 254,
+      "token_str": "<SPECIAL_254>",
+      "is_control": true
+    },
+    {
+      "rank": 255,
+      "token_str": "<SPECIAL_255>",
+      "is_control": true
+    },
+    {
+      "rank": 256,
+      "token_str": "<SPECIAL_256>",
+      "is_control": true
+    },
+    {
+      "rank": 257,
+      "token_str": "<SPECIAL_257>",
+      "is_control": true
+    },
+    {
+      "rank": 258,
+      "token_str": "<SPECIAL_258>",
+      "is_control": true
+    },
+    {
+      "rank": 259,
+      "token_str": "<SPECIAL_259>",
+      "is_control": true
+    },
+    {
+      "rank": 260,
+      "token_str": "<SPECIAL_260>",
+      "is_control": true
+    },
+    {
+      "rank": 261,
+      "token_str": "<SPECIAL_261>",
+      "is_control": true
+    },
+    {
+      "rank": 262,
+      "token_str": "<SPECIAL_262>",
+      "is_control": true
+    },
+    {
+      "rank": 263,
+      "token_str": "<SPECIAL_263>",
+      "is_control": true
+    },
+    {
+      "rank": 264,
+      "token_str": "<SPECIAL_264>",
+      "is_control": true
+    },
+    {
+      "rank": 265,
+      "token_str": "<SPECIAL_265>",
+      "is_control": true
+    },
+    {
+      "rank": 266,
+      "token_str": "<SPECIAL_266>",
+      "is_control": true
+    },
+    {
+      "rank": 267,
+      "token_str": "<SPECIAL_267>",
+      "is_control": true
+    },
+    {
+      "rank": 268,
+      "token_str": "<SPECIAL_268>",
+      "is_control": true
+    },
+    {
+      "rank": 269,
+      "token_str": "<SPECIAL_269>",
+      "is_control": true
+    },
+    {
+      "rank": 270,
+      "token_str": "<SPECIAL_270>",
+      "is_control": true
+    },
+    {
+      "rank": 271,
+      "token_str": "<SPECIAL_271>",
+      "is_control": true
+    },
+    {
+      "rank": 272,
+      "token_str": "<SPECIAL_272>",
+      "is_control": true
+    },
+    {
+      "rank": 273,
+      "token_str": "<SPECIAL_273>",
+      "is_control": true
+    },
+    {
+      "rank": 274,
+      "token_str": "<SPECIAL_274>",
+      "is_control": true
+    },
+    {
+      "rank": 275,
+      "token_str": "<SPECIAL_275>",
+      "is_control": true
+    },
+    {
+      "rank": 276,
+      "token_str": "<SPECIAL_276>",
+      "is_control": true
+    },
+    {
+      "rank": 277,
+      "token_str": "<SPECIAL_277>",
+      "is_control": true
+    },
+    {
+      "rank": 278,
+      "token_str": "<SPECIAL_278>",
+      "is_control": true
+    },
+    {
+      "rank": 279,
+      "token_str": "<SPECIAL_279>",
+      "is_control": true
+    },
+    {
+      "rank": 280,
+      "token_str": "<SPECIAL_280>",
+      "is_control": true
+    },
+    {
+      "rank": 281,
+      "token_str": "<SPECIAL_281>",
+      "is_control": true
+    },
+    {
+      "rank": 282,
+      "token_str": "<SPECIAL_282>",
+      "is_control": true
+    },
+    {
+      "rank": 283,
+      "token_str": "<SPECIAL_283>",
+      "is_control": true
+    },
+    {
+      "rank": 284,
+      "token_str": "<SPECIAL_284>",
+      "is_control": true
+    },
+    {
+      "rank": 285,
+      "token_str": "<SPECIAL_285>",
+      "is_control": true
+    },
+    {
+      "rank": 286,
+      "token_str": "<SPECIAL_286>",
+      "is_control": true
+    },
+    {
+      "rank": 287,
+      "token_str": "<SPECIAL_287>",
+      "is_control": true
+    },
+    {
+      "rank": 288,
+      "token_str": "<SPECIAL_288>",
+      "is_control": true
+    },
+    {
+      "rank": 289,
+      "token_str": "<SPECIAL_289>",
+      "is_control": true
+    },
+    {
+      "rank": 290,
+      "token_str": "<SPECIAL_290>",
+      "is_control": true
+    },
+    {
+      "rank": 291,
+      "token_str": "<SPECIAL_291>",
+      "is_control": true
+    },
+    {
+      "rank": 292,
+      "token_str": "<SPECIAL_292>",
+      "is_control": true
+    },
+    {
+      "rank": 293,
+      "token_str": "<SPECIAL_293>",
+      "is_control": true
+    },
+    {
+      "rank": 294,
+      "token_str": "<SPECIAL_294>",
+      "is_control": true
+    },
+    {
+      "rank": 295,
+      "token_str": "<SPECIAL_295>",
+      "is_control": true
+    },
+    {
+      "rank": 296,
+      "token_str": "<SPECIAL_296>",
+      "is_control": true
+    },
+    {
+      "rank": 297,
+      "token_str": "<SPECIAL_297>",
+      "is_control": true
+    },
+    {
+      "rank": 298,
+      "token_str": "<SPECIAL_298>",
+      "is_control": true
+    },
+    {
+      "rank": 299,
+      "token_str": "<SPECIAL_299>",
+      "is_control": true
+    },
+    {
+      "rank": 300,
+      "token_str": "<SPECIAL_300>",
+      "is_control": true
+    },
+    {
+      "rank": 301,
+      "token_str": "<SPECIAL_301>",
+      "is_control": true
+    },
+    {
+      "rank": 302,
+      "token_str": "<SPECIAL_302>",
+      "is_control": true
+    },
+    {
+      "rank": 303,
+      "token_str": "<SPECIAL_303>",
+      "is_control": true
+    },
+    {
+      "rank": 304,
+      "token_str": "<SPECIAL_304>",
+      "is_control": true
+    },
+    {
+      "rank": 305,
+      "token_str": "<SPECIAL_305>",
+      "is_control": true
+    },
+    {
+      "rank": 306,
+      "token_str": "<SPECIAL_306>",
+      "is_control": true
+    },
+    {
+      "rank": 307,
+      "token_str": "<SPECIAL_307>",
+      "is_control": true
+    },
+    {
+      "rank": 308,
+      "token_str": "<SPECIAL_308>",
+      "is_control": true
+    },
+    {
+      "rank": 309,
+      "token_str": "<SPECIAL_309>",
+      "is_control": true
+    },
+    {
+      "rank": 310,
+      "token_str": "<SPECIAL_310>",
+      "is_control": true
+    },
+    {
+      "rank": 311,
+      "token_str": "<SPECIAL_311>",
+      "is_control": true
+    },
+    {
+      "rank": 312,
+      "token_str": "<SPECIAL_312>",
+      "is_control": true
+    },
+    {
+      "rank": 313,
+      "token_str": "<SPECIAL_313>",
+      "is_control": true
+    },
+    {
+      "rank": 314,
+      "token_str": "<SPECIAL_314>",
+      "is_control": true
+    },
+    {
+      "rank": 315,
+      "token_str": "<SPECIAL_315>",
+      "is_control": true
+    },
+    {
+      "rank": 316,
+      "token_str": "<SPECIAL_316>",
+      "is_control": true
+    },
+    {
+      "rank": 317,
+      "token_str": "<SPECIAL_317>",
+      "is_control": true
+    },
+    {
+      "rank": 318,
+      "token_str": "<SPECIAL_318>",
+      "is_control": true
+    },
+    {
+      "rank": 319,
+      "token_str": "<SPECIAL_319>",
+      "is_control": true
+    },
+    {
+      "rank": 320,
+      "token_str": "<SPECIAL_320>",
+      "is_control": true
+    },
+    {
+      "rank": 321,
+      "token_str": "<SPECIAL_321>",
+      "is_control": true
+    },
+    {
+      "rank": 322,
+      "token_str": "<SPECIAL_322>",
+      "is_control": true
+    },
+    {
+      "rank": 323,
+      "token_str": "<SPECIAL_323>",
+      "is_control": true
+    },
+    {
+      "rank": 324,
+      "token_str": "<SPECIAL_324>",
+      "is_control": true
+    },
+    {
+      "rank": 325,
+      "token_str": "<SPECIAL_325>",
+      "is_control": true
+    },
+    {
+      "rank": 326,
+      "token_str": "<SPECIAL_326>",
+      "is_control": true
+    },
+    {
+      "rank": 327,
+      "token_str": "<SPECIAL_327>",
+      "is_control": true
+    },
+    {
+      "rank": 328,
+      "token_str": "<SPECIAL_328>",
+      "is_control": true
+    },
+    {
+      "rank": 329,
+      "token_str": "<SPECIAL_329>",
+      "is_control": true
+    },
+    {
+      "rank": 330,
+      "token_str": "<SPECIAL_330>",
+      "is_control": true
+    },
+    {
+      "rank": 331,
+      "token_str": "<SPECIAL_331>",
+      "is_control": true
+    },
+    {
+      "rank": 332,
+      "token_str": "<SPECIAL_332>",
+      "is_control": true
+    },
+    {
+      "rank": 333,
+      "token_str": "<SPECIAL_333>",
+      "is_control": true
+    },
+    {
+      "rank": 334,
+      "token_str": "<SPECIAL_334>",
+      "is_control": true
+    },
+    {
+      "rank": 335,
+      "token_str": "<SPECIAL_335>",
+      "is_control": true
+    },
+    {
+      "rank": 336,
+      "token_str": "<SPECIAL_336>",
+      "is_control": true
+    },
+    {
+      "rank": 337,
+      "token_str": "<SPECIAL_337>",
+      "is_control": true
+    },
+    {
+      "rank": 338,
+      "token_str": "<SPECIAL_338>",
+      "is_control": true
+    },
+    {
+      "rank": 339,
+      "token_str": "<SPECIAL_339>",
+      "is_control": true
+    },
+    {
+      "rank": 340,
+      "token_str": "<SPECIAL_340>",
+      "is_control": true
+    },
+    {
+      "rank": 341,
+      "token_str": "<SPECIAL_341>",
+      "is_control": true
+    },
+    {
+      "rank": 342,
+      "token_str": "<SPECIAL_342>",
+      "is_control": true
+    },
+    {
+      "rank": 343,
+      "token_str": "<SPECIAL_343>",
+      "is_control": true
+    },
+    {
+      "rank": 344,
+      "token_str": "<SPECIAL_344>",
+      "is_control": true
+    },
+    {
+      "rank": 345,
+      "token_str": "<SPECIAL_345>",
+      "is_control": true
+    },
+    {
+      "rank": 346,
+      "token_str": "<SPECIAL_346>",
+      "is_control": true
+    },
+    {
+      "rank": 347,
+      "token_str": "<SPECIAL_347>",
+      "is_control": true
+    },
+    {
+      "rank": 348,
+      "token_str": "<SPECIAL_348>",
+      "is_control": true
+    },
+    {
+      "rank": 349,
+      "token_str": "<SPECIAL_349>",
+      "is_control": true
+    },
+    {
+      "rank": 350,
+      "token_str": "<SPECIAL_350>",
+      "is_control": true
+    },
+    {
+      "rank": 351,
+      "token_str": "<SPECIAL_351>",
+      "is_control": true
+    },
+    {
+      "rank": 352,
+      "token_str": "<SPECIAL_352>",
+      "is_control": true
+    },
+    {
+      "rank": 353,
+      "token_str": "<SPECIAL_353>",
+      "is_control": true
+    },
+    {
+      "rank": 354,
+      "token_str": "<SPECIAL_354>",
+      "is_control": true
+    },
+    {
+      "rank": 355,
+      "token_str": "<SPECIAL_355>",
+      "is_control": true
+    },
+    {
+      "rank": 356,
+      "token_str": "<SPECIAL_356>",
+      "is_control": true
+    },
+    {
+      "rank": 357,
+      "token_str": "<SPECIAL_357>",
+      "is_control": true
+    },
+    {
+      "rank": 358,
+      "token_str": "<SPECIAL_358>",
+      "is_control": true
+    },
+    {
+      "rank": 359,
+      "token_str": "<SPECIAL_359>",
+      "is_control": true
+    },
+    {
+      "rank": 360,
+      "token_str": "<SPECIAL_360>",
+      "is_control": true
+    },
+    {
+      "rank": 361,
+      "token_str": "<SPECIAL_361>",
+      "is_control": true
+    },
+    {
+      "rank": 362,
+      "token_str": "<SPECIAL_362>",
+      "is_control": true
+    },
+    {
+      "rank": 363,
+      "token_str": "<SPECIAL_363>",
+      "is_control": true
+    },
+    {
+      "rank": 364,
+      "token_str": "<SPECIAL_364>",
+      "is_control": true
+    },
+    {
+      "rank": 365,
+      "token_str": "<SPECIAL_365>",
+      "is_control": true
+    },
+    {
+      "rank": 366,
+      "token_str": "<SPECIAL_366>",
+      "is_control": true
+    },
+    {
+      "rank": 367,
+      "token_str": "<SPECIAL_367>",
+      "is_control": true
+    },
+    {
+      "rank": 368,
+      "token_str": "<SPECIAL_368>",
+      "is_control": true
+    },
+    {
+      "rank": 369,
+      "token_str": "<SPECIAL_369>",
+      "is_control": true
+    },
+    {
+      "rank": 370,
+      "token_str": "<SPECIAL_370>",
+      "is_control": true
+    },
+    {
+      "rank": 371,
+      "token_str": "<SPECIAL_371>",
+      "is_control": true
+    },
+    {
+      "rank": 372,
+      "token_str": "<SPECIAL_372>",
+      "is_control": true
+    },
+    {
+      "rank": 373,
+      "token_str": "<SPECIAL_373>",
+      "is_control": true
+    },
+    {
+      "rank": 374,
+      "token_str": "<SPECIAL_374>",
+      "is_control": true
+    },
+    {
+      "rank": 375,
+      "token_str": "<SPECIAL_375>",
+      "is_control": true
+    },
+    {
+      "rank": 376,
+      "token_str": "<SPECIAL_376>",
+      "is_control": true
+    },
+    {
+      "rank": 377,
+      "token_str": "<SPECIAL_377>",
+      "is_control": true
+    },
+    {
+      "rank": 378,
+      "token_str": "<SPECIAL_378>",
+      "is_control": true
+    },
+    {
+      "rank": 379,
+      "token_str": "<SPECIAL_379>",
+      "is_control": true
+    },
+    {
+      "rank": 380,
+      "token_str": "<SPECIAL_380>",
+      "is_control": true
+    },
+    {
+      "rank": 381,
+      "token_str": "<SPECIAL_381>",
+      "is_control": true
+    },
+    {
+      "rank": 382,
+      "token_str": "<SPECIAL_382>",
+      "is_control": true
+    },
+    {
+      "rank": 383,
+      "token_str": "<SPECIAL_383>",
+      "is_control": true
+    },
+    {
+      "rank": 384,
+      "token_str": "<SPECIAL_384>",
+      "is_control": true
+    },
+    {
+      "rank": 385,
+      "token_str": "<SPECIAL_385>",
+      "is_control": true
+    },
+    {
+      "rank": 386,
+      "token_str": "<SPECIAL_386>",
+      "is_control": true
+    },
+    {
+      "rank": 387,
+      "token_str": "<SPECIAL_387>",
+      "is_control": true
+    },
+    {
+      "rank": 388,
+      "token_str": "<SPECIAL_388>",
+      "is_control": true
+    },
+    {
+      "rank": 389,
+      "token_str": "<SPECIAL_389>",
+      "is_control": true
+    },
+    {
+      "rank": 390,
+      "token_str": "<SPECIAL_390>",
+      "is_control": true
+    },
+    {
+      "rank": 391,
+      "token_str": "<SPECIAL_391>",
+      "is_control": true
+    },
+    {
+      "rank": 392,
+      "token_str": "<SPECIAL_392>",
+      "is_control": true
+    },
+    {
+      "rank": 393,
+      "token_str": "<SPECIAL_393>",
+      "is_control": true
+    },
+    {
+      "rank": 394,
+      "token_str": "<SPECIAL_394>",
+      "is_control": true
+    },
+    {
+      "rank": 395,
+      "token_str": "<SPECIAL_395>",
+      "is_control": true
+    },
+    {
+      "rank": 396,
+      "token_str": "<SPECIAL_396>",
+      "is_control": true
+    },
+    {
+      "rank": 397,
+      "token_str": "<SPECIAL_397>",
+      "is_control": true
+    },
+    {
+      "rank": 398,
+      "token_str": "<SPECIAL_398>",
+      "is_control": true
+    },
+    {
+      "rank": 399,
+      "token_str": "<SPECIAL_399>",
+      "is_control": true
+    },
+    {
+      "rank": 400,
+      "token_str": "<SPECIAL_400>",
+      "is_control": true
+    },
+    {
+      "rank": 401,
+      "token_str": "<SPECIAL_401>",
+      "is_control": true
+    },
+    {
+      "rank": 402,
+      "token_str": "<SPECIAL_402>",
+      "is_control": true
+    },
+    {
+      "rank": 403,
+      "token_str": "<SPECIAL_403>",
+      "is_control": true
+    },
+    {
+      "rank": 404,
+      "token_str": "<SPECIAL_404>",
+      "is_control": true
+    },
+    {
+      "rank": 405,
+      "token_str": "<SPECIAL_405>",
+      "is_control": true
+    },
+    {
+      "rank": 406,
+      "token_str": "<SPECIAL_406>",
+      "is_control": true
+    },
+    {
+      "rank": 407,
+      "token_str": "<SPECIAL_407>",
+      "is_control": true
+    },
+    {
+      "rank": 408,
+      "token_str": "<SPECIAL_408>",
+      "is_control": true
+    },
+    {
+      "rank": 409,
+      "token_str": "<SPECIAL_409>",
+      "is_control": true
+    },
+    {
+      "rank": 410,
+      "token_str": "<SPECIAL_410>",
+      "is_control": true
+    },
+    {
+      "rank": 411,
+      "token_str": "<SPECIAL_411>",
+      "is_control": true
+    },
+    {
+      "rank": 412,
+      "token_str": "<SPECIAL_412>",
+      "is_control": true
+    },
+    {
+      "rank": 413,
+      "token_str": "<SPECIAL_413>",
+      "is_control": true
+    },
+    {
+      "rank": 414,
+      "token_str": "<SPECIAL_414>",
+      "is_control": true
+    },
+    {
+      "rank": 415,
+      "token_str": "<SPECIAL_415>",
+      "is_control": true
+    },
+    {
+      "rank": 416,
+      "token_str": "<SPECIAL_416>",
+      "is_control": true
+    },
+    {
+      "rank": 417,
+      "token_str": "<SPECIAL_417>",
+      "is_control": true
+    },
+    {
+      "rank": 418,
+      "token_str": "<SPECIAL_418>",
+      "is_control": true
+    },
+    {
+      "rank": 419,
+      "token_str": "<SPECIAL_419>",
+      "is_control": true
+    },
+    {
+      "rank": 420,
+      "token_str": "<SPECIAL_420>",
+      "is_control": true
+    },
+    {
+      "rank": 421,
+      "token_str": "<SPECIAL_421>",
+      "is_control": true
+    },
+    {
+      "rank": 422,
+      "token_str": "<SPECIAL_422>",
+      "is_control": true
+    },
+    {
+      "rank": 423,
+      "token_str": "<SPECIAL_423>",
+      "is_control": true
+    },
+    {
+      "rank": 424,
+      "token_str": "<SPECIAL_424>",
+      "is_control": true
+    },
+    {
+      "rank": 425,
+      "token_str": "<SPECIAL_425>",
+      "is_control": true
+    },
+    {
+      "rank": 426,
+      "token_str": "<SPECIAL_426>",
+      "is_control": true
+    },
+    {
+      "rank": 427,
+      "token_str": "<SPECIAL_427>",
+      "is_control": true
+    },
+    {
+      "rank": 428,
+      "token_str": "<SPECIAL_428>",
+      "is_control": true
+    },
+    {
+      "rank": 429,
+      "token_str": "<SPECIAL_429>",
+      "is_control": true
+    },
+    {
+      "rank": 430,
+      "token_str": "<SPECIAL_430>",
+      "is_control": true
+    },
+    {
+      "rank": 431,
+      "token_str": "<SPECIAL_431>",
+      "is_control": true
+    },
+    {
+      "rank": 432,
+      "token_str": "<SPECIAL_432>",
+      "is_control": true
+    },
+    {
+      "rank": 433,
+      "token_str": "<SPECIAL_433>",
+      "is_control": true
+    },
+    {
+      "rank": 434,
+      "token_str": "<SPECIAL_434>",
+      "is_control": true
+    },
+    {
+      "rank": 435,
+      "token_str": "<SPECIAL_435>",
+      "is_control": true
+    },
+    {
+      "rank": 436,
+      "token_str": "<SPECIAL_436>",
+      "is_control": true
+    },
+    {
+      "rank": 437,
+      "token_str": "<SPECIAL_437>",
+      "is_control": true
+    },
+    {
+      "rank": 438,
+      "token_str": "<SPECIAL_438>",
+      "is_control": true
+    },
+    {
+      "rank": 439,
+      "token_str": "<SPECIAL_439>",
+      "is_control": true
+    },
+    {
+      "rank": 440,
+      "token_str": "<SPECIAL_440>",
+      "is_control": true
+    },
+    {
+      "rank": 441,
+      "token_str": "<SPECIAL_441>",
+      "is_control": true
+    },
+    {
+      "rank": 442,
+      "token_str": "<SPECIAL_442>",
+      "is_control": true
+    },
+    {
+      "rank": 443,
+      "token_str": "<SPECIAL_443>",
+      "is_control": true
+    },
+    {
+      "rank": 444,
+      "token_str": "<SPECIAL_444>",
+      "is_control": true
+    },
+    {
+      "rank": 445,
+      "token_str": "<SPECIAL_445>",
+      "is_control": true
+    },
+    {
+      "rank": 446,
+      "token_str": "<SPECIAL_446>",
+      "is_control": true
+    },
+    {
+      "rank": 447,
+      "token_str": "<SPECIAL_447>",
+      "is_control": true
+    },
+    {
+      "rank": 448,
+      "token_str": "<SPECIAL_448>",
+      "is_control": true
+    },
+    {
+      "rank": 449,
+      "token_str": "<SPECIAL_449>",
+      "is_control": true
+    },
+    {
+      "rank": 450,
+      "token_str": "<SPECIAL_450>",
+      "is_control": true
+    },
+    {
+      "rank": 451,
+      "token_str": "<SPECIAL_451>",
+      "is_control": true
+    },
+    {
+      "rank": 452,
+      "token_str": "<SPECIAL_452>",
+      "is_control": true
+    },
+    {
+      "rank": 453,
+      "token_str": "<SPECIAL_453>",
+      "is_control": true
+    },
+    {
+      "rank": 454,
+      "token_str": "<SPECIAL_454>",
+      "is_control": true
+    },
+    {
+      "rank": 455,
+      "token_str": "<SPECIAL_455>",
+      "is_control": true
+    },
+    {
+      "rank": 456,
+      "token_str": "<SPECIAL_456>",
+      "is_control": true
+    },
+    {
+      "rank": 457,
+      "token_str": "<SPECIAL_457>",
+      "is_control": true
+    },
+    {
+      "rank": 458,
+      "token_str": "<SPECIAL_458>",
+      "is_control": true
+    },
+    {
+      "rank": 459,
+      "token_str": "<SPECIAL_459>",
+      "is_control": true
+    },
+    {
+      "rank": 460,
+      "token_str": "<SPECIAL_460>",
+      "is_control": true
+    },
+    {
+      "rank": 461,
+      "token_str": "<SPECIAL_461>",
+      "is_control": true
+    },
+    {
+      "rank": 462,
+      "token_str": "<SPECIAL_462>",
+      "is_control": true
+    },
+    {
+      "rank": 463,
+      "token_str": "<SPECIAL_463>",
+      "is_control": true
+    },
+    {
+      "rank": 464,
+      "token_str": "<SPECIAL_464>",
+      "is_control": true
+    },
+    {
+      "rank": 465,
+      "token_str": "<SPECIAL_465>",
+      "is_control": true
+    },
+    {
+      "rank": 466,
+      "token_str": "<SPECIAL_466>",
+      "is_control": true
+    },
+    {
+      "rank": 467,
+      "token_str": "<SPECIAL_467>",
+      "is_control": true
+    },
+    {
+      "rank": 468,
+      "token_str": "<SPECIAL_468>",
+      "is_control": true
+    },
+    {
+      "rank": 469,
+      "token_str": "<SPECIAL_469>",
+      "is_control": true
+    },
+    {
+      "rank": 470,
+      "token_str": "<SPECIAL_470>",
+      "is_control": true
+    },
+    {
+      "rank": 471,
+      "token_str": "<SPECIAL_471>",
+      "is_control": true
+    },
+    {
+      "rank": 472,
+      "token_str": "<SPECIAL_472>",
+      "is_control": true
+    },
+    {
+      "rank": 473,
+      "token_str": "<SPECIAL_473>",
+      "is_control": true
+    },
+    {
+      "rank": 474,
+      "token_str": "<SPECIAL_474>",
+      "is_control": true
+    },
+    {
+      "rank": 475,
+      "token_str": "<SPECIAL_475>",
+      "is_control": true
+    },
+    {
+      "rank": 476,
+      "token_str": "<SPECIAL_476>",
+      "is_control": true
+    },
+    {
+      "rank": 477,
+      "token_str": "<SPECIAL_477>",
+      "is_control": true
+    },
+    {
+      "rank": 478,
+      "token_str": "<SPECIAL_478>",
+      "is_control": true
+    },
+    {
+      "rank": 479,
+      "token_str": "<SPECIAL_479>",
+      "is_control": true
+    },
+    {
+      "rank": 480,
+      "token_str": "<SPECIAL_480>",
+      "is_control": true
+    },
+    {
+      "rank": 481,
+      "token_str": "<SPECIAL_481>",
+      "is_control": true
+    },
+    {
+      "rank": 482,
+      "token_str": "<SPECIAL_482>",
+      "is_control": true
+    },
+    {
+      "rank": 483,
+      "token_str": "<SPECIAL_483>",
+      "is_control": true
+    },
+    {
+      "rank": 484,
+      "token_str": "<SPECIAL_484>",
+      "is_control": true
+    },
+    {
+      "rank": 485,
+      "token_str": "<SPECIAL_485>",
+      "is_control": true
+    },
+    {
+      "rank": 486,
+      "token_str": "<SPECIAL_486>",
+      "is_control": true
+    },
+    {
+      "rank": 487,
+      "token_str": "<SPECIAL_487>",
+      "is_control": true
+    },
+    {
+      "rank": 488,
+      "token_str": "<SPECIAL_488>",
+      "is_control": true
+    },
+    {
+      "rank": 489,
+      "token_str": "<SPECIAL_489>",
+      "is_control": true
+    },
+    {
+      "rank": 490,
+      "token_str": "<SPECIAL_490>",
+      "is_control": true
+    },
+    {
+      "rank": 491,
+      "token_str": "<SPECIAL_491>",
+      "is_control": true
+    },
+    {
+      "rank": 492,
+      "token_str": "<SPECIAL_492>",
+      "is_control": true
+    },
+    {
+      "rank": 493,
+      "token_str": "<SPECIAL_493>",
+      "is_control": true
+    },
+    {
+      "rank": 494,
+      "token_str": "<SPECIAL_494>",
+      "is_control": true
+    },
+    {
+      "rank": 495,
+      "token_str": "<SPECIAL_495>",
+      "is_control": true
+    },
+    {
+      "rank": 496,
+      "token_str": "<SPECIAL_496>",
+      "is_control": true
+    },
+    {
+      "rank": 497,
+      "token_str": "<SPECIAL_497>",
+      "is_control": true
+    },
+    {
+      "rank": 498,
+      "token_str": "<SPECIAL_498>",
+      "is_control": true
+    },
+    {
+      "rank": 499,
+      "token_str": "<SPECIAL_499>",
+      "is_control": true
+    },
+    {
+      "rank": 500,
+      "token_str": "<SPECIAL_500>",
+      "is_control": true
+    },
+    {
+      "rank": 501,
+      "token_str": "<SPECIAL_501>",
+      "is_control": true
+    },
+    {
+      "rank": 502,
+      "token_str": "<SPECIAL_502>",
+      "is_control": true
+    },
+    {
+      "rank": 503,
+      "token_str": "<SPECIAL_503>",
+      "is_control": true
+    },
+    {
+      "rank": 504,
+      "token_str": "<SPECIAL_504>",
+      "is_control": true
+    },
+    {
+      "rank": 505,
+      "token_str": "<SPECIAL_505>",
+      "is_control": true
+    },
+    {
+      "rank": 506,
+      "token_str": "<SPECIAL_506>",
+      "is_control": true
+    },
+    {
+      "rank": 507,
+      "token_str": "<SPECIAL_507>",
+      "is_control": true
+    },
+    {
+      "rank": 508,
+      "token_str": "<SPECIAL_508>",
+      "is_control": true
+    },
+    {
+      "rank": 509,
+      "token_str": "<SPECIAL_509>",
+      "is_control": true
+    },
+    {
+      "rank": 510,
+      "token_str": "<SPECIAL_510>",
+      "is_control": true
+    },
+    {
+      "rank": 511,
+      "token_str": "<SPECIAL_511>",
+      "is_control": true
+    },
+    {
+      "rank": 512,
+      "token_str": "<SPECIAL_512>",
+      "is_control": true
+    },
+    {
+      "rank": 513,
+      "token_str": "<SPECIAL_513>",
+      "is_control": true
+    },
+    {
+      "rank": 514,
+      "token_str": "<SPECIAL_514>",
+      "is_control": true
+    },
+    {
+      "rank": 515,
+      "token_str": "<SPECIAL_515>",
+      "is_control": true
+    },
+    {
+      "rank": 516,
+      "token_str": "<SPECIAL_516>",
+      "is_control": true
+    },
+    {
+      "rank": 517,
+      "token_str": "<SPECIAL_517>",
+      "is_control": true
+    },
+    {
+      "rank": 518,
+      "token_str": "<SPECIAL_518>",
+      "is_control": true
+    },
+    {
+      "rank": 519,
+      "token_str": "<SPECIAL_519>",
+      "is_control": true
+    },
+    {
+      "rank": 520,
+      "token_str": "<SPECIAL_520>",
+      "is_control": true
+    },
+    {
+      "rank": 521,
+      "token_str": "<SPECIAL_521>",
+      "is_control": true
+    },
+    {
+      "rank": 522,
+      "token_str": "<SPECIAL_522>",
+      "is_control": true
+    },
+    {
+      "rank": 523,
+      "token_str": "<SPECIAL_523>",
+      "is_control": true
+    },
+    {
+      "rank": 524,
+      "token_str": "<SPECIAL_524>",
+      "is_control": true
+    },
+    {
+      "rank": 525,
+      "token_str": "<SPECIAL_525>",
+      "is_control": true
+    },
+    {
+      "rank": 526,
+      "token_str": "<SPECIAL_526>",
+      "is_control": true
+    },
+    {
+      "rank": 527,
+      "token_str": "<SPECIAL_527>",
+      "is_control": true
+    },
+    {
+      "rank": 528,
+      "token_str": "<SPECIAL_528>",
+      "is_control": true
+    },
+    {
+      "rank": 529,
+      "token_str": "<SPECIAL_529>",
+      "is_control": true
+    },
+    {
+      "rank": 530,
+      "token_str": "<SPECIAL_530>",
+      "is_control": true
+    },
+    {
+      "rank": 531,
+      "token_str": "<SPECIAL_531>",
+      "is_control": true
+    },
+    {
+      "rank": 532,
+      "token_str": "<SPECIAL_532>",
+      "is_control": true
+    },
+    {
+      "rank": 533,
+      "token_str": "<SPECIAL_533>",
+      "is_control": true
+    },
+    {
+      "rank": 534,
+      "token_str": "<SPECIAL_534>",
+      "is_control": true
+    },
+    {
+      "rank": 535,
+      "token_str": "<SPECIAL_535>",
+      "is_control": true
+    },
+    {
+      "rank": 536,
+      "token_str": "<SPECIAL_536>",
+      "is_control": true
+    },
+    {
+      "rank": 537,
+      "token_str": "<SPECIAL_537>",
+      "is_control": true
+    },
+    {
+      "rank": 538,
+      "token_str": "<SPECIAL_538>",
+      "is_control": true
+    },
+    {
+      "rank": 539,
+      "token_str": "<SPECIAL_539>",
+      "is_control": true
+    },
+    {
+      "rank": 540,
+      "token_str": "<SPECIAL_540>",
+      "is_control": true
+    },
+    {
+      "rank": 541,
+      "token_str": "<SPECIAL_541>",
+      "is_control": true
+    },
+    {
+      "rank": 542,
+      "token_str": "<SPECIAL_542>",
+      "is_control": true
+    },
+    {
+      "rank": 543,
+      "token_str": "<SPECIAL_543>",
+      "is_control": true
+    },
+    {
+      "rank": 544,
+      "token_str": "<SPECIAL_544>",
+      "is_control": true
+    },
+    {
+      "rank": 545,
+      "token_str": "<SPECIAL_545>",
+      "is_control": true
+    },
+    {
+      "rank": 546,
+      "token_str": "<SPECIAL_546>",
+      "is_control": true
+    },
+    {
+      "rank": 547,
+      "token_str": "<SPECIAL_547>",
+      "is_control": true
+    },
+    {
+      "rank": 548,
+      "token_str": "<SPECIAL_548>",
+      "is_control": true
+    },
+    {
+      "rank": 549,
+      "token_str": "<SPECIAL_549>",
+      "is_control": true
+    },
+    {
+      "rank": 550,
+      "token_str": "<SPECIAL_550>",
+      "is_control": true
+    },
+    {
+      "rank": 551,
+      "token_str": "<SPECIAL_551>",
+      "is_control": true
+    },
+    {
+      "rank": 552,
+      "token_str": "<SPECIAL_552>",
+      "is_control": true
+    },
+    {
+      "rank": 553,
+      "token_str": "<SPECIAL_553>",
+      "is_control": true
+    },
+    {
+      "rank": 554,
+      "token_str": "<SPECIAL_554>",
+      "is_control": true
+    },
+    {
+      "rank": 555,
+      "token_str": "<SPECIAL_555>",
+      "is_control": true
+    },
+    {
+      "rank": 556,
+      "token_str": "<SPECIAL_556>",
+      "is_control": true
+    },
+    {
+      "rank": 557,
+      "token_str": "<SPECIAL_557>",
+      "is_control": true
+    },
+    {
+      "rank": 558,
+      "token_str": "<SPECIAL_558>",
+      "is_control": true
+    },
+    {
+      "rank": 559,
+      "token_str": "<SPECIAL_559>",
+      "is_control": true
+    },
+    {
+      "rank": 560,
+      "token_str": "<SPECIAL_560>",
+      "is_control": true
+    },
+    {
+      "rank": 561,
+      "token_str": "<SPECIAL_561>",
+      "is_control": true
+    },
+    {
+      "rank": 562,
+      "token_str": "<SPECIAL_562>",
+      "is_control": true
+    },
+    {
+      "rank": 563,
+      "token_str": "<SPECIAL_563>",
+      "is_control": true
+    },
+    {
+      "rank": 564,
+      "token_str": "<SPECIAL_564>",
+      "is_control": true
+    },
+    {
+      "rank": 565,
+      "token_str": "<SPECIAL_565>",
+      "is_control": true
+    },
+    {
+      "rank": 566,
+      "token_str": "<SPECIAL_566>",
+      "is_control": true
+    },
+    {
+      "rank": 567,
+      "token_str": "<SPECIAL_567>",
+      "is_control": true
+    },
+    {
+      "rank": 568,
+      "token_str": "<SPECIAL_568>",
+      "is_control": true
+    },
+    {
+      "rank": 569,
+      "token_str": "<SPECIAL_569>",
+      "is_control": true
+    },
+    {
+      "rank": 570,
+      "token_str": "<SPECIAL_570>",
+      "is_control": true
+    },
+    {
+      "rank": 571,
+      "token_str": "<SPECIAL_571>",
+      "is_control": true
+    },
+    {
+      "rank": 572,
+      "token_str": "<SPECIAL_572>",
+      "is_control": true
+    },
+    {
+      "rank": 573,
+      "token_str": "<SPECIAL_573>",
+      "is_control": true
+    },
+    {
+      "rank": 574,
+      "token_str": "<SPECIAL_574>",
+      "is_control": true
+    },
+    {
+      "rank": 575,
+      "token_str": "<SPECIAL_575>",
+      "is_control": true
+    },
+    {
+      "rank": 576,
+      "token_str": "<SPECIAL_576>",
+      "is_control": true
+    },
+    {
+      "rank": 577,
+      "token_str": "<SPECIAL_577>",
+      "is_control": true
+    },
+    {
+      "rank": 578,
+      "token_str": "<SPECIAL_578>",
+      "is_control": true
+    },
+    {
+      "rank": 579,
+      "token_str": "<SPECIAL_579>",
+      "is_control": true
+    },
+    {
+      "rank": 580,
+      "token_str": "<SPECIAL_580>",
+      "is_control": true
+    },
+    {
+      "rank": 581,
+      "token_str": "<SPECIAL_581>",
+      "is_control": true
+    },
+    {
+      "rank": 582,
+      "token_str": "<SPECIAL_582>",
+      "is_control": true
+    },
+    {
+      "rank": 583,
+      "token_str": "<SPECIAL_583>",
+      "is_control": true
+    },
+    {
+      "rank": 584,
+      "token_str": "<SPECIAL_584>",
+      "is_control": true
+    },
+    {
+      "rank": 585,
+      "token_str": "<SPECIAL_585>",
+      "is_control": true
+    },
+    {
+      "rank": 586,
+      "token_str": "<SPECIAL_586>",
+      "is_control": true
+    },
+    {
+      "rank": 587,
+      "token_str": "<SPECIAL_587>",
+      "is_control": true
+    },
+    {
+      "rank": 588,
+      "token_str": "<SPECIAL_588>",
+      "is_control": true
+    },
+    {
+      "rank": 589,
+      "token_str": "<SPECIAL_589>",
+      "is_control": true
+    },
+    {
+      "rank": 590,
+      "token_str": "<SPECIAL_590>",
+      "is_control": true
+    },
+    {
+      "rank": 591,
+      "token_str": "<SPECIAL_591>",
+      "is_control": true
+    },
+    {
+      "rank": 592,
+      "token_str": "<SPECIAL_592>",
+      "is_control": true
+    },
+    {
+      "rank": 593,
+      "token_str": "<SPECIAL_593>",
+      "is_control": true
+    },
+    {
+      "rank": 594,
+      "token_str": "<SPECIAL_594>",
+      "is_control": true
+    },
+    {
+      "rank": 595,
+      "token_str": "<SPECIAL_595>",
+      "is_control": true
+    },
+    {
+      "rank": 596,
+      "token_str": "<SPECIAL_596>",
+      "is_control": true
+    },
+    {
+      "rank": 597,
+      "token_str": "<SPECIAL_597>",
+      "is_control": true
+    },
+    {
+      "rank": 598,
+      "token_str": "<SPECIAL_598>",
+      "is_control": true
+    },
+    {
+      "rank": 599,
+      "token_str": "<SPECIAL_599>",
+      "is_control": true
+    },
+    {
+      "rank": 600,
+      "token_str": "<SPECIAL_600>",
+      "is_control": true
+    },
+    {
+      "rank": 601,
+      "token_str": "<SPECIAL_601>",
+      "is_control": true
+    },
+    {
+      "rank": 602,
+      "token_str": "<SPECIAL_602>",
+      "is_control": true
+    },
+    {
+      "rank": 603,
+      "token_str": "<SPECIAL_603>",
+      "is_control": true
+    },
+    {
+      "rank": 604,
+      "token_str": "<SPECIAL_604>",
+      "is_control": true
+    },
+    {
+      "rank": 605,
+      "token_str": "<SPECIAL_605>",
+      "is_control": true
+    },
+    {
+      "rank": 606,
+      "token_str": "<SPECIAL_606>",
+      "is_control": true
+    },
+    {
+      "rank": 607,
+      "token_str": "<SPECIAL_607>",
+      "is_control": true
+    },
+    {
+      "rank": 608,
+      "token_str": "<SPECIAL_608>",
+      "is_control": true
+    },
+    {
+      "rank": 609,
+      "token_str": "<SPECIAL_609>",
+      "is_control": true
+    },
+    {
+      "rank": 610,
+      "token_str": "<SPECIAL_610>",
+      "is_control": true
+    },
+    {
+      "rank": 611,
+      "token_str": "<SPECIAL_611>",
+      "is_control": true
+    },
+    {
+      "rank": 612,
+      "token_str": "<SPECIAL_612>",
+      "is_control": true
+    },
+    {
+      "rank": 613,
+      "token_str": "<SPECIAL_613>",
+      "is_control": true
+    },
+    {
+      "rank": 614,
+      "token_str": "<SPECIAL_614>",
+      "is_control": true
+    },
+    {
+      "rank": 615,
+      "token_str": "<SPECIAL_615>",
+      "is_control": true
+    },
+    {
+      "rank": 616,
+      "token_str": "<SPECIAL_616>",
+      "is_control": true
+    },
+    {
+      "rank": 617,
+      "token_str": "<SPECIAL_617>",
+      "is_control": true
+    },
+    {
+      "rank": 618,
+      "token_str": "<SPECIAL_618>",
+      "is_control": true
+    },
+    {
+      "rank": 619,
+      "token_str": "<SPECIAL_619>",
+      "is_control": true
+    },
+    {
+      "rank": 620,
+      "token_str": "<SPECIAL_620>",
+      "is_control": true
+    },
+    {
+      "rank": 621,
+      "token_str": "<SPECIAL_621>",
+      "is_control": true
+    },
+    {
+      "rank": 622,
+      "token_str": "<SPECIAL_622>",
+      "is_control": true
+    },
+    {
+      "rank": 623,
+      "token_str": "<SPECIAL_623>",
+      "is_control": true
+    },
+    {
+      "rank": 624,
+      "token_str": "<SPECIAL_624>",
+      "is_control": true
+    },
+    {
+      "rank": 625,
+      "token_str": "<SPECIAL_625>",
+      "is_control": true
+    },
+    {
+      "rank": 626,
+      "token_str": "<SPECIAL_626>",
+      "is_control": true
+    },
+    {
+      "rank": 627,
+      "token_str": "<SPECIAL_627>",
+      "is_control": true
+    },
+    {
+      "rank": 628,
+      "token_str": "<SPECIAL_628>",
+      "is_control": true
+    },
+    {
+      "rank": 629,
+      "token_str": "<SPECIAL_629>",
+      "is_control": true
+    },
+    {
+      "rank": 630,
+      "token_str": "<SPECIAL_630>",
+      "is_control": true
+    },
+    {
+      "rank": 631,
+      "token_str": "<SPECIAL_631>",
+      "is_control": true
+    },
+    {
+      "rank": 632,
+      "token_str": "<SPECIAL_632>",
+      "is_control": true
+    },
+    {
+      "rank": 633,
+      "token_str": "<SPECIAL_633>",
+      "is_control": true
+    },
+    {
+      "rank": 634,
+      "token_str": "<SPECIAL_634>",
+      "is_control": true
+    },
+    {
+      "rank": 635,
+      "token_str": "<SPECIAL_635>",
+      "is_control": true
+    },
+    {
+      "rank": 636,
+      "token_str": "<SPECIAL_636>",
+      "is_control": true
+    },
+    {
+      "rank": 637,
+      "token_str": "<SPECIAL_637>",
+      "is_control": true
+    },
+    {
+      "rank": 638,
+      "token_str": "<SPECIAL_638>",
+      "is_control": true
+    },
+    {
+      "rank": 639,
+      "token_str": "<SPECIAL_639>",
+      "is_control": true
+    },
+    {
+      "rank": 640,
+      "token_str": "<SPECIAL_640>",
+      "is_control": true
+    },
+    {
+      "rank": 641,
+      "token_str": "<SPECIAL_641>",
+      "is_control": true
+    },
+    {
+      "rank": 642,
+      "token_str": "<SPECIAL_642>",
+      "is_control": true
+    },
+    {
+      "rank": 643,
+      "token_str": "<SPECIAL_643>",
+      "is_control": true
+    },
+    {
+      "rank": 644,
+      "token_str": "<SPECIAL_644>",
+      "is_control": true
+    },
+    {
+      "rank": 645,
+      "token_str": "<SPECIAL_645>",
+      "is_control": true
+    },
+    {
+      "rank": 646,
+      "token_str": "<SPECIAL_646>",
+      "is_control": true
+    },
+    {
+      "rank": 647,
+      "token_str": "<SPECIAL_647>",
+      "is_control": true
+    },
+    {
+      "rank": 648,
+      "token_str": "<SPECIAL_648>",
+      "is_control": true
+    },
+    {
+      "rank": 649,
+      "token_str": "<SPECIAL_649>",
+      "is_control": true
+    },
+    {
+      "rank": 650,
+      "token_str": "<SPECIAL_650>",
+      "is_control": true
+    },
+    {
+      "rank": 651,
+      "token_str": "<SPECIAL_651>",
+      "is_control": true
+    },
+    {
+      "rank": 652,
+      "token_str": "<SPECIAL_652>",
+      "is_control": true
+    },
+    {
+      "rank": 653,
+      "token_str": "<SPECIAL_653>",
+      "is_control": true
+    },
+    {
+      "rank": 654,
+      "token_str": "<SPECIAL_654>",
+      "is_control": true
+    },
+    {
+      "rank": 655,
+      "token_str": "<SPECIAL_655>",
+      "is_control": true
+    },
+    {
+      "rank": 656,
+      "token_str": "<SPECIAL_656>",
+      "is_control": true
+    },
+    {
+      "rank": 657,
+      "token_str": "<SPECIAL_657>",
+      "is_control": true
+    },
+    {
+      "rank": 658,
+      "token_str": "<SPECIAL_658>",
+      "is_control": true
+    },
+    {
+      "rank": 659,
+      "token_str": "<SPECIAL_659>",
+      "is_control": true
+    },
+    {
+      "rank": 660,
+      "token_str": "<SPECIAL_660>",
+      "is_control": true
+    },
+    {
+      "rank": 661,
+      "token_str": "<SPECIAL_661>",
+      "is_control": true
+    },
+    {
+      "rank": 662,
+      "token_str": "<SPECIAL_662>",
+      "is_control": true
+    },
+    {
+      "rank": 663,
+      "token_str": "<SPECIAL_663>",
+      "is_control": true
+    },
+    {
+      "rank": 664,
+      "token_str": "<SPECIAL_664>",
+      "is_control": true
+    },
+    {
+      "rank": 665,
+      "token_str": "<SPECIAL_665>",
+      "is_control": true
+    },
+    {
+      "rank": 666,
+      "token_str": "<SPECIAL_666>",
+      "is_control": true
+    },
+    {
+      "rank": 667,
+      "token_str": "<SPECIAL_667>",
+      "is_control": true
+    },
+    {
+      "rank": 668,
+      "token_str": "<SPECIAL_668>",
+      "is_control": true
+    },
+    {
+      "rank": 669,
+      "token_str": "<SPECIAL_669>",
+      "is_control": true
+    },
+    {
+      "rank": 670,
+      "token_str": "<SPECIAL_670>",
+      "is_control": true
+    },
+    {
+      "rank": 671,
+      "token_str": "<SPECIAL_671>",
+      "is_control": true
+    },
+    {
+      "rank": 672,
+      "token_str": "<SPECIAL_672>",
+      "is_control": true
+    },
+    {
+      "rank": 673,
+      "token_str": "<SPECIAL_673>",
+      "is_control": true
+    },
+    {
+      "rank": 674,
+      "token_str": "<SPECIAL_674>",
+      "is_control": true
+    },
+    {
+      "rank": 675,
+      "token_str": "<SPECIAL_675>",
+      "is_control": true
+    },
+    {
+      "rank": 676,
+      "token_str": "<SPECIAL_676>",
+      "is_control": true
+    },
+    {
+      "rank": 677,
+      "token_str": "<SPECIAL_677>",
+      "is_control": true
+    },
+    {
+      "rank": 678,
+      "token_str": "<SPECIAL_678>",
+      "is_control": true
+    },
+    {
+      "rank": 679,
+      "token_str": "<SPECIAL_679>",
+      "is_control": true
+    },
+    {
+      "rank": 680,
+      "token_str": "<SPECIAL_680>",
+      "is_control": true
+    },
+    {
+      "rank": 681,
+      "token_str": "<SPECIAL_681>",
+      "is_control": true
+    },
+    {
+      "rank": 682,
+      "token_str": "<SPECIAL_682>",
+      "is_control": true
+    },
+    {
+      "rank": 683,
+      "token_str": "<SPECIAL_683>",
+      "is_control": true
+    },
+    {
+      "rank": 684,
+      "token_str": "<SPECIAL_684>",
+      "is_control": true
+    },
+    {
+      "rank": 685,
+      "token_str": "<SPECIAL_685>",
+      "is_control": true
+    },
+    {
+      "rank": 686,
+      "token_str": "<SPECIAL_686>",
+      "is_control": true
+    },
+    {
+      "rank": 687,
+      "token_str": "<SPECIAL_687>",
+      "is_control": true
+    },
+    {
+      "rank": 688,
+      "token_str": "<SPECIAL_688>",
+      "is_control": true
+    },
+    {
+      "rank": 689,
+      "token_str": "<SPECIAL_689>",
+      "is_control": true
+    },
+    {
+      "rank": 690,
+      "token_str": "<SPECIAL_690>",
+      "is_control": true
+    },
+    {
+      "rank": 691,
+      "token_str": "<SPECIAL_691>",
+      "is_control": true
+    },
+    {
+      "rank": 692,
+      "token_str": "<SPECIAL_692>",
+      "is_control": true
+    },
+    {
+      "rank": 693,
+      "token_str": "<SPECIAL_693>",
+      "is_control": true
+    },
+    {
+      "rank": 694,
+      "token_str": "<SPECIAL_694>",
+      "is_control": true
+    },
+    {
+      "rank": 695,
+      "token_str": "<SPECIAL_695>",
+      "is_control": true
+    },
+    {
+      "rank": 696,
+      "token_str": "<SPECIAL_696>",
+      "is_control": true
+    },
+    {
+      "rank": 697,
+      "token_str": "<SPECIAL_697>",
+      "is_control": true
+    },
+    {
+      "rank": 698,
+      "token_str": "<SPECIAL_698>",
+      "is_control": true
+    },
+    {
+      "rank": 699,
+      "token_str": "<SPECIAL_699>",
+      "is_control": true
+    },
+    {
+      "rank": 700,
+      "token_str": "<SPECIAL_700>",
+      "is_control": true
+    },
+    {
+      "rank": 701,
+      "token_str": "<SPECIAL_701>",
+      "is_control": true
+    },
+    {
+      "rank": 702,
+      "token_str": "<SPECIAL_702>",
+      "is_control": true
+    },
+    {
+      "rank": 703,
+      "token_str": "<SPECIAL_703>",
+      "is_control": true
+    },
+    {
+      "rank": 704,
+      "token_str": "<SPECIAL_704>",
+      "is_control": true
+    },
+    {
+      "rank": 705,
+      "token_str": "<SPECIAL_705>",
+      "is_control": true
+    },
+    {
+      "rank": 706,
+      "token_str": "<SPECIAL_706>",
+      "is_control": true
+    },
+    {
+      "rank": 707,
+      "token_str": "<SPECIAL_707>",
+      "is_control": true
+    },
+    {
+      "rank": 708,
+      "token_str": "<SPECIAL_708>",
+      "is_control": true
+    },
+    {
+      "rank": 709,
+      "token_str": "<SPECIAL_709>",
+      "is_control": true
+    },
+    {
+      "rank": 710,
+      "token_str": "<SPECIAL_710>",
+      "is_control": true
+    },
+    {
+      "rank": 711,
+      "token_str": "<SPECIAL_711>",
+      "is_control": true
+    },
+    {
+      "rank": 712,
+      "token_str": "<SPECIAL_712>",
+      "is_control": true
+    },
+    {
+      "rank": 713,
+      "token_str": "<SPECIAL_713>",
+      "is_control": true
+    },
+    {
+      "rank": 714,
+      "token_str": "<SPECIAL_714>",
+      "is_control": true
+    },
+    {
+      "rank": 715,
+      "token_str": "<SPECIAL_715>",
+      "is_control": true
+    },
+    {
+      "rank": 716,
+      "token_str": "<SPECIAL_716>",
+      "is_control": true
+    },
+    {
+      "rank": 717,
+      "token_str": "<SPECIAL_717>",
+      "is_control": true
+    },
+    {
+      "rank": 718,
+      "token_str": "<SPECIAL_718>",
+      "is_control": true
+    },
+    {
+      "rank": 719,
+      "token_str": "<SPECIAL_719>",
+      "is_control": true
+    },
+    {
+      "rank": 720,
+      "token_str": "<SPECIAL_720>",
+      "is_control": true
+    },
+    {
+      "rank": 721,
+      "token_str": "<SPECIAL_721>",
+      "is_control": true
+    },
+    {
+      "rank": 722,
+      "token_str": "<SPECIAL_722>",
+      "is_control": true
+    },
+    {
+      "rank": 723,
+      "token_str": "<SPECIAL_723>",
+      "is_control": true
+    },
+    {
+      "rank": 724,
+      "token_str": "<SPECIAL_724>",
+      "is_control": true
+    },
+    {
+      "rank": 725,
+      "token_str": "<SPECIAL_725>",
+      "is_control": true
+    },
+    {
+      "rank": 726,
+      "token_str": "<SPECIAL_726>",
+      "is_control": true
+    },
+    {
+      "rank": 727,
+      "token_str": "<SPECIAL_727>",
+      "is_control": true
+    },
+    {
+      "rank": 728,
+      "token_str": "<SPECIAL_728>",
+      "is_control": true
+    },
+    {
+      "rank": 729,
+      "token_str": "<SPECIAL_729>",
+      "is_control": true
+    },
+    {
+      "rank": 730,
+      "token_str": "<SPECIAL_730>",
+      "is_control": true
+    },
+    {
+      "rank": 731,
+      "token_str": "<SPECIAL_731>",
+      "is_control": true
+    },
+    {
+      "rank": 732,
+      "token_str": "<SPECIAL_732>",
+      "is_control": true
+    },
+    {
+      "rank": 733,
+      "token_str": "<SPECIAL_733>",
+      "is_control": true
+    },
+    {
+      "rank": 734,
+      "token_str": "<SPECIAL_734>",
+      "is_control": true
+    },
+    {
+      "rank": 735,
+      "token_str": "<SPECIAL_735>",
+      "is_control": true
+    },
+    {
+      "rank": 736,
+      "token_str": "<SPECIAL_736>",
+      "is_control": true
+    },
+    {
+      "rank": 737,
+      "token_str": "<SPECIAL_737>",
+      "is_control": true
+    },
+    {
+      "rank": 738,
+      "token_str": "<SPECIAL_738>",
+      "is_control": true
+    },
+    {
+      "rank": 739,
+      "token_str": "<SPECIAL_739>",
+      "is_control": true
+    },
+    {
+      "rank": 740,
+      "token_str": "<SPECIAL_740>",
+      "is_control": true
+    },
+    {
+      "rank": 741,
+      "token_str": "<SPECIAL_741>",
+      "is_control": true
+    },
+    {
+      "rank": 742,
+      "token_str": "<SPECIAL_742>",
+      "is_control": true
+    },
+    {
+      "rank": 743,
+      "token_str": "<SPECIAL_743>",
+      "is_control": true
+    },
+    {
+      "rank": 744,
+      "token_str": "<SPECIAL_744>",
+      "is_control": true
+    },
+    {
+      "rank": 745,
+      "token_str": "<SPECIAL_745>",
+      "is_control": true
+    },
+    {
+      "rank": 746,
+      "token_str": "<SPECIAL_746>",
+      "is_control": true
+    },
+    {
+      "rank": 747,
+      "token_str": "<SPECIAL_747>",
+      "is_control": true
+    },
+    {
+      "rank": 748,
+      "token_str": "<SPECIAL_748>",
+      "is_control": true
+    },
+    {
+      "rank": 749,
+      "token_str": "<SPECIAL_749>",
+      "is_control": true
+    },
+    {
+      "rank": 750,
+      "token_str": "<SPECIAL_750>",
+      "is_control": true
+    },
+    {
+      "rank": 751,
+      "token_str": "<SPECIAL_751>",
+      "is_control": true
+    },
+    {
+      "rank": 752,
+      "token_str": "<SPECIAL_752>",
+      "is_control": true
+    },
+    {
+      "rank": 753,
+      "token_str": "<SPECIAL_753>",
+      "is_control": true
+    },
+    {
+      "rank": 754,
+      "token_str": "<SPECIAL_754>",
+      "is_control": true
+    },
+    {
+      "rank": 755,
+      "token_str": "<SPECIAL_755>",
+      "is_control": true
+    },
+    {
+      "rank": 756,
+      "token_str": "<SPECIAL_756>",
+      "is_control": true
+    },
+    {
+      "rank": 757,
+      "token_str": "<SPECIAL_757>",
+      "is_control": true
+    },
+    {
+      "rank": 758,
+      "token_str": "<SPECIAL_758>",
+      "is_control": true
+    },
+    {
+      "rank": 759,
+      "token_str": "<SPECIAL_759>",
+      "is_control": true
+    },
+    {
+      "rank": 760,
+      "token_str": "<SPECIAL_760>",
+      "is_control": true
+    },
+    {
+      "rank": 761,
+      "token_str": "<SPECIAL_761>",
+      "is_control": true
+    },
+    {
+      "rank": 762,
+      "token_str": "<SPECIAL_762>",
+      "is_control": true
+    },
+    {
+      "rank": 763,
+      "token_str": "<SPECIAL_763>",
+      "is_control": true
+    },
+    {
+      "rank": 764,
+      "token_str": "<SPECIAL_764>",
+      "is_control": true
+    },
+    {
+      "rank": 765,
+      "token_str": "<SPECIAL_765>",
+      "is_control": true
+    },
+    {
+      "rank": 766,
+      "token_str": "<SPECIAL_766>",
+      "is_control": true
+    },
+    {
+      "rank": 767,
+      "token_str": "<SPECIAL_767>",
+      "is_control": true
+    },
+    {
+      "rank": 768,
+      "token_str": "<SPECIAL_768>",
+      "is_control": true
+    },
+    {
+      "rank": 769,
+      "token_str": "<SPECIAL_769>",
+      "is_control": true
+    },
+    {
+      "rank": 770,
+      "token_str": "<SPECIAL_770>",
+      "is_control": true
+    },
+    {
+      "rank": 771,
+      "token_str": "<SPECIAL_771>",
+      "is_control": true
+    },
+    {
+      "rank": 772,
+      "token_str": "<SPECIAL_772>",
+      "is_control": true
+    },
+    {
+      "rank": 773,
+      "token_str": "<SPECIAL_773>",
+      "is_control": true
+    },
+    {
+      "rank": 774,
+      "token_str": "<SPECIAL_774>",
+      "is_control": true
+    },
+    {
+      "rank": 775,
+      "token_str": "<SPECIAL_775>",
+      "is_control": true
+    },
+    {
+      "rank": 776,
+      "token_str": "<SPECIAL_776>",
+      "is_control": true
+    },
+    {
+      "rank": 777,
+      "token_str": "<SPECIAL_777>",
+      "is_control": true
+    },
+    {
+      "rank": 778,
+      "token_str": "<SPECIAL_778>",
+      "is_control": true
+    },
+    {
+      "rank": 779,
+      "token_str": "<SPECIAL_779>",
+      "is_control": true
+    },
+    {
+      "rank": 780,
+      "token_str": "<SPECIAL_780>",
+      "is_control": true
+    },
+    {
+      "rank": 781,
+      "token_str": "<SPECIAL_781>",
+      "is_control": true
+    },
+    {
+      "rank": 782,
+      "token_str": "<SPECIAL_782>",
+      "is_control": true
+    },
+    {
+      "rank": 783,
+      "token_str": "<SPECIAL_783>",
+      "is_control": true
+    },
+    {
+      "rank": 784,
+      "token_str": "<SPECIAL_784>",
+      "is_control": true
+    },
+    {
+      "rank": 785,
+      "token_str": "<SPECIAL_785>",
+      "is_control": true
+    },
+    {
+      "rank": 786,
+      "token_str": "<SPECIAL_786>",
+      "is_control": true
+    },
+    {
+      "rank": 787,
+      "token_str": "<SPECIAL_787>",
+      "is_control": true
+    },
+    {
+      "rank": 788,
+      "token_str": "<SPECIAL_788>",
+      "is_control": true
+    },
+    {
+      "rank": 789,
+      "token_str": "<SPECIAL_789>",
+      "is_control": true
+    },
+    {
+      "rank": 790,
+      "token_str": "<SPECIAL_790>",
+      "is_control": true
+    },
+    {
+      "rank": 791,
+      "token_str": "<SPECIAL_791>",
+      "is_control": true
+    },
+    {
+      "rank": 792,
+      "token_str": "<SPECIAL_792>",
+      "is_control": true
+    },
+    {
+      "rank": 793,
+      "token_str": "<SPECIAL_793>",
+      "is_control": true
+    },
+    {
+      "rank": 794,
+      "token_str": "<SPECIAL_794>",
+      "is_control": true
+    },
+    {
+      "rank": 795,
+      "token_str": "<SPECIAL_795>",
+      "is_control": true
+    },
+    {
+      "rank": 796,
+      "token_str": "<SPECIAL_796>",
+      "is_control": true
+    },
+    {
+      "rank": 797,
+      "token_str": "<SPECIAL_797>",
+      "is_control": true
+    },
+    {
+      "rank": 798,
+      "token_str": "<SPECIAL_798>",
+      "is_control": true
+    },
+    {
+      "rank": 799,
+      "token_str": "<SPECIAL_799>",
+      "is_control": true
+    },
+    {
+      "rank": 800,
+      "token_str": "<SPECIAL_800>",
+      "is_control": true
+    },
+    {
+      "rank": 801,
+      "token_str": "<SPECIAL_801>",
+      "is_control": true
+    },
+    {
+      "rank": 802,
+      "token_str": "<SPECIAL_802>",
+      "is_control": true
+    },
+    {
+      "rank": 803,
+      "token_str": "<SPECIAL_803>",
+      "is_control": true
+    },
+    {
+      "rank": 804,
+      "token_str": "<SPECIAL_804>",
+      "is_control": true
+    },
+    {
+      "rank": 805,
+      "token_str": "<SPECIAL_805>",
+      "is_control": true
+    },
+    {
+      "rank": 806,
+      "token_str": "<SPECIAL_806>",
+      "is_control": true
+    },
+    {
+      "rank": 807,
+      "token_str": "<SPECIAL_807>",
+      "is_control": true
+    },
+    {
+      "rank": 808,
+      "token_str": "<SPECIAL_808>",
+      "is_control": true
+    },
+    {
+      "rank": 809,
+      "token_str": "<SPECIAL_809>",
+      "is_control": true
+    },
+    {
+      "rank": 810,
+      "token_str": "<SPECIAL_810>",
+      "is_control": true
+    },
+    {
+      "rank": 811,
+      "token_str": "<SPECIAL_811>",
+      "is_control": true
+    },
+    {
+      "rank": 812,
+      "token_str": "<SPECIAL_812>",
+      "is_control": true
+    },
+    {
+      "rank": 813,
+      "token_str": "<SPECIAL_813>",
+      "is_control": true
+    },
+    {
+      "rank": 814,
+      "token_str": "<SPECIAL_814>",
+      "is_control": true
+    },
+    {
+      "rank": 815,
+      "token_str": "<SPECIAL_815>",
+      "is_control": true
+    },
+    {
+      "rank": 816,
+      "token_str": "<SPECIAL_816>",
+      "is_control": true
+    },
+    {
+      "rank": 817,
+      "token_str": "<SPECIAL_817>",
+      "is_control": true
+    },
+    {
+      "rank": 818,
+      "token_str": "<SPECIAL_818>",
+      "is_control": true
+    },
+    {
+      "rank": 819,
+      "token_str": "<SPECIAL_819>",
+      "is_control": true
+    },
+    {
+      "rank": 820,
+      "token_str": "<SPECIAL_820>",
+      "is_control": true
+    },
+    {
+      "rank": 821,
+      "token_str": "<SPECIAL_821>",
+      "is_control": true
+    },
+    {
+      "rank": 822,
+      "token_str": "<SPECIAL_822>",
+      "is_control": true
+    },
+    {
+      "rank": 823,
+      "token_str": "<SPECIAL_823>",
+      "is_control": true
+    },
+    {
+      "rank": 824,
+      "token_str": "<SPECIAL_824>",
+      "is_control": true
+    },
+    {
+      "rank": 825,
+      "token_str": "<SPECIAL_825>",
+      "is_control": true
+    },
+    {
+      "rank": 826,
+      "token_str": "<SPECIAL_826>",
+      "is_control": true
+    },
+    {
+      "rank": 827,
+      "token_str": "<SPECIAL_827>",
+      "is_control": true
+    },
+    {
+      "rank": 828,
+      "token_str": "<SPECIAL_828>",
+      "is_control": true
+    },
+    {
+      "rank": 829,
+      "token_str": "<SPECIAL_829>",
+      "is_control": true
+    },
+    {
+      "rank": 830,
+      "token_str": "<SPECIAL_830>",
+      "is_control": true
+    },
+    {
+      "rank": 831,
+      "token_str": "<SPECIAL_831>",
+      "is_control": true
+    },
+    {
+      "rank": 832,
+      "token_str": "<SPECIAL_832>",
+      "is_control": true
+    },
+    {
+      "rank": 833,
+      "token_str": "<SPECIAL_833>",
+      "is_control": true
+    },
+    {
+      "rank": 834,
+      "token_str": "<SPECIAL_834>",
+      "is_control": true
+    },
+    {
+      "rank": 835,
+      "token_str": "<SPECIAL_835>",
+      "is_control": true
+    },
+    {
+      "rank": 836,
+      "token_str": "<SPECIAL_836>",
+      "is_control": true
+    },
+    {
+      "rank": 837,
+      "token_str": "<SPECIAL_837>",
+      "is_control": true
+    },
+    {
+      "rank": 838,
+      "token_str": "<SPECIAL_838>",
+      "is_control": true
+    },
+    {
+      "rank": 839,
+      "token_str": "<SPECIAL_839>",
+      "is_control": true
+    },
+    {
+      "rank": 840,
+      "token_str": "<SPECIAL_840>",
+      "is_control": true
+    },
+    {
+      "rank": 841,
+      "token_str": "<SPECIAL_841>",
+      "is_control": true
+    },
+    {
+      "rank": 842,
+      "token_str": "<SPECIAL_842>",
+      "is_control": true
+    },
+    {
+      "rank": 843,
+      "token_str": "<SPECIAL_843>",
+      "is_control": true
+    },
+    {
+      "rank": 844,
+      "token_str": "<SPECIAL_844>",
+      "is_control": true
+    },
+    {
+      "rank": 845,
+      "token_str": "<SPECIAL_845>",
+      "is_control": true
+    },
+    {
+      "rank": 846,
+      "token_str": "<SPECIAL_846>",
+      "is_control": true
+    },
+    {
+      "rank": 847,
+      "token_str": "<SPECIAL_847>",
+      "is_control": true
+    },
+    {
+      "rank": 848,
+      "token_str": "<SPECIAL_848>",
+      "is_control": true
+    },
+    {
+      "rank": 849,
+      "token_str": "<SPECIAL_849>",
+      "is_control": true
+    },
+    {
+      "rank": 850,
+      "token_str": "<SPECIAL_850>",
+      "is_control": true
+    },
+    {
+      "rank": 851,
+      "token_str": "<SPECIAL_851>",
+      "is_control": true
+    },
+    {
+      "rank": 852,
+      "token_str": "<SPECIAL_852>",
+      "is_control": true
+    },
+    {
+      "rank": 853,
+      "token_str": "<SPECIAL_853>",
+      "is_control": true
+    },
+    {
+      "rank": 854,
+      "token_str": "<SPECIAL_854>",
+      "is_control": true
+    },
+    {
+      "rank": 855,
+      "token_str": "<SPECIAL_855>",
+      "is_control": true
+    },
+    {
+      "rank": 856,
+      "token_str": "<SPECIAL_856>",
+      "is_control": true
+    },
+    {
+      "rank": 857,
+      "token_str": "<SPECIAL_857>",
+      "is_control": true
+    },
+    {
+      "rank": 858,
+      "token_str": "<SPECIAL_858>",
+      "is_control": true
+    },
+    {
+      "rank": 859,
+      "token_str": "<SPECIAL_859>",
+      "is_control": true
+    },
+    {
+      "rank": 860,
+      "token_str": "<SPECIAL_860>",
+      "is_control": true
+    },
+    {
+      "rank": 861,
+      "token_str": "<SPECIAL_861>",
+      "is_control": true
+    },
+    {
+      "rank": 862,
+      "token_str": "<SPECIAL_862>",
+      "is_control": true
+    },
+    {
+      "rank": 863,
+      "token_str": "<SPECIAL_863>",
+      "is_control": true
+    },
+    {
+      "rank": 864,
+      "token_str": "<SPECIAL_864>",
+      "is_control": true
+    },
+    {
+      "rank": 865,
+      "token_str": "<SPECIAL_865>",
+      "is_control": true
+    },
+    {
+      "rank": 866,
+      "token_str": "<SPECIAL_866>",
+      "is_control": true
+    },
+    {
+      "rank": 867,
+      "token_str": "<SPECIAL_867>",
+      "is_control": true
+    },
+    {
+      "rank": 868,
+      "token_str": "<SPECIAL_868>",
+      "is_control": true
+    },
+    {
+      "rank": 869,
+      "token_str": "<SPECIAL_869>",
+      "is_control": true
+    },
+    {
+      "rank": 870,
+      "token_str": "<SPECIAL_870>",
+      "is_control": true
+    },
+    {
+      "rank": 871,
+      "token_str": "<SPECIAL_871>",
+      "is_control": true
+    },
+    {
+      "rank": 872,
+      "token_str": "<SPECIAL_872>",
+      "is_control": true
+    },
+    {
+      "rank": 873,
+      "token_str": "<SPECIAL_873>",
+      "is_control": true
+    },
+    {
+      "rank": 874,
+      "token_str": "<SPECIAL_874>",
+      "is_control": true
+    },
+    {
+      "rank": 875,
+      "token_str": "<SPECIAL_875>",
+      "is_control": true
+    },
+    {
+      "rank": 876,
+      "token_str": "<SPECIAL_876>",
+      "is_control": true
+    },
+    {
+      "rank": 877,
+      "token_str": "<SPECIAL_877>",
+      "is_control": true
+    },
+    {
+      "rank": 878,
+      "token_str": "<SPECIAL_878>",
+      "is_control": true
+    },
+    {
+      "rank": 879,
+      "token_str": "<SPECIAL_879>",
+      "is_control": true
+    },
+    {
+      "rank": 880,
+      "token_str": "<SPECIAL_880>",
+      "is_control": true
+    },
+    {
+      "rank": 881,
+      "token_str": "<SPECIAL_881>",
+      "is_control": true
+    },
+    {
+      "rank": 882,
+      "token_str": "<SPECIAL_882>",
+      "is_control": true
+    },
+    {
+      "rank": 883,
+      "token_str": "<SPECIAL_883>",
+      "is_control": true
+    },
+    {
+      "rank": 884,
+      "token_str": "<SPECIAL_884>",
+      "is_control": true
+    },
+    {
+      "rank": 885,
+      "token_str": "<SPECIAL_885>",
+      "is_control": true
+    },
+    {
+      "rank": 886,
+      "token_str": "<SPECIAL_886>",
+      "is_control": true
+    },
+    {
+      "rank": 887,
+      "token_str": "<SPECIAL_887>",
+      "is_control": true
+    },
+    {
+      "rank": 888,
+      "token_str": "<SPECIAL_888>",
+      "is_control": true
+    },
+    {
+      "rank": 889,
+      "token_str": "<SPECIAL_889>",
+      "is_control": true
+    },
+    {
+      "rank": 890,
+      "token_str": "<SPECIAL_890>",
+      "is_control": true
+    },
+    {
+      "rank": 891,
+      "token_str": "<SPECIAL_891>",
+      "is_control": true
+    },
+    {
+      "rank": 892,
+      "token_str": "<SPECIAL_892>",
+      "is_control": true
+    },
+    {
+      "rank": 893,
+      "token_str": "<SPECIAL_893>",
+      "is_control": true
+    },
+    {
+      "rank": 894,
+      "token_str": "<SPECIAL_894>",
+      "is_control": true
+    },
+    {
+      "rank": 895,
+      "token_str": "<SPECIAL_895>",
+      "is_control": true
+    },
+    {
+      "rank": 896,
+      "token_str": "<SPECIAL_896>",
+      "is_control": true
+    },
+    {
+      "rank": 897,
+      "token_str": "<SPECIAL_897>",
+      "is_control": true
+    },
+    {
+      "rank": 898,
+      "token_str": "<SPECIAL_898>",
+      "is_control": true
+    },
+    {
+      "rank": 899,
+      "token_str": "<SPECIAL_899>",
+      "is_control": true
+    },
+    {
+      "rank": 900,
+      "token_str": "<SPECIAL_900>",
+      "is_control": true
+    },
+    {
+      "rank": 901,
+      "token_str": "<SPECIAL_901>",
+      "is_control": true
+    },
+    {
+      "rank": 902,
+      "token_str": "<SPECIAL_902>",
+      "is_control": true
+    },
+    {
+      "rank": 903,
+      "token_str": "<SPECIAL_903>",
+      "is_control": true
+    },
+    {
+      "rank": 904,
+      "token_str": "<SPECIAL_904>",
+      "is_control": true
+    },
+    {
+      "rank": 905,
+      "token_str": "<SPECIAL_905>",
+      "is_control": true
+    },
+    {
+      "rank": 906,
+      "token_str": "<SPECIAL_906>",
+      "is_control": true
+    },
+    {
+      "rank": 907,
+      "token_str": "<SPECIAL_907>",
+      "is_control": true
+    },
+    {
+      "rank": 908,
+      "token_str": "<SPECIAL_908>",
+      "is_control": true
+    },
+    {
+      "rank": 909,
+      "token_str": "<SPECIAL_909>",
+      "is_control": true
+    },
+    {
+      "rank": 910,
+      "token_str": "<SPECIAL_910>",
+      "is_control": true
+    },
+    {
+      "rank": 911,
+      "token_str": "<SPECIAL_911>",
+      "is_control": true
+    },
+    {
+      "rank": 912,
+      "token_str": "<SPECIAL_912>",
+      "is_control": true
+    },
+    {
+      "rank": 913,
+      "token_str": "<SPECIAL_913>",
+      "is_control": true
+    },
+    {
+      "rank": 914,
+      "token_str": "<SPECIAL_914>",
+      "is_control": true
+    },
+    {
+      "rank": 915,
+      "token_str": "<SPECIAL_915>",
+      "is_control": true
+    },
+    {
+      "rank": 916,
+      "token_str": "<SPECIAL_916>",
+      "is_control": true
+    },
+    {
+      "rank": 917,
+      "token_str": "<SPECIAL_917>",
+      "is_control": true
+    },
+    {
+      "rank": 918,
+      "token_str": "<SPECIAL_918>",
+      "is_control": true
+    },
+    {
+      "rank": 919,
+      "token_str": "<SPECIAL_919>",
+      "is_control": true
+    },
+    {
+      "rank": 920,
+      "token_str": "<SPECIAL_920>",
+      "is_control": true
+    },
+    {
+      "rank": 921,
+      "token_str": "<SPECIAL_921>",
+      "is_control": true
+    },
+    {
+      "rank": 922,
+      "token_str": "<SPECIAL_922>",
+      "is_control": true
+    },
+    {
+      "rank": 923,
+      "token_str": "<SPECIAL_923>",
+      "is_control": true
+    },
+    {
+      "rank": 924,
+      "token_str": "<SPECIAL_924>",
+      "is_control": true
+    },
+    {
+      "rank": 925,
+      "token_str": "<SPECIAL_925>",
+      "is_control": true
+    },
+    {
+      "rank": 926,
+      "token_str": "<SPECIAL_926>",
+      "is_control": true
+    },
+    {
+      "rank": 927,
+      "token_str": "<SPECIAL_927>",
+      "is_control": true
+    },
+    {
+      "rank": 928,
+      "token_str": "<SPECIAL_928>",
+      "is_control": true
+    },
+    {
+      "rank": 929,
+      "token_str": "<SPECIAL_929>",
+      "is_control": true
+    },
+    {
+      "rank": 930,
+      "token_str": "<SPECIAL_930>",
+      "is_control": true
+    },
+    {
+      "rank": 931,
+      "token_str": "<SPECIAL_931>",
+      "is_control": true
+    },
+    {
+      "rank": 932,
+      "token_str": "<SPECIAL_932>",
+      "is_control": true
+    },
+    {
+      "rank": 933,
+      "token_str": "<SPECIAL_933>",
+      "is_control": true
+    },
+    {
+      "rank": 934,
+      "token_str": "<SPECIAL_934>",
+      "is_control": true
+    },
+    {
+      "rank": 935,
+      "token_str": "<SPECIAL_935>",
+      "is_control": true
+    },
+    {
+      "rank": 936,
+      "token_str": "<SPECIAL_936>",
+      "is_control": true
+    },
+    {
+      "rank": 937,
+      "token_str": "<SPECIAL_937>",
+      "is_control": true
+    },
+    {
+      "rank": 938,
+      "token_str": "<SPECIAL_938>",
+      "is_control": true
+    },
+    {
+      "rank": 939,
+      "token_str": "<SPECIAL_939>",
+      "is_control": true
+    },
+    {
+      "rank": 940,
+      "token_str": "<SPECIAL_940>",
+      "is_control": true
+    },
+    {
+      "rank": 941,
+      "token_str": "<SPECIAL_941>",
+      "is_control": true
+    },
+    {
+      "rank": 942,
+      "token_str": "<SPECIAL_942>",
+      "is_control": true
+    },
+    {
+      "rank": 943,
+      "token_str": "<SPECIAL_943>",
+      "is_control": true
+    },
+    {
+      "rank": 944,
+      "token_str": "<SPECIAL_944>",
+      "is_control": true
+    },
+    {
+      "rank": 945,
+      "token_str": "<SPECIAL_945>",
+      "is_control": true
+    },
+    {
+      "rank": 946,
+      "token_str": "<SPECIAL_946>",
+      "is_control": true
+    },
+    {
+      "rank": 947,
+      "token_str": "<SPECIAL_947>",
+      "is_control": true
+    },
+    {
+      "rank": 948,
+      "token_str": "<SPECIAL_948>",
+      "is_control": true
+    },
+    {
+      "rank": 949,
+      "token_str": "<SPECIAL_949>",
+      "is_control": true
+    },
+    {
+      "rank": 950,
+      "token_str": "<SPECIAL_950>",
+      "is_control": true
+    },
+    {
+      "rank": 951,
+      "token_str": "<SPECIAL_951>",
+      "is_control": true
+    },
+    {
+      "rank": 952,
+      "token_str": "<SPECIAL_952>",
+      "is_control": true
+    },
+    {
+      "rank": 953,
+      "token_str": "<SPECIAL_953>",
+      "is_control": true
+    },
+    {
+      "rank": 954,
+      "token_str": "<SPECIAL_954>",
+      "is_control": true
+    },
+    {
+      "rank": 955,
+      "token_str": "<SPECIAL_955>",
+      "is_control": true
+    },
+    {
+      "rank": 956,
+      "token_str": "<SPECIAL_956>",
+      "is_control": true
+    },
+    {
+      "rank": 957,
+      "token_str": "<SPECIAL_957>",
+      "is_control": true
+    },
+    {
+      "rank": 958,
+      "token_str": "<SPECIAL_958>",
+      "is_control": true
+    },
+    {
+      "rank": 959,
+      "token_str": "<SPECIAL_959>",
+      "is_control": true
+    },
+    {
+      "rank": 960,
+      "token_str": "<SPECIAL_960>",
+      "is_control": true
+    },
+    {
+      "rank": 961,
+      "token_str": "<SPECIAL_961>",
+      "is_control": true
+    },
+    {
+      "rank": 962,
+      "token_str": "<SPECIAL_962>",
+      "is_control": true
+    },
+    {
+      "rank": 963,
+      "token_str": "<SPECIAL_963>",
+      "is_control": true
+    },
+    {
+      "rank": 964,
+      "token_str": "<SPECIAL_964>",
+      "is_control": true
+    },
+    {
+      "rank": 965,
+      "token_str": "<SPECIAL_965>",
+      "is_control": true
+    },
+    {
+      "rank": 966,
+      "token_str": "<SPECIAL_966>",
+      "is_control": true
+    },
+    {
+      "rank": 967,
+      "token_str": "<SPECIAL_967>",
+      "is_control": true
+    },
+    {
+      "rank": 968,
+      "token_str": "<SPECIAL_968>",
+      "is_control": true
+    },
+    {
+      "rank": 969,
+      "token_str": "<SPECIAL_969>",
+      "is_control": true
+    },
+    {
+      "rank": 970,
+      "token_str": "<SPECIAL_970>",
+      "is_control": true
+    },
+    {
+      "rank": 971,
+      "token_str": "<SPECIAL_971>",
+      "is_control": true
+    },
+    {
+      "rank": 972,
+      "token_str": "<SPECIAL_972>",
+      "is_control": true
+    },
+    {
+      "rank": 973,
+      "token_str": "<SPECIAL_973>",
+      "is_control": true
+    },
+    {
+      "rank": 974,
+      "token_str": "<SPECIAL_974>",
+      "is_control": true
+    },
+    {
+      "rank": 975,
+      "token_str": "<SPECIAL_975>",
+      "is_control": true
+    },
+    {
+      "rank": 976,
+      "token_str": "<SPECIAL_976>",
+      "is_control": true
+    },
+    {
+      "rank": 977,
+      "token_str": "<SPECIAL_977>",
+      "is_control": true
+    },
+    {
+      "rank": 978,
+      "token_str": "<SPECIAL_978>",
+      "is_control": true
+    },
+    {
+      "rank": 979,
+      "token_str": "<SPECIAL_979>",
+      "is_control": true
+    },
+    {
+      "rank": 980,
+      "token_str": "<SPECIAL_980>",
+      "is_control": true
+    },
+    {
+      "rank": 981,
+      "token_str": "<SPECIAL_981>",
+      "is_control": true
+    },
+    {
+      "rank": 982,
+      "token_str": "<SPECIAL_982>",
+      "is_control": true
+    },
+    {
+      "rank": 983,
+      "token_str": "<SPECIAL_983>",
+      "is_control": true
+    },
+    {
+      "rank": 984,
+      "token_str": "<SPECIAL_984>",
+      "is_control": true
+    },
+    {
+      "rank": 985,
+      "token_str": "<SPECIAL_985>",
+      "is_control": true
+    },
+    {
+      "rank": 986,
+      "token_str": "<SPECIAL_986>",
+      "is_control": true
+    },
+    {
+      "rank": 987,
+      "token_str": "<SPECIAL_987>",
+      "is_control": true
+    },
+    {
+      "rank": 988,
+      "token_str": "<SPECIAL_988>",
+      "is_control": true
+    },
+    {
+      "rank": 989,
+      "token_str": "<SPECIAL_989>",
+      "is_control": true
+    },
+    {
+      "rank": 990,
+      "token_str": "<SPECIAL_990>",
+      "is_control": true
+    },
+    {
+      "rank": 991,
+      "token_str": "<SPECIAL_991>",
+      "is_control": true
+    },
+    {
+      "rank": 992,
+      "token_str": "<SPECIAL_992>",
+      "is_control": true
+    },
+    {
+      "rank": 993,
+      "token_str": "<SPECIAL_993>",
+      "is_control": true
+    },
+    {
+      "rank": 994,
+      "token_str": "<SPECIAL_994>",
+      "is_control": true
+    },
+    {
+      "rank": 995,
+      "token_str": "<SPECIAL_995>",
+      "is_control": true
+    },
+    {
+      "rank": 996,
+      "token_str": "<SPECIAL_996>",
+      "is_control": true
+    },
+    {
+      "rank": 997,
+      "token_str": "<SPECIAL_997>",
+      "is_control": true
+    },
+    {
+      "rank": 998,
+      "token_str": "<SPECIAL_998>",
+      "is_control": true
+    },
+    {
+      "rank": 999,
+      "token_str": "<SPECIAL_999>",
+      "is_control": true
+    }
+  ],
+  "image": {
+    "image_patch_size": 14,
+    "spatial_merge_size": 2,
+    "max_image_size": 1540
+  },
+  "model_settings_builder": {
+    "reasoning_effort": {
+      "type": "enum",
+      "accepts_none": true,
+      "default": "none",
+      "values": [
+        "none",
+        "high"
+      ]
+    },
+    "json_schema": {
+      "type": "json_schema",
+      "accepts_none": false,
+      "default": null
+    }
+  }
+}

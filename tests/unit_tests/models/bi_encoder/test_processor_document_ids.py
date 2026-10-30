@@ -41,6 +41,8 @@ from nemo_automodel.components.models.ministral_bidirectional.processor import M
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 from nemo_automodel.shared.retrieval_ids import document_id_to_int64
 
+pytestmark = pytest.mark.cpu_only
+
 
 def processor():
     backend = Tokenizer(WordLevel({"<unk>": 0, "<pad>": 1}, unk_token="<unk>"))
