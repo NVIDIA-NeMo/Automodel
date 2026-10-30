@@ -27,7 +27,7 @@ uv run torchrun --nnodes=32 --nproc-per-node=4 \
 | Goal | Start Here |
 | --- | --- |
 | Full image-text SFT on MedPix | [mistral_large4_medpix_ep64_pp2.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/mistral_large4_medpix_ep64_pp2.yaml) |
-| 128K packed text SFT on Tulu3 | [mistral_large4_tulu3_packed128k_ep64_pp2_cp32_tilelang.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/mistral/mistral_large4_tulu3_packed128k_ep64_pp2_cp32_tilelang.yaml) |
+| 128K packed text SFT on Tulu3 | [mistral_large4_tulu3_packed128k_ep64_pp2_cp32_tilelang.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/mistral_large4_tulu3_packed128k_ep64_pp2_cp32_tilelang.yaml) |
 | Throughput benchmark | [mistral_large4_gb200.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/mistral/mistral_large4_gb200.yaml) |
 
 ### Configuration
@@ -44,7 +44,7 @@ uv run torchrun --nnodes=32 --nproc-per-node=4 \
 | Optimizer | AdamW, LR 5e-6, betas 0.9/0.95, weight decay 0.1, clip 1.0 | FusedAdam, LR 5e-6, BF16 moments, FP32 master weights |
 
 Both SFT recipes use full activation checkpointing and keep the DSA indexer frozen.
-The MedPix recipe also freezes the vision tower; the Tulu3 recipe builds only the text model.
+Both recipes freeze the vision tower.
 W&B is opt-in: set `wandb.enable: true` and configure your entity and project when launching.
 With TP1, the data-parallel degree for batch accounting is `world_size / (PP * CP)`.
 
@@ -55,17 +55,10 @@ The recipes load `mistralai/Mistral-Large-4-1T-A52B` directly.
 weights in BF16. Router, LeRoPE, and indexer-normalization state stays in FP32. FP8 indexer and
 KV-cache execution are disabled for training.
 
-## Prepare Packed Tulu3 Data
+## Tulu3 Data
 
-The 128K recipe reads prepacked data. Build it once with the same environment as training:
-
-```bash
-uv run python examples/llm_finetune/mistral/prepare_tulu3_packed.py \
-  --model-path /path/to/checkpoint \
-  --output data/mistral_large4_tulu3_packed128k/train
-```
-
-Labels are assistant-only. Documents and packs are shuffled with seed 1234 and aligned to 64 tokens.
+The 128K recipe tokenizes and packs `allenai/tulu-3-sft-mixture` online. Labels are assistant-only,
+and each document is padded to a multiple of `2 * cp_size` tokens.
 
 ## Training Results
 

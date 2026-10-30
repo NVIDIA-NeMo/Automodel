@@ -29,6 +29,7 @@ from PIL import Image
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.tokenization.tokenization_mistral_common import MistralCommonBackend
 from nemo_automodel.components.datasets.vlm.collate_fns import build_labels_from_template, default_collate_fn
+from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
 from nemo_automodel.components.datasets.vlm.pp_media import prepare_vlm_media_for_pp
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.models.mistral_large4.config import MistralLarge4Config
@@ -156,6 +157,26 @@ def test_standard_image_forms_preserve_pixels_and_messages(tokenizer, tmp_path):
             torch.testing.assert_close(result["input_ids"], expected["input_ids"], atol=0, rtol=0)
             torch.testing.assert_close(result["pixel_values"], expected["pixel_values"], atol=0, rtol=0)
         expected = result
+
+
+def test_pretokenized_text_matches_collator():
+    tokenizer = MistralCommonBackend(Path(__file__).parent / "tiny_tekken.json", mode="finetuning")
+    answers = ["Four.", "Goodbye for now."]
+    conversation = [
+        {"role": "user", "content": [{"type": "text", "text": "What is two plus two?"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": answers[0]}]},
+        {"role": "user", "content": [{"type": "text", "text": "Bye."}]},
+        {"role": "assistant", "content": [{"type": "text", "text": answers[1]}]},
+    ]
+    sample = PreTokenizedDatasetWrapper([{"conversation": conversation}], tokenizer, inject_fake_images=False)[0]
+    batch = default_collate_fn([{"conversation": conversation}], processor=tokenizer)
+
+    # The collator shifts once; pretokenized samples are shifted later by the packer.
+    torch.testing.assert_close(sample["input_ids"][:-1], batch["input_ids"][0], rtol=0, atol=0)
+    torch.testing.assert_close(sample["labels"][1:], batch["labels"][0], rtol=0, atol=0)
+    supervised = tokenizer.decode(sample["labels"][sample["labels"] != -100].tolist())
+    assert all(answer in supervised for answer in answers)
+    assert "two plus two" not in supervised
 
 
 def test_medpix_labels_equal_vendor_and_padding_is_ignored():
