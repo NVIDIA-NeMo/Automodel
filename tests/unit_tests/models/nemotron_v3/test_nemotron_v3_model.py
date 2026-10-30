@@ -1519,6 +1519,8 @@ def test_factory_freezes_only_explicit_parameters_on_one_rank(tmp_path):
     )
     assert {name for name, p in model.named_parameters() if not p.requires_grad} == {"model.layers.0.norm.weight"}
     assert all(p.dtype == torch.float32 for p in model.parameters())
+    # Custom models initialize after placement, as in the recipe/checkpointer path.
+    model.initialize_weights(buffer_device=torch.device("cuda"), dtype=torch.float32)
     ids = torch.tensor([[1, 2, 3]], device="cuda")
     output = model(ids)
     assert torch.isfinite(output.logits).all()

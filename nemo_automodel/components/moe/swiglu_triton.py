@@ -31,6 +31,7 @@ falls back to the compiled version otherwise.
 from __future__ import annotations
 
 import torch
+from packaging.version import Version
 
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -43,6 +44,9 @@ _FWD_BLOCK_M = 8
 _FWD_BLOCK_N = 256
 _BWD_BLOCK_M = 4
 _BWD_BLOCK_N = 512
+# PyTorch 2.15 changed scalar clamp's subgradient to zero at either exact bound.
+# Keep fused backward aligned with the installed framework on older releases too.
+_CLAMP_GRAD_INCLUSIVE = Version(torch.__version__).release < (2, 15)
 
 
 if HAVE_TRITON:
@@ -95,7 +99,26 @@ if HAVE_TRITON:
         limit,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        CLAMP_GRAD_INCLUSIVE: tl.constexpr,
     ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
+        """Write gradients using the installed PyTorch scalar-clamp boundary convention.
+
+        Args:
+            x_ptr: Input storage of shape [rows, 2 * inter], gate followed by up.
+            probs_ptr: FP32 probability storage of shape [rows].
+            grad_y_ptr: Upstream gradient storage of shape [rows, inter].
+            grad_x_ptr: Output gradient storage of shape [rows, 2 * inter], written in place.
+            grad_probs_ptr: FP32 output gradient storage of shape [rows], written in place.
+            rows: Number of token rows.
+            inter: Intermediate width per gate/up half.
+            stride_x: Input row stride in elements.
+            stride_gy: Upstream-gradient row stride in elements.
+            stride_gx: Output-gradient row stride in elements.
+            limit: Scalar clamp limit.
+            BLOCK_M: Rows per program.
+            BLOCK_N: Columns per iteration.
+            CLAMP_GRAD_INCLUSIVE: Whether gradients include values exactly on a clamp bound.
+        """
         # Promote before multiplying by the row stride, including grad_x offsets.
         pid = tl.program_id(0).to(tl.int64)
         row = pid * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -118,8 +141,14 @@ if HAVE_TRITON:
             weighted = grad * probs[:, None]
             d_gate = weighted * up * (sig * (1.0 + gate * (1.0 - sig)))
             d_up = weighted * silu
-            d_gate = tl.where(gate_raw <= limit, d_gate, 0.0)
-            d_up = tl.where((up_raw >= -limit) & (up_raw <= limit), d_up, 0.0)
+            if CLAMP_GRAD_INCLUSIVE:
+                gate_active = gate_raw <= limit
+                up_active = (up_raw >= -limit) & (up_raw <= limit)
+            else:
+                gate_active = gate_raw < limit
+                up_active = (up_raw > -limit) & (up_raw < limit)
+            d_gate = tl.where(gate_active, d_gate, 0.0)
+            d_up = tl.where(up_active, d_up, 0.0)
             gx_off = row[:, None] * stride_gx + col[None, :]
             tl.store(grad_x_ptr + gx_off, d_gate.to(grad_x_ptr.dtype.element_ty), mask=mask)
             tl.store(grad_x_ptr + gx_off + inter, d_up.to(grad_x_ptr.dtype.element_ty), mask=mask)
@@ -168,6 +197,19 @@ def _forward(x: torch.Tensor, probs: torch.Tensor, limit: float) -> torch.Tensor
 def _backward(
     x: torch.Tensor, probs: torch.Tensor, grad_y: torch.Tensor, limit: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return fused SwiGLU gradients with the runtime's scalar-clamp subgradient.
+
+    Args:
+        x: Contiguous input tensor of shape [rows, 2 * inter], gate followed by up.
+        probs: FP32 probability tensor of shape [rows] or [rows, 1].
+        grad_y: Upstream gradient tensor of shape [rows, inter].
+        limit: Scalar clamp limit.
+
+    Returns:
+        Tuple of independent input-gradient storage of shape [rows, 2 * inter] and
+        probability-gradient storage of shape [rows] or [rows, 1], matching probs.
+        Output dtypes match their corresponding inputs.
+    """
     rows, width = x.shape
     inter = width // 2
     grad_x = torch.empty_like(x)
@@ -191,6 +233,7 @@ def _backward(
         float(limit),
         BLOCK_M=_BWD_BLOCK_M,
         BLOCK_N=_BWD_BLOCK_N,
+        CLAMP_GRAD_INCLUSIVE=_CLAMP_GRAD_INCLUSIVE,
         num_warps=8,
     )
     return grad_x, grad_probs.view_as(probs)
