@@ -182,6 +182,12 @@ class TestRollTensor:
         rolled = roll_tensor(t, shifts=1, dim=-1)
         assert rolled.tolist() == [[0, 0, 1, 2, 3, 4, 5, 6]]
 
+    def test_shift_larger_than_dimension_zeros_everything(self):
+        t = torch.arange(3).unsqueeze(0)
+
+        assert roll_tensor(t, shifts=-8, dim=-1).tolist() == [[0, 0, 0]]
+        assert roll_tensor(t, shifts=8, dim=-1).tolist() == [[0, 0, 0]]
+
 
 class TestMTPConfig:
     def test_disabled_when_zero_layers(self):
@@ -309,6 +315,40 @@ class TestMTPEnabled:
         assert not hasattr(last, "enorm")
         assert hasattr(last, "final_layernorm")
         assert not hasattr(first, "final_layernorm")
+
+    def test_mtp_moe_intermediate_size_does_not_resize_backbone_experts(self, backend):
+        model, _ = _make_model(
+            backend,
+            mtp_layers=1,
+            mtp_pattern="*E",
+            mtp_moe_intermediate_size=16,
+        )
+
+        backbone_experts = model.model.layers["1"].mixer.experts
+        mtp_experts = model.mtp.layers[1].mixer.experts
+        assert backbone_experts.gate_and_up_projs.shape == (4, 64, 32)
+        assert backbone_experts.down_projs.shape == (4, 32, 64)
+        assert mtp_experts.gate_and_up_projs.shape == (4, 64, 16)
+        assert mtp_experts.down_projs.shape == (4, 16, 64)
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_mtp_moe_intermediate_size_must_be_positive(self, backend, value):
+        with pytest.raises(ValueError, match="mtp_moe_intermediate_size must be positive"):
+            _make_model(
+                backend,
+                mtp_layers=1,
+                mtp_pattern="*E",
+                mtp_moe_intermediate_size=value,
+            )
+
+    def test_mtp_moe_intermediate_size_requires_moe_pattern(self, backend):
+        with pytest.raises(ValueError, match="requires an MoE sublayer"):
+            _make_model(
+                backend,
+                mtp_layers=1,
+                mtp_pattern="*",
+                mtp_moe_intermediate_size=16,
+            )
 
     @pytest.mark.run_only_on("GPU")
     def test_forward_train_emits_mtp_per_depth_h(self, backend):
