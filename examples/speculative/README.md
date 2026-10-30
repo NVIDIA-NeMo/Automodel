@@ -9,7 +9,7 @@ acceptance length and the larger the inference speedup.
 NeMo AutoModel trains the draft. You then serve the draft and target together in an
 inference engine (SGLang or vLLM). The training code lives in
 `nemo_automodel/components/speculative/`, the recipes in
-`nemo_automodel/recipes/llm/`, and ready-to-run configs in this folder.
+`nemo_automodel/recipes/speculative_decoding/`, and ready-to-run configs in this folder.
 
 ## Supported Methods
 
@@ -257,11 +257,11 @@ path, so training is numerically unchanged. See
 `dspark/qwen3_0.6b_dspark_remote.yaml`:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m nemo_automodel.recipes.llm.serve_dspark_target -c examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
+CUDA_VISIBLE_DEVICES=0 python -m nemo_automodel.recipes.speculative_decoding.serve_dspark_target -c examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
+CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 -m nemo_automodel.recipes.speculative_decoding.train_dspark -c examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
 ```
 
 The server listens on `target_server.host` / `target_server.port` (default
@@ -333,7 +333,7 @@ own global-indexed shards straight into the shared `cache_output_dir` (no merge 
 ```bash
 torchrun --nnodes=4 --node-rank=0 --nproc_per_node=8 \
   --master-addr=<NODE0_IP> --master-port=29500 \
-  -m nemo_automodel.recipes.llm.precompute_dspark_dist \
+  -m nemo_automodel.recipes.speculative_decoding.precompute_dspark_dist \
   -c examples/speculative/dspark/deepseek_v4_flash_dspark_precompute.yaml
 ```
 
@@ -709,8 +709,10 @@ nemo_automodel/components/speculative/
   bench_sglang.py          # acceptance-length / speedup benchmark (SGLang)
   bench_vllm.py            # acceptance-length / speedup benchmark (vLLM)
   bench_sweep.py           # multi-dataset acceptance-length sweep (either engine)
-nemo_automodel/recipes/llm/
+nemo_automodel/recipes/speculative_decoding/
   train_eagle1.py  train_eagle2.py  train_eagle3.py  peagle_recipe.py
-  train_dflash.py  train_domino.py  train_jetspec.py  train_dspark.py
+  train_dflash.py  train_dflash2.py  train_domino.py  train_jetspec.py
+  train_dspark.py  train_vispec.py
+  precompute_dspark_dist.py                 # offline DSpark target precompute
   serve_dspark_target.py                    # remote DSpark target server
 ```

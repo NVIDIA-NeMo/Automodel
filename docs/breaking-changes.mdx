@@ -3,6 +3,30 @@ title: "Breaking Changes"
 description: ""
 position: 6
 ---
+## 0.8.0
+
+### Speculative-Decoding Recipes Moved to `recipes/speculative_decoding/`
+
+The draft-model training recipes (EAGLE-1/2/3, DFlash, DFlash 2, Domino, JetSpec, DSpark, ViSpec) and the DSpark
+precompute and target-server entry points now live in `nemo_automodel/recipes/speculative_decoding/` instead of
+`nemo_automodel/recipes/llm/`. Recipes are grouped by type rather than by model family. Update module paths in launch
+commands and imports, for example:
+
+**Before:**
+
+```bash
+torchrun --nproc-per-node 8 -m nemo_automodel.recipes.llm.train_eagle3 -c examples/speculative/eagle3/qwen3_eagle3_perfectblend.yaml
+```
+
+**After:**
+
+```bash
+torchrun --nproc-per-node 8 -m nemo_automodel.recipes.speculative_decoding.train_eagle3 -c examples/speculative/eagle3/qwen3_eagle3_perfectblend.yaml
+```
+
+YAML configs launched through the `automodel` CLI are unaffected unless they name a recipe class by its fully-qualified
+module path.
+
 ## 0.5.0
 
 ### Frozen Multimodal FSDP2 Modules Default to Root Sharding

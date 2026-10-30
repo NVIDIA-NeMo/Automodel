@@ -89,7 +89,7 @@ defaults to `ep_size=64` for 8 nodes). Run the **same** command on every node, v
 from the other nodes:
 
 ```
-torchrun --nnodes=8 --node-rank=0 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/glm_5.2_dspark.yaml
+torchrun --nnodes=8 --node-rank=0 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.speculative_decoding.train_dspark -c examples/speculative/dspark/glm_5.2_dspark.yaml
 ```
 
 Run the same line on nodes 1..7 with `--node-rank` 1..7. For a 4-node run set `ep_size: 32`

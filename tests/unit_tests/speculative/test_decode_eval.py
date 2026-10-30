@@ -391,7 +391,7 @@ def test_config_json_roundtrips_through_the_worker_boundary(tmp_path):
 def test_recipe_hook_collects_logs_and_launches(monkeypatch):
     """The rank-0 log-point hook must log finished results to wandb (at the
     current step) and hand the launch decision to the runner."""
-    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe.runtime = SimpleNamespace(global_step=42)
@@ -421,14 +421,14 @@ def test_recipe_hook_collects_logs_and_launches(monkeypatch):
 
 
 def test_recipe_hook_noop_without_runner():
-    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe._maybe_run_decode_eval()  # must not raise (bare object, no setup)
 
 
 def test_recipe_hook_can_collect_without_launching():
-    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe.runtime = SimpleNamespace(global_step=42)
@@ -446,7 +446,7 @@ def test_recipe_hook_can_collect_without_launching():
 
 
 def test_recipe_hook_contains_optional_eval_failures(caplog):
-    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe.runtime = SimpleNamespace(global_step=42)
