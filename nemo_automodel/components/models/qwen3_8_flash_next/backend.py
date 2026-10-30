@@ -12,23 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime backend configuration owned by Qwen3.8-Flash-Next."""
+"""Deprecated Qwen3.8-Flash-Next backend config, kept so existing YAML ``_target_`` paths still load."""
 
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
 from nemo_automodel.components.models.common import BackendConfig
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(kw_only=True)
 class Qwen3_8_FlashNextBackendConfig(BackendConfig):
-    """Extend shared backend choices with this model's optional FA4 QSA.
+    """Deprecated alias of :class:`BackendConfig` for Qwen3.8-Flash-Next.
 
-    ``attn="cute"`` selects FA4 SM90 BF16 sparse GQA; ``attn="flex"`` selects
-    FlexAttention. CPU execution uses the numerical oracle with either choice.
-    Other values and the environment-dependent default are retained for
-    compatibility with existing BackendConfig callers; CUDA QSA requires
-    ``"flex"`` or ``"cute"``. All other component settings are inherited.
+    FA4 QSA is now selected with the shared ``BackendConfig(attn="fa4")``. This class only keeps YAMLs that target
+    ``nemo_automodel.components.models.qwen3_8_flash_next.backend.Qwen3_8_FlashNextBackendConfig`` working: the
+    former ``attn="cute"`` is translated to ``"fa4"`` with a migration warning. All other settings are inherited.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn", "cute"] = BackendConfig.attn
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "cute"] = BackendConfig.attn
+
+    def __post_init__(self) -> None:
+        logger.warning(
+            "Qwen3_8_FlashNextBackendConfig is deprecated; use nemo_automodel.components.models.common.BackendConfig."
+        )
+        if self.attn == "cute":
+            logger.warning("backend.attn='cute' is deprecated for Qwen3.8-Flash-Next; use backend.attn='fa4'.")
+            self.attn = "fa4"
+        super().__post_init__()
