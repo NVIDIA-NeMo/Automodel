@@ -455,6 +455,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         microbatch_size: int,
         seq_len: int,
         dtype: torch.dtype,
+        packed_sequence: bool = False,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         # Under context parallelism the first stage embeds the full sequence and
         # shards it in forward, so every stage output and later-stage input (incl.
@@ -466,15 +467,23 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
             local_seq_len = padded_seq_len // cp_size
 
-        hidden_shape = (microbatch_size, local_seq_len, self.config.text_config.hidden_size)
-        vocab_shape = (microbatch_size, local_seq_len, self.config.text_config.vocab_size)
+        batch_seq_shape = (local_seq_len,) if packed_sequence else (microbatch_size, local_seq_len)
+        hidden_shape = (*batch_seq_shape, self.config.text_config.hidden_size)
+        vocab_shape = (*batch_seq_shape, self.config.text_config.vocab_size)
         mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
 
         def meta(shape: tuple[int, ...]) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dtype)
 
         if is_first:
-            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+            # Packed THD: the sharder emits [num_chunks, T] and the schedule's
+            # TensorChunkSpec(0) hands stage0 a [1, T] microbatch slice BEFORE the
+            # model's squeeze_input_for_thd runs, so PipelineStage's runtime input
+            # validation sees the singleton batch axis. Declare [1, T] here (the
+            # squeeze to flat [T] happens inside the model); inter-stage
+            # activations stay flat [T, H] per the shapes above.
+            input_shape = (1, seq_len) if packed_sequence else (microbatch_size, seq_len)
+            inputs_meta = (torch.empty(*input_shape, device="meta", dtype=torch.long),)
         else:
             inputs_meta = (meta(hidden_shape), *(meta(hidden_shape) for _ in range(mtp_depth)))
 
@@ -499,10 +508,21 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             return False
 
     def _build_mtp_embed_inputs_from_embeds(self, inputs_embeds: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # The MTP head is conditioned on the next token's embedding, so the
+        # roll must run along the TOKEN axis. Under flat THD input
+        # (qkv_format='thd' after squeeze_input_for_thd) inputs_embeds is
+        # [T, H] and the token axis is dim 0; the batch-major layout is
+        # [B, S, H] with dim 1. Rolling dim 1 of a flat tensor shifts hidden
+        # channels instead of tokens and silently corrupts MTP conditioning.
+        if inputs_embeds.ndim not in (2, 3):
+            raise ValueError(
+                f"inputs_embeds must be [B, S, H] or flat [T, H] for MTP embed inputs, got {tuple(inputs_embeds.shape)}"
+            )
+        token_dim = 0 if inputs_embeds.ndim == 2 else 1
         cur_embeds = inputs_embeds
         embed_inputs = []
         for _ in range(self.mtp_config.num_layers):
-            cur_embeds = roll_tensor(cur_embeds, shifts=-1, dim=1)
+            cur_embeds = roll_tensor(cur_embeds, shifts=-1, dim=token_dim)
             embed_inputs.append(cur_embeds)
         return tuple(embed_inputs)
 
@@ -715,6 +735,19 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 "attention_mask": attention_mask,
                 "padding_mask": padding_mask,
             }
+            # MTP transformer blocks run attention over the same token layout as
+            # the main decoder. Preserve THD/varlen metadata; otherwise their
+            # 3-D [T, H, D] Q/K/V tensors fall back to TE's default BSHD path.
+            for key in (
+                "qkv_format",
+                "cu_seqlens",
+                "cu_seqlens_padded",
+                "max_seqlen",
+                "cp_size",
+                "cp_rank",
+            ):
+                if key in kwargs:
+                    mtp_kwargs[key] = kwargs[key]
             if mtp_embed_inputs:
                 mtp_kwargs["embed_inputs"] = tuple(mtp_embed_inputs)
             elif inputs_embeds is not None:
