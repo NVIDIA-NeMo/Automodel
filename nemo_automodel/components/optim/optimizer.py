@@ -47,12 +47,12 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Required, TypedDict
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.optim.dion import build_dion_optimizer, is_dion_optimizer
+from nemo_automodel.components.optim.dion import _get_dion_mesh, build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
@@ -362,8 +362,12 @@ class _DionConfigBase(OptimizerConfig):
 
     # Dion optimizers are incompatible with Megatron-FSDP optimizer sharding.
     supports_megatron_fsdp_sharding: ClassVar[bool] = False
-    supports_batched_matrices: ClassVar[bool] = False
     use_matrix_layout: ClassVar[bool] = False
+
+    @property
+    def supports_batched_matrices(self) -> bool:
+        """Whether 3D+ weights go to the matrix optimizer; Dion treats them as scalars."""
+        return False
 
     lr: float = 5e-4
     weight_decay: float = 0.0
@@ -511,9 +515,40 @@ class _DionConfigBase(OptimizerConfig):
         return result + overridden
 
 
+class _DionParamGroup(TypedDict, total=False):
+    """Parameter group handed to a Dion-family optimizer.
+
+    ``params`` is always present. Layout groups built by
+    :func:`~nemo_automodel.components.optim.dion._separate_param_groups` carry ``matrix_transposed``; scalar groups
+    carry ``algorithm`` with their own ``lr``, ``weight_decay`` and Adam/Lion hyperparameters.
+    :meth:`_DionConfigBase._apply_param_group_overrides` adds ``lr_mult`` / ``wd_mult`` and
+    :meth:`MuonConfig._spectral_norm_groups` sets ``adjust_lr``.
+    """
+
+    params: Required[list[torch.Tensor]]
+    algorithm: str
+    lr: float
+    weight_decay: float
+    beta1: float
+    beta2: float
+    epsilon: float
+    matrix_transposed: bool
+    adjust_lr: str | None
+    lr_mult: float
+    wd_mult: float
+
+
 @dataclass
 class MuonConfig(_DionConfigBase):
-    """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D."""
+    """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D.
+
+    Grouped MoE experts are trained as batches of matrices. Their ``[expert, in, out]``
+    storage is orthogonalized as is (Newton–Schulz is transpose-equivariant), but
+    dion.Muon's spectral-norm LR scale reads the last two dims as ``[out, in]``, so
+    :meth:`_make_optimizer` folds the correct per-shape scale into those groups.
+    """
+
+    use_matrix_layout: ClassVar[bool] = True
 
     mu: float = 0.95
     betas: tuple[float, float] = (0.9, 0.95)
@@ -523,18 +558,111 @@ class MuonConfig(_DionConfigBase):
     flatten: bool = False
     use_triton: bool = False
 
+    @property
+    def supports_batched_matrices(self) -> bool:
+        """Route 3D+ weights to Muon unless ``flatten`` would merge their batch axis into each matrix."""
+        return not self.flatten
+
+    def build(
+        self,
+        model: torch.nn.Module,
+        *,
+        device_mesh: DeviceMesh | None = None,
+        is_peft: bool = False,
+    ) -> list[torch.optim.Optimizer]:
+        """Build dion.Muon per model part and reject batched matrices it cannot update.
+
+        dion.Muon gathers sharded matrix axes only over its own data-parallel mesh. A 3D+ weight (for example grouped
+        experts with ``1 < ep_size < dp_size``) whose matrix axis is sharded over another mesh fails at the first
+        step, so this raises at build time instead.
+
+        Raises:
+            ValueError: If a Muon-updated 3D+ DTensor has a matrix axis sharded over a mesh other than Muon's.
+        """
+        optimizers = super().build(model, device_mesh=device_mesh, is_peft=is_peft)
+        dion_mesh = _get_dion_mesh(device_mesh)
+        process_group = dion_mesh.get_group() if dion_mesh is not None else None
+        names = {id(p): n for part in getattr(model, "parts", [model]) for n, p in part.named_parameters()}
+        muon_params = [
+            param
+            for optimizer in optimizers
+            for group in optimizer.param_groups
+            if group["algorithm"] == "muon"
+            for param in group["params"]
+            if param.ndim > 2 and isinstance(param, DTensor)
+        ]
+        for param in muon_params:
+            foreign_matrix_shards = [
+                placement.dim
+                for i, placement in enumerate(param.placements)
+                if isinstance(placement, Shard)
+                and placement.dim % param.ndim >= param.ndim - 2
+                and param.device_mesh.size(i) > 1
+                and param.device_mesh.get_group(i) != process_group
+            ]
+            if foreign_matrix_shards:
+                raise ValueError(
+                    f"MuonConfig cannot update {names.get(id(param), 'a 3D parameter')}: its matrix axis "
+                    f"{foreign_matrix_shards[0]} is sharded over mesh {param.device_mesh} (placements "
+                    f"{param.placements}), not dion.Muon's data-parallel mesh. For grouped experts use ep_size equal "
+                    "to the data-parallel size, ep_size 1, or MuownConfig, which handles per-parameter meshes."
+                )
+        return optimizers
+
     def _make_optimizer(self, param_groups, ctor_kwargs):
         from dion import Muon
 
+        if self.adjust_lr == "spectral_norm":
+            # torch's ParamsT takes plain dicts, so the typed groups are copied at this boundary.
+            param_groups = [dict(split) for group in param_groups for split in self._spectral_norm_groups(group)]
         return Muon(param_groups, **ctor_kwargs)
+
+    def _spectral_norm_groups(self, group: _DionParamGroup) -> list[_DionParamGroup]:
+        """Split a transposed ``[..., in, out]`` matrix group by shape and fold the spectral-norm scale into its LR.
+
+        dion.Muon would scale by ``sqrt(shape[-2] / shape[-1])``, the inverse of the correct ``sqrt(out / in)`` for
+        this layout. Each shape gets ``adjust_lr=None`` with ``lr`` (and any ``lr_mult``) multiplied by the correct
+        scale; ``weight_decay`` (and any ``wd_mult``) is divided by it because Muon decays with ``lr * weight_decay``.
+
+        Args:
+            group: Dion param group. When ``matrix_transposed`` is set, ``params`` are tensors of shape
+                ``[..., in, out]`` with arbitrary leading batch (expert) dimensions; DTensor shapes are global.
+
+        Returns:
+            ``[group]`` unchanged when it is not a transposed matrix group, otherwise one group per distinct
+            ``(in, out)`` with the same parameter objects (no copies).
+        """
+        if not group.get("matrix_transposed"):
+            return [group]
+        by_shape: dict[tuple[int, int], list[torch.Tensor]] = {}
+        for param in group["params"]:
+            fan_in, fan_out = param.shape[-2:]
+            by_shape.setdefault((fan_in, fan_out), []).append(param)
+        lr = group.get("lr", self.lr)
+        weight_decay = group.get("weight_decay", self.weight_decay)
+        splits: list[_DionParamGroup] = []
+        for (fan_in, fan_out), params in by_shape.items():
+            scale = math.sqrt(fan_out / fan_in)
+            split = group.copy()
+            split.update(params=params, adjust_lr=None, lr=lr * scale, weight_decay=weight_decay / scale)
+            if "lr_mult" in group:
+                split["lr_mult"] = group["lr_mult"] * scale
+            if "wd_mult" in group:
+                split["wd_mult"] = group["wd_mult"] / scale
+            splits.append(split)
+        return splits
 
 
 @dataclass
 class MuownConfig(_DionConfigBase):
     """Muown: per-neuron Adam magnitudes and Dion Muon directions, including MoE."""
 
-    supports_batched_matrices: ClassVar[bool] = True
     use_matrix_layout: ClassVar[bool] = True
+
+    @property
+    def supports_batched_matrices(self) -> bool:
+        """Muown updates every expert of a grouped weight as its own matrix."""
+        return True
 
     lr: float = 3e-4
     mu: float = 0.95
