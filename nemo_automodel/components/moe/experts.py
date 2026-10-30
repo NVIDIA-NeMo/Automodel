@@ -1793,9 +1793,22 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                     defer_down_proj=self.dispatcher_recompute_cache == "moe_tail" and post_expert_output is None,
                 )
         else:
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1_ = self.expert_activation(output1, activation_probs)
-            output2 = torch.matmul(output1_, down_projs[0])
+            # Keep the zero-token path connected to the tensors produced by
+            # DeepEP dispatch.  Basing the dummy computation on ``x`` bypasses
+            # FusedDispatch autograd, so this rank never enters the reverse
+            # dispatch collective while peers with local tokens do.  Preserve
+            # the dispatched empty shape and attach zero-valued dependencies
+            # for every local expert parameter as grouped GEMM would.
+            zero_dependency = permuted_local_hidden_states.sum() * 0
+            zero_dependency = zero_dependency + permuted_probs.sum() * 0
+            zero_dependency = zero_dependency + gate_and_up_projs.reshape(-1)[0] * 0
+            zero_dependency = zero_dependency + down_projs.reshape(-1)[0] * 0
+            if self.expert_bias:
+                gate_up_proj_bias = self.gate_up_proj_bias.to_local().to(compute_dtype)
+                down_proj_bias = self.down_proj_bias.to_local().to(compute_dtype)
+                zero_dependency = zero_dependency + gate_up_proj_bias.reshape(-1)[0] * 0
+                zero_dependency = zero_dependency + down_proj_bias.reshape(-1)[0] * 0
+            output2 = (permuted_local_hidden_states * 0 + zero_dependency).to(compute_dtype)
 
         if post_expert_output is not None:
             output2 = post_expert_output(output2)
