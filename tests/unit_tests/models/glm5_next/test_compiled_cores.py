@@ -121,7 +121,7 @@ def test_compile_dispatch_is_instance_local_and_preserves_state(
     def fake_compile(function, **kwargs):
         assert kwargs["dynamic"] is False
         assert kwargs["options"]["emulate_precision_casts"] is True
-        assert kwargs["options"]["eager_numerics.division_rounding"] is True
+        assert kwargs["options"] == optimized_kernels._compile_options()
         compiled_names.append(function.__name__)
 
         def wrapped(*args):
@@ -320,3 +320,17 @@ def test_compiled_mhc_cores_cuda_match_eager_arithmetic_and_vjps(monkeypatch: py
             zip(torch.autograd.grad(actual, inputs, upstream), torch.autograd.grad(expected, inputs, upstream))
         ):
             _assert_matches(observed, reference, f"{name} d_input{index}")
+
+
+def test_compile_options_use_a_division_rounding_key_the_installed_inductor_accepts() -> None:
+    """Every requested option must exist in this PyTorch's Inductor config, or torch.compile rejects it."""
+    options = optimized_kernels._compile_options()
+    assert set(options) <= set(torch._inductor.config.get_config_copy())
+    assert all(options.values())
+    assert len(options) == 2
+
+
+@pytest.mark.parametrize("spelling", ["eager_numerics.division_rounding", "emulate_divison_rounding"])
+def test_division_rounding_option_follows_both_pytorch_spellings(spelling: str) -> None:
+    """Older PyTorch only knows the legacy key; newer PyTorch rejects it."""
+    assert optimized_kernels._division_rounding_option({"emulate_precision_casts", spelling}) == spelling

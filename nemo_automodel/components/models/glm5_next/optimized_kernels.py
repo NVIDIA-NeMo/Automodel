@@ -14,17 +14,41 @@
 
 """Optional model-owned mHC and RMSNorm compilation for GLM-5.3-Flash."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from functools import cache
 
 import torch
+import torch._inductor.config
 import torch.nn.functional as F
 
-# Preserve the eager BF16 truncation points between fused operations.
-_COMPILE_OPTIONS = {
-    "emulate_precision_casts": True,
-    "eager_numerics.division_rounding": True,
-}
+
+def _division_rounding_option(known_options: Collection[str]) -> str:
+    """Name Inductor's eager division-rounding control as the given PyTorch spells it.
+
+    Newer PyTorch spells it ``eager_numerics.division_rounding``; older releases
+    still inside the supported range only accept the legacy
+    ``emulate_divison_rounding`` key, and ``torch.compile`` rejects unknown keys.
+
+    Args:
+        known_options: Option names of the installed Inductor config.
+
+    Returns:
+        The division-rounding option name present in ``known_options``.
+    """
+    if "eager_numerics.division_rounding" in known_options:
+        return "eager_numerics.division_rounding"
+    return "emulate_divison_rounding"
+
+
+def _compile_options() -> dict[str, bool]:
+    """Inductor options that preserve the eager BF16 truncation points between fused operations.
+
+    Returns:
+        Option mapping for ``torch.compile(options=...)``, using the
+        division-rounding key the installed Inductor recognizes.
+    """
+    division_rounding = _division_rounding_option(torch._inductor.config.get_config_copy())
+    return {"emulate_precision_casts": True, division_rounding: True}
 
 
 def project_core(hidden_streams: torch.Tensor, fn: torch.Tensor, eps: float) -> torch.Tensor:
@@ -161,10 +185,11 @@ def hc_cores(compiled: bool) -> tuple[ProjectionCore, CollapseCore, ExpandCore]:
     """
     if not compiled:
         return project_core, collapse_core, expand_core
+    options = _compile_options()
     return (
-        torch.compile(project_core, dynamic=False, options=_COMPILE_OPTIONS),
-        torch.compile(collapse_core, dynamic=False, options=_COMPILE_OPTIONS),
-        torch.compile(_expand_core_four_streams, dynamic=False, options=_COMPILE_OPTIONS),
+        torch.compile(project_core, dynamic=False, options=options),
+        torch.compile(collapse_core, dynamic=False, options=options),
+        torch.compile(_expand_core_four_streams, dynamic=False, options=options),
     )
 
 
@@ -173,7 +198,7 @@ def rms_norm_core(compiled: bool) -> NormCore:
     """Select the decoder/final RMSNorm core, retaining GLM's cast order."""
     if not compiled:
         return norm_core
-    return torch.compile(norm_core, dynamic=False, options=_COMPILE_OPTIONS)
+    return torch.compile(norm_core, dynamic=False, options=_compile_options())
 
 
 @cache
@@ -181,4 +206,4 @@ def rms_norm_gated_core(compiled: bool) -> GatedNormCore:
     """Select the KDA gated norm core with the same cast policy as decoder norms."""
     if not compiled:
         return gated_norm_core
-    return torch.compile(gated_norm_core, dynamic=False, options=_COMPILE_OPTIONS)
+    return torch.compile(gated_norm_core, dynamic=False, options=_compile_options())
