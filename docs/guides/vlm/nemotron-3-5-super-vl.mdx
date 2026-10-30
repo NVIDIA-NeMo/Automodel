@@ -18,7 +18,7 @@ architecture `NemotronH_Omni_Reasoning_V3`) is the 121B member of the Nemotron 3
 Key architectural details:
 - **LLM backbone**: NemotronV3 hybrid, 88 layers (40 Mamba2, 8 attention, 40 MoE), hidden dim 4096
 - **MoE**: 512 routed experts per MoE layer, top-22 routing plus 1 shared expert
-- **Vision encoder**: RADIO v2.5-H (ViT-Huge), 512x512 tiles, 256 vision tokens per tile
+- **Vision encoder**: RADIO v2.5-H (ViT-Huge), dynamic-resolution patch grids; a 512x512 image yields 256 vision tokens
 - **Audio**: This BF16 checkpoint ships no `sound_config`, so no audio tower is built
 - **MTP**: The checkpoint ships one multi-token-prediction head; the recipe below keeps it off (`num_nextn_predict_layers: 0`)
 - **Parameters**: 120.7B trainable with the vision tower frozen (99.31% of the model); ~227 GB in bf16
@@ -62,6 +62,17 @@ The **model before task-specific fine-tuning** produces free-form descriptions. 
 ---
 
 ## Step 0 — Set Up the Environment
+
+Use the repository-pinned Transformers 5.18.0. The recipes set `trust_remote_code: false` for
+both the model and processor. AutoModel keeps its distributed Nemotron text backbone and uses
+the native Transformers configuration, processor, and RADIO encoder.
+
+The inference examples below include the Transformers 5.18 vision LayerNorm key mapping and
+Mamba compatibility setup. They preserve the checkpoint's runtime time-step bounds
+([upstream fix](https://github.com/huggingface/transformers/pull/48989)) and launch each Mamba
+layer on its own CUDA device when using `device_map`. AutoModel handles the checkpoint
+mapping and time-step bounds in its training implementation.
+For video training, set `model.video_pruning_rate: 0`; token pruning is not supported.
 
 ```bash
 # Inside the NeMo AutoModel container (26.04+):
@@ -144,7 +155,7 @@ step_scheduler:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
-  trust_remote_code: true
+  trust_remote_code: false
   num_nextn_predict_layers: 0
   torch_dtype: torch.bfloat16
   backend:
@@ -384,20 +395,43 @@ bash vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidate.
 
 ```python
 import difflib, json
+from functools import wraps
 
 import torch
 from datasets import load_dataset
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMamba2Mixer
 
 from nemo_automodel.components.datasets.vlm.utils import json2token
+
+def prepare_native_inference(model):
+    # Transformers 5.18 must use the checkpoint's runtime dt limits.
+    # mamba-ssm's scan must launch on the GPU that owns the layer.
+    def on_device(forward, device):
+        @wraps(forward)
+        def wrapped(*args, **kwargs):
+            with torch.cuda.device(device):
+                return forward(*args, **kwargs)
+        return wrapped
+
+    for module in model.modules():
+        if isinstance(module, NemotronHMamba2Mixer):
+            module.time_step_limit = module.config.time_step_limit
+            module.forward = on_device(module.forward, module.dt_bias.device)
 
 CKPT = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidated"  # pragma: allowlist secret
 NUM_SAMPLES = 20
 
-processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
-model = AutoModel.from_pretrained(CKPT, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto")
-# RADIO's `summary_idxs` is a non-persistent buffer and can come back as a meta tensor after loading.
-model.vision_model.radio_model.summary_idxs = None
+processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=False)
+config = AutoConfig.from_pretrained(CKPT, trust_remote_code=False)
+# Transformers 5.18 uses this flag to construct the pretrained vision final LayerNorm.
+# Standard generation does not execute an MTP training objective.
+config.text_config.num_nextn_predict_layers = 1
+model = AutoModelForImageTextToText.from_pretrained(
+    CKPT, config=config, trust_remote_code=False, dtype=torch.bfloat16, device_map="auto",
+    key_mapping={r"^vision_projector\.vision_final_layernorm\.": "vision_final_layernorm."},
+)
+prepare_native_inference(model)
 model.eval()
 
 # Same single-turn prompt the collate function trained on; enable_thinking=False emits the empty
@@ -407,15 +441,9 @@ prompt = processor.tokenizer.apply_chat_template(
     tokenize=False, add_generation_prompt=True, enable_thinking=False,
 )
 
-# v3 processors return placeholder-expansion metadata that is NOT a generate() kwarg.
-PROCESSOR_METADATA_KEYS = ("num_patches", "num_tokens", "imgs_sizes")
-
-
 @torch.no_grad()
 def predict(image, max_new_tokens=1024):
     inputs = processor(text=prompt, images=[image], return_tensors="pt")
-    for key in PROCESSOR_METADATA_KEYS:
-        inputs.pop(key, None)
     device = next(model.parameters()).device
     inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
     output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
@@ -441,42 +469,24 @@ scores the model before task-specific fine-tuning the same way.
 
 ### LoRA PEFT Inference
 
-LoRA checkpoints contain only `adapter_model.safetensors` + `adapter_config.json`, saved under the
-training wrapper's module names (`language_model.model.layers.N.mixer.in_proj`, ...), which match the
-HF module tree. Load the base checkpoint as above, fold the adapters into the base weights
-(`W += (B @ A) * alpha / r`), then run the same `predict` loop:
+LoRA checkpoints contain `adapter_model.safetensors` and `adapter_config.json` with native
+Transformers module names. Load them with PEFT, then reuse the `predict` function above:
 
 ```python
-import re
-from pathlib import Path
-
-from safetensors import safe_open
+from peft import PeftModel
 
 BASE = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
 ADAPTER = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/LOWEST_VAL/model"  # pragma: allowlist secret
 
-processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
-model = AutoModel.from_pretrained(BASE, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto")
-model.vision_model.radio_model.summary_idxs = None
+processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=False)
+model = AutoModelForImageTextToText.from_pretrained(
+    BASE, trust_remote_code=False, dtype=torch.bfloat16, device_map="auto",
+    key_mapping={r"^vision_projector\.vision_final_layernorm\.": "vision_final_layernorm."},
+)
+model = PeftModel.from_pretrained(model, ADAPTER, autocast_adapter_dtype=False)
+prepare_native_inference(model)
 model.eval()
-
-cfg = json.loads((Path(ADAPTER) / "adapter_config.json").read_text())
-scale = cfg["lora_alpha"] / cfg["r"]
-pairs = {}
-with safe_open(str(Path(ADAPTER) / "adapter_model.safetensors"), framework="pt") as f:
-    for key in f.keys():
-        m = re.match(r"^(?:base_model\.model\.)?(.+)\.lora_(A|B)\.weight$", key)
-        if m:
-            pairs.setdefault(m.group(1), {})[m.group(2)] = f.get_tensor(key)
-
-modules = dict(model.named_modules())
-with torch.no_grad():
-    for fqn, ab in pairs.items():
-        weight = modules[fqn].weight
-        delta = (ab["B"].to(weight.device, torch.float32) @ ab["A"].to(weight.device, torch.float32)) * scale
-        weight.add_(delta.to(weight.dtype))
-print(f"merged {len(pairs)} LoRA modules (r={cfg['r']}, alpha={cfg['lora_alpha']})")
-# ... then build `prompt` and run the `predict` loop from the SFT example above.
+# Build `prompt` and run the `predict` loop from the SFT example above.
 ```
 
 **Resources:** One node with 8x H100 (bf16 weights spread over the GPUs).

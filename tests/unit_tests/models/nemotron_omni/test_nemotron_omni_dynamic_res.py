@@ -64,6 +64,7 @@ def _make_model_stub(*, patch_size=2, downsample_ratio=0.5, c_feat=16, img_token
     (RADIO + LM construction)."""
     self = object.__new__(NemotronOmniForConditionalGeneration)
     nn.Module.__init__(self)
+    self._native_transformers = False
     self.patch_size = patch_size
     self.downsample_ratio = downsample_ratio
     self.img_context_token_id = img_token_id
@@ -211,6 +212,8 @@ def test_forward_dynamic_res_branch_fills_image_slots():
     hidden = 64
     model = _make_model_stub(patch_size=2, downsample_ratio=0.5, c_feat=16, img_token_id=18)
     model.language_model = _StubLM(hidden_size=hidden)
+    model.language_model.config = SimpleNamespace(output_hidden_states=False)
+    model.language_model.config = SimpleNamespace(output_hidden_states=False)
 
     # Sequence: 2 batch x 6 tokens; image tokens scattered.
     img = 18
@@ -259,6 +262,8 @@ def test_forward_prefers_dynamic_res_over_image_flags_when_both_present():
     hidden = 64
     model = _make_model_stub(patch_size=2, downsample_ratio=0.5, c_feat=16, img_token_id=18)
     model.language_model = _StubLM(hidden_size=hidden)
+    model.language_model.config = SimpleNamespace(output_hidden_states=False)
+    model.language_model.config = SimpleNamespace(output_hidden_states=False)
 
     # Spy on extract_feature_dynamic vs extract_feature.
     calls = {"dynamic": 0, "tile": 0}

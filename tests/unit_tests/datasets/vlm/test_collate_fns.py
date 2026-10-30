@@ -3615,3 +3615,35 @@ def test_merge_media_values_flattens_mixed_tensor_and_list_packs():
     assert isinstance(merged, list)
     assert [tuple(v.shape) for v in merged] == [(3, 8, 8), (3, 8, 8), (3, 12, 4), (3, 6, 6)]
     assert all(v.dtype == torch.bfloat16 for v in merged)
+
+
+@pytest.mark.parametrize("max_length", [None, 3])
+def test_nemotron_native_patches_preserve_grids_and_truncation(collate_mod, monkeypatch, max_length):
+    """Native patches concatenate in sample order; truncation removes their grids too."""
+
+    class PackedProcessor(DummyNemotronOmniProcessor):
+        def __call__(self, *, text, return_tensors, **kwargs):
+            i = self._call_idx
+            self._call_idx += 1
+            ids = torch.tensor([[1, 9, 9, 2, 3]]) if i == 0 else torch.tensor([[9, 2, 3]])
+            return {
+                "input_ids": ids,
+                "attention_mask": torch.ones_like(ids),
+                "pixel_values": torch.full((8 if i == 0 else 4, 12), i + 0.12345),
+                "image_grid_hw": torch.tensor([[4, 2] if i == 0 else [2, 2]]),
+            }
+
+    processor = PackedProcessor()
+    monkeypatch.setattr(collate_mod, "build_labels", lambda ids, *args: ids.clone())
+    batch = collate_mod.nemotron_omni_collate_fn(
+        _nemotron_omni_image_examples(2), processor=processor, max_length=max_length
+    )
+    if max_length is None:
+        assert batch["pixel_values"].shape == (12, 12)
+        assert batch["image_grid_hw"].tolist() == [[4, 2], [2, 2]]
+        assert batch["pixel_values"].dtype == torch.float32
+        torch.testing.assert_close(batch["pixel_values"][:8], torch.full((8, 12), 0.12345))
+    else:
+        assert batch["pixel_values"].shape == (4, 12)
+        assert batch["image_grid_hw"].tolist() == [[2, 2]]
+        assert (batch["input_ids"] == 9).sum() == 1

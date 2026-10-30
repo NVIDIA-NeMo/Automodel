@@ -88,6 +88,14 @@ _VISION_PROJ_MODULE_CUSTOM_TO_HF = {
     "vision_projector.vision_final_layernorm": "vision_projector.vision_final_layernorm",
 }
 _VISION_PROJ_MODULE_HF_TO_CUSTOM = {v: k for k, v in _VISION_PROJ_MODULE_CUSTOM_TO_HF.items()}
+_VISION_PROJ_MODULE_CUSTOM_TO_NATIVE = {
+    "vision_projector.norm": "multi_modal_projector.layer_norm",
+    "vision_projector.linear1": "multi_modal_projector.linear_1",
+    "vision_projector.linear2": "multi_modal_projector.linear_2",
+    "vision_projector.vision_final_layernorm": "vision_final_layernorm",
+}
+_VISION_PROJ_MODULE_HF_TO_CUSTOM.update({v: k for k, v in _VISION_PROJ_MODULE_CUSTOM_TO_NATIVE.items()})
+
 
 # Legacy full parameter table retained for backwards compatibility
 _VISION_PROJ_HF_TO_CUSTOM = {
@@ -100,9 +108,10 @@ _VISION_PROJ_HF_TO_CUSTOM = {
 _VISION_PROJ_CUSTOM_TO_HF = {v: k for k, v in _VISION_PROJ_HF_TO_CUSTOM.items()}
 
 
-def _map_vision_proj_key_to_hf(bare_fqn: str) -> str:
+def _map_vision_proj_key_to_hf(bare_fqn: str, *, native_transformers: bool = False) -> str:
     """Map a custom vision projector parameter or module name to HF format."""
-    for custom_prefix, hf_prefix in _VISION_PROJ_MODULE_CUSTOM_TO_HF.items():
+    mapping = _VISION_PROJ_MODULE_CUSTOM_TO_NATIVE if native_transformers else _VISION_PROJ_MODULE_CUSTOM_TO_HF
+    for custom_prefix, hf_prefix in mapping.items():
         if bare_fqn == custom_prefix:
             return hf_prefix
         if bare_fqn.startswith(f"{custom_prefix}."):
@@ -154,6 +163,15 @@ _RADIO_NATIVE_TO_LEGACY_RENAMES: list[tuple[str, str]] = [(new, old) for old, ne
 # attn.qkv.{weight,bias} (fused) <-> attention.attention.{query,key,value}.{weight,bias},
 # chunked/concatenated along dim 0 in query, key, value order.
 _RADIO_QKV_SPLIT_TARGETS = ("attention.attention.query", "attention.attention.key", "attention.attention.value")
+
+# Transformers 5.18 RADIO flattens the attention wrapper used by the
+# checkpoint-bundled implementation. Normalize both released layouts.
+_RADIO_REMOTE_TO_TRANSFORMERS_RENAMES = [
+    ("attention.attention.query", "attention.q_proj"),
+    ("attention.attention.key", "attention.k_proj"),
+    ("attention.attention.value", "attention.v_proj"),
+    ("attention.output.dense", "attention.o_proj"),
+]
 
 
 def _rename_radio_key(sub_key: str, renames: list[tuple[str, str]]) -> str:
@@ -226,8 +244,19 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
 
     @property
     def _v5_peft_target_parameters(self) -> tuple[str, ...]:
-        """Omni PEFT export targets the remote-code receiver with per-expert target_modules."""
-        return ()
+        """Native Transformers receivers expose fused expert parameters."""
+        return ("mixer.experts.up_proj", "mixer.experts.down_proj") if self.native_transformers else ()
+
+    @property
+    def checkpoint_key_aliases(self) -> dict[str, str]:
+        """Accept released projector names when DCP reads native export destinations."""
+        if not self.native_transformers:
+            return {}
+        return {
+            f"{native_prefix}.{suffix}": f"{_VISION_PROJ_MODULE_CUSTOM_TO_HF[custom_prefix]}.{suffix}"
+            for custom_prefix, native_prefix in _VISION_PROJ_MODULE_CUSTOM_TO_NATIVE.items()
+            for suffix in ("weight", "bias")
+        }
 
     @property
     def supports_low_memory_dcp_load(self) -> bool:
@@ -252,6 +281,7 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         backend: BackendConfig,
         dtype: torch.dtype = torch.bfloat16,
         vision_uses_native_radio: bool = False,
+        native_transformers: bool = False,
     ):
         """Initialize the state dict adapter.
 
@@ -266,6 +296,7 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                 "radio_model.model.blocks" checkpoint keys to be renamed and their fused
                 QKV split. False for the legacy `radio_model`-wrapped vision class, whose
                 checkpoint keys already match the module tree as-is.
+            native_transformers: Export native Transformers vision/projector and PEFT names.
         """
         self.config = config
         self.llm_config = llm_config
@@ -273,6 +304,7 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         self.backend = backend
         self.dtype = dtype
         self.vision_uses_native_radio = vision_uses_native_radio
+        self.native_transformers = native_transformers
 
         # Create the LLM state dict adapter (handles expert merging etc.)
         self._llm_adapter = NemotronV3StateDictAdapter(
@@ -334,13 +366,17 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
                     result[f"{prefix}vision_model.{sub_key}"] = value
                 elif self.vision_uses_native_radio:
                     for new_sub_key, new_value in _radio_legacy_to_native(sub_key, value):
+                        if self.native_transformers:
+                            new_sub_key = _rename_radio_key(new_sub_key, _RADIO_REMOTE_TO_TRANSFORMERS_RENAMES)
                         result[f"vision_model.{new_sub_key}"] = new_value
                 else:
                     result[f"vision_model.{sub_key}"] = value
                 debug_counts["vision_model"] += 1
 
-            # 2. Vision projector keys (mlp1.* or vision_projector.* -> vision_projector.*)
-            elif bare_key.startswith(("mlp1.", "vision_projector.")):
+            # Accept both released checkpoint names and native Transformers exports.
+            elif bare_key.startswith(
+                ("mlp1.", "vision_projector.", "multi_modal_projector.", "vision_final_layernorm.")
+            ):
                 mapped_key = _map_vision_proj_key_to_custom(bare_key)
                 new_key = f"{prefix}{mapped_key}"
                 result[new_key] = value
@@ -457,7 +493,7 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
 
             # Vision projector (custom -> HF)
             elif bare_fqn.startswith("vision_projector."):
-                mapped_fqn = _map_vision_proj_key_to_hf(bare_fqn)
+                mapped_fqn = _map_vision_proj_key_to_hf(bare_fqn, native_transformers=self.native_transformers)
                 hf_result[f"{prefix}{mapped_fqn}"] = tensor
 
             # Sound encoder (custom -> HF: add "encoder." prefix)
@@ -478,9 +514,9 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
             else:
                 hf_result[fqn] = tensor
 
-        # Convert LLM keys to HF remote-code format (always v4_compatible for the remote-code backbone layout)
+        # Export native Transformers names for Super and remote-code names for legacy Nano.
         kwargs_llm = dict(kwargs)
-        kwargs_llm["v4_compatible"] = True
+        kwargs_llm["v4_compatible"] = not self.native_transformers
         converted_llm = self._llm_adapter.to_hf(llm_state_dict, exclude_key_regex=exclude_key_regex, **kwargs_llm)
 
         # Re-add "language_model." prefix
@@ -493,6 +529,14 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         # Convert vision base keys back to the checkpoint's own naming (remap for native RadioModel,
         # pass through otherwise) and re-add "vision_model." prefix
         if vision_state_dict:
+            if self.native_transformers:
+                # DCP constructs its destinations through to_hf before reading.
+                # Keep released fused-QKV storage on export too, so initial load
+                # and resume use the same layout; native HF also accepts it.
+                inverse_renames = [(new, old) for old, new in _RADIO_REMOTE_TO_TRANSFORMERS_RENAMES]
+                vision_state_dict = {
+                    _rename_radio_key(key, inverse_renames): value for key, value in vision_state_dict.items()
+                }
             converted_vision = (
                 _radio_native_to_legacy(vision_state_dict) if self.vision_uses_native_radio else vision_state_dict
             )
@@ -535,7 +579,7 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
 
         # Vision projector
         elif bare_fqn.startswith("vision_projector."):
-            mapped_bare_fqn = _map_vision_proj_key_to_hf(bare_fqn)
+            mapped_bare_fqn = _map_vision_proj_key_to_hf(bare_fqn, native_transformers=self.native_transformers)
             new_fqn = f"{prefix}{mapped_bare_fqn}"
 
         # Sound encoder
@@ -551,7 +595,7 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
             stripped = bare_fqn[len("language_model.") :]
             llm_fqn = f"{prefix}{stripped}" if prefix else stripped
             kwargs_llm = dict(kwargs)
-            kwargs_llm["v4_compatible"] = True
+            kwargs_llm["v4_compatible"] = not self.native_transformers
             llm_results = self._llm_adapter.convert_single_tensor_to_hf(llm_fqn, tensor, **kwargs_llm)
             # Re-add language_model. prefix
             results = []
@@ -577,10 +621,12 @@ class NemotronOmniStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapt
         """Map native PEFT target modules to the public HF namespace."""
         if name.startswith("language_model."):
             stripped = name[len("language_model.") :]
-            mapped = self._llm_adapter.map_peft_target_module_to_hf(stripped, v4_compatible=True)
+            mapped = self._llm_adapter.map_peft_target_module_to_hf(
+                stripped, v4_compatible=not self.native_transformers
+            )
             return f"language_model.{mapped}"
         if name.startswith("sound_encoder."):
             return "sound_encoder.encoder." + name[len("sound_encoder.") :]
         if name.startswith("vision_projector."):
-            return _map_vision_proj_key_to_hf(name)
+            return _map_vision_proj_key_to_hf(name, native_transformers=self.native_transformers)
         return name

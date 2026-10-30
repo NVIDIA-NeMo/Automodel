@@ -158,7 +158,7 @@ step_scheduler:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16
-  trust_remote_code: true
+  trust_remote_code: false
   num_nextn_predict_layers: 0
   torch_dtype: torch.bfloat16
   backend:
@@ -313,7 +313,7 @@ adapter weights, so the whole run needs about 1.5 GB of disk.
 ## Step 4 — Run Inference and Evaluation
 
 Load the base checkpoint across all visible GPUs (`device_map="auto"`; the bf16 weights need ~232 GB, so use
-one node with 8x H100), fold the LoRA adapter into the base weights (`W += (B @ A) * alpha / r`), and greedy-decode
+one node with 8x H100), load the LoRA adapter with PEFT, and greedy-decode
 validation questions with the training prompt. Each prediction is scored against the gold query after
 normalization (lower-cased, whitespace collapsed, trailing `;` removed):
 
@@ -324,45 +324,47 @@ Spider's validation split is ordered by database, so the snippet takes every 51s
 many databases in a small sample.
 
 ```python
-import difflib, json, re
-from pathlib import Path
+import difflib, re
+from functools import wraps
 
 import torch
-from safetensors import safe_open
-from transformers import AutoModel, AutoProcessor
+from peft import PeftModel
+from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMamba2Mixer
 
 from datasets import load_dataset
 from nemo_automodel.components.datasets.vlm.datasets import TEXT_TO_SQL_PROMPT, spider_schema_to_ddl
+
+def prepare_native_inference(model):
+    # Transformers 5.18 must use the checkpoint's runtime dt limits.
+    # mamba-ssm's scan must launch on the GPU that owns the layer.
+    def on_device(forward, device):
+        @wraps(forward)
+        def wrapped(*args, **kwargs):
+            with torch.cuda.device(device):
+                return forward(*args, **kwargs)
+        return wrapped
+
+    for module in model.modules():
+        if isinstance(module, NemotronHMamba2Mixer):
+            module.time_step_limit = module.config.time_step_limit
+            module.forward = on_device(module.forward, module.dt_bias.device)
 
 BASE = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
 ADAPTER = "vlm_checkpoints/nemotron_3_5_super_vl_spider_peft/LATEST/model"  # pragma: allowlist secret
 NUM_SAMPLES, STRIDE = 20, 51
 
-processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
-model = AutoModel.from_pretrained(BASE, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto")
-model.vision_model.radio_model.summary_idxs = None  # non-persistent RADIO buffer; can be a meta tensor after load
+processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=False)
+model = AutoModelForImageTextToText.from_pretrained(
+    BASE, trust_remote_code=False, dtype=torch.bfloat16, device_map="auto",
+    key_mapping={r"^vision_projector\.vision_final_layernorm\.": "vision_final_layernorm."},
+)
+model = PeftModel.from_pretrained(model, ADAPTER, autocast_adapter_dtype=False)
+prepare_native_inference(model)
 model.eval()
-
-# Fold the LoRA adapter into the base weights.
-cfg = json.loads((Path(ADAPTER) / "adapter_config.json").read_text())
-scale = cfg["lora_alpha"] / cfg["r"]
-pairs = {}
-with safe_open(str(Path(ADAPTER) / "adapter_model.safetensors"), framework="pt") as f:
-    for key in f.keys():
-        m = re.match(r"^(?:base_model\.model\.)?(.+)\.lora_(A|B)\.weight$", key)
-        if m:
-            pairs.setdefault(m.group(1), {})[m.group(2)] = f.get_tensor(key)
-modules = dict(model.named_modules())
-with torch.no_grad():
-    for fqn, ab in pairs.items():
-        weight = modules[fqn].weight
-        delta = (ab["B"].to(weight.device, torch.float32) @ ab["A"].to(weight.device, torch.float32)) * scale
-        weight.add_(delta.to(weight.dtype))
-print(f"merged {len(pairs)} LoRA modules")
 
 validation = load_dataset("xlangai/spider", split="validation")
 schemas = {row["db_id"]: spider_schema_to_ddl(row) for row in load_dataset("richardr1126/spider-schema", split="train")}
-PROCESSOR_METADATA_KEYS = ("num_patches", "num_tokens", "imgs_sizes")  # not generate() kwargs
 
 
 def normalize_sql(sql):
@@ -376,8 +378,6 @@ def predict(db_id, question, max_new_tokens=256):
         [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True, enable_thinking=False
     )
     inputs = processor(text=text, return_tensors="pt")
-    for key in PROCESSOR_METADATA_KEYS:
-        inputs.pop(key, None)
     device = next(model.parameters()).device
     inputs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
     output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
@@ -396,7 +396,7 @@ for i in range(0, len(validation), STRIDE)[:NUM_SAMPLES]:
 print(f"exact match {exact}/{NUM_SAMPLES} | mean similarity {similarity / NUM_SAMPLES:.3f}")
 ```
 
-Skipping the merge block scores the starting BF16 checkpoint the same way.
+Skipping the PEFT adapter load scores the starting BF16 checkpoint the same way.
 
 **Resources:** One node with 8x H100 (bf16 weights spread over the GPUs).
 **Runtime:** About 2–4 min to load the starting BF16 checkpoint, then about 3.4 s per question for the fine-tuned

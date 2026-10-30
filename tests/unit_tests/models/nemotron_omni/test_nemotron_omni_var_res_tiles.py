@@ -90,6 +90,7 @@ def _make_model_stub(*, patch_size=2, downsample_ratio=0.5, c_feat=16, img_token
     tile-based path touches. Skips the heavy __init__ (RADIO + LM)."""
     self = object.__new__(NemotronOmniForConditionalGeneration)
     nn.Module.__init__(self)
+    self._native_transformers = False
     self.patch_size = patch_size
     self.downsample_ratio = downsample_ratio
     self.img_context_token_id = img_token_id
@@ -97,6 +98,7 @@ def _make_model_stub(*, patch_size=2, downsample_ratio=0.5, c_feat=16, img_token
     self.vision_model = _StubVisionModel(patch_size, c_feat)
     self.vision_projector = _IdentityProjector()
     self.language_model = _StubLM(hidden_size=hidden)
+    self.language_model.config = SimpleNamespace(output_hidden_states=False)
     return self
 
 
