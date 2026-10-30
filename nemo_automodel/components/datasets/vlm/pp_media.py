@@ -39,12 +39,12 @@ _VLM_MEDIA_KEYS = (
 
 
 def chunk_vlm_media(
-    pixel_values: torch.Tensor,
+    pixel_values: torch.Tensor | list[torch.Tensor],
     image_grid: torch.Tensor,
     batch_size: int,
     n_microbatches: int,
     n_images_per_sample: torch.Tensor | None = None,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+) -> tuple[list[torch.Tensor | list[torch.Tensor]], list[torch.Tensor]]:
     """Split VLM pixel values and media metadata into PP microbatch chunks.
 
     Explicit image counts take precedence over a coincidental equality between
@@ -53,7 +53,8 @@ def chunk_vlm_media(
     Args:
         pixel_values: Image-major pixels [images, channels, height, width],
             padded patches [images, max_patches, features], or flat patches
-            [total_patches, features].
+            [total_patches, features], or a list of [channels, height, width]
+            tensors with possibly different image sizes.
         image_grid: Per-image metadata [images, coordinates]. For flat patches,
             the product of each grid gives the corresponding patch count.
         batch_size: Number of batch documents owning the media.
@@ -63,13 +64,36 @@ def chunk_vlm_media(
 
     Returns:
         Pixel and metadata lists in microbatch order, retaining each input's
-        trailing axes. Each chunk is a view; inputs are never mutated.
+        trailing axes. Tensor chunks are views; list chunks retain their tensor
+        references. Inputs are never mutated.
     """
     n_images = image_grid.shape[0]
-    pixel_values_chunks: list[torch.Tensor] = []
+    pixel_values_chunks: list[torch.Tensor | list[torch.Tensor]] = []
     image_grid_chunks: list[torch.Tensor] = []
 
-    if (
+    if isinstance(pixel_values, list) or (pixel_values.ndim == 4 and n_images_per_sample is not None):
+        # Complete images (possibly ragged), with explicit sample ownership.
+        # Counts take precedence even when total images happens to equal batch
+        # size: [0, 2] is not the same ownership as one image on each sample.
+        if len(pixel_values) != n_images:
+            raise ValueError("Complete image count must match image metadata")
+        counts = n_images_per_sample
+        if counts is None:
+            if n_images != batch_size:
+                raise ValueError("Multiple or missing images require n_images_per_sample")
+            counts = torch.ones(batch_size, dtype=torch.long)
+        counts = counts.to(dtype=torch.long).reshape(-1)
+        if counts.numel() != batch_size or bool((counts < 0).any()) or int(counts.sum()) != n_images:
+            raise ValueError("n_images_per_sample must partition complete images across the batch")
+        offsets = torch.nn.functional.pad(counts.cpu().cumsum(0), (1, 0))
+        samples_per_mb = -(-batch_size // n_microbatches)
+        for mb_idx in range(n_microbatches):
+            first = min(mb_idx * samples_per_mb, batch_size)
+            stop = min(first + samples_per_mb, batch_size)
+            begin, end = int(offsets[first]), int(offsets[stop])
+            pixel_values_chunks.append(pixel_values[begin:end])
+            image_grid_chunks.append(image_grid[begin:end])
+    elif (
         pixel_values.shape[0] == batch_size
         and pixel_values.dim() in (3, 4)
         and (n_images_per_sample is None or bool(n_images_per_sample.eq(1).all()))
