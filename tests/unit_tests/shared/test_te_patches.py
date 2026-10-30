@@ -747,7 +747,17 @@ class TestFusedAdamCachedListsPatch:
         for step in steps[1:]:
             assert len(step) == (1 if count == 1024 else 2)
             assert all(len(column) <= 1024 for _, _, columns in step for column in columns)
-            assert [ptr for _, _, columns in step for ptr, _ in columns[1]] == [param.data_ptr() for param in params]
+            expected_columns = [params, [optimizer.state[param]["exp_avg"] for param in params]]
+            expected_columns.append([optimizer.state[param]["exp_avg_sq"] for param in params])
+            if dtype == torch.bfloat16:
+                expected_columns.append([optimizer.state[param]["master_param"] for param in params])
+            for index, tensors in enumerate(expected_columns, start=1):
+                assert [ptr for _, _, columns in step for ptr, _ in columns[index]] == [
+                    tensor.data_ptr() for tensor in tensors
+                ]
+        assert [ptr for _, _, columns in steps[-1] for ptr, _ in columns[0]] == [
+            param.grad.data_ptr() for param in params
+        ]
 
     def test_mixed_small_and_large_groups_update_each_parameter_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _, FusedAdam, calls = self._patched_module(monkeypatch)
@@ -942,7 +952,8 @@ class TestFusedAdamCachedListsPatch:
 @pytest.mark.run_only_on("GPU")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native TE optimizer parity")
 @pytest.mark.parametrize("count", [4, 1025])
-def test_cached_fused_adam_matches_native_updates(count: int) -> None:
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_cached_fused_adam_matches_native_updates(count: int, dtype: torch.dtype) -> None:
     """Compare cached and native CUDA updates, including large and empty parameter groups."""
     module = pytest.importorskip("transformer_engine.pytorch.optimizers.fused_adam")
     optimizer_type = module.FusedAdam
@@ -950,21 +961,22 @@ def test_cached_fused_adam_matches_native_updates(count: int) -> None:
     original_step = getattr(optimizer_type.step, "_nemo_original_step", optimizer_type.step)
     native_step = MagicMock(wraps=original_step)
     torch.manual_seed(123)
-    params = [torch.nn.Parameter(torch.randn(4, device="cuda", dtype=torch.bfloat16)) for _ in range(count)]
+    params = [torch.nn.Parameter(torch.randn(4, device="cuda", dtype=dtype)) for _ in range(count)]
     reference_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
+    moment_dtype = torch.bfloat16 if dtype == torch.bfloat16 else torch.float32
     optimizer = optimizer_type(
         [{"params": params}, {"params": []}],
         master_weights=True,
         store_param_remainders=True,
-        exp_avg_dtype=torch.bfloat16,
-        exp_avg_sq_dtype=torch.bfloat16,
+        exp_avg_dtype=moment_dtype,
+        exp_avg_sq_dtype=moment_dtype,
     )
     reference = optimizer_type(
         [{"params": reference_params}, {"params": []}],
         master_weights=True,
         store_param_remainders=True,
-        exp_avg_dtype=torch.bfloat16,
-        exp_avg_sq_dtype=torch.bfloat16,
+        exp_avg_dtype=moment_dtype,
+        exp_avg_sq_dtype=moment_dtype,
     )
     # Restore all three methods changed by the compatibility patch after this test.
     with (
@@ -983,7 +995,10 @@ def test_cached_fused_adam_matches_native_updates(count: int) -> None:
             original_step(reference)
             optimizer.step()
             torch.testing.assert_close(torch.stack(params), torch.stack(reference_params), rtol=0, atol=0)
-            for name in ("exp_avg", "exp_avg_sq", "master_param"):
+            state_names = (
+                ("exp_avg", "exp_avg_sq", "master_param") if dtype == torch.bfloat16 else ("exp_avg", "exp_avg_sq")
+            )
+            for name in state_names:
                 torch.testing.assert_close(
                     torch.stack([optimizer.state[param][name] for param in params]),
                     torch.stack([reference.state[param][name] for param in reference_params]),
