@@ -55,7 +55,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: zai-org/GLM-5.3
-  torch_dtype: float32  # fp32 master weights; FSDP2 computes in bf16
+  dtype: bfloat16  # bf16 resident params + bf16 checkpoints; fp32 master weights live in TE FusedAdam
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: tilelang
@@ -97,13 +97,21 @@ dataloader:
   shuffle: true
 
 optimizer:
-  _target_: torch.optim.Adam
+  # Pattern A (docs/guides/mixed-precision-training.mdx): bf16 resident params, TE FusedAdam keeps
+  # fp32 master weights (as bf16 + 16-bit remainders) and fp32 Adam moments.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 1e-5
   betas:
   - 0.9
   - 0.999
   eps: 1e-8
-  lr: 1e-5
   weight_decay: 0
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
 
 wandb:
   enable: false
