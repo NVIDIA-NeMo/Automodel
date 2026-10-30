@@ -502,8 +502,7 @@ jobs:
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             is-unit-test: true
             cpu-only: false
-            # Shard 2 also needs headroom beyond 40 minutes for the full suite.
-            timeout: 45
+            timeout: 40
             shard-id: 1
             num-shards: 2
           # Run cold Magi/TileLang compilation alongside the general unit shards.
@@ -599,7 +598,7 @@ jobs:
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 40
+            timeout: 30
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval
@@ -696,7 +695,7 @@ jobs:
             is-optional: "true"
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 40
+            timeout: 30
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20
