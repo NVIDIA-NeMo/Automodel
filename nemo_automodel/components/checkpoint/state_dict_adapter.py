@@ -26,6 +26,15 @@ class StateDictAdapter(ABC):
     state dict format and other model state dict formats.
     """
 
+    @property
+    def checkpoint_key_aliases(self) -> dict[str, str]:
+        """Current HF names mapped to legacy names accepted during strict checkpoint reads.
+
+        The loader uses an alias only when the current name is absent, then restores the current name
+        before invoking from_hf. Saving always uses the current names.
+        """
+        return {}
+
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.

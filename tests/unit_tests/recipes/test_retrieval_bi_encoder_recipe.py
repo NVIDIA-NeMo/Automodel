@@ -73,7 +73,7 @@ def test_retrieval_attrs_accept_unwrapped_model():
     assert _uses_multi_vector_scoring(inner) is True
 
 
-def test_configure_sentence_transformer_export_binds_structured_multimodal_prompts_without_separator():
+def test_configure_sentence_transformer_export_binds_structured_multimodal_prompts_with_separator():
     captured = {}
 
     class _Model(torch.nn.Module):
@@ -94,7 +94,7 @@ def test_configure_sentence_transformer_export_binds_structured_multimodal_promp
     wrapped = _DDPLikeWrapper(_Model())
     _configure_sentence_transformer_export(wrapped, collator)
 
-    assert captured == {"query_prompt": "query:", "document_prompt": "passage:", "tokenizer": None}
+    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": None}
 
 
 def test_configure_sentence_transformer_export_retains_separator_for_text_prompts():
@@ -120,7 +120,7 @@ def test_configure_sentence_transformer_export_retains_separator_for_text_prompt
     assert captured == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": None}
 
 
-def test_configure_sentence_transformer_export_avoids_duplicate_structured_prompt_separator():
+def test_configure_sentence_transformer_export_retains_structured_prompt_separator():
     captured = {}
 
     class _Model(torch.nn.Module):
@@ -137,7 +137,7 @@ def test_configure_sentence_transformer_export_avoids_duplicate_structured_promp
 
     _configure_sentence_transformer_export(_Model(), collator)
 
-    assert captured == {"query_prompt": "query:", "document_prompt": "passage:", "tokenizer": None}
+    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": None}
 
 
 def test_configure_sentence_transformer_export_reads_processor_method_collator_prompts():
@@ -161,7 +161,7 @@ def test_configure_sentence_transformer_export_reads_processor_method_collator_p
     assert collator.passage_prefix == "passage:"
     _configure_sentence_transformer_export(_Model(), collator)
 
-    assert captured == {"query_prompt": "query:", "document_prompt": "passage:", "tokenizer": None}
+    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": None}
 
 
 def test_configure_sentence_transformer_export_ignores_collator_when_export_is_disabled():

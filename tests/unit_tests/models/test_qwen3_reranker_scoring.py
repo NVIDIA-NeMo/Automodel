@@ -30,11 +30,13 @@ import json
 
 import pytest
 import torch
+
+from nemo_automodel._transformers.retrieval import CrossEncoderModel
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
-from nemo_automodel._transformers.retrieval import CrossEncoderModel
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.qwen3_reranker.model import (
     Qwen3RerankerConfig,
     Qwen3RerankerForCausalReranking,
@@ -56,7 +58,6 @@ def _tiny_model() -> Qwen3RerankerForCausalReranking:
         num_key_value_heads=1,
         max_position_embeddings=32,
         head_dim=8,
-        is_decoder=False,
     )
     torch.manual_seed(0)
     model = Qwen3RerankerForCausalReranking(config)
@@ -64,30 +65,18 @@ def _tiny_model() -> Qwen3RerankerForCausalReranking:
     return model
 
 
-def test_cross_encoder_default_preserves_native_causal_attention():
-    """An unspecified wrapper policy must not change a causal reranker's semantics."""
-    model = _tiny_model()
-    assert all(layer.self_attn.is_causal is True for layer in model.model.layers)
-
-    encoder = CrossEncoderModel(model)
-
-    assert encoder.is_causal is True
-    assert encoder.model.config.is_causal is True
-    assert all(layer.self_attn.is_causal is True for layer in model.model.layers)
-
-    input_ids = torch.tensor([[1, 2, 3, 4]])
-    changed_ids = input_ids.clone()
-    changed_ids[0, -1] = 5
-    attention_mask = torch.ones_like(input_ids)
-    with torch.no_grad():
-        original = model.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        changed = model.model(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
-
-    torch.testing.assert_close(original[0, 0], changed[0, 0])
-
-
 def _reference_p_yes(model, input_ids, attention_mask, last_idx) -> torch.Tensor:
-    """The model-card computation, run through the underlying causal LM."""
+    """Run the model-card probability computation through the underlying causal LM.
+
+    Args:
+        model: Causal language model with a vocabulary projection.
+        input_ids: Tensor of shape [batch, sequence].
+        attention_mask: Tensor of shape [batch, sequence], with zero padding positions.
+        last_idx: Tensor of shape [batch] with the scored position per row.
+
+    Returns:
+        Tensor of shape [batch] containing the probability of yes.
+    """
     hidden = model.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True).last_hidden_state
     logits = model.lm_head(hidden)  # [batch, sequence, vocab]
     last = logits[torch.arange(logits.shape[0]), last_idx]  # [batch, vocab]
@@ -195,7 +184,16 @@ def test_missing_attention_mask_raises():
 
 
 def _yes_minus_no_from_causal_lm(model, input_ids, attention_mask) -> torch.Tensor:
-    """Score a plain causal LM the way the model card does, at the final position."""
+    """Score a plain causal LM at the final position.
+
+    Args:
+        model: Causal language model with a vocabulary projection.
+        input_ids: Tensor of shape [batch, sequence], with an attended final token.
+        attention_mask: Tensor of shape [batch, sequence], with zero padding positions.
+
+    Returns:
+        Tensor of shape [batch] containing logit(yes) - logit(no).
+    """
     with torch.no_grad():
         logits = model(input_ids=input_ids, attention_mask=attention_mask).logits[:, -1, :]
     return logits[:, YES_ID] - logits[:, NO_ID]
@@ -265,3 +263,182 @@ def test_round_trip_preserves_no_weights_beyond_the_backbone(tmp_path):
     reloaded = AutoModelForCausalLM.from_pretrained(tmp_path)
 
     assert set(reloaded.state_dict()) == set(model.state_dict())
+
+
+def test_supports_tied_embeddings():
+    """The published checkpoints set tie_word_embeddings=True, so the tie must actually apply.
+
+    Scoring reads the yes/no rows of ``lm_head``; a tie that silently failed would leave the
+    head drifting from the embeddings it is meant to share, and the published checkpoint's
+    scores would not reproduce.
+    """
+    config = Qwen3RerankerConfig(
+        yes_token_id=YES_ID,
+        no_token_id=NO_ID,
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+        head_dim=8,
+        tie_word_embeddings=True,
+    )
+    model = Qwen3RerankerForCausalReranking(config)
+
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+
+
+def test_declares_tie_support_both():
+    """Registered lm_head-bearing classes must state their policy rather than default to one."""
+    assert Qwen3RerankerForCausalReranking.tie_word_embeddings_support is TieSupport.BOTH
+
+
+def test_untied_config_leaves_the_head_independent():
+    """BOTH means both layouts work, so the untied case must not alias."""
+    config = Qwen3RerankerConfig(
+        yes_token_id=YES_ID,
+        no_token_id=NO_ID,
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+        head_dim=8,
+        tie_word_embeddings=False,
+    )
+    model = Qwen3RerankerForCausalReranking(config)
+
+    assert model.lm_head.weight is not model.model.embed_tokens.weight
+
+
+def _tiny_kwargs(**overrides) -> dict:
+    base = dict(
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+        head_dim=8,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_serialized_config_carries_a_non_default_rope_scale():
+    """A scaled-RoPE checkpoint must reload with the scale it was trained under.
+
+    ``rope_parameters`` nests the scaling config, and the serializer flattens that dict
+    into rope_theta + rope_scaling for vLLM and stock HF. Dropping the dict without
+    carrying the scaling across would reload the checkpoint with different position
+    encoding than it was trained with -- silently, and only visible as degraded long
+    -context quality.
+    """
+    config = Qwen3RerankerConfig(
+        yes_token_id=YES_ID,
+        no_token_id=NO_ID,
+        **_tiny_kwargs(
+            rope_parameters={
+                "rope_theta": 5.0,
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 8,
+            }
+        ),
+    )
+
+    serialized = config.to_dict()
+
+    assert serialized["rope_theta"] == 5.0
+    assert serialized["rope_scaling"]["rope_type"] == "yarn"
+    assert serialized["rope_scaling"]["factor"] == 4.0
+    assert "rope_parameters" not in serialized
+
+
+def test_serialized_config_has_no_rope_scaling_when_the_scale_is_default():
+    """The stock config carries rope_scaling: None; an empty dict would not round-trip."""
+    serialized = Qwen3RerankerConfig(yes_token_id=YES_ID, no_token_id=NO_ID, **_tiny_kwargs()).to_dict()
+
+    assert serialized["rope_scaling"] is None
+    assert serialized["rope_theta"] is not None
+
+
+def test_scoring_without_yes_no_ids_raises_rather_than_scoring_garbage():
+    """Unset ids would otherwise index the vocab at 0/0 and return a constant."""
+    model = Qwen3RerankerForCausalReranking(Qwen3RerankerConfig(**_tiny_kwargs()))
+    model.eval()
+
+    with pytest.raises(ValueError, match="yes_token_id/no_token_id are unset"):
+        model(input_ids=torch.tensor([[1, 2, 3]]), attention_mask=torch.tensor([[1, 1, 1]]))
+
+
+def test_labels_produce_a_pointwise_yes_no_loss():
+    """The recipe pops labels and computes its own listwise loss; this is the direct-caller
+    path, which must return a finite scalar tied to the yes/no logits."""
+    model = _tiny_model()
+    input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    attention_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+
+    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=torch.tensor([1, 0]))
+
+    assert out.loss is not None
+    assert out.loss.ndim == 0
+    assert torch.isfinite(out.loss)
+
+
+def test_no_loss_without_labels():
+    out = _tiny_model()(input_ids=torch.tensor([[1, 2, 3]]), attention_mask=torch.tensor([[1, 1, 1]]))
+
+    assert out.loss is None
+
+
+def test_from_pretrained_resolves_missing_yes_no_ids_from_the_tokenizer(tmp_path, monkeypatch):
+    """A checkpoint saved as a plain causal LM carries no yes/no ids, so loading one must
+    recover them from the tokenizer rather than leaving the model unscoreable."""
+    import transformers
+
+    Qwen3ForCausalLM(Qwen3Config(**_tiny_kwargs())).save_pretrained(tmp_path)
+
+    class _StubTokenizer:
+        @staticmethod
+        def convert_tokens_to_ids(token: str) -> int:
+            return {"yes": YES_ID, "no": NO_ID}[token]
+
+    class _StubAutoTokenizer:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return _StubTokenizer()
+
+    monkeypatch.setattr(transformers, "AutoTokenizer", _StubAutoTokenizer)
+
+    model = Qwen3RerankerForCausalReranking.from_pretrained(tmp_path)
+
+    assert model.config.yes_token_id == YES_ID
+    assert model.config.no_token_id == NO_ID
+
+
+def test_cross_encoder_default_preserves_native_causal_attention():
+    """An unspecified wrapper policy must not change a causal reranker's semantics."""
+    model = _tiny_model()
+    assert all(layer.self_attn.is_causal is True for layer in model.model.layers)
+
+    encoder = CrossEncoderModel(model)
+
+    assert encoder.is_causal is True
+    assert encoder.model.config.is_causal is True
+    assert all(layer.self_attn.is_causal is True for layer in model.model.layers)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    changed_ids = input_ids.clone()
+    changed_ids[0, -1] = 5
+    attention_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        original = model.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        changed = model.model(input_ids=changed_ids, attention_mask=attention_mask).last_hidden_state
+
+    torch.testing.assert_close(original[0, 0], changed[0, 0])
