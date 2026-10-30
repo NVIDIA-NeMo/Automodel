@@ -251,6 +251,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "MistralLarge4ForConditionalGeneration",
+            ("nemo_automodel.components.models.mistral_large4.multimodal", "MistralLarge4ForConditionalGeneration"),
+        ),
+        (
+            "MistralLarge4ForCausalLM",
+            ("nemo_automodel.components.models.mistral_large4.model", "MistralLarge4ForCausalLM"),
+        ),
+        (
             "Mistral4ForCausalLM",
             ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
         ),
@@ -468,6 +476,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
         "Mistral3BidirectionalConfig",
     ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "mistral_large4": ("nemo_automodel.components.models.mistral_large4.config", "MistralLarge4Config"),
     "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),
     "muse_spark": (
         "nemo_automodel.components.models.muse_spark.configuration_muse_spark",

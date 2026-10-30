@@ -30,9 +30,8 @@ on:
     paths:
       - 'docs/**'
       - 'nemo_automodel/_transformers/registry.py'
-      - 'tests/ci_tests/utils/sync_model_coverage_tables.py'
-      - 'tests/unit_tests/_transformers/test_doc_coverage.py'
-      - 'tools/apply_fern_code_styles.py'
+      - 'tools/docs/**'
+      - 'tests/unit_tests/tools/docs/**'
     tags:
       - 'docs/v*'
   workflow_dispatch: {}
@@ -56,24 +55,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Backward version trees (frozen GA snapshots) are not kept on main -- only
-      # the nightly tree (top-level docs/) is. Restore them from their archive ref
-      # so `fern generate --docs` (a full-site snapshot publish) sees every train.
-      - name: Stitch archived version pages
-        uses: ./.github/actions/stitch-fern-versions
+      - name: Set up UV
+        uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
-          archived-versions: |
-            v0.4=docs-archive
-            v0.5=docs-archive
-            v0.7=docs-archive
-
-      - name: Generate model coverage tables
-        run: python3 tests/ci_tests/utils/sync_model_coverage_tables.py
+          version: 0.8.22
 
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
+
+      - name: Check documentation
+        # Validate through the same entry point as contributors and PR CI.
+        # This also restores archived pages, without access to the publish token.
+        run: uv run --script tools/docs/check_docs.py --keep-generated
 
       - name: Publish Docs
         env:
@@ -90,5 +85,5 @@ jobs:
           # prep needed. Without it, `generate --docs` fatals with "Folder not
           # found: ../product-docs/nemo-automodel/Full-Library-Reference".
           npx -y "fern-api@$fern_version" docs md generate
-          python3 "$GITHUB_WORKSPACE/tools/apply_fern_code_styles.py" --repo-root "$GITHUB_WORKSPACE"
+          python3 "$GITHUB_WORKSPACE/tools/docs/build/code_styles.py" --repo-root "$GITHUB_WORKSPACE"
           npx -y "fern-api@$fern_version" generate --docs

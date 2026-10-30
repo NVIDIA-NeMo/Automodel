@@ -89,6 +89,7 @@ def _sparse_attention_torch_module_oracle(
     sm_scale: float,
     *,
     backend: str,
+    all_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run the Torch sparse-attention oracle behind the module's TileLang dispatch.
 
@@ -99,11 +100,12 @@ def _sparse_attention_torch_module_oracle(
         topk_indices: Sparse key indices of shape [batch, sequence, selected_keys].
         sm_scale: Attention score scaling factor.
         backend: Module-selected backend, ignored by this CPU oracle.
+        all_rows_nonempty: cuDNN empty-row hint, ignored by this CPU oracle.
 
     Returns:
         Attention output tensor of shape [batch, sequence, heads, head_dim].
     """
-    del backend
+    del backend, all_rows_nonempty
     return dsv4_sparse_attention(q, kv, sinks, topk_indices, sm_scale, backend="sparse_torch")
 
 
