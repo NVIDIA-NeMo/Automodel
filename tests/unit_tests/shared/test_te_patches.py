@@ -746,7 +746,12 @@ class TestFusedAdamCachedListsPatch:
         assert optimizer.param_groups[0]["step"] == 3
         for step in steps[1:]:
             assert len(step) == (1 if count == 1024 else 2)
+            assert [len(columns[0]) for _, _, columns in step] == ([1024] if count == 1024 else [1024, 1])
             assert all(len(column) <= 1024 for _, _, columns in step for column in columns)
+            assert all(len({len(column) for column in columns}) == 1 for _, _, columns in step)
+            expected_kernel = "multi_tensor_adam_param_remainder" if dtype == torch.bfloat16 else "multi_tensor_adam"
+            assert all(kernel == expected_kernel for kernel, _, _ in step)
+            assert all(args == step[0][1] for _, args, _ in step)
             expected_columns = [params, [optimizer.state[param]["exp_avg"] for param in params]]
             expected_columns.append([optimizer.state[param]["exp_avg_sq"] for param in params])
             if dtype == torch.bfloat16:
@@ -956,6 +961,11 @@ class TestFusedAdamCachedListsPatch:
 def test_cached_fused_adam_matches_native_updates(count: int, dtype: torch.dtype) -> None:
     """Compare cached and native CUDA updates, including large and empty parameter groups."""
     module = pytest.importorskip("transformer_engine.pytorch.optimizers.fused_adam")
+    # Native numerical parity cannot detect a changed resource cap; TE 2.19 has no cap constant.
+    assert (
+        getattr(module, "_MAX_TENSORS_PER_MULTI_TENSOR_ADAM_CALL", 1024)
+        == te_patches_module._FUSED_ADAM_MAX_TENSORS_PER_CALL
+    )
     optimizer_type = module.FusedAdam
     # Recipe setup tests may already have installed this wrapper on the real TE class.
     original_step = getattr(optimizer_type.step, "_nemo_original_step", optimizer_type.step)

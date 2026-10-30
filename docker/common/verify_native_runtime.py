@@ -55,6 +55,13 @@ def main() -> None:
     if installed_te_version < Version("2.20.2"):
         raise RuntimeError(f"Transformer Engine 2.20.2 or later is required, found {installed_te_version}")
 
+    installed_frontend_version = Version(version("nvidia-cudnn-frontend"))
+    if installed_frontend_version < Version("1.29.0"):
+        raise RuntimeError(
+            f"Transformer Engine 2.20.2 requires cuDNN Frontend 1.29.0 or later, found {installed_frontend_version}"
+        )
+    importlib.import_module("cudnn")
+
     # Importing the framework binding eagerly catches stale extensions whose
     # PyTorch or CUDA symbols cannot be resolved by the final image runtime.
     importlib.import_module("transformer_engine.pytorch")
