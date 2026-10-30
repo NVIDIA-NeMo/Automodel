@@ -31,6 +31,7 @@ from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.shared.dist_moe import DistMoEConfig
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
@@ -552,13 +553,14 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok", "dist_moe"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
+    dist_moe: DistMoEConfig = field(default_factory=DistMoEConfig)
     te_grouped_tensor: bool = False
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
@@ -671,6 +673,16 @@ class BackendConfig:
             self.cuda_graph = CudaGraphConfig(**self.cuda_graph)
         elif not isinstance(self.cuda_graph, CudaGraphConfig):
             raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
+
+        if isinstance(self.dist_moe, dict):
+            self.dist_moe = DistMoEConfig(**self.dist_moe)
+        elif not isinstance(self.dist_moe, DistMoEConfig):
+            raise TypeError("dist_moe must be a DistMoEConfig or mapping")
+        if self.dispatcher == "dist_moe":
+            if self.dist_moe.max_tokens_per_rank is None:
+                raise ValueError("dispatcher='dist_moe' requires dist_moe.max_tokens_per_rank")
+            if self.experts != "torch_mm":
+                raise ValueError("The Dist-MoE integration requires canonical experts='torch_mm' storage")
 
         if isinstance(self.mok, dict):
             self.mok = MoKBackendConfig(**self.mok)

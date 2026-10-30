@@ -534,6 +534,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 wrapper is idempotent.
         """
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
+        self._stage_timing_events: list[tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]] | None = None
         # Partial graphs are opt-in through model.backend. Discovery happens
         # after checkpoint restore, and capture is deferred until one complete
         # eager optimizer step has supplied representative runtime inputs.
@@ -1363,6 +1364,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             with train_ctx(), sync_ctx, fp8_ctx:
                 batch = filter_forward_kwargs(model, batch)
+                if self._stage_timing_events is not None:
+                    stage_start = torch.cuda.Event(enable_timing=True)
+                    backward_start = torch.cuda.Event(enable_timing=True)
+                    backward_end = torch.cuda.Event(enable_timing=True)
+                    stage_start.record()
+
                 if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(**{**batch, "logits_to_keep": 1, "output_hidden_states": True})
@@ -1444,7 +1451,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 del out, mtp_per_depth_h, mtp_per_depth_logits
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
+                    if self._stage_timing_events is not None:
+                        backward_start.record()
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+                    if self._stage_timing_events is not None:
+                        backward_end.record()
+                        self._stage_timing_events.append((stage_start, backward_start, backward_end))
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""

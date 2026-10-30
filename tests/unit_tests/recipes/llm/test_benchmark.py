@@ -682,6 +682,7 @@ class TestBenchmarkingRecipeHelpers:
 
     def test_main_closes_partial_cuda_graphs_when_setup_fails(self):
         recipe = MagicMock()
+        recipe._training_graph = None
         graph_manager = MagicMock()
         recipe.partial_cuda_graph_manager = graph_manager
         recipe.setup.side_effect = RuntimeError("setup failed")

@@ -694,8 +694,9 @@ class _HybridEPManager(_DispatchManager):
             # one blocking calibration dispatch and the overflow check happen after the call.
             if self._hybridep_capacity is None:
                 self._calibrate_hybridep_capacity(tokens_per_expert, dispatched_hidden.device)
-            else:
-                _assert_no_hybridep_overflow(self.handle, self._hybridep_capacity)
+            # Run the guard on calibration too: checkpoint recompute must see
+            # the same device-side validation ops as its original forward.
+            _assert_no_hybridep_overflow(self.handle, self._hybridep_capacity)
             return dispatched_hidden
         self.num_permuted_tokens = self.tokens_per_expert.sum()
         if self.benchmark_static_routing and getattr(self, "_static_num_permuted_tokens", None) is None:

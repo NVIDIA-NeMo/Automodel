@@ -620,8 +620,8 @@ class GroupedExpertsMoK(nn.Module):
             unsupported.append(f"dim={config.dim} (must be divisible by 256)")
         if config.moe_inter_dim % 256 != 0:
             unsupported.append(f"moe_inter_dim={config.moe_inter_dim} (must be divisible by 256)")
-        if config.n_shared_experts != 1:
-            unsupported.append(f"n_shared_experts={config.n_shared_experts} (must be 1)")
+        if config.n_shared_experts not in (0, 1):
+            unsupported.append(f"n_shared_experts={config.n_shared_experts} (must be 0 or 1)")
         if config.shared_expert_inter_dim not in (None, config.moe_inter_dim):
             unsupported.append("shared_expert_inter_dim must equal moe_inter_dim")
         if config.expert_activation != "swiglu" or config.shared_expert_activation != "swiglu":
@@ -692,9 +692,9 @@ class GroupedExpertsMoK(nn.Module):
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
-        shared_gate_weights: torch.Tensor,
-        shared_up_weights: torch.Tensor,
-        shared_down_weights: torch.Tensor,
+        shared_gate_weights: torch.Tensor | None,
+        shared_up_weights: torch.Tensor | None,
+        shared_down_weights: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute fused shared and routed SwiGLU experts.
 
@@ -702,16 +702,26 @@ class GroupedExpertsMoK(nn.Module):
             x: BF16 tensor of shape [tokens, hidden].
             weights: Tensor of shape [tokens, activated_experts].
             indices: Int64 tensor of shape [tokens, activated_experts].
-            shared_gate_weights: BF16 tensor of shape [expert_intermediate, hidden].
-            shared_up_weights: BF16 tensor of shape [expert_intermediate, hidden].
-            shared_down_weights: BF16 tensor of shape [hidden, expert_intermediate].
+            shared_gate_weights: BF16 tensor of shape [expert_intermediate, hidden], or None without shared experts.
+            shared_up_weights: BF16 tensor of shape [expert_intermediate, hidden], or None without shared experts.
+            shared_down_weights: BF16 tensor of shape [hidden, expert_intermediate], or None without shared experts.
 
         Returns:
-            BF16 tensor of shape [tokens, hidden] containing the fused shared and
+            BF16 tensor of shape [tokens, hidden] containing the optional shared and
             router-weighted routed expert output.
         """
         if isinstance(x, DTensor):
             raise ValueError("MoK expects rank-local activations, not a DTensor")
+        if self.config.n_shared_experts == 0:
+            if self.runtime.mok_config.precision != "bf16":
+                raise ValueError("MoK routed-only support currently requires BF16")
+            if any(weight is not None for weight in (shared_gate_weights, shared_up_weights, shared_down_weights)):
+                raise ValueError("Routed-only MoK must not receive shared parameters")
+            shared_gate_weights = x.new_empty((0, self.config.dim), dtype=torch.bfloat16)
+            shared_up_weights = x.new_empty((0, self.config.dim), dtype=torch.bfloat16)
+            shared_down_weights = x.new_empty((self.config.dim, 0), dtype=torch.bfloat16)
+        elif any(weight is None for weight in (shared_gate_weights, shared_up_weights, shared_down_weights)):
+            raise ValueError("Shared MoK requires all three shared projection weights")
         return _MoKAutogradFunction.apply(
             self.runtime,
             x.contiguous(),
