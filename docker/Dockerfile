@@ -408,7 +408,7 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
 RUN mkdir -p /tmp/cuda-driver-stubs && \
     ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-driver-stubs/libcuda.so.1 && \
     LD_LIBRARY_PATH=/tmp/cuda-driver-stubs:${LD_LIBRARY_PATH} \
-        MAX_JOBS=2 python docker/common/verify_native_runtime.py && \
+        MAX_JOBS=2 python docker/common/verify_native_runtime.py --base-image "$BASE_IMAGE" && \
     rm -rf /tmp/cuda-driver-stubs && \
     python -c "from _pytest.config import get_config; get_config().pluginmanager.load_setuptools_entrypoints('pytest11')"
 
