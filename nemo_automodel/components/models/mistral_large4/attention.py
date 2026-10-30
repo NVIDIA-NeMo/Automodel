@@ -35,6 +35,8 @@ from nemo_automodel.components.models.mistral_large4.rope_utils import (
     apply_interleaved_rope,
 )
 
+_INDEXER_NORM_EPS = 1e-6
+
 
 def sparse_mla(
     q: torch.Tensor,
@@ -64,8 +66,6 @@ def sparse_mla(
         raise RuntimeError("Mistral TileLang sparse MLA requires the TileLang kernel dependencies")
     if q.device.type != "cuda" or q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
         raise ValueError("Mistral TileLang sparse MLA requires CUDA BF16 queries and KV")
-    if q.shape[-1] != 576 or kv.shape[-1] != 576 or value_weight.shape[-1] != 512:
-        raise ValueError("Mistral TileLang sparse MLA requires latent dimension 512 and rotary tail 64")
     # External CUDA kernels read raw pointers and do not trigger PyTorch tensor
     # dispatch. Complete and unwrap functional all-gather before passing KV to
     # TileLang; wait_tensor preserves the collective autograd edge.
@@ -124,12 +124,12 @@ class MistralLarge4Indexer(nn.Module):
         super().__init__()
         self.config = config
         self.use_rope = not config.indexer_nope_layer_flags[layer_idx]
-        self.q_input_norm = nn.LayerNorm(config.hidden_size, eps=config.indexer_norm_eps, dtype=dtype)
+        self.q_input_norm = nn.LayerNorm(config.hidden_size, eps=_INDEXER_NORM_EPS, dtype=dtype)
         self.wq_b = nn.Linear(config.hidden_size, config.index_n_heads * config.index_head_dim, bias=False, dtype=dtype)
         self.wk = nn.Linear(config.hidden_size, config.index_head_dim, bias=False, dtype=dtype)
         self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False, dtype=dtype)
-        self.k_norm = FP32LayerNorm(config.index_head_dim, eps=config.indexer_norm_eps, dtype=torch.float32)
-        self.ssmax = SSMax(config.index_n_heads, dtype) if config.indexer_ssmax_scaling else None
+        self.k_norm = FP32LayerNorm(config.index_head_dim, eps=_INDEXER_NORM_EPS, dtype=torch.float32)
+        self.ssmax = SSMax(config.index_n_heads, dtype)
         self.requires_grad_(False)
 
     @torch.no_grad()
@@ -156,8 +156,7 @@ class MistralLarge4Indexer(nn.Module):
         c = self.config
         q = self.wq_b(self.q_input_norm(x)).unflatten(-1, (c.index_n_heads, c.index_head_dim))
         k = self.k_norm(self.wk(x))
-        if self.ssmax is not None:
-            q = self.ssmax(q, (layout.positions.float() + 1).log())
+        q = self.ssmax(q, (layout.positions.float() + 1).log())
         if self.use_rope:
             d = c.qk_rope_head_dim
             q = torch.cat((apply_interleaved_rope(q[..., :d], tables), q[..., d:]), -1)
@@ -215,7 +214,7 @@ class MistralLarge4Attention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * config.v_head_dim, config.hidden_size, bias=False, dtype=dtype
         )
-        self.ssmax = SSMax(config.num_attention_heads, dtype) if config.ssmax_scaling else None
+        self.ssmax = SSMax(config.num_attention_heads, dtype)
         self.indexer = (
             MistralLarge4Indexer(config, layer_idx=layer_idx, dtype=dtype)
             if config.index_sharing[layer_idx] == "full"
@@ -262,8 +261,7 @@ class MistralLarge4Attention(nn.Module):
             )
         if self.use_rope:
             q = torch.cat((q[..., : self.nope_dim], apply_interleaved_rope(q[..., self.nope_dim :], tables)), -1)
-        if self.ssmax is not None:
-            q = self.ssmax(q, (layout.positions.float() + 1).log())
+        q = self.ssmax(q, (layout.positions.float() + 1).log())
         if self.indexer is not None:
             indices = self.indexer(x, tables, layout)
         if indices is None:

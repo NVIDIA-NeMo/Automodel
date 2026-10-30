@@ -45,8 +45,6 @@ def tiny_config(**overrides: ConfigValue | torch.dtype) -> MistralLarge4Config:
         n_routed_experts=3,
         num_experts_per_tok=2,
         moe_intermediate_size=12,
-        fp8_indexer=False,
-        fp8_kv_cache=False,
         dtype="float32",
         nope_layer_flags=[False, False, False, True],
         kv_source_layers=[0, 1, 2, 3],
@@ -128,7 +126,7 @@ def rotate(
         frequency = torch.tensor(frequencies, device=x.device, dtype=torch.float32)
         if alpha is not None:
             frequency = frequency * alpha.exp()
-    elif frequency_mode == "float32":
+    else:
         # Match documented FP32 frequency rounding before BF16 rotations. At
         # large positions a one-ULP frequency change crosses BF16 rounding bins
         # and can strongly perturb a cancellation-sensitive LeRoPE gradient.
@@ -137,8 +135,6 @@ def rotate(
         wavelength = torch.pow(c.rope_theta, 2 * channel / d)
         scale = 1.0 if alpha is None else alpha.exp()
         frequency = (1 / (c.yarn_factor * wavelength) * scale) * ramp + (1 / wavelength * scale) * (1 - ramp)
-    else:
-        raise ValueError(f"Unknown frequency precision: {frequency_mode}")
     phase = positions.float()[:, None] * frequency
     multiplier = torch.polar(torch.ones_like(phase), phase)
     if x.ndim == 3:
@@ -154,7 +150,7 @@ def reference_logits(
     positions: torch.Tensor | None = None,
     *,
     inputs_embeds: torch.Tensor | None = None,
-    expert_batching: Literal["token", "matrix", "grouped"] = "token",
+    expert_batching: Literal["token", "grouped"] = "token",
 ) -> torch.Tensor:
     """One-document oracle with released names and explicit sparse attention.
 
@@ -165,19 +161,14 @@ def reference_logits(
         c: Architecture configuration.
         positions: Optional integer [tokens] document positions.
         inputs_embeds: Optional floating [tokens, hidden] fused image/text embeddings.
-        expert_batching: Token-wise selected-expert evaluation, or one matrix
-            contraction per expert followed by selected-output gathering. Matrix
-            batching matches BF16 GEMM gradient accumulation before the final
-            weight-gradient cast; token batching rounds each contribution first.
-            Grouped batching concatenates gate/up weights and selects tokens
-            before each expert GEMM, matching shared MoE BF16 accumulation.
-            All three independently implement the same FP32 equations.
+        expert_batching: Token-wise selected-expert evaluation, which rounds each
+            contribution, or grouped batching, which concatenates gate/up weights and
+            selects tokens before each expert GEMM, matching shared MoE BF16
+            accumulation. Both independently implement the same FP32 equations.
 
     Returns:
         Capped FP32 logits [tokens, vocab], preserving a differentiable graph.
     """
-    if expert_batching not in ("token", "matrix", "grouped"):
-        raise ValueError(f"Unknown reference expert batching: {expert_batching}")
     n = ids.numel()
     positions = torch.arange(n) if positions is None else positions
     alpha = state.get("lerope.alpha")
@@ -204,16 +195,15 @@ def reference_logits(
             q = torch.cat(
                 (q[..., :nope], rotate(q[..., nope:], positions, alpha, c, frequency_mode=frequency_mode)), -1
             )
-        if c.ssmax_scaling:
-            q = (
-                q
-                * (
-                    (
-                        (positions.float() + 1).log().to(q.dtype)[:, None] * state[a + "ssmax_scaling.s"]
-                        + state[a + "ssmax_scaling.b"]
-                    )[..., None]
-                )
+        q = (
+            q
+            * (
+                (
+                    (positions.float() + 1).log().to(q.dtype)[:, None] * state[a + "ssmax_scaling.s"]
+                    + state[a + "ssmax_scaling.b"]
+                )[..., None]
             )
+        )
         if c.index_sharing[layer] == "full":
             with torch.no_grad():
                 ip = a + "indexer."
@@ -222,7 +212,7 @@ def reference_logits(
                     (c.hidden_size,),
                     state[ip + "q_input_norm.weight"],
                     state[ip + "q_input_norm.bias"],
-                    c.indexer_norm_eps,
+                    1e-6,
                 )
                 iq = F.linear(iq, state[ip + "wq_b.weight"]).reshape(n, c.index_n_heads, c.index_head_dim)
                 ik = F.linear(y, state[ip + "wk.weight"])
@@ -231,21 +221,20 @@ def reference_logits(
                     (c.index_head_dim,),
                     state[ip + "k_norm.weight"].float(),
                     state[ip + "k_norm.bias"].float(),
-                    c.indexer_norm_eps,
+                    1e-6,
                 ).to(y.dtype)
                 iw = F.linear(y, state[ip + "weights_proj.weight"]).float() / math.sqrt(
                     c.index_head_dim * c.index_n_heads
                 )
-                if c.indexer_ssmax_scaling:
-                    iq = (
-                        iq
-                        * (
-                            (
-                                (positions.float() + 1).log().to(iq.dtype)[:, None] * state[ip + "ssmax_scaling.s"]
-                                + state[ip + "ssmax_scaling.b"]
-                            )[..., None]
-                        )
+                iq = (
+                    iq
+                    * (
+                        (
+                            (positions.float() + 1).log().to(iq.dtype)[:, None] * state[ip + "ssmax_scaling.s"]
+                            + state[ip + "ssmax_scaling.b"]
+                        )[..., None]
                     )
+                )
                 if not c.indexer_nope_layer_flags[layer]:
                     d = c.qk_rope_head_dim
                     iq = torch.cat(
@@ -293,7 +282,7 @@ def reference_logits(
                 state[prefix + "w2.weight"],
             )
 
-        if layer < c.first_k_dense_replace or layer % c.moe_layer_freq:
+        if layer < c.first_k_dense_replace:
             x = x + mlp(y, p + "feed_forward.")
         else:
             scores = F.linear(y.float(), state[p + "gate.weight"].float()).softmax(-1)
@@ -314,14 +303,6 @@ def reference_logits(
                         0, rows * c.num_experts_per_tok + choices, output.float() * weights[rows, choices, None]
                     )
                 update = slots.view(n, c.num_experts_per_tok, -1).sum(1).to(y.dtype)
-            elif expert_batching == "matrix":
-                # Select outputs after independent expert contractions. Gathering
-                # inputs first changes the BF16 input-gradient accumulation tree.
-                expert_outputs = torch.stack(
-                    [mlp(y, p + f"experts.{expert}.").float() for expert in range(c.n_routed_experts)]
-                )
-                selected_outputs = expert_outputs[experts, torch.arange(n, device=y.device)[:, None]]
-                update = (selected_outputs * weights[..., None]).sum(1).to(y.dtype)
             else:
                 routed = []
                 for t in range(n):

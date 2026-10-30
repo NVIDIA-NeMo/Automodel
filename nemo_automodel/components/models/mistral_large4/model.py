@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Mistral Large 4 floating text baseline for single-device correctness and training."""
+"""Mistral Large 4 text model with expert, pipeline and context parallelism."""
 
 from dataclasses import dataclass, replace
-from typing import Any
 
 import torch
 from torch import nn
@@ -24,7 +23,10 @@ from torch.nn import functional as F
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_contiguous
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    shard_sequence_for_cp_contiguous,
+)
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
@@ -42,6 +44,7 @@ from nemo_automodel.components.models.mistral_large4.attention import (
 )
 from nemo_automodel.components.models.mistral_large4.config import MistralLarge4Config
 from nemo_automodel.components.models.mistral_large4.context_parallel import (
+    CPBatch,
     gather_tokens,
     prepare_cp_inputs,
     shifted_cp_loss,
@@ -330,7 +333,7 @@ class MistralLarge4Block(nn.Module):
         self.post_attention_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
-        is_moe = layer_idx >= config.first_k_dense_replace and layer_idx % config.moe_layer_freq == 0
+        is_moe = layer_idx >= config.first_k_dense_replace
         self.moe_config = (
             MoEConfig(
                 n_routed_experts=config.n_routed_experts,
@@ -454,9 +457,11 @@ class MistralLarge4Model(nn.Module):
 
 
 class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
-    """Floating text training baseline; source FP8 weights are reconstructed on load.
+    """Text model; source FP8 weights are reconstructed on load.
 
-    Serving activation/cache quantization, vision and DSpark are not enabled. DSA parameters remain frozen pending a training specification.
+    Training runs in floating point: serving FP8 indexer/KV-cache execution and
+    DSpark drafting are not implemented. DSA parameters remain frozen pending a
+    training specification.
     """
 
     parallelizer = MistralLarge4Parallelizer()
@@ -466,7 +471,6 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
     config_class = MistralLarge4Config
     base_model_prefix = "model"
     _supports_sdpa = True
-    _supports_cp_sdpa = True
     _owns_cp_attention = True  # Both supported backends own their CP KV transport.
     supports_thd = True
     _packed_cp_attn_backends = ("tilelang",)
@@ -476,7 +480,7 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
 
     @dataclass(frozen=True)
     class ModelCapabilities:
-        """Contiguous SDPA CP supports BSHD and THD; EP requires FSDP2."""
+        """SDPA and TileLang CP support BSHD; packed THD CP requires TileLang."""
 
         supports_tp: bool = False
         supports_cp: bool = True
@@ -488,10 +492,6 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
         reject_unsupported_tie_word_embeddings(type(self), config)
         config.validate_architecture()
         super().__init__(config)
-        if config.fp8_indexer or config.fp8_kv_cache:
-            raise ValueError(
-                "Floating training baseline requires fp8_indexer=False and fp8_kv_cache=False; serving FP8 activation/cache parity is not enabled"
-            )
         self.backend = backend or BackendConfig(
             attn="sdpa",
             linear="torch",
@@ -568,7 +568,7 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
                 nn.init.ones_(module.weight)
                 if isinstance(module, nn.LayerNorm) and module.bias is not None:
                     nn.init.zeros_(module.bias)
-            elif isinstance(module, MistralLarge4Rotary) and module.alpha is not None:
+            elif isinstance(module, MistralLarge4Rotary):
                 nn.init.zeros_(module.alpha)
             elif isinstance(module, SSMax):
                 nn.init.zeros_(module.s)
@@ -576,7 +576,7 @@ class MistralLarge4ForCausalLM(MistralLarge4PipelineMixin, HFCheckpointingMixin,
         if dtype is not None:
             cast_model_to_dtype(self, dtype, skip_modules=("rotary_emb", "k_norm", "gate"))
 
-    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
+    def prepare_model_inputs_for_cp(self, batch: CPBatch, *, num_chunks: int = 1) -> dict[str, ContextParallelSharder]:
         """Prepare CP-local targets and positions with the model-owned sharder.
 
         Args:

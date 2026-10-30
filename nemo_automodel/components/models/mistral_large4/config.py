@@ -53,8 +53,6 @@ class MistralLarge4Config(PretrainedConfig):
         yarn_original_max_position_embeddings: int = 512,
         yarn_beta_fast: float = 32.0,
         yarn_beta_slow: float = 1.0,
-        lerope: bool = True,
-        ssmax_scaling: bool = True,
         final_logit_softcapping: float = 30.0,
         nope_layer_flags: list[bool] | None = None,
         kv_source_layers: list[int] | None = None,
@@ -63,12 +61,7 @@ class MistralLarge4Config(PretrainedConfig):
         index_topk: int = 2048,
         index_n_heads: int = 32,
         index_head_dim: int = 128,
-        indexer_norm_eps: float = 1e-6,
-        indexer_ssmax_scaling: bool = True,
-        fp8_indexer: bool = True,
-        fp8_kv_cache: bool = True,
         first_k_dense_replace: int = 1,
-        moe_layer_freq: int = 1,
         n_routed_experts: int = 128,
         n_shared_experts: int = 1,
         num_experts_per_tok: int = 4,
@@ -109,8 +102,6 @@ class MistralLarge4Config(PretrainedConfig):
         self.yarn_original_max_position_embeddings = yarn_original_max_position_embeddings
         self.yarn_beta_fast = yarn_beta_fast
         self.yarn_beta_slow = yarn_beta_slow
-        self.lerope = lerope
-        self.ssmax_scaling = ssmax_scaling
         self.final_logit_softcapping = final_logit_softcapping
         self.nope_layer_flags = (
             list(nope_layer_flags) if nope_layer_flags is not None else [i % 4 == 3 for i in range(num_hidden_layers)]
@@ -131,12 +122,7 @@ class MistralLarge4Config(PretrainedConfig):
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
-        self.indexer_norm_eps = indexer_norm_eps
-        self.indexer_ssmax_scaling = indexer_ssmax_scaling
-        self.fp8_indexer = fp8_indexer
-        self.fp8_kv_cache = fp8_kv_cache
         self.first_k_dense_replace = first_k_dense_replace
-        self.moe_layer_freq = moe_layer_freq
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -165,11 +151,10 @@ class MistralLarge4Config(PretrainedConfig):
                 self.index_topk,
                 self.index_n_heads,
                 self.kv_lora_rank,
-                self.moe_layer_freq,
             )
             <= 0
         ):
-            raise ValueError("Model dimensions, depth, MoE frequency and index_topk must be positive")
+            raise ValueError("Model dimensions, depth and index_topk must be positive")
         if self.qk_rope_head_dim <= 0 or self.qk_rope_head_dim % 2 or self.index_head_dim < self.qk_rope_head_dim:
             raise ValueError("RoPE dimensions must be positive, even and fit the indexer head")
         if not self.norm_topk_prob or self.n_shared_experts < 0 or self.first_k_dense_replace < 0:
@@ -302,7 +287,6 @@ def _config_from_hf(config: dict[str, ConfigValue]) -> dict[str, ConfigValue]:
     if vision:
         settings = {name: vision[name] for name in _VISION_FIELDS if name in vision}
         settings.update(
-            max_image_size=vision["image_size"],
             rope_theta=_section(vision, "rope_parameters")["rope_theta"],
             spatial_merge_size=config["spatial_merge_size"],
             adapter_bias=config.get("multimodal_projector_bias", False),

@@ -16,7 +16,7 @@
 
 import contextlib
 from collections.abc import Callable
-from typing import Any
+from typing import TypeAlias
 
 import torch
 import torch.distributed as dist
@@ -31,6 +31,9 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_contiguous,
 )
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
+
+# Recipe batch entries: token tensors, complete-image lists and the packed-format tag.
+CPBatch: TypeAlias = dict[str, torch.Tensor | list[torch.Tensor] | str | None]
 
 
 def gather_tokens(value: torch.Tensor, mesh: DeviceMesh | None, *, differentiable: bool) -> torch.Tensor:
@@ -48,7 +51,9 @@ def gather_tokens(value: torch.Tensor, mesh: DeviceMesh | None, *, differentiabl
     return torch.cat(pieces, dim=0)
 
 
-def prepare_cp_inputs(batch: dict[str, Any], *, num_chunks: int = 1, shard_primary: bool = True) -> dict[str, Any]:
+def prepare_cp_inputs(
+    batch: CPBatch, *, num_chunks: int = 1, shard_primary: bool = True
+) -> dict[str, ContextParallelSharder]:
     """Prepare contiguous CP shards with positions computed before partitioning.
 
     Args:
@@ -75,11 +80,11 @@ def prepare_cp_inputs(batch: dict[str, Any], *, num_chunks: int = 1, shard_prima
     def shard(
         cp_mesh: DeviceMesh,
         tp_mesh: DeviceMesh | None,
-        local_batch: dict[str, Any],
+        local_batch: CPBatch,
         *,
         loss_mask: torch.Tensor | None = None,
         padding_token_id: int = 0,
-    ) -> tuple[Callable, dict[str, Any], ShardLayout]:
+    ) -> tuple[Callable, CPBatch, ShardLayout]:
         """Apply the shared contiguous layout without consuming PP media.
 
         Args:
@@ -159,7 +164,7 @@ def shifted_cp_loss(logits: torch.Tensor, labels: torch.Tensor, valid: torch.Ten
 
 
 def prepare_packed_cp_inputs(
-    batch: dict[str, Any], *, num_chunks: int, shard_primary: bool
+    batch: CPBatch, *, num_chunks: int, shard_primary: bool
 ) -> dict[str, ContextParallelSharder]:
     """Preserve packed documents while preparing contiguous model-owned CP.
 
@@ -183,11 +188,11 @@ def prepare_packed_cp_inputs(
     def shard(
         cp_mesh: DeviceMesh | None,
         tp_mesh: DeviceMesh | None,
-        local_batch: dict[str, Any],
+        local_batch: CPBatch,
         *,
         loss_mask: torch.Tensor | None = None,
         padding_token_id: int = 0,
-    ) -> tuple[Callable[[], contextlib.AbstractContextManager], dict[str, Any], ShardLayout]:
+    ) -> tuple[Callable[[], contextlib.AbstractContextManager], CPBatch, ShardLayout]:
         """Convert global THD metadata then shard all token-aligned fields.
 
         Args:

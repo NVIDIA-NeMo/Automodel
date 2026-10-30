@@ -42,7 +42,6 @@ def make_multimodal(*, seed=201, dtype=torch.float32):
         num_attention_heads=2,
         patch_size=2,
         image_size=16,
-        max_image_size=16,
     )
     config = tiny_config(
         vision_config=asdict(vision),

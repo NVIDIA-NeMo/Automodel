@@ -29,9 +29,7 @@ class MistralLarge4Rotary(nn.Module):
     def __init__(self, config: MistralLarge4Config) -> None:
         super().__init__()
         self.config = config
-        self.alpha = (
-            nn.Parameter(torch.zeros(config.qk_rope_head_dim // 2, dtype=torch.float32)) if config.lerope else None
-        )
+        self.alpha = nn.Parameter(torch.zeros(config.qk_rope_head_dim // 2, dtype=torch.float32))
 
     def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Build differentiable interleaved YaRN tables.
@@ -61,11 +59,9 @@ class MistralLarge4Rotary(nn.Module):
             (torch.arange(dim // 2, device=positions.device, dtype=torch.float32) - low)
             / (high - low if high != low else 0.001)
         ).clamp(0, 1)
-        extrapolated = 1.0 / pos_freq
-        interpolated = 1.0 / (c.yarn_factor * pos_freq)
-        if c.lerope:
-            extrapolated = extrapolated * self.alpha.float().exp()
-            interpolated = interpolated * self.alpha.float().exp()
+        scale = self.alpha.float().exp()
+        extrapolated = scale / pos_freq
+        interpolated = scale / (c.yarn_factor * pos_freq)
         freq = interpolated * ramp + extrapolated * (1 - ramp)
         angles = positions.float()[:, None] * freq[None, :]
         return angles.cos(), angles.sin()

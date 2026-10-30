@@ -41,7 +41,6 @@ def make_pipeline_model(*, dtype: torch.dtype = torch.float32, multimodal: bool 
         num_attention_heads=2,
         patch_size=2,
         image_size=16,
-        max_image_size=16,
     )
     config = tiny_config(
         dtype=dtype,

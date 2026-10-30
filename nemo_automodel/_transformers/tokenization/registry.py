@@ -113,9 +113,7 @@ def _register_default_tokenizers():
     TokenizerRegistry.register("mistral", mistral_common)
     TokenizerRegistry.register("pixtral", mistral_common)
     TokenizerRegistry.register("mistral3", mistral_common)
-    TokenizerRegistry.register(
-        "mistral_large4", "nemo_automodel._transformers.tokenization.tokenization_mistral_common:MistralCommonBackend"
-    )
+    TokenizerRegistry.register("mistral_large4", mistral_common)
     TokenizerRegistry.register("ministral3", mistral_common)
     TokenizerRegistry.register(
         "kimi_k3",

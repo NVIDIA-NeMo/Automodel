@@ -256,9 +256,9 @@ def test_grouped_lora_zero_update_preserves_activation_and_logits():
     ids = torch.tensor([[1, 5, 7, 2, 8]])
     expected = model(ids).logits.detach()
     activations = {
-        name: module.expert_activation_grouped
-        for name, module in model.named_modules()
-        if hasattr(module, "expert_activation_grouped")
+        f"model.layers.{index}.mlp.experts": layer.mlp.experts.expert_activation_grouped
+        for index, layer in enumerate(model.model.layers)
+        if layer.moe_config is not None
     }
     count = apply_lora_to_linear_modules(
         model,
@@ -453,13 +453,9 @@ def test_load_part_count_reduction_uses_process_group_device(monkeypatch, backen
     assert devices == [expected]
 
 
-def _released_config() -> dict:
-    # Released Transformers config.json; it contains no weights or tokenizer.
-    return json.loads((Path(__file__).parent / "config.json").read_text())
-
-
 def test_released_config_maps_to_native_fields(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps(_released_config()))
+    # Released Transformers config.json; it contains no weights or tokenizer.
+    (tmp_path / "config.json").write_text((Path(__file__).parent / "config.json").read_text())
     config = AutoConfig.from_pretrained(tmp_path, local_files_only=True)
     assert isinstance(config, MistralLarge4Config)
     assert config.architectures == ["MistralLarge4ForConditionalGeneration"]
@@ -489,7 +485,7 @@ def test_released_config_maps_to_native_fields(tmp_path):
     ],
 )
 def test_released_config_rejects_unsupported_variants(section, changes):
-    config = _released_config()
+    config = json.loads((Path(__file__).parent / "config.json").read_text())
     config[section].update(changes)
     with pytest.raises(ValueError):
         MistralLarge4Config.from_dict(config)

@@ -56,8 +56,7 @@ def test_forward_backward_update_against_independent_oracle() -> None:
     ids = torch.tensor([1, 5, 7, 2, 9, 3, 8])
     expected = reference_logits(oracle, ids, model.config)
     actual = model(ids[None]).logits[0]
-    # FP32 permits only floating reduction-order differences. BF16 backward
-    # accumulation against this token-wise oracle is a separately reported gate.
+    # FP32 permits only floating reduction-order differences.
     atol, rtol = 2e-6, 2e-5
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
     upstream = torch.randn_like(actual)
@@ -206,8 +205,6 @@ def test_softcap_all_positions_tail_and_empty_supervision() -> None:
 
 
 def test_reject_unsupported_training_paths() -> None:
-    with pytest.raises(ValueError, match="fp8_indexer=False"):
-        MistralLarge4ForCausalLM(tiny_config(fp8_indexer=True))
     model = make_model()
     ids = torch.tensor([[1, 2, 3]])
     with pytest.raises(ValueError, match="without a KV cache"):
@@ -297,25 +294,6 @@ class TensorError:
         return math.sqrt(self.reference_squared_norm / self.elements)
 
 
-@dataclass(frozen=True)
-class BF16Comparison:
-    """Numerical evidence for one independently initialized comparison."""
-
-    seed: int
-    tokens: int
-    layers: int
-    objective: str
-    fp32_master: bool
-    logits: TensorError
-    gradients: tuple[TensorError, ...]
-    updates: tuple[TensorError, ...]
-    loss_absolute_error: float
-    global_gradient_relative_l2: float
-    global_update_relative_l2: float
-    strict_fp32_gradient_failures: int
-    frozen_parameters: int
-
-
 def tensor_error(name: str, actual: torch.Tensor, expected: torch.Tensor) -> TensorError:
     """Compare a corresponding logit, gradient, or update tensor.
 
@@ -353,9 +331,7 @@ def compare_bf16_gradients(
     tokens: int,
     objective: Literal["random", "ce"],
     fp32_master: bool,
-    device: torch.device,
-    layers: int = 4,
-) -> BF16Comparison:
+) -> None:
     """Check BF16 compute against independent equations and SGD updates.
 
     Constructs identical independent parameters. The master mode differentiates
@@ -363,10 +339,7 @@ def compare_bf16_gradients(
     model's FP32 router/LeRoPE/indexer-norm policy. This is a single-device
     numerical check, not a substitute for distributed precision/lifecycle tests.
     """
-    overrides = {}
-    if layers != 4:
-        overrides = dict(num_hidden_layers=layers, nope_layer_flags=None, kv_source_layers=None, index_sharing=None)
-    model = make_model(dtype=torch.bfloat16, seed=seed, **overrides).to(device=device)
+    model = make_model(dtype=torch.bfloat16, seed=seed)
     native = dict(model.named_parameters())
     parameters = (
         {
@@ -383,12 +356,10 @@ def compare_bf16_gradients(
         assert torch.equal(value, reference[name]), name
         assert value.untyped_storage().data_ptr() != reference[name].untyped_storage().data_ptr(), name
     generator = torch.Generator().manual_seed(seed + 10000)
-    ids = torch.randint(model.config.vocab_size, (tokens,), generator=generator).to(device)
-    # Repeated IDs exercise embedding reduction; large positions exercise LeRoPE.
+    ids = torch.randint(model.config.vocab_size, (tokens,), generator=generator)
+    # Repeated IDs exercise embedding reduction.
     ids[-1] = ids[0]
-    positions = (
-        (torch.arange(tokens, device=device) * 293 + 2047) if layers > 4 else torch.arange(tokens, device=device)
-    )
+    positions = torch.arange(tokens)
     if fp32_master:
         cast = {name: value.to(native[name].dtype) for name, value in parameters.items()}
         actual = torch.func.functional_call(model, cast, (ids[None],), {"position_ids": positions[None]}).logits[0]
@@ -399,7 +370,7 @@ def compare_bf16_gradients(
     logits_error = tensor_error("logits", actual, expected)
     assert_bf16_error(logits_error, absolute=2e-6)
     if objective == "random":
-        upstream = torch.randn(actual.shape, generator=generator, dtype=torch.float32).to(device)
+        upstream = torch.randn(actual.shape, generator=generator, dtype=torch.float32)
         actual_loss, reference_loss = (actual * upstream).sum(), (expected * upstream).sum()
     else:
         actual_loss = F.cross_entropy(actual[:-1], ids[1:])
@@ -407,12 +378,11 @@ def compare_bf16_gradients(
     actual_loss.backward()
     reference_loss.backward()
     gradients = model.state_dict_adapter.to_hf({n: p.grad for n, p in parameters.items() if p.grad is not None})
-    errors, frozen, strict_failures = [], 0, 0
+    errors = []
     for name, value in source.items():
         other = reference[name]
         if not value.requires_grad:
             assert name not in gradients and other.grad is None, name
-            frozen += 1
             continue
         assert name in gradients, name
         # The selected-expert oracle can omit an unused expert completely.
@@ -420,9 +390,6 @@ def compare_bf16_gradients(
         error = tensor_error(name, gradients[name], reference_gradient)
         assert_bf16_error(error)
         errors.append(error)
-        strict_failures += not torch.allclose(
-            gradients[name].float(), reference_gradient.float(), atol=1.6e-5, rtol=4e-5
-        )
     global_relative = math.sqrt(
         sum(e.squared_error for e in errors) / max(sum(e.reference_squared_norm for e in errors), 1e-30)
     )
@@ -449,21 +416,6 @@ def compare_bf16_gradients(
         sum(e.squared_error for e in updates) / max(sum(e.reference_squared_norm for e in updates), 1e-30)
     )
     assert update_relative <= 0.005, update_relative
-    return BF16Comparison(
-        seed,
-        tokens,
-        layers,
-        objective,
-        fp32_master,
-        logits_error,
-        tuple(errors),
-        updates,
-        abs(actual_loss.item() - reference_loss.item()),
-        global_relative,
-        update_relative,
-        strict_failures,
-        frozen,
-    )
 
 
 @pytest.mark.parametrize("seed,tokens", [(101, 7), (211, 17), (307, 31)])
@@ -471,9 +423,7 @@ def compare_bf16_gradients(
 def test_bf16_held_out_gradients_and_master_updates(
     seed: int, tokens: int, objective: Literal["random", "ce"], fp32_master: bool
 ) -> None:
-    compare_bf16_gradients(
-        seed=seed, tokens=tokens, objective=objective, fp32_master=fp32_master, device=torch.device("cpu")
-    )
+    compare_bf16_gradients(seed=seed, tokens=tokens, objective=objective, fp32_master=fp32_master)
 
 
 def test_layer_discovery_uses_decoder_stack_when_experts_outnumber_layers() -> None:
@@ -481,18 +431,3 @@ def test_layer_discovery_uses_decoder_stack_when_experts_outnumber_layers() -> N
         model = MistralLarge4ForCausalLM(tiny_config(n_routed_experts=128))
     assert get_model_layer_groups(model) == {"language": list(model.model.layers)}
     assert model.model.layers[1].mlp.experts.gate_and_up_projs.shape[0] == 128
-
-
-def test_unsharded_thd_selects_model_owned_batch_preparation() -> None:
-    with torch.device("meta"):
-        model = MistralLarge4ForCausalLM(tiny_config())
-    assert "cp_sharder" in model.prepare_model_inputs_for_cp({"qkv_format": "thd"})
-
-
-def test_cp_rejects_invalid_format_and_chunk_layouts() -> None:
-    from nemo_automodel.components.models.mistral_large4.context_parallel import prepare_cp_inputs
-
-    with pytest.raises(ValueError, match="BSHD"):
-        prepare_cp_inputs({"qkv_format": "unsupported"})
-    with pytest.raises(ValueError, match="num_chunks >= 1"):
-        prepare_cp_inputs({}, num_chunks=0)

@@ -16,17 +16,19 @@
 
 import copy
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.context_parallel.sharder import shard_sequence_for_cp_contiguous
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    shard_sequence_for_cp_contiguous,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import Float32RMSNorm
 from nemo_automodel.components.models.mistral_large4.config import MistralLarge4Config
-from nemo_automodel.components.models.mistral_large4.context_parallel import prepare_cp_inputs
+from nemo_automodel.components.models.mistral_large4.context_parallel import CPBatch, prepare_cp_inputs
 from nemo_automodel.components.models.mistral_large4.model import MistralLarge4ForCausalLM
 from nemo_automodel.components.models.mistral_large4.vision import (
     MistralLarge4PatchMerger,
@@ -184,7 +186,7 @@ class MistralLarge4ForConditionalGeneration(MistralLarge4ForCausalLM):
         self.patch_merger = MistralLarge4PatchMerger(self.vision_settings, dtype=dtype)
         self.vision_language_adapter = MistralLarge4VisionAdapter(self.vision_settings, config.hidden_size, dtype=dtype)
 
-    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
+    def prepare_model_inputs_for_cp(self, batch: CPBatch, *, num_chunks: int = 1) -> dict[str, ContextParallelSharder]:
         """Keep complete image/token streams until stage-zero embedding.
 
         Args:

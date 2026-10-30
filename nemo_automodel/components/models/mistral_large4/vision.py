@@ -39,11 +39,8 @@ class MistralLarge4VisionConfig:
     num_channels: int = 3
     patch_size: int = 14
     image_size: int = 1540
-    max_image_size: int = 1540
     rope_theta: float = 10000.0
     spatial_merge_size: int = 2
-    mm_projector_id: str = "patch_merge"
-    add_pre_mm_projector_layer_norm: bool = True
     adapter_bias: bool = False
     image_token_id: int = 10
     image_break_token_id: int = 12
@@ -58,17 +55,16 @@ class MistralLarge4VisionConfig:
             self.num_channels,
             self.patch_size,
             self.image_size,
-            self.max_image_size,
             self.spatial_merge_size,
         )
         if min(dimensions) <= 0 or self.hidden_size % self.num_attention_heads:
             raise ValueError("Pixtral dimensions must be positive and heads must divide hidden_size")
         if (self.hidden_size // self.num_attention_heads) % 4 or self.rope_theta <= 0:
             raise ValueError("Pixtral axial RoPE requires head_dim divisible by four and positive rope_theta")
-        if self.mm_projector_id != "patch_merge" or not self.add_pre_mm_projector_layer_norm or self.adapter_bias:
-            raise ValueError("Large 4 requires patch_merge, pre-projector RMSNorm and bias-free adapters")
-        if self.image_size != self.max_image_size or self.image_size % (self.patch_size * self.spatial_merge_size):
-            raise ValueError("Image limits must agree and be divisible by patch_size * spatial_merge_size")
+        if self.adapter_bias:
+            raise ValueError("Large 4 requires bias-free vision adapters")
+        if self.image_size % (self.patch_size * self.spatial_merge_size):
+            raise ValueError("image_size must be divisible by patch_size * spatial_merge_size")
         if (
             min(self.image_token_id, self.image_break_token_id, self.image_end_token_id) < 0
             or len({self.image_token_id, self.image_break_token_id, self.image_end_token_id}) != 3
@@ -93,8 +89,8 @@ class MistralLarge4VisionConfig:
         if pixels.ndim != 3 or pixels.shape[0] != self.num_channels or not pixels.is_floating_point():
             raise ValueError("pixel_values entries must be floating [channels, height, width] images")
         height, width = pixels.shape[-2:]
-        if min(height, width) <= 0 or max(height, width) > self.max_image_size or height % unit or width % unit:
-            raise ValueError("Image dimensions must fit max_image_size and contain complete merged patches")
+        if min(height, width) <= 0 or max(height, width) > self.image_size or height % unit or width % unit:
+            raise ValueError("Image dimensions must fit image_size and contain complete merged patches")
         return height // unit, width // unit
 
 

@@ -440,3 +440,16 @@ def test_sparse_absorption_rejects_active_kvb_lora_dropout(monkeypatch: pytest.M
     monkeypatch.setattr(attention, "sparse_mla", dense_latent_oracle)
     with pytest.raises(RuntimeError, match="active LoRA training dropout"):
         model(torch.tensor([[1, 2, 3]]))
+
+
+def test_unsharded_thd_selects_model_owned_batch_preparation() -> None:
+    with torch.device("meta"):
+        model = MistralLarge4ForCausalLM(tiny_config())
+    assert "cp_sharder" in model.prepare_model_inputs_for_cp({"qkv_format": "thd"})
+
+
+def test_cp_rejects_invalid_format_and_chunk_layouts() -> None:
+    with pytest.raises(ValueError, match="BSHD"):
+        prepare_cp_inputs({"qkv_format": "unsupported"})
+    with pytest.raises(ValueError, match="num_chunks >= 1"):
+        prepare_cp_inputs({}, num_chunks=0)

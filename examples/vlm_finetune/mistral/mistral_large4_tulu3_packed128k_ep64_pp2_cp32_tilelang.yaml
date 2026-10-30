@@ -43,11 +43,8 @@ model:
     rope_fusion: false
     experts: torch_mm
     dispatcher: hybridep
-    gate_precision: float32
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: false
-  fp8_indexer: false
-  fp8_kv_cache: false
 distributed:
   strategy: fsdp2
   dp_size: none
