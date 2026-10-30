@@ -715,6 +715,13 @@ navigation:
             contents:
               - page: "BAGEL-7B-MoT"
                 path: ../../model-coverage/multimodal/bytedance-seed/bagel.mdx
+          - section: "LiquidAI"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRjgCAABXRUJQVlA4TCwCAAAvE8AEEAfkppEkScrlD/a8+avSOg6M27aRpO2/2P3NbYtx2zaStP0Xu7+5bbmqbVtV5rm4BuAbQtC/gnsH93sSSCCBVAEJJJBAAi0ggAIEEEAf2AAVeAF/4AwkkMABWAB/4An8kgCa3/fNgRkwBbrABCgqoKqAokpS1QBC1TbPOdF2rF5UbSWx9041qlAqFZD33mhrjCGJJFR7b0m897SVhCqJtlSq9x5VEm2996jee9pSpbXmpNa2JQkVUNuGmmpRjTHceyWx1vL7f0kksdZy76VK4pxjrUWtqralrSTaakvVVlvvPfdeSaj+k4BEbdsLPXrbNG3e37aS2rbX7Nrs2qg10/lOvTqGiP4TCFCEA3ohImGJ5jJ1reuZXFTCIiKhsBSSJK9eIZksSDgkoYhkyUZH/8b/nvYGmZXImWnVyUfAE3YqfVopURtrR+8e+rvjgTWaRYkmjKLj5zdvgXU6KpOI5nm6S9i+seVj9bTMp4wKbN9vDw8ewv/VawNlUjEax2fwNgd6//l4SmcYa6ENJvc8rJE34e1OBJatJ/ADjr91Whd8OcY6T4jRXMEhLrPTcdk7wC3DWNqor/4Rpp21dgr4/lqZap7qOg5xja6Lc+/u3B9WzEdrRn2E92e2kyNr7/9+6ja1qBSpZ/aPgNtLG4A/plmUM9+/BF7d28MOHusLhAQ/n78Ampp/kJWTnbosJ12wsri4MD+ULJ+6PON8MJeJt7XFM7lBCYsI"/></svg>'
+            slug: liquidai
+            path: ../../model-coverage/multimodal/liquidai/index.mdx
+            contents:
+              - page: "d1-3B"
+                path: ../../model-coverage/multimodal/liquidai/d1-3b.mdx
       - section: "Omni"
         slug: omni
         contents:
