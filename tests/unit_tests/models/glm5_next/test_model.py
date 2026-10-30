@@ -1,16 +1,22 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
 from nemo_automodel._transformers.capabilities import ModelSupports
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.models.glm5_next import layers as glm5_next_layers
 from nemo_automodel.components.models.glm5_next.cp import Glm5NextPackedContext
 from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextLinearAttention,
     Glm5NextSparseAttention,
 )
-from nemo_automodel.components.models.glm5_next.model import build_glm5_next_moe_config
+from nemo_automodel.components.models.glm5_next.model import (
+    Glm5NextForConditionalGeneration,
+    build_glm5_next_moe_config,
+)
 from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config, tiny_glm5_next_model
 
 
@@ -47,6 +53,30 @@ def _torch_sparse_latent_attention(
     return torch.stack(rows)
 
 
+def _packed_document_slice(
+    attention: Glm5NextSparseAttention,
+    hidden_states: torch.Tensor,
+    query_start: int,
+    query_end: int,
+) -> torch.Tensor:
+    """Exercise the production packed kernel path for one document interval.
+
+    Args:
+        attention: Sparse attention module using the cuDNN backend.
+        hidden_states: Full document states [1, document_tokens, hidden].
+        query_start: First document-local query position.
+        query_end: Exclusive final document-local query position.
+
+    Returns:
+        Attention output [1, query_end - query_start, hidden].
+    """
+    context = Glm5NextPackedContext(
+        doc_ids=torch.ones(hidden_states.shape[:2], dtype=torch.int32, device=hidden_states.device),
+        seq_start=query_start,
+    )
+    return attention._forward_packed_cudnn(hidden_states, context, query_end - query_start)
+
+
 def test_tiny_hybrid_packed_forward_backward_is_finite():
     torch.manual_seed(7)
     model = tiny_glm5_next_model().train()
@@ -60,6 +90,30 @@ def test_tiny_hybrid_packed_forward_backward_is_finite():
     assert torch.isfinite(logits).all()
     assert model.model.language_model.layers["0"].self_attn.q_proj.weight.grad is not None
     assert model.model.language_model.layers["3"].self_attn.q_a_proj.weight.grad is not None
+
+
+def test_checkpointer_initializes_checkpoint_free_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The native initializer must populate weights without a checkpoint load."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    torch.manual_seed(17)
+    model = Glm5NextForConditionalGeneration(tiny_glm5_next_config(), backend=tiny_backend())
+    # Poison storage so skipping initialization cannot pass due to allocator reuse.
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(float("nan"))
+
+    Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+    for name, parameter in model.named_parameters():
+        assert torch.isfinite(parameter).all(), name
+    gate = model.model.language_model.layers["3"].mlp.gate
+    assert gate.weight.std() > 0
+    logits = model(input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]])).logits
+    assert torch.isfinite(logits).all()
+    logits.square().mean().backward()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    assert gradients
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
 def test_torch_kda_decay_scales_the_key_dimension():
@@ -122,8 +176,12 @@ def test_sparse_indexer_prepares_document_pools_once_across_query_chunks():
     assert calls == 1
 
 
-def test_cudnn_sparse_attention_matches_sdpa_absorbed_math(monkeypatch):
-    """The cuDNN dispatch preserves GLM-5.3 forward and gradient math."""
+@pytest.mark.parametrize(
+    ("length", "query_start", "query_end"),
+    [(1, 0, 1), (6, 0, 6), (69, 0, 69), (69, 5, 64)],
+)
+def test_cudnn_sparse_attention_matches_sdpa_absorbed_math(monkeypatch, length, query_start, query_end):
+    """Check absorbed math, sparse tails and nonzero local query offsets."""
     torch.manual_seed(19)
     config = tiny_glm5_next_config().text_config
     config.kv_lora_rank = 512
@@ -138,20 +196,284 @@ def test_cudnn_sparse_attention_matches_sdpa_absorbed_math(monkeypatch):
     monkeypatch.setattr(glm5_next_layers, "is_cudnn_sparse_attention_available", lambda: True)
     monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", _torch_sparse_latent_attention)
 
-    sdpa_input = torch.randn(1, 6, config.hidden_size, requires_grad=True)
+    cudnn.indexer_query_chunk_size = 17
+    sdpa_input = torch.randn(1, length, config.hidden_size, requires_grad=True)
     cudnn_input = sdpa_input.detach().clone().requires_grad_(True)
-    sdpa_output = sdpa._forward_document(sdpa_input, 0, 6)
-    cudnn_output = cudnn._forward_document(cudnn_input, 0, 6)
+    sdpa_output = sdpa._forward_document(sdpa_input, query_start, query_end)
+    with (
+        patch.object(cudnn.q_a_proj, "forward", wraps=cudnn.q_a_proj.forward) as q_a_projection,
+        patch.object(cudnn.q_b_proj, "forward", wraps=cudnn.q_b_proj.forward) as q_b_projection,
+        patch.object(cudnn.indexer, "select", wraps=cudnn.indexer.select) as selections,
+    ):
+        cudnn_output = _packed_document_slice(cudnn, cudnn_input, query_start, query_end)
     upstream = torch.randn_like(sdpa_output)
     (sdpa_output * upstream).sum().backward()
     (cudnn_output * upstream).sum().backward()
 
     torch.testing.assert_close(cudnn_output, sdpa_output, rtol=2e-4, atol=2e-6)
     torch.testing.assert_close(cudnn_input.grad, sdpa_input.grad, rtol=5e-4, atol=2e-6)
-    for name in ("q_b_proj.weight", "kv_a_proj_with_mqa.weight", "kv_b_proj.weight"):
-        sdpa_grad = dict(sdpa.named_parameters())[name].grad
-        cudnn_grad = dict(cudnn.named_parameters())[name].grad
-        torch.testing.assert_close(cudnn_grad, sdpa_grad, rtol=5e-4, atol=2e-6)
+    for name, sdpa_parameter in sdpa.named_parameters():
+        cudnn_parameter = dict(cudnn.named_parameters())[name]
+        if name.startswith("indexer."):
+            assert sdpa_parameter.grad is None
+            assert cudnn_parameter.grad is None
+        else:
+            assert sdpa_parameter.grad is not None, name
+            assert cudnn_parameter.grad is not None, name
+            torch.testing.assert_close(cudnn_parameter.grad, sdpa_parameter.grad, rtol=5e-4, atol=2e-6)
+
+    # The numerical assertions above stay valid for the old implementation.
+    # These dispatch assertions detect a regression in the intended batching.
+    assert q_b_projection.call_count == 1
+    assert q_a_projection.call_count == 1
+    # Dense-prefix chunks may enumerate their keys without invoking the indexer.
+    positions = [call.args[2] for call in selections.call_args_list]
+    for position in positions:
+        assert position.numel() <= cudnn.indexer_query_chunk_size
+        assert ((position >= query_start) & (position < query_end)).all()
+    if positions:
+        assert torch.cat(positions).unique().numel() == sum(position.numel() for position in positions)
+
+
+def test_cudnn_sparse_attention_packed_documents_match_separate_execution(monkeypatch):
+    """Packed cuDNN dispatch preserves each document's outputs and gradients."""
+    torch.manual_seed(91)
+    config = tiny_glm5_next_config().text_config
+    config.kv_lora_rank = 512
+    backend = tiny_backend()
+    backend.attn = "cudnn"
+    attention = Glm5NextSparseAttention(config, layer_idx=3, backend=backend)
+    attention.init_weights(torch.device("cpu"), init_std=0.02)
+    attention.indexer_query_chunk_size = 17
+    monkeypatch.setattr(glm5_next_layers, "is_cudnn_sparse_attention_available", lambda: True)
+    monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", _torch_sparse_latent_attention)
+    lengths = [5, 69, 7]
+    document_ids = torch.cat(
+        [torch.full((length,), index + 1, dtype=torch.int32) for index, length in enumerate(lengths)]
+    )
+    context = Glm5NextPackedContext(doc_ids=document_ids.unsqueeze(0))
+    packed_input = torch.randn(1, sum(lengths), config.hidden_size, requires_grad=True)
+    separate_input = packed_input.detach().clone().requires_grad_(True)
+    selected = []
+
+    def record_selection(
+        query: torch.Tensor,
+        latent_kv: torch.Tensor,
+        indices: torch.Tensor,
+        softmax_scale: float,
+        *,
+        all_rows_nonempty: bool,
+    ) -> torch.Tensor:
+        """Observe every query at the actual sparse-attention boundary.
+
+        Args:
+            query: Absorbed query tensor [queries, heads, latent_dim].
+            latent_kv: Shared latent keys and values [keys, 1, latent_dim].
+            indices: Document-local selected indices [queries, 1, sparse_width].
+            softmax_scale: Attention score scale.
+            all_rows_nonempty: Whether every query has a selected key.
+
+        Returns:
+            Reference latent attention output [queries, heads, latent_dim].
+        """
+        assert (indices >= -1).all()
+        assert (indices < latent_kv.shape[0]).all()
+        assert (indices <= torch.arange(query.shape[0])[:, None, None]).all()
+        selected.append(indices.transpose(0, 1).detach().clone())
+        return _torch_sparse_latent_attention(
+            query, latent_kv, indices, softmax_scale, all_rows_nonempty=all_rows_nonempty
+        )
+
+    monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", record_selection)
+    packed_output = attention(packed_input, packed_context=context)
+    packed_selected = torch.cat(selected, dim=1)
+    selected.clear()
+    separate_output = torch.cat(
+        [
+            _packed_document_slice(attention, document, 0, document.shape[1])
+            for document in separate_input.split(lengths, dim=1)
+        ],
+        dim=1,
+    )
+    # Separate calls number keys within each document. Translate them using
+    # independently computed document offsets before comparing packed keys.
+    document_offsets = [sum(lengths[:index]) for index in range(len(lengths))]
+    separate_selected = torch.cat(
+        [torch.where(indices >= 0, indices + offset, indices) for indices, offset in zip(selected, document_offsets)],
+        dim=1,
+    )
+    torch.testing.assert_close(packed_selected.sort(dim=-1).values, separate_selected.sort(dim=-1).values)
+    local_positions = torch.cat([torch.arange(length) for length in lengths])
+    assert ((packed_selected[0] >= 0).sum(-1) < local_positions + 1).any()
+    upstream = torch.randn_like(packed_output)
+    (packed_output * upstream).sum().backward()
+    (separate_output * upstream).sum().backward()
+    torch.testing.assert_close(packed_output, separate_output, rtol=2e-4, atol=2e-6)
+    torch.testing.assert_close(packed_input.grad, separate_input.grad, rtol=5e-4, atol=2e-6)
+
+    perturbed = packed_input.detach().clone()
+    middle_document = slice(lengths[0], lengths[0] + lengths[1])
+    perturbed[:, middle_document] += torch.randn_like(perturbed[:, middle_document])
+    with torch.no_grad():
+        changed_output = attention(perturbed, packed_context=context)
+    torch.testing.assert_close(changed_output[:, : lengths[0]], packed_output[:, : lengths[0]], rtol=0, atol=0)
+    torch.testing.assert_close(changed_output[:, -lengths[-1] :], packed_output[:, -lengths[-1] :], rtol=0, atol=0)
+    assert not torch.allclose(changed_output[:, middle_document], packed_output[:, middle_document])
+
+
+def _assert_dense_prefix_key_sets(
+    indices: torch.Tensor,
+    positions: torch.Tensor,
+    index_topk: int,
+    pool_size: int,
+    always_select_tail: bool,
+) -> None:
+    """Check dense-prefix keys using independent integer pool enumeration.
+
+    Args:
+        indices: Document-local selected indices [queries, 1, sparse_width].
+        positions: Absolute document-local query positions [queries].
+        index_topk: Token budget for complete pools.
+        pool_size: Tokens in each complete pool.
+        always_select_tail: Whether incomplete causal pools are included.
+    """
+    assert indices.dtype == torch.int32
+    assert indices.shape == (positions.numel(), 1, index_topk + (pool_size - 1 if always_select_tail else 0))
+    for row, position in zip(indices[:, 0].tolist(), positions.tolist()):
+        complete_pools = [
+            list(range(start, start + pool_size))
+            for start in range(0, position + 1, pool_size)
+            if start + pool_size - 1 <= position
+        ]
+        assert len(complete_pools) <= len(range(pool_size, index_topk + 1, pool_size))
+        expected = [key for pool in complete_pools for key in pool]
+        if always_select_tail:
+            expected += list(range(len(expected), position + 1))
+        assert all(key == -1 or 0 <= key <= position for key in row)
+        actual = sorted(key for key in row if key >= 0)
+        assert actual == expected
+
+
+@pytest.mark.parametrize(("index_topk", "pool_size"), [(8, 4), (5, 3), (8, 1)])
+@pytest.mark.parametrize("always_select_tail", [False, True])
+@pytest.mark.parametrize("query_start", [0, 2])
+def test_cudnn_dense_prefix_matches_independent_integer_keys(
+    monkeypatch, index_topk, pool_size, always_select_tail, query_start
+):
+    """Check all dense positions, including empty, incomplete and non-divisible pools."""
+    torch.manual_seed(27)
+    config = tiny_glm5_next_config().text_config
+    config.kv_lora_rank = 512
+    config.index_topk = index_topk
+    config.index_kpool = pool_size
+    config.index_kpool_always_select_tail = always_select_tail
+    backend = tiny_backend()
+    backend.attn = "cudnn"
+    attention = Glm5NextSparseAttention(config, layer_idx=3, backend=backend)
+    attention.init_weights(torch.device("cpu"), init_std=0.02)
+    attention.indexer_query_chunk_size = 4
+    # Enumerate complete pools explicitly to find the first sparse query.
+    length = len(range(pool_size, index_topk + 1, pool_size)) * pool_size + pool_size - 1
+    calls = []
+
+    def check_keys(
+        query: torch.Tensor,
+        latent_kv: torch.Tensor,
+        indices: torch.Tensor,
+        softmax_scale: float,
+        *,
+        all_rows_nonempty: bool,
+    ) -> torch.Tensor:
+        """Validate integer dispatch; this test does not execute a CUDA kernel.
+
+        Args:
+            query: Absorbed query tensor [queries, heads, latent_dim].
+            latent_kv: Shared latent keys and values [keys, 1, latent_dim].
+            indices: Document-local selected indices [queries, 1, sparse_width].
+            softmax_scale: Attention score scale.
+            all_rows_nonempty: Whether every query has a selected key.
+
+        Returns:
+            Zero latent output [queries, heads, latent_dim].
+        """
+        assert latent_kv.shape[0] == length
+        assert all_rows_nonempty == always_select_tail
+        _assert_dense_prefix_key_sets(
+            indices, torch.arange(query_start, length), index_topk, pool_size, always_select_tail
+        )
+        calls.append(indices.detach().clone())
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(glm5_next_layers, "is_cudnn_sparse_attention_available", lambda: True)
+    monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", check_keys)
+    _packed_document_slice(attention, torch.randn(1, length, config.hidden_size), query_start, length)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(("query_start", "query_end"), [(0, 37), (5, 30), (12, 29)])
+def test_cudnn_dense_prefix_skips_only_complete_chunks(monkeypatch, query_start, query_end):
+    """Whole dense chunks skip selection; mixed/sparse chunks retain identical inputs."""
+    torch.manual_seed(39)
+    config = tiny_glm5_next_config().text_config
+    config.kv_lora_rank = 512
+    config.index_topk = 8
+    config.index_kpool = 4
+    backend = tiny_backend()
+    backend.attn = "cudnn"
+    attention = Glm5NextSparseAttention(config, layer_idx=3, backend=backend)
+    attention.init_weights(torch.device("cpu"), init_std=0.02)
+    attention.indexer_query_chunk_size = 4
+    hidden = torch.randn(1, 37, config.hidden_size, requires_grad=True)
+    expected_input = hidden.detach().clone().requires_grad_(True)
+    residual = attention.q_a_layernorm(attention.q_a_proj(hidden))
+    expected_ranges = []
+    for start in range(query_start, query_end, 4):
+        end = min(start + 4, query_end)
+        visible_pools = [key for key in range(3, end, 4)]
+        if len(visible_pools) > 2:
+            expected_ranges.append(list(range(start, end)))
+
+    monkeypatch.setattr(glm5_next_layers, "is_cudnn_sparse_attention_available", lambda: True)
+    monkeypatch.setattr(glm5_next_layers, "cudnn_sparse_attention", _torch_sparse_latent_attention)
+    with patch.object(attention.indexer, "select", wraps=attention.indexer.select) as selections:
+        result = _packed_document_slice(attention, hidden, query_start, query_end)
+    # Compare the non-cuDNN SDPA path before asserting the new dispatch contract.
+    attention.backend.attn = "sdpa"
+    expected = attention._forward_document(expected_input, query_start, query_end)
+    torch.testing.assert_close(result, expected, rtol=2e-4, atol=2e-6)
+    upstream = torch.randn_like(result)
+    result_gradient = torch.autograd.grad((result * upstream).sum(), hidden)[0]
+    expected_gradient = torch.autograd.grad((expected * upstream).sum(), expected_input)[0]
+    torch.testing.assert_close(result_gradient, expected_gradient, rtol=5e-4, atol=2e-6)
+    for call in selections.call_args_list:
+        query_hidden, query_residual, positions, _, _, key_length = call.args
+        assert key_length == 37
+        torch.testing.assert_close(query_hidden, hidden[:, positions], rtol=0, atol=0)
+        torch.testing.assert_close(query_residual, residual[:, positions], rtol=2e-5, atol=2e-6)
+    actual_ranges = [call.args[2].tolist() for call in selections.call_args_list]
+    assert actual_ranges == expected_ranges, "dense-prefix selector dispatch mismatch"
+
+
+def test_cudnn_dense_prefix_integer_oracle_rejects_boundary_errors():
+    """The same checker rejects reset positions, future keys and dropped-tail keys."""
+    positions = torch.tensor([5, 6, 7])
+    correct = torch.full((3, 1, 11), -1, dtype=torch.int32)
+    for row, position in enumerate(positions.tolist()):
+        correct[row, 0, : position + 1] = torch.arange(position + 1, dtype=torch.int32)
+    _assert_dense_prefix_key_sets(correct, positions, 8, 4, True)
+    wrong_reset = torch.full_like(correct, -1)
+    for row in range(3):
+        wrong_reset[row, 0, : row + 1] = torch.arange(row + 1, dtype=torch.int32)
+    wrong_future = correct.clone()
+    wrong_future[0, 0, 5] = 6
+    wrong_tail = correct.clone()
+    wrong_tail[0, 0, 5] = -1
+    for wrong in [wrong_reset, wrong_future, wrong_tail]:
+        with pytest.raises(AssertionError):
+            _assert_dense_prefix_key_sets(wrong, positions, 8, 4, True)
+    # Once a third complete pool is visible, enumerating all keys is invalid.
+    with pytest.raises(AssertionError):
+        _assert_dense_prefix_key_sets(correct[:1], torch.tensor([11]), 8, 4, True)
 
 
 def test_cudnn_sparse_attention_rejects_dropout():
@@ -285,3 +607,27 @@ def test_short_sequence_training_uses_chunk_kda_and_reaches_kda_parameters(monke
     assert calls == [32]
     missing = [name for name, param in layer.named_parameters() if param.grad is None]
     assert missing == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("boundaries", [[0, 4096], [0, 1, 64, 257, 2049, 4096]])
+@pytest.mark.parametrize("chunk_size", [64, 128])
+def test_fla_cpu_boundaries_preserve_chunk_indices(boundaries, chunk_size):
+    """Real FLA metadata agrees with independent integer indexing for packed 4K."""
+    prepare_chunk_indices = pytest.importorskip("fla.ops.utils.index").prepare_chunk_indices
+
+    cpu_boundaries = torch.tensor(boundaries, dtype=torch.long)
+    expected = torch.tensor(
+        [
+            [document, chunk]
+            for document, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:], strict=True))
+            for chunk in range((end - start + chunk_size - 1) // chunk_size)
+        ],
+        device="cuda",
+    )
+    for _ in range(2):
+        device_boundaries = cpu_boundaries.cuda()
+        original = prepare_chunk_indices(device_boundaries, chunk_size)
+        cached = prepare_chunk_indices(device_boundaries, chunk_size, cpu_boundaries)
+        torch.testing.assert_close(original, expected, rtol=0, atol=0)
+        torch.testing.assert_close(cached, expected, rtol=0, atol=0)

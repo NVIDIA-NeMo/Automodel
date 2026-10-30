@@ -14,6 +14,8 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
+from nemo_automodel.components.models.glm5_next.flops import glm5_next_flops
+
 
 def _json_safe_value(value: Any) -> Any:
     """Return a JSON-serializable representation of a config value."""
@@ -31,6 +33,7 @@ class Glm5NextTextConfig(PretrainedConfig):
 
     model_type = "glm5_next_text"
     keys_to_ignore_at_inference = ["past_key_values"]
+    flops_formula = staticmethod(glm5_next_flops)
     attribute_map = {"num_local_experts": "n_routed_experts"}
 
     def __init__(

@@ -516,12 +516,13 @@ class BackendConfig:
             mixing chain is compiled as well. Compiled numerics are allclose to eager but
             not bitwise-identical.
         compile_norm: torch.compile the fp32 RMSNorm chain of models that opt in
-            (currently Kimi K3 and DeepSeek V4.1), fusing cast/pow/mean/rsqrt/mul into one kernel.
+            (currently Kimi K3, DeepSeek V4.1 and GLM-5.3-Flash decoder/final norms),
+            fusing cast/pow/mean/rsqrt/mul into one kernel.
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
         compile_hc: torch.compile the mHC (hyper-connection) cores of models that opt in
-            (currently DeepSeek V4 / V4.1): coefficient projection, stream collapse and stream expand,
-            one fused kernel each, static shapes (a new sequence length compiles them again; past
+            (currently DeepSeek V4 / V4.1 and GLM-5.3-Flash): coefficient projection, stream collapse and stream
+            expand, fusing their elementwise chains with static shapes (a new sequence length compiles them again; past
             dynamo's recompile limit a core runs eager). Same lazy once-per-process pattern as
             ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
         shared_expert_overlap: run the shared experts of MoE models (the shared ``MoE`` class, e.g. DeepSeek V4 / V4.1, and Kimi K3)
@@ -607,12 +608,12 @@ class BackendConfig:
     # Kimi K3): fused whole-tensor weighted-SiTU forward/backward, the dense SituAndMul core
     # and the attn-res chain. Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_situ: bool = False
-    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3 and
-    # DeepSeek V4.1), same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
-    # not bitwise-identical. Default False.
+    # When True, torch.compile the fp32 RMSNorm chain of opted-in models (currently Kimi K3,
+    # DeepSeek V4.1 and GLM-5.3-Flash decoder/final norms), same lazy once-per-process pattern as compile_situ.
+    # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_norm: bool = False
     # When True, torch.compile the mHC projection / collapse / expand cores of opted-in models
-    # (currently DeepSeek V4 / V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
+    # (currently DeepSeek V4 / V4.1 and GLM-5.3-Flash), static shapes, same lazy once-per-process pattern as compile_situ.
     # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_hc: bool = False
     # When True, torch.compile DeepSeek V4.1's cache quantize/dequantize core (fp8 SWA KV, mxfp4 index

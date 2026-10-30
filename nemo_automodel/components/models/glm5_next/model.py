@@ -25,6 +25,7 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.glm5_next.backend import Glm5NextBackendConfig
 from nemo_automodel.components.models.glm5_next.config import Glm5NextConfig, Glm5NextTextConfig
 from nemo_automodel.components.models.glm5_next.cp import (
     Glm5NextPackedContext,
@@ -35,6 +36,7 @@ from nemo_automodel.components.models.glm5_next.layers import (
     Glm5NextDecoderLayer,
     Glm5NextRMSNorm,
 )
+from nemo_automodel.components.models.glm5_next.parallelization import PARALLELIZER
 from nemo_automodel.components.models.glm5_next.vision import Glm5NextVisionModel, Glm5NextVisionOutput
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -89,7 +91,31 @@ def _packed_context_from_inputs(
     cu_seqlens: torch.Tensor | None,
     packed_seq_ids: torch.Tensor | None,
 ) -> Glm5NextPackedContext:
-    """Build one global document map for a non-CP forward."""
+    """Build one global document map for a non-CP forward.
+
+    Sources are tried in order: ``packed_seq_ids``, ``cu_seqlens``, a 2-D
+    ``attention_mask``, then ``padding_mask``; otherwise every token belongs
+    to document 1.
+
+    Args:
+        input_ids: Tensor of shape [batch, sequence]. Only its shape and
+            device are read.
+        attention_mask: Optional integer tensor of shape [batch, sequence],
+            either binary (one document) or one-based packed document ids
+            with 0 at padding.
+        padding_mask: Optional Boolean tensor of shape [batch, sequence],
+            with True marking padding.
+        cu_seqlens: Optional integer tensor of cumulative document
+            boundaries, flattened to [documents + 1]; negative entries are
+            ignored. Describes a single packed row.
+        packed_seq_ids: Optional integer tensor of shape [batch, sequence] or
+            [sequence] holding one-based document ids, with 0 at padding.
+
+    Returns:
+        Context whose ``doc_ids`` is an int32 tensor of shape [batch,
+        sequence] (``[1, sequence]`` when built from ``cu_seqlens``), with
+        ``seq_start=0`` and ``cp_size=1``.
+    """
     sequence = input_ids.shape[1]
     if packed_seq_ids is not None:
         doc_ids = packed_seq_ids.to(torch.int32)
@@ -137,7 +163,7 @@ class Glm5NextTextModel(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             }
         )
-        self.norm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+        self.norm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps, dtype, compile_norm=backend.compile_norm)
 
     def forward(
         self,
@@ -148,11 +174,41 @@ class Glm5NextTextModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Run ``[batch, local_sequence]`` ids/embeddings through the text model."""
+        """Decode local tokens, preserving residual streams between PP stages.
+
+        Only the embedding stage (``embed_tokens`` present) expands the
+        streams; the final-norm stage (``norm`` present) averages them and
+        applies RMSNorm. ``streams`` below is ``config.hc_mult``.
+
+        Args:
+            input_ids: Optional integer tensor of shape [batch,
+                local_sequence], embedded on the embedding stage. Exactly one
+                of ``input_ids`` and ``inputs_embeds`` must be given.
+            inputs_embeds: Optional tensor of shape [batch, local_sequence,
+                hidden] on the embedding stage, or residual streams of shape
+                [batch, local_sequence, streams, hidden] on later PP stages.
+            glm5_next_packed_context: Global document layout. Its ``doc_ids``
+                tensor has shape [batch, padded_global_sequence] and is
+                replicated across CP ranks; ``seq_start`` locates this rank's
+                local interval. Each row's document-range cache is filled in
+                place before the decoder layers run.
+            padding_mask: Optional Boolean tensor of shape [batch,
+                local_sequence], with True marking padding.
+            **kwargs: Forwarded unchanged to every decoder layer.
+
+        Returns:
+            On the final-norm stage, a tensor of shape [batch, local_sequence,
+            hidden]; on other stages, residual streams of shape [batch,
+            local_sequence, streams, hidden]. Both use the stream dtype.
+        """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids and inputs_embeds")
         hidden = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-        hidden = hidden.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+        if self.embed_tokens is not None:
+            hidden = hidden.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+        # Boundary caches must be populated before checkpointed decoder calls.
+        for row in range(hidden.shape[0]):
+            glm5_next_packed_context.row_document_ranges(row)
         for layer in self.layers.values():
             hidden = layer(
                 hidden,
@@ -160,7 +216,7 @@ class Glm5NextTextModel(nn.Module):
                 padding_mask=padding_mask,
                 **kwargs,
             )
-        return self.norm(hidden.mean(dim=2))
+        return self.norm(hidden.mean(dim=2)) if self.norm is not None else hidden
 
     def update_moe_gate_bias(self) -> None:
         """Update every sparse layer's no-aux-loss routing correction bias."""
@@ -172,10 +228,12 @@ class Glm5NextTextModel(nn.Module):
         """Initialize a checkpoint-free text model on ``buffer_device``."""
         init_std = self.config.initializer_range
         with buffer_device:
-            nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
-            if self.padding_idx is not None:
-                self.embed_tokens.weight[self.padding_idx].zero_()
-            self.norm.reset_parameters()
+            if self.embed_tokens is not None:
+                nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=init_std)
+                if self.padding_idx is not None:
+                    self.embed_tokens.weight[self.padding_idx].zero_()
+            if self.norm is not None:
+                self.norm.reset_parameters()
         for layer in self.layers.values():
             layer.init_weights(buffer_device, init_std)
 
@@ -206,10 +264,9 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """Trainable GLM-5.3 VLM with EP and contiguous packed CP support."""
+    """Trainable GLM-5.3 VLM with PP, EP and contiguous packed CP support."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-    _skip_init_weights_on_load = True
     _owns_cp_attention = True
     _owns_packed_attention = True
     _packed_cp_attn_backends = ("sdpa", "cudnn")
@@ -219,6 +276,13 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         "rotary_pos_emb",
     ]
     cp_mesh = None
+    _pp_keep_self_forward = True
+    _pp_return_hidden_states_supported = True
+    _pp_return_hidden_states = False
+    _vlm_pixel_values_chunks: list[torch.Tensor] | None = None
+    _vlm_image_grid_hws_chunks: list[torch.Tensor] | None = None
+    _vlm_pixel_values_videos_chunks: list[torch.Tensor] | None = None
+    _vlm_chunk_idx: int | None = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -226,7 +290,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
 
         supports_tp: bool = False
         supports_cp: bool = True
-        supports_pp: bool = False
+        supports_pp: bool = True
         supports_ep: bool = True
         supports_thd: bool = True
 
@@ -262,7 +326,7 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.config = config
-        self.backend = copy.copy(backend) if backend is not None else BackendConfig()
+        self.backend = copy.copy(backend) if backend is not None else Glm5NextBackendConfig()
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
         moe_overrides = kwargs.pop("moe_overrides", None)
@@ -341,6 +405,52 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         embeddings[mask] = features.to(device=embeddings.device, dtype=embeddings.dtype)
         return embeddings
 
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Describe token ids ``[B,S]`` and local mHC activations ``[B,S/CP,M,H]``.
+
+        CP pads the global length to a multiple of its size. Only the last
+        stage emits collapsed hidden states ``[B,S/CP,H]`` or logits
+        ``[B,S/CP,V]``; the first stage still receives unsharded token ids.
+
+        Args:
+            is_first: Whether the stage owns the token embedding.
+            microbatch_size: PP microbatch size.
+            seq_len: Global sequence length before CP padding.
+            dtype: Activation dtype.
+
+        Returns:
+            One-element input and output tuples of meta tensors. The input is
+            int64 ids of shape [microbatch, seq_len] on the first stage, else
+            streams of shape [microbatch, local_sequence, streams, hidden],
+            where local_sequence is the CP-padded length divided by the CP
+            size and streams is ``hc_mult``. The output is that stream shape
+            on stages without the final norm, otherwise [microbatch,
+            local_sequence, hidden] for hidden-state returns or [microbatch,
+            local_sequence, vocab] for logits.
+        """
+        config = self.config.text_config
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        local_length = (seq_len + (-seq_len) % cp_size) // cp_size
+        hidden_shape = (microbatch_size, local_length, config.hc_mult, config.hidden_size)
+        inputs = torch.empty(
+            (microbatch_size, seq_len) if is_first else hidden_shape,
+            device="meta",
+            dtype=torch.long if is_first else dtype,
+        )
+        if self.language_model.norm is None:
+            output_shape = hidden_shape
+        else:
+            width = config.hidden_size if self._pp_return_hidden_states else config.vocab_size
+            output_shape = (microbatch_size, local_length, width)
+        return (inputs,), (torch.empty(output_shape, device="meta", dtype=dtype),)
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -354,10 +464,86 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         pixel_values_videos: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
+        glm5_next_packed_context: Glm5NextPackedContext | tuple[torch.Tensor, int, int, int] | None = None,
         **kwargs: Any,
-    ) -> CausalLMOutputWithPast:
-        """Run image splice, contiguous CP slicing, text decoding and lm head."""
+    ) -> CausalLMOutputWithPast | torch.Tensor:
+        """Decode ids ``[B,S]`` or a PP activation ``[B,Slocal,hc_mult,H]``.
+
+        Vision splice and CP slicing run only on the embedding stage. Packed
+        metadata arrives as a chunkable tuple under multi-microbatch PP, then
+        gets a fresh per-microbatch boundary cache. ``streams`` below is
+        ``config.text_config.hc_mult``; ``padded_global_sequence`` is the
+        global length padded to a multiple of the CP size, and
+        ``local_sequence`` is that length divided by the CP size.
+
+        Args:
+            input_ids: Integer tensor of shape [microbatch, global_sequence]
+                (or [global_sequence]) on the embedding stage; it is not CP
+                sharded. Later PP stages receive residual streams of shape
+                [microbatch, local_sequence, streams, hidden] in this
+                position, already local to this CP rank.
+            attention_mask: Optional integer tensor of shape [microbatch,
+                global_sequence], binary or holding one-based document ids.
+                Read only when ``glm5_next_packed_context`` is None.
+            position_ids: Ignored; positions follow the document map.
+            inputs_embeds: Optional tensor of shape [microbatch,
+                global_sequence, hidden] on the embedding stage, padded and
+                sliced here to this rank's interval; or already-local
+                [microbatch, local_sequence, streams, hidden] on later stages.
+            padding_mask: Optional Boolean tensor of shape [microbatch,
+                local_sequence], with True marking padding. Defaults to
+                nonpositive local document ids.
+            pixel_values: Optional flattened image patches of shape
+                [vision_patches, channels * temporal_patch * patch * patch].
+                Under PP microbatching the embedding stage reads its chunk
+                from ``_vlm_pixel_values_chunks`` instead.
+            image_grid_thw: Integer tensor of shape [images, 3] holding each
+                image's (t, h, w) patch grid; required with ``pixel_values``.
+            pixel_values_videos: Unsupported; must be None. Empty PP chunks
+                are treated as None.
+            logits_to_keep: 0 to project every local position, or the
+                positions to keep as in ``compute_lm_head_logits``.
+            output_hidden_states: Whether to attach final hidden states.
+            glm5_next_packed_context: Per-microbatch context or
+                (doc_ids, seq_start, cp_size, original_seq_len). doc_ids is an
+                integer tensor of shape [microbatch, padded_global_sequence],
+                replicated across CP ranks; nonpositive values mark padding.
+                seq_start is the global offset of this rank's contiguous
+                interval, and original_seq_len is the length before CP
+                padding. The global map is used even on later PP stages,
+                whose activations are already local. When None, a non-CP
+                context is built from ``input_ids``, ``attention_mask``,
+                ``padding_mask`` and ``cu_seqlens``/``_packed_seq_ids``.
+            **kwargs: ``qkv_format="thd"`` restores a batch axis on THD
+                logits; ``cu_seqlens`` and ``_packed_seq_ids`` feed the
+                fallback context. All kwargs reach the decoder layers.
+
+        Returns:
+            With ``_pp_return_hidden_states``, the text-model tensor: [microbatch,
+            local_sequence, hidden] on the final-norm stage, else [microbatch,
+            local_sequence, streams, hidden]. Otherwise a
+            ``CausalLMOutputWithPast`` whose ``logits`` has shape [microbatch,
+            local_sequence, vocab] (kept positions only when
+            ``logits_to_keep`` is nonzero); on a stage without ``lm_head`` it
+            carries the stream activation unchanged. ``hidden_states`` holds
+            the [microbatch, local_sequence, hidden] final states when
+            requested, else None.
+        """
         del position_ids
+        first_stage = self.language_model.embed_tokens is not None
+        if not first_stage:
+            inputs_embeds, input_ids = input_ids if inputs_embeds is None else inputs_embeds, None
+        elif self._vlm_chunk_idx is not None:
+            index = self._vlm_chunk_idx
+            if self._vlm_pixel_values_chunks is not None:
+                pixels = self._vlm_pixel_values_chunks[index]
+                pixel_values = pixels if pixels.numel() else None
+                assert self._vlm_image_grid_hws_chunks is not None
+                image_grid_thw = self._vlm_image_grid_hws_chunks[index]
+            if self._vlm_pixel_values_videos_chunks is not None:
+                videos = self._vlm_pixel_values_videos_chunks[index]
+                pixel_values_videos = videos if videos.numel() else None
+            self._vlm_chunk_idx += 1
         if pixel_values_videos is not None:
             raise NotImplementedError("GLM-5.3 AutoModel onboarding currently supports images, not video training")
         is_thd = kwargs.get("qkv_format") == "thd"
@@ -370,7 +556,9 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         if input_ids is None and inputs_embeds is None:
             raise ValueError("input_ids or inputs_embeds is required")
 
-        context = kwargs.pop("glm5_next_packed_context", None)
+        context = glm5_next_packed_context
+        if isinstance(context, tuple):
+            context = Glm5NextPackedContext(*context)
         context_ids = input_ids
         if context_ids is None:
             context_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
@@ -383,20 +571,21 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
                 kwargs.get("_packed_seq_ids"),
             )
 
-        if inputs_embeds is None:
-            inputs_embeds = self._embed_and_splice(input_ids, pixel_values, image_grid_thw)
-        elif pixel_values is not None:
-            raise ValueError("pixel_values cannot be combined with precomputed inputs_embeds")
+        if first_stage:
+            if inputs_embeds is None:
+                inputs_embeds = self._embed_and_splice(input_ids, pixel_values, image_grid_thw)
+            elif pixel_values is not None:
+                raise ValueError("pixel_values cannot be combined with precomputed inputs_embeds")
 
-        padded_length = context.doc_ids.shape[1]
-        if inputs_embeds.shape[1] < padded_length:
-            pad = inputs_embeds.new_zeros(
-                inputs_embeds.shape[0], padded_length - inputs_embeds.shape[1], inputs_embeds.shape[2]
-            )
-            inputs_embeds = torch.cat((inputs_embeds, pad), dim=1)
-        local_length = context.local_seq_len
-        if inputs_embeds.shape[1] != local_length or context.seq_start:
-            inputs_embeds = inputs_embeds[:, context.seq_start : context.seq_start + local_length].contiguous()
+            padded_length = context.doc_ids.shape[1]
+            if inputs_embeds.shape[1] < padded_length:
+                pad = inputs_embeds.new_zeros(
+                    inputs_embeds.shape[0], padded_length - inputs_embeds.shape[1], inputs_embeds.shape[2]
+                )
+                inputs_embeds = torch.cat((inputs_embeds, pad), dim=1)
+            local_length = context.local_seq_len
+            if inputs_embeds.shape[1] != local_length or context.seq_start:
+                inputs_embeds = inputs_embeds[:, context.seq_start : context.seq_start + local_length].contiguous()
         if padding_mask is None:
             padding_mask = context.local_doc_ids <= 0
 
@@ -406,6 +595,8 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             padding_mask=padding_mask,
             **kwargs,
         )
+        if self._pp_return_hidden_states:
+            return hidden
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -421,10 +612,10 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
 
     def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
         """Install GLM's contiguous packed sharder while leaving media and ids global."""
-        del batch, num_chunks
+        del batch
         return {
             "cp_sharder": ContextParallelSharder(
-                shard_batch=partial(shard_batch_for_glm5_next_cp, shard_primary=False),
+                shard_batch=partial(shard_batch_for_glm5_next_cp, shard_primary=False, num_chunks=num_chunks),
                 local_token_global_indices=contiguous_local_indices,
             )
         }
@@ -444,12 +635,16 @@ class Glm5NextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
             f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
         )
         self.model.language_model.init_weights(buffer_device)
-        self.model.visual.init_weights(buffer_device, self.config.text_config.initializer_range)
+        if self.model.visual is not None:
+            self.model.visual.init_weights(buffer_device, self.config.text_config.initializer_range)
         final_std = self.config.text_config.hidden_size**-0.5
-        with buffer_device:
-            nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=final_std, a=-3 * final_std, b=3 * final_std)
+        if self.lm_head is not None:
+            with buffer_device:
+                nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=final_std, a=-3 * final_std, b=3 * final_std)
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
+
+Glm5NextForConditionalGeneration.parallelizer = PARALLELIZER
 
 ModelClass = Glm5NextForConditionalGeneration
 

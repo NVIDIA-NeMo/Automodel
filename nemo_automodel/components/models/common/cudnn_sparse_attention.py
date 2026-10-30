@@ -350,6 +350,44 @@ class _CudnnSparseAttention(torch.autograd.Function):
         return grad_q, grad_kv, None, None, None, None, None, None, grad_sink
 
 
+def cudnn_indexer_scores(
+    queries: torch.Tensor,
+    pool_keys: torch.Tensor,
+    weights: torch.Tensor,
+    query_positions: torch.Tensor,
+    pool_size: int,
+    scale: float,
+) -> torch.Tensor:
+    """Compute head-reduced index scores without the per-head score workspace.
+
+    Args:
+        queries: BF16 index queries [1, queries, index_heads, index_head_dim].
+        pool_keys: BF16 compressed keys [pools, index_head_dim].
+        weights: Unscaled BF16 head weights [1, queries, index_heads].
+        query_positions: Contiguous document-local positions [queries].
+        pool_size: Number of raw document tokens represented by one pool.
+        scale: Positive combined query-key and head-reduction scale.
+
+    Returns:
+        FP32 scores [1, queries, pools], with invisible pools masked to -inf.
+    """
+    if not _HAS_CUDNN_DSA:
+        raise RuntimeError("The cuDNN indexer requires nvidia-cudnn-frontend with DSA support.")
+    _require_cuda_tensors("cuDNN indexer", queries, pool_keys, weights, query_positions)
+    if any(tensor.dtype != torch.bfloat16 for tensor in (queries, pool_keys, weights)):
+        raise TypeError("cuDNN indexer queries, pool keys, and unscaled weights must be BF16.")
+    if queries.shape[1] == 0 or pool_keys.shape[0] == 0:
+        return queries.new_empty((1, queries.shape[1], pool_keys.shape[0]), dtype=torch.float32)
+    return _CUDNN_DSA.indexer_forward_wrapper(
+        queries.contiguous(),
+        pool_keys.unsqueeze(0).unsqueeze(2).contiguous(),
+        weights.contiguous(),
+        ratio=pool_size,
+        q_causal_offsets=query_positions[:1].to(torch.int32),
+        sm_scale=scale,
+    )["scores"]
+
+
 def cudnn_sparse_attention(
     q: torch.Tensor,
     kv_latent: torch.Tensor,
@@ -462,4 +500,9 @@ def cudnn_sparse_attention(
     )
 
 
-__all__ = ["cudnn_sparse_attention", "is_cudnn_sparse_attention_available", "plan_sparse_indices"]
+__all__ = [
+    "cudnn_indexer_scores",
+    "cudnn_sparse_attention",
+    "is_cudnn_sparse_attention_available",
+    "plan_sparse_indices",
+]

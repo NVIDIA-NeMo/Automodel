@@ -62,4 +62,5 @@ def test_registry_resolves_native_config_and_model():
     assert resolve_custom_config_cls("glm5_next") is Glm5NextConfig
     capabilities = Glm5NextForConditionalGeneration.ModelCapabilities()
     assert capabilities.supports_ep and capabilities.supports_cp and capabilities.supports_thd
-    assert not capabilities.supports_tp and not capabilities.supports_pp
+    assert not capabilities.supports_tp
+    assert capabilities.supports_pp
