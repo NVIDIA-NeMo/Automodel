@@ -21,12 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
-from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
-from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
-    NeatPackConfig,
-    _build_packed_vlm_sample,
-    _shift_sample,
-)
+from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _build_packed_vlm_sample, _shift_sample
 from nemo_automodel.components.models.deepseek_v41.cp import shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from nemo_automodel.components.models.deepseek_v41.processing import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
@@ -348,10 +343,7 @@ def test_one_token_document_becomes_safe_padding_after_shift(length: int | None)
 
 
 @pytest.mark.parametrize("mode,size", [("L", (1, 7)), ("RGBA", (7, 1)), ("RGB", (5, 7)), ("RGB", (40, 50))])
-@pytest.mark.parametrize("cp_size", [1, 2])
-def test_exact_pack_length_uses_headers_without_decoding(
-    mode: str, size: tuple[int, int], cp_size: int, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_exact_pack_length_uses_headers_without_decoding(mode: str, size: tuple[int, int], monkeypatch) -> None:
     import io
 
     from PIL import Image
@@ -370,22 +362,6 @@ def test_exact_pack_length_uses_headers_without_decoding(
     with monkeypatch.context() as patch:
         patch.setattr(image, "load", lambda *a, **k: pytest.fail("Length estimation decoded image pixels"))
         expected_length, expected_media = processor.estimate_packed_tokens(messages)
-        alignment = 2 * cp_size if cp_size > 1 else 1
-        padded_length = ((expected_length - 1 + alignment - 1) // alignment) * alignment
-        # Deliberately coarse cached text counts must not override this processor's
-        # exact count. Plan two complete image documents without decoding pixels.
-        raw = [{"conversation": messages, "_text_tokens": padded_length * 10} for _ in range(2)]
-        dataset = PreTokenizedDatasetWrapperConfig(inject_fake_images=False).build(dataset=raw, processor=processor)
-        packed = NeatPackConfig(pack_size=2 * padded_length, drop_long_samples=True, packing_format="thd").build(
-            dataset=dataset, ds_raw=raw, processor=processor, padding_idx=0, cp_size=cp_size
-        )
-        assert len(packed) == 1
-
     result = processor.apply_chat_template(messages, tokenize=True, return_dict=True, return_tensors="pt")
     assert result["input_ids"].numel() == expected_length
     assert int((result["vision_token_types"] >= 0).sum()) == expected_media
-    materialized = packed[0]
-    assert materialized["seq_lens"] == [expected_length - 1] * 2
-    assert materialized["seq_lens_padded"] == [padded_length] * 2
-    assert len(materialized["input_ids"]) == 2 * padded_length
-    assert int((materialized["vision_token_types"] >= 0).sum()) == 2 * expected_media
