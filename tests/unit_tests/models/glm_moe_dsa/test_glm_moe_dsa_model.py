@@ -380,6 +380,25 @@ class TestGlmMoeDsaForCausalLM:
         assert not torch.equal(model.lm_head.weight, original)
         assert model.lm_head.weight.dtype == torch.float32
 
+    def test_lm_head_is_plain_linear_regardless_of_backend_linear(self, config, backend_config):
+        # The GLM-5.3 checkpoint, the RL trainer and SGLang all keep lm_head in bf16, so it must not
+        # pick up the TE Linear (and the te_fp8 autocast) that backend.linear="te" selects elsewhere.
+        backend_config.linear = "te"
+
+        def plain_linear(linear_impl, in_features, out_features, bias=False, device=None, dtype=torch.bfloat16):
+            return torch.nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
+
+        with (
+            patch(
+                "nemo_automodel.components.models.glm_moe_dsa.layers.initialize_linear_module", side_effect=plain_linear
+            ),
+            patch("nemo_automodel.components.moe.layers.initialize_linear_module", side_effect=plain_linear),
+        ):
+            model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+
+        assert type(model.lm_head) is torch.nn.Linear
+        assert model.lm_head.weight.shape == (config.vocab_size, config.hidden_size)
+
     def test_initialize_weights_uses_scaled_std_for_lm_head(self, config, backend_config):
         model = GlmMoeDsaForCausalLM(config, backend=backend_config)
 

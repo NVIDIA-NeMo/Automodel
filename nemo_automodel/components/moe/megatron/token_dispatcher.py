@@ -924,15 +924,19 @@ class HybridEPPipelineRuntimeInitializer:
         *,
         num_tokens: int,
         device: torch.device,
+        dtype: torch.dtype | None = None,
     ) -> None:
         """Initialize the group capacity when the upcoming pipeline shape grows.
 
         Args:
             num_tokens: Maximum number of tokens in the upcoming pipeline microbatch.
             device: Runtime device used for group capacity exchange and initialization.
+            dtype: Hidden-state dtype of the pipeline activations. When given it overrides the
+                expert module's parameter dtype, which is float32 for fp32 master weights while
+                FSDP2 computes (and HybridEP dispatches) in bf16.
 
         Raises:
-            ValueError: If the token capacity is not positive.
+            ValueError: If the token capacity is not positive or the hidden dtype is not 16-bit.
             RuntimeError: If the process-global resource signature conflicts or initialization fails.
         """
         if num_tokens <= 0:
@@ -948,11 +952,17 @@ class HybridEPPipelineRuntimeInitializer:
         if required_capacity <= get_hybrid_ep_initialized_capacity(active_signature):
             return
 
+        hidden_dtype = dtype if dtype is not None else self.dtype
+        if hidden_dtype.itemsize != 2:
+            raise ValueError(
+                f"HybridEP dispatches 16-bit hidden states, got {hidden_dtype}. Set distributed.pipeline.dtype "
+                "to the activation dtype (e.g. bf16) when the model stores fp32 master weights."
+            )
         try:
             self.manager.initialize_runtime(
                 num_tokens=required_capacity,
                 hidden_dim=self.hidden_dim,
-                dtype=self.dtype,
+                dtype=hidden_dtype,
                 device=device,
             )
         except Exception:
@@ -966,7 +976,7 @@ class HybridEPPipelineRuntimeInitializer:
                 "Initialized HybridEP runtime before PP schedule (capacity=%d, hidden=%d, dtype=%s).",
                 required_capacity,
                 self.hidden_dim,
-                self.dtype,
+                hidden_dtype,
             )
 
 

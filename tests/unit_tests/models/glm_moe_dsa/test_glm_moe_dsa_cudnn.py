@@ -895,7 +895,12 @@ def test_cudnn_indexer_layer_preserves_fp32_reference_scaling(monkeypatch: pytes
     monkeypatch.setattr(layer_mod, "cudnn_indexer_topk", fake_indexer)
     x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16)
     q_resid = torch.randn(4, config.q_lora_rank, dtype=torch.bfloat16)
-    expected_weights = indexer.weights_proj(x).float() * config.index_n_heads**-0.5 * config.index_head_dim**-0.5
+    # Independent oracle: the head weights are an fp32 matmul over the bf16 weight (never FP8).
+    expected_weights = (
+        torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
+        * config.index_n_heads**-0.5
+        * config.index_head_dim**-0.5
+    )
     packed_metadata = (
         torch.zeros(4, dtype=torch.int32),
         torch.arange(1, 5, dtype=torch.int32),
