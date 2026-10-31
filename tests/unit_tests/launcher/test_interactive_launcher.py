@@ -400,3 +400,92 @@ def test_is_torchrun_worker_false_local_rank_only(monkeypatch):
 
 
 import nemo_automodel.components.launcher.interactive
+
+
+# ---------------------------------------------------------------------------
+# InteractiveLauncher.launch – an explicit --nproc-per-node wins over the probe
+# ---------------------------------------------------------------------------
+def test_interactive_launcher_explicit_nproc_beats_single_device(tmp_path):
+    """--nproc-per-node 4 on a one-GPU host must start 4 workers, not silently 1."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("")
+
+    mock_dist, mock_args = _make_torch_distributed_mock(world_size=1, run_return=0)
+
+    with (
+        mock.patch.dict("sys.modules", {"torch.distributed.run": mock_dist}),
+        mock.patch(
+            "nemo_automodel.components.launcher.interactive._get_repo_root",
+            return_value=Path("/opt/Automodel"),
+        ),
+    ):
+        launcher = InteractiveLauncher()
+        rc = launcher.launch(
+            config={"key": "val"},
+            config_path=cfg_file,
+            recipe_target="some.module.Recipe",
+            launcher_config=4,
+        )
+    assert rc == 0
+    mock_dist.run.assert_called_once()
+    assert mock_args.nproc_per_node == 4
+
+
+def test_interactive_launcher_explicit_nproc_skips_device_probe(tmp_path):
+    """An explicit worker count must not consult the local device count at all."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("")
+
+    mock_dist, _ = _make_torch_distributed_mock(world_size=8, run_return=0)
+
+    with (
+        mock.patch.dict("sys.modules", {"torch.distributed.run": mock_dist}),
+        mock.patch(
+            "nemo_automodel.components.launcher.interactive._get_repo_root",
+            return_value=Path("/opt/Automodel"),
+        ),
+    ):
+        launcher = InteractiveLauncher()
+        launcher.launch(
+            config={"key": "val"},
+            config_path=cfg_file,
+            recipe_target="some.module.Recipe",
+            launcher_config=2,
+        )
+    mock_dist.determine_local_world_size.assert_not_called()
+
+
+def test_interactive_launcher_nproc_1_without_visible_cuda(tmp_path):
+    """--nproc-per-node 1 runs in-process, so a failing GPU probe must not block it."""
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("")
+
+    mock_recipe_instance = mock.MagicMock()
+    mock_recipe_instance.run_train_validation_loop.return_value = 0
+    mock_recipe_cls = mock.MagicMock(return_value=mock_recipe_instance)
+
+    mock_dist, _ = _make_torch_distributed_mock(world_size=1)
+    # torch.distributed.run raises this when torch.cuda.is_available() is False.
+    mock_dist.determine_local_world_size.side_effect = ValueError("Cuda is not available.")
+
+    with (
+        mock.patch.dict("sys.modules", {"torch.distributed.run": mock_dist}),
+        mock.patch(
+            "nemo_automodel.components.launcher.interactive.resolve_recipe_cls",
+            return_value=mock_recipe_cls,
+        ),
+        mock.patch(
+            "nemo_automodel.components.launcher.interactive._get_repo_root",
+            return_value=Path("/opt/Automodel"),
+        ),
+    ):
+        launcher = InteractiveLauncher()
+        rc = launcher.launch(
+            config={"key": "val"},
+            config_path=cfg_file,
+            recipe_target="some.module.Recipe",
+            launcher_config=1,
+        )
+    assert rc == 0
+    mock_recipe_instance.setup.assert_called_once()
+    mock_dist.determine_local_world_size.assert_not_called()
