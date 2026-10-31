@@ -84,7 +84,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
+from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, apply_mtp_kl_recovery, calculate_mtp_loss
 from nemo_automodel.components.loss.utils import (
     _count_label_tokens,
     _get_lm_head_module,
@@ -1393,18 +1393,59 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # loss paths that predate them keep their original signature.
                 if loss_weights is not None:
                     loss_distributed_kwargs["loss_weights"] = loss_weights
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                logits_for_loss = getattr(out, "logits", out)
+                hidden_states_for_loss = get_final_hidden_states(out)
+                if (
+                    is_train
+                    and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None)
+                    and getattr(self.cfg.mtp, "distillation_mode", "hard") == "soft"
+                ):
+                    # Experimental soft-MTP KL-recovery (apply_mtp_kl_recovery): must run BEFORE
+                    # the main loss below, on the SAME representation (hidden states for the
+                    # LinearCrossEntropy path, logits otherwise) that calculate_loss consumes.
+                    # Packed/THD sequences are out of scope: the main loss's own ignore_index
+                    # gradient masking only zeroes the correction at tail padding, not at
+                    # cross-document packing boundaries (see apply_mtp_kl_recovery's docstring).
+                    if mtp_per_depth_targets is not None or mtp_seq_idx is not None or mtp_is_packed:
+                        raise NotImplementedError(
+                            "mtp.distillation_mode='soft' does not yet support packed/THD sequences "
+                            "or context-parallel MTP targets"
+                        )
+                    soft_scaling_factor = (
+                        self.cfg.mtp.scaling_factor
+                        if self.cfg.mtp.scaling_factor is not None
+                        else out.mtp_loss_scaling_factor
+                    )
+                    if isinstance(self.loss_fn, LinearCrossEntropy):
+                        if mtp_per_depth_logits is not None:
+                            raise ValueError(f"MTP logits are incompatible with {type(self.loss_fn).__name__}")
+                        hidden_states_for_loss = apply_mtp_kl_recovery(
+                            hidden_states_for_loss, mtp_per_depth_h, scaling_factor=soft_scaling_factor
+                        )
+                    else:
+                        if mtp_per_depth_logits is not None:
+                            head_logits = mtp_per_depth_logits
+                        else:
+                            lm_head = _get_lm_head_module(model)
+                            if lm_head is None:
+                                raise ValueError("lm_head module not found in model")
+                            head_logits = [lm_head(h) for h in mtp_per_depth_h]
+                        logits_for_loss = apply_mtp_kl_recovery(
+                            logits_for_loss, head_logits, scaling_factor=soft_scaling_factor
+                        )
+                        del head_logits
                 local_loss = calculate_loss(
                     self.loss_fn,
-                    logits=getattr(out, "logits", out),
+                    logits=logits_for_loss,
                     labels=labels,
                     model=model,
-                    hidden_states=get_final_hidden_states(out),
+                    hidden_states=hidden_states_for_loss,
                     lm_weight=shared_lm_weight,
                     num_label_tokens=num_label_tokens,
                     **loss_distributed_kwargs,
                 )
-                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
-                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
                 if is_train and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None):
                     if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
                         # CP targets or NEAT document IDs already define the boundaries.
@@ -1469,7 +1510,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # Autograd retains tensors needed by the losses. Release the
                 # output container and auxiliary aliases before backward so
                 # unused full-vocabulary logits do not overlap its allocations.
-                del out, mtp_per_depth_h, mtp_per_depth_logits
+                # logits_for_loss/hidden_states_for_loss are extra aliases (same
+                # convention as verifier_logits above) introduced by the soft-MTP
+                # KL-recovery patch above; not in `out`'s own del, so drop them too.
+                del out, mtp_per_depth_h, mtp_per_depth_logits, logits_for_loss, hidden_states_for_loss
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()

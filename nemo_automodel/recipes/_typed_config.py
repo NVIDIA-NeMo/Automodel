@@ -642,9 +642,14 @@ class RecipeConfig:
         # output / get_mtp_loss_scaling_factor; ignore_index comes from the loss)
         # and are not exposed via YAML. This typed accessor lets recipes build MTP through
         # the typed-config boundary like the other sections.
+        # distillation_mode is the one experimental exception: an opt-in YAML
+        # `mtp:` block lets a test config select the soft-distillation prototype
+        # without touching the model-driven fields.
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
-        return MTPLossConfig()
+        node = self._raw.get("mtp", None)
+        distillation_mode = _section_kwargs(node).get("distillation_mode", "hard") if node is not None else "hard"
+        return MTPLossConfig(distillation_mode=distillation_mode)
 
     @cached_property
     def prewarm(self) -> "PrewarmConfig | None":

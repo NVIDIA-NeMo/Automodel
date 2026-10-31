@@ -45,6 +45,65 @@ class MTPLossOutput:
     per_depth_losses: list[torch.Tensor]
 
 
+def apply_mtp_kl_recovery(
+    main_repr: torch.Tensor,
+    head_reprs: Sequence[torch.Tensor],
+    *,
+    scaling_factor: float,
+) -> torch.Tensor:
+    """Route each MTP depth's forward-KL(main-head's own distribution ‖ depth's own distribution)
+    gradient into the main loss's backward, at zero extra softmax cost (experimental; non-packed
+    sequences only — see the packed-sequence guard at this function's call site).
+
+    Mechanism (straight-through estimator): for depth ``k`` (0-indexed, offset ``depth = k + 1``),
+    add ``coeff * (head_reprs[k].detach() - head_reprs[k])`` into ``main_repr`` at the aligned
+    sequence slice ``[..., depth:, :]``. This term is exactly zero in the forward pass (``x.detach()
+    - x == 0``), so the main loss's *value* computed from the returned tensor is numerically
+    identical to computing it from ``main_repr`` directly. Only the backward pass changes: the
+    main loss's own gradient at position ``depth + p`` (which the main loss already computes,
+    independent of this function) gets routed, scaled by ``-coeff``, onto ``head_reprs[k][p]``.
+
+    This function alone does *not* produce the KL gradient -- it must be combined with the
+    existing hard-label CE term for the same depths (:func:`calculate_mtp_loss`, called
+    afterward, unmodified, with the SAME ``scaling_factor``). The two gradient contributions
+    combine algebraically so that each one's ``-onehot(label)`` term cancels, leaving
+    ``coeff * (softmax(head_logits) - softmax(main_logits))`` -- the forward-KL gradient --
+    using only the two softmaxes the hard-CE MTP loss already needs (the head's own, from its CE
+    term, and the main head's own, from the main loss). No teacher-logits tensor and no extra
+    softmax are computed solely for this term.
+
+    Args:
+        main_repr: The main loss's pre-loss representation, full sequence length
+            ``[..., sequence, *]``: pre-lm_head hidden states (``LinearCrossEntropy`` /
+            ``ChunkedCrossEntropy`` main loss) or post-lm_head logits (plain CE main loss).
+        head_reprs: Per-depth tensors in the SAME representation as ``main_repr`` (hidden states
+            with hidden states, logits with logits), each full sequence length. Project
+            ``mtp_per_depth_h`` through the shared LM head yourself first when ``main_repr`` is
+            logits; see the call site in ``train_ft.py`` for the exact dispatch.
+        scaling_factor: The SAME MTP auxiliary-loss weight passed to the paired
+            :func:`calculate_mtp_loss` call. The effective per-depth coefficient is
+            ``scaling_factor / len(head_reprs)`` -- matches the existing hard-path MTP loss's own
+            ``scaling_factor / D`` weighting (see :func:`calculate_mtp_loss`), which is what makes
+            the gradient cancellation above exact rather than approximate.
+
+    Returns:
+        A new tensor (``main_repr`` is not modified in place), numerically identical to
+        ``main_repr``, with the backward graph described above attached.
+    """
+    num_depths = len(head_reprs)
+    coeff = scaling_factor / num_depths
+    seq_len = main_repr.shape[-2]
+    correction = torch.zeros_like(main_repr)
+    for k, head_repr in enumerate(head_reprs):
+        depth = k + 1
+        valid_len = seq_len - depth
+        if valid_len <= 0:
+            continue
+        aligned_head = head_repr[..., :valid_len, :]
+        correction[..., depth:, :] = correction[..., depth:, :] + coeff * (aligned_head.detach() - aligned_head)
+    return main_repr + correction
+
+
 @overload
 def calculate_mtp_loss(
     loss_fn: nn.Module,
@@ -467,6 +526,11 @@ class MTPLossConfig:
 
     scaling_factor: float | None = None
     ignore_index: int | None = None
+    # Experimental: route each MTP depth's forward-KL(main‖head) gradient into the
+    # main loss via apply_mtp_kl_recovery, on top of (not instead of) the existing
+    # hard-label CE below. Non-PP, non-packed-sequence path only; "soft" is a
+    # research/test prototype, not validated for production use.
+    distillation_mode: Literal["hard", "soft"] = "hard"
 
     def build(
         self,
