@@ -75,7 +75,10 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  # Chunked projection + CE: the last PP stage emits hidden states, so no [4096, 154880] fp32
+  # logits tensor is kept per in-flight microbatch (that is what OOMs the last stage on 80 GB H100).
+  # Same bf16-logits -> fp32-CE rounding as MaskedCrossEntropy.
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
@@ -91,6 +94,7 @@ dataset:
 
 packed_sequence:
   packed_sequence_size: 4096
+  num_proc: 8  # parallel pre-tokenization; serial packing of 100k Tulu3 samples takes ~9 min per rank
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -132,6 +136,7 @@ ci:
   time: "02:00:00"
   max_steps: 100
   env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
     # GLM-5.3 is new and may not be present in the shared NeMo-CI Hugging Face cache yet.
     HF_HUB_OFFLINE: "0"
     FINETUNE_ARGS: "--wandb.enable=true"

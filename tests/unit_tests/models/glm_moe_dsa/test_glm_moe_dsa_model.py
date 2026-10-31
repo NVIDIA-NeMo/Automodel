@@ -645,6 +645,105 @@ class TestIndexShare:
         assert out is hidden
 
 
+class TestPipelineHiddenStateOutput:
+    """Linear CE losses (chunked/fused) consume the last stage's hidden states instead of logits."""
+
+    def test_supported_flag_is_declared_and_off_by_default(self, config, backend_config):
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        assert model._pp_return_hidden_states_supported is True
+        assert model._pp_return_hidden_states is False
+
+    def test_last_stage_hidden_output_preserves_logits_and_gradients(self, config, backend_config):
+        torch.manual_seed(7)
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+        model.model.embed_tokens = None  # last (non-first) pipeline stage: hidden in, lm_head owned
+        model.train()
+        seq_len = 8
+        inputs = torch.randn(1, seq_len, config.hidden_size, requires_grad=True)
+        upstream = torch.randn(1, seq_len, config.vocab_size)
+
+        # Negative control: without the flag the stage still emits full logits.
+        reference_logits = model(inputs)
+        assert reference_logits.shape == (1, seq_len, config.vocab_size)
+        reference_logits.backward(upstream)
+        expected_input_grad = inputs.grad.clone()
+        expected_param_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+        model.zero_grad(set_to_none=True)
+        inputs.grad = None
+
+        model._pp_return_hidden_states = True
+        hidden = model(inputs)
+        assert hidden.shape == (1, seq_len, config.hidden_size)
+        _, outputs_meta = model.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=1, seq_len=seq_len, dtype=torch.float32
+        )
+        assert len(outputs_meta) == 1 and outputs_meta[0].shape == hidden.shape
+
+        # The loss owns the projection: applying lm_head outside the stage reproduces the logits path.
+        actual_logits = torch.nn.functional.linear(hidden, model.lm_head.weight)
+        torch.testing.assert_close(actual_logits, reference_logits, rtol=0, atol=0)
+        actual_logits.backward(upstream)
+        torch.testing.assert_close(inputs.grad, expected_input_grad, rtol=0, atol=0)
+        for name, parameter in model.named_parameters():
+            if name in expected_param_grads:
+                torch.testing.assert_close(parameter.grad, expected_param_grads[name], rtol=0, atol=0)
+
+    def test_last_stage_hidden_output_keeps_indexshare_carry_link(self, config, backend_config):
+        config.indexer_types = ["full", "shared", "full", "shared"]
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        model.model.embed_tokens = None
+        model._pp_return_hidden_states = True
+        hidden = torch.randn(1, 4, config.hidden_size, requires_grad=True)
+        carry_in = torch.zeros(1, 4, config.index_topk, dtype=torch.float32, requires_grad=True)
+
+        with patch.object(model.model, "forward", return_value=(hidden, torch.zeros(1, 4, 8, dtype=torch.int64))):
+            out = model(torch.zeros(1, 4, config.hidden_size), carry_in)
+
+        assert not isinstance(out, tuple)
+        assert out.shape == (1, 4, config.hidden_size)
+        torch.testing.assert_close(out, hidden, rtol=0, atol=0)  # the zero-weight carry link leaves values unchanged
+        out.sum().backward()
+        assert carry_in.grad is not None  # pipeline backward needs a defined gradient for the float32 carry
+
+    def test_thd_last_stage_restores_batch_dim_for_hidden_output(self, config, backend_config):
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        model.model.embed_tokens = None
+        model._pp_return_hidden_states = True
+        seq_len = 5
+        thd_hidden = torch.randn(seq_len, config.hidden_size).to(torch.bfloat16)  # 2D THD layout
+
+        with (
+            patch("nemo_automodel.components.models.glm_moe_dsa.model.squeeze_input_for_thd") as mock_squeeze,
+            patch.object(model.model, "forward", return_value=(thd_hidden, None)),
+        ):
+            mock_squeeze.return_value = (thd_hidden, None, None, {"qkv_format": "thd"})
+            out = model(thd_hidden.unsqueeze(0), qkv_format="thd")
+
+        # Same [1, T, *] layout the logits path produces, so the pipeline loss sees labels-shaped tokens.
+        assert out.shape == (1, seq_len, config.hidden_size)
+        torch.testing.assert_close(out[0], thd_hidden, rtol=0, atol=0)
+
+    def test_thd_metas_declare_batch_restored_hidden_output(self, config, backend_config):
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        model.backend.attn = "tilelang"  # optimized THD: 2D inter-stage hidden, batch-restored last-stage output
+        seq_len = 16
+
+        model._pp_return_hidden_states = False
+        _, logits_meta = model.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=1, seq_len=seq_len, dtype=torch.bfloat16
+        )
+        model._pp_return_hidden_states = True
+        inputs_meta, hidden_meta = model.get_pipeline_stage_metas(
+            is_first=False, microbatch_size=1, seq_len=seq_len, dtype=torch.bfloat16
+        )
+
+        assert inputs_meta[0].shape == (seq_len, config.hidden_size)  # upstream hidden stays 2D THD
+        assert logits_meta[0].shape == (1, seq_len, config.vocab_size)
+        assert len(hidden_meta) == 1 and hidden_meta[0].shape == (1, seq_len, config.hidden_size)
+        assert hidden_meta[0].dtype == torch.bfloat16
+
+
 class TestUpdateMoeGateBias:
     def test_updates_every_local_moe_gate_via_outer_model(self, config, backend_config):
         """Outer hook delegates to the inner model and updates each sparse layer's gate once."""
