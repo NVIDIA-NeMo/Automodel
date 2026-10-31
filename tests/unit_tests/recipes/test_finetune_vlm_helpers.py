@@ -3911,3 +3911,58 @@ def test_build_dataloader_forwards_inject_fake_images_false():
 
     wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
+
+
+@pytest.mark.cuda(False)
+def test_linear_ce_releases_gathered_head_before_backbone_backward(monkeypatch):
+    """The recipe must not extend a temporary full-head allocation past its last CE consumer."""
+    import weakref
+
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+    gathered = {}
+    backward_checked = []
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 6)
+            self.lm_head = torch.nn.Linear(6, 11, bias=False)
+
+        def forward(self, input_ids, **kwargs):
+            hidden = self.embed(input_ids)
+
+            def check_head_released(gradient):
+                assert gathered["reference"]() is None, "Full LM head is still retained during backbone backward"
+                backward_checked.append(True)
+                return gradient
+
+            hidden.register_hook(check_head_released)
+            return _ModelOutput(logits=torch.empty(1, 1, 11), hidden_states=[hidden])
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    def materialize_head(loss_fn, model, **kwargs):
+        # Simulate a differentiable all-gather without distributed/GPU dependencies.
+        full_weight = model.lm_head.weight.clone()
+        gathered["reference"] = weakref.ref(full_weight)
+        return full_weight
+
+    model = TinyModel()
+    recipe = _create_non_pp_recipe(model)
+    recipe.__dict__["loss_fn"] = ChunkedCrossEntropy(chunk_len=2, compile=False)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.prepare_lm_weight", materialize_head)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
+    losses = []
+    recipe._forward_backward_step(
+        idx=0,
+        batch={"input_ids": torch.tensor([[1, 2, 3, 4]]), "labels": torch.tensor([[2, 3, 4, 5]])},
+        loss_buffer=losses,
+        num_label_tokens=4,
+        num_batches=1,
+        is_train=True,
+    )
+    assert backward_checked == [True]
+    assert len(losses) == 1
+    assert all(parameter.grad is not None for parameter in model.parameters())

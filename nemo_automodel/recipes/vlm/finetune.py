@@ -1149,6 +1149,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     log=(idx == 0 and self.step_scheduler.is_remote_logging_step),
                 )
 
+                # Autograd retains the head until all CE consumers finish. Drop
+                # this Python reference so its gathered storage can then be freed.
+                del shared_lm_weight
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
