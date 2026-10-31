@@ -20,7 +20,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.utils import (
     _get_final_hidden_states,
@@ -65,8 +64,6 @@ def calculate_mtp_loss(
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
     return_per_depth: Literal[False] = False,
-    teacher_logits: torch.Tensor | None = None,
-    distillation_loss_fn: KDLoss | None = None,
 ) -> torch.Tensor: ...
 
 
@@ -89,8 +86,6 @@ def calculate_mtp_loss(
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
     return_per_depth: Literal[True],
-    teacher_logits: torch.Tensor | None = None,
-    distillation_loss_fn: KDLoss | None = None,
 ) -> MTPLossOutput: ...
 
 
@@ -113,8 +108,6 @@ def calculate_mtp_loss(
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
     return_per_depth: bool,
-    teacher_logits: torch.Tensor | None = None,
-    distillation_loss_fn: KDLoss | None = None,
 ) -> torch.Tensor | MTPLossOutput: ...
 
 
@@ -136,8 +129,6 @@ def calculate_mtp_loss(
     grad_reduce_group: dist.ProcessGroup | None = None,
     loss_weights: torch.Tensor | None = None,
     return_per_depth: bool = False,
-    teacher_logits: torch.Tensor | None = None,
-    distillation_loss_fn: KDLoss | None = None,
 ) -> torch.Tensor | MTPLossOutput:
     """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
 
@@ -189,16 +180,6 @@ def calculate_mtp_loss(
         return_per_depth: Return the aggregate loss together with the unscaled
             loss for each MTP depth. Defaults to ``False`` to preserve the
             scalar return expected by existing callers.
-        teacher_logits: Main head's logits, shape ``[batch, sequence, vocab]``
-            (or ``[tokens, vocab]`` for THD). When supplied together with
-            ``distillation_loss_fn``, each depth trains against the main
-            head's own (detached) distribution instead of the hard label —
-            experimental soft-MTP self-distillation. Mutually exclusive with
-            ``mtp_per_depth_targets`` / CP in this prototype.
-        distillation_loss_fn: :class:`KDLoss` instance used for every depth
-            when ``teacher_logits`` is supplied. ``loss_fn`` is still used to
-            resolve ``ignore_index`` for masking, but the hard-label CE path
-            is skipped entirely.
 
     Returns:
         Scalar MTP loss tensor. When ``return_per_depth=True``, returns an
@@ -210,13 +191,6 @@ def calculate_mtp_loss(
         ignore_index = loss_ignore_index
     elif ignore_index != loss_ignore_index:
         raise ValueError(f"MTP ignore_index must match the configured loss: got {ignore_index} and {loss_ignore_index}")
-
-    if (teacher_logits is None) != (distillation_loss_fn is None):
-        raise ValueError("teacher_logits and distillation_loss_fn must be supplied together")
-    if distillation_loss_fn is not None and mtp_per_depth_targets is not None:
-        raise NotImplementedError(
-            "Soft-MTP distillation does not yet support mtp_per_depth_targets (CP-prepared targets)"
-        )
 
     if mtp_per_depth_logits is not None:
         if mtp_per_depth_h is not None:
@@ -235,8 +209,6 @@ def calculate_mtp_loss(
     # batch axis when labels are flat.
     if labels.dim() == 1:
         mtp_outputs = [h.squeeze(0) if (h.dim() == 3 and h.shape[0] == 1) else h for h in mtp_outputs]
-        if teacher_logits is not None and teacher_logits.dim() == 3 and teacher_logits.shape[0] == 1:
-            teacher_logits = teacher_logits.squeeze(0)
 
     D = len(mtp_outputs)
     if mtp_per_depth_targets is not None:
@@ -263,7 +235,7 @@ def calculate_mtp_loss(
     # they accumulate on-device -> OOM for large-vocab MoE. One shared gather is
     # numerically identical (same weight); grads from every depth accumulate into
     # it and collapse to a single reduce-scatter on the sharded parameter.
-    if distillation_loss_fn is None and isinstance(loss_fn, LinearCrossEntropy) and lm_weight is None:
+    if isinstance(loss_fn, LinearCrossEntropy) and lm_weight is None:
         lm_weight = prepare_lm_weight(
             loss_fn,
             model,
@@ -289,25 +261,7 @@ def calculate_mtp_loss(
         else:
             masked = mtp_per_depth_targets[k]
 
-        if distillation_loss_fn is not None:
-            # Teacher = main head's own (detached) distribution at the position
-            # that depth k's target occupies — same roll as cur_labels/masked above,
-            # applied once directly instead of iteratively (net effect is identical).
-            rolled_teacher = roll_tensor(teacher_logits, shifts=-(k + 1), dim=-2).detach()
-            if mtp_per_depth_logits is not None:
-                student_logits = mtp_output
-            else:
-                lm_head = _get_lm_head_module(model)
-                if lm_head is None:
-                    raise ValueError("lm_head module not found in model")
-                student_logits = lm_head(mtp_output)
-            depth_loss = distillation_loss_fn(
-                student_logits=student_logits,
-                teacher_logits=rolled_teacher,
-                labels=masked,
-                num_batch_labels=num_label_tokens,
-            )
-        elif mtp_per_depth_logits is not None:
+        if mtp_per_depth_logits is not None:
             if isinstance(loss_fn, LinearCrossEntropy):
                 raise ValueError(f"MTP logits are incompatible with {type(loss_fn).__name__}")
             depth_loss = calculate_loss(
@@ -513,11 +467,6 @@ class MTPLossConfig:
 
     scaling_factor: float | None = None
     ignore_index: int | None = None
-    # Experimental: train MTP heads against the main head's own (detached)
-    # distribution via forward-KL instead of the hard label. Non-PP path only;
-    # "soft" is a research/test prototype, not validated for production use.
-    distillation_mode: Literal["hard", "soft"] = "hard"
-    distillation_temperature: float = 1.0
 
     def build(
         self,
