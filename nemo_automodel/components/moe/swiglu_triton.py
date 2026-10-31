@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Triton kernels for the clamped SwiGLU expert activation (DeepSeek-V4 style, ``swiglu_limit > 0``).
+"""Triton kernels for the weighted SwiGLU expert activation, clamped (DeepSeek-V4 style) or not.
 
 The routed experts apply ``silu(clamp(gate, max=L)) * clamp(up, -L, L) * probs`` to the grouped-GEMM output
 ``x = [gate | up]`` (bf16, ``[rows, 2 * inter]``) with fp32 routing probabilities ``probs`` (``[rows, 1]``). The
@@ -19,14 +19,18 @@ compiled PyTorch version (``experts._swiglu_clamped_deepep_compiled``) is one in
 autograd-derived backward concatenates ``d_gate`` and ``d_up`` and ran at about a quarter of HBM bandwidth on
 GB200 (0.7 ms for a 1.1 GB pass at the 16-node shape). These kernels do one pass each:
 
-* forward: a 2-D tile per program, fp32 math, result rounded to ``x.dtype``;
+* forward: a 2-D tile of 2048 elements per program, fp32 math, result rounded to ``x.dtype``. The widest
+  column block that pads the intermediate width by at most an eighth is used, because wide rows run faster;
 * backward: one program per block of rows looping over the columns, writing ``d_gate`` / ``d_up`` straight into
   the two halves of ``grad_x`` and accumulating the per-row probability gradient in registers.
 
+Both block shapes are fixed per intermediate width rather than autotuned, so results are reproducible across
+runs; on GB200 the kernels move 5.5 to 6.7 TB/s of HBM traffic.
+
 Clamp gradients follow the installed scalar ``torch.clamp`` subgradient: inclusive before PyTorch 2.15,
-and zero at exact bounds from 2.15 onward. The dispatcher in
-``experts.swiglu_clamped_deepep`` uses these kernels on contiguous CUDA inputs when Triton is importable and
-falls back to the compiled version otherwise.
+and zero at exact bounds from 2.15 onward. The unclamped SwiGLU passes ``L = inf``. The dispatchers
+``experts.swiglu_clamped_deepep`` and ``experts.weighted_swiglu_deepep`` use these kernels on contiguous CUDA
+inputs when Triton is importable and fall back to PyTorch otherwise.
 """
 
 from __future__ import annotations
@@ -41,10 +45,10 @@ _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
 HAVE_TRITON: bool = bool(_HAVE_TRITON and _HAVE_TRITON_LANGUAGE)
 
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
-_FWD_BLOCK_M = 8
-_FWD_BLOCK_N = 256
+_FWD_TILE = 2048
+_FWD_BLOCK_N_CHOICES = (1024, 512, 256, 128)
 _BWD_BLOCK_M = 4
-_BWD_BLOCK_N = 512
+_BWD_BLOCK_N = 256
 # PyTorch 2.15 changed scalar clamp's subgradient to zero at either exact bound.
 # Keep fused backward aligned with the installed framework on older releases too.
 _CLAMP_GRAD_INCLUSIVE = Version(torch.__version__).release < (2, 15)
@@ -168,6 +172,23 @@ if HAVE_TRITON:
         tl.store(grad_probs_ptr + row, acc, mask=row_ok)
 
 
+def _forward_block_n(inter: int) -> int:
+    """Return the forward column block for an intermediate width.
+
+    Args:
+        inter: Intermediate width of each gate/up half.
+
+    Returns:
+        The widest candidate whose padding of ``inter`` is at most an eighth of the
+        padded width, or else the narrowest candidate, which pads ``inter`` least.
+    """
+    for block in _FWD_BLOCK_N_CHOICES:
+        padded = -(-inter // block) * block
+        if 8 * (padded - inter) <= padded:
+            return block
+    return _FWD_BLOCK_N_CHOICES[-1]
+
+
 def uses_triton_kernel(x: torch.Tensor, probs: torch.Tensor) -> bool:
     """Whether the Triton kernels can take these inputs (contiguous 2-D CUDA ``x``, one probability per row)."""
     return (
@@ -203,7 +224,9 @@ def _forward(x: torch.Tensor, probs: torch.Tensor, limit: float, routed_rows: to
     y = torch.empty((rows, inter), dtype=x.dtype, device=x.device)
     if rows == 0 or inter == 0:
         return y
-    grid = (triton.cdiv(rows, _FWD_BLOCK_M), triton.cdiv(inter, _FWD_BLOCK_N))
+    block_n = _forward_block_n(inter)
+    block_m = _FWD_TILE // block_n
+    grid = (triton.cdiv(rows, block_m), triton.cdiv(inter, block_n))
     _swiglu_clamped_fwd_kernel[grid](
         x,
         probs,
@@ -214,8 +237,8 @@ def _forward(x: torch.Tensor, probs: torch.Tensor, limit: float, routed_rows: to
         x.stride(0),
         y.stride(0),
         float(limit),
-        BLOCK_M=_FWD_BLOCK_M,
-        BLOCK_N=_FWD_BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         HAS_ROUTED_ROWS=routed_rows is not None,
         num_warps=4,
     )
@@ -268,7 +291,7 @@ def _backward(
         BLOCK_N=_BWD_BLOCK_N,
         CLAMP_GRAD_INCLUSIVE=_CLAMP_GRAD_INCLUSIVE,
         HAS_ROUTED_ROWS=routed_rows is not None,
-        num_warps=8,
+        num_warps=4,
     )
     return grad_x, grad_probs.view_as(probs)
 

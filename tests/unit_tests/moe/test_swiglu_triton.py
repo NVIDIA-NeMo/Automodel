@@ -22,6 +22,7 @@ from nemo_automodel.components.moe.experts import (
     _swiglu_clamped_deepep_compiled,
     swiglu_clamped_deepep,
     swiglu_routed_rows,
+    weighted_swiglu_deepep,
 )
 
 pytestmark = pytest.mark.timeout(600)
@@ -114,6 +115,26 @@ def test_dispatcher_prefers_triton_on_cuda_and_matches_the_compiled_function():
     ref = _swiglu_clamped_deepep_compiled(x.detach().clone(), probs.detach().clone(), 2.0)
     assert not type(ref.grad_fn).__name__.startswith("SwigluClampedTriton") if ref.grad_fn is not None else True
     torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
+
+
+@requires_gpu_triton
+def test_weighted_swiglu_takes_triton_on_cuda_and_matches_the_fp32_reference():
+    x, probs, grad = _inputs(300, 768, 3.0, "cuda")
+    out = weighted_swiglu_deepep(x, probs)
+    assert type(out.grad_fn).__name__.startswith("SwigluClampedTriton")
+    out.backward(grad)
+    x_ref, probs_ref = x.detach().clone().requires_grad_(True), probs.detach().clone().requires_grad_(True)
+    gate, up = torch.chunk(x_ref.float(), 2, dim=-1)
+    ref = F.silu(gate) * up * probs_ref
+    ref.backward(grad.float())
+    torch.testing.assert_close(out, ref.to(x.dtype))
+    torch.testing.assert_close(x.grad, x_ref.grad.to(x.dtype))
+    torch.testing.assert_close(probs.grad, probs_ref.grad, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("inter,block_n", [(2048, 1024), (2880, 1024), (1536, 512), (768, 256), (96, 128)])
+def test_forward_block_is_the_widest_with_little_padding(inter, block_n):
+    assert swiglu_triton._forward_block_n(inter) == block_n
 
 
 @requires_gpu_triton

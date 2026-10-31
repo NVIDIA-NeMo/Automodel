@@ -64,6 +64,7 @@ from nemo_automodel.components.moe.experts import (
     get_expert_activation_for_deepep,
     is_gated_activation,
     swiglu_clamped_deepep,
+    weighted_swiglu_deepep,
 )
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
@@ -108,20 +109,19 @@ class TestActivationFunctions:
     """Test activation functions used in MoE layers."""
 
     def test_get_expert_activation_for_deepep_swiglu(self, moe_config):
-        """Test getting swiglu activation for DeepEP."""
-        moe_config.expert_activation = "swiglu"
-
-        with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
-            activation_fn = get_expert_activation_for_deepep(moe_config)
-            assert activation_fn == mock_swiglu
-
-    def test_get_expert_activation_for_deepep_swiglu_default_uses_fused(self, moe_config):
-        """``swiglu_limit == 0`` (default) keeps the fast fused ``weighted_bias_swiglu_impl`` path."""
+        """``swiglu_limit == 0`` (default) selects the unclamped weighted SwiGLU."""
         moe_config.expert_activation = "swiglu"
         moe_config.swiglu_limit = 0.0
 
+        assert get_expert_activation_for_deepep(moe_config) is weighted_swiglu_deepep
+
+    def test_weighted_swiglu_deepep_uses_the_fused_function_off_cuda(self):
+        """CPU inputs fall back to ``weighted_bias_swiglu_impl``; CUDA inputs take the Triton kernels."""
+        x = torch.randn(3, 8)
+        probs = torch.rand(3, 1)
         with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
-            assert get_expert_activation_for_deepep(moe_config) is mock_swiglu
+            assert weighted_swiglu_deepep(x, probs) is mock_swiglu.return_value
+        mock_swiglu.assert_called_once_with(x, probs)
 
     def test_get_expert_activation_for_deepep_swiglu_with_limit_uses_clamped(self, moe_config):
         """``swiglu_limit > 0`` dispatches to the clamped FP32 variant for DSV4."""
@@ -137,13 +137,12 @@ class TestActivationFunctions:
         assert activation_fn.func is swiglu_clamped_deepep
         assert activation_fn.keywords == {"limit": 7.0, "clamp_after_activation": False}
 
-    def test_get_expert_activation_for_deepep_swiglu_negative_limit_uses_fused(self, moe_config):
-        """A non-positive ``swiglu_limit`` (e.g. 0.0 or negative) falls back to the fused path."""
+    def test_get_expert_activation_for_deepep_swiglu_negative_limit_is_unclamped(self, moe_config):
+        """A non-positive ``swiglu_limit`` (e.g. 0.0 or negative) selects the unclamped SwiGLU."""
         moe_config.expert_activation = "swiglu"
         moe_config.swiglu_limit = -1.0
 
-        with patch("nemo_automodel.components.moe.experts.weighted_bias_swiglu_impl") as mock_swiglu:
-            assert get_expert_activation_for_deepep(moe_config) is mock_swiglu
+        assert get_expert_activation_for_deepep(moe_config) is weighted_swiglu_deepep
 
 
 class TestSwigluClampedDeepEP:

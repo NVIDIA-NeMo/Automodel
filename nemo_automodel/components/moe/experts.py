@@ -1282,6 +1282,24 @@ def swiglu_clamped_deepep(x, permuted_probs, limit: float, *, clamp_after_activa
     return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit)
 
 
+def weighted_swiglu_deepep(x: torch.Tensor, permuted_probs: torch.Tensor) -> torch.Tensor:
+    """Apply the routing-weighted SwiGLU: the Triton kernels on CUDA, the fused PyTorch function elsewhere.
+
+    The Triton kernels read and write each element once in each direction and round once from FP32;
+    see :mod:`nemo_automodel.components.moe.swiglu_triton`.
+
+    Args:
+        x: Grouped-GEMM output of shape [rows, 2 * inter], gate followed by up.
+        permuted_probs: Routing weights of shape [rows, 1].
+
+    Returns:
+        Tensor of shape [rows, inter] in ``x.dtype``.
+    """
+    if swiglu_triton.uses_triton_kernel(x, permuted_probs):
+        return swiglu_triton.swiglu_clamped_triton(x, permuted_probs, math.inf)
+    return weighted_bias_swiglu_impl(x, permuted_probs)
+
+
 def swiglu_routed_rows(
     x: torch.Tensor, permuted_probs: torch.Tensor, *, routed_rows: torch.Tensor, limit: float
 ) -> torch.Tensor:
@@ -1315,7 +1333,7 @@ def get_expert_activation_for_deepep(config: MoEConfig):
                 limit=config.swiglu_limit,
                 clamp_after_activation=config.swiglu_clamp_after_activation,
             )
-        return weighted_bias_swiglu_impl
+        return weighted_swiglu_deepep
     elif config.expert_activation == "swigluoai":
         return partial(
             swiglu_oai_deepep,
