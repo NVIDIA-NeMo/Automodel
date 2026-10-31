@@ -170,6 +170,7 @@ PROVIDER_ORGS = {
     "internlm": "internlm",
     "lgai-exaone": "LGAI-EXAONE",
     "lightricks": "Lightricks",
+    "liquidai": "LiquidAI",
     "llava-hf": "llava-hf",
     "lmms-lab": "lmms-lab",
     "meta": "meta-llama",

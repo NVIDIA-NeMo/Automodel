@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from nemo_automodel.components.models.gemma4_moe import cp_attention as cpa
 
@@ -127,15 +128,18 @@ def test_varlen_ring_cp1_single_doc_matches_sdpa(Hq, Hkv):
     out = cpa._Gemma4FFPAVarlenRingAttention.apply(qf, kf, vf, _ring_ctx(qf, kf, vf, doc))
     out.sum().backward()
 
-    qr, kr, vr = (t.clone().requires_grad_(True) for t in (q, k, v))
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        qr, kr, vr, is_causal=True, scale=_SCALE, enable_gqa=(Hq != Hkv)
-    )
+    # Keep the oracle and its leaf gradients in FP32; BF16 reference rounding
+    # and automatic backend selection must not determine kernel parity.
+    qr, kr, vr = (t.float().requires_grad_(True) for t in (q, k, v))
+    with sdpa_kernel(SDPBackend.MATH):
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            qr, kr, vr, is_causal=True, scale=_SCALE, enable_gqa=(Hq != Hkv)
+        )
     ref.sum().backward()
 
-    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
     for got, exp in ((qf, qr), (kf, kr), (vf, vr)):
-        assert torch.allclose(got.grad.float(), exp.grad.float(), atol=3e-2, rtol=2e-2)
+        torch.testing.assert_close(got.grad.float(), exp.grad, atol=3e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("Hq,Hkv", [(8, 8), (8, 4)])
@@ -163,12 +167,15 @@ def test_varlen_ring_cp1_packed_matches_blockdiag_sdpa(Hq, Hkv):
     allowed[~real, 0] = True  # pad rows attend pos 0 (output discarded)
     mask = torch.zeros(S, S, device=dev).masked_fill(~allowed, float("-inf")).view(1, 1, S, S)
 
-    qr, kr, vr = (t.clone().requires_grad_(True) for t in (q, k, v))
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        qr, kr, vr, attn_mask=mask.to(dt), scale=_SCALE, enable_gqa=(Hq != Hkv)
-    )
-    ref.backward(g)
+    # Keep the oracle and its leaf gradients in FP32; BF16 reference rounding
+    # and automatic backend selection must not determine kernel parity.
+    qr, kr, vr = (t.float().requires_grad_(True) for t in (q, k, v))
+    with sdpa_kernel(SDPBackend.MATH):
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            qr, kr, vr, attn_mask=mask, scale=_SCALE, enable_gqa=(Hq != Hkv)
+        )
+    ref.backward(g.float())
 
-    assert torch.allclose(out.float()[:, :, real], ref.float()[:, :, real], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(out.float()[:, :, real], ref[:, :, real], atol=2e-2, rtol=2e-2)
     for got, exp in ((qf, qr), (kf, kr), (vf, vr)):
-        assert torch.allclose(got.grad.float()[:, :, real], exp.grad.float()[:, :, real], atol=3e-2, rtol=2e-2)
+        torch.testing.assert_close(got.grad.float()[:, :, real], exp.grad[:, :, real], atol=3e-2, rtol=2e-2)
