@@ -66,3 +66,6 @@ checkpoint:
   checkpoint_dir: checkpoints/zephon-model-parallel
 dist_env:
   backend: nccl
+
+ci:
+  cluster_tag: h100

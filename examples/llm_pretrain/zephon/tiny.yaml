@@ -61,3 +61,6 @@ checkpoint:
   checkpoint_dir: checkpoints/zephon-tiny
 dist_env:
   backend: nccl
+
+ci:
+  cluster_tag: h100
