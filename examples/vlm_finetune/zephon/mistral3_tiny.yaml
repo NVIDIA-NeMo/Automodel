@@ -63,3 +63,9 @@ checkpoint:
 dist_env:
   backend: nccl
   timeout_minutes: 10
+
+ci:
+  cluster_tag: h100
+  recipe_owner: MaxiBoether
+  time: "00:30:00"
+  nodes: 1
