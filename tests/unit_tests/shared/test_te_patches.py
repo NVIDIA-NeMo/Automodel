@@ -733,6 +733,52 @@ class TestFusedAdamCachedListsPatch:
         _set_grads(params, seed=102)
         assert all(torch.equal(value, p.grad) for value, p in zip(grads_step3, params[:2]))
 
+    @pytest.mark.parametrize("count", [1024, 1025])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_cached_calls_bound_tensor_batches_without_losing_or_repeating_parameters(
+        self, monkeypatch: pytest.MonkeyPatch, count: int, dtype: torch.dtype
+    ) -> None:
+        _, FusedAdam, calls = self._patched_module(monkeypatch)
+        params = [torch.nn.Parameter(torch.ones(1, dtype=dtype)) for _ in range(count)]
+        optimizer = FusedAdam(params)
+        steps = self._run(optimizer, params, 3, calls)
+        assert optimizer.original_calls == 1
+        assert optimizer.param_groups[0]["step"] == 3
+        for step in steps[1:]:
+            assert len(step) == (1 if count == 1024 else 2)
+            assert [len(columns[0]) for _, _, columns in step] == ([1024] if count == 1024 else [1024, 1])
+            assert all(len(column) <= 1024 for _, _, columns in step for column in columns)
+            assert all(len({len(column) for column in columns}) == 1 for _, _, columns in step)
+            expected_kernel = "multi_tensor_adam_param_remainder" if dtype == torch.bfloat16 else "multi_tensor_adam"
+            assert all(kernel == expected_kernel for kernel, _, _ in step)
+            assert all(args == step[0][1] for _, args, _ in step)
+            expected_columns = [params, [optimizer.state[param]["exp_avg"] for param in params]]
+            expected_columns.append([optimizer.state[param]["exp_avg_sq"] for param in params])
+            if dtype == torch.bfloat16:
+                expected_columns.append([optimizer.state[param]["master_param"] for param in params])
+            for index, tensors in enumerate(expected_columns, start=1):
+                assert [ptr for _, _, columns in step for ptr, _ in columns[index]] == [
+                    tensor.data_ptr() for tensor in tensors
+                ]
+        assert [ptr for _, _, columns in steps[-1] for ptr, _ in columns[0]] == [
+            param.grad.data_ptr() for param in params
+        ]
+
+    def test_mixed_small_and_large_groups_update_each_parameter_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _, FusedAdam, calls = self._patched_module(monkeypatch)
+        small = _fake_params()
+        large = [torch.nn.Parameter(torch.ones(1)) for _ in range(1025)]
+        optimizer = FusedAdam(small)
+        optimizer.add_param_group({**optimizer.param_groups[0], "params": large})
+        steps = self._run(optimizer, small + large, 3, calls)
+        assert optimizer.original_calls == 1
+        assert [group["step"] for group in optimizer.param_groups] == [3, 3]
+        for step in steps[1:]:
+            assert len(step) == 4
+            assert [ptr for _, _, columns in step for ptr, _ in columns[1]] == [
+                param.data_ptr() for param in small + large
+            ]
+
     def test_missing_gradient_falls_back_and_rebuilds(self, monkeypatch):
         _, FusedAdam, calls = self._patched_module(monkeypatch)
         params = _fake_params()
@@ -906,3 +952,69 @@ class TestFusedAdamCachedListsPatch:
         finally:
             if dist.is_initialized():
                 dist.destroy_process_group()
+
+
+@pytest.mark.run_only_on("GPU")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native TE optimizer parity")
+@pytest.mark.parametrize("count", [4, 1025])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_cached_fused_adam_matches_native_updates(count: int, dtype: torch.dtype) -> None:
+    """Compare cached and native CUDA updates, including large and empty parameter groups."""
+    module = pytest.importorskip("transformer_engine.pytorch.optimizers.fused_adam")
+    # Native numerical parity cannot detect a changed resource cap; TE 2.19 has no cap constant.
+    assert (
+        getattr(module, "_MAX_TENSORS_PER_MULTI_TENSOR_ADAM_CALL", 1024)
+        == te_patches_module._FUSED_ADAM_MAX_TENSORS_PER_CALL
+    )
+    optimizer_type = module.FusedAdam
+    # Recipe setup tests may already have installed this wrapper on the real TE class.
+    original_step = getattr(optimizer_type.step, "_nemo_original_step", optimizer_type.step)
+    native_step = MagicMock(wraps=original_step)
+    torch.manual_seed(123)
+    params = [torch.nn.Parameter(torch.randn(4, device="cuda", dtype=dtype)) for _ in range(count)]
+    reference_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
+    moment_dtype = torch.bfloat16 if dtype == torch.bfloat16 else torch.float32
+    optimizer = optimizer_type(
+        [{"params": params}, {"params": []}],
+        master_weights=True,
+        store_param_remainders=True,
+        exp_avg_dtype=moment_dtype,
+        exp_avg_sq_dtype=moment_dtype,
+    )
+    reference = optimizer_type(
+        [{"params": reference_params}, {"params": []}],
+        master_weights=True,
+        store_param_remainders=True,
+        exp_avg_dtype=moment_dtype,
+        exp_avg_sq_dtype=moment_dtype,
+    )
+    # Restore all three methods changed by the compatibility patch after this test.
+    with (
+        torch.no_grad(),
+        patch.object(optimizer_type, "step", native_step),
+        patch.object(optimizer_type, "load_state_dict", optimizer_type.load_state_dict),
+        patch.object(optimizer_type, "add_param_group", optimizer_type.add_param_group),
+    ):
+        _apply_fused_adam_cached_lists_patch()
+        assert optimizer_type.step is not native_step
+        for step in range(4):
+            for index, (param, reference_param) in enumerate(zip(params, reference_params)):
+                grad = None if step == 2 and index == 0 else torch.randn_like(param)
+                param.grad = grad
+                reference_param.grad = None if grad is None else grad.clone()
+            original_step(reference)
+            optimizer.step()
+            torch.testing.assert_close(torch.stack(params), torch.stack(reference_params), rtol=0, atol=0)
+            state_names = (
+                ("exp_avg", "exp_avg_sq", "master_param") if dtype == torch.bfloat16 else ("exp_avg", "exp_avg_sq")
+            )
+            for name in state_names:
+                torch.testing.assert_close(
+                    torch.stack([optimizer.state[param][name] for param in params]),
+                    torch.stack([reference.state[param][name] for param in reference_params]),
+                    rtol=0,
+                    atol=0,
+                )
+            assert [group["step"] for group in optimizer.param_groups] == [step + 1, step + 1]
+            assert [group["step"] for group in reference.param_groups] == [step + 1, step + 1]
+        native_step.assert_called_once()  # First step initializes state; the other three use the cache.
