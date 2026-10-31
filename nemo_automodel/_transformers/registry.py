@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
+            "Lfm2VlForConditionalGeneration",
+            ("nemo_automodel.components.models.d1.vl_model", "Lfm2VlForConditionalGeneration"),
+        ),
+        ("D1OmniModel", ("nemo_automodel.components.models.d1.model", "D1OmniModel")),
+        (
             "BagelForUnifiedMultimodal",
             (
                 "nemo_automodel.components.models.bagel.model",
@@ -412,6 +417,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "d1_omni": ("nemo_automodel.components.models.d1.config", "D1OmniConfig"),
     "step5": ("nemo_automodel.components.models.step5.configuration", "Step5Config"),
     "step5_vl": ("nemo_automodel.components.models.step5.configuration", "Step5VLConfig"),
     "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),

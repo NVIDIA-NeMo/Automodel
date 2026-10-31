@@ -497,7 +497,7 @@ class StepSchedulerConfig:
 
     def build(
         self,
-        dataloader: DataLoader,
+        dataloader: DataLoader | None,
         dp_group_size: int,
         local_batch_size: int,
         process_group: ProcessGroup | None = None,
@@ -507,7 +507,7 @@ class StepSchedulerConfig:
         """Build the step scheduler.
 
         Args:
-            dataloader: The training dataloader.
+            dataloader: The training dataloader, or None when max_steps is explicit.
             dp_group_size: The size of the data parallel group.
             local_batch_size: The size of the local batch.
             process_group: Process group whose ranks participate in distributed signal handling.

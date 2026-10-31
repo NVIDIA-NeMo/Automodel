@@ -43,6 +43,7 @@ def test_make_magi_attn_func_matches_sdpa_causal() -> None:
     import torch.distributed as dist
     import torch.nn.functional as F
     from einops import rearrange
+    from torch.nn.attention import SDPBackend, sdpa_kernel
 
     torch.cuda.set_device(0)
     cp_group = _init_single_rank_cp_group()
@@ -57,11 +58,14 @@ def test_make_magi_attn_func_matches_sdpa_causal() -> None:
 
         attn = mu.make_magi_attn_func(softmax_scale=hd**-0.5)
         out = attn(q, k, v)  # thd layout [S, nh, hd]
+        torch.cuda.synchronize()  # Attribute any asynchronous failure to Magi, before running the oracle.
 
         qh = rearrange(q, "s nh hd -> 1 nh s hd")
         kh = rearrange(k, "s nh hd -> 1 nh s hd").repeat_interleave(nh_q // nh_kv, 1)
         vh = rearrange(v, "s nh hd -> 1 nh s hd").repeat_interleave(nh_q // nh_kv, 1)
-        ref = rearrange(F.scaled_dot_product_attention(qh, kh, vh, is_causal=True), "1 nh s hd -> s nh hd")
+        # Use the independent dense-math oracle rather than compiling/selecting another fused backend.
+        with sdpa_kernel(SDPBackend.MATH):
+            ref = rearrange(F.scaled_dot_product_attention(qh, kh, vh, is_causal=True), "1 nh s hd -> s nh hd")
 
         rel = (out.float() - ref.float()).abs().max() / (ref.float().abs().max() + 1e-6)
         assert rel.item() < 5e-3, f"magi vs sdpa rel={rel.item()}"
