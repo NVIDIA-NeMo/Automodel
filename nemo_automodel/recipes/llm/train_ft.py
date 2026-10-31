@@ -82,6 +82,7 @@ from nemo_automodel.components.loggers.mlflow_utils import (
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss, calculate_mtp_loss
@@ -1202,6 +1203,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = False
 
     # ------------------ helpers ------------------
+    def _get_mtp_distillation_loss_fn(self, ignore_index: int, temperature: float) -> KDLoss:
+        """Lazily build and cache the experimental soft-MTP KD loss (mtp.distillation_mode='soft')."""
+        cached = getattr(self, "_mtp_distillation_loss_fn", None)
+        if cached is None or cached.ignore_index != ignore_index or cached.temperature != temperature:
+            cached = KDLoss(ignore_index=ignore_index, temperature=temperature)
+            self._mtp_distillation_loss_fn = cached
+        return cached
+
     def _forward_backward_step(
         self,
         idx,
@@ -1423,6 +1432,29 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     scaling_factor = (
                         mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
                     )
+                    distillation_kwargs = {}
+                    if getattr(mtp_cfg, "distillation_mode", "hard") == "soft":
+                        # Experimental soft-MTP prototype: requires the main head's full
+                        # per-position logits, which only exist when the main loss is NOT
+                        # LinearCrossEntropy (that path only materializes a logits_to_keep=1
+                        # slice). Not validated for production; see kashif/experiment/soft-mtp.
+                        teacher_logits = getattr(out, "logits", None)
+                        if (
+                            not isinstance(teacher_logits, torch.Tensor)
+                            or teacher_logits.dim() < 2
+                            or teacher_logits.shape[-2] != labels.shape[-1]
+                        ):
+                            raise ValueError(
+                                "mtp.distillation_mode='soft' requires full per-position main-head "
+                                "logits; it is incompatible with a LinearCrossEntropy/ChunkedCrossEntropy "
+                                "main loss_fn (which only keeps a 1-token logits slice)."
+                            )
+                        distillation_kwargs = {
+                            "teacher_logits": teacher_logits.detach(),
+                            "distillation_loss_fn": self._get_mtp_distillation_loss_fn(
+                                ignore_index, getattr(mtp_cfg, "distillation_temperature", 1.0)
+                            ),
+                        }
                     local_loss = local_loss + calculate_mtp_loss(
                         self.loss_fn,
                         mtp_per_depth_h=mtp_per_depth_h,
@@ -1438,6 +1470,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         cu_seqlens=mtp_cu_seqlens,
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
+                        **distillation_kwargs,
                     )
                 elif not is_train and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None):
                     # Eval-only: score against the verifier, no loss term added, so val_loss
