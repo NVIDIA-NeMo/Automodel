@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Indexer key-normalization epsilon follows the HuggingFace implementation (Apache-2.0).
+# Copyright 2025 the HuggingFace Team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/41251
+# Revision: 513146c175a534a913b8cfd448b9a06f0caf9365
+# Original file: src/transformers/models/deepseek_v32/modeling_deepseek_v32.py
+
 """DeepSeek V3.2 Layers.
 
 Contains the DeepseekV32Indexer for top-k sparse attention selection
@@ -145,7 +151,7 @@ class DeepseekV32Indexer(nn.Module):
         )
 
         # LayerNorm for K (official uses LayerNorm, not RMSNorm)
-        self.k_norm = nn.LayerNorm(self.head_dim, dtype=dtype)
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype)
 
         # Per-head weight projection from hidden states
         self.weights_proj = initialize_linear_module(

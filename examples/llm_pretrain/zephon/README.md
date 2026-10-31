@@ -14,8 +14,8 @@ Zephon concepts, pipeline operations, and API questions, see the
 
 Start with an AutoModel checkout and a CUDA training environment, following the
 [AutoModel installation instructions](../../../README.md#getting-started).
-Zephon is included in this checkout's Python dependencies; installing the project
-also installs the pinned Zephon revision.
+Zephon is included in this checkout's Python dependencies. Installing the project
+also installs Zephon 0.2.1 or later from PyPI.
 
 The small text example creates a local tokenizer and corpus, then trains a tiny
 Llama model from random weights. Run both commands from the repository root:
