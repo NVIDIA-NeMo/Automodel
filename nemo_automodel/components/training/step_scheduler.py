@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import logging
 import signal
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
+from itertools import islice
 from math import ceil
 from typing import TYPE_CHECKING
 
+import torch
+import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler, SignalLike
@@ -77,7 +81,9 @@ class StepScheduler(Stateful):
         max_steps: int | None = None,
         preemption_signal: SignalLike | list[SignalLike] | None = signal.SIGTERM,
         process_group: ProcessGroup | None = None,
-    ):
+        *,
+        synchronized_stream: bool = False,
+    ) -> None:
         """
         Initialize the StepScheduler.
 
@@ -106,6 +112,11 @@ class StepScheduler(Stateful):
                 ``signal.Signals`` member. When ``None``, no signal handler is installed and preemption
                 checkpointing is disabled. Default: ``signal.SIGTERM``.
             process_group: Process group whose ranks participate in distributed signal handling.
+                Also includes every rank that must agree on stream completion.
+            synchronized_stream: Whether the loader owns a single, potentially finite stream.
+                Only full accumulation windows available on every rank are yielded. Source
+                exhaustion ends training without restarting an epoch. This is a runtime
+                loader contract, not a source repetition policy.
         """
         if global_batch_size <= 0:
             raise ValueError(f"global_batch_size must be greater than 0, got {global_batch_size}")
@@ -126,6 +137,10 @@ class StepScheduler(Stateful):
                 "Please ensure that global_batch_size >= (local_batch_size * dp_size)"
             )
         self.dataloader = dataloader
+        self._synchronized_stream = synchronized_stream
+        self._completion_group = process_group
+        self._stream_exhausted = False
+        self._step_in_progress = False
         self.step = start_step
         if start_step < 0:
             raise ValueError(f"start_step must be greater than or equal to 0, got {start_step}")
@@ -201,6 +216,9 @@ class StepScheduler(Stateful):
         """
         if self.step >= self.max_steps:
             return
+        if self._synchronized_stream:
+            yield from self._iter_stream()
+            return
         batch_buffer = []
         for batch in self.dataloader:
             batch_buffer.append(batch)
@@ -214,6 +232,70 @@ class StepScheduler(Stateful):
             yield batch_buffer
             self.step += 1
         self.epoch += 1
+
+    def _iter_stream(self) -> Iterator[list[Mapping[str, object]]]:
+        """Yield complete accumulation windows after collective availability checks.
+
+        Returns:
+            Iterator of microbatch mappings passed through without mutation. Tensor fields
+            keep their loader-defined layouts (token fields typically have shape
+            [local_batch, sequence]); this scheduler does not transform tensor contents.
+
+        The only buffered data is the current optimizer step, as in the native iterator.
+        There is no next-step lookahead that could advance checkpointed data progress.
+        """
+        if self._stream_exhausted:
+            return
+        iterator = None
+        while self.step < self.max_steps and not self.sigterm_flag:
+            batches = []
+            error = None
+            try:
+                if iterator is None:
+                    iterator = iter(self.dataloader)
+                batches = list(islice(iterator, self.grad_acc_steps))
+            except Exception as exc:
+                # Propagate source errors on all ranks before any model collective.
+                error = exc
+            status = 0 if error is not None else (2 if len(batches) == self.grad_acc_steps else 1)
+            if dist.is_available() and dist.is_initialized():
+                backend = dist.get_backend(self._completion_group)
+                device = torch.device("cuda", torch.cuda.current_device()) if backend == "nccl" else torch.device("cpu")
+                availability = torch.tensor(status, dtype=torch.int32, device=device)
+                dist.all_reduce(availability, op=dist.ReduceOp.MIN, group=self._completion_group)
+                status = int(availability.item())
+            if status == 0:
+                if error is not None:
+                    raise RuntimeError("Reading the synchronized training stream failed") from error
+                raise RuntimeError("Reading the synchronized training stream failed on another rank")
+            if status == 1:
+                self._stream_exhausted = True
+                self.epoch += 1
+                if batches:
+                    logger.warning(
+                        "Discarding %d local microbatches at final stream exhaustion; "
+                        "a complete optimizer step is not available on every rank. "
+                        "These batches are recorded as consumed in the terminal checkpoint",
+                        len(batches),
+                    )
+                if self.step == 0:
+                    raise RuntimeError(
+                        "Training stream ended before a complete optimizer step was available on every rank"
+                    )
+                return
+            self._step_in_progress = True
+            yield batches
+            self.step += 1
+            self._step_in_progress = False
+
+    @property
+    def stream_exhausted(self) -> bool:
+        """Whether synchronized source exhaustion ended training before its step cap.
+
+        Recipes can use this after iteration to write a final checkpoint without
+        reading ahead into the next optimizer step.
+        """
+        return self._stream_exhausted
 
     def set_epoch(self, epoch: int):
         """
@@ -286,7 +368,7 @@ class StepScheduler(Stateful):
         """
         # we +1 here because the step is incremented after
         # the batch is yielded in the tail handling of __iter__
-        if self.step + 1 >= self.max_steps:
+        if self._stream_exhausted or self.step + 1 >= self.max_steps:
             return True
         # Last batch of the last epoch when epochs are exhausted before max_steps.
         if self.num_epochs is not None and self.epoch + 1 >= self.num_epochs:
@@ -327,7 +409,7 @@ class StepScheduler(Stateful):
         """
         epoch = self.epoch
         for e in range(epoch, self.num_epochs):
-            if self.step >= self.max_steps or self.sigterm_received:
+            if self._stream_exhausted or self.step >= self.max_steps or self.sigterm_received:
                 return
             yield e
 
@@ -342,6 +424,12 @@ class StepScheduler(Stateful):
         # and the checkpointing happens after the yield but before the increment.
         # Added min(self.max_steps, self.step + 1) to ensure that the step is not greater than max_steps.
         # for example, if state_dict is called outside the for loop that increments step scheduler.
+        if self._synchronized_stream:
+            return {
+                "step": min(self.max_steps, self.step + int(self._step_in_progress)),
+                "epoch": self.epoch,
+                "stream_exhausted": self._stream_exhausted,
+            }
         return {"step": min(self.max_steps, self.step + 1), "epoch": self.epoch}
 
     def load_state_dict(self, s):
@@ -352,6 +440,8 @@ class StepScheduler(Stateful):
             s (dict): Dictionary containing 'step' and 'epoch'.
         """
         self.step, self.epoch = s["step"], s["epoch"]
+        self._stream_exhausted = bool(s.get("stream_exhausted", False))
+        self._step_in_progress = False
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +501,8 @@ class StepSchedulerConfig:
         dp_group_size: int,
         local_batch_size: int,
         process_group: ProcessGroup | None = None,
+        *,
+        synchronized_stream: bool | None = None,
     ) -> StepScheduler:
         """Build the step scheduler.
 
@@ -419,6 +511,10 @@ class StepSchedulerConfig:
             dp_group_size: The size of the data parallel group.
             local_batch_size: The size of the local batch.
             process_group: Process group whose ranks participate in distributed signal handling.
+                All ranks participating in training must also agree on stream completion.
+            synchronized_stream: Whether to coordinate complete accumulation windows and
+                stop at final source exhaustion without restarting the loader. None
+                uses the loader's ``synchronized_stream`` capability, defaulting to False.
 
         Returns:
             Configured StepScheduler.
@@ -428,4 +524,9 @@ class StepSchedulerConfig:
         kwargs["dp_size"] = dp_group_size
         kwargs["dataloader"] = dataloader
         kwargs["process_group"] = process_group
+        kwargs["synchronized_stream"] = (
+            bool(getattr(dataloader, "synchronized_stream", False))
+            if synchronized_stream is None
+            else synchronized_stream
+        )
         return StepScheduler(**kwargs)

@@ -24,7 +24,8 @@ from transformers.models.glm46v.video_processing_glm46v import Glm46VVideoProces
 
 from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn
 from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
-from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _build_packed_vlm_sample, _shift_sample
+from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _shift_sample
+from nemo_automodel.components.datasets.vlm.preprocessing import merge_vlm_documents
 from nemo_automodel.components.models.glm5_next.image_processing import Glm5NextImageProcessor
 
 
@@ -176,9 +177,7 @@ def test_pretokenized_pack_preserves_each_document_stop_target(processor):
         assert sample["labels"][-1] == processor.tokenizer.eos_token_id
         assert sample["labels"].ne(-100).any()
     shifted = [_shift_sample(sample) for sample in samples]
-    packed = _build_packed_vlm_sample(
-        shifted, pack_size=sum(len(s["input_ids"]) for s in shifted), padding_idx=processor.tokenizer.pad_token_id
-    )
+    packed = merge_vlm_documents(shifted, padding_idx=processor.tokenizer.pad_token_id)
     boundary = len(shifted[0]["input_ids"])
     assert packed["labels"][boundary - 1] == processor.tokenizer.eos_token_id
     assert packed["labels"][-1] == processor.tokenizer.eos_token_id

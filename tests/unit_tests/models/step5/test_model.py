@@ -29,7 +29,8 @@ from transformers import AutoConfig
 
 from nemo_automodel._transformers.registry import resolve_custom_config_cls
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
-from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _build_packed_vlm_sample, _shift_sample
+from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _shift_sample
+from nemo_automodel.components.datasets.vlm.preprocessing import merge_vlm_documents
 from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.activation_checkpointing import make_selective_checkpoint_context_fn
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
@@ -471,7 +472,7 @@ def test_native_vlm_packing_contract() -> None:
         )
     packing = configure_packing_for_models([model])
     assert packing.packed_mask_type == "document_ids"
-    assert not packing.requires_packed_sequence_metadata  # Model uses reset positions directly.
+    assert not packing.return_packed_sequence_metadata  # Model uses reset positions directly.
 
 
 def test_native_vlm_packing_preserves_crops() -> None:
@@ -489,7 +490,7 @@ def test_native_vlm_packing_preserves_crops() -> None:
             sample["patch_pixel_values"] = torch.full((count, 3, 56, 56), float(index + 10))
         samples.append(sample)
     shifted = [_shift_sample(sample) for sample in samples]
-    packed = _build_packed_vlm_sample(shifted, 64, 0)
+    packed = merge_vlm_documents(shifted, padding_idx=0)
     batch = neat_packed_vlm_collater([packed], packing=PackingCapabilities(packed_mask_type="document_ids"))
     assert "patch_pixel_values" in batch
     assert "num_patches" in batch
@@ -562,7 +563,7 @@ def test_vlm_packed_fp32_independent_documents_and_gradients() -> None:
 
     def batch_for(documents):
         return neat_packed_vlm_collater(
-            [_build_packed_vlm_sample([_shift_sample(s) for s in documents], 128, 0)], packing=packing
+            [merge_vlm_documents([_shift_sample(s) for s in documents], padding_idx=0)], packing=packing
         )
 
     def evaluate(batch):

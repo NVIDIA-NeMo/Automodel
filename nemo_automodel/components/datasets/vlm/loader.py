@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Sized
+from collections.abc import Callable, Iterator, Sized
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -36,6 +36,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_cha
 from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDatasetConfig
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    BatchOutputFormat,
     PackedSequenceContract,
     resolve_packing_contract,
 )
@@ -53,6 +54,31 @@ logger = logging.getLogger(__name__)
 
 VlmCollateFn = Callable[[list[object]], object]
 _VLM_PARENT_DATASET_STATE = "_vlm_parent_dataset_state"
+
+
+class ImagePositionState(Protocol):
+    """Serialization-safe model-owned image-position calculation."""
+
+    def positions(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        mm_token_type_ids: torch.Tensor,
+        image_grid_thw: torch.Tensor | None,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return scalar or multi-axis positions from unshifted fields.
+
+        Args:
+            input_ids: Token IDs [sequence].
+            mm_token_type_ids: Processor modality IDs [1, sequence].
+            image_grid_thw: Image grids [images, 3], or None for text-only input.
+            attention_mask: Processor token eligibility [sequence].
+
+        Returns:
+            Integer positions [sequence] or [position_axes, sequence], without input mutation.
+        """
+        ...
 
 
 class _VlmStatefulDataloader(StatefulDataLoader):
@@ -263,8 +289,20 @@ class VlmCollatorConfig:
 class VlmDataloaderBuild:
     """Materialized VLM dataloader and its processor."""
 
-    dataloader: DataLoader
+    dataloader: DataLoader | Iterator[object]
     processor: ProcessorMixin | None
+
+
+def apply_vlm_chat_template(processor: ProcessorMixin | None, chat_template: str | None) -> None:
+    """Apply the same resolved conversation template to processor and tokenizer."""
+    if chat_template is None or processor is None:
+        return
+    resolved = _resolve_chat_template(chat_template)
+    processor.chat_template = resolved
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("A processor tokenizer is required to apply dataset.chat_template")
+    tokenizer.chat_template = resolved
 
 
 @dataclass
@@ -285,6 +323,16 @@ class VlmDataloaderConfig:
     prefetch_factor: int | None = None
     drop_last: bool = False
 
+    @property
+    def is_packed(self) -> bool:
+        """Whether this loader emits packed multimodal inputs."""
+        return self.packing is not None
+
+    @property
+    def output_format(self) -> BatchOutputFormat:
+        """Selected native batch representation, independent of the packing algorithm."""
+        return "thd" if self.packing is not None and self.packing.packing_format == "thd" else "batched"
+
     def _build_source(
         self,
         *,
@@ -298,13 +346,7 @@ class VlmDataloaderConfig:
             processor = self.processor_config.build(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
             )
-            if self.chat_template is not None and processor is not None:
-                chat_template = _resolve_chat_template(self.chat_template)
-                processor.chat_template = chat_template
-                tokenizer = getattr(processor, "tokenizer", None)
-                if tokenizer is None:
-                    raise ValueError("A processor tokenizer is required to apply dataset.chat_template")
-                tokenizer.chat_template = chat_template
+            apply_vlm_chat_template(processor, self.chat_template)
 
             if isinstance(self.dataset_config, RankedVlmDatasetConfig):
                 dataset = self.dataset_config.build(rank=dp_rank, world_size=dp_world_size)
@@ -332,6 +374,8 @@ class VlmDataloaderConfig:
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         pp_n_microbatches: int | None = None,
         cp_size: int = 1,
+        position_state_factory: Callable[[], ImagePositionState] | None = None,
+        ignore_index: int = -100,
     ) -> VlmDataloaderBuild:
         """Build the processor, dataset wrappers, sampler, collator, and dataloader.
 
@@ -350,10 +394,15 @@ class VlmDataloaderConfig:
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
                 compact document IDs instead of a dense quadratic attention mask;
                 THD packing also accounts for per-document CP alignment.
+            position_state_factory: Parent-only stream-backend position-state factory.
+                Native preprocessing uses ``get_rope_index`` and never invokes this factory.
+            ignore_index: Stream-backend label exclusion value. Native collators retain
+                their existing configured supervision policy.
 
         Returns:
             Named result containing the stateful dataloader and runtime processor.
         """
+        del position_state_factory, ignore_index
         if self.num_workers < 0:
             raise ValueError("VLM num_workers must be zero (automatic workers) or a positive worker count.")
         dataset, processor = self._build_source(
@@ -405,6 +454,7 @@ class VlmDataloaderConfig:
                     max_length=self.packing.collate_max_length,
                     packing=packing_contract,
                     materialize_4d_mask=materialize_4d_mask,
+                    defer_flash_metadata=pp_n_microbatches is not None,
                 )
         elif self.collator is not None:
             collate_fn = self.collator.build(processor=processor)

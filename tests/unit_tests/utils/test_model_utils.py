@@ -738,6 +738,16 @@ def test_non_phi4mm_use_cache_unchanged():
 
 
 class TestFilterForwardKwargs:
+    def test_rejects_dropping_attention_policy_from_strict_forward(self):
+        class Model(nn.Module):
+            def forward(self, input_ids, cu_seq_lens_q=None, cu_seq_lens_k=None, max_length_q=None, max_length_k=None):
+                return input_ids
+
+        with pytest.raises(ValueError, match="cannot receive _packed_seq_ids"):
+            model_utils.filter_forward_kwargs(
+                Model(), {"input_ids": torch.ones(1, 2), "_packed_seq_ids": torch.ones(1, 2)}
+            )
+
     def test_drops_unsupported_kwargs(self):
         class Model(nn.Module):
             def forward(self, input_ids, attention_mask=None):

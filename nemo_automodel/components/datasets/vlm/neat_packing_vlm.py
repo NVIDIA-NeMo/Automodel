@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 from nemo_automodel.components.datasets.llm.neat_packing import (
     greedy_knapsack,
 )
+from nemo_automodel.components.datasets.vlm.preprocessing import merge_vlm_documents
 from nemo_automodel.components.datasets.vlm.samplers import (
     LengthGroupedSampler,
     _smart_resize_image,
@@ -447,129 +448,6 @@ def _aligned_length(length: int, alignment: int) -> int:
     return ((length + alignment - 1) // alignment) * alignment
 
 
-def _build_packed_vlm_sample(
-    samples: list[dict],
-    pack_size: int,
-    padding_idx: int,
-    has_mrope: bool = False,
-    sequence_alignment: int = 1,
-) -> dict:
-    """Concatenate shifted VLM samples, including per-document alignment padding."""
-    if has_mrope and sequence_alignment > 1:
-        raise NotImplementedError("Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented.")
-
-    all_input_ids: list[int] = []
-    all_labels: list[int] = []
-    all_attention_mask: list[int] = []
-    all_mm_token_type_ids: list[int] = []
-    all_position_ids_1d: list[int] = []
-    mrope_position_ids_list: list[torch.Tensor] = []
-    seq_lens: list[int] = []
-    seq_lens_padded: list[int] = []
-
-    pixel_values_list: list[torch.Tensor | list[torch.Tensor]] = []
-    patch_pixel_values_list: list[torch.Tensor] = []
-    num_patches_list: list[torch.Tensor] = []
-    image_grid_thw_list: list[torch.Tensor] = []
-    image_position_ids_list: list[torch.Tensor] = []
-    pixel_values_videos_list: list[torch.Tensor] = []
-    video_grid_thw_list: list[torch.Tensor] = []
-    second_per_grid_ts_list: list[torch.Tensor] = []
-    n_images = 0
-    n_videos = 0
-
-    for seq_idx, sample in enumerate(samples, start=1):
-        ids = sample["input_ids"]
-        labs = sample["labels"]
-        if isinstance(ids, torch.Tensor):
-            ids = ids.tolist()
-        if isinstance(labs, torch.Tensor):
-            labs = labs.tolist()
-
-        seq_len = len(ids)
-        padded_seq_len = _aligned_length(seq_len, sequence_alignment)
-        pad = padded_seq_len - seq_len
-        seq_lens.append(seq_len)
-        seq_lens_padded.append(padded_seq_len)
-        all_input_ids.extend(ids + [padding_idx] * pad)
-        all_labels.extend(labs + [-100] * pad)
-        all_attention_mask.extend([seq_idx] * padded_seq_len)
-
-        mm_ttids = sample.get("mm_token_type_ids")
-        if mm_ttids is not None:
-            mm_ttids = mm_ttids.tolist() if isinstance(mm_ttids, torch.Tensor) else list(mm_ttids)
-            all_mm_token_type_ids.extend(mm_ttids + [0] * pad)
-        else:
-            all_mm_token_type_ids.extend([0] * padded_seq_len)
-
-        if has_mrope and "position_ids" in sample:
-            mrope_position_ids_list.append(sample["position_ids"])
-        else:
-            all_position_ids_1d.extend(range(padded_seq_len))
-
-        if "pixel_values" in sample and sample["pixel_values"] is not None:
-            pixel_values_list.append(sample["pixel_values"])
-        if "patch_pixel_values" in sample and sample["patch_pixel_values"] is not None:
-            patch_pixel_values_list.append(sample["patch_pixel_values"])
-        if "num_patches" in sample and sample["num_patches"] is not None:
-            num_patches_list.append(torch.as_tensor(sample["num_patches"], dtype=torch.long))
-        if "image_grid_thw" in sample and sample["image_grid_thw"] is not None:
-            n_images += sample["image_grid_thw"].shape[0]
-            image_grid_thw_list.append(sample["image_grid_thw"])
-        if "image_position_ids" in sample and sample["image_position_ids"] is not None:
-            image_position_ids_list.append(sample["image_position_ids"])
-        if "pixel_values_videos" in sample and sample["pixel_values_videos"] is not None:
-            pixel_values_videos_list.append(sample["pixel_values_videos"])
-        if "video_grid_thw" in sample and sample["video_grid_thw"] is not None:
-            n_videos += sample["video_grid_thw"].shape[0]
-            video_grid_thw_list.append(sample["video_grid_thw"])
-        if "second_per_grid_ts" in sample and sample["second_per_grid_ts"] is not None:
-            second_per_grid_ts_list.append(sample["second_per_grid_ts"])
-
-    # No padding here — collater pads to batch-max for efficiency.
-    packed = {
-        "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
-        "labels": torch.tensor(all_labels, dtype=torch.long),
-        "attention_mask": torch.tensor(all_attention_mask, dtype=torch.long),
-        "mm_token_type_ids": torch.tensor(all_mm_token_type_ids, dtype=torch.long),
-        "seq_lens": seq_lens,
-        "seq_lens_padded": seq_lens_padded,
-        "n_images": n_images,
-        "n_videos": n_videos,
-    }
-
-    if has_mrope and mrope_position_ids_list:
-        packed["position_ids"] = torch.cat(mrope_position_ids_list, dim=1)
-    else:
-        packed["position_ids"] = torch.tensor(all_position_ids_1d, dtype=torch.long)
-
-    if pixel_values_list and all(isinstance(value, torch.Tensor) for value in pixel_values_list):
-        if all(value.shape[1:] == pixel_values_list[0].shape[1:] for value in pixel_values_list):
-            packed["pixel_values"] = torch.cat(pixel_values_list, dim=0)
-        else:
-            # Variable-resolution images (e.g. dynamic-resolution processors): keep
-            # one tensor per image; the THD collater and the model's feature
-            # extractor accept the list form.
-            packed["pixel_values"] = [image for value in pixel_values_list for image in value]
-    elif pixel_values_list and all(isinstance(value, (list, tuple)) for value in pixel_values_list):
-        packed["pixel_values"] = [item for value in pixel_values_list for item in value]
-    elif pixel_values_list:
-        raise TypeError("Packed VLM pixel_values must be consistently tensors or variable-resolution lists.")
-    else:
-        packed["pixel_values"] = None
-    if patch_pixel_values_list:
-        packed["patch_pixel_values"] = torch.cat(patch_pixel_values_list, dim=0)
-    if num_patches_list:
-        packed["num_patches"] = torch.cat(num_patches_list, dim=0)
-    packed["image_grid_thw"] = torch.cat(image_grid_thw_list, dim=0) if image_grid_thw_list else None
-    packed["image_position_ids"] = torch.cat(image_position_ids_list, dim=0) if image_position_ids_list else None
-    packed["pixel_values_videos"] = torch.cat(pixel_values_videos_list, dim=0) if pixel_values_videos_list else None
-    packed["video_grid_thw"] = torch.cat(video_grid_thw_list, dim=0) if video_grid_thw_list else None
-    packed["second_per_grid_ts"] = torch.cat(second_per_grid_ts_list, dim=0) if second_per_grid_ts_list else None
-
-    return packed
-
-
 # ---------------------------------------------------------------------------
 # PackedDatasetWrapper — lazy packing via __getitem__
 # ---------------------------------------------------------------------------
@@ -716,10 +594,9 @@ class PackedDatasetWrapper(torch.utils.data.Dataset):
             # Fallback: return a padding-only pack
             kept = [{"input_ids": torch.tensor([], dtype=torch.long), "labels": torch.tensor([], dtype=torch.long)}]
 
-        return _build_packed_vlm_sample(
+        return merge_vlm_documents(
             kept,
-            self.pack_size,
-            self.padding_idx,
+            padding_idx=self.padding_idx,
             has_mrope=self.has_mrope,
             sequence_alignment=self.sequence_alignment,
         )

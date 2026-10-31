@@ -23,6 +23,22 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def resolve_chat_template_string(
+    chat_template: str | dict[str, str] | None, *, tools: list[dict] | None = None
+) -> str | None:
+    """Select one template for both rendering and supervision inspection.
+
+    Named templates use HF's tool-use preference when tools are supplied,
+    otherwise ``default`` or the first named template. An empty mapping has no
+    template. This does not interpret template strings as filesystem paths.
+    """
+    if isinstance(chat_template, dict):
+        if tools is not None and "tool_use" in chat_template:
+            return chat_template["tool_use"]
+        return chat_template.get("default", next(iter(chat_template.values()), None))
+    return chat_template
+
+
 def _resolve_chat_template(chat_template: str | None) -> str | None:
     """Resolve a chat template string that may be a file path.
 
@@ -981,11 +997,12 @@ def format_chat_template(
     if not _has_chat_template(tokenizer):
         raise ValueError("Tokenizer lacks a usable chat template (chat_template/apply_chat_template)")
 
-    # Resolve the template string — some tokenizers store multiple templates as a dict
-    # (keyed by name, e.g. "default", "tool_use"). We need the raw string for regex checks.
-    chat_template_str = tokenizer.chat_template
-    if isinstance(chat_template_str, dict):
-        chat_template_str = chat_template_str.get("default", next(iter(chat_template_str.values())))
+    chat_template_str = resolve_chat_template_string(tokenizer.chat_template, tools=tools)
+    if not chat_template_str:
+        raise ValueError("Tokenizer lacks a usable chat template")
+    if isinstance(tokenizer.chat_template, dict):
+        # Every auxiliary render must use the same template as the mask checks.
+        template_kwargs["chat_template"] = chat_template_str
 
     template_has_generation_kwd = GENERATION_REGEX.search(chat_template_str) is not None
     template_mentions_reasoning_content = "reasoning_content" in chat_template_str
