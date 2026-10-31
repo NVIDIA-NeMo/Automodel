@@ -12,18 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared eager, dropless NCCL-EP transport through Transformer Engine."""
+"""Eager, dropless NCCL-EP token transport through Transformer Engine."""
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import ModuleType
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
+from nemo_automodel.components.models.common.utils import NcclEpConfig
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+
+# NCCL-EP reads group options from the environment once, when the group is created.
+# The scan layout fills each expert's receive slots in (source rank, token) order.
+# The default single-NVLink-domain layout assigns slots atomically, so a
+# non-reentrant activation-checkpoint recompute could pair recomputed expert
+# activations with a layout other than the one the forward's routing handle holds.
+_ORDERED_LAYOUT_ENV = "NCCL_EP_HT_EM_AG_SCAN_MODE"
 
 
 @dataclass
@@ -45,89 +55,68 @@ def finalize_nccl_ep() -> None:
         _runtime.settings = None
 
 
-@dataclass(kw_only=True)
-class NcclEpConfig:
-    """NCCL-EP capacity, identical on every EP rank and layer in a process.
+@contextmanager
+def _ordered_layout_environment() -> Iterator[None]:
+    """Select NCCL-EP's ordered expert layout for groups created inside the block."""
+    previous = os.environ.get(_ORDERED_LAYOUT_ENV)
+    os.environ[_ORDERED_LAYOUT_ENV] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_ORDERED_LAYOUT_ENV, None)
+        else:
+            os.environ[_ORDERED_LAYOUT_ENV] = previous
+
+
+def _join_transport(
+    *, group: dist.ProcessGroup, capacity: int, hidden_dim: int, num_experts: int, top_k: int
+) -> ModuleType:
+    """Bootstrap the process-wide transport once, or check that it matches these settings.
 
     Args:
-        max_tokens_per_rank: Upper bound on tokens entering one MoE layer per
-            microbatch, including masked tokens. Required when selecting NCCL-EP.
-            Rounded up to a multiple of 64 for the transport. Shorter inputs are
-            padded with invalid routes; receive buffers remain dropless and dynamic.
+        group: NCCL expert-parallel group with contiguous expert ownership.
+        capacity: Group-uniform input extent, a multiple of 64.
+        hidden_dim: Width of each dispatched token.
+        num_experts: Global expert count across the EP group.
+        top_k: Distinct expert selections per token.
+
+    Returns:
+        Transformer Engine's NCCL-EP API module.
     """
-
-    max_tokens_per_rank: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.max_tokens_per_rank is not None and self.max_tokens_per_rank <= 0:
-            raise ValueError("nccl_ep.max_tokens_per_rank must be positive")
-
-    def build(
-        self,
-        *,
-        group: dist.ProcessGroup,
-        hidden_dim: int,
-        num_experts: int,
-        top_k: int,
-        num_sms: int,
-    ) -> NcclEpManager:
-        """Initialize the transport collectively, outside forward/recomputation.
-
-        Args:
-            group: NCCL expert-parallel group with contiguous expert ownership.
-            hidden_dim: Width of each dispatched token.
-            num_experts: Global expert count, divisible by the EP group size.
-            top_k: Distinct expert selections per token.
-            num_sms: Transport SM budget; zero lets NCCL-EP choose.
-
-        Returns:
-            A layer-local manager sharing the process-wide communication context.
-        """
-        if self.max_tokens_per_rank is None:
-            raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
-        if group.size() < 2 or num_experts % group.size():
-            raise ValueError("NCCL-EP requires EP size >= 2 dividing the global expert count")
-        if not 0 < top_k <= num_experts or hidden_dim <= 0 or num_sms < 0:
-            raise ValueError("Invalid NCCL-EP top-k, hidden dimension, or SM budget")
-        available, api = safe_import("transformer_engine.pytorch.ep")
-        if available:
-            available, _ = safe_import_from("transformer_engine_torch", "ep_initialize")
-        if not available:
-            raise ImportError(
-                "dispatcher='nccl_ep' requires Transformer Engine with NCCL-EP support "
-                "and its transformer_engine.pytorch.ep API; the default public-wheel "
-                "installation disables NCCL-EP."
-            )
-        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
-            raise RuntimeError("NCCL-EP requires Hopper or newer CUDA GPUs (SM90+)")
-        if dist.get_backend(group) != "nccl":
-            raise ValueError("NCCL-EP requires an NCCL process group")
-        capacity = (self.max_tokens_per_rank + 63) // 64 * 64
-        settings = (capacity, hidden_dim, num_experts, top_k, num_sms, torch.cuda.current_device())
-        if _runtime.api is None:
-            if api.is_ep_bootstrapped():
-                raise RuntimeError("NCCL-EP is already initialized outside AutoModel; finalize that context first")
+    available, api = safe_import("transformer_engine.pytorch.ep")
+    if available:
+        available, _ = safe_import_from("transformer_engine_torch", "ep_initialize")
+    if not available:
+        raise ImportError(
+            "dispatcher='nccl_ep' requires Transformer Engine with NCCL-EP support "
+            "and its transformer_engine.pytorch.ep API; the default public-wheel "
+            "installation disables NCCL-EP."
+        )
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+        raise RuntimeError("NCCL-EP requires Hopper or newer CUDA GPUs (SM90+)")
+    if dist.get_backend(group) != "nccl":
+        raise ValueError("NCCL-EP requires an NCCL process group")
+    settings = (capacity, hidden_dim, num_experts, top_k, torch.cuda.current_device())
+    if _runtime.api is None:
+        if api.is_ep_bootstrapped():
+            raise RuntimeError("NCCL-EP is already initialized outside AutoModel; finalize that context first")
+        with _ordered_layout_environment():
             api.ep_bootstrap(
                 group,
                 num_experts=num_experts,
                 max_tokens_per_rank=capacity,
                 hidden_dim=hidden_dim,
                 num_topk=top_k,
-                max_num_sms=num_sms,
+                # Zero lets NCCL-EP size its kernels. An explicit budget would also cap its
+                # token-reordering kernels, which otherwise use every SM.
+                max_num_sms=0,
                 recv_capacity_per_rank=None,
             )
-            _runtime.api, _runtime.group, _runtime.settings = api, group, settings
-        elif _runtime.group is not group or _runtime.settings != settings:
-            raise ValueError("NCCL-EP supports one EP group and one capacity/shape/SM configuration per process")
-        return NcclEpManager(
-            api=api,
-            max_tokens=self.max_tokens_per_rank,
-            capacity=capacity,
-            hidden_dim=hidden_dim,
-            num_experts=num_experts,
-            num_local_experts=num_experts // group.size(),
-            top_k=top_k,
-        )
+        _runtime.api, _runtime.group, _runtime.settings = api, group, settings
+    elif _runtime.group is not group or _runtime.settings != settings:
+        raise ValueError("NCCL-EP supports one EP group and one capacity/shape configuration per process")
+    return api
 
 
 class NcclEpManager:
@@ -135,32 +124,40 @@ class NcclEpManager:
 
     def __init__(
         self,
+        config: NcclEpConfig,
         *,
-        api: ModuleType,
-        max_tokens: int,
-        capacity: int,
+        group: dist.ProcessGroup,
         hidden_dim: int,
         num_experts: int,
-        num_local_experts: int,
         top_k: int,
     ) -> None:
-        """Keep layer-local routing state for an initialized NCCL-EP context.
+        """Join the process-wide transport and set up layer-local routing state.
+
+        The first manager in a process bootstraps NCCL-EP collectively on ``group``, so
+        every EP rank must construct it with identical arguments, outside forward and
+        activation-checkpoint recomputation. Later managers must use the same settings.
 
         Args:
-            api: Transformer Engine NCCL-EP API owning the shared transport.
-            max_tokens: Upper bound on real input rows for this layer.
-            capacity: Group-uniform input extent, padded to a multiple of 64.
+            config: NCCL-EP settings shared by every layer and EP rank.
+            group: NCCL expert-parallel group with contiguous expert ownership.
             hidden_dim: Width of each dispatched token.
-            num_experts: Global expert count across the EP group.
-            num_local_experts: Number of contiguous experts owned by this EP rank.
+            num_experts: Global expert count, divisible by the EP group size.
             top_k: Distinct expert selections per token.
         """
-        self.api = api
-        self.max_tokens = max_tokens
-        self.capacity = capacity
+        if config.max_tokens_per_rank is None:
+            raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
+        if group.size() < 2 or num_experts % group.size():
+            raise ValueError("NCCL-EP requires EP size >= 2 dividing the global expert count")
+        if not 0 < top_k <= num_experts or hidden_dim <= 0:
+            raise ValueError("Invalid NCCL-EP top-k or hidden dimension")
+        self.max_tokens = config.max_tokens_per_rank
+        self.capacity = (config.max_tokens_per_rank + 63) // 64 * 64
+        self.api = _join_transport(
+            group=group, capacity=self.capacity, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k
+        )
         self.hidden_dim = hidden_dim
         self.num_experts = num_experts
-        self.num_local_experts = num_local_experts
+        self.num_local_experts = num_experts // group.size()
         self.top_k = top_k
         self.token_indices: torch.Tensor | None = None
         self.token_probs: torch.Tensor | None = None
@@ -190,13 +187,15 @@ class NcclEpManager:
         """Dispatch into a fresh expert-packed buffer with differentiable weights.
 
         Args:
-            hidden_states: BF16 CUDA tensor of shape [local_tokens, hidden].
+            hidden_states: BF16 CUDA tensor of shape [local_tokens, hidden], with at
+                most ``max_tokens_per_rank`` rows.
             async_finish: Must be false; TE owns stream ordering.
             allocate_on_comm_stream: Must be false; TE owns allocations.
 
         Returns:
-            BF16 tensor of shape [received_tokens, hidden], packed by local expert.
-            Storage is unique to this call and retained by TE autograd through backward.
+            BF16 tensor of shape [received_tokens, hidden], packed by local expert and,
+            within an expert, ordered by source rank and token. Storage is unique to this
+            call and retained by TE autograd through backward.
         """
         if async_finish or allocate_on_comm_stream:
             raise ValueError("NCCL-EP uses Transformer Engine stream ordering")
@@ -222,11 +221,12 @@ class NcclEpManager:
             num_local_experts=self.num_local_experts,
             recv_capacity_per_rank=None,
         )
-        padding = self.capacity - num_tokens
-        tokens = F.pad(hidden_states, (0, 0, 0, padding)).contiguous()
-        indices = F.pad(self.token_indices.to(torch.int64), (0, 0, 0, padding), value=-1).contiguous()
-        weights = F.pad(self.token_probs.float(), (0, 0, 0, padding)).contiguous()
-        received, self.dispatched_probs, self.tokens_per_expert = self.api.ep_dispatch(buffer, tokens, indices, weights)
+        received, self.dispatched_probs, self.tokens_per_expert = self.api.ep_dispatch(
+            buffer,
+            hidden_states.contiguous(),
+            self.token_indices.to(torch.int64).contiguous(),
+            self.token_probs.float().contiguous(),
+        )
         self._buffer = buffer
         self._num_tokens = num_tokens
         return received
@@ -270,7 +270,7 @@ class NcclEpManager:
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> torch.Tensor:
-        """Combine expert outputs and remove invalid padding tokens.
+        """Combine expert outputs back into the dispatched token order.
 
         Args:
             hidden_states: BF16 tensor of shape [received_tokens, hidden],
@@ -285,10 +285,10 @@ class NcclEpManager:
             raise ValueError("NCCL-EP uses Transformer Engine stream ordering")
         if self._buffer is None:
             raise RuntimeError("NCCL-EP combine requires a matching dispatch")
-        result = self.api.ep_combine(self._buffer, hidden_states.contiguous(), num_local_tokens=self.capacity)
+        result = self.api.ep_combine(self._buffer, hidden_states.contiguous(), num_local_tokens=self._num_tokens)
         self._buffer = None
         self.dispatched_probs = None
         self.tokens_per_expert = None
         self.token_indices = None
         self.token_probs = None
-        return result[: self._num_tokens]
+        return result

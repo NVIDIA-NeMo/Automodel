@@ -14,17 +14,88 @@
 
 """CPU contract tests; the emulated transport does not validate NCCL kernels."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-import nemo_automodel.shared.nccl_ep as nccl_ep
-from nemo_automodel.components.models.common.utils import BackendConfig
+import nemo_automodel.components.moe.nccl_ep as nccl_ep
+from nemo_automodel.components.models.common.utils import BackendConfig, NcclEpConfig
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
+from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, _has_dispatched_rows
 from nemo_automodel.components.moe.layers import MoE
+
+_ORDERED_LAYOUT_ENV = "NCCL_EP_HT_EM_AG_SCAN_MODE"
+
+
+class _Dispatch(torch.autograd.Function):
+    """Emulated TE dispatch whose routing handle rides on ctx, outside saved tensors."""
+
+    @staticmethod
+    def forward(ctx, tokens, weights, buffer):
+        """Gather routed rows in the buffer's layout.
+
+        Args:
+            tokens: Tensor of shape [tokens, hidden].
+            weights: Tensor of shape [tokens, top_k].
+            buffer: Routing state whose ``rows`` and ``slots`` have shape [received_tokens].
+
+        Returns:
+            Received rows [received_tokens, hidden] and their weights [received_tokens].
+        """
+        ctx.buffer = buffer
+        ctx.shapes = tokens.shape, weights.shape
+        return tokens[buffer.rows], weights[buffer.rows, buffer.slots]
+
+    @staticmethod
+    def backward(ctx, grad_received, grad_weights):
+        """Scatter received-row gradients back through the handle held on ctx.
+
+        Args:
+            grad_received: Tensor of shape [received_tokens, hidden].
+            grad_weights: Tensor of shape [received_tokens].
+
+        Returns:
+            Gradients for tokens [tokens, hidden] and weights [tokens, top_k].
+        """
+        rows, slots = ctx.buffer.rows, ctx.buffer.slots
+        token_shape, weight_shape = ctx.shapes
+        grad_tokens = grad_received.new_zeros(token_shape).index_add(0, rows, grad_received)
+        grad_topk = grad_weights.new_zeros(weight_shape).index_put((rows, slots), grad_weights, accumulate=True)
+        return grad_tokens, grad_topk, None
+
+
+class _Combine(torch.autograd.Function):
+    """Emulated TE combine with the same ctx-held routing handle."""
+
+    @staticmethod
+    def forward(ctx, expert_out, buffer, num_local_tokens):
+        """Sum received rows back into source tokens.
+
+        Args:
+            expert_out: Tensor of shape [received_tokens, hidden].
+            buffer: Routing state from the matching dispatch.
+            num_local_tokens: Rows of the result.
+
+        Returns:
+            Tensor of shape [num_local_tokens, hidden].
+        """
+        ctx.buffer = buffer
+        return expert_out.new_zeros(num_local_tokens, expert_out.shape[1]).index_add(0, buffer.rows, expert_out)
+
+    @staticmethod
+    def backward(ctx, grad):
+        """Gather source-token gradients into the layout of the handle held on ctx.
+
+        Args:
+            grad: Tensor of shape [num_local_tokens, hidden].
+
+        Returns:
+            Gradient for the received rows, [received_tokens, hidden].
+        """
+        return grad[ctx.buffer.rows], None, None
 
 
 class _Transport:
@@ -32,11 +103,15 @@ class _Transport:
         self.bootstraps = []
         self.buffers = []
         self.finalized = 0
+        self.ordered = False
+        self.dispatches = 0
 
     def is_ep_bootstrapped(self):
         return False
 
     def ep_bootstrap(self, group, **kwargs):
+        # NCCL-EP reads its layout option from the environment when the group is created.
+        self.ordered = os.environ.get(_ORDERED_LAYOUT_ENV) == "1"
         self.bootstraps.append((group, kwargs))
 
     def ep_finalize(self):
@@ -50,28 +125,32 @@ class _Transport:
     def ep_dispatch(self, buffer, tokens, indices, weights):
         """Route CPU tensors to emulate the public TE contract.
 
+        Without the ordered layout, rows within an expert change order between
+        dispatches of identical routing, as with NCCL-EP's atomic slot assignment.
+
         Args:
             buffer: Per-call routing state.
-            tokens: Tensor of shape [capacity, hidden].
-            indices: Tensor of shape [capacity, top_k].
-            weights: Tensor of shape [capacity, top_k].
+            tokens: Tensor of shape [tokens, hidden], with at most capacity rows.
+            indices: Tensor of shape [tokens, top_k], with -1 for masked routes.
+            weights: Tensor of shape [tokens, top_k].
 
         Returns:
             Expert-packed activations [received_tokens, hidden], probabilities
             [received_tokens], and counts [local_experts].
         """
-        assert tokens.shape[0] == indices.shape[0] == weights.shape[0] == buffer.max_tokens_per_rank
+        assert tokens.shape[0] == indices.shape[0] == weights.shape[0] <= buffer.max_tokens_per_rank
         assert indices.dtype == torch.int64 and weights.dtype == torch.float32
         assert tokens.is_contiguous() and indices.is_contiguous() and weights.is_contiguous()
         rows, slots = (indices >= 0).nonzero(as_tuple=True)
-        order = indices[rows, slots].argsort(stable=True)
-        rows, slots = rows[order], slots[order]
-        buffer.rows = rows
-        return (
-            tokens[rows],
-            weights[rows, slots],
-            torch.bincount(indices[rows, slots], minlength=buffer.num_local_experts),
-        )
+        experts = indices[rows, slots]
+        position = torch.arange(rows.numel())
+        if not self.ordered and self.dispatches % 2:
+            position = position.flip(0)
+        self.dispatches += 1
+        order = (experts * (rows.numel() + 1) + position).argsort()
+        buffer.rows, buffer.slots = rows[order], slots[order]
+        received, probs = _Dispatch.apply(tokens, weights, buffer)
+        return received, probs, torch.bincount(experts, minlength=buffer.num_local_experts)
 
     def ep_combine(self, buffer, expert_out, *, num_local_tokens):
         """Sum packed expert outputs back into source rows.
@@ -79,12 +158,12 @@ class _Transport:
         Args:
             buffer: Per-call routing state.
             expert_out: Tensor of shape [received_tokens, hidden].
-            num_local_tokens: Padded output extent.
+            num_local_tokens: Rows of the dispatched input.
 
         Returns:
-            Tensor of shape [capacity, hidden].
+            Tensor of shape [num_local_tokens, hidden].
         """
-        return expert_out.new_zeros(num_local_tokens, expert_out.shape[1]).index_add(0, buffer.rows, expert_out)
+        return _Combine.apply(expert_out, buffer, num_local_tokens)
 
 
 @pytest.fixture
@@ -108,8 +187,8 @@ def group():
 
 
 def _manager(group, *, max_tokens=5, hidden_dim=4):
-    return nccl_ep.NcclEpConfig(max_tokens_per_rank=max_tokens).build(
-        group=group, hidden_dim=hidden_dim, num_experts=4, top_k=2, num_sms=20
+    return nccl_ep.NcclEpManager(
+        NcclEpConfig(max_tokens_per_rank=max_tokens), group=group, hidden_dim=hidden_dim, num_experts=4, top_k=2
     )
 
 
@@ -210,6 +289,29 @@ def test_context_reuse_rejection_and_cleanup(transport, group):
     assert transport.finalized == 1
     _manager(group, hidden_dim=8)
     assert len(transport.bootstraps) == 2
+
+
+@pytest.mark.parametrize("previous", [None, "0"])
+def test_group_uses_ordered_layout_and_automatic_sms(transport, group, monkeypatch, previous):
+    if previous is None:
+        monkeypatch.delenv(_ORDERED_LAYOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_ORDERED_LAYOUT_ENV, previous)
+    _manager(group)
+    assert transport.ordered
+    assert transport.bootstraps[0][1]["max_num_sms"] == 0
+    assert os.environ.get(_ORDERED_LAYOUT_ENV) == previous
+
+
+@pytest.mark.parametrize("rows", [0, 3])
+def test_nccl_ep_row_check_reads_the_host_extent(rows):
+    # A meta tensor cannot be read on the host: the NCCL-EP check must not touch the counts.
+    counts = torch.empty(2, dtype=torch.int64, device="meta")
+    received = torch.empty(rows, 4)
+    assert _has_dispatched_rows(received, counts, never_empty=False, dispatcher_backend="nccl_ep") == (rows > 0)
+    assert _has_dispatched_rows(received, counts, never_empty=True, dispatcher_backend="deepep")
+    with pytest.raises(RuntimeError):
+        _has_dispatched_rows(received, counts, never_empty=False, dispatcher_backend="deepep")
 
 
 @pytest.mark.parametrize(
@@ -382,7 +484,7 @@ def test_backend_preserves_explicit_selection(experts):
     config = BackendConfig(dispatcher="nccl_ep", experts=experts, nccl_ep={"max_tokens_per_rank": 17})
     assert config.dispatcher == "nccl_ep"
     assert config.experts == experts
-    assert isinstance(config.nccl_ep, nccl_ep.NcclEpConfig)
+    assert isinstance(config.nccl_ep, NcclEpConfig)
     assert config.nccl_ep.max_tokens_per_rank == 17
 
 

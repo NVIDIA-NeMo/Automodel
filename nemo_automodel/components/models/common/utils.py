@@ -32,7 +32,6 @@ from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
-from nemo_automodel.shared.nccl_ep import NcclEpConfig
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -410,6 +409,29 @@ class MoKBackendConfig:
         )
 
 
+@dataclass(kw_only=True, frozen=True)
+class NcclEpConfig:
+    """Configuration for the optional NCCL-EP token dispatcher (``dispatcher="nccl_ep"``).
+
+    Every EP rank and every NCCL-EP layer in a process must use the same settings.
+    NCCL-EP sizes its dispatch and combine kernels itself; its ``NCCL_EP_COMM_SMS``
+    environment variable tunes that budget.
+
+    Attributes:
+        max_tokens_per_rank: Upper bound on tokens entering one MoE layer per
+            microbatch on one rank, including masked tokens. Required when selecting
+            NCCL-EP. The transport rounds it up to a multiple of 64; inputs may be
+            shorter. Receive buffers remain dropless and are sized per dispatch.
+    """
+
+    max_tokens_per_rank: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate settings that do not depend on a CUDA device or EP group."""
+        if self.max_tokens_per_rank is not None and self.max_tokens_per_rank <= 0:
+            raise ValueError("nccl_ep.max_tokens_per_rank must be positive")
+
+
 AttentionBackend = Literal["torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi"]
 
 
@@ -455,7 +477,8 @@ class BackendConfig:
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
             "nccl_ep" uses Transformer Engine NCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
-        nccl_ep: NCCL-EP token capacity; required when selecting "nccl_ep".
+        nccl_ep: NCCL-EP settings; ``max_tokens_per_rank`` is required when selecting
+            "nccl_ep". NCCL-EP sizes its own kernels and ignores ``dispatcher_num_sms``.
         mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers. NCCL-EP always keeps routing state layer-local.

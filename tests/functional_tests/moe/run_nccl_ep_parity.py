@@ -28,7 +28,7 @@ from torch.utils.checkpoint import checkpoint
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
-from nemo_automodel.shared.nccl_ep import finalize_nccl_ep
+from nemo_automodel.components.moe.nccl_ep import finalize_nccl_ep
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,75 @@ def _check_case(experts, global_up, global_down, *, rank, world_size, case, chec
     logger.info("rank=%d case=%s checkpoint=%s: output, gradients, norm and update passed", rank, case, checkpointed)
 
 
+def _check_checkpoint_recompute(mesh, *, rank: int, world_size: int) -> None:
+    """Compare gradients with and without non-reentrant recomputation at a realistic size.
+
+    NCCL-EP backward reuses the forward's routing handle while recomputation
+    redispatches the tokens, so the recomputed expert layout must match the forward's.
+    A few tokens keep their order by accident; thousands of routes per expert do not
+    unless the transport fixes the order of each expert's receive slots.
+
+    Args:
+        mesh: One-dimensional EP device mesh.
+        rank: EP rank.
+        world_size: EP size.
+    """
+    tokens, hidden_dim, top_k = 4096, 512, 4
+    config = MoEConfig(
+        n_routed_experts=world_size * 8,
+        n_shared_experts=0,
+        n_activated_experts=top_k,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=hidden_dim,
+        inter_dim=256,
+        moe_inter_dim=256,
+        norm_topk_prob=False,
+    )
+    backend = BackendConfig(
+        dispatcher="nccl_ep", experts="torch_mm", nccl_ep={"max_tokens_per_rank": tokens}, attn="sdpa", linear="torch"
+    )
+    experts = MoE(config, backend).experts.cuda().bfloat16()
+    torch.manual_seed(29)
+    global_up = (torch.randn_like(experts.gate_and_up_projs.float()) * 0.02).bfloat16()
+    global_down = (torch.randn_like(experts.down_projs.float()) * 0.02).bfloat16()
+    experts.gate_and_up_projs = torch.nn.Parameter(distribute_tensor(global_up, mesh, [Shard(0)]))
+    experts.down_projs = torch.nn.Parameter(distribute_tensor(global_down, mesh, [Shard(0)]))
+    experts.init_token_dispatcher(mesh)
+    torch.manual_seed(31 + rank)
+    hidden = (torch.randn(tokens, hidden_dim, device="cuda") * 0.2).bfloat16()
+    probs, indices = torch.randn(tokens, config.n_routed_experts, device="cuda").softmax(-1).topk(top_k, dim=-1)
+    mask = torch.ones(tokens, device="cuda", dtype=torch.bool)
+    upstream = torch.randn(tokens, hidden_dim, device="cuda")
+    grads = []
+    for checkpointed in (False, True):
+        experts.zero_grad(set_to_none=True)
+        hidden_in = hidden.detach().requires_grad_()
+        probs_in = probs.detach().requires_grad_()
+        out = (
+            checkpoint(experts, hidden_in, mask, probs_in, indices, use_reentrant=False)
+            if checkpointed
+            else experts(hidden_in, mask, probs_in, indices)
+        )
+        (out.float() * upstream).sum().backward()
+        grads.append(
+            (
+                hidden_in.grad,
+                probs_in.grad,
+                experts.gate_and_up_projs.grad.to_local(),
+                experts.down_projs.grad.to_local(),
+            )
+        )
+    for name, eager, recomputed in zip(("hidden", "probs", "gate_and_up_projs", "down_projs"), *grads):
+        torch.testing.assert_close(recomputed, eager, rtol=0, atol=0, msg=f"{name} gradients differ under recompute")
+    logger.info("rank=%d case=recompute tokens=%d: gradients match without recomputation", rank, tokens)
+
+
 def main() -> None:
     """Validate routed expert outputs and a training step on the EP group."""
     logging.basicConfig(level=logging.INFO)
@@ -174,6 +243,9 @@ def main() -> None:
                     case=case,
                     checkpointed=checkpointed,
                 )
+        # NCCL-EP keeps one configuration per process; rebuild it at the larger size.
+        finalize_nccl_ep()
+        _check_checkpoint_recompute(mesh, rank=rank, world_size=world_size)
     finally:
         torch.cuda.synchronize()
         finalize_nccl_ep()

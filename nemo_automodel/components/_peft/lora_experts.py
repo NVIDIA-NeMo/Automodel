@@ -29,6 +29,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     _apply_bias,
     _apply_router_weight_fp32,
+    _has_dispatched_rows,
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.shared.utils import dtype_from_str
@@ -723,9 +724,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
-        # GroupedExpertsDeepEP.forward does.
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if _has_dispatched_rows(
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            never_empty=self.dispatch_rows_never_empty,
+            dispatcher_backend=self.dispatcher_backend,
+        ):
             lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                 lora_gate_and_up_A, lora_gate_and_up_B
             )

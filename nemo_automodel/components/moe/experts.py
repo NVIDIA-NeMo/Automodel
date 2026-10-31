@@ -26,6 +26,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.models.common.utils import NcclEpConfig
 from nemo_automodel.components.moe import swiglu_triton
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.megatron.fused_a2a import hybridep_combine_output_cached
@@ -43,7 +44,6 @@ from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp3
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 from nemo_automodel.shared.import_utils import is_te_min_version, safe_import
 from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
-from nemo_automodel.shared.nccl_ep import NcclEpConfig
 
 _HAVE_TRITON, triton = safe_import("triton")
 _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
@@ -1314,6 +1314,37 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
 
+def _has_dispatched_rows(
+    hidden_states: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    *,
+    never_empty: bool,
+    dispatcher_backend: str,
+) -> bool:
+    """Return whether this rank received routed rows, reading the device only when needed.
+
+    Static routing and capacity buffers always dispatch rows. NCCL-EP sizes its receive
+    buffer to the routed rows, so the buffer's leading extent already answers on the
+    host. Other dispatchers need a device-to-host read of the per-expert counts.
+
+    Args:
+        hidden_states: Dispatched activations of shape [received_rows, hidden].
+        tokens_per_expert: Integer tensor of shape [local_experts] with the routed rows
+            of each local expert.
+        never_empty: Whether the dispatcher always returns rows (static routing or
+            capacity mode).
+        dispatcher_backend: Flex dispatcher backend that produced ``hidden_states``.
+
+    Returns:
+        True when the grouped expert GEMMs have routed rows to process.
+    """
+    if never_empty:
+        return True
+    if dispatcher_backend == "nccl_ep":
+        return hidden_states.shape[0] > 0
+    return bool(torch.count_nonzero(tokens_per_expert) > 0)
+
+
 def _stabilize_empty_routing_probs_dtype(permuted_probs: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
     """Keep empty expert probabilities stable across checkpoint recomputation.
 
@@ -1730,9 +1761,13 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read.
         router_weight_already_applied = False
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if _has_dispatched_rows(
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            never_empty=self.dispatch_rows_never_empty,
+            dispatcher_backend=self.dispatcher_backend,
+        ):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             gate_up_output_bytes = (
                 permuted_local_hidden_states.shape[0]

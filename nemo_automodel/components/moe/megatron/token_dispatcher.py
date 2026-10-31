@@ -23,7 +23,8 @@ from typing import Literal, Tuple
 import torch
 from torch import nn
 
-from nemo_automodel.shared.nccl_ep import NcclEpConfig
+from nemo_automodel.components.models.common.utils import NcclEpConfig
+from nemo_automodel.components.moe.nccl_ep import NcclEpManager
 
 from .fused_a2a import (
     fused_combine,
@@ -1102,12 +1103,12 @@ class MoEFlexTokenDispatcher:
                 raise ValueError("NCCL-EP currently supports eager dropless dispatch without expert padding")
             if self.config.moe_deepep_async_dispatch:
                 raise ValueError("NCCL-EP does not support dispatcher_async_dispatch")
-            self._comm_manager = self.config.nccl_ep.build(
+            self._comm_manager = NcclEpManager(
+                self.config.nccl_ep,
                 group=ep_group,
                 hidden_dim=hidden_dim,
                 num_experts=self.config.num_moe_experts,
                 top_k=self.config.moe_router_topk,
-                num_sms=self.config.moe_deepep_num_sms,
             )
         elif backend == "uccl_ep":
             if set_uccl_num_sms is not None:
