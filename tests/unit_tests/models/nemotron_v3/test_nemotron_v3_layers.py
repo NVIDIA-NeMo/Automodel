@@ -190,6 +190,30 @@ class TestNemotronV3Attention:
         assert torch.allclose(attn.q_proj.bias, torch.zeros_like(attn.q_proj.bias))
         assert torch.allclose(attn.k_proj.bias, torch.zeros_like(attn.k_proj.bias))
 
+    @pytest.mark.parametrize("rescale", [False, True])
+    def test_attention_initializes_materialized_projection_weights(self, config, rescale: bool) -> None:
+        """Meta construction must not leave attention projections as allocator contents."""
+        config.torch_dtype = "float32"
+        config.attention_bias = True
+        with torch.device("meta"):
+            attn = NemotronV3Attention(config, backend=BackendConfig(linear="torch", attn="sdpa"))
+        attn.to_empty(device=torch.device("cpu"))
+        with torch.no_grad():
+            for parameter in attn.parameters():
+                parameter.fill_(float("nan"))
+        attn.init_weights(
+            num_hidden_layers=config.num_hidden_layers,
+            rescale_prenorm_residual=rescale,
+            buffer_device=torch.device("cpu"),
+        )
+        for projection in (attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj):
+            assert torch.isfinite(projection.weight).all()
+            assert torch.count_nonzero(projection.bias) == 0
+            expected_std = config.initializer_range
+            if projection is attn.o_proj and rescale:
+                expected_std /= config.num_hidden_layers**0.5
+            assert projection.weight.std().item() == pytest.approx(expected_std, rel=0.05)
+
     @skip_if_no_gpu
     def test_attention_forward_single_token(self, config):
         """Test attention with single token (seqlen=1)."""
