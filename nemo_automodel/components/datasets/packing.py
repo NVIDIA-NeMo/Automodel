@@ -21,20 +21,57 @@ from typing import Final, Literal, Protocol, TypedDict
 import torch
 import torch.nn.functional as F
 
+BatchOutputFormat = Literal["batched", "thd"]
+
 PackedMaskType = Literal["block_causal", "document_ids", "flash_varlen"]
 
 
 class PackedSequenceContract(Protocol):
-    """Structural model contract consumed while collating packed data."""
+    """Model-derived requests passed to every loader, independently of format.
+
+    Batched packed inputs interpret ``packed_mask_type`` and
+    ``return_packed_sequence_metadata``. Native THD inputs derive their kernel
+    metadata from lengths instead. ``return_document_ids`` requests optional
+    original membership in either format; effective segmentation always remains
+    available separately. Unpacked native loaders ignore packing-only requests.
+    ``max_sequence_length`` is the model's input-token limit per packed document,
+    before batch flattening, and applies to both batched and THD output.
+    """
 
     @property
     def packed_mask_type(self) -> PackedMaskType:
-        """Packed attention-mask representation required by the model."""
+        """Attention representation for batched packed inputs; ignored by THD."""
         ...
 
     @property
-    def requires_packed_sequence_metadata(self) -> bool:
-        """Whether the model consumes flat token indices and cumulative lengths."""
+    def return_packed_sequence_metadata(self) -> bool:
+        """Return the gathered-token bundle for batched packed output only.
+
+        This requests ``packed_token_indices`` [batch, sequence] (-1 at padding),
+        ``cu_seqlens`` [batch, boundaries] for the non-padding token stream (-1
+        at unused entries), and ``max_seqlen``. AutoModel's FA4 and recurrent
+        consumers use these to gather tokens and delimit kernel/state sequences.
+        Their model-entry code flattens the bundle after PP microbatch splitting.
+        ``build_packed_sequence_metadata`` constructs this layout from IDs; a
+        loader's physical padded offsets cannot simply be renamed to match it.
+        THD ignores this request and derives its own metadata from seq_lens
+        and seq_lens_padded. The flag does not select an output format.
+        """
+        ...
+
+    @property
+    def return_document_ids(self) -> bool:
+        """Return original membership as ``document_ids`` in either output format.
+
+        Effective segmentation always uses ``_packed_seq_ids``. Original IDs
+        are opt-in metadata for model policies such as independent image groups;
+        they do not select attention or MTP loss boundaries.
+        """
+        ...
+
+    @property
+    def max_sequence_length(self) -> int | None:
+        """Decoder input-token limit, or None when the model does not declare one."""
         ...
 
 
@@ -43,7 +80,9 @@ class _DefaultPackedSequenceContract:
     """Block-causal packing defaults for callers without model requirements."""
 
     packed_mask_type: PackedMaskType = "block_causal"
-    requires_packed_sequence_metadata: bool = False
+    return_packed_sequence_metadata: bool = False
+    return_document_ids: bool = False
+    max_sequence_length: int | None = None
 
 
 DEFAULT_PACKED_SEQUENCE_CONTRACT: Final[PackedSequenceContract] = _DefaultPackedSequenceContract()

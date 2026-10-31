@@ -297,6 +297,31 @@ def test_neat_packing_uses_default_contract(monkeypatch):
     assert collate_fn.keywords["packing"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
 
 
+@pytest.mark.parametrize("pp_enabled", [False, True])
+def test_native_loader_selects_flash_deferral_from_pipeline_runtime(monkeypatch, pp_enabled):
+    from nemo_automodel.components.models.common.packing import PackingCapabilities
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
+        lambda dataset, **_: dataset,
+    )
+    document = {"input_ids": [1, 2, 3], "labels": [2, 3, 4], "position_ids": [0, 1, 0], "attention_mask": [1, 1, 2]}
+    config = DataloaderConfig(
+        dataset_config=StaticDatasetConfig([document]),
+        packing=NeatPackingConfig(packed_sequence_size=3),
+        shuffle=False,
+    )
+    batch = next(
+        iter(
+            config.build(
+                dp_rank=0, dp_world_size=1, pp_enabled=pp_enabled, packing_contract=PackingCapabilities("flash_varlen")
+            )
+        )
+    )
+    assert "_packed_seq_ids" in batch
+    assert ("cu_seq_lens_q" in batch) is not pp_enabled
+
+
 def test_packing_config_build_preserves_deprecated_attention_keyword(monkeypatch):
     monkeypatch.setattr(
         "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
@@ -428,3 +453,21 @@ def test_rank_ordering_context_wraps_only_dataset_construction():
     config.build(dp_rank=0, dp_world_size=1, dataset_build_context=BuildContext())
 
     assert events == ["enter", "dataset", "exit", "packing"]
+
+
+def test_thd_rejects_unsupported_model_instead_of_silently_disabling_packing():
+    with pytest.raises(ValueError, match="THD packing requires a model that consumes seq_lens"):
+        ThdPackingConfig(packed_sequence_size=8).build([], supports_seq_lens=False)
+
+
+def test_prepacked_thd_is_reported_as_packed_without_online_packing():
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    config = DataloaderConfig(dataset_config=StaticDatasetConfig([]), collate_fn=packed_sequence_thd_collater)
+    assert config.is_packed and config.output_format == "thd"
+
+
+def test_emits_thd_compatibility_alias_warns():
+    config = DataloaderConfig(dataset_config=StaticDatasetConfig([]))
+    with pytest.warns(FutureWarning, match="output_format"):
+        assert config.emits_thd is False

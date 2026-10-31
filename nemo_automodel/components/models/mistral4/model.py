@@ -50,6 +50,7 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
 
 
 def _get_llama_4_attn_scale(position_ids: torch.Tensor, beta: float, max_position_embeddings: int) -> torch.Tensor:
@@ -860,25 +861,30 @@ if _HF_MISTRAL3_AVAILABLE:
             inputs_embeds: torch.Tensor | None = None,
             **kwargs: Any,
         ) -> torch.Tensor:
-            # PP VLM support: retrieve pixel_values from stored chunks
-            if (
-                pixel_values is None
-                and hasattr(self, "_vlm_pixel_values_chunks")
-                and self._vlm_pixel_values_chunks is not None
-            ):
-                has_media_tokens = (
-                    input_ids is not None
-                    and self.image_token_index is not None
-                    and (input_ids == self.image_token_index).any()
-                )
-                if has_media_tokens:
-                    chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                    if chunk_idx < len(self._vlm_pixel_values_chunks):
-                        pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                        image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
-                        if image_grid_hws is not None:
-                            image_sizes = image_grid_hws
-                        self._vlm_chunk_idx = chunk_idx + 1
+            """Run one text/image microbatch, consuming staged media when present.
+
+            Args:
+                input_ids: Token IDs [batch, sequence], or [tokens] for THD.
+                position_ids: Scalar coordinates with the same token axes.
+                attention_mask: Optional [batch, sequence] padding mask or
+                    [batch, 1, sequence, sequence] additive attention mask.
+                padding_mask: Optional boolean padding flags matching token axes.
+                pixel_values: Optional pixels [images, channels, height, width].
+                image_sizes: Optional original image sizes [images, 2].
+                inputs_embeds: Optional [batch, sequence, hidden] from a prior stage.
+                **kwargs: Packed attention metadata; cumulative token offsets are
+                    [segments + 1] and maximum segment lengths are scalars.
+
+            Returns:
+                Logits [batch, sequence, vocab], or hidden values with final
+                dimension hidden on a pipeline stage without the output head.
+            """
+            # Explicit media ownership advances for text-only microbatches too.
+            if pixel_values is None:
+                media = next_vlm_media_chunk(self)
+                if media is not None:
+                    pixel_values = media.pixel_values
+                    image_sizes = media.image_grid
 
             if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
                 input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(

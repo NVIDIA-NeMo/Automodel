@@ -40,6 +40,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    BatchOutputFormat,
     PackedSequenceContract,
     resolve_packing_contract,
 )
@@ -191,6 +192,7 @@ class PackingConfig:
         cp_size: int = 1,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+        defer_flash_metadata: bool = False,
     ) -> tuple[object, CollateFn | None]:
         """Pack ``dataset`` and return ``(dataset, collate_fn)``."""
         raise NotImplementedError
@@ -200,7 +202,7 @@ class PackingConfig:
 class ThdPackingConfig(PackingConfig):
     """THD (flattened, ``seq_lens``-based) packing; pairs with ``packed_sequence_thd_collater``.
 
-    Requires a model whose forward accepts ``seq_lens`` — packing is skipped (with a warning) otherwise.
+    Requires a model whose forward accepts ``seq_lens``; unsupported inputs are rejected.
     """
 
     pad_to_multiple_of: int = 1
@@ -217,12 +219,12 @@ class ThdPackingConfig(PackingConfig):
         cp_size: int = 1,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+        defer_flash_metadata: bool = False,
     ) -> tuple[object, CollateFn | None]:
-        """Pack with THD; returns ``(dataset, None)`` if the model does not accept ``seq_lens``."""
+        """Pack with THD, rejecting models that cannot consume sequence lengths."""
         resolve_packing_contract(packing_contract, attn_implementation)
         if not supports_seq_lens:
-            logger.warning("Packed sequence is not supported without seq_lens; disabling packed sequence")
-            return dataset, None
+            raise ValueError("THD packing requires a model that consumes seq_lens; choose a supported input format")
         from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
         from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
@@ -259,8 +261,13 @@ class NeatPackingConfig(PackingConfig):
         cp_size: int = 1,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+        defer_flash_metadata: bool = False,
     ) -> tuple[object, CollateFn]:
-        """Pack with NEAT and configure the collator for the selected attention implementation."""
+        """Pack with NEAT and select the model input format.
+
+        ``defer_flash_metadata`` is runtime-only: PP keeps document boundaries
+        batch-major until decoder entry; the default emits public Flash offsets.
+        """
         del supports_seq_lens, cp_size
         packing_contract = resolve_packing_contract(packing_contract, attn_implementation)
         from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
@@ -278,7 +285,9 @@ class NeatPackingConfig(PackingConfig):
             padding_idx=pad_token_id,
             drop_long_samples=self.drop_long_samples,
         )
-        return dataset, partial(neat_packed_collater, packing=packing_contract)
+        return dataset, partial(
+            neat_packed_collater, packing=packing_contract, defer_flash_metadata=defer_flash_metadata
+        )
 
 
 _PACKING_CONFIGS: dict[str, type[PackingConfig]] = {
@@ -608,16 +617,31 @@ class DataloaderConfig:
     drop_last: bool = False
 
     @property
+    def is_packed(self) -> bool:
+        """Whether the loader emits packed inputs, including prepacked THD data."""
+        return self.packing is not None or self.output_format == "thd"
+
+    @property
     def dataset_builds_on_all_ranks(self) -> bool:
         """Whether dataset construction must bypass rank-zero-first ordering."""
         return isinstance(self.dataset_config, AllRanksDatasetConfig)
 
     @property
-    def emits_thd(self) -> bool:
-        """Whether this configuration produces THD-formatted batches."""
+    def output_format(self) -> BatchOutputFormat:
+        """Selected input format, derived from the native packing/collator config."""
         from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
-        return isinstance(self.packing, ThdPackingConfig) or self.collate_fn is packed_sequence_thd_collater
+        return (
+            "thd"
+            if isinstance(self.packing, ThdPackingConfig) or self.collate_fn is packed_sequence_thd_collater
+            else "batched"
+        )
+
+    @property
+    def emits_thd(self) -> bool:
+        """Deprecated boolean spelling; use output_format instead."""
+        warnings.warn("emits_thd is deprecated; use output_format", FutureWarning, stacklevel=2)
+        return self.output_format == "thd"
 
     def _build_dataset(
         self,
@@ -687,6 +711,7 @@ class DataloaderConfig:
                 pad_token_id=getattr(tokenizer, "pad_token_id", 0),
                 cp_size=cp_size,
                 packing_contract=packing_contract,
+                defer_flash_metadata=pp_enabled,
             )
         elif self.packing is not None:
             logger.info(

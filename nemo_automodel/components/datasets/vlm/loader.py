@@ -36,6 +36,7 @@ from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_cha
 from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDatasetConfig
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    BatchOutputFormat,
     PackedSequenceContract,
     resolve_packing_contract,
 )
@@ -285,6 +286,16 @@ class VlmDataloaderConfig:
     prefetch_factor: int | None = None
     drop_last: bool = False
 
+    @property
+    def is_packed(self) -> bool:
+        """Whether this loader emits packed multimodal inputs."""
+        return self.packing is not None
+
+    @property
+    def output_format(self) -> BatchOutputFormat:
+        """Selected native batch representation, independent of the packing algorithm."""
+        return "thd" if self.packing is not None and self.packing.packing_format == "thd" else "batched"
+
     def _build_source(
         self,
         *,
@@ -405,6 +416,7 @@ class VlmDataloaderConfig:
                     max_length=self.packing.collate_max_length,
                     packing=packing_contract,
                     materialize_4d_mask=materialize_4d_mask,
+                    defer_flash_metadata=pp_n_microbatches is not None,
                 )
         elif self.collator is not None:
             collate_fn = self.collator.build(processor=processor)

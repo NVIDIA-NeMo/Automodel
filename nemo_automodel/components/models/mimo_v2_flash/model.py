@@ -913,7 +913,8 @@ class MiMoV2FlashModel(nn.Module):
             and attention_mask.numel() > 0
             and bool((attention_mask > 1).any().item())
         )
-        if self.backend.attn == "te" and not is_thd and (_packed_seq_ids is not None or indexed_attention):
+        multiple_documents = _packed_seq_ids is not None and bool((_packed_seq_ids > 1).any().item())
+        if self.backend.attn == "te" and not is_thd and (multiple_documents or indexed_attention):
             raise ValueError(
                 "MiMo TE packed attention requires THD packing with seq_lens/seq_lens_padded; "
                 "NEAT document IDs cannot be represented safely by TE context parallelism."

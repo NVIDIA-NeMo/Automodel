@@ -24,6 +24,7 @@ from nemo_automodel.components.datasets.packing import (
     build_packed_sequence_metadata,
     resolve_packing_contract,
 )
+from nemo_automodel.shared.packed_seq import indexed_mask_to_4d_block_causal
 
 
 def batchify(tensor, default_tensor_cls=torch.LongTensor):
@@ -515,44 +516,12 @@ def packed_sequence_thd_collater_vlm(examples, processor=None, **kwargs):
     return packed_sequence_thd_collater(examples)
 
 
-def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Convert an indexed attention mask to a 4D block-causal mask.
-
-    Args:
-        attention_mask: Integer tensor of shape ``[B, S]`` where each
-            position contains the 1-based index of the sub-sequence it
-            belongs to (0 = padding).
-
-    Returns:
-        Bool tensor of shape ``[B, 1, S, S]`` suitable for
-        ``eager`` / ``sdpa`` attention backends.  ``True`` means the
-        position is **allowed** to attend.
-    """
-    # attention_mask: [B, S]
-    B, S = attention_mask.shape
-
-    # same_doc[b, i, j] = True iff positions i and j belong to the same sub-sequence
-    mask_q = attention_mask.unsqueeze(2)  # [B, S, 1]
-    mask_k = attention_mask.unsqueeze(1)  # [B, 1, S]
-    same_doc = mask_q == mask_k  # [B, S, S]
-
-    # causal: position i can attend to position j only if j <= i
-    causal = torch.ones(S, S, dtype=torch.bool, device=attention_mask.device).tril()  # [S, S]
-
-    # not_padding: both positions must be non-padding (index > 0)
-    not_padding_q = (attention_mask > 0).unsqueeze(2)  # [B, S, 1]
-    not_padding_k = (attention_mask > 0).unsqueeze(1)  # [B, 1, S]
-
-    mask_4d = same_doc & causal.unsqueeze(0) & not_padding_q & not_padding_k  # [B, S, S]
-
-    return mask_4d.unsqueeze(1)  # [B, 1, S, S]
-
-
 def neat_packed_collater(
     batch: list[dict],
     attn_implementation: str | None = None,
     *,
     packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    defer_flash_metadata: bool = False,
 ) -> dict:
     """Collater for neat-packed LLM sequences.
 
@@ -572,6 +541,9 @@ def neat_packed_collater(
             Python-call compatibility during the packing-contract migration.
         packing: Structural model contract selecting the packed mask representation.
             Defaults to block-causal masking without packed-sequence metadata.
+        defer_flash_metadata: Keep Flash boundaries batch-major for pipeline
+            splitting. Model entry converts the map to microbatch-local offsets.
+            Other mask representations are unchanged.
 
     Returns:
         Mapping with ``input_ids``, ``labels``, and ``position_ids`` of shape
@@ -580,7 +552,10 @@ def neat_packed_collater(
         For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
         and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
         padding runs. ``max_length_q`` and ``max_length_k`` are Python ints.
-        Optional ``_packed_seq_ids`` retains the [batch, sequence] document map.
+        With ``defer_flash_metadata``, ``_packed_seq_ids`` instead carries
+        the [batch, sequence] attention map until model entry after PP splitting.
+        ``_packed_seq_ids`` retains the original map for multiple-document packs,
+        or for single-document packs when the model requests boundaries or metadata.
         A contract requiring native packed-sequence metadata additionally adds
         int64 ``packed_token_indices`` of shape [batch, sequence], containing
         row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
@@ -603,7 +578,7 @@ def neat_packed_collater(
     if packed_mask_type in ("document_ids", "flash_varlen"):
         mask_out = attention_mask
     elif packed_mask_type == "block_causal":
-        mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
+        mask_out = indexed_mask_to_4d_block_causal(attention_mask)
     else:
         raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
 
@@ -622,11 +597,12 @@ def neat_packed_collater(
         # HF consumes physical offsets, including padding, without an attention
         # mask. Native FA4's unpadded offsets below have a different contract.
         result.pop("attention_mask")
-        result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
-    if packing.requires_packed_sequence_metadata:
+        if not defer_flash_metadata:
+            result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
+    if packing.return_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
-    if attention_mask.max() > 1 or packing.requires_packed_sequence_metadata:
-        result["_packed_seq_ids"] = attention_mask
+    # Original boundaries are data, including when a pack contains one document.
+    result["_packed_seq_ids"] = attention_mask
     return result
 
 

@@ -42,6 +42,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
 
 from .state_dict_adapter import Qwen3VLMoeStateDictAdapter
 
@@ -641,54 +642,26 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
             else getattr(text_config, "output_hidden_states", False)
         )
 
-        # PP VLM support: retrieve pixel_values from stored chunks if not passed directly
-        pixel_values = kwargs.get("pixel_values", None)
-        pixel_values_videos = kwargs.get("pixel_values_videos", None)
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        video_grid_thw = kwargs.get("video_grid_thw", None)
-        if input_ids is not None:
-            has_image_tokens = (input_ids == 151655).any()
-            has_video_tokens = (input_ids == 151656).any()
-        else:
-            has_image_tokens = False
-            has_video_tokens = False
-
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        consumed_vlm_chunk = False
-
-        if pixel_values is None and has_image_tokens:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            if image_chunks is not None and chunk_idx < len(image_chunks):
-                pixel_values = image_chunks[chunk_idx]
-                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
-                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
-                    image_grid_hws = image_grid_chunks[chunk_idx]
-                    # Convert image_grid_hws [N, 2] to image_grid_thw [N, 3] by prepending T=1
-                    if image_grid_hws is not None and image_grid_hws.numel() > 0:
-                        if image_grid_hws.shape[-1] == 2:
-                            ones = torch.ones(
-                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
-                            )
-                            image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
-                        else:
-                            image_grid_thw = image_grid_hws
-                kwargs["pixel_values"] = pixel_values
-                kwargs["image_grid_thw"] = image_grid_thw
-                consumed_vlm_chunk = True
-
-        if pixel_values_videos is None and has_video_tokens:
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if video_chunks is not None and chunk_idx < len(video_chunks):
-                pixel_values_videos = video_chunks[chunk_idx]
-                video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
-                if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
-                    video_grid_thw = video_grid_chunks[chunk_idx]
-                kwargs["pixel_values_videos"] = pixel_values_videos
-                kwargs["video_grid_thw"] = video_grid_thw
-                consumed_vlm_chunk = True
-
-        if consumed_vlm_chunk:
-            self._vlm_chunk_idx = chunk_idx + 1
+        # Explicit chunks, rather than token values, own PP media scheduling.
+        pixel_values = kwargs.get("pixel_values")
+        pixel_values_videos = kwargs.get("pixel_values_videos")
+        image_grid_thw = kwargs.get("image_grid_thw")
+        video_grid_thw = kwargs.get("video_grid_thw")
+        if pixel_values is None and pixel_values_videos is None:
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values = media.pixel_values
+                pixel_values_videos = media.pixel_values_videos
+                image_grid_thw = media.image_grid
+                video_grid_thw = media.video_grid
+                if image_grid_thw is not None and image_grid_thw.shape[-1] == 2:
+                    image_grid_thw = torch.nn.functional.pad(image_grid_thw, (1, 0), value=1)
+                kwargs.update(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                )
 
         # With pipeline parallelism, attention_mask (from batch kwargs) can have a
         # different sequence length than inputs_embeds (hidden states from prev stage).

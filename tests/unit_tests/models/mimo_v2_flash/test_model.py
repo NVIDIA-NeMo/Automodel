@@ -660,3 +660,18 @@ def _moe_config(cfg: MiMoV2FlashConfig):
         force_e_score_correction_bias=True,
         dtype=torch.float32,
     )
+
+
+def test_te_layout_guard_accepts_single_document_metadata(tiny_config, backend_config):
+    """Exercise the layout guard without importing or claiming to execute TE kernels."""
+    from dataclasses import replace
+
+    model = MiMoV2FlashModel(tiny_config, backend_config)
+    model.layers = torch.nn.ModuleDict()
+    model.backend = replace(backend_config, attn="te")
+    tokens = torch.tensor([[2, 3, 4, 5]])
+    expected = model(input_ids=tokens)
+    actual = model(input_ids=tokens, _packed_seq_ids=torch.ones_like(tokens))
+    torch.testing.assert_close(actual, expected)
+    with pytest.raises(ValueError, match="requires THD"):
+        model(input_ids=tokens, _packed_seq_ids=torch.tensor([[1, 1, 2, 2]]))
