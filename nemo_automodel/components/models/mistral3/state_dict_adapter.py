@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -48,6 +48,7 @@ import torch
 from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
 
 if TYPE_CHECKING:
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
     from torch.distributed.device_mesh import DeviceMesh
 
 logger = logging.getLogger(__name__)
@@ -311,6 +312,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: "DeviceMesh" | None = None,
+        checkpoint_metadata: Mapping[str, "TensorStorageMetadata"] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load Mistral3 FP8 weights in bounded decoder-layer groups.
 
@@ -331,6 +333,7 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
                 alias and are populated through final model storage.
             device_mesh: Optional distributed mesh. The tensors already carry their final placements, so this value is
                 not otherwise needed.
+            checkpoint_metadata: Unused; part destinations derive from model shapes.
 
         Returns:
             One direct-load part for tensors outside decoder layers plus bounded temporary-load parts for decoder

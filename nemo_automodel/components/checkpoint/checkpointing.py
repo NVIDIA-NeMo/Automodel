@@ -977,9 +977,7 @@ class Checkpointer:
             part_bytes = sum(estimate_tensor_bytes(tensor) for tensor in part.checkpoint_tensors.values())
             requested_bytes += part_bytes
             temporary_bytes = sum(
-                estimate_tensor_bytes(
-                    tensor.to_local() if type(tensor).__name__ == "DTensor" else tensor  # noqa: PLC2801
-                )
+                estimate_tensor_bytes(tensor.to_local() if isinstance(tensor, DTensor) else tensor)
                 for checkpoint_key, tensor in part.checkpoint_tensors.items()
                 if checkpoint_key in part.temporary_checkpoint_keys
             )
@@ -1121,6 +1119,7 @@ class Checkpointer:
 
         part_loaded_model_state_dict: dict[str, torch.Tensor] | None = None
         checkpoint_load_parts: Iterator[CheckpointLoadPart] | None = None
+        parts_storage_reader: StorageReader | None = None
         # Adapter-owned parts name their DCP destinations with exact checkpoint keys, so any generic Transformers
         # key_mapping is redundant for this path and must not prevent the adapter from describing bounded groups.
         if (
@@ -1131,14 +1130,36 @@ class Checkpointer:
             and len(model_state.model) == 1
             and not allow_checkpoint_key_subset
         ):
-            candidate_state_dict = model_state.state_dict()
-            candidate_parts = state_dict_adapter.iter_checkpoint_load_parts(
-                candidate_state_dict,
-                device_mesh=self.moe_mesh,
+            candidate_storage_reader = self._get_storage_reader(
+                model_path,
+                key_mapping=None,
+                is_init_step=True,
+                is_safetensors=True,
             )
-            if candidate_parts is not None:
-                part_loaded_model_state_dict = candidate_state_dict
-                checkpoint_load_parts = candidate_parts
+            if candidate_storage_reader is not None:
+                # *_extra_state entries are DCP metadata, not checkpoint tensors; the
+                # full-state path preserves them separately, and part destinations are
+                # tensor-only.
+                candidate_state_dict = {
+                    key: value for key, value in model_state.state_dict().items() if isinstance(value, torch.Tensor)
+                }
+                # The validated tensor-only boundary: adapters consume concrete
+                # tensor storage metadata, so non-tensor (bytes) entries are filtered here.
+                candidate_parts = state_dict_adapter.iter_checkpoint_load_parts(
+                    candidate_state_dict,
+                    device_mesh=self.moe_mesh,
+                    checkpoint_metadata={
+                        key: value
+                        for key, value in _get_checkpoint_metadata(
+                            model_path, candidate_storage_reader
+                        ).state_dict_metadata.items()
+                        if isinstance(value, TensorStorageMetadata)
+                    },
+                )
+                if candidate_parts is not None:
+                    part_loaded_model_state_dict = candidate_state_dict
+                    checkpoint_load_parts = candidate_parts
+                    parts_storage_reader = candidate_storage_reader
 
         safetensors_requires_full_cpu = (
             is_safetensors
@@ -1147,12 +1168,7 @@ class Checkpointer:
             and (not is_custom_model or world_size == 1)
         )
         if checkpoint_load_parts is not None and part_loaded_model_state_dict is not None:
-            storage_reader = self._get_storage_reader(
-                model_path,
-                key_mapping=None,
-                is_init_step=True,
-                is_safetensors=True,
-            )
+            storage_reader = parts_storage_reader
             if storage_reader is None:
                 raise RuntimeError(
                     f"No safetensors storage reader is available for part-by-part loading from {model_path}"

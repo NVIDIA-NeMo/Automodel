@@ -16,7 +16,7 @@ import gc
 import math
 import re
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 
 if TYPE_CHECKING:
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
     from torch.distributed.device_mesh import DeviceMesh
 
 FP4_VALUES = [
@@ -129,6 +130,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         self,
         model_state_dict: dict[str, torch.Tensor],
         device_mesh: Optional["DeviceMesh"] = None,
+        checkpoint_metadata: Mapping[str, "TensorStorageMetadata"] | None = None,
     ) -> Iterator[CheckpointLoadPart] | None:
         """Load a single-GPU GPT-OSS MXFP4 checkpoint one decoder layer at a time.
 
@@ -146,6 +148,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                 ``[experts, input_features, output_features]``, use BF16 or FP32, and own ordinary single-device
                 storage. Other tensors retain arbitrary model-defined shapes, dtypes, devices, strides, and storage.
             device_mesh: Optional distributed mesh. A non-``None`` mesh disables this single-device path.
+            checkpoint_metadata: Unused; part destinations derive from model shapes.
 
         Returns:
             One direct-load part for ordinary tensors followed by one bounded temporary-load part per decoder layer,

@@ -54,20 +54,30 @@ weights without attaching the draft objective to the frozen backbone.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
-from typing import Any
+from collections.abc import Callable
+from functools import partial
+from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Shard
 
-from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+if TYPE_CHECKING:
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+from nemo_automodel.components.checkpoint.state_dict_adapter import CheckpointLoadPart, StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
-from nemo_automodel.components.moe.state_dict_utils import is_dtensor, should_load_expert_for_rank
+from nemo_automodel.components.moe.state_dict_utils import (
+    get_expert_range_for_rank_from_mesh,
+    is_dtensor,
+    should_load_expert_for_rank,
+)
 
 _ENGRAM_EMBED_PATTERN = re.compile(r"^layers\.(\d+)\.engram\.embed\.weight$")
 _DSPARK_EXPERT_PATTERN = re.compile(r"^mtp\.(\d+)\.ffn\.experts\.(gate_and_up_projs|down_projs)$")
@@ -141,6 +151,65 @@ def _local_offsets(tensor: DTensor) -> tuple[int, ...]:
     return tuple(offsets)
 
 
+_FUSED_EXPERT_KEY = re.compile(r"^model\.layers\.(\d+)\.ffn\.experts\.(gate_and_up_projs|down_projs)$")
+
+
+def _split_weight_scale(required: frozenset[str]) -> tuple[str, str]:
+    """Split a quantized checkpoint key pair into (weight key, scale key)."""
+    scale_key = next(key for key in required if key.endswith(".scale"))
+    weight_key = next(key for key in required if key.endswith(".weight"))
+    return weight_key, scale_key
+
+
+def _finish_part_loads(
+    adapter_dtype: torch.dtype,
+    generic: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool], ...],
+    engrams: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, Callable[[torch.Tensor], torch.Tensor]], ...],
+    experts: tuple[tuple[torch.Tensor, int, str, torch.Tensor, torch.Tensor, int, int, int], ...],
+) -> None:
+    """Install one load part's FP8 tensors into final model storage.
+
+    Args:
+        adapter_dtype: Decoded storage dtype (``self.dtype`` of the owning adapter).
+        generic: ``(target, fp8_temp, scale_temp, rowwise)`` per quantized tensor. Targets are
+            final model tensors (plain or DTensor) of shape [rows, columns]; the decoded
+            tensor of the same global shape is copied in.
+        engrams: ``(target, fp8_temp, scale_temp, restore_fn)`` per Engram table. The temps
+            are true-row-count owner-sharded views; the decoded tensor restores equal owner
+            padding via ``restore_fn`` (the adapter's ``_restore_engram_padding`` partial)
+            before copying into the padded target storage.
+        experts: ``(fused_local, expert_index, projection, fp8_temp, scale_temp, inter_dim,
+            row_offset, row_count)`` per per-expert projection. ``fused_local`` is the
+            rank-local grouped storage; the decoded full [rows, columns] checkpoint tensor is
+            transposed exactly as ``_from_hf_w_merged_experts`` does, then this rank's
+            inner-axis shard rows ``[row_offset : row_offset + row_count]`` are written into
+            the expert's slice (unsharded targets pass the full range).
+    """
+    for target, fp8, scale, rowwise in generic:
+        target.copy_(dequantize_checkpoint_weight(fp8, scale, dtype=adapter_dtype, rowwise=rowwise))
+    for target, fp8, scale, restore_fn in engrams:
+        decoded = dequantize_checkpoint_weight(fp8, scale, dtype=adapter_dtype, rowwise=True)
+        target.copy_(restore_fn(decoded))
+    for (
+        fused_local,
+        expert_index,
+        projection,
+        fp8,
+        scale,
+        inter_dim,
+        row_offset,
+        row_count,
+    ) in experts:
+        decoded = dequantize_checkpoint_weight(fp8, scale, dtype=adapter_dtype)
+        shard = decoded.transpose(0, 1)[row_offset : row_offset + row_count]
+        if projection == "w1":
+            fused_local[expert_index, :, :inter_dim] = shard
+        elif projection == "w3":
+            fused_local[expert_index, :, inter_dim:] = shard
+        else:
+            fused_local[expert_index] = shard
+
+
 def dequantize_checkpoint_weight(
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -163,9 +232,10 @@ def dequantize_checkpoint_weight(
         rowwise: Use per-row scales for FP8 Engram tables. FP4 always uses them.
 
     Returns:
-        Independent tensor of shape [rows, columns] in ``dtype``; DTensor
-        inputs retain their mesh and placements. No input is modified, and
-        FP32/expanded-scale temporaries cover at most 4M weight elements.
+        Independent tensor of shape [rows, columns] in ``dtype`` on the operands'
+        device; DTensor inputs retain their mesh and placements. No input is
+        modified, and FP32/expanded-scale temporaries cover at most 4M weight
+        elements.
     """
     if weight.ndim != 2 or scale.ndim != 2:
         raise ValueError("Checkpoint weights and scales must both be two-dimensional")
@@ -461,10 +531,371 @@ class DeepseekV41StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
                     raise ValueError(f"Quantized weight {key} is missing its scale tensor {scale_key}")
                 continue
             scale = state_dict.pop(scale_key)
-            state_dict[key] = dequantize_checkpoint_weight(
-                weight, scale, dtype=self.dtype, rowwise=".engram.embed." in key
-            )
+            state_dict[key] = self._dequantize_one(weight, scale, key)
         return state_dict
+
+    def _dequantize_one(self, weight: torch.Tensor, scale: torch.Tensor, key: str) -> torch.Tensor:
+        """Dequantize one weight/scale pair.
+
+        Args:
+            weight: Quantized weight; plain tensor or DTensor of FP8/INT8 payload.
+            scale: Companion block-wise scale tensor on the same device.
+            key: State-dict key, used to select the rowwise Engram scale layout.
+
+        Returns:
+            Decoded tensor in ``self.dtype`` on the weight's device.
+        """
+        return dequantize_checkpoint_weight(weight, scale, dtype=self.dtype, rowwise=".engram.embed." in key)
+
+    def iter_checkpoint_load_parts(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+        device_mesh: "DeviceMesh" | None = None,
+        checkpoint_metadata: "Mapping[str, TensorStorageMetadata] | None" = None,
+    ) -> Iterator[CheckpointLoadPart] | None:
+        """Load the released V4.1 FP8 checkpoint in bounded per-layer parts.
+
+        Every quantized checkpoint tensor gets a temporary FP8 destination (plus its
+        block-scale destination) while non-quantized tensors use their final model
+        storage directly. ``finish`` decodes one part and writes it straight into the
+        parameter shells: per-expert ``w1``/``w3``/``w2`` tensors are decoded, transposed,
+        and written into their slices of the grouped expert storage, reproducing
+        ``_from_hf_w_merged_experts``'s layout. Only one layer's temporaries co-reside
+        with the parameter shells, so peak load memory is the model plus one layer
+        instead of the model plus a full decoded copy (the small-world OOM).
+
+        Engram tables keep their checkpoint-side shapes (the model pads rows up to a
+        multiple of the owner count) and install through an offset-aware local copy.
+
+        Requires the checkpoint's DCP metadata as ground truth; returns ``None``
+        (falling back to the full-state path) for DSpark-shaped state dicts, non-tensor
+        entries, dtype mismatches, grouped expert state-dict tensors that do not alias
+        model storage (TE / MoK experts), or any model tensor the checkpoint cannot
+        serve.
+
+        Args:
+            model_state_dict: Native names mapped to final parameter and persistent-buffer
+                tensors, with their model-specific shapes and distributed placements.
+            device_mesh: Optional mesh whose expert-parallel range selects this rank's
+                experts.
+            checkpoint_metadata: Checkpoint names mapped to DCP storage metadata.
+
+        Returns:
+            One load part per decoder layer plus one for shared tensors, or ``None``.
+
+        Raises:
+            ValueError: The checkpoint holds an expert layer's projections only partially,
+                a quantized weight without its scale companion, or an orphan scale whose
+                weight is absent. Corrupt checkpoints reject here instead of loading
+                silently wrong values; the full-state path raises equivalent errors for
+                the same checkpoints.
+        """
+        if checkpoint_metadata is None:
+            logging.info("%s: part loading declined (no checkpoint metadata)", type(self).__name__)
+            return None
+        if any(key.startswith("mtp.") for key in model_state_dict):
+            logging.info("%s: part loading declined (DSpark-shaped state dict)", type(self).__name__)
+            return None
+        non_tensor_keys = [key for key, value in model_state_dict.items() if not isinstance(value, torch.Tensor)]
+        if non_tensor_keys:
+            logging.info(
+                "%s: part loading declined (%d non-tensor entries, examples=%s)",
+                type(self).__name__,
+                len(non_tensor_keys),
+                non_tensor_keys[:5],
+            )
+            return None
+        n_experts = self.moe_config.n_routed_experts if self.moe_config is not None else 0
+        expert_range: tuple[int, int]
+        if n_experts and device_mesh is not None:
+            expert_range = get_expert_range_for_rank_from_mesh(device_mesh, n_experts)
+        elif n_experts:
+            expert_range = (0, n_experts)
+        else:
+            expert_range = (0, 0)
+        absent_keys: list[str] = []
+        for model_key, target in model_state_dict.items():
+            classified = self._classify_model_key(model_key, expert_range, n_experts, checkpoint_metadata)
+            if classified is None:
+                # Keys absent from the checkpoint (LoRA parameters injected before the base
+                # load, a tied lm_head the checkpoint omits, ...) keep their initialization,
+                # matching the full-state path's missing-key semantics.
+                absent_keys.append(model_key)
+                continue
+            kind, required = classified
+            if kind == "fused" and not self._expert_checkpoint_tensors_use_model_storage:
+                # GroupedExpertsTE and the MoK gate/up storage expose grouped experts through
+                # stacked copies of the real parameters, so part destinations would write into
+                # the copies while the model keeps its initialization. The full-state path
+                # rebuilds and installs those tensors after the read; serve it there.
+                logging.info(
+                    "%s: part loading declined (grouped expert state-dict tensors do not alias model storage)",
+                    type(self).__name__,
+                )
+                return None
+            if kind == "quantized":
+                if target.ndim != 2 or target.dtype != self.dtype:
+                    logging.info(
+                        "%s: part loading declined (%s has %dD %s targets, expected 2D %s)",
+                        type(self).__name__,
+                        model_key,
+                        target.ndim,
+                        target.dtype,
+                        self.dtype,
+                    )
+                    return None
+                weight_key, _ = _split_weight_scale(required)
+                size = checkpoint_metadata[weight_key].size
+                if not isinstance(target, DTensor) and tuple(size) != tuple(target.shape):
+                    # Plain rank-local destinations (FSDP2 state dicts) need the full-state
+                    # path's mesh-planned reads; only DTensor or exact-shape targets are served.
+                    logging.info(
+                        "%s: part loading declined (%s is a plain rank-local destination)",
+                        type(self).__name__,
+                        model_key,
+                    )
+                    return None
+            if (
+                kind == "fused"
+                and isinstance(target, DTensor)
+                and not all(
+                    placement.is_replicate() or (isinstance(placement, Shard) and placement.dim in (0, 1))
+                    for placement in target.placements
+                )
+            ):
+                # Grouped experts shard on dim 0 (EP) and dim 1 (the ep_shard FSDP axis,
+                # see _moe_shard_placement). Anything else needs the full-state path.
+                logging.info(
+                    "%s: part loading declined (%s shards outside the expert/inner axes)",
+                    type(self).__name__,
+                    model_key,
+                )
+                return None
+        if absent_keys:
+            logging.info(
+                "%s: %d model keys absent from the checkpoint keep their initialization (examples=%s)",
+                type(self).__name__,
+                len(absent_keys),
+                absent_keys[:5],
+            )
+        return self._iter_checkpoint_load_parts(model_state_dict, expert_range, n_experts, checkpoint_metadata)
+
+    def _classify_model_key(
+        self,
+        model_key: str,
+        expert_range: tuple[int, int],
+        n_experts: int,
+        checkpoint_metadata: "Mapping[str, TensorStorageMetadata]",
+    ) -> tuple[str, frozenset[str]] | None:
+        """Classify one model key against the checkpoint and list its required checkpoint keys.
+
+        Args:
+            model_key: Native model state-dict name.
+            expert_range: Inclusive-exclusive global expert IDs owned by this rank.
+            n_experts: Total routed experts per MoE layer, used for a rank-independent
+                completeness check over the classified layer.
+            checkpoint_metadata: Checkpoint names mapped to DCP storage metadata.
+
+        Returns:
+            ``("fused"|"engram"|"quantized"|"direct", required checkpoint keys)``, or
+            ``None`` when the checkpoint legitimately lacks this key, whose model tensor
+            then keeps its initialization like on the full-state path.
+
+        Raises:
+            ValueError: The layer's expert projections are only partially present in the
+                checkpoint, a quantized checkpoint weight lacks its scale companion, or a
+                checkpoint scale lacks its companion weight. All are corrupt checkpoints
+                and must reject exactly like the full-state conversion instead of
+                silently keeping initialization or installing raw payload values.
+        """
+        fused = _FUSED_EXPERT_KEY.match(model_key)
+        if fused is not None:
+            required: set[str] = set()
+            layer_num = fused.group(1)
+            any_expert_key = False
+            complete = True
+            for global_expert in range(n_experts):
+                for projection in ("w1", "w3", "w2"):
+                    base = f"layers.{layer_num}.ffn.experts.{global_expert}.{projection}"
+                    weight_key, scale_key = base + ".weight", base + ".scale"
+                    has_weight = weight_key in checkpoint_metadata
+                    has_scale = scale_key in checkpoint_metadata
+                    any_expert_key = any_expert_key or has_weight or has_scale
+                    if not (has_weight and has_scale):
+                        complete = False
+                    if expert_range[0] <= global_expert < expert_range[1]:
+                        required.update((weight_key, scale_key))
+            if not any_expert_key:
+                return None
+            if not complete:
+                raise ValueError(
+                    f"Checkpoint expert projections for layer {layer_num} are incomplete; expected a weight and a "
+                    f"scale for w1/w3/w2 of all {n_experts} routed experts"
+                )
+            return ("fused", frozenset(required))
+        released = _released_key(model_key)
+        if released not in checkpoint_metadata:
+            # An orphan scale means its companion weight was expected: reject like the
+            # full-state conversion instead of treating the projection as legitimately
+            # absent and silently keeping its initialization.
+            orphan_scale_key = released.removesuffix(".weight") + ".scale"
+            if released.endswith(".weight") and orphan_scale_key in checkpoint_metadata:
+                raise ValueError(f"Checkpoint scale {orphan_scale_key} has no matching weight")
+            return None
+        scale_key = released[: -len(".weight")] + ".scale" if released.endswith(".weight") else None
+        if scale_key is not None and scale_key not in checkpoint_metadata:
+            if checkpoint_metadata[released].properties.dtype in (torch.float8_e4m3fn, torch.int8):
+                raise ValueError(f"Quantized checkpoint weight {released} is missing its scale tensor {scale_key}")
+        if scale_key is not None and scale_key in checkpoint_metadata:
+            if ".engram.embed." in model_key:
+                return ("engram", frozenset((released, scale_key)))
+            return ("quantized", frozenset((released, scale_key)))
+        return ("direct", frozenset((released,)))
+
+    def _iter_checkpoint_load_parts(
+        self,
+        model_state_dict: dict[str, torch.Tensor],
+        expert_range: tuple[int, int],
+        n_experts: int,
+        checkpoint_metadata: "Mapping[str, TensorStorageMetadata]",
+    ) -> Iterator[CheckpointLoadPart]:
+        """Build per-layer load parts after :meth:`iter_checkpoint_load_parts` validated the inputs.
+
+        Args:
+            model_state_dict: Native names mapped to final tensors with their placements.
+            expert_range: Inclusive-exclusive global expert IDs owned by this rank.
+            n_experts: Total routed experts per MoE layer.
+            checkpoint_metadata: Checkpoint names mapped to DCP storage metadata; sizes
+                allocate the temporary destinations at checkpoint-side shapes.
+
+        Yields:
+            One load part per decoder layer plus one for shared tensors.
+        """
+        start_expert, end_expert = expert_range
+
+        groups: dict[str, list[str]] = {}
+        for model_key in model_state_dict:
+            layer_match = re.match(r"^model\.layers\.(\d+)\.", model_key)
+            group = f"layer-{layer_match.group(1)}" if layer_match is not None else "shared"
+            groups.setdefault(group, []).append(model_key)
+
+        def _checkpoint_size(key: str) -> tuple[int, int]:
+            size = checkpoint_metadata[key].size
+            if len(size) != 2:
+                raise ValueError(f"Checkpoint metadata for {key} lacks a two-dimensional size")
+            return int(size[0]), int(size[1])
+
+        def _checkpoint_dtype(key: str) -> torch.dtype:
+            return checkpoint_metadata[key].properties.dtype
+
+        def _checkpoint_temp(key: str, device: torch.device) -> torch.Tensor:
+            """Allocate a temporary destination at the checkpoint tensor's exact shape and dtype."""
+            return torch.empty(_checkpoint_size(key), dtype=_checkpoint_dtype(key), device=device)
+
+        for group_keys in groups.values():
+            checkpoint_tensors: dict[str, torch.Tensor] = {}
+            temporary_keys: set[str] = set()
+            generic: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]] = []
+            engrams: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]] = []
+            experts: list[tuple[torch.Tensor, int, str, torch.Tensor, torch.Tensor, int, int, int]] = []
+            for model_key in group_keys:
+                target = model_state_dict[model_key]
+                classified = self._classify_model_key(model_key, expert_range, n_experts, checkpoint_metadata)
+                if classified is None:
+                    # Absent from the checkpoint: no destination, covered keep-at-init.
+                    continue
+                kind, required = classified
+                if kind == "fused":
+                    fused_local = target.to_local() if isinstance(target, DTensor) else target
+                    # Row offsets of this rank's inner-axis shard (dim 1): gate/up slice the
+                    # hidden rows of the transposed checkpoint tensor, down slices the
+                    # intermediate rows. Unsharded targets take the full range.
+                    offsets = _local_offsets(target) if isinstance(target, DTensor) else (0, 0, 0)
+                    layer_match = _FUSED_EXPERT_KEY.match(model_key)
+                    layer_num, which = layer_match.group(1), layer_match.group(2)
+                    row_offset, row_count = int(offsets[1]), int(fused_local.shape[-2])
+                    inter_dim = (
+                        int(fused_local.shape[-1]) // 2 if which == "gate_and_up_projs" else int(fused_local.shape[-1])
+                    )
+                    projections = ("w1", "w3") if which == "gate_and_up_projs" else ("w2",)
+                    for global_expert in range(start_expert, end_expert):
+                        for projection in projections:
+                            base = f"layers.{layer_num}.ffn.experts.{global_expert}.{projection}"
+                            weight_key, scale_key = base + ".weight", base + ".scale"
+                            # Released experts are FP4-packed INT8 with per-row scales; the
+                            # temp mirrors the checkpoint tensor exactly (the full per-expert
+                            # tensor - the shard pair reads it twice, a few MB each) instead
+                            # of guessing the quantization layout.
+                            fp8 = _checkpoint_temp(weight_key, fused_local.device)
+                            scale = _checkpoint_temp(scale_key, fused_local.device)
+                            checkpoint_tensors[weight_key] = fp8
+                            checkpoint_tensors[scale_key] = scale
+                            temporary_keys.update((weight_key, scale_key))
+                            experts.append(
+                                (
+                                    fused_local,
+                                    global_expert - start_expert,
+                                    projection,
+                                    fp8,
+                                    scale,
+                                    inter_dim,
+                                    row_offset,
+                                    row_count,
+                                )
+                            )
+                elif kind == "engram":
+                    weight_key, scale_key = _split_weight_scale(required)
+                    rows, _ = _checkpoint_size(weight_key)
+                    _, scale_columns = _checkpoint_size(scale_key)
+                    layer_id = int(re.search(r"layers\.(\d+)\.engram\.embed\.", model_key).group(1))
+                    # The Engram table is a ~100GB monolith: the destination must be the
+                    # true-row-count owner-sharded view of the model's padded storage
+                    # (_engram_checkpoint_tensor), so each rank reads only its own rows.
+                    checkpoint_view = self._engram_checkpoint_tensor(target, layer_id)
+                    fp8 = checkpoint_view.to(_checkpoint_dtype(weight_key))
+                    if isinstance(fp8, DTensor):
+                        local_rows = int(fp8.to_local().shape[0])
+                        scale = DTensor.from_local(
+                            torch.empty(
+                                (local_rows, scale_columns),
+                                dtype=_checkpoint_dtype(scale_key),
+                                device=target.device,
+                            ),
+                            fp8.device_mesh,
+                            fp8.placements,
+                            shape=torch.Size((rows, scale_columns)),
+                            stride=(scale_columns, 1),
+                        )
+                    else:
+                        scale = torch.empty(
+                            (rows, scale_columns), dtype=_checkpoint_dtype(scale_key), device=target.device
+                        )
+                    checkpoint_tensors[weight_key] = fp8
+                    checkpoint_tensors[scale_key] = scale
+                    temporary_keys.update((weight_key, scale_key))
+                    engrams.append((target, fp8, scale, partial(self._restore_engram_padding, layer_id=layer_id)))
+                elif kind == "quantized":
+                    weight_key, scale_key = _split_weight_scale(required)
+                    fp8 = torch.empty_like(target, dtype=torch.float8_e4m3fn)
+                    scale = _checkpoint_temp(scale_key, target.device)
+                    checkpoint_tensors[weight_key] = fp8
+                    checkpoint_tensors[scale_key] = scale
+                    temporary_keys.update((weight_key, scale_key))
+                    generic.append((target, fp8, scale, False))
+                else:
+                    checkpoint_tensors[next(iter(required))] = target
+            yield CheckpointLoadPart(
+                checkpoint_tensors=checkpoint_tensors,
+                model_keys=frozenset(group_keys),
+                temporary_checkpoint_keys=frozenset(temporary_keys),
+                finish=partial(
+                    _finish_part_loads,
+                    self.dtype,
+                    tuple(generic),
+                    tuple(engrams),
+                    tuple(experts),
+                ),
+            )
 
     # ------------------------------------------------------------------
     # to_hf
