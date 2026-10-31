@@ -1,5 +1,5 @@
-# Prepare work/zephon-vlm/images and corpus with prepare_images.py first.
-# Run: automodel examples/vlm_finetune/zephon/qwen2_5_vl.yaml --nproc-per-node 1
+# Set dataloader.zephon.sources[0].path to your image-conversation JSONL directory.
+# Run: uv run automodel examples/vlm_finetune/zephon/train.yaml --nproc-per-node 1
 recipe: FinetuneRecipeForVLM
 seed: 42
 step_scheduler:
@@ -22,7 +22,7 @@ dataloader:
   zephon:
     sources:
     - name: images
-      path: work/zephon-vlm/corpus
+      path: /data/image-conversations
       fmt: jsonl
     packing:
       seq_len: 1024

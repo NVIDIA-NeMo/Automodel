@@ -26,11 +26,6 @@ import yaml
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoConfig, Mistral3ForConditionalGeneration
 
-from examples.vlm_finetune.zephon.prepare_mistral3 import (
-    build_model_config,
-    build_processor,
-    prepare,
-)
 from nemo_automodel._transformers.registry import resolve_image_position_state
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.vlm.datasets import encode_vlm_document
@@ -58,6 +53,11 @@ from nemo_automodel.components.models.common.packing import (
     configure_packing,
 )
 from nemo_automodel.recipes._typed_config import RecipeConfig
+from tests.utils.mistral3_vlm_fixtures import (
+    build_model_config,
+    build_processor,
+    prepare,
+)
 from tests.utils.zephon_distributed import (
     distributed_environment as distributed_environment,
 )
@@ -132,14 +132,19 @@ def _forward(model, batch):
     return model(**{key: value for key, value in batch.items() if key != "labels"}).logits
 
 
-def test_shipped_recipe_uses_local_processor_and_preserves_expanded_images(source):
+def test_training_recipe_uses_local_processor_and_preserves_expanded_images(source):
     prepare(source)
     values = yaml.safe_load(
-        (Path(__file__).resolve().parents[3] / "examples/vlm_finetune/zephon/mistral3_tiny.yaml").read_text()
+        (Path(__file__).resolve().parents[3] / "examples/vlm_finetune/zephon/train.yaml").read_text()
     )
-    values["processor"]["pretrained_model_name_or_path"] = str(source / "processor")
+    values["model"]["pretrained_model_name_or_path"] = str(source / "model")
+    values["processor"] = {
+        "_target_": "transformers.AutoProcessor.from_pretrained",
+        "pretrained_model_name_or_path": str(source / "processor"),
+    }
     settings = values["dataloader"]["zephon"]
     settings["sources"] = [{"name": "images", "path": str(source / "corpus")}]
+    settings["packing"]["seq_len"] = 63
     settings.setdefault("runtime", {}).update(runner="inline", mtp_mode=False)
     settings["checkpoint"].update(aggregate_store=None, run_id=None)
     resolved = RecipeConfig(ConfigNode(values)).vlm_dataloader
