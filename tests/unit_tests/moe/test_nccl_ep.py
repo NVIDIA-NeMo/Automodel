@@ -40,30 +40,37 @@ class _Dispatch(torch.autograd.Function):
         Args:
             tokens: Tensor of shape [tokens, hidden].
             weights: Tensor of shape [tokens, top_k].
-            buffer: Routing state whose ``rows`` and ``slots`` have shape [received_tokens].
+            buffer: Routing state whose ``rows`` and ``slots`` have shape [routed_rows].
 
         Returns:
-            Received rows [received_tokens, hidden] and their weights [received_tokens].
+            Received rows [received_rows, hidden] and weights [received_rows]. With a fixed
+            receive capacity, NaN rows stand in for the unused tail.
         """
         ctx.buffer = buffer
         ctx.shapes = tokens.shape, weights.shape
-        return tokens[buffer.rows], weights[buffer.rows, buffer.slots]
+        received, probs = tokens[buffer.rows], weights[buffer.rows, buffer.slots]
+        slack = (buffer.recv_capacity_per_rank or received.shape[0]) - received.shape[0]
+        received = torch.cat([received, received.new_full((slack, received.shape[1]), float("nan"))])
+        return received, torch.cat([probs, probs.new_full((slack,), float("nan"))])
 
     @staticmethod
     def backward(ctx, grad_received, grad_weights):
         """Scatter received-row gradients back through the handle held on ctx.
 
         Args:
-            grad_received: Tensor of shape [received_tokens, hidden].
-            grad_weights: Tensor of shape [received_tokens].
+            grad_received: Tensor of shape [received_rows, hidden].
+            grad_weights: Tensor of shape [received_rows].
 
         Returns:
             Gradients for tokens [tokens, hidden] and weights [tokens, top_k].
         """
         rows, slots = ctx.buffer.rows, ctx.buffer.slots
+        routed = rows.numel()
         token_shape, weight_shape = ctx.shapes
-        grad_tokens = grad_received.new_zeros(token_shape).index_add(0, rows, grad_received)
-        grad_topk = grad_weights.new_zeros(weight_shape).index_put((rows, slots), grad_weights, accumulate=True)
+        grad_tokens = grad_received.new_zeros(token_shape).index_add(0, rows, grad_received[:routed])
+        grad_topk = grad_weights.new_zeros(weight_shape).index_put(
+            (rows, slots), grad_weights[:routed], accumulate=True
+        )
         return grad_tokens, grad_topk, None
 
 
@@ -75,7 +82,8 @@ class _Combine(torch.autograd.Function):
         """Sum received rows back into source tokens.
 
         Args:
-            expert_out: Tensor of shape [received_tokens, hidden].
+            expert_out: Tensor of shape [received_rows, hidden]; rows past the routed count
+                are ignored.
             buffer: Routing state from the matching dispatch.
             num_local_tokens: Rows of the result.
 
@@ -83,7 +91,9 @@ class _Combine(torch.autograd.Function):
             Tensor of shape [num_local_tokens, hidden].
         """
         ctx.buffer = buffer
-        return expert_out.new_zeros(num_local_tokens, expert_out.shape[1]).index_add(0, buffer.rows, expert_out)
+        ctx.received_rows = expert_out.shape[0]
+        routed = expert_out[: buffer.rows.numel()]
+        return expert_out.new_zeros(num_local_tokens, expert_out.shape[1]).index_add(0, buffer.rows, routed)
 
     @staticmethod
     def backward(ctx, grad):
@@ -93,9 +103,12 @@ class _Combine(torch.autograd.Function):
             grad: Tensor of shape [num_local_tokens, hidden].
 
         Returns:
-            Gradient for the received rows, [received_tokens, hidden].
+            Gradient for the received rows, [received_rows, hidden], with NaN rows for an
+            unused fixed-capacity tail.
         """
-        return grad[ctx.buffer.rows], None, None
+        routed = grad[ctx.buffer.rows]
+        slack = routed.new_full((ctx.received_rows - routed.shape[0], routed.shape[1]), float("nan"))
+        return torch.cat([routed, slack]), None, None
 
 
 class _Transport:
@@ -147,6 +160,8 @@ class _Transport:
         if not self.ordered and self.dispatches % 2:
             position = position.flip(0)
         self.dispatches += 1
+        if buffer.recv_capacity_per_rank is not None and rows.numel() > buffer.recv_capacity_per_rank:
+            raise RuntimeError("receive capacity overflow traps")
         order = (experts * (rows.numel() + 1) + position).argsort()
         buffer.rows, buffer.slots = rows[order], slots[order]
         received, probs = _Dispatch.apply(tokens, weights, buffer)
@@ -303,6 +318,54 @@ def test_group_uses_ordered_layout_and_automatic_sms(transport, group, monkeypat
     assert os.environ.get(_ORDERED_LAYOUT_ENV) == previous
 
 
+def test_fixed_receive_capacity_ignores_unused_rows(transport, group):
+    manager = nccl_ep.NcclEpManager(
+        NcclEpConfig(max_tokens_per_rank=5, recv_capacity_factor=1.5),
+        group=group,
+        hidden_dim=4,
+        num_experts=4,
+        top_k=2,
+    )
+    assert transport.bootstraps[0][1]["recv_capacity_per_rank"] == 192
+    torch.manual_seed(11)
+    hidden = torch.randn(5, 4, dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.tensor([[0.25, 0.75]] * 5, requires_grad=True)
+    indices = torch.tensor([[1, 0]] * 5)
+    manager.token_indices, manager.token_probs = indices, weights
+    received, probs = manager.get_permuted_hidden_states_by_experts(manager.dispatch(hidden))
+    assert received.shape == (192, 4) and transport.buffers[-1].recv_capacity_per_rank == 192
+    # Expert math runs over every row, as the grouped GEMM epilogues do; NaN rows stand in for the unused tail.
+    out = manager.combine((received.float() * probs[:, None]).bfloat16())
+    upstream = torch.randn_like(hidden)
+    (out.float() * upstream).sum().backward()
+    reference = [x.detach().clone().requires_grad_() for x in (hidden, weights)]
+    expected = (reference[0].float() * reference[1].sum(-1, keepdim=True)).bfloat16()
+    (expected.float() * upstream).sum().backward()
+    torch.testing.assert_close(out, expected)
+    torch.testing.assert_close(hidden.grad, reference[0].grad)
+    torch.testing.assert_close(weights.grad, reference[1].grad)
+
+
+def test_fixed_receive_capacity_overflow_is_not_dropped(transport, group):
+    manager = nccl_ep.NcclEpManager(
+        NcclEpConfig(max_tokens_per_rank=5, recv_capacity_factor=1.0),
+        group=group,
+        hidden_dim=4,
+        num_experts=4,
+        top_k=2,
+    )
+    manager.token_indices = torch.tensor([[1, 0]] * 5)
+    manager.token_probs = torch.full((5, 2), 0.5)
+    transport.buffers.clear()
+    manager.dispatch(torch.zeros(5, 4, dtype=torch.bfloat16))
+    assert transport.buffers[-1].recv_capacity_per_rank == 128
+    manager.recv_capacity = 4
+    manager.token_indices = torch.tensor([[1, 0]] * 5)
+    manager.token_probs = torch.full((5, 2), 0.5)
+    with pytest.raises(RuntimeError, match="overflow"):
+        manager.dispatch(torch.zeros(5, 4, dtype=torch.bfloat16))
+
+
 @pytest.mark.parametrize("rows", [0, 3])
 def test_nccl_ep_row_check_reads_the_host_extent(rows):
     # A meta tensor cannot be read on the host: the NCCL-EP check must not touch the counts.
@@ -320,6 +383,8 @@ def test_nccl_ep_row_check_reads_the_host_extent(rows):
         ({}, "max_tokens_per_rank"),
         ({"nccl_ep": {"max_tokens_per_rank": 0}}, "positive"),
         ({"nccl_ep": {"max_tokens_per_rank": 5}, "dispatcher_async_dispatch": True}, "async_dispatch"),
+        ({"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 0.5}}, "recv_capacity_factor"),
+        ({"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 2.0}, "experts": "te"}, "torch_mm"),
     ],
 )
 def test_invalid_backend_config(kwargs, match):
@@ -486,6 +551,33 @@ def test_backend_preserves_explicit_selection(experts):
     assert config.experts == experts
     assert isinstance(config.nccl_ep, NcclEpConfig)
     assert config.nccl_ep.max_tokens_per_rank == 17
+
+
+def test_fixed_receive_capacity_rejects_expert_bias():
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=4,
+        inter_dim=8,
+        moe_inter_dim=8,
+        norm_topk_prob=False,
+        expert_bias=True,
+    )
+    backend = BackendConfig(
+        dispatcher="nccl_ep",
+        experts="torch_mm",
+        nccl_ep={"max_tokens_per_rank": 17, "recv_capacity_factor": 1.25},
+    )
+    with pytest.raises(ValueError, match="expert_bias"):
+        GroupedExpertsDeepEP(config, backend=backend, dispatcher_backend=backend.dispatcher)
 
 
 def test_lora_preserves_nccl_ep_capacity():

@@ -1586,6 +1586,12 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                 "dispatcher_capacity_factor is not supported for experts with expert_bias=True; "
                 "leave it at None (blocking HybridEP dispatch) for this model."
             )
+        if dispatcher_backend == "nccl_ep" and self.nccl_ep.recv_capacity_factor is not None and self.expert_bias:
+            # The fixed NCCL-EP receive buffer has the same slack rows past the routed count.
+            raise ValueError(
+                "nccl_ep.recv_capacity_factor is not supported for experts with expert_bias=True; "
+                "leave it at None (per-dispatch receive buffers) for this model."
+            )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]

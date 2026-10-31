@@ -421,15 +421,31 @@ class NcclEpConfig:
         max_tokens_per_rank: Upper bound on tokens entering one MoE layer per
             microbatch on one rank, including masked tokens. Required when selecting
             NCCL-EP. The transport rounds it up to a multiple of 64; inputs may be
-            shorter. Receive buffers remain dropless and are sized per dispatch.
+            shorter.
+        recv_capacity_factor: Size every receive buffer for the rounded
+            ``max_tokens_per_rank`` times top-k times this factor routed rows, instead of
+            the rows each dispatch needs. Dispatch then skips its per-layer host
+            synchronization, and rows past the routed count are left unused. A rank that
+            receives more rows than the capacity aborts with a device-side trap rather
+            than dropping tokens, so choose a factor that covers the expected routing
+            skew. Requires the ``torch_mm`` experts backend without expert bias. ``None``
+            (default) sizes receive buffers per dispatch.
     """
 
     max_tokens_per_rank: int | None = None
+    recv_capacity_factor: float | None = None
 
     def __post_init__(self) -> None:
         """Validate settings that do not depend on a CUDA device or EP group."""
         if self.max_tokens_per_rank is not None and self.max_tokens_per_rank <= 0:
             raise ValueError("nccl_ep.max_tokens_per_rank must be positive")
+        if self.recv_capacity_factor is not None and not (
+            math.isfinite(self.recv_capacity_factor) and self.recv_capacity_factor >= 1.0
+        ):
+            raise ValueError(
+                "nccl_ep.recv_capacity_factor must be a finite number >= 1.0 (a smaller receive buffer "
+                f"overflows under balanced routing), got {self.recv_capacity_factor!r}"
+            )
 
 
 AttentionBackend = Literal["torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi"]
@@ -706,6 +722,15 @@ class BackendConfig:
         if self.dispatcher == "nccl_ep":
             if self.nccl_ep.max_tokens_per_rank is None:
                 raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
+            if self.nccl_ep.recv_capacity_factor is not None and self.experts not in (
+                "torch_mm",
+                "gmm",
+                "torch_mm_mxfp8",
+            ):
+                raise ValueError(
+                    "nccl_ep.recv_capacity_factor requires experts='torch_mm': the grouped GEMMs must bound the "
+                    f"routed rows with device-side offsets; got experts={self.experts!r}"
+                )
             if self.dispatcher_async_dispatch:
                 raise ValueError("dispatcher_async_dispatch is not supported by NCCL-EP")
 

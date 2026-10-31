@@ -129,18 +129,28 @@ def _check_case(experts, global_up, global_down, *, rank, world_size, case, chec
     logger.info("rank=%d case=%s checkpoint=%s: output, gradients, norm and update passed", rank, case, checkpointed)
 
 
-def _check_checkpoint_recompute(mesh, *, rank: int, world_size: int) -> None:
-    """Compare gradients with and without non-reentrant recomputation at a realistic size.
+_GRADIENT_NAMES = ("hidden", "probs", "gate_and_up_projs", "down_projs")
+
+
+def _large_routing_gradients(mesh, *, rank: int, world_size: int, nccl_ep: dict) -> list[tuple[torch.Tensor, ...]]:
+    """Run one expert layer at a realistic size without and with non-reentrant recomputation.
 
     NCCL-EP backward reuses the forward's routing handle while recomputation
     redispatches the tokens, so the recomputed expert layout must match the forward's.
     A few tokens keep their order by accident; thousands of routes per expert do not
-    unless the transport fixes the order of each expert's receive slots.
+    unless the transport fixes the order of each expert's receive slots. The layer is
+    rebuilt for each NCCL-EP configuration because a process holds one at a time.
 
     Args:
         mesh: One-dimensional EP device mesh.
         rank: EP rank.
         world_size: EP size.
+        nccl_ep: ``BackendConfig.nccl_ep`` settings for this run.
+
+    Returns:
+        Gradients without and with recomputation, each ordered as ``_GRADIENT_NAMES``:
+        input [tokens, hidden], routing weights [tokens, top_k], local gate/up weights
+        [local_experts, hidden, 2 * inter], and local down weights [local_experts, inter, hidden].
     """
     tokens, hidden_dim, top_k = 4096, 512, 4
     config = MoEConfig(
@@ -159,9 +169,7 @@ def _check_checkpoint_recompute(mesh, *, rank: int, world_size: int) -> None:
         moe_inter_dim=256,
         norm_topk_prob=False,
     )
-    backend = BackendConfig(
-        dispatcher="nccl_ep", experts="torch_mm", nccl_ep={"max_tokens_per_rank": tokens}, attn="sdpa", linear="torch"
-    )
+    backend = BackendConfig(dispatcher="nccl_ep", experts="torch_mm", nccl_ep=nccl_ep, attn="sdpa", linear="torch")
     experts = MoE(config, backend).experts.cuda().bfloat16()
     torch.manual_seed(29)
     global_up = (torch.randn_like(experts.gate_and_up_projs.float()) * 0.02).bfloat16()
@@ -175,27 +183,52 @@ def _check_checkpoint_recompute(mesh, *, rank: int, world_size: int) -> None:
     mask = torch.ones(tokens, device="cuda", dtype=torch.bool)
     upstream = torch.randn(tokens, hidden_dim, device="cuda")
     grads = []
-    for checkpointed in (False, True):
-        experts.zero_grad(set_to_none=True)
-        hidden_in = hidden.detach().requires_grad_()
-        probs_in = probs.detach().requires_grad_()
-        out = (
-            checkpoint(experts, hidden_in, mask, probs_in, indices, use_reentrant=False)
-            if checkpointed
-            else experts(hidden_in, mask, probs_in, indices)
-        )
-        (out.float() * upstream).sum().backward()
-        grads.append(
-            (
-                hidden_in.grad,
-                probs_in.grad,
-                experts.gate_and_up_projs.grad.to_local(),
-                experts.down_projs.grad.to_local(),
+    try:
+        for checkpointed in (False, True):
+            experts.zero_grad(set_to_none=True)
+            hidden_in = hidden.detach().requires_grad_()
+            probs_in = probs.detach().requires_grad_()
+            out = (
+                checkpoint(experts, hidden_in, mask, probs_in, indices, use_reentrant=False)
+                if checkpointed
+                else experts(hidden_in, mask, probs_in, indices)
             )
-        )
-    for name, eager, recomputed in zip(("hidden", "probs", "gate_and_up_projs", "down_projs"), *grads):
-        torch.testing.assert_close(recomputed, eager, rtol=0, atol=0, msg=f"{name} gradients differ under recompute")
-    logger.info("rank=%d case=recompute tokens=%d: gradients match without recomputation", rank, tokens)
+            (out.float() * upstream).sum().backward()
+            grads.append(
+                (
+                    hidden_in.grad,
+                    probs_in.grad,
+                    experts.gate_and_up_projs.grad.to_local(),
+                    experts.down_projs.grad.to_local(),
+                )
+            )
+    finally:
+        torch.cuda.synchronize()
+        finalize_nccl_ep()
+    return grads
+
+
+def _check_large_routing(mesh, *, rank: int, world_size: int) -> None:
+    """Require recomputation and fixed receive capacity to reproduce per-dispatch gradients exactly.
+
+    Args:
+        mesh: One-dimensional EP device mesh.
+        rank: EP rank.
+        world_size: EP size.
+    """
+    tokens = 4096
+    per_dispatch = _large_routing_gradients(
+        mesh, rank=rank, world_size=world_size, nccl_ep={"max_tokens_per_rank": tokens}
+    )
+    # Factor 2 covers every route this layer can receive, so the fixed buffer cannot overflow.
+    fixed = _large_routing_gradients(
+        mesh, rank=rank, world_size=world_size, nccl_ep={"max_tokens_per_rank": tokens, "recv_capacity_factor": 2.0}
+    )
+    runs = (("recompute", per_dispatch[1]), ("fixed capacity", fixed[0]), ("fixed capacity recompute", fixed[1]))
+    for label, grads in runs:
+        for name, expected, actual in zip(_GRADIENT_NAMES, per_dispatch[0], grads):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=f"{label}: {name} gradients differ")
+        logger.info("rank=%d case=%s tokens=%d: gradients match per-dispatch buffers", rank, label, tokens)
 
 
 def main() -> None:
@@ -245,7 +278,7 @@ def main() -> None:
                 )
         # NCCL-EP keeps one configuration per process; rebuild it at the larger size.
         finalize_nccl_ep()
-        _check_checkpoint_recompute(mesh, rank=rank, world_size=world_size)
+        _check_large_routing(mesh, rank=rank, world_size=world_size)
     finally:
         torch.cuda.synchronize()
         finalize_nccl_ep()

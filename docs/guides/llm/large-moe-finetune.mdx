@@ -166,6 +166,28 @@ environment. Received tokens use NCCL-EP's ordered
 expert layout, which activation-checkpoint recomputation requires and which keeps
 expert gradients reproducible from run to run.
 
+By default each dispatch sizes its receive buffer from the routing counts, which
+requires one host synchronization per MoE layer. With the `torch_mm` experts
+backend, `nccl_ep.recv_capacity_factor` instead gives every dispatch a fixed
+receive buffer of `max_tokens_per_rank` (rounded up to a multiple of 64) times
+top-k times the factor rows, and removes that synchronization:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: nccl_ep
+    nccl_ep:
+      max_tokens_per_rank: 4096
+      recv_capacity_factor: 1.25
+```
+
+Rows past the routed count are left unused. A rank that receives more rows than
+the capacity aborts with a device-side error instead of dropping tokens, so
+choose a factor that covers the routing skew of the model; balanced routing
+needs about 1.0. The fixed buffers increase expert activation memory by up to
+the same factor. Experts with bias terms do not support this mode.
+
 When all ranks of the EP group share one NVLink domain, such as one H100 node or
 one GB200 NVL72 rack, setting `NCCL_EP_HT_EM_PULL_PUSH=1` in the job environment
 selects NCCL-EP's NVLink pull-dispatch and push-combine kernels. They can reduce

@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Eager, dropless NCCL-EP token transport through Transformer Engine."""
+"""Dropless NCCL-EP token transport through Transformer Engine."""
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -70,13 +71,20 @@ def _ordered_layout_environment() -> Iterator[None]:
 
 
 def _join_transport(
-    *, group: dist.ProcessGroup, capacity: int, hidden_dim: int, num_experts: int, top_k: int
+    *,
+    group: dist.ProcessGroup,
+    capacity: int,
+    recv_capacity: int | None,
+    hidden_dim: int,
+    num_experts: int,
+    top_k: int,
 ) -> ModuleType:
     """Bootstrap the process-wide transport once, or check that it matches these settings.
 
     Args:
         group: NCCL expert-parallel group with contiguous expert ownership.
         capacity: Group-uniform input extent, a multiple of 64.
+        recv_capacity: Fixed receive rows per rank, or None to size them per dispatch.
         hidden_dim: Width of each dispatched token.
         num_experts: Global expert count across the EP group.
         top_k: Distinct expert selections per token.
@@ -97,7 +105,7 @@ def _join_transport(
         raise RuntimeError("NCCL-EP requires Hopper or newer CUDA GPUs (SM90+)")
     if dist.get_backend(group) != "nccl":
         raise ValueError("NCCL-EP requires an NCCL process group")
-    settings = (capacity, hidden_dim, num_experts, top_k, torch.cuda.current_device())
+    settings = (capacity, recv_capacity, hidden_dim, num_experts, top_k, torch.cuda.current_device())
     if _runtime.api is None:
         if api.is_ep_bootstrapped():
             raise RuntimeError("NCCL-EP is already initialized outside AutoModel; finalize that context first")
@@ -111,7 +119,8 @@ def _join_transport(
                 # Zero lets NCCL-EP size its kernels. An explicit budget would also cap its
                 # token-reordering kernels, which otherwise use every SM.
                 max_num_sms=0,
-                recv_capacity_per_rank=None,
+                # Overflowing a fixed capacity traps on the device instead of dropping tokens.
+                recv_capacity_per_rank=recv_capacity,
             )
         _runtime.api, _runtime.group, _runtime.settings = api, group, settings
     elif _runtime.group is not group or _runtime.settings != settings:
@@ -120,7 +129,7 @@ def _join_transport(
 
 
 class NcclEpManager:
-    """Layer-local routing state for the flex dispatcher's eager NCCL-EP path."""
+    """Layer-local routing state for the flex dispatcher's NCCL-EP path."""
 
     def __init__(
         self,
@@ -152,8 +161,18 @@ class NcclEpManager:
             raise ValueError("Invalid NCCL-EP top-k or hidden dimension")
         self.max_tokens = config.max_tokens_per_rank
         self.capacity = (config.max_tokens_per_rank + 63) // 64 * 64
+        self.recv_capacity = (
+            None
+            if config.recv_capacity_factor is None
+            else math.ceil(self.capacity * top_k * config.recv_capacity_factor)
+        )
         self.api = _join_transport(
-            group=group, capacity=self.capacity, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k
+            group=group,
+            capacity=self.capacity,
+            recv_capacity=self.recv_capacity,
+            hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            top_k=top_k,
         )
         self.hidden_dim = hidden_dim
         self.num_experts = num_experts
@@ -193,14 +212,16 @@ class NcclEpManager:
             allocate_on_comm_stream: Must be false; TE owns allocations.
 
         Returns:
-            BF16 tensor of shape [received_tokens, hidden], packed by local expert and,
-            within an expert, ordered by source rank and token. Storage is unique to this
-            call and retained by TE autograd through backward.
+            BF16 tensor of shape [received_rows, hidden], packed by local expert and,
+            within an expert, ordered by source rank and token. ``received_rows`` is the
+            routed row count, or ``recv_capacity`` with ``recv_capacity_factor``, in which
+            case rows past the routed count are uninitialized and never combined. Storage
+            is unique to this call and retained by TE autograd through backward.
         """
         if async_finish or allocate_on_comm_stream:
             raise ValueError("NCCL-EP uses Transformer Engine stream ordering")
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("The eager NCCL-EP dispatcher does not support CUDA Graph capture")
+            raise RuntimeError("The NCCL-EP dispatcher does not support CUDA Graph capture")
         if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim != 2:
             raise ValueError("NCCL-EP dispatch requires BF16 [local_tokens, hidden] inputs")
         num_tokens, hidden = hidden_states.shape
@@ -219,7 +240,7 @@ class NcclEpManager:
             max_tokens_per_rank=self.capacity,
             hidden_dim=self.hidden_dim,
             num_local_experts=self.num_local_experts,
-            recv_capacity_per_rank=None,
+            recv_capacity_per_rank=self.recv_capacity,
         )
         received, self.dispatched_probs, self.tokens_per_expert = self.api.ep_dispatch(
             buffer,
@@ -235,11 +256,11 @@ class NcclEpManager:
         """Return the already packed dispatch result without a second permutation.
 
         Args:
-            hidden_states: Tensor of shape [received_tokens, hidden], expert-packed.
+            hidden_states: Tensor of shape [received_rows, hidden], expert-packed.
 
         Returns:
-            The input activation tensor of shape [received_tokens, hidden], returned by
-            reference, and FP32 routing weights of shape [received_tokens], aligned with
+            The input activation tensor of shape [received_rows, hidden], returned by
+            reference, and FP32 routing weights of shape [received_rows], aligned with
             its expert-packed rows.
         """
         if self.dispatched_probs is None:
@@ -247,7 +268,7 @@ class NcclEpManager:
         return hidden_states, self.dispatched_probs
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        """Return device counts of shape [local_experts] for the packed rows."""
+        """Return device counts of shape [local_experts] for the routed packed rows."""
         if self.tokens_per_expert is None:
             raise RuntimeError("NCCL-EP dispatch has not completed")
         return self.tokens_per_expert
@@ -256,10 +277,10 @@ class NcclEpManager:
         """Keep expert-packed outputs in the layout consumed by combine.
 
         Args:
-            hidden_states: Tensor of shape [received_tokens, hidden], expert-packed.
+            hidden_states: Tensor of shape [received_rows, hidden], expert-packed.
 
         Returns:
-            The input tensor of shape [received_tokens, hidden], returned by reference
+            The input tensor of shape [received_rows, hidden], returned by reference
             without copying or weighting it again.
         """
         return hidden_states
@@ -273,8 +294,9 @@ class NcclEpManager:
         """Combine expert outputs back into the dispatched token order.
 
         Args:
-            hidden_states: BF16 tensor of shape [received_tokens, hidden],
-                expert-packed and already multiplied by routing weights.
+            hidden_states: BF16 tensor of shape [received_rows, hidden],
+                expert-packed and already multiplied by routing weights. Rows past
+                the routed count are ignored.
             async_finish: Must be false; TE owns stream ordering.
             allocate_on_comm_stream: Must be false; TE owns allocations.
 
