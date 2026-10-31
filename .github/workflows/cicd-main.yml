@@ -616,8 +616,9 @@ jobs:
           # 2-rank parallel), so the budget is roughly double a single smoke test.
           # The merged pytest run takes about 30 minutes, so a 45-minute timeout
           # leaves room for slow runners without letting a hung test retry for long.
+          # Include the two-GPU CLEF optimizer/reload and native YAML-setup coverage.
           - test-name: L2_Distributed
-            test-folder: moe,parallelism,optim
+            test-folder: moe,parallelism,optim,decision_models/clef
             timeout: 45
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
@@ -700,8 +701,9 @@ jobs:
             test-folder: retrieval
             timeout: 20
           # moe + parallelism merged, mirroring cicd-e2e-tests (about 30 minutes of pytest).
+          # Include the two-GPU CLEF optimizer/reload and native YAML-setup coverage.
           - test-name: L2_Distributed
-            test-folder: moe,parallelism,optim
+            test-folder: moe,parallelism,optim,decision_models/clef
             timeout: 45
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
     runs-on: ${{ startsWith(matrix.runner || 'nemo-ci-gcp-gpu-x2', 'ephe-v2-') && format('{0}-a{1}', matrix.runner || 'nemo-ci-gcp-gpu-x2', github.run_attempt) || matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
