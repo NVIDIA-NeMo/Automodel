@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -1281,6 +1282,28 @@ def swiglu_clamped_deepep(x, permuted_probs, limit: float, *, clamp_after_activa
     return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit)
 
 
+def swiglu_routed_rows(
+    x: torch.Tensor, permuted_probs: torch.Tensor, *, routed_rows: torch.Tensor, limit: float
+) -> torch.Tensor:
+    """Apply the weighted SwiGLU to the routed leading rows of a fixed-capacity dispatch buffer.
+
+    Args:
+        x: Grouped-GEMM output of shape [rows, 2 * inter], gate followed by up.
+        permuted_probs: FP32 routing weights of shape [rows, 1].
+        routed_rows: Integer tensor of shape [1] with the routed row count; later rows are unused.
+        limit: Clamp limit in DeepSeek V4 order, or ``math.inf`` for the plain SwiGLU.
+
+    Returns:
+        Tensor of shape [rows, inter]. The Triton kernels leave rows past ``routed_rows``
+        uninitialized; the compiled fallback computes them like routed rows.
+    """
+    if swiglu_triton.uses_triton_kernel(x, permuted_probs):
+        return swiglu_triton.swiglu_clamped_triton(x, permuted_probs, limit, routed_rows)
+    if math.isinf(limit):
+        return weighted_bias_swiglu_impl(x, permuted_probs)
+    return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit)
+
+
 def get_expert_activation_for_deepep(config: MoEConfig):
     """Return the DeepEP expert activation function selected by the MoE config."""
 
@@ -1592,6 +1615,14 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                 "nccl_ep.recv_capacity_factor is not supported for experts with expert_bias=True; "
                 "leave it at None (per-dispatch receive buffers) for this model."
             )
+        # A fixed NCCL-EP receive buffer leaves the rows past the routed count unused; the SwiGLU
+        # kernels read that count on the device and skip them. The wrappers copy this flag.
+        self.activation_skips_unused_rows = (
+            dispatcher_backend == "nccl_ep"
+            and self.nccl_ep.recv_capacity_factor is not None
+            and config.expert_activation == "swiglu"
+            and not config.swiglu_clamp_after_activation
+        )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -1703,6 +1734,24 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             permuted_probs = permuted_probs.detach()
         permuted_probs = permuted_probs.unsqueeze(-1)
         return permuted_local_hidden_states, tokens_per_expert, permuted_probs
+
+    def _routed_rows_activation(
+        self, tokens_per_expert: torch.Tensor
+    ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Return the expert activation for one dispatch.
+
+        Args:
+            tokens_per_expert: Device integer tensor of shape [local_experts] with the routed
+                rows of each local expert.
+
+        Returns:
+            ``expert_activation``, or for a fixed-capacity NCCL-EP buffer a SwiGLU that reads the
+            routed row count on the device and skips the unused rows.
+        """
+        if not self.activation_skips_unused_rows:
+            return self.expert_activation
+        limit = self.config.swiglu_limit if self.config.swiglu_limit > 0.0 else math.inf
+        return partial(swiglu_routed_rows, routed_rows=tokens_per_expert.sum(dim=0, keepdim=True), limit=limit)
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
         """Return dispatcher-owned resources that must be ready before a PP step.
@@ -1830,7 +1879,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                     down_projs,
                     tokens_per_expert_gpu,
                     activation_probs,
-                    self.expert_activation,
+                    self._routed_rows_activation(tokens_per_expert_gpu),
                     use_mxfp8=self.use_mxfp8,
                     # moe_tail skips the down projection's GEMM in a recompute whose combine is cached — sound
                     # only while nothing reads that output. A post-expert callback does, and would save an

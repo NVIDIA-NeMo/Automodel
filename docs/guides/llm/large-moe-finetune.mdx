@@ -182,7 +182,9 @@ model:
       recv_capacity_factor: 1.25
 ```
 
-Rows past the routed count are left unused. A rank that receives more rows than
+Rows past the routed count are left unused; the grouped GEMMs stop at the routed
+rows, and the SwiGLU expert activation reads the routed count on the device and
+skips the remaining rows. A rank that receives more rows than
 the capacity aborts with a device-side error instead of dropping tokens, so
 choose a factor that covers the routing skew of the model; balanced routing
 needs about 1.0. The fixed buffers increase expert activation memory by up to

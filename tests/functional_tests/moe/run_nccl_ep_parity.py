@@ -209,7 +209,7 @@ def _large_routing_gradients(mesh, *, rank: int, world_size: int, nccl_ep: dict)
 
 
 def _check_large_routing(mesh, *, rank: int, world_size: int) -> None:
-    """Require recomputation and fixed receive capacity to reproduce per-dispatch gradients exactly.
+    """Require recomputation to be exact and a fixed receive capacity to match per-dispatch buffers.
 
     Args:
         mesh: One-dimensional EP device mesh.
@@ -224,11 +224,16 @@ def _check_large_routing(mesh, *, rank: int, world_size: int) -> None:
     fixed = _large_routing_gradients(
         mesh, rank=rank, world_size=world_size, nccl_ep={"max_tokens_per_rank": tokens, "recv_capacity_factor": 2.0}
     )
-    runs = (("recompute", per_dispatch[1]), ("fixed capacity", fixed[0]), ("fixed capacity recompute", fixed[1]))
-    for label, grads in runs:
-        for name, expected, actual in zip(_GRADIENT_NAMES, per_dispatch[0], grads):
+    for label, (eager, recomputed) in (("recompute", per_dispatch), ("fixed capacity recompute", fixed)):
+        for name, expected, actual in zip(_GRADIENT_NAMES, eager, recomputed):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=f"{label}: {name} gradients differ")
-        logger.info("rank=%d case=%s tokens=%d: gradients match per-dispatch buffers", rank, label, tokens)
+        logger.info("rank=%d case=%s tokens=%d: gradients match without recomputation", rank, label, tokens)
+    # The fixed buffer's SwiGLU skips the unused rows with Triton kernels, which round like the
+    # compiled per-dispatch activation only to within BF16 precision.
+    for name, expected, actual in zip(_GRADIENT_NAMES, per_dispatch[0], fixed[0]):
+        error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert error < 1e-2, f"fixed capacity: {name} gradients differ by relative L2 {error.item():.3g}"
+    logger.info("rank=%d case=fixed capacity tokens=%d: gradients match per-dispatch buffers", rank, tokens)
 
 
 def main() -> None:

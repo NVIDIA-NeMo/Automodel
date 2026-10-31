@@ -595,6 +595,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
         self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
         self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
+        self.activation_skips_unused_rows = orig_module.activation_skips_unused_rows
         # The combine cache (BackendConfig.dispatcher_recompute_cache) is read by the shared dispatcher's config as
         # well: the replacement must carry it, or the requested mode silently reverts to "none" (review of #4395).
         self.dispatcher_recompute_cache = orig_module.dispatcher_recompute_cache
@@ -748,7 +749,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-            output1 = self.expert_activation(output1, activation_probs)
+            output1 = self._routed_rows_activation(tokens_per_expert_gpu)(output1, activation_probs)
 
             # Down projection + LoRA
             output2 = torch._grouped_mm(output1, down_projs, offs=offs)

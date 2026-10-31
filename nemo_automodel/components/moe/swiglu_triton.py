@@ -57,6 +57,7 @@ if HAVE_TRITON:
         x_ptr,
         probs_ptr,
         y_ptr,
+        routed_rows_ptr,
         rows,
         inter,
         stride_x,
@@ -64,10 +65,14 @@ if HAVE_TRITON:
         limit,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        HAS_ROUTED_ROWS: tl.constexpr,
     ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
         # Skewed expert routing can make rows * stride_x exceed 2**31.
         pid_m = tl.program_id(0).to(tl.int64)
         pid_n = tl.program_id(1)
+        if HAS_ROUTED_ROWS:
+            # Rows past the routed count of a fixed-capacity buffer are neither read nor written.
+            rows = tl.minimum(tl.load(routed_rows_ptr).to(tl.int64), rows)
         row = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         col = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         row_ok = row < rows
@@ -92,6 +97,7 @@ if HAVE_TRITON:
         grad_y_ptr,
         grad_x_ptr,
         grad_probs_ptr,
+        routed_rows_ptr,
         rows,
         inter,
         stride_x,
@@ -101,6 +107,7 @@ if HAVE_TRITON:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         CLAMP_GRAD_INCLUSIVE: tl.constexpr,
+        HAS_ROUTED_ROWS: tl.constexpr,
     ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
         """Write gradients using the installed PyTorch scalar-clamp boundary convention.
 
@@ -110,6 +117,8 @@ if HAVE_TRITON:
             grad_y_ptr: Upstream gradient storage of shape [rows, inter].
             grad_x_ptr: Output gradient storage of shape [rows, 2 * inter], written in place.
             grad_probs_ptr: FP32 output gradient storage of shape [rows], written in place.
+            routed_rows_ptr: Integer storage of shape [1] with the leading rows to process,
+                read when ``HAS_ROUTED_ROWS``; later rows are neither read nor written.
             rows: Number of token rows.
             inter: Intermediate width per gate/up half.
             stride_x: Input row stride in elements.
@@ -119,9 +128,12 @@ if HAVE_TRITON:
             BLOCK_M: Rows per program.
             BLOCK_N: Columns per iteration.
             CLAMP_GRAD_INCLUSIVE: Whether gradients include values exactly on a clamp bound.
+            HAS_ROUTED_ROWS: Whether ``routed_rows_ptr`` bounds the processed rows.
         """
         # Promote before multiplying by the row stride, including grad_x offsets.
         pid = tl.program_id(0).to(tl.int64)
+        if HAS_ROUTED_ROWS:
+            rows = tl.minimum(tl.load(routed_rows_ptr).to(tl.int64), rows)
         row = pid * BLOCK_M + tl.arange(0, BLOCK_M)
         row_ok = row < rows
         limit = limit.to(tl.float32)  # see the forward kernel: fp64 under inductor otherwise, and the loop-carried
@@ -172,7 +184,20 @@ def uses_triton_kernel(x: torch.Tensor, probs: torch.Tensor) -> bool:
     )
 
 
-def _forward(x: torch.Tensor, probs: torch.Tensor, limit: float) -> torch.Tensor:
+def _forward(x: torch.Tensor, probs: torch.Tensor, limit: float, routed_rows: torch.Tensor | None) -> torch.Tensor:
+    """Return the clamped SwiGLU of the leading routed rows.
+
+    Args:
+        x: Contiguous input tensor of shape [rows, 2 * inter]; gate is followed by up.
+        probs: FP32 probability tensor of shape [rows] or [rows, 1].
+        limit: Scalar clamp limit; ``math.inf`` gives the unclamped SwiGLU.
+        routed_rows: Integer tensor of shape [1] counting the leading rows to process, or
+            None for every row.
+
+    Returns:
+        Tensor of shape [rows, inter] in ``x.dtype``; rows past ``routed_rows`` are
+        uninitialized.
+    """
     rows, width = x.shape
     inter = width // 2
     y = torch.empty((rows, inter), dtype=x.dtype, device=x.device)
@@ -183,6 +208,7 @@ def _forward(x: torch.Tensor, probs: torch.Tensor, limit: float) -> torch.Tensor
         x,
         probs,
         y,
+        x if routed_rows is None else routed_rows,
         rows,
         inter,
         x.stride(0),
@@ -190,27 +216,31 @@ def _forward(x: torch.Tensor, probs: torch.Tensor, limit: float) -> torch.Tensor
         float(limit),
         BLOCK_M=_FWD_BLOCK_M,
         BLOCK_N=_FWD_BLOCK_N,
+        HAS_ROUTED_ROWS=routed_rows is not None,
         num_warps=4,
     )
     return y
 
 
 def _backward(
-    x: torch.Tensor, probs: torch.Tensor, grad_y: torch.Tensor, limit: float
+    x: torch.Tensor, probs: torch.Tensor, grad_y: torch.Tensor, limit: float, routed_rows: torch.Tensor | None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return fused SwiGLU gradients with the runtime's scalar-clamp subgradient.
 
     Args:
-        x: Contiguous input tensor of shape [rows, 2 * inter], where rows counts routed tokens
+        x: Contiguous input tensor of shape [rows, 2 * inter], where rows counts dispatched rows
             and inter is the expert intermediate width; gate is followed by up.
         probs: FP32 probability tensor of shape [rows] or [rows, 1].
         grad_y: Upstream gradient tensor of shape [rows, inter].
-        limit: Scalar clamp limit.
+        limit: Scalar clamp limit; ``math.inf`` gives the unclamped SwiGLU.
+        routed_rows: Integer tensor of shape [1] counting the leading rows to process, or
+            None for every row.
 
     Returns:
         Tuple of independent input-gradient storage of shape [rows, 2 * inter] and
         probability-gradient storage of shape [rows] or [rows, 1], matching probs.
-        Output dtypes match their corresponding inputs.
+        Output dtypes match their corresponding inputs; rows past ``routed_rows`` are
+        uninitialized.
     """
     rows, width = x.shape
     inter = width // 2
@@ -227,6 +257,7 @@ def _backward(
         grad_y,
         grad_x,
         grad_probs,
+        x if routed_rows is None else routed_rows,
         rows,
         inter,
         x.stride(0),
@@ -236,6 +267,7 @@ def _backward(
         BLOCK_M=_BWD_BLOCK_M,
         BLOCK_N=_BWD_BLOCK_N,
         CLAMP_GRAD_INCLUSIVE=_CLAMP_GRAD_INCLUSIVE,
+        HAS_ROUTED_ROWS=routed_rows is not None,
         num_warps=8,
     )
     return grad_x, grad_probs.view_as(probs)
@@ -245,18 +277,34 @@ class SwigluClampedTriton(torch.autograd.Function):
     """``silu(clamp(gate)) * clamp(up) * probs`` with the Triton forward and backward kernels."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, probs: torch.Tensor, limit: float) -> torch.Tensor:
-        ctx.save_for_backward(x, probs)
+    def forward(
+        ctx, x: torch.Tensor, probs: torch.Tensor, limit: float, routed_rows: torch.Tensor | None
+    ) -> torch.Tensor:
+        ctx.save_for_backward(x, probs, routed_rows)
         ctx.limit = limit
-        return _forward(x, probs, limit)
+        return _forward(x, probs, limit, routed_rows)
 
     @staticmethod
     def backward(ctx, grad_y: torch.Tensor):
-        x, probs = ctx.saved_tensors
-        grad_x, grad_probs = _backward(x, probs, grad_y, ctx.limit)
-        return grad_x, (grad_probs if ctx.needs_input_grad[1] else None), None
+        x, probs, routed_rows = ctx.saved_tensors
+        grad_x, grad_probs = _backward(x, probs, grad_y, ctx.limit, routed_rows)
+        return grad_x, (grad_probs if ctx.needs_input_grad[1] else None), None, None
 
 
-def swiglu_clamped_triton(x: torch.Tensor, probs: torch.Tensor, limit: float) -> torch.Tensor:
-    """Apply the clamped SwiGLU with the Triton kernels; callers check :func:`uses_triton_kernel` first."""
-    return SwigluClampedTriton.apply(x, probs, limit)
+def swiglu_clamped_triton(
+    x: torch.Tensor, probs: torch.Tensor, limit: float, routed_rows: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Apply the clamped SwiGLU with the Triton kernels; callers check :func:`uses_triton_kernel` first.
+
+    Args:
+        x: Contiguous input tensor of shape [rows, 2 * inter]; gate is followed by up.
+        probs: FP32 probability tensor of shape [rows, 1].
+        limit: Scalar clamp limit; ``math.inf`` gives the unclamped SwiGLU.
+        routed_rows: Integer tensor of shape [1] counting the leading rows of a fixed-capacity
+            buffer to process, or None for every row. Later rows of the output and of both
+            input gradients are left uninitialized.
+
+    Returns:
+        Tensor of shape [rows, inter] in ``x.dtype``.
+    """
+    return SwigluClampedTriton.apply(x, probs, limit, routed_rows)

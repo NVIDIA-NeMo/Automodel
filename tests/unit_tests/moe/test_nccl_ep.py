@@ -599,8 +599,12 @@ def test_lora_preserves_nccl_ep_capacity():
         moe_inter_dim=8,
         norm_topk_prob=False,
     )
-    backend = BackendConfig(dispatcher="nccl_ep", experts="torch_mm", nccl_ep={"max_tokens_per_rank": 17})
+    backend = BackendConfig(
+        dispatcher="nccl_ep", experts="torch_mm", nccl_ep={"max_tokens_per_rank": 17, "recv_capacity_factor": 1.25}
+    )
     original = GroupedExpertsDeepEP(config, backend=backend, dispatcher_backend=backend.dispatcher)
     wrapped = GroupedExpertsDeepEPLoRA(original, lora_dim=2)
     assert wrapped.nccl_ep is original.nccl_ep
     assert wrapped.dispatcher_backend == "nccl_ep"
+    # A fixed receive buffer keeps the SwiGLU bounded to the routed rows through the wrapper.
+    assert original.activation_skips_unused_rows and wrapped.activation_skips_unused_rows

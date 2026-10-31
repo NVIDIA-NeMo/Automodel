@@ -320,7 +320,7 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
                 assert self.down_proj_bias is not None
                 output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
 
-            output1 = self.expert_activation(output1, permuted_probs)
+            output1 = self._routed_rows_activation(tokens_per_expert_gpu)(output1, permuted_probs)
 
             # Down projection (mxfp4 base) + LoRA
             output2 = self._mxfp4_base_mm(output1, "down_projs", offs)
