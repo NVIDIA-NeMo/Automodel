@@ -185,15 +185,25 @@ class RecipeConfig:
         node = self._raw.get("lr_scheduler", None)
         return LRSchedulerConfig(**_section_kwargs(node)) if node else None
 
-    @cached_property
-    def optimizer(self) -> "OptimizerConfig" | None:
+    def _optimizer_config(self, section: str) -> "OptimizerConfig" | None:
+        """Resolve one optimizer section through the shared typed boundary."""
         from nemo_automodel.components.optim.optimizer import build_optimizer_config
 
-        node = self._raw.get("optimizer", None)
+        node = self._raw.get(section, None)
         if node is None:
             return None
         factory, kwargs = _callable_and_kwargs(node)
         return build_optimizer_config(factory, kwargs)
+
+    @cached_property
+    def optimizer(self) -> "OptimizerConfig" | None:
+        """Return the primary model's configured optimizer policy."""
+        return self._optimizer_config("optimizer")
+
+    @cached_property
+    def head_optimizer(self) -> "OptimizerConfig" | None:
+        """Return the separately configured replicated decision-head optimizer."""
+        return self._optimizer_config("head_optimizer")
 
     @cached_property
     def dataloader(self) -> "DataloaderConfig" | None:

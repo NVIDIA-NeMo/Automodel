@@ -1,0 +1,10 @@
+CLEF prompt layout and joint schema head
+Adapted from Cloudflare/clef joint_schema_model.py, revision ed3eed331870db2eff4b0db01237128ede8a00ce.
+https://huggingface.co/Cloudflare/clef/blob/ed3eed331870db2eff4b0db01237128ede8a00ce/joint_schema_model.py
+
+The publisher distributes the release under Apache License 2.0. Its LICENSE includes:
+Copyright 2026 Alibaba Cloud
+https://huggingface.co/Cloudflare/clef/blob/ed3eed331870db2eff4b0db01237128ede8a00ce/LICENSE
+
+NeMo adaptations add typed head configuration, validation, fp32 training and callable lexical-row lookup.
+No publisher model weights are included here.

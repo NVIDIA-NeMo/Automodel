@@ -12,17 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import json
+from types import ModuleType
 
-import httpx
 import pytest
+from huggingface_hub.utils import get_session
 
 A, B = "a" * 40, "b" * 40
 
 
 @pytest.fixture
-def hf_config_hub(tmp_path, monkeypatch):
+def hub_http_transport() -> ModuleType:
+    """Return the HTTP implementation used by the installed Hub client."""
+    # Hub 1.x uses httpx; Hub 2.x uses httpx2. Mock the transport the Hub actually
+    # owns, including its matching response/exception classes.
+    client_type = type(get_session())
+    return importlib.import_module(client_type.__module__.split(".", 1)[0])
+
+
+@pytest.fixture
+def hf_config_hub(tmp_path, monkeypatch, hub_http_transport):
     """Real Hub cache and file I/O, with deterministic HTTP metadata and content."""
+    transport = hub_http_transport
     cache = tmp_path / "models--test--config-race"
     for revision, width in ((A, 32), (B, 64)):
         snapshot = cache / "snapshots" / revision
@@ -38,13 +50,13 @@ def hf_config_hub(tmp_path, monkeypatch):
 
     def respond(client, request, *args, **kwargs):
         if request.url.path == "/api/agent-harnesses":
-            return httpx.Response(200, request=request, json={})
+            return transport.Response(200, request=request, json={})
         requests.append(request)
         if request.url.path == "/api/models/test/config-race" or request.url.path.startswith(
             "/api/models/test/config-race/revision/"
         ):
             revision = request.url.path.rsplit("/", 1)[-1]
-            return httpx.Response(
+            return transport.Response(
                 200, request=request, json={"id": "test/config-race", "sha": A if revision == A else B}
             )
         revision = request.url.path.split("/resolve/")[1].split("/")[0]
@@ -53,8 +65,8 @@ def hf_config_hub(tmp_path, monkeypatch):
         source = cache / "snapshots" / commit / filename
         content = source.read_bytes() if source.is_file() else remote_files.get((commit, filename))
         if content is None:
-            return httpx.Response(404, request=request, headers={"X-Error-Code": "EntryNotFound"})
-        return httpx.Response(
+            return transport.Response(404, request=request, headers={"X-Error-Code": "EntryNotFound"})
+        return transport.Response(
             200,
             request=request,
             headers={
@@ -65,7 +77,7 @@ def hf_config_hub(tmp_path, monkeypatch):
             content=content if request.method == "GET" else b"",
         )
 
-    monkeypatch.setattr(httpx.Client, "send", respond)
+    monkeypatch.setattr(transport.Client, "send", respond)
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
     monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", False)
     return tmp_path, cache, ref, requests
