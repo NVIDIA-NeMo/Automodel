@@ -2584,9 +2584,9 @@ class TestForwardBackwardStepNonPP:
         grid = torch.tensor([[1, 2, 2]])
         moved = []
 
-        def record_move(value, device):
-            moved.append(value)
-            return value
+        def record_move(batch, device):
+            moved.extend(batch.values())
+            return batch
 
         def check_batch(sharder, batch):
             assert batch["_packed_seq_ids"] is packed_ids
@@ -2598,7 +2598,7 @@ class TestForwardBackwardStepNonPP:
                 assert batch["_host_image_grid_thw"].tensor is grid
             raise _CPPreEmbedStop
 
-        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune._move_to_device", record_move)
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.move_batch_to_device", record_move)
         monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder.shard", check_batch)
         with pytest.raises(_CPPreEmbedStop):
             recipe._forward_backward_step(
@@ -3143,6 +3143,8 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     )
     loader_config = SimpleNamespace(
         packing=None,
+        is_packed=False,
+        output_format="batched",
         build=lambda **kwargs: SimpleNamespace(dataloader="dl", processor="proc"),
     )
     monkeypatch.setattr(
@@ -3716,7 +3718,7 @@ def _patches_for_packing(neat_pack_side_effect):
     processor.chat_template = "{{ x }}"
     packing_contract = SimpleNamespace(
         packed_mask_type="document_ids",
-        requires_packed_sequence_metadata=True,
+        return_packed_sequence_metadata=True,
     )
     stateful_dataloader = MagicMock(return_value=MagicMock())
     return (
@@ -3737,6 +3739,10 @@ def _patches_for_packing(neat_pack_side_effect):
             patch("nemo_automodel.components.datasets.vlm.loader._VlmStatefulDataloader", stateful_dataloader),
             patch(
                 "nemo_automodel.components.models.common.packing.configure_packing",
+                return_value=packing_contract,
+            ),
+            patch(
+                "nemo_automodel.components.models.common.packing.get_packing_capabilities",
                 return_value=packing_contract,
             ),
             patch(
@@ -3911,3 +3917,15 @@ def test_build_dataloader_forwards_inject_fake_images_false():
 
     wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
+
+
+@pytest.mark.parametrize("pixel_shape", [(2, 4, 6), (2, 3, 4, 4)])
+def test_pipeline_image_counts_override_accidental_batch_size_match(pixel_shape):
+    pixels = torch.arange(torch.tensor(pixel_shape).prod()).reshape(pixel_shape)
+    grids = torch.tensor([[1, 2, 2], [1, 2, 2]])
+    pixel_chunks, grid_chunks = chunk_vlm_media(
+        pixels, grids, batch_size=2, n_microbatches=2, n_images_per_sample=torch.tensor([2, 0])
+    )
+    torch.testing.assert_close(pixel_chunks[0], pixels)
+    torch.testing.assert_close(grid_chunks[0], grids)
+    assert pixel_chunks[1].shape[0] == grid_chunks[1].shape[0] == 0
