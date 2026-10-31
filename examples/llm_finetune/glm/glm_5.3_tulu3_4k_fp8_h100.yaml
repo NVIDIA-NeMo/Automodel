@@ -1,0 +1,146 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 256
+  local_batch_size: 4
+  ckpt_every_steps: 100000
+  val_every_steps: 100000
+  gc_every_steps: 10
+  num_epochs: 2
+  max_steps: 100
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
+
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: false
+    ignore_router_for_ac: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: zai-org/GLM-5.3
+  dtype: bfloat16  # bf16 resident params + bf16 checkpoints; fp32 master weights live in TE FusedAdam
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: te  # q/kv/o proj, indexer wq_b/wk, dense+shared MLP -> FP8 (indexer weights_proj and lm_head stay bf16/fp32)
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: te  # GroupedExpertsTE -> FP8 grouped GEMM
+    dispatcher: hybridep
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+    te_fp8:
+      recipe: block
+
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+
+loss_fn:
+  # Chunked projection + CE: the last PP stage emits hidden states, so no [4096, 154880] fp32
+  # logits tensor is kept per in-flight microbatch (that is what OOMs the last stage on 80 GB H100).
+  # Same bf16-logits -> fp32-CE rounding as MaskedCrossEntropy.
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:100000]
+  shuffle_seed: 42
+  truncation: true
+  seq_length: 4096
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: zai-org/GLM-5.3
+
+packed_sequence:
+  packed_sequence_size: 4096
+  num_proc: 8  # parallel pre-tokenization; serial packing of 100k Tulu3 samples takes ~9 min per rank
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+
+optimizer:
+  # Pattern A (docs/guides/mixed-precision-training.mdx): bf16 resident params, TE FusedAdam keeps
+  # fp32 master weights (as bf16 + 16-bit remainders) and fp32 Adam moments.
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 1e-5
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  weight_decay: 0
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  # bf16 Adam moments: on 80 GB H100 at PP4 x EP64 the fp32 moments (~29 GB/GPU together with the masters) plus the
+  # TE FP8 padded expert buffers of GLM-5.3's hot experts do not fit; master weights stay fp32 (bf16 param + 16-bit
+  # remainder). The gb200 recipes keep fp32 moments.
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+wandb:
+  enable: false
+  project: huiyingl_workspace
+  entity: Nemo-automodel
+  name: glm53_tulu3_4k_fp8_tilelang_h100
+  group: glm53-dsa-tulu3-4k-h100-fp8-vs-bf16
+  tags: [glm53, dsa, tulu3, 4k, cp1, tilelang, fp8, 100step]
+  mode: online
+  resume: never
+
+ci:
+  cluster_tag: h100
+  # pp4 with ep64 requires 256 ranks.
+  recipe_owner: huiyingl
+  nodes: 32
+  time: "02:00:00"
+  max_steps: 100
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    # GLM-5.3 is new and may not be present in the shared NeMo-CI Hugging Face cache yet.
+    HF_HUB_OFFLINE: "0"
+    FINETUNE_ARGS: "--wandb.enable=true"
+    REQUIRE_FINITE_METRICS: "true"

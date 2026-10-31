@@ -23,7 +23,6 @@ from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaC
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -334,6 +333,12 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _packed_cp_attn_backends = ("tilelang", "cudnn")
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+    # Linear CE losses (ChunkedCrossEntropy / FusedLinearCrossEntropy) own the final projection
+    # under pipeline parallelism: the recipe sets ``_pp_return_hidden_states`` on the last stage,
+    # which then emits final hidden states instead of one [T, vocab] logits tensor per in-flight
+    # microbatch (GLM-5.3: 4096 x 154880 fp32 = 2.4 GiB each on an 80 GB H100).
+    _pp_return_hidden_states_supported: bool = True
+    _pp_return_hidden_states: bool = False
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -388,9 +393,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_overrides=moe_overrides,
         )
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        # Plain torch Linear on purpose: the GLM-5.3 checkpoint keeps lm_head in bf16
+        # (``modules_to_not_convert``) and so do the RL trainer and SGLang, so it must stay out of
+        # the TE FP8 autocast that ``backend.linear='te'`` + ``te_fp8`` would otherwise apply to it.
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GlmMoeDsaStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -527,15 +533,42 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         else:
             inputs_meta = (hidden_meta,)
 
-        if self.lm_head is not None:
+        if self.lm_head is not None and not self._pp_return_hidden_states:
             # The last stage emits logits; compute_lm_head_logits restores [1, T, V] under THD.
             outputs_meta = (meta((microbatch_size, seq_len, vocab_size), dtype),)
+        elif self.lm_head is not None:
+            # Linear CE owns the projection: the last stage emits the final hidden states in the
+            # same batch-restored layout as the logits ([1, T, H] under THD) and no top-k carry.
+            outputs_meta = (meta((microbatch_size, seq_len, hidden_size), dtype),)
         elif uses_indexshare:
             outputs_meta = (hidden_meta, topk_meta)
         else:
             outputs_meta = (hidden_meta,)
 
         return inputs_meta, outputs_meta
+
+    def _pipeline_last_stage_output(
+        self, hidden: torch.Tensor, logits_to_keep: Union[int, torch.Tensor], is_thd: bool
+    ) -> torch.Tensor:
+        """Return the last pipeline stage's output: logits, or final hidden states for linear CE.
+
+        Args:
+            hidden: Final normalized hidden states in the backend layout (THD: ``[T, H]``;
+                bshd: ``[B, S, H]``).
+            logits_to_keep: Position selection forwarded to ``compute_lm_head_logits``.
+            is_thd: Whether the stage ran in THD layout; a 2D result regains its leading batch dim.
+
+        Returns:
+            ``[B, S, V]`` logits, or ``[B, S, H]`` hidden states when ``_pp_return_hidden_states``
+            is set, matching the output meta declared by ``get_pipeline_stage_metas``.
+        """
+        if not self._pp_return_hidden_states:
+            return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
+        # The linear CE loss projects from the hidden states itself, so no full logits tensor is
+        # kept per in-flight microbatch. Restore the leading batch dim like compute_lm_head_logits.
+        if is_thd and hidden.dim() == 2:
+            return hidden.unsqueeze(0)
+        return hidden
 
     def forward(
         self,
@@ -557,7 +590,8 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         Pipeline parallelism: ``input_ids`` is the upstream hidden state on non-first stages.
         IndexShare models additionally use ``*carry`` for the previous stage's running top-k
         selection. Non-last stages return the declared pipeline outputs and the last stage returns
-        the ``logits`` tensor.
+        the ``logits`` tensor, or the final hidden states when a linear CE loss has set
+        ``_pp_return_hidden_states``.
 
         Args:
             input_ids: Token-ID tensor of shape ``[batch, sequence]`` (BSHD) or ``[1, tokens]``
@@ -633,7 +667,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if self._is_pipeline_parallel_stage():
             if not uses_indexshare:
                 if self.lm_head is not None:
-                    return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
+                    return self._pipeline_last_stage_output(hidden, logits_to_keep, is_thd)
                 return hidden
 
             # The top-k carry is non-differentiable (integer indices transported as float32), but
@@ -642,11 +676,11 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             # carry it RECEIVES and the carry it SENDS both get a DEFINED (zero) gradient instead of
             # ``None`` — values are unchanged (``+ x.sum() * 0.0``).
             if self.lm_head is not None:
-                # Last stage: emit logits for the pipeline loss.
-                logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
+                # Last stage: emit logits (or hidden states for a linear CE loss) for the pipeline loss.
+                output = self._pipeline_last_stage_output(hidden, logits_to_keep, is_thd)
                 if carry_in is not None:
-                    logits = logits + (carry_in.float().sum() * 0.0).to(logits.dtype)
-                return logits
+                    output = output + (carry_in.float().sum() * 0.0).to(output.dtype)
+                return output
             # Non-last stage: emit (hidden, float32 top-k carry) to the next stage. The tensors are
             # already in the backend's natural pipeline shape (THD: [T, H] + [T, 1, topk]; bshd:
             # [B, S, H] + [B, S, topk]) per get_pipeline_stage_metas, so no reshape is needed.

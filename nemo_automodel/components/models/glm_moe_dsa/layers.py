@@ -21,6 +21,7 @@ and GlmMoeDsaMLA which integrates the indexer with Multi-head Latent Attention.
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 # Try to import fast_hadamard_transform, fall back to torch implementation
@@ -208,13 +209,20 @@ class GlmMoeDsaIndexer(nn.Module):
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype)
 
         # Per-head weight projection from hidden states
-        self.weights_proj = initialize_linear_module(
-            linear_impl=linear_impl,
-            in_features=self.hidden_size,
-            out_features=self.num_heads,
-            bias=False,
-            dtype=dtype,
-        )
+        # Always a plain torch Linear evaluated in fp32 (see ``_head_weights``): its output drives
+        # top-k key selection, so it must not run through the FP8 GEMM that ``backend.linear='te'`` picks.
+        self.weights_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False, dtype=dtype)
+
+    def _head_weights(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-head indexer weights computed with an fp32 matmul.
+
+        Args:
+            x: Hidden states of shape ``[tokens, hidden]`` (THD) or ``[batch, sequence, hidden]``.
+
+        Returns:
+            fp32 tensor of shape ``x.shape[:-1] + [index_n_heads]``.
+        """
+        return F.linear(x.float(), self.weights_proj.weight.float())
 
     def forward(
         self,
@@ -309,7 +317,7 @@ class GlmMoeDsaIndexer(nn.Module):
                 )
             # Preserve the reference scaling in FP32. The cuDNN adapter owns the final bf16 cast and
             # intentionally applies no additional scale to these per-head weights.
-            head_weights = self.weights_proj(x).float() * (self.num_heads**-0.5) * self.softmax_scale
+            head_weights = self._head_weights(x) * (self.num_heads**-0.5) * self.softmax_scale
             return cudnn_indexer_topk(
                 q.contiguous(),
                 k.contiguous(),
@@ -344,7 +352,7 @@ class GlmMoeDsaIndexer(nn.Module):
                 raise ValueError("TileLang DSA indexer requires 'cu_seqlens' in attn_kwargs (THD packing metadata).")
             # Fold the index softmax_scale (head_dim ** -0.5) into the per-head weight: the kernel
             # computes relu(q·k) * w with no internal scale, and relu(s*x) == s*relu(x) for s > 0.
-            head_weights = self.weights_proj(x).float() * (self.num_heads**-0.5) * self.softmax_scale
+            head_weights = self._head_weights(x) * (self.num_heads**-0.5) * self.softmax_scale
             return tilelang_indexer_topk(
                 q.contiguous(),
                 k.contiguous(),
@@ -373,7 +381,7 @@ class GlmMoeDsaIndexer(nn.Module):
         # (n_heads ** -0.5) factor goes here and softmax_scale is applied to the q·k scores
         # below (relu(scale * x) == scale * relu(x)), then the head reduction is a matmul.
         # weights: [B, S, H] or [T, H]
-        weights = self.weights_proj(x).float() * (self.num_heads**-0.5)
+        weights = self._head_weights(x) * (self.num_heads**-0.5)
 
         # Per-head q·k scores with K kept single-head (no expand-to-heads), mirroring HF so the
         # index scores — and therefore the top-k selection — track the reference as closely as
