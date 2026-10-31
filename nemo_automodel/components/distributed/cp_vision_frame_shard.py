@@ -187,7 +187,8 @@ class _AllGatherSeqDiff(torch.autograd.Function):
     """Differentiable all-gather of equal-size per-rank shards along ``seq_dim``.
 
     Forward concatenates every rank's shard in rank order, producing the full
-    sequence.  Backward reduce-scatters the incoming gradient: each position may
+    sequence using one output buffer; no second concatenated copy is allocated.
+    Backward reduce-scatters the incoming gradient: each position may
     be read on any rank, so its gradient is the sum over ranks of the per-rank
     grad slice; reduce-scatter(SUM) hands each rank the summed gradient for the
     shard it owns.  All shards must have equal length along ``seq_dim``.
@@ -197,19 +198,18 @@ class _AllGatherSeqDiff(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, group, seq_dim: int) -> torch.Tensor:
         ctx.group = group
         ctx.seq_dim = seq_dim
-        world = dist.get_world_size(group)
-        ctx.world = world
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(world)]
-        dist.all_gather(gathered, x, group=group)
-        return torch.cat(gathered, dim=seq_dim)
+        ctx.local_sequence = x.shape[seq_dim]
+        source = x.movedim(seq_dim, 0).contiguous()
+        gathered = source.new_empty((source.shape[0] * dist.get_world_size(group), *source.shape[1:]))
+        dist.all_gather_into_tensor(gathered, source, group=group)
+        return gathered.movedim(0, seq_dim)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        chunks = [c.contiguous() for c in grad_out.chunk(ctx.world, dim=ctx.seq_dim)]
-        local = torch.empty_like(chunks[0])
-        dist.reduce_scatter(local, chunks, op=dist.ReduceOp.SUM, group=ctx.group)
-        return local, None, None
+        source = grad_out.movedim(ctx.seq_dim, 0).contiguous()
+        local = source.new_empty((ctx.local_sequence, *source.shape[1:]))
+        dist.reduce_scatter_tensor(local, source, op=dist.ReduceOp.SUM, group=ctx.group)
+        return local.movedim(0, ctx.seq_dim), None, None
 
 
 def _grid_for_visual(grid_thw: torch.Tensor, pixel_values: torch.Tensor) -> torch.Tensor:

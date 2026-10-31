@@ -166,3 +166,42 @@ def test_cp_capability_is_declared():
     assert DeepseekV41ForCausalLM.ModelCapabilities().supports_cp
     model = DeepseekV41ForCausalLM(_tiny_config(), backend=_backend())
     assert ModelSupports(model).supports_cp
+
+
+def _window_collective_worker(rank: int, rendezvous: str) -> None:
+    """Verify sequence gather and halo gradients with random, rank-dependent upstreams."""
+    from nemo_automodel.components.models.deepseek_v41.cp import gather_window
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", rank=rank, world_size=2, init_method=f"file://{rendezvous}")
+    try:
+        for local_length, window in ((7, 1), (7, 4), (3, 8)):
+            torch.manual_seed(81)
+            full = torch.randn(2, local_length * 2, 5)
+            upstreams = [torch.randn_like(full) for _ in range(2)]
+            local = full[:, rank * local_length : (rank + 1) * local_length].clone().requires_grad_()
+            gathered = gather_sequence(local, dist.group.WORLD)
+            torch.testing.assert_close(gathered, full, atol=0, rtol=0)
+            gathered.backward(upstreams[rank])
+            expected = sum(upstreams)[:, rank * local_length : (rank + 1) * local_length]
+            torch.testing.assert_close(local.grad, expected, atol=0, rtol=0)
+            local.grad = None
+            actual, start = gather_window(local, dist.group.WORLD, window_size=window)
+            end = (rank + 1) * local_length
+            torch.testing.assert_close(actual, full[:, start:end], atol=0, rtol=0)
+            actual.backward(upstreams[rank][:, start:end])
+            expected = torch.zeros_like(full)
+            for consumer in range(2):
+                left = max(0, consumer * local_length - window + 1)
+                right = (consumer + 1) * local_length
+                expected[:, left:right] += upstreams[consumer][:, left:right]
+            torch.testing.assert_close(
+                local.grad, expected[:, rank * local_length : (rank + 1) * local_length], atol=0, rtol=0
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.cpu_only
+def test_window_collectives_match_global_values_and_reverse_gradients(tmp_path):
+    mp.spawn(_window_collective_worker, args=(str(tmp_path / "window-rendezvous"),), nprocs=2, join=True)

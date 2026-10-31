@@ -57,6 +57,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
+from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -93,7 +94,6 @@ from nemo_automodel.components.models.deepseek_v41.layers import (
 )
 from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.models.deepseek_v41.processing import (
-    IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,
     IMAGE_START,
@@ -313,52 +313,126 @@ class DeepseekV41Model(nn.Module):
     def _image_embeddings(
         self,
         input_ids: torch.Tensor,
-        pixel_values: torch.Tensor,
-        image_grid_hws: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+        image_grid_hws: torch.Tensor | None,
         vision_token_types: torch.Tensor,
+        *,
+        cp_group: dist.ProcessGroup | None = None,
+        packed_seq_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Insert image features and learned delimiters into fresh token embeddings.
+        """Fuse globally ordered images into the local contiguous language shard.
 
         Args:
-            input_ids: Integer tensor of shape [batch, sequence].
-            pixel_values: Tensor of shape [all_patches, 3, patch_size, patch_size].
-            image_grid_hws: Integer tensor of shape [images, 2], containing patch grids.
-            vision_token_types: Integer tensor of shape [batch, sequence], with
-                -1 for text and 0/1/2/3 for image start/content/newline/end.
+            input_ids: Integer local token IDs [batch, local_sequence].
+            pixel_values: Global patches [patches, 3, patch_size, patch_size],
+                replicated within CP; None for a text-only batch.
+            image_grid_hws: Global image grids [images, 2], in batch-row order.
+            vision_token_types: Local markers [batch, local_sequence]; -1 for
+                text, 0/1/2/3 for image start/content/newline/end.
+            cp_group: CP-only group, or None. Complete spans are validated after
+                gathering marker metadata, so a shard may start inside an image.
+            packed_seq_ids: Local document IDs [batch, local_sequence], zero
+                for padding. An image must lie wholly inside one document.
 
         Returns:
-            Tensor of shape [batch, sequence, hidden], retaining text and image
-            gradients. The supplied input tensors are not modified.
+            Local fused embeddings [batch, local_sequence, hidden]. Vision
+            blocks and the projector each execute once, even on text-only
+            ranks, preserving FSDP collective order. Frame-sharder backward
+            sums contributions from all CP language shards.
         """
         if self.vision is None:
             raise ValueError("pixel_values requires an enabled DeepSeek V4.1 vision encoder")
         if vision_token_types.shape != input_ids.shape:
-            raise ValueError("vision_token_types must match input_ids [batch, sequence]")
-        if torch.any(input_ids[vision_token_types >= 0] != self.image_token_id):
+            raise ValueError("vision_token_types must match input_ids [batch, local_sequence]")
+        # Validate IDs after gathering too: every CP rank sees the same failure
+        # before any rank enters a visual collective.
+        types = gather_sequence(vision_token_types, cp_group)
+        ids = gather_sequence(input_ids, cp_group)
+        if torch.any(ids[types >= 0] != self.image_token_id):
             raise ValueError("Every image-span token must use the checkpoint's image_token_id")
-        images = image_inputs_from_batch(
-            pixel_values,
-            image_grid_hws,
-            vision_token_types,
-            downsample_ratio=self.vision_config.downsample_ratio,
-        )
-        embedded = self.embed_tokens(input_ids)
-        for item in images:
-            patches = item.patches.to(device=embedded.device, dtype=self.vision.patch_embed.proj.weight.dtype)
-            features = self.vision(patches, item.n_vit_h, item.n_vit_w)
-            features = self.aligner(features, item.n_vit_h, item.n_vit_w).to(embedded.dtype)
-            types = item.types.to(embedded.device)
-            if (types == IMAGE).sum() != features.shape[0]:
-                raise ValueError("Image token count does not match the downsampled vision grid")
-            span = embedded.new_empty(types.shape[0], embedded.shape[-1])
-            span[types == IMAGE] = features
-            span[types == IMAGE_START] = self.image_start.to(embedded.dtype)
-            span[types == IMAGE_END] = self.image_end.to(embedded.dtype)
-            span[types == IMAGE_NEW_LINE] = self.image_newline.to(embedded.dtype)
-            flat_indices = item.batch_index * input_ids.shape[1] + torch.arange(
-                item.start, item.start + types.shape[0], device=embedded.device
+        if pixel_values is None:
+            if image_grid_hws is not None or torch.any(types >= 0):
+                raise ValueError("Image spans require pixel_values")
+            images = ()
+        else:
+            if image_grid_hws is None:
+                raise ValueError("pixel_values requires image_grid_hws")
+            images = image_inputs_from_batch(
+                pixel_values, image_grid_hws, types, downsample_ratio=self.vision_config.downsample_ratio
             )
-            embedded = embedded.flatten(0, 1).index_copy(0, flat_indices, span).view_as(embedded)
+        if packed_seq_ids is not None:
+            documents = gather_sequence(packed_seq_ids, cp_group).cpu()
+            for item in images:
+                span_docs = documents[item.batch_index, item.start : item.start + item.types.numel()]
+                if torch.any(span_docs <= 0) or torch.any(span_docs != span_docs[0]):
+                    raise ValueError("An image span cannot cross a packed document boundary or padding")
+
+        embedded = self.embed_tokens(input_ids)
+        if not images:
+            # All DP ranks must call the same trainable FSDP units. This dummy
+            # never enters language tokens and receives exactly zero gradient.
+            size = self.vision_config.patch_size
+            pixel_values = embedded.new_zeros(1, 3, size, size)
+            image_grid_hws = torch.ones(1, 2, dtype=torch.long, device=embedded.device)
+        patches = pixel_values.to(device=embedded.device, dtype=self.vision.patch_embed.proj.weight.dtype)
+        grids = image_grid_hws.to(embedded.device)
+        grid_thw = torch.cat([torch.ones_like(grids[:, :1]), grids], dim=1)
+        encoded = maybe_distribute_visual(self.vision, patches.flatten(1), grid_thw).pooler_output
+        start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
+        end = start + input_ids.shape[1]
+        # Project only images contributing content to this language shard. An
+        # image straddling a shard boundary is projected as a whole on its
+        # consumers, preserving spatial-merge cells; only local token uses
+        # contribute gradients. Each FSDP-owned projector is still called once.
+        selected_patches = []
+        selected_grids = []
+        destination_indices: list[int] = []
+        feature_indices: list[int] = []
+        patch_offset = feature_offset = 0
+        ratio = self.vision_config.downsample_ratio
+        for item in images:
+            patch_end = patch_offset + item.n_vit_h * item.n_vit_w
+            height = (item.n_vit_h + ratio - 1) // ratio
+            width = (item.n_vit_w + ratio - 1) // ratio
+            # Plan integer placements on the host from already validated grids.
+            # Hundreds of images must not cause one GPU synchronization each.
+            keep = []
+            if item.start < end and item.start + item.types.numel() > start:
+                for row in range(height):
+                    for col in range(width):
+                        position = item.start + 1 + row * (width + 1) + col
+                        if start <= position < end:
+                            keep.append((position, row * width + col))
+            if keep:
+                selected_patches.append(encoded[patch_offset:patch_end])
+                selected_grids.append((item.n_vit_h, item.n_vit_w))
+                destination_indices.extend(item.batch_index * input_ids.shape[1] + pos - start for pos, _ in keep)
+                feature_indices.extend(feature_offset + index for _, index in keep)
+                feature_offset += height * width
+            patch_offset = patch_end
+        if selected_patches:
+            local_encoded = encoded if len(selected_patches) == len(images) else torch.cat(selected_patches)
+            local_grids = torch.tensor(selected_grids, dtype=torch.long, device=embedded.device)
+        else:
+            # Link the dummy to the gather even when no local image content is
+            # used, so every rank participates in its backward collective.
+            local_encoded = encoded[:1] * 0
+            local_grids = torch.ones(1, 2, dtype=torch.long, device=embedded.device)
+        features = self.aligner(local_encoded, image_grid_hws=local_grids).to(embedded.dtype)
+        # Keep the visual graph alive even on a shard with no image tokens.
+        embedded = embedded + features.reshape(-1)[:1].sum() * 0
+        if destination_indices:
+            destinations = torch.tensor(destination_indices, dtype=torch.long, device=embedded.device)
+            indices = torch.tensor(feature_indices, dtype=torch.long, device=embedded.device)
+            embedded = embedded.flatten(0, 1).index_copy(0, destinations, features[indices]).view_as(embedded)
+        else:
+            embedded = embedded.clone()
+        for marker, value in (
+            (IMAGE_START, self.image_start),
+            (IMAGE_END, self.image_end),
+            (IMAGE_NEW_LINE, self.image_newline),
+        ):
+            embedded[vision_token_types == marker] = value.to(embedded.dtype)
         return embedded
 
     def forward(
@@ -400,13 +474,26 @@ class DeepseekV41Model(nn.Module):
         """
         # Fuse within this FSDP owner's forward so learned image delimiters
         # are unsharded before they are read.
-        if pixel_values is not None:
-            if image_grid_hws is None or vision_token_types is None:
-                raise ValueError("pixel_values requires image_grid_hws and vision_token_types")
-            inputs_embeds = self._image_embeddings(input_ids, pixel_values, image_grid_hws, vision_token_types)
+        if self.vision is not None and (inputs_embeds is None or pixel_values is not None):
+            if vision_token_types is None:
+                if pixel_values is not None or image_grid_hws is not None:
+                    raise ValueError("Image inputs require vision_token_types")
+                vision_token_types = torch.full_like(input_ids, -1)
+            inputs_embeds = self._image_embeddings(
+                input_ids,
+                pixel_values,
+                image_grid_hws,
+                vision_token_types,
+                cp_group=cp_group,
+                packed_seq_ids=packed_seq_ids,
+            )
             image_mask = vision_token_types >= 0
-        elif image_grid_hws is not None or (vision_token_types is not None and torch.any(vision_token_types >= 0)):
-            raise ValueError("Image spans require pixel_values; image placeholders cannot be trained as ordinary text")
+        elif (
+            pixel_values is not None
+            or image_grid_hws is not None
+            or (vision_token_types is not None and torch.any(vision_token_types >= 0))
+        ):
+            raise ValueError("Image inputs require an enabled vision encoder")
         if position_ids is None:
             start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
             position_ids = (torch.arange(input_ids.shape[1], device=input_ids.device) + start).expand_as(input_ids)
@@ -482,6 +569,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     # parallelizer_utils.fully_shard_across_blocks) — per-block units could only be reduce-scattered one by one
     # in FSDP2's root post-backward callback after the whole backward.
     _fsdp_shard_across_blocks = ["attn.sinks_param"]
+    _packed_cp_attn_backends = ("tilelang", "cudnn")
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -492,6 +580,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         supports_pp: bool = False
         supports_ep: bool = True
         supports_thd: bool = True
+        supports_cp_vision_frame_sharding: bool = True
 
     @classmethod
     def from_config(cls, config: DeepseekV41Config, **kwargs: Any) -> DeepseekV41ForCausalLM:
@@ -695,8 +784,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
             if labels is not None:
                 raise ValueError("CP training requires the recipe loss with labels shifted before sequence sharding")
-            if pixel_values is not None:
-                raise ValueError("DeepSeek V4.1 context parallelism currently supports text only")
         if packed_seq_ids is not None:
             if labels is not None:
                 raise ValueError("Prepared packed input requires the recipe loss with independently shifted labels")
@@ -708,8 +795,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 raise ValueError("packed_seq_ids must be an integer tensor with shape [batch, local_sequence]")
         layout = None
         if seq_lens is not None:
-            if pixel_values is not None or packed_seq_ids is not None:
-                raise ValueError("Packed text requires seq_lens or prepared packed_seq_ids, without image inputs")
+            if packed_seq_ids is not None:
+                raise ValueError("Provide either seq_lens or prepared packed_seq_ids")
             if cp_group is not None and dist.get_world_size(cp_group) > 1:
                 raise ValueError("Packed CP input must pass through the model-owned ContextParallelSharder")
             layout = packed_layout(
@@ -720,6 +807,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 minimum_length=input_ids.shape[1],
             )
             input_ids = layout.pack(input_ids, fill=self.config.text_config.pad_token_id or 0)
+            if vision_token_types is not None:
+                vision_token_types = layout.pack(vision_token_types, fill=-1)
             position_ids = layout.position_ids
             packed_seq_ids = layout.sequence_ids
             attention_mask = packed_seq_ids > 0

@@ -1,0 +1,181 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Packed image/text SFT on 16 GB200 nodes x 4 GPUs in one NVLink domain.
+# Global sequence 131072, CP32 -> 4096 local language tokens; EP64, PP1.
+# Vision frames use the existing CP frame-sharding policy. The tower gathers
+# unmerged patches before the ceil-based spatial merger, including odd grids.
+# Native per-document shifting and THD metadata preserve image/document boundaries.
+# This is a new recipe; full pretrained 128K fit/performance require validation.
+
+recipe: FinetuneRecipeForVLM
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 4  # DP2 x local batch 1 x gradient accumulation 2.
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  save_checkpoint_every_epoch: false
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 10
+  num_epochs: 10
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41Config.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+    name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+    revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
+    text_config:
+      compile_engram: true
+      compile_cache_quant: false
+  revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
+  trust_remote_code: false
+  load_base_model: true
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: cudnn
+    linear: torch
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: hybridep
+    gate_precision: float32
+    rope: triton
+    rope_fusion: false
+    compile_hc: true
+    compile_norm: false  # TE supplies the fused RMSNorm path.
+    shared_expert_overlap: true
+    compile_router_weight: true
+    dispatcher_equal_token_counts: true  # Packed CP synchronizes physical lengths across EP ranks.
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: nemo_automodel.components.models.deepseek_v41.processing.DeepseekV41Processor.from_pretrained
+  pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+  revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
+  trust_remote_code: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  pp_size: 1
+  cp_size: 32
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: false
+  multimodal:
+    vision:
+      frame_sharding:
+        enabled: true
+        mesh_dims: [cp]
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    lm_head_precision: float32
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      param_dtype: bfloat16
+      reduce_dtype: float32
+      output_dtype: null
+      cast_forward_inputs: false
+
+freeze_config:
+  freeze_vision_tower: false
+  freeze_language_model: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: ../checkpoints/deepseek_v41_flash_llava_packed128k_cp32_ep64
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+
+prewarm:
+  comm_groups: true
+  cublas_backward: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+  chunk_len: 512
+  compile: true
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.HfImageConversationDatasetConfig
+  path_or_dataset: HuggingFaceH4/llava-instruct-mix-vsft
+  revision: 4c04c8302cb25a9c7ee48d2dfda99308d432f87c
+  split: train
+  seed: 1234
+  truncate: false
+  inject_fake_images: false
+
+packed_sequence:
+  pretokenize: true
+  max_length: 131073  # One extra token for the per-document next-token shift.
+  pack_size: 131072
+  collate_max_length: 131072
+  packing_ratio: 0.95
+  drop_long_samples: true
+  balance_media_tokens: true
+  packing_format: thd  # Metadata only; DSV4.1 builds sparse attention indices within each document.
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  shuffle: true
+  drop_last: true
+  prefetch_factor: 1
+
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+lr_scheduler:
+  lr_warmup_steps: 10
+  lr_decay_steps: 100
+  lr_decay_style: cosine
+  min_lr: 5.0e-7
+
+clip_grad_norm:
+  backend: triton  # Avoid gradient-sized temporaries for the Engram owner shards.
+  max_norm: 1.0
+
+wandb:
+  enable: false  # Opt in with --wandb.enable true; validation runs enable W&B.
+  entity: Nemo-automodel
+  project: automodel-ds41-vision-packed128k
+  name: ds41-llava-packed128k-cp32-ep64-opt-ga2
+  mode: online
+  dir: ../logs/wandb
+
+ci:
+  recipe_owner: huiyingl
+  nodes: 16
+  cluster_tag: gb200
+  time: "01:00:00"
