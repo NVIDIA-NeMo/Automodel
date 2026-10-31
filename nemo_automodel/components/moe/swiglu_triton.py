@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Triton kernels for the clamped SwiGLU expert activation (DeepSeek-V4 style, ``swiglu_limit > 0``).
+"""Triton kernels for the weighted SwiGLU expert activation, clamped (DeepSeek-V4 style) or not.
 
 The routed experts apply ``silu(clamp(gate, max=L)) * clamp(up, -L, L) * probs`` to the grouped-GEMM output
 ``x = [gate | up]`` (bf16, ``[rows, 2 * inter]``) with fp32 routing probabilities ``probs`` (``[rows, 1]``). The
@@ -19,14 +19,18 @@ compiled PyTorch version (``experts._swiglu_clamped_deepep_compiled``) is one in
 autograd-derived backward concatenates ``d_gate`` and ``d_up`` and ran at about a quarter of HBM bandwidth on
 GB200 (0.7 ms for a 1.1 GB pass at the 16-node shape). These kernels do one pass each:
 
-* forward: a 2-D tile per program, fp32 math, result rounded to ``x.dtype``;
+* forward: a 2-D tile of 2048 elements per program, fp32 math, result rounded to ``x.dtype``. The widest
+  column block that pads the intermediate width by at most an eighth is used, because wide rows run faster;
 * backward: one program per block of rows looping over the columns, writing ``d_gate`` / ``d_up`` straight into
   the two halves of ``grad_x`` and accumulating the per-row probability gradient in registers.
 
+Both block shapes are fixed per intermediate width rather than autotuned, so results are reproducible across
+runs; on GB200 the kernels move 5.5 to 6.7 TB/s of HBM traffic.
+
 Clamp gradients follow the installed scalar ``torch.clamp`` subgradient: inclusive before PyTorch 2.15,
-and zero at exact bounds from 2.15 onward. The dispatcher in
-``experts.swiglu_clamped_deepep`` uses these kernels on contiguous CUDA inputs when Triton is importable and
-falls back to the compiled version otherwise.
+and zero at exact bounds from 2.15 onward. The unclamped SwiGLU passes ``L = inf``. The dispatchers
+``experts.swiglu_clamped_deepep`` and ``experts.weighted_swiglu_deepep`` use these kernels on contiguous CUDA
+inputs when Triton is importable and fall back to PyTorch otherwise.
 """
 
 from __future__ import annotations
@@ -41,10 +45,10 @@ _HAVE_TRITON_LANGUAGE, tl = safe_import("triton.language")
 HAVE_TRITON: bool = bool(_HAVE_TRITON and _HAVE_TRITON_LANGUAGE)
 
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
-_FWD_BLOCK_M = 8
-_FWD_BLOCK_N = 256
+_FWD_TILE = 2048
+_FWD_BLOCK_N_CHOICES = (1024, 512, 256, 128)
 _BWD_BLOCK_M = 4
-_BWD_BLOCK_N = 512
+_BWD_BLOCK_N = 256
 # PyTorch 2.15 changed scalar clamp's subgradient to zero at either exact bound.
 # Keep fused backward aligned with the installed framework on older releases too.
 _CLAMP_GRAD_INCLUSIVE = Version(torch.__version__).release < (2, 15)
@@ -57,6 +61,7 @@ if HAVE_TRITON:
         x_ptr,
         probs_ptr,
         y_ptr,
+        routed_rows_ptr,
         rows,
         inter,
         stride_x,
@@ -64,10 +69,14 @@ if HAVE_TRITON:
         limit,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        HAS_ROUTED_ROWS: tl.constexpr,
     ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
         # Skewed expert routing can make rows * stride_x exceed 2**31.
         pid_m = tl.program_id(0).to(tl.int64)
         pid_n = tl.program_id(1)
+        if HAS_ROUTED_ROWS:
+            # Rows past the routed count of a fixed-capacity buffer are neither read nor written.
+            rows = tl.minimum(tl.load(routed_rows_ptr).to(tl.int64), rows)
         row = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         col = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         row_ok = row < rows
@@ -92,6 +101,7 @@ if HAVE_TRITON:
         grad_y_ptr,
         grad_x_ptr,
         grad_probs_ptr,
+        routed_rows_ptr,
         rows,
         inter,
         stride_x,
@@ -101,6 +111,7 @@ if HAVE_TRITON:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         CLAMP_GRAD_INCLUSIVE: tl.constexpr,
+        HAS_ROUTED_ROWS: tl.constexpr,
     ):  # pragma: no cover - Triton JIT executes on the GPU, outside Python tracing.
         """Write gradients using the installed PyTorch scalar-clamp boundary convention.
 
@@ -110,6 +121,8 @@ if HAVE_TRITON:
             grad_y_ptr: Upstream gradient storage of shape [rows, inter].
             grad_x_ptr: Output gradient storage of shape [rows, 2 * inter], written in place.
             grad_probs_ptr: FP32 output gradient storage of shape [rows], written in place.
+            routed_rows_ptr: Integer storage of shape [1] with the leading rows to process,
+                read when ``HAS_ROUTED_ROWS``; later rows are neither read nor written.
             rows: Number of token rows.
             inter: Intermediate width per gate/up half.
             stride_x: Input row stride in elements.
@@ -119,9 +132,12 @@ if HAVE_TRITON:
             BLOCK_M: Rows per program.
             BLOCK_N: Columns per iteration.
             CLAMP_GRAD_INCLUSIVE: Whether gradients include values exactly on a clamp bound.
+            HAS_ROUTED_ROWS: Whether ``routed_rows_ptr`` bounds the processed rows.
         """
         # Promote before multiplying by the row stride, including grad_x offsets.
         pid = tl.program_id(0).to(tl.int64)
+        if HAS_ROUTED_ROWS:
+            rows = tl.minimum(tl.load(routed_rows_ptr).to(tl.int64), rows)
         row = pid * BLOCK_M + tl.arange(0, BLOCK_M)
         row_ok = row < rows
         limit = limit.to(tl.float32)  # see the forward kernel: fp64 under inductor otherwise, and the loop-carried
@@ -156,6 +172,23 @@ if HAVE_TRITON:
         tl.store(grad_probs_ptr + row, acc, mask=row_ok)
 
 
+def _forward_block_n(inter: int) -> int:
+    """Return the forward column block for an intermediate width.
+
+    Args:
+        inter: Intermediate width of each gate/up half.
+
+    Returns:
+        The widest candidate whose padding of ``inter`` is at most an eighth of the
+        padded width, or else the narrowest candidate, which pads ``inter`` least.
+    """
+    for block in _FWD_BLOCK_N_CHOICES:
+        padded = -(-inter // block) * block
+        if 8 * (padded - inter) <= padded:
+            return block
+    return _FWD_BLOCK_N_CHOICES[-1]
+
+
 def uses_triton_kernel(x: torch.Tensor, probs: torch.Tensor) -> bool:
     """Whether the Triton kernels can take these inputs (contiguous 2-D CUDA ``x``, one probability per row)."""
     return (
@@ -172,45 +205,65 @@ def uses_triton_kernel(x: torch.Tensor, probs: torch.Tensor) -> bool:
     )
 
 
-def _forward(x: torch.Tensor, probs: torch.Tensor, limit: float) -> torch.Tensor:
+def _forward(x: torch.Tensor, probs: torch.Tensor, limit: float, routed_rows: torch.Tensor | None) -> torch.Tensor:
+    """Return the clamped SwiGLU of the leading routed rows.
+
+    Args:
+        x: Contiguous input tensor of shape [rows, 2 * inter]; gate is followed by up.
+        probs: FP32 probability tensor of shape [rows] or [rows, 1].
+        limit: Scalar clamp limit; ``math.inf`` gives the unclamped SwiGLU.
+        routed_rows: Integer tensor of shape [1] counting the leading rows to process, or
+            None for every row.
+
+    Returns:
+        Tensor of shape [rows, inter] in ``x.dtype``; rows past ``routed_rows`` are
+        uninitialized.
+    """
     rows, width = x.shape
     inter = width // 2
     y = torch.empty((rows, inter), dtype=x.dtype, device=x.device)
     if rows == 0 or inter == 0:
         return y
-    grid = (triton.cdiv(rows, _FWD_BLOCK_M), triton.cdiv(inter, _FWD_BLOCK_N))
+    block_n = _forward_block_n(inter)
+    block_m = _FWD_TILE // block_n
+    grid = (triton.cdiv(rows, block_m), triton.cdiv(inter, block_n))
     _swiglu_clamped_fwd_kernel[grid](
         x,
         probs,
         y,
+        x if routed_rows is None else routed_rows,
         rows,
         inter,
         x.stride(0),
         y.stride(0),
         float(limit),
-        BLOCK_M=_FWD_BLOCK_M,
-        BLOCK_N=_FWD_BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HAS_ROUTED_ROWS=routed_rows is not None,
         num_warps=4,
     )
     return y
 
 
 def _backward(
-    x: torch.Tensor, probs: torch.Tensor, grad_y: torch.Tensor, limit: float
+    x: torch.Tensor, probs: torch.Tensor, grad_y: torch.Tensor, limit: float, routed_rows: torch.Tensor | None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return fused SwiGLU gradients with the runtime's scalar-clamp subgradient.
 
     Args:
-        x: Contiguous input tensor of shape [rows, 2 * inter], where rows counts routed tokens
+        x: Contiguous input tensor of shape [rows, 2 * inter], where rows counts dispatched rows
             and inter is the expert intermediate width; gate is followed by up.
         probs: FP32 probability tensor of shape [rows] or [rows, 1].
         grad_y: Upstream gradient tensor of shape [rows, inter].
-        limit: Scalar clamp limit.
+        limit: Scalar clamp limit; ``math.inf`` gives the unclamped SwiGLU.
+        routed_rows: Integer tensor of shape [1] counting the leading rows to process, or
+            None for every row.
 
     Returns:
         Tuple of independent input-gradient storage of shape [rows, 2 * inter] and
         probability-gradient storage of shape [rows] or [rows, 1], matching probs.
-        Output dtypes match their corresponding inputs.
+        Output dtypes match their corresponding inputs; rows past ``routed_rows`` are
+        uninitialized.
     """
     rows, width = x.shape
     inter = width // 2
@@ -227,6 +280,7 @@ def _backward(
         grad_y,
         grad_x,
         grad_probs,
+        x if routed_rows is None else routed_rows,
         rows,
         inter,
         x.stride(0),
@@ -236,7 +290,8 @@ def _backward(
         BLOCK_M=_BWD_BLOCK_M,
         BLOCK_N=_BWD_BLOCK_N,
         CLAMP_GRAD_INCLUSIVE=_CLAMP_GRAD_INCLUSIVE,
-        num_warps=8,
+        HAS_ROUTED_ROWS=routed_rows is not None,
+        num_warps=4,
     )
     return grad_x, grad_probs.view_as(probs)
 
@@ -245,18 +300,34 @@ class SwigluClampedTriton(torch.autograd.Function):
     """``silu(clamp(gate)) * clamp(up) * probs`` with the Triton forward and backward kernels."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, probs: torch.Tensor, limit: float) -> torch.Tensor:
-        ctx.save_for_backward(x, probs)
+    def forward(
+        ctx, x: torch.Tensor, probs: torch.Tensor, limit: float, routed_rows: torch.Tensor | None
+    ) -> torch.Tensor:
+        ctx.save_for_backward(x, probs, routed_rows)
         ctx.limit = limit
-        return _forward(x, probs, limit)
+        return _forward(x, probs, limit, routed_rows)
 
     @staticmethod
     def backward(ctx, grad_y: torch.Tensor):
-        x, probs = ctx.saved_tensors
-        grad_x, grad_probs = _backward(x, probs, grad_y, ctx.limit)
-        return grad_x, (grad_probs if ctx.needs_input_grad[1] else None), None
+        x, probs, routed_rows = ctx.saved_tensors
+        grad_x, grad_probs = _backward(x, probs, grad_y, ctx.limit, routed_rows)
+        return grad_x, (grad_probs if ctx.needs_input_grad[1] else None), None, None
 
 
-def swiglu_clamped_triton(x: torch.Tensor, probs: torch.Tensor, limit: float) -> torch.Tensor:
-    """Apply the clamped SwiGLU with the Triton kernels; callers check :func:`uses_triton_kernel` first."""
-    return SwigluClampedTriton.apply(x, probs, limit)
+def swiglu_clamped_triton(
+    x: torch.Tensor, probs: torch.Tensor, limit: float, routed_rows: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Apply the clamped SwiGLU with the Triton kernels; callers check :func:`uses_triton_kernel` first.
+
+    Args:
+        x: Contiguous input tensor of shape [rows, 2 * inter]; gate is followed by up.
+        probs: FP32 probability tensor of shape [rows, 1].
+        limit: Scalar clamp limit; ``math.inf`` gives the unclamped SwiGLU.
+        routed_rows: Integer tensor of shape [1] counting the leading rows of a fixed-capacity
+            buffer to process, or None for every row. Later rows of the output and of both
+            input gradients are left uninitialized.
+
+    Returns:
+        Tensor of shape [rows, inter] in ``x.dtype``.
+    """
+    return SwigluClampedTriton.apply(x, probs, limit, routed_rows)

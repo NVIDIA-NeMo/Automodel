@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -26,6 +27,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.models.common.utils import NcclEpConfig
 from nemo_automodel.components.moe import swiglu_triton
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.megatron.fused_a2a import hybridep_combine_output_cached
@@ -1280,6 +1282,46 @@ def swiglu_clamped_deepep(x, permuted_probs, limit: float, *, clamp_after_activa
     return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit)
 
 
+def weighted_swiglu_deepep(x: torch.Tensor, permuted_probs: torch.Tensor) -> torch.Tensor:
+    """Apply the routing-weighted SwiGLU: the Triton kernels on CUDA, the fused PyTorch function elsewhere.
+
+    The Triton kernels read and write each element once in each direction and round once from FP32;
+    see :mod:`nemo_automodel.components.moe.swiglu_triton`.
+
+    Args:
+        x: Grouped-GEMM output of shape [rows, 2 * inter], gate followed by up.
+        permuted_probs: Routing weights of shape [rows, 1].
+
+    Returns:
+        Tensor of shape [rows, inter] in ``x.dtype``.
+    """
+    if swiglu_triton.uses_triton_kernel(x, permuted_probs):
+        return swiglu_triton.swiglu_clamped_triton(x, permuted_probs, math.inf)
+    return weighted_bias_swiglu_impl(x, permuted_probs)
+
+
+def swiglu_routed_rows(
+    x: torch.Tensor, permuted_probs: torch.Tensor, *, routed_rows: torch.Tensor, limit: float
+) -> torch.Tensor:
+    """Apply the weighted SwiGLU to the routed leading rows of a fixed-capacity dispatch buffer.
+
+    Args:
+        x: Grouped-GEMM output of shape [rows, 2 * inter], gate followed by up.
+        permuted_probs: FP32 routing weights of shape [rows, 1].
+        routed_rows: Integer tensor of shape [1] with the routed row count; later rows are unused.
+        limit: Clamp limit in DeepSeek V4 order, or ``math.inf`` for the plain SwiGLU.
+
+    Returns:
+        Tensor of shape [rows, inter]. The Triton kernels leave rows past ``routed_rows``
+        uninitialized; the compiled fallback computes them like routed rows.
+    """
+    if swiglu_triton.uses_triton_kernel(x, permuted_probs):
+        return swiglu_triton.swiglu_clamped_triton(x, permuted_probs, limit, routed_rows)
+    if math.isinf(limit):
+        return weighted_bias_swiglu_impl(x, permuted_probs)
+    return _swiglu_clamped_deepep_compiled(x, permuted_probs, limit)
+
+
 def get_expert_activation_for_deepep(config: MoEConfig):
     """Return the DeepEP expert activation function selected by the MoE config."""
 
@@ -1291,7 +1333,7 @@ def get_expert_activation_for_deepep(config: MoEConfig):
                 limit=config.swiglu_limit,
                 clamp_after_activation=config.swiglu_clamp_after_activation,
             )
-        return weighted_bias_swiglu_impl
+        return weighted_swiglu_deepep
     elif config.expert_activation == "swigluoai":
         return partial(
             swiglu_oai_deepep,
@@ -1311,6 +1353,94 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         return relu2_deepep
     else:
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
+
+
+def _skips_unused_rows(config: MoEConfig, dispatcher_backend: str, nccl_ep: NcclEpConfig) -> bool:
+    """Return whether the config's SwiGLU can skip the unused rows of a fixed NCCL-EP receive buffer.
+
+    Args:
+        config: MoE configuration selecting the expert activation.
+        dispatcher_backend: Flex dispatcher backend of the expert module.
+        nccl_ep: NCCL-EP settings of the expert module.
+
+    Returns:
+        True for the default SwiGLU, clamped or not, fed by fixed-capacity NCCL-EP buffers.
+    """
+    return (
+        dispatcher_backend == "nccl_ep"
+        and nccl_ep.recv_capacity_factor is not None
+        and config.expert_activation == "swiglu"
+        and not config.swiglu_clamp_after_activation
+    )
+
+
+def _routed_rows_swiglu(
+    config: MoEConfig, tokens_per_expert: torch.Tensor
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Return the config's SwiGLU bounded to the routed rows of a fixed-capacity buffer.
+
+    Args:
+        config: MoE configuration with the SwiGLU clamp limit.
+        tokens_per_expert: Device integer tensor of shape [local_experts] with the rows of
+            each local expert, alignment padding included.
+
+    Returns:
+        A SwiGLU that reads the routed row count on the device and leaves later rows of its
+        output and gradients uninitialized.
+    """
+    limit = config.swiglu_limit if config.swiglu_limit > 0.0 else math.inf
+    return partial(swiglu_routed_rows, routed_rows=tokens_per_expert.sum(dim=0, keepdim=True), limit=limit)
+
+
+def _te_grouped_gemm_alignment(recipe: "Recipe | None", use_grouped_tensor: bool) -> int:
+    """Return the row multiple that TE's grouped expert GEMMs need in each expert segment.
+
+    Args:
+        recipe: Active Transformer Engine quantization recipe, or None for unquantized GEMMs.
+        use_grouped_tensor: Whether the GEMMs use TE's native grouped-tensor path.
+
+    Returns:
+        1 without quantization; 128 for MXFP8 and FP8 block scaling on the native
+        grouped-tensor path; otherwise Transformer Engine's alignment for the recipe.
+    """
+    if recipe is None:
+        return 1
+    if use_grouped_tensor and (recipe.mxfp8() or recipe.float8_block_scaling()):
+        return 128
+    from transformer_engine.pytorch.quantization import get_align_size_for_quantization
+
+    return get_align_size_for_quantization(recipe)
+
+
+def _has_dispatched_rows(
+    hidden_states: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    *,
+    never_empty: bool,
+    dispatcher_backend: str,
+) -> bool:
+    """Return whether this rank received routed rows, reading the device only when needed.
+
+    Static routing and capacity buffers always dispatch rows. NCCL-EP sizes its receive
+    buffer to the routed rows, so the buffer's leading extent already answers on the
+    host. Other dispatchers need a device-to-host read of the per-expert counts.
+
+    Args:
+        hidden_states: Dispatched activations of shape [received_rows, hidden].
+        tokens_per_expert: Integer tensor of shape [local_experts] with the routed rows
+            of each local expert.
+        never_empty: Whether the dispatcher always returns rows (static routing or
+            capacity mode).
+        dispatcher_backend: Flex dispatcher backend that produced ``hidden_states``.
+
+    Returns:
+        True when the grouped expert GEMMs have routed rows to process.
+    """
+    if never_empty:
+        return True
+    if dispatcher_backend == "nccl_ep":
+        return hidden_states.shape[0] > 0
+    return bool(torch.count_nonzero(tokens_per_expert) > 0)
 
 
 def _stabilize_empty_routing_probs_dtype(permuted_probs: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
@@ -1503,6 +1633,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.nccl_ep = backend.nccl_ep if backend is not None else NcclEpConfig()
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1553,6 +1684,12 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                 "dispatcher_capacity_factor is not supported for experts with expert_bias=True; "
                 "leave it at None (blocking HybridEP dispatch) for this model."
             )
+        if dispatcher_backend == "nccl_ep" and self.nccl_ep.recv_capacity_factor is not None and self.expert_bias:
+            # The fixed NCCL-EP receive buffer has the same slack rows past the routed count.
+            raise ValueError(
+                "nccl_ep.recv_capacity_factor is not supported for experts with expert_bias=True; "
+                "leave it at None (per-dispatch receive buffers) for this model."
+            )
 
         # Allocate projection tensor - size depends on whether activation is gated
         # Gated (SwiGLU, Quick-GEGLU): [n_experts, dim, 2*inter_dim]
@@ -1576,6 +1713,13 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             self.down_proj_bias = None
 
         self.expert_activation = get_expert_activation_for_deepep(config)
+        # A fixed NCCL-EP receive buffer leaves the rows past the routed count unused. This default
+        # SwiGLU then reads that count on the device and skips them. An activation that a model
+        # installs in its place processes every row, which is safe because nothing reads the
+        # unused rows. The wrappers carry this reference.
+        self.routed_rows_swiglu = (
+            self.expert_activation if _skips_unused_rows(config, dispatcher_backend, self.nccl_ep) else None
+        )
 
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
         self.ep_size = ep_mesh.size()
@@ -1588,6 +1732,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            nccl_ep=self.nccl_ep,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -1615,6 +1760,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             local_expert_indices=local_expert_indices,
             config=config,
             ep_group=ep_group,
+            hidden_dim=self.config.expert_dim,
         )
         if self.dispatcher_backend == "deepep":
             self._init_deepep_buffer(ep_group)
@@ -1662,6 +1808,23 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             permuted_probs = permuted_probs.detach()
         permuted_probs = permuted_probs.unsqueeze(-1)
         return permuted_local_hidden_states, tokens_per_expert, permuted_probs
+
+    def _routed_rows_activation(
+        self, tokens_per_expert: torch.Tensor
+    ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Return the expert activation for one dispatch.
+
+        Args:
+            tokens_per_expert: Device integer tensor of shape [local_experts] with the routed
+                rows of each local expert.
+
+        Returns:
+            ``expert_activation``, or for a fixed-capacity NCCL-EP buffer feeding the default
+            SwiGLU, that SwiGLU bounded to the routed rows.
+        """
+        if self.expert_activation is not self.routed_rows_swiglu:
+            return self.expert_activation
+        return _routed_rows_swiglu(self.config, tokens_per_expert)
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
         """Return dispatcher-owned resources that must be ready before a PP step.
@@ -1726,9 +1889,13 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read.
         router_weight_already_applied = False
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if _has_dispatched_rows(
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            never_empty=self.dispatch_rows_never_empty,
+            dispatcher_backend=self.dispatcher_backend,
+        ):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             gate_up_output_bytes = (
                 permuted_local_hidden_states.shape[0]
@@ -1785,7 +1952,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                     down_projs,
                     tokens_per_expert_gpu,
                     activation_probs,
-                    self.expert_activation,
+                    self._routed_rows_activation(tokens_per_expert_gpu),
                     use_mxfp8=self.use_mxfp8,
                     # moe_tail skips the down projection's GEMM in a recompute whose combine is cached — sound
                     # only while nothing reads that output. A post-expert callback does, and would save an
@@ -1793,9 +1960,20 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                     defer_down_proj=self.dispatcher_recompute_cache == "moe_tail" and post_expert_output is None,
                 )
         else:
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
+            # Preserve the dispatch autograd edge even when this rank receives no
+            # tokens: its backward must still participate in EP communication.
+            output1 = torch.matmul(permuted_local_hidden_states, gate_and_up_projs[0])
+            if self.expert_bias:
+                output1 = _apply_bias(output1, self.gate_up_proj_bias.to_local(), tokens_per_expert)
             output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
+            if self.expert_bias:
+                output2 = _apply_bias(
+                    output2,
+                    self.down_proj_bias.to_local(),
+                    tokens_per_expert,
+                    None if self.config.apply_router_weight_after_down else permuted_probs,
+                )
 
         if post_expert_output is not None:
             output2 = post_expert_output(output2)
@@ -1903,9 +2081,11 @@ class GroupedExpertsTE(nn.Module):
         Args:
             config: MoE configuration containing expert parameters.
             backend: Backend configuration; reads ``benchmark_static_routing``
-                (cache the per-microbatch split list under forced-balanced routing) and
-                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs).
-            dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
+                (cache the per-microbatch split list under forced-balanced routing),
+                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs), ``te_fp8``
+                (the row alignment NCCL-EP gives each expert), and ``nccl_ep``.
+            dispatcher_backend: Backend for the flex token dispatcher ("deepep", "hybridep",
+                "uccl_ep", or "nccl_ep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
@@ -1935,9 +2115,34 @@ class GroupedExpertsTE(nn.Module):
         self._static_m_splits: list | None = None
         if backend is not None and backend.compile_router_weight:
             _compile_router_weight_cores()
+        self.nccl_ep = backend.nccl_ep if backend is not None else NcclEpConfig()
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
+        nccl_ep = dispatcher_backend == "nccl_ep"
+        # The native grouped GEMMs read NCCL-EP's per-expert row counts on the device, so the
+        # forward never copies them to the host.
+        self.device_m_splits = nccl_ep and self.use_grouped_tensor
+        if nccl_ep and self.nccl_ep.recv_capacity_factor is not None:
+            if not self.use_grouped_tensor:
+                raise ValueError("nccl_ep.recv_capacity_factor with experts='te' requires te_grouped_tensor=True")
+            if self.expert_bias:
+                # The down-bias correction expands the bias by the routed counts over every buffer row.
+                raise ValueError(
+                    "nccl_ep.recv_capacity_factor is not supported for experts with expert_bias=True; "
+                    "leave it at None (per-dispatch receive buffers) for this model."
+                )
+        self.zero_copy = nccl_ep and self.nccl_ep.zero_copy
+        if self.zero_copy and config.apply_router_weight_after_down:
+            raise ValueError(
+                "nccl_ep.zero_copy requires apply_router_weight_after_down=False: the down projection "
+                "writes the combine input directly"
+            )
+        # NCCL-EP pads each expert's rows to the multiple the FP8 grouped GEMMs need, so they run
+        # without TE's padding and unpadding copies. Other dispatchers pack rows unpadded.
+        self.expert_alignment = 1
+        if nccl_ep and backend is not None and backend.te_fp8 is not None:
+            self.expert_alignment = _te_grouped_gemm_alignment(backend.te_fp8.build_recipe(), self.use_grouped_tensor)
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1967,6 +2172,10 @@ class GroupedExpertsTE(nn.Module):
 
         self._init_grouped_layers(self.num_local_experts)
         self.expert_activation = get_expert_activation_for_deepep(config)
+        # See GroupedExpertsDeepEP: the default SwiGLU skips the unused rows of fixed NCCL-EP buffers.
+        self.routed_rows_swiglu = (
+            self.expert_activation if _skips_unused_rows(config, dispatcher_backend, self.nccl_ep) else None
+        )
         self._grouped_tensor_signature: tuple["Recipe | None", torch.dtype] | None = None
 
         self.token_dispatcher = None
@@ -2257,6 +2466,7 @@ class GroupedExpertsTE(nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            nccl_ep=self.nccl_ep,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -2278,6 +2488,8 @@ class GroupedExpertsTE(nn.Module):
             local_expert_indices=local_expert_indices,
             config=token_dispatcher_config,
             ep_group=ep_mesh.get_group(),
+            hidden_dim=self.config.expert_dim,
+            expert_alignment=self.expert_alignment,
         )
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
@@ -2292,6 +2504,23 @@ class GroupedExpertsTE(nn.Module):
             hidden_dim=self.config.expert_dim,
             dtype=self.config.dtype,
         )
+
+    def _routed_rows_activation(
+        self, tokens_per_expert: torch.Tensor
+    ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Return the expert activation for one dispatch; see ``GroupedExpertsDeepEP``.
+
+        Args:
+            tokens_per_expert: Device integer tensor of shape [local_experts] with the rows of
+                each local expert.
+
+        Returns:
+            ``expert_activation``, or for a fixed-capacity NCCL-EP buffer feeding the default
+            SwiGLU, that SwiGLU bounded to the routed rows.
+        """
+        if self.expert_activation is not self.routed_rows_swiglu:
+            return self.expert_activation
+        return _routed_rows_swiglu(self.config, tokens_per_expert)
 
     def forward(
         self,
@@ -2311,7 +2540,8 @@ class GroupedExpertsTE(nn.Module):
             indices: Integer tensor of shape [tokens, top_k] with global expert IDs.
             post_expert_output: Optional operation applied to dispatched expert
                 outputs with shape ``[routed_tokens, expert_dim]`` after the
-                down projection and before token combine.
+                down projection and before token combine. Not supported with
+                ``nccl_ep.zero_copy``.
 
         Returns:
             Tensor of shape [tokens, hidden], local to this EP rank.
@@ -2320,6 +2550,11 @@ class GroupedExpertsTE(nn.Module):
         assert self.config.n_routed_experts % self.ep_size == 0, (
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
+        if self.zero_copy and post_expert_output is not None:
+            raise ValueError(
+                "nccl_ep.zero_copy does not support post_expert_output: the down projection writes the combine "
+                "input directly"
+            )
 
         indices = indices.masked_fill(~token_mask.unsqueeze(-1), -1)
 
@@ -2343,10 +2578,6 @@ class GroupedExpertsTE(nn.Module):
         if self.config.apply_router_weight_after_down:
             permuted_probs = torch.ones_like(permuted_probs)
 
-        m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
-        if self.static_routing and self._static_m_splits is None:
-            self._static_m_splits = m_splits
-
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         fp8_active = FP8GlobalStateManager.is_fp8_enabled()
@@ -2363,23 +2594,46 @@ class GroupedExpertsTE(nn.Module):
                         "Set te_grouped_tensor=False to use the legacy TE path."
                     )
                 self._grouped_tensor_signature = signature
+        # NCCL-EP already padded each expert's rows for the te_fp8 recipe; other dispatchers pack them unpadded.
+        rows_aligned = recipe is None or (
+            self.expert_alignment > 1
+            and self.expert_alignment % _te_grouped_gemm_alignment(recipe, self.use_grouped_tensor) == 0
+        )
         actual_m_splits = None
         unpadding = self.fp8_unpadding
-        if recipe is not None:
-            actual_m_splits = m_splits
-            padding = self.fp8_padding
-            if self.use_grouped_tensor and (recipe.mxfp8() or recipe.float8_block_scaling()):
-                # Native MXFP8 and FP8 block scaling require 128-row segments;
-                # the legacy MXFP8 padding defaults to 32. Keep separate modules
-                # so external autocast recipe changes do not cache this alignment
-                # into the legacy/current-scaling path.
-                assert self.native_fp8_padding is not None and self.native_fp8_unpadding is not None
-                padding = self.native_fp8_padding
-                unpadding = self.native_fp8_unpadding
-            permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
-            permuted_probs, _ = padding(permuted_probs, actual_m_splits)
-
-        if sum(m_splits) > 0:
+        if self.device_m_splits:
+            if not rows_aligned:
+                raise RuntimeError(
+                    "NCCL-EP pads expert rows for backend.te_fp8, which does not cover the active Transformer Engine "
+                    "recipe; enable FP8 through backend.te_fp8"
+                )
+            # The grouped GEMMs process the leading sum(tokens_per_expert) rows and never read the
+            # unused rows of a fixed-capacity buffer.
+            m_splits = grouped_m_splits = tokens_per_expert
+            has_rows = _has_dispatched_rows(
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                never_empty=self.nccl_ep.recv_capacity_factor is not None,
+                dispatcher_backend=self.dispatcher_backend,
+            )
+        else:
+            m_splits = _resolve_m_splits(tokens_per_expert, self.static_routing, self._static_m_splits)
+            if self.static_routing and self._static_m_splits is None:
+                self._static_m_splits = m_splits
+            if not rows_aligned:
+                actual_m_splits = m_splits
+                padding = self.fp8_padding
+                if self.use_grouped_tensor and (recipe.mxfp8() or recipe.float8_block_scaling()):
+                    # Native MXFP8 and FP8 block scaling require 128-row segments;
+                    # the legacy MXFP8 padding defaults to 32. Keep separate modules
+                    # so external autocast recipe changes do not cache this alignment
+                    # into the legacy/current-scaling path.
+                    assert self.native_fp8_padding is not None and self.native_fp8_unpadding is not None
+                    padding = self.native_fp8_padding
+                    unpadding = self.native_fp8_unpadding
+                permuted_local_hidden_states, m_splits = padding(permuted_local_hidden_states, m_splits)
+                permuted_probs, _ = padding(permuted_probs, actual_m_splits)
+            has_rows = sum(m_splits) > 0
             # The native grouped-tensor API consumes device-side int64 split sizes.
             # Keep the host list for padding, unpadding, and the legacy TE path.
             grouped_m_splits = (
@@ -2387,6 +2641,8 @@ class GroupedExpertsTE(nn.Module):
                 if self.use_grouped_tensor
                 else m_splits
             )
+
+        if has_rows:
             # No FSDP mixed-precision wrapper casts EP-local experts when ep_shard is 1, so
             # FP32 master weights meet BF16 dispatched tokens here. TE accepts parameters
             # in another dtype only under torch.autocast, which casts them per GEMM like
@@ -2397,11 +2653,22 @@ class GroupedExpertsTE(nn.Module):
                 and not torch.is_autocast_enabled("cuda")
                 else nullcontext()
             )
+            # Zero-copy NCCL-EP: the down projection writes the combine input, and in backward the
+            # gate/up projection writes the dispatch-backward input, into shared symmetric buffers.
+            expert_buffers = self.token_dispatcher.expert_buffers() if self.zero_copy else None
             with cast_weights:
-                output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
-            output1 = self.expert_activation(output1, permuted_probs)
+                if expert_buffers is None:
+                    output1 = self.gate_up_linear(permuted_local_hidden_states, grouped_m_splits)
+                else:
+                    output1 = self.gate_up_linear(
+                        permuted_local_hidden_states, grouped_m_splits, dgrad_out=expert_buffers[1]
+                    )
+            output1 = self._routed_rows_activation(tokens_per_expert)(output1, permuted_probs)
             with cast_weights:
-                output2 = self.down_linear(output1, grouped_m_splits)
+                if expert_buffers is None:
+                    output2 = self.down_linear(output1, grouped_m_splits)
+                else:
+                    output2 = self.down_linear(output1, grouped_m_splits, out=expert_buffers[0])
             # The down-projection bias must be weighted by the per-token routing probability
             # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
             # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
@@ -2432,8 +2699,10 @@ class GroupedExpertsTE(nn.Module):
                 else:
                     return tensor
 
-            # Cast like the TE path above: FP32 master weights meet BF16 tokens here too.
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
+            # Empty dispatched rows retain the collective backward edge and also
+            # work when the local input itself has zero rows. Cast like the TE path
+            # above: FP32 master weights meet BF16 tokens here too.
+            output1 = torch.matmul(permuted_local_hidden_states, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).to(x.dtype).T)
             all_expert_dependency = output2.new_zeros(())

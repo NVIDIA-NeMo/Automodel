@@ -29,6 +29,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     _apply_bias,
     _apply_router_weight_fp32,
+    _has_dispatched_rows,
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.shared.utils import dtype_from_str
@@ -583,6 +584,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
                 dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
             )
+        self.nccl_ep = orig_module.nccl_ep
         self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
         self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
@@ -600,6 +602,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.gate_and_up_projs = orig_module.gate_and_up_projs
         self.down_projs = orig_module.down_projs
         self.expert_activation = orig_module.expert_activation
+        self.routed_rows_swiglu = orig_module.routed_rows_swiglu
 
         if self.expert_bias:
             self.gate_up_proj_bias = orig_module.gate_up_proj_bias
@@ -693,16 +696,16 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         """Apply LoRA while preserving the base expert transform and routing order.
 
         Args:
-            x: Local input activations [local_tokens, expert_dim].
-            token_mask: Valid-token flags [local_tokens].
-            weights: Selected routing probabilities [local_tokens, topk].
-            indices: Global expert IDs [local_tokens, topk].
-            post_expert_output: Optional transform from [routed_tokens, expert_dim]
-                to the same layout, applied after the down projection and before
-                router weighting when apply_router_weight_after_down is enabled.
+            x: Tensor of shape [local_tokens, hidden].
+            token_mask: Boolean tensor of shape [local_tokens], marking valid tokens.
+            weights: Routing probabilities of shape [local_tokens, top_k].
+            indices: Global expert IDs of shape [local_tokens, top_k].
+            post_expert_output: Optional transform from [routed_tokens, hidden] to the same layout,
+                applied after the down projection and before router weighting when
+                apply_router_weight_after_down is enabled.
 
         Returns:
-            Combined local activations [local_tokens, expert_dim], with x's dtype.
+            Combined expert output of shape [local_tokens, hidden], with x's dtype.
         """
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0
@@ -722,9 +725,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
         lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
-        # GroupedExpertsDeepEP.forward does.
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if _has_dispatched_rows(
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            never_empty=self.dispatch_rows_never_empty,
+            dispatcher_backend=self.dispatcher_backend,
+        ):
             lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                 lora_gate_and_up_A, lora_gate_and_up_B
             )
@@ -743,7 +749,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
-            output1 = self.expert_activation(output1, activation_probs)
+            output1 = self._routed_rows_activation(tokens_per_expert_gpu)(output1, activation_probs)
 
             # Down projection + LoRA
             output2 = torch._grouped_mm(output1, down_projs, offs=offs)
@@ -761,11 +767,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                     None if self.config.apply_router_weight_after_down else permuted_probs,
                 )
         else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
+            # Preserve the dispatch backward edge on empty receiving ranks.
+            output1 = torch.matmul(permuted_local_hidden_states, gate_and_up_projs[0])
             output1 = (
                 output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
+                + torch.matmul(torch.matmul(permuted_local_hidden_states, lora_gate_and_up_A[0]), lora_gate_and_up_B[0])
+                * self.scale
             )
             output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
