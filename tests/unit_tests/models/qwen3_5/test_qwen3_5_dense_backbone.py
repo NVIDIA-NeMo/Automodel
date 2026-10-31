@@ -269,6 +269,22 @@ class TestDenseTextBackbone:
         assert metadata.document_ids is attention_mask
         assert metadata.cu_seqlens_cpu.tolist() == [0, 2, 4]
 
+    def test_single_document_metadata_preserves_padding(self):
+        selected_ids = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 0, 0, 0]])
+        packed_metadata = build_packed_sequence_metadata(selected_ids)
+        metadata = qwen3_5_packing.prepare_gated_delta_packed_metadata(
+            None,
+            selected_ids,
+            packed_token_indices=packed_metadata["packed_token_indices"],
+            cu_seqlens=packed_metadata["cu_seqlens"],
+        )
+
+        assert metadata is not None
+        assert metadata.document_ids is selected_ids
+        assert metadata.indices.tolist() == [0, 1, 2, 3, 5, 6]
+        assert metadata.cu_seqlens.tolist() == [0, 4, 6]
+        assert metadata.cu_seqlens_cpu.tolist() == [0, 4, 6]
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_packed_metadata_uses_host_mirror_without_cuda_readback(self, monkeypatch):
         host_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)

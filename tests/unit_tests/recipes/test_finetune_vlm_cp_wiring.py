@@ -426,7 +426,7 @@ class _FakePPModel:
         self.info = SimpleNamespace(has_last_stage=False, stages=[], schedule=None)
 
 
-class _StageWithCPPreembedInForward:
+class _StageWithCPPreembedInForward(torch.nn.Module):
     # Sunk VLM (minimax/qwen3_5/qwen3_5_moe/step3p7): embeds + shards per
     # microbatch inside forward and pulls media from the PP side channel, so
     # media MUST still be staged for PP under CP.
@@ -434,7 +434,7 @@ class _StageWithCPPreembedInForward:
         return {}
 
 
-class _StageWithoutCPPrepare:
+class _StageWithoutCPPrepare(torch.nn.Module):
     pass
 
 
@@ -501,6 +501,8 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
 
     loader_config = SimpleNamespace(
         packing=None,
+        is_packed=False,
+        output_format="batched",
         build=_build_dataloader,
     )
     monkeypatch.setattr(
@@ -586,7 +588,10 @@ def test_setup_always_stages_pp_media_under_pp(
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
     assert dataloader_calls[0]["cp_size"] == cp_size
-    assert dataloader_calls[0]["packing_contract"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
+    contract = dataloader_calls[0]["packing_contract"]
+    assert contract.packed_mask_type == DEFAULT_PACKED_SEQUENCE_CONTRACT.packed_mask_type
+    assert contract.return_packed_sequence_metadata is False
+    assert contract.return_document_ids is False
 
 
 # -----------------------------------------------------------------------------
