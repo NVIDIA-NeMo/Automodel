@@ -41,7 +41,13 @@ _ORDERED_LAYOUT_ENV = "NCCL_EP_HT_EM_AG_SCAN_MODE"
 class _Runtime:
     api: ModuleType | None = None
     group: dist.ProcessGroup | None = None
-    settings: tuple[int, ...] | None = None
+    settings: tuple[int | bool | None, ...] | None = None
+    # Zero-copy symmetric buffers of shape [recv_capacity, hidden], shared by every layer:
+    # each layer's combine reads the expert output before the next layer writes it, and
+    # each layer's dispatch backward reads the input gradient before the next combine
+    # backward overwrites it.
+    expert_output: torch.Tensor | None = None
+    expert_input_grad: torch.Tensor | None = None
 
 
 _runtime = _Runtime()
@@ -50,6 +56,9 @@ _runtime = _Runtime()
 def finalize_nccl_ep() -> None:
     """Release the owned NCCL-EP context before destroying its process group."""
     if _runtime.api is not None:
+        # Drop the symmetric buffers while the group that registered them is still valid.
+        _runtime.expert_output = None
+        _runtime.expert_input_grad = None
         _runtime.api.ep_finalize()
         _runtime.api = None
         _runtime.group = None
@@ -78,6 +87,7 @@ def _join_transport(
     hidden_dim: int,
     num_experts: int,
     top_k: int,
+    zero_copy: bool,
 ) -> ModuleType:
     """Bootstrap the process-wide transport once, or check that it matches these settings.
 
@@ -88,6 +98,8 @@ def _join_transport(
         hidden_dim: Width of each dispatched token.
         num_experts: Global expert count across the EP group.
         top_k: Distinct expert selections per token.
+        zero_copy: Whether dispatch and combine use symmetric-memory windows; requires
+            ``recv_capacity``. Bootstrap then also allocates the shared expert buffers.
 
     Returns:
         Transformer Engine's NCCL-EP API module.
@@ -105,7 +117,7 @@ def _join_transport(
         raise RuntimeError("NCCL-EP requires Hopper or newer CUDA GPUs (SM90+)")
     if dist.get_backend(group) != "nccl":
         raise ValueError("NCCL-EP requires an NCCL process group")
-    settings = (capacity, recv_capacity, hidden_dim, num_experts, top_k, torch.cuda.current_device())
+    settings = (capacity, recv_capacity, hidden_dim, num_experts, top_k, zero_copy, torch.cuda.current_device())
     if _runtime.api is None:
         if api.is_ep_bootstrapped():
             raise RuntimeError("NCCL-EP is already initialized outside AutoModel; finalize that context first")
@@ -121,8 +133,13 @@ def _join_transport(
                 max_num_sms=0,
                 # Overflowing a fixed capacity traps on the device instead of dropping tokens.
                 recv_capacity_per_rank=recv_capacity,
+                zero_copy=zero_copy,
             )
         _runtime.api, _runtime.group, _runtime.settings = api, group, settings
+        if zero_copy:
+            # Collective: every EP rank registers each buffer as one window.
+            _runtime.expert_output = api.symm_mem_alloc((recv_capacity, hidden_dim), torch.bfloat16, group)
+            _runtime.expert_input_grad = api.symm_mem_alloc((recv_capacity, hidden_dim), torch.bfloat16, group)
     elif _runtime.group is not group or _runtime.settings != settings:
         raise ValueError("NCCL-EP supports one EP group and one capacity/shape configuration per process")
     return api
@@ -139,6 +156,7 @@ class NcclEpManager:
         hidden_dim: int,
         num_experts: int,
         top_k: int,
+        expert_alignment: int = 1,
     ) -> None:
         """Join the process-wide transport and set up layer-local routing state.
 
@@ -152,6 +170,8 @@ class NcclEpManager:
             hidden_dim: Width of each dispatched token.
             num_experts: Global expert count, divisible by the EP group size.
             top_k: Distinct expert selections per token.
+            expert_alignment: Power-of-two row multiple of each local expert's dispatched
+                segment, as the expert GEMMs require; 1 packs segments without padding.
         """
         if config.max_tokens_per_rank is None:
             raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
@@ -159,13 +179,19 @@ class NcclEpManager:
             raise ValueError("NCCL-EP requires EP size >= 2 dividing the global expert count")
         if not 0 < top_k <= num_experts or hidden_dim <= 0:
             raise ValueError("Invalid NCCL-EP top-k or hidden dimension")
+        if expert_alignment < 1 or expert_alignment & (expert_alignment - 1):
+            raise ValueError(f"NCCL-EP expert alignment must be a power of two, got {expert_alignment}")
         self.max_tokens = config.max_tokens_per_rank
         self.capacity = (config.max_tokens_per_rank + 63) // 64 * 64
-        self.recv_capacity = (
-            None
-            if config.recv_capacity_factor is None
-            else math.ceil(self.capacity * top_k * config.recv_capacity_factor)
-        )
+        self.num_local_experts = num_experts // group.size()
+        self.expert_alignment = expert_alignment
+        self.recv_capacity = None
+        if config.recv_capacity_factor is not None:
+            # Each local expert's segment may grow by up to expert_alignment - 1 padding rows.
+            routed = math.ceil(self.capacity * top_k * config.recv_capacity_factor)
+            padded = routed + self.num_local_experts * (expert_alignment - 1)
+            self.recv_capacity = -(-padded // expert_alignment) * expert_alignment
+        self.zero_copy = config.zero_copy
         self.api = _join_transport(
             group=group,
             capacity=self.capacity,
@@ -173,10 +199,10 @@ class NcclEpManager:
             hidden_dim=hidden_dim,
             num_experts=num_experts,
             top_k=top_k,
+            zero_copy=self.zero_copy,
         )
         self.hidden_dim = hidden_dim
         self.num_experts = num_experts
-        self.num_local_experts = num_experts // group.size()
         self.top_k = top_k
         self.token_indices: torch.Tensor | None = None
         self.token_probs: torch.Tensor | None = None
@@ -213,10 +239,12 @@ class NcclEpManager:
 
         Returns:
             BF16 tensor of shape [received_rows, hidden], packed by local expert and,
-            within an expert, ordered by source rank and token. ``received_rows`` is the
-            routed row count, or ``recv_capacity`` with ``recv_capacity_factor``, in which
-            case rows past the routed count are uninitialized and never combined. Storage
-            is unique to this call and retained by TE autograd through backward.
+            within an expert, ordered by source rank and token. Each expert's segment is
+            zero-padded to a multiple of ``expert_alignment`` rows. ``received_rows`` is the
+            padded row count, or ``recv_capacity`` with ``recv_capacity_factor``, in which
+            case rows past the padded count are uninitialized and never combined. Storage
+            is unique to this call and retained by TE autograd through backward; with
+            ``zero_copy`` it is a symmetric-memory window.
         """
         if async_finish or allocate_on_comm_stream:
             raise ValueError("NCCL-EP uses Transformer Engine stream ordering")
@@ -241,6 +269,7 @@ class NcclEpManager:
             hidden_dim=self.hidden_dim,
             num_local_experts=self.num_local_experts,
             recv_capacity_per_rank=self.recv_capacity,
+            alignment=self.expert_alignment if self.expert_alignment > 1 else 0,
         )
         received, self.dispatched_probs, self.tokens_per_expert = self.api.ep_dispatch(
             buffer,
@@ -268,7 +297,7 @@ class NcclEpManager:
         return hidden_states, self.dispatched_probs
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        """Return device counts of shape [local_experts] for the routed packed rows."""
+        """Return device counts of shape [local_experts] for the packed rows, padding included."""
         if self.tokens_per_expert is None:
             raise RuntimeError("NCCL-EP dispatch has not completed")
         return self.tokens_per_expert
@@ -285,6 +314,21 @@ class NcclEpManager:
         """
         return hidden_states
 
+    def expert_buffers(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return the shared symmetric buffers that zero-copy experts write into.
+
+        Returns:
+            None without ``zero_copy``. Otherwise detached BF16 views of shape
+            [recv_capacity, hidden]: the expert output that combine reads, and the
+            gradient of the dispatched tokens that dispatch backward reads. Both are
+            shared by every layer; combine backward also writes the expert-output
+            gradient into the second buffer before the experts consume it.
+        """
+        if not self.zero_copy:
+            return None
+        # Detached so autograd metadata attached to one layer's outputs never reaches the shared buffers.
+        return _runtime.expert_output.detach(), _runtime.expert_input_grad.detach()
+
     def combine(
         self,
         hidden_states: torch.Tensor,
@@ -296,7 +340,8 @@ class NcclEpManager:
         Args:
             hidden_states: BF16 tensor of shape [received_rows, hidden],
                 expert-packed and already multiplied by routing weights. Rows past
-                the routed count are ignored.
+                the routed count are ignored. With ``zero_copy`` it must be the
+                expert-output buffer from :meth:`expert_buffers`.
             async_finish: Must be false; TE owns stream ordering.
             allocate_on_comm_stream: Must be false; TE owns allocations.
 
@@ -307,7 +352,17 @@ class NcclEpManager:
             raise ValueError("NCCL-EP uses Transformer Engine stream ordering")
         if self._buffer is None:
             raise RuntimeError("NCCL-EP combine requires a matching dispatch")
-        result = self.api.ep_combine(self._buffer, hidden_states.contiguous(), num_local_tokens=self._num_tokens)
+        grad_out = None
+        if self.zero_copy:
+            if hidden_states.data_ptr() != _runtime.expert_output.data_ptr():
+                raise RuntimeError(
+                    "nccl_ep.zero_copy requires the experts to write their output into the shared "
+                    "symmetric buffer from expert_buffers()"
+                )
+            grad_out = _runtime.expert_input_grad.detach()
+        result = self.api.ep_combine(
+            self._buffer, hidden_states.contiguous(), num_local_tokens=self._num_tokens, grad_out=grad_out
+        )
         self._buffer = None
         self.dispatched_probs = None
         self.tokens_per_expert = None

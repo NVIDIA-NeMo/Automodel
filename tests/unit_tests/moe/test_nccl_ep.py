@@ -24,10 +24,29 @@ from torch.utils.checkpoint import checkpoint
 import nemo_automodel.components.moe.nccl_ep as nccl_ep
 from nemo_automodel.components.models.common.utils import BackendConfig, NcclEpConfig
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, _has_dispatched_rows
+from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, _has_dispatched_rows, swiglu_routed_rows
 from nemo_automodel.components.moe.layers import MoE
 
 _ORDERED_LAYOUT_ENV = "NCCL_EP_HT_EM_AG_SCAN_MODE"
+
+
+def _packed(buffer, rows, values):
+    """Lay routed values out in the buffer's expert-packed rows.
+
+    Args:
+        buffer: Routing state with ``positions`` of shape [routed_rows] and the padded and
+            received row counts.
+        rows: Number of rows of the result, ``buffer.received_rows``.
+        values: Tensor of shape [routed_rows, *features].
+
+    Returns:
+        Tensor of shape [rows, *features]: alignment padding rows are zero, as NCCL-EP
+        writes them, and NaN rows stand in for an unused fixed-capacity tail.
+    """
+    packed = values.new_full((rows, *values.shape[1:]), float("nan"))
+    packed[: buffer.padded_rows] = 0
+    packed[buffer.positions] = values
+    return packed
 
 
 class _Dispatch(torch.autograd.Function):
@@ -35,23 +54,22 @@ class _Dispatch(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tokens, weights, buffer):
-        """Gather routed rows in the buffer's layout.
+        """Scatter routed rows into the buffer's expert-packed layout.
 
         Args:
             tokens: Tensor of shape [tokens, hidden].
             weights: Tensor of shape [tokens, top_k].
-            buffer: Routing state whose ``rows`` and ``slots`` have shape [routed_rows].
+            buffer: Routing state whose ``rows``, ``slots``, and ``positions`` have shape
+                [routed_rows].
 
         Returns:
-            Received rows [received_rows, hidden] and weights [received_rows]. With a fixed
-            receive capacity, NaN rows stand in for the unused tail.
+            Received rows [received_rows, hidden] and weights [received_rows], laid out by
+            :func:`_packed`.
         """
         ctx.buffer = buffer
         ctx.shapes = tokens.shape, weights.shape
-        received, probs = tokens[buffer.rows], weights[buffer.rows, buffer.slots]
-        slack = (buffer.recv_capacity_per_rank or received.shape[0]) - received.shape[0]
-        received = torch.cat([received, received.new_full((slack, received.shape[1]), float("nan"))])
-        return received, torch.cat([probs, probs.new_full((slack,), float("nan"))])
+        received = _packed(buffer, buffer.received_rows, tokens[buffer.rows])
+        return received, _packed(buffer, buffer.received_rows, weights[buffer.rows, buffer.slots])
 
     @staticmethod
     def backward(ctx, grad_received, grad_weights):
@@ -64,12 +82,11 @@ class _Dispatch(torch.autograd.Function):
         Returns:
             Gradients for tokens [tokens, hidden] and weights [tokens, top_k].
         """
-        rows, slots = ctx.buffer.rows, ctx.buffer.slots
-        routed = rows.numel()
+        rows, slots, positions = ctx.buffer.rows, ctx.buffer.slots, ctx.buffer.positions
         token_shape, weight_shape = ctx.shapes
-        grad_tokens = grad_received.new_zeros(token_shape).index_add(0, rows, grad_received[:routed])
+        grad_tokens = grad_received.new_zeros(token_shape).index_add(0, rows, grad_received[positions])
         grad_topk = grad_weights.new_zeros(weight_shape).index_put(
-            (rows, slots), grad_weights[:routed], accumulate=True
+            (rows, slots), grad_weights[positions], accumulate=True
         )
         return grad_tokens, grad_topk, None
 
@@ -78,21 +95,22 @@ class _Combine(torch.autograd.Function):
     """Emulated TE combine with the same ctx-held routing handle."""
 
     @staticmethod
-    def forward(ctx, expert_out, buffer, num_local_tokens):
+    def forward(ctx, expert_out, buffer, num_local_tokens, grad_out):
         """Sum received rows back into source tokens.
 
         Args:
-            expert_out: Tensor of shape [received_rows, hidden]; rows past the routed count
-                are ignored.
+            expert_out: Tensor of shape [received_rows, hidden]; padding rows and rows past
+                the padded count are ignored.
             buffer: Routing state from the matching dispatch.
             num_local_tokens: Rows of the result.
+            grad_out: Optional caller-owned storage of shape [received_rows, hidden] that
+                backward writes the expert-output gradient into.
 
         Returns:
             Tensor of shape [num_local_tokens, hidden].
         """
-        ctx.buffer = buffer
-        ctx.received_rows = expert_out.shape[0]
-        routed = expert_out[: buffer.rows.numel()]
+        ctx.buffer, ctx.received_rows, ctx.grad_out = buffer, expert_out.shape[0], grad_out
+        routed = expert_out[buffer.positions]
         return expert_out.new_zeros(num_local_tokens, expert_out.shape[1]).index_add(0, buffer.rows, routed)
 
     @staticmethod
@@ -103,18 +121,21 @@ class _Combine(torch.autograd.Function):
             grad: Tensor of shape [num_local_tokens, hidden].
 
         Returns:
-            Gradient for the received rows, [received_rows, hidden], with NaN rows for an
-            unused fixed-capacity tail.
+            Gradient for the received rows, [received_rows, hidden], laid out by
+            :func:`_packed`; written into ``grad_out`` when the caller supplied it.
         """
-        routed = grad[ctx.buffer.rows]
-        slack = routed.new_full((ctx.received_rows - routed.shape[0], routed.shape[1]), float("nan"))
-        return torch.cat([routed, slack]), None, None
+        grad_expert_out = _packed(ctx.buffer, ctx.received_rows, grad[ctx.buffer.rows])
+        if ctx.grad_out is None:
+            return grad_expert_out, None, None, None
+        ctx.grad_out.copy_(grad_expert_out)
+        return ctx.grad_out, None, None, None
 
 
 class _Transport:
     def __init__(self):
         self.bootstraps = []
         self.buffers = []
+        self.symmetric = []
         self.finalized = 0
         self.ordered = False
         self.dispatches = 0
@@ -129,6 +150,12 @@ class _Transport:
 
     def ep_finalize(self):
         self.finalized += 1
+
+    def symm_mem_alloc(self, shape, dtype, group):
+        """Return uninitialized storage of ``shape``; NaN stands in for its contents."""
+        tensor = torch.full(shape, float("nan"), dtype=dtype)
+        self.symmetric.append(tensor)
+        return tensor
 
     def EpBuffer(self, **kwargs):
         buffer = SimpleNamespace(**kwargs)
@@ -149,7 +176,7 @@ class _Transport:
 
         Returns:
             Expert-packed activations [received_tokens, hidden], probabilities
-            [received_tokens], and counts [local_experts].
+            [received_tokens], and counts [local_experts] padded to the buffer alignment.
         """
         assert tokens.shape[0] == indices.shape[0] == weights.shape[0] <= buffer.max_tokens_per_rank
         assert indices.dtype == torch.int64 and weights.dtype == torch.float32
@@ -160,25 +187,38 @@ class _Transport:
         if not self.ordered and self.dispatches % 2:
             position = position.flip(0)
         self.dispatches += 1
-        if buffer.recv_capacity_per_rank is not None and rows.numel() > buffer.recv_capacity_per_rank:
-            raise RuntimeError("receive capacity overflow traps")
         order = (experts * (rows.numel() + 1) + position).argsort()
-        buffer.rows, buffer.slots = rows[order], slots[order]
+        rows, slots, experts = rows[order], slots[order], experts[order]
+        alignment = max(buffer.alignment, 1)
+        counts = torch.bincount(experts, minlength=buffer.num_local_experts)
+        padded = (counts + alignment - 1) // alignment * alignment
+        rank_in_expert = torch.arange(rows.numel()) - (counts.cumsum(0) - counts)[experts]
+        buffer.positions = (padded.cumsum(0) - padded)[experts] + rank_in_expert
+        buffer.padded_rows = int(padded.sum())
+        if buffer.recv_capacity_per_rank is not None and buffer.padded_rows > buffer.recv_capacity_per_rank:
+            raise RuntimeError("receive capacity overflow traps")
+        buffer.received_rows = buffer.recv_capacity_per_rank or buffer.padded_rows
+        buffer.rows, buffer.slots = rows, slots
         received, probs = _Dispatch.apply(tokens, weights, buffer)
-        return received, probs, torch.bincount(experts, minlength=buffer.num_local_experts)
+        return received, probs, padded
 
-    def ep_combine(self, buffer, expert_out, *, num_local_tokens):
+    def ep_combine(self, buffer, expert_out, *, num_local_tokens, grad_out=None):
         """Sum packed expert outputs back into source rows.
 
         Args:
             buffer: Per-call routing state.
             expert_out: Tensor of shape [received_tokens, hidden].
             num_local_tokens: Rows of the dispatched input.
+            grad_out: Optional storage that backward writes the expert-output gradient into.
 
         Returns:
             Tensor of shape [num_local_tokens, hidden].
         """
-        return _Combine.apply(expert_out, buffer, num_local_tokens)
+        if self.bootstraps[-1][1].get("zero_copy"):
+            # Zero-copy combine reads its input from, and writes its gradient into, registered windows.
+            assert expert_out.data_ptr() == self.symmetric[0].data_ptr()
+            assert grad_out.data_ptr() == self.symmetric[1].data_ptr()
+        return _Combine.apply(expert_out, buffer, num_local_tokens, grad_out)
 
 
 @pytest.fixture
@@ -201,9 +241,14 @@ def group():
     return SimpleNamespace(size=lambda: 2)
 
 
-def _manager(group, *, max_tokens=5, hidden_dim=4):
+def _manager(group, *, max_tokens=5, hidden_dim=4, expert_alignment=1):
     return nccl_ep.NcclEpManager(
-        NcclEpConfig(max_tokens_per_rank=max_tokens), group=group, hidden_dim=hidden_dim, num_experts=4, top_k=2
+        NcclEpConfig(max_tokens_per_rank=max_tokens),
+        group=group,
+        hidden_dim=hidden_dim,
+        num_experts=4,
+        top_k=2,
+        expert_alignment=expert_alignment,
     )
 
 
@@ -250,11 +295,14 @@ def _reference(hidden, weights, indices, scales):
     return output
 
 
+@pytest.mark.parametrize("expert_alignment", [1, 4])
 @pytest.mark.parametrize("checkpointed", [False, True])
 @pytest.mark.parametrize("tokens", [0, 3, 5])
 @pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
-def test_roundtrip_gradients_and_inflight_buffers(transport, group, checkpointed, tokens, weights_dtype):
-    manager = _manager(group)
+def test_roundtrip_gradients_and_inflight_buffers(
+    transport, group, checkpointed, tokens, weights_dtype, expert_alignment
+):
+    manager = _manager(group, expert_alignment=expert_alignment)
     torch.manual_seed(7)
     hidden = torch.randn(tokens, 4, dtype=torch.bfloat16, requires_grad=True)
     weights = torch.tensor([[0.25, 0.75]] * tokens, dtype=weights_dtype).reshape(tokens, 2).requires_grad_()
@@ -280,6 +328,7 @@ def test_roundtrip_gradients_and_inflight_buffers(transport, group, checkpointed
     for value, ref in zip((hidden, weights, scales), reference_inputs):
         torch.testing.assert_close(value.grad, ref.grad, rtol=0.02, atol=0.0625)
     assert len({id(x) for x in transport.buffers}) == len(transport.buffers)
+    assert {x.alignment for x in transport.buffers} == {expert_alignment if expert_alignment > 1 else 0}
     assert len(transport.bootstraps) == 1
     # Checkpoint replay can stop before combine. A subsequent full forward must
     # replace that abandoned handle and release its own handle after combine.
@@ -346,6 +395,73 @@ def test_fixed_receive_capacity_ignores_unused_rows(transport, group):
     torch.testing.assert_close(weights.grad, reference[1].grad)
 
 
+def test_expert_alignment_pads_segments_and_capacity(transport, group):
+    manager = nccl_ep.NcclEpManager(
+        NcclEpConfig(max_tokens_per_rank=5, recv_capacity_factor=1.5),
+        group=group,
+        hidden_dim=4,
+        num_experts=4,
+        top_k=2,
+        expert_alignment=16,
+    )
+    # 192 routed rows plus up to 15 padding rows for each of the two local experts, rounded to 16.
+    assert manager.recv_capacity == 224
+    assert transport.bootstraps[0][1]["recv_capacity_per_rank"] == 224
+    hidden = torch.randn(5, 4, dtype=torch.bfloat16)
+    manager.token_indices, manager.token_probs = torch.tensor([[1, 0]] * 5), torch.full((5, 2), 0.5)
+    received = manager.dispatch(hidden)
+    assert transport.buffers[-1].alignment == 16
+    assert manager.get_number_of_tokens_per_expert().tolist() == [16, 16]
+    assert received.shape == (224, 4)
+    assert torch.equal(received[5:16], torch.zeros(11, 4, dtype=torch.bfloat16))
+    assert torch.equal(received[:5], hidden) and torch.equal(received[16:21], hidden)
+    with pytest.raises(ValueError, match="power of two"):
+        _manager(group, expert_alignment=3)
+
+
+def test_zero_copy_buffers_carry_expert_output_and_gradient(transport, group):
+    manager = nccl_ep.NcclEpManager(
+        NcclEpConfig(max_tokens_per_rank=5, recv_capacity_factor=1.0, zero_copy=True),
+        group=group,
+        hidden_dim=4,
+        num_experts=4,
+        top_k=2,
+    )
+    assert transport.bootstraps[0][1]["zero_copy"]
+    assert [tuple(x.shape) for x in transport.symmetric] == [(128, 4), (128, 4)]
+    output_buffer, grad_buffer = manager.expert_buffers()
+    assert output_buffer.data_ptr() == transport.symmetric[0].data_ptr() and not output_buffer.requires_grad
+    assert grad_buffer.data_ptr() == transport.symmetric[1].data_ptr()
+
+    class WriteInto(torch.autograd.Function):
+        """Stand-in for a GEMM with ``out=``: write [rows, hidden] values into ``out`` and return it."""
+
+        @staticmethod
+        def forward(ctx, values, out):
+            out.copy_(values)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad):
+            return grad, None
+
+    hidden = torch.randn(5, 4, dtype=torch.bfloat16, requires_grad=True)
+    manager.token_indices, manager.token_probs = torch.tensor([[1, 0]] * 5), torch.full((5, 2), 0.5)
+    received, probs = manager.get_permuted_hidden_states_by_experts(manager.dispatch(hidden))
+    with pytest.raises(RuntimeError, match="symmetric buffer"):
+        manager.combine(received)
+    expert_out = WriteInto.apply((received.float() * probs[:, None]).bfloat16(), output_buffer)
+    out = manager.combine(expert_out)
+    torch.testing.assert_close(out, hidden)
+    upstream = torch.randn_like(hidden)
+    (out.float() * upstream).sum().backward()
+    torch.testing.assert_close(hidden.grad, (upstream * 0.5 * 2).bfloat16())
+    # Combine backward wrote the routed rows' gradient into the shared buffer.
+    torch.testing.assert_close(grad_buffer[:5], upstream.bfloat16())
+    nccl_ep.finalize_nccl_ep()
+    assert nccl_ep._runtime.expert_output is None and nccl_ep._runtime.expert_input_grad is None
+
+
 def test_fixed_receive_capacity_overflow_is_not_dropped(transport, group):
     manager = nccl_ep.NcclEpManager(
         NcclEpConfig(max_tokens_per_rank=5, recv_capacity_factor=1.0),
@@ -384,7 +500,12 @@ def test_nccl_ep_row_check_reads_the_host_extent(rows):
         ({"nccl_ep": {"max_tokens_per_rank": 0}}, "positive"),
         ({"nccl_ep": {"max_tokens_per_rank": 5}, "dispatcher_async_dispatch": True}, "async_dispatch"),
         ({"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 0.5}}, "recv_capacity_factor"),
-        ({"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 2.0}, "experts": "te"}, "torch_mm"),
+        ({"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 2.0}, "experts": "te"}, "te_grouped_tensor"),
+        ({"nccl_ep": {"max_tokens_per_rank": 5, "zero_copy": True}}, "recv_capacity_factor"),
+        (
+            {"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 1.5, "zero_copy": True}},
+            "zero_copy requires experts='te'",
+        ),
     ],
 )
 def test_invalid_backend_config(kwargs, match):
@@ -553,6 +674,16 @@ def test_backend_preserves_explicit_selection(experts):
     assert config.nccl_ep.max_tokens_per_rank == 17
 
 
+def test_backend_accepts_te_grouped_capacity_and_zero_copy():
+    config = BackendConfig(
+        dispatcher="nccl_ep",
+        experts="te",
+        te_grouped_tensor=True,
+        nccl_ep={"max_tokens_per_rank": 17, "recv_capacity_factor": 1.25, "zero_copy": True},
+    )
+    assert config.te_grouped_tensor and config.nccl_ep.zero_copy
+
+
 def test_fixed_receive_capacity_rejects_expert_bias():
     config = MoEConfig(
         n_routed_experts=4,
@@ -594,9 +725,9 @@ def test_lora_preserves_nccl_ep_capacity():
         aux_loss_coeff=0.0,
         score_func="softmax",
         route_scale=1.0,
-        dim=4,
-        inter_dim=8,
-        moe_inter_dim=8,
+        dim=64,
+        inter_dim=64,
+        moe_inter_dim=64,
         norm_topk_prob=False,
     )
     backend = BackendConfig(
@@ -606,5 +737,43 @@ def test_lora_preserves_nccl_ep_capacity():
     wrapped = GroupedExpertsDeepEPLoRA(original, lora_dim=2)
     assert wrapped.nccl_ep is original.nccl_ep
     assert wrapped.dispatcher_backend == "nccl_ep"
-    # A fixed receive buffer keeps the SwiGLU bounded to the routed rows through the wrapper.
-    assert original.activation_skips_unused_rows and wrapped.activation_skips_unused_rows
+    # A fixed receive buffer keeps the SwiGLU bounded to the routed rows through the wrappers.
+    assert original.routed_rows_swiglu is original.expert_activation
+    assert wrapped.routed_rows_swiglu is wrapped.expert_activation
+    from nemo_automodel.components.moe.quantized_experts import GroupedExpertsDeepEPMXFP4
+
+    packed = GroupedExpertsDeepEPMXFP4(original)
+    assert packed.routed_rows_swiglu is packed.expert_activation
+
+
+def test_installed_activation_replaces_the_routed_row_bound():
+    config = MoEConfig(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=4,
+        inter_dim=8,
+        moe_inter_dim=8,
+        norm_topk_prob=False,
+    )
+    backend = BackendConfig(
+        dispatcher="nccl_ep", experts="torch_mm", nccl_ep={"max_tokens_per_rank": 17, "recv_capacity_factor": 1.25}
+    )
+    experts = GroupedExpertsDeepEP(config, backend=backend, dispatcher_backend=backend.dispatcher)
+    counts = torch.tensor([3, 5])
+    bounded = experts._routed_rows_activation(counts)
+    assert bounded.func is swiglu_routed_rows and bounded.keywords["routed_rows"].tolist() == [8]
+
+    def installed(values, probabilities):
+        return values.chunk(2, -1)[0] * probabilities
+
+    # A model-specific activation runs on every row instead of being replaced by the default SwiGLU.
+    experts.expert_activation = installed
+    assert experts._routed_rows_activation(counts) is installed

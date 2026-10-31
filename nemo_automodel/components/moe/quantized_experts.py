@@ -316,7 +316,8 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
         self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
         self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
         self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
-        self.activation_skips_unused_rows = orig_module.activation_skips_unused_rows
+        # This module builds its own default activation, which takes the bound when the original's did.
+        self.routed_rows_swiglu = self.expert_activation if orig_module.routed_rows_swiglu is not None else None
         # The combine cache (BackendConfig.dispatcher_recompute_cache) is read by the shared dispatcher's config as
         # well: a frozen layer next to a LoRA one must carry the same mode, or the shared-manager check rejects the
         # pair and an all-frozen conversion silently loses the request (review of #4395).

@@ -140,9 +140,9 @@ Leave the numeric tuning settings unset to use HybridEP defaults unless a matche
 
 ## Configure NCCL-EP
 
-NCCL-EP is an experimental, opt-in dispatcher for BF16 expert-parallel training
-on Hopper or newer GPUs. Select it with an explicit upper bound on the number
-of tokens entering each MoE layer on each rank per microbatch:
+NCCL-EP is an experimental, opt-in dispatcher that exchanges BF16 tokens between
+expert-parallel ranks on Hopper or newer GPUs. Select it with an explicit upper
+bound on the number of tokens entering each MoE layer on each rank per microbatch:
 
 ```yaml
 model:
@@ -168,9 +168,11 @@ expert gradients reproducible from run to run.
 
 By default each dispatch sizes its receive buffer from the routing counts, which
 requires one host synchronization per MoE layer. With the `torch_mm` experts
-backend, `nccl_ep.recv_capacity_factor` instead gives every dispatch a fixed
-receive buffer of `max_tokens_per_rank` (rounded up to a multiple of 64) times
-top-k times the factor rows, and removes that synchronization:
+backend, or `experts: te` with `te_grouped_tensor: true`,
+`nccl_ep.recv_capacity_factor` instead gives every dispatch a fixed receive
+buffer of `max_tokens_per_rank` (rounded up to a multiple of 64) times top-k
+times the factor rows, plus the expert padding described below, and removes that
+synchronization:
 
 ```yaml
 model:
@@ -189,6 +191,39 @@ the capacity aborts with a device-side error instead of dropping tokens, so
 choose a factor that covers the routing skew of the model; balanced routing
 needs about 1.0. The fixed buffers increase expert activation memory by up to
 the same factor. Experts with bias terms do not support this mode.
+
+With `experts: te`, NCCL-EP zero-pads each local expert's received rows to the
+multiple that the `te_fp8` recipe needs: 16 rows for FP8 current scaling, 32 for
+MXFP8, and 128 for MXFP8 and FP8 block scaling with `te_grouped_tensor: true`.
+The grouped GEMMs then skip Transformer Engine's padding and unpadding copies
+and produce the same results. Enable FP8 through `te_fp8`, not an outer Transformer
+Engine autocast, so that NCCL-EP knows the alignment. With `te_grouped_tensor: true`,
+the experts also read the per-expert row counts on the device instead of copying
+them to the host.
+
+`nccl_ep.zero_copy` lets dispatch write received tokens into symmetric memory
+that the experts read directly, and lets combine read the expert output from
+symmetric memory that the down projection writes, instead of copying through
+NCCL-EP's staging buffers:
+
+```yaml
+model:
+  backend:
+    experts: te
+    te_grouped_tensor: true
+    dispatcher: nccl_ep
+    nccl_ep:
+      max_tokens_per_rank: 4096
+      recv_capacity_factor: 1.25
+      zero_copy: true
+```
+
+Zero copy requires a fixed receive capacity and adds two BF16 buffers of the
+receive capacity that all MoE layers share. It does not support expert bias,
+`apply_router_weight_after_down`, or models that transform the expert output
+before combine. Its effect on speed depends on the model: on eight GB200 GPUs,
+MoE layer steps ran 1% to 5% faster at hidden sizes 2880 and 7168 but about 9%
+slower at hidden size 2048, so measure it on your model before enabling it.
 
 When all ranks of the EP group share one NVLink domain, such as one H100 node or
 one GB200 NVL72 rack, setting `NCCL_EP_HT_EM_PULL_PUSH=1` in the job environment

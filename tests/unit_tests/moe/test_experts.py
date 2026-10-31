@@ -2306,6 +2306,26 @@ def test_grouped_experts_te_legacy_constructor_compatibility(moe_config, monkeyp
 def fake_native_te(monkeypatch):
     """Exercise Automodel's TE integration on CPU, including coupled autograd outputs."""
 
+    class RoutedRowsLinear(torch.autograd.Function):
+        """Grouped-GEMM stand-in over the leading ``rows`` of [capacity, in] values, with ``out=``/``dgrad_out=``."""
+
+        @staticmethod
+        def forward(ctx, values, weight, rows, out, dgrad_out):
+            ctx.save_for_backward(values, weight)
+            ctx.rows, ctx.dgrad_out = rows, dgrad_out
+            if out is None:
+                out = values.new_full((values.shape[0], weight.shape[0]), float("nan"))
+            out[:rows] = torch.nn.functional.linear(values[:rows], weight)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad):
+            values, weight = ctx.saved_tensors
+            rows = ctx.rows
+            grad_values = torch.full_like(values, float("nan")) if ctx.dgrad_out is None else ctx.dgrad_out
+            grad_values[:rows] = grad[:rows] @ weight
+            return grad_values, grad[:rows].T @ values[:rows], None, None, None
+
     class GroupedLinear(torch.nn.Module):
         def __init__(
             self, *, num_gemms, in_features, out_features, bias, params_dtype, device, use_grouped_tensor=False
@@ -2315,9 +2335,13 @@ def fake_native_te(monkeypatch):
             self.use_grouped_tensor = use_grouped_tensor
             self.weight = torch.nn.Parameter(torch.randn(out_features, in_features, dtype=params_dtype) * 0.02)
 
-        def forward(self, values, splits):
+        def forward(self, values, splits, out=None, dgrad_out=None):
             assert isinstance(splits, torch.Tensor) == self.use_grouped_tensor
-            return torch.nn.functional.linear(values, self.weight)
+            # TE's grouped-tensor GEMMs process only the leading sum(splits) rows.
+            rows = int(splits.sum()) if isinstance(splits, torch.Tensor) else values.shape[0]
+            if out is None and dgrad_out is None and rows == values.shape[0]:
+                return torch.nn.functional.linear(values, self.weight)
+            return RoutedRowsLinear.apply(values, self.weight, rows, out, dgrad_out)
 
     class Padding(torch.nn.Module):
         def __init__(self, num_gemms, align_size=None):
@@ -2364,6 +2388,7 @@ def fake_native_te(monkeypatch):
     te.GroupedLinear, te.Fp8Padding, te.Fp8Unpadding = GroupedLinear, Padding, Unpadding
     quantization = ModuleType("transformer_engine.pytorch.quantization")
     quantization.FP8GlobalStateManager = state
+    quantization.get_align_size_for_quantization = lambda recipe: 32 if recipe.mxfp8() else 16
     grouped_linear = ModuleType("transformer_engine.pytorch.module.grouped_linear")
     grouped_linear.is_module_grouped_tensor_path_supported = supported
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te)
@@ -2518,6 +2543,144 @@ def test_te_native_recipe_validation_and_padding(moe_config, fake_native_te):
     with patch("torch.tensor", side_effect=AssertionError("Must reject before creating device splits")):
         with pytest.raises(ValueError, match="Set te_grouped_tensor=False"):
             experts(*args)
+
+
+def _fake_recipe(kind: str) -> SimpleNamespace:
+    """TE recipe stand-in answering the format queries for "current", "block", or "mxfp8"."""
+    return SimpleNamespace(mxfp8=lambda: kind == "mxfp8", float8_block_scaling=lambda: kind == "block")
+
+
+@pytest.mark.parametrize(
+    "recipe,native,alignment",
+    [(None, True, 1), ("current", False, 16), ("current", True, 16), ("mxfp8", False, 32)]
+    + [("mxfp8", True, 128), ("block", False, 16), ("block", True, 128)],
+)
+def test_te_nccl_ep_alignment_follows_te_fp8(moe_config, fake_native_te, monkeypatch, recipe, native, alignment):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    monkeypatch.setattr("nemo_automodel.components.models.common.utils.HAVE_TE", True)
+    te_fp8 = None if recipe is None else {"recipe": _fake_recipe(recipe)}
+    backend = BackendConfig(
+        experts="te", dispatcher="nccl_ep", te_grouped_tensor=native, nccl_ep={"max_tokens_per_rank": 8}, te_fp8=te_fp8
+    )
+    assert GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="nccl_ep").expert_alignment == alignment
+    # Other dispatchers pack expert rows unpadded; TE's padding modules align them.
+    deepep = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native, te_fp8=te_fp8)
+    assert GroupedExpertsTE(moe_config, backend=deepep).expert_alignment == 1
+
+
+@pytest.mark.parametrize("zero_copy", [False, True])
+def test_te_nccl_ep_capacity_reads_device_splits(moe_config, fake_native_te, monkeypatch, zero_copy):
+    """Fixed-capacity NCCL-EP: no host split list, a routed-row SwiGLU, and with zero_copy the shared buffers."""
+    import nemo_automodel.components.moe.experts as experts_module
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    rows, capacity, dim = 3, 8, moe_config.dim
+    symmetric = (torch.zeros(capacity, dim, dtype=moe_config.dtype), torch.zeros(capacity, dim, dtype=moe_config.dtype))
+    seen = {}
+
+    class Dispatcher:
+        def __init__(self, num_local_experts, expert_alignment, **kwargs):
+            self.num_local_experts = num_local_experts
+            seen["alignment"] = expert_alignment
+
+        def token_permutation2(self, hidden_states, token_probs, **kwargs):
+            # NaN stands in for the unused rows of the fixed receive buffer.
+            slack = hidden_states.new_full((capacity - rows, dim), float("nan"))
+            probs = torch.cat([token_probs[:, 0], token_probs.new_full((capacity - rows,), float("nan"))])
+            counts = torch.tensor([rows] + [0] * (self.num_local_experts - 1))
+            return torch.cat([hidden_states, slack]), counts, probs
+
+        def expert_buffers(self):
+            return symmetric
+
+        def token_unpermutation(self, values):
+            assert values.data_ptr() == symmetric[0].data_ptr() if zero_copy else values.shape == (capacity, dim)
+            return values[:rows]
+
+    def routed_rows_swiglu(values, probabilities, *, routed_rows, limit):
+        """Unclamped SwiGLU of the leading routed rows; later rows stay NaN."""
+        seen["routed_rows"] = routed_rows.tolist()
+        gate, up = values[:rows].float().chunk(2, -1)
+        active = (torch.nn.functional.silu(gate) * up * probabilities[:rows]).to(values.dtype)
+        return torch.cat([active, values.new_full((capacity - rows, active.shape[1]), float("nan"))])
+
+    monkeypatch.setattr(experts_module, "MoEFlexTokenDispatcher", Dispatcher)
+    monkeypatch.setattr(experts_module, "swiglu_routed_rows", routed_rows_swiglu)
+    monkeypatch.setattr(experts_module, "_resolve_m_splits", Mock(side_effect=AssertionError("host split list")))
+    backend = BackendConfig(
+        experts="te",
+        dispatcher="nccl_ep",
+        te_grouped_tensor=True,
+        nccl_ep={"max_tokens_per_rank": rows, "recv_capacity_factor": 1.0, "zero_copy": zero_copy},
+    )
+    experts = GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="nccl_ep")
+    mesh = Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+    assert seen["alignment"] == 1
+    x = torch.randn(rows, dim, dtype=moe_config.dtype, requires_grad=True)
+    weights = torch.rand(rows, 1, requires_grad=True)
+    out = experts(x, torch.ones(rows, dtype=torch.bool), weights, torch.zeros(rows, 1, dtype=torch.long))
+    assert seen["routed_rows"] == [rows]
+    upstream = torch.randn_like(out)
+    (out.float() * upstream).sum().backward()
+
+    x_ref = x.detach().clone().requires_grad_()
+    weights_ref = weights.detach().clone().requires_grad_()
+    gate, up = torch.nn.functional.linear(x_ref, experts.gate_up_linear.weight).float().chunk(2, -1)
+    hidden = (torch.nn.functional.silu(gate) * up * weights_ref).to(x.dtype)
+    expected = torch.nn.functional.linear(hidden, experts.down_linear.weight)
+    (expected.float() * upstream).sum().backward()
+    torch.testing.assert_close(out, expected)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(weights.grad, weights_ref.grad)
+    if zero_copy:
+        # The gate/up projection wrote the dispatched tokens' gradient into the shared buffer.
+        torch.testing.assert_close(symmetric[1][:rows], x.grad)
+        with pytest.raises(ValueError, match="post_expert_output"):
+            experts(x, torch.ones(rows, dtype=torch.bool), weights, torch.zeros(rows, 1, dtype=torch.long), lambda v: v)
+
+
+def test_te_nccl_ep_rejects_unsupported_capacity_settings(moe_config, fake_native_te):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    capacity = {"max_tokens_per_rank": 8, "recv_capacity_factor": 1.25}
+    backend = BackendConfig(experts="te", dispatcher="nccl_ep", te_grouped_tensor=True, nccl_ep=capacity)
+    with pytest.raises(ValueError, match="expert_bias"):
+        GroupedExpertsTE(replace(moe_config, expert_bias=True), backend=backend, dispatcher_backend="nccl_ep")
+    zero_copy = BackendConfig(
+        experts="te", dispatcher="nccl_ep", te_grouped_tensor=True, nccl_ep={**capacity, "zero_copy": True}
+    )
+    with pytest.raises(ValueError, match="apply_router_weight_after_down"):
+        GroupedExpertsTE(
+            replace(moe_config, apply_router_weight_after_down=True), backend=zero_copy, dispatcher_backend="nccl_ep"
+        )
+
+
+def test_te_nccl_ep_rejects_a_recipe_its_alignment_does_not_cover(moe_config, fake_native_te):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    backend = BackendConfig(
+        experts="te", dispatcher="nccl_ep", te_grouped_tensor=True, nccl_ep={"max_tokens_per_rank": 8}
+    )
+    experts = GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="nccl_ep")
+    experts.ep_size = 1
+    experts.token_dispatcher = SimpleNamespace(
+        token_permutation2=lambda hidden_states, token_probs, **kwargs: (
+            hidden_states,
+            torch.tensor([hidden_states.shape[0]] + [0] * 7),
+            token_probs[:, 0],
+        )
+    )
+    # FP8 enabled outside backend.te_fp8: the dispatched rows were not padded for it.
+    fake_native_te.state.is_fp8_enabled.return_value = True
+    fake_native_te.state.get_fp8_recipe.return_value = _fake_recipe("current")
+    x = torch.randn(3, moe_config.dim, dtype=moe_config.dtype)
+    with pytest.raises(RuntimeError, match="backend.te_fp8"):
+        experts(x, torch.ones(3, dtype=torch.bool), torch.ones(3, 1), torch.zeros(3, 1, dtype=torch.long))
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")

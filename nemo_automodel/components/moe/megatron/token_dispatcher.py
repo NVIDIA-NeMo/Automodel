@@ -1070,6 +1070,7 @@ class MoEFlexTokenDispatcher:
         config: TokenDispatcherConfig,
         ep_group: torch.distributed.ProcessGroup,
         hidden_dim: int | None = None,
+        expert_alignment: int = 1,
     ) -> None:
         """
         Initialize the Flex token dispatcher.
@@ -1080,6 +1081,8 @@ class MoEFlexTokenDispatcher:
             config (TokenDispatcherConfig): Configuration for the transformer model.
             ep_group (torch.distributed.ProcessGroup): Process group for MoE operations.
             hidden_dim: Dispatched token width; required for NCCL-EP initialization.
+            expert_alignment: Row multiple that NCCL-EP pads each local expert's dispatched
+                segment to; other backends require 1.
         """
         self.config = config
         self.shared_experts = None
@@ -1095,6 +1098,8 @@ class MoEFlexTokenDispatcher:
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
 
         backend = self.config.moe_flex_dispatcher_backend
+        if expert_alignment != 1 and backend != "nccl_ep":
+            raise ValueError(f"expert_alignment is only supported by the NCCL-EP backend, got {backend!r}")
 
         if backend == "nccl_ep":
             if hidden_dim is None:
@@ -1109,6 +1114,7 @@ class MoEFlexTokenDispatcher:
                 hidden_dim=hidden_dim,
                 num_experts=self.config.num_moe_experts,
                 top_k=self.config.moe_router_topk,
+                expert_alignment=expert_alignment,
             )
         elif backend == "uccl_ep":
             if set_uccl_num_sms is not None:
@@ -1345,6 +1351,18 @@ class MoEFlexTokenDispatcher:
             self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
             self._comm_manager.dispatched_probs,
         )
+
+    def expert_buffers(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return the symmetric buffers that zero-copy NCCL-EP experts write into.
+
+        Returns:
+            ``(expert_output, expert_input_grad)``, each BF16 of shape [recv_capacity, hidden],
+            when NCCL-EP runs with ``zero_copy``; otherwise None. See
+            :meth:`NcclEpManager.expert_buffers`.
+        """
+        if not isinstance(self._comm_manager, NcclEpManager):
+            return None
+        return self._comm_manager.expert_buffers()
 
     def dispatch_postprocess(self, hidden_states: torch.Tensor):
         """

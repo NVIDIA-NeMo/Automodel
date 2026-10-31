@@ -16,6 +16,7 @@
 
 import logging
 import os
+from contextlib import nullcontext
 from datetime import timedelta
 
 import torch
@@ -25,7 +26,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 from torch.utils.checkpoint import checkpoint
 
-from nemo_automodel.components.models.common.utils import BackendConfig
+from nemo_automodel.components.models.common.utils import BackendConfig, TEFp8Config
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.moe.nccl_ep import finalize_nccl_ep
@@ -228,12 +229,153 @@ def _check_large_routing(mesh, *, rank: int, world_size: int) -> None:
         for name, expected, actual in zip(_GRADIENT_NAMES, eager, recomputed):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=f"{label}: {name} gradients differ")
         logger.info("rank=%d case=%s tokens=%d: gradients match without recomputation", rank, label, tokens)
-    # The fixed buffer's SwiGLU skips the unused rows with Triton kernels, which round like the
-    # compiled per-dispatch activation only to within BF16 precision.
+    # Both buffers feed the same grouped GEMMs and SwiGLU kernels the same routed rows.
     for name, expected, actual in zip(_GRADIENT_NAMES, per_dispatch[0], fixed[0]):
-        error = (actual.float() - expected.float()).norm() / expected.float().norm()
-        assert error < 1e-2, f"fixed capacity: {name} gradients differ by relative L2 {error.item():.3g}"
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=f"fixed capacity: {name} gradients differ")
     logger.info("rank=%d case=fixed capacity tokens=%d: gradients match per-dispatch buffers", rank, tokens)
+
+
+def _te_step(
+    mesh,
+    *,
+    rank: int,
+    world_size: int,
+    nccl_ep: dict,
+    te_grouped_tensor: bool,
+    te_fp8: str | None,
+    outer_recipe: str | None = None,
+    checkpointed: bool = False,
+) -> list[torch.Tensor]:
+    """Run one Transformer Engine expert layer step on fixed weights and routing.
+
+    Args:
+        mesh: One-dimensional EP device mesh.
+        rank: EP rank.
+        world_size: EP size.
+        nccl_ep: ``BackendConfig.nccl_ep`` settings.
+        te_grouped_tensor: Whether the experts use TE's native grouped-tensor GEMMs.
+        te_fp8: ``BackendConfig.te_fp8`` recipe, for which NCCL-EP aligns the expert rows.
+        outer_recipe: Recipe enabled outside the backend instead, leaving the rows to TE's padding.
+        checkpointed: Whether to recompute the layer in backward.
+
+    Returns:
+        Output [tokens, hidden], gradients of the input [tokens, hidden] and routing weights
+        [tokens, top_k], then the gradient of every local GEMM weight.
+    """
+    tokens, hidden_dim, inter_dim, top_k = 1024, 512, 256, 4
+    config = MoEConfig(
+        n_routed_experts=world_size * 8,
+        n_shared_experts=0,
+        n_activated_experts=top_k,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=hidden_dim,
+        inter_dim=inter_dim,
+        moe_inter_dim=inter_dim,
+        norm_topk_prob=False,
+        dtype=torch.bfloat16,
+    )
+    backend = BackendConfig(
+        dispatcher="nccl_ep",
+        experts="te",
+        te_grouped_tensor=te_grouped_tensor,
+        nccl_ep=nccl_ep,
+        te_fp8=None if te_fp8 is None else {"recipe": te_fp8},
+        attn="sdpa",
+        linear="torch",
+    )
+    recipe = te_fp8 or outer_recipe
+    with torch.device("meta"):
+        experts = MoE(config, backend).experts
+    experts.init_token_dispatcher(mesh)
+    experts.to_empty(device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(43 + rank)
+    local = config.n_routed_experts // world_size
+    gate_up = torch.randn(local, hidden_dim, 2 * inter_dim, device="cuda", generator=generator) * hidden_dim**-0.5
+    down = torch.randn(local, inter_dim, hidden_dim, device="cuda", generator=generator) * inter_dim**-0.5
+    experts.gate_and_up_projs = gate_up.bfloat16()
+    experts.down_projs = down.bfloat16()
+    hidden = (torch.randn(tokens, hidden_dim, device="cuda", generator=generator) * 0.5).bfloat16().requires_grad_()
+    scores = torch.randn(tokens, config.n_routed_experts, device="cuda", generator=generator)
+    probs, indices = scores.softmax(-1).topk(top_k, dim=-1)
+    probs.requires_grad_()
+    mask = torch.ones(tokens, device="cuda", dtype=torch.bool)
+    upstream = torch.randn(tokens, hidden_dim, device="cuda", generator=generator)
+    try:
+        # As in the training recipes, backward and its recomputation run inside the FP8 context.
+        with TEFp8Config(recipe=recipe).maybe_te_autocast() if recipe is not None else nullcontext():
+            out = (
+                checkpoint(experts, hidden, mask, probs, indices, use_reentrant=False)
+                if checkpointed
+                else experts(hidden, mask, probs, indices)
+            )
+            (out.float() * upstream).sum().backward()
+        weights = [
+            getattr(linear, f"weight{i}").grad
+            for linear in (experts.gate_up_linear, experts.down_linear)
+            for i in range(linear.num_gemms)
+        ]
+        return [out.detach(), hidden.grad, probs.grad, *weights]
+    finally:
+        torch.cuda.synchronize()
+        finalize_nccl_ep()
+
+
+def _check_te_experts(mesh, *, rank: int, world_size: int) -> None:
+    """Require exact results from aligned rows, fixed capacity, and zero copy with TE experts.
+
+    NCCL-EP zero-pads each expert's rows to the multiple the FP8 GEMMs need, which TE's
+    padding would otherwise add, and the grouped GEMMs never read a fixed buffer's unused
+    rows, so each configuration must reproduce the reference bit for bit.
+
+    Args:
+        mesh: One-dimensional EP device mesh.
+        rank: EP rank.
+        world_size: EP size.
+    """
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.module.grouped_linear import is_module_grouped_tensor_path_supported
+
+    blackwell = torch.cuda.get_device_capability()[0] >= 10
+    max_tokens = {"max_tokens_per_rank": 1024}
+    fixed = {**max_tokens, "recv_capacity_factor": 2.0}
+
+    def same(label: str, expected: list[torch.Tensor], actual: list[torch.Tensor]) -> None:
+        for index, (reference, value) in enumerate(zip(expected, actual, strict=True)):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0, msg=f"{label}: tensor {index} differs")
+        logger.info("rank=%d case=te %s: output and gradients match", rank, label)
+
+    def step(**kwargs) -> list[torch.Tensor]:
+        return _te_step(mesh, rank=rank, world_size=world_size, **kwargs)
+
+    for recipe in (None, "current", "mxfp8"):
+        if recipe == "mxfp8" and not blackwell:
+            continue
+        name = recipe or "bf16"
+        if recipe is not None:
+            padded = step(nccl_ep=max_tokens, te_grouped_tensor=False, te_fp8=None, outer_recipe=recipe)
+            aligned = step(nccl_ep=max_tokens, te_grouped_tensor=False, te_fp8=recipe)
+            same(f"{name} aligned rows", padded, aligned)
+        te_recipe = None if recipe is None else TEFp8Config(recipe=recipe).build_recipe()
+        if not is_module_grouped_tensor_path_supported(te_recipe, torch.bfloat16):
+            continue
+        reference = step(nccl_ep=max_tokens, te_grouped_tensor=True, te_fp8=recipe)
+        cases = [
+            ("recompute", max_tokens, True),
+            ("fixed capacity", fixed, False),
+            ("fixed capacity recompute", fixed, True),
+        ]
+        if tex.ep_zero_copy_supported():
+            zero_copy = {**fixed, "zero_copy": True}
+            cases += [("zero copy", zero_copy, False), ("zero copy recompute", zero_copy, True)]
+        for label, nccl_ep, checkpointed in cases:
+            actual = step(nccl_ep=nccl_ep, te_grouped_tensor=True, te_fp8=recipe, checkpointed=checkpointed)
+            same(f"{name} {label}", reference, actual)
 
 
 def main() -> None:
@@ -284,6 +426,7 @@ def main() -> None:
         # NCCL-EP keeps one configuration per process; rebuild it at the larger size.
         finalize_nccl_ep()
         _check_large_routing(mesh, rank=rank, world_size=world_size)
+        _check_te_experts(mesh, rank=rank, world_size=world_size)
     finally:
         torch.cuda.synchronize()
         finalize_nccl_ep()
