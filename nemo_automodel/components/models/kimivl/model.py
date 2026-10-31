@@ -28,6 +28,7 @@ from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
+from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
 
 LOGGER = logging.getLogger(__name__)
 
@@ -733,26 +734,11 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
             else getattr(self.config.text_config, "output_hidden_states", False)
         )
 
-        # Retrieve pre-chunked VLM inputs from model attributes
-        # This allows native forward to work with pipeline parallelism
-        # finetune.py stores chunks on model, we retrieve them here per microbatch
-        if (
-            pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
-            and self._vlm_pixel_values_chunks is not None
-        ):
-            # Check if we have media tokens to process
-            has_media_tokens = (
-                input_ids is not None
-                and self.media_placeholder_token_id is not None
-                and (input_ids == self.media_placeholder_token_id).any()
-            )
-            if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(self._vlm_pixel_values_chunks):
-                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
-                    self._vlm_chunk_idx = chunk_idx + 1
+        if pixel_values is None:
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values = media.pixel_values
+                image_grid_hws = media.image_grid
 
         hidden_states = self.model(
             input_ids=input_ids,

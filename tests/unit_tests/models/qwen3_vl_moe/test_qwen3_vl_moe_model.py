@@ -1126,6 +1126,11 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
         ms = MagicMock()
         ms._vlm_pixel_values_chunks = None
         ms._vlm_image_grid_hws_chunks = None
+        ms._vlm_pixel_values_videos_chunks = None
+        ms._vlm_video_grid_thw_chunks = None
+        ms._vlm_patch_pixel_values_chunks = None
+        ms._vlm_num_patches_chunks = None
+        ms._vlm_patch_newline_mask_chunks = None
         ms._vlm_chunk_idx = 0
         return ms
 
@@ -1288,12 +1293,12 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
         assert captured["video_grid_thw"] is video_grid_chunk
         assert captured["pixel_values"] is None  # image stream untouched
 
-    def test_chunked_pixel_values_skipped_without_media_tokens(self):
+    def test_empty_chunk_advances_without_media_tokens(self):
         ms = self._mock_self()
         pixel_chunk = torch.randn(4, 3, 2, 2)
         grid_hws_chunk = torch.tensor([[2, 2]])
-        ms._vlm_pixel_values_chunks = [pixel_chunk]
-        ms._vlm_image_grid_hws_chunks = [grid_hws_chunk]
+        ms._vlm_pixel_values_chunks = [pixel_chunk[:0]]
+        ms._vlm_image_grid_hws_chunks = [grid_hws_chunk[:0]]
         ms._vlm_chunk_idx = 0
 
         input_ids = torch.tensor([[1, 2, 3, 4]])
@@ -1310,7 +1315,7 @@ class TestQwen3VLMoeForConditionalGenerationPpGuardCpu:
 
         Qwen3VLMoeForConditionalGeneration.forward(ms, input_ids=input_ids)
 
-        assert ms._vlm_chunk_idx == 0
+        assert ms._vlm_chunk_idx == 1
         assert captured["pixel_values"] is None
 
     def test_chunked_pixel_values_passthrough_when_already_3d_grid(self):

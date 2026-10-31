@@ -25,7 +25,7 @@ from nemo_automodel.components.datasets.packing import (
 
 def test_default_packed_sequence_contract_preserves_block_causal_behavior() -> None:
     assert DEFAULT_PACKED_SEQUENCE_CONTRACT.packed_mask_type == "block_causal"
-    assert DEFAULT_PACKED_SEQUENCE_CONTRACT.requires_packed_sequence_metadata is False
+    assert DEFAULT_PACKED_SEQUENCE_CONTRACT.return_packed_sequence_metadata is False
 
 
 def test_get_seqlens_in_batch_preserves_batch_document_order() -> None:

@@ -428,3 +428,21 @@ def test_rank_ordering_context_wraps_only_dataset_construction():
     config.build(dp_rank=0, dp_world_size=1, dataset_build_context=BuildContext())
 
     assert events == ["enter", "dataset", "exit", "packing"]
+
+
+def test_thd_rejects_unsupported_model_instead_of_silently_disabling_packing():
+    with pytest.raises(ValueError, match="THD packing requires a model that consumes seq_lens"):
+        ThdPackingConfig(packed_sequence_size=8).build([], supports_seq_lens=False)
+
+
+def test_prepacked_thd_is_reported_as_packed_without_online_packing():
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    config = DataloaderConfig(dataset_config=StaticDatasetConfig([]), collate_fn=packed_sequence_thd_collater)
+    assert config.is_packed and config.output_format == "thd"
+
+
+def test_emits_thd_compatibility_alias_warns():
+    config = DataloaderConfig(dataset_config=StaticDatasetConfig([]))
+    with pytest.warns(FutureWarning, match="output_format"):
+        assert config.emits_thd is False
