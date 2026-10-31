@@ -29,8 +29,10 @@ import logging
 import pathlib
 import time
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 
+from nemo_automodel.shared.batch import move_batch_to_device
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_MLFLOW, mlflow = safe_import(
@@ -52,10 +54,13 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForMultimodalLM,
 )
+from nemo_automodel._transformers.registry import resolve_image_position_state
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.loader import close_dataloader
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
+from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -86,7 +91,11 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
-from nemo_automodel.components.models.common.packing import PackingCapabilities
+from nemo_automodel.components.models.common.packing import (
+    PackingCapabilities,
+    configure_packing_for_models,
+    validate_thd_packing_support,
+)
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -233,11 +242,13 @@ def build_model(
     cfg_quantization=None,
     *,
     load_metadata_with_gloo: bool = False,
+    has_packed_sequence: bool = False,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
     Args:
         load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
+        has_packed_sequence: Whether input documents are packed, for backend compatibility checks.
 
     Returns:
         The instantiated model and optimizer.
@@ -245,6 +256,7 @@ def build_model(
     with ScopedRNG(seed=seed, ranked=True):
         # Build infrastructure kwargs
         kwargs = {
+            "has_packed_sequence": has_packed_sequence,
             "peft_config": cfg_peft,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
             "load_metadata_with_gloo": load_metadata_with_gloo,
@@ -352,18 +364,6 @@ def _shift_labels_left(labels: torch.Tensor, k: int) -> torch.Tensor:
     return shifted
 
 
-def _move_to_device(value: Any, device: torch.device) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.to(device, non_blocking=True)
-    if isinstance(value, dict):
-        return {k: _move_to_device(v, device) if v is not None else None for k, v in value.items()}
-    if isinstance(value, list):
-        return [_move_to_device(v, device) for v in value]
-    if isinstance(value, tuple):
-        return tuple(_move_to_device(v, device) for v in value)
-    return value
-
-
 def build_dataloader(
     cfg_ds,
     cfg_dl,
@@ -414,6 +414,8 @@ def build_dataloader(
         processor_node=cfg_processor,
         packed_sequence_node=cfg_ps,
     )
+    if isinstance(config, ZephonVlmDataloaderConfig):
+        raise ValueError("Zephon VLM requires typed recipe construction with model-owned position state")
     dp_rank = 0
     dp_world_size = 1
     cp_size = 1
@@ -426,13 +428,21 @@ def build_dataloader(
         if "cp" in getattr(device_mesh, "mesh_dim_names", ()):
             cp_size = device_mesh["cp"].size()
 
-    from nemo_automodel.components.models.common.packing import configure_packing, get_model_attn_implementation
+    from nemo_automodel.components.models.common.packing import (
+        configure_packing,
+        get_model_attn_implementation,
+        get_packing_capabilities,
+    )
 
-    packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
-    if config.packing is not None and config.packing.packing_format != "thd":
+    packing_contract = (
+        get_packing_capabilities(get_model_attn_implementation(model), model=model)
+        if model is not None
+        else DEFAULT_PACKED_SEQUENCE_CONTRACT
+    )
+    if config.is_packed and config.output_format == "batched":
         if model is None:
             raise ValueError("Packed deprecated build_dataloader calls require the built model")
-        packing_contract = configure_packing(
+        configure_packing(
             get_model_attn_implementation(model),
             model=model,
         )
@@ -482,11 +492,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """Whether this rank owns the trainable model and its components."""
         return True
 
-    def _configure_packing(self) -> PackingCapabilities:
-        """Configure local model stages before the VLM dataloader is built."""
-        from nemo_automodel.components.models.common.packing import configure_packing_for_models
+    def _get_packing_contract(self) -> PackingCapabilities:
+        """Query loader requests; KD can include a teacher constructed later."""
+        from nemo_automodel.components.models.common.packing import get_packing_capabilities_for_models
 
-        return configure_packing_for_models(self.model_parts)
+        return get_packing_capabilities_for_models(self.model_parts)
 
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
@@ -527,6 +537,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         if not self._should_setup_training_components():
             return
+
+        dataloader_config = self.cfg.vlm_dataloader
+        if dataloader_config is None:
+            raise ValueError("VLM training requires a dataset config")
+        validate_parallelism = getattr(dataloader_config, "validate_parallelism", None)
+        if callable(validate_parallelism):
+            validate_parallelism(cp_size=self.mesh_context.cp_size)
 
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
@@ -618,6 +635,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
             load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
+            has_packed_sequence=dataloader_config.is_packed,
         )
         capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
         _validate_cp_vision_frame_sharding_support(capability_model, self.cp_vision_frame_sharding)
@@ -678,17 +696,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
-        dataloader_config = self.cfg.vlm_dataloader
-        if dataloader_config is None:
-            raise ValueError("VLM training requires a dataset config")
         _validate_cp_packing_support(
             self.model_parts[0],
-            packing_enabled=dataloader_config.packing is not None,
+            packing_enabled=dataloader_config.is_packed,
             cp_size=self.mesh_context.cp_size,
         )
-        packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
-        if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
-            packing_contract = self._configure_packing()
+        # Every loader receives model return requests; only packed batched input
+        # configures mask/Flash/gather adapters. THD owns its length-based route.
+        packing_contract = self._get_packing_contract()
+        if dataloader_config.output_format == "thd":
+            validate_thd_packing_support(self.model_parts)
+        elif dataloader_config.is_packed:
+            configure_packing_for_models(self.model_parts)
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
@@ -699,7 +718,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                 dataset_build_context=dataset_build_context,
                 get_rope_index=get_rope_index,
+                position_state_factory=partial(resolve_image_position_state, self.model_parts[0]),
                 packing_contract=packing_contract,
+                ignore_index=_get_loss_ignore_index(self.loss_fn),
                 pp_n_microbatches=pp_n_microbatches,
                 cp_size=self.mesh_context.cp_size,
             )
@@ -761,6 +782,29 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self._log_step_scheduler_details(self.step_scheduler)
 
     # ------------------ main loop ------------------
+    def _run_validation_loader(self, *, step: int | None = None) -> dict[str, float]:
+        """Validate the configured VLM source and restore training mode.
+
+        Args:
+            step: Completed optimizer-step index for terminal validation.
+
+        Returns:
+            Validation loss used by checkpoint selection, or an empty mapping
+            when no validation loader is configured or PP is enabled.
+        """
+        if self.val_dataloader is None:
+            return {}
+        if self.pp_enabled:
+            logger.warning("Validation is not supported for pipeline parallelism")
+            return {}
+        val_log_data = self._run_validation_epoch(self.val_dataloader)
+        if step is not None:
+            val_log_data.step = step
+        self.log_val_metrics(val_log_data)
+        for model_part in self.model_parts:
+            model_part.train()
+        return {"val_loss": val_log_data.metrics["val_loss"]}
+
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches.
 
@@ -772,6 +816,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.timestamp = time.perf_counter()
 
         pbar = self._make_progress_bar()
+        log_data = None
+        last_validation_step = None
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
@@ -782,15 +828,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self._update_progress_bar(pbar, log_data.metrics)
 
                     val_loss = {}
-                    if self.step_scheduler.is_val_step and self.val_dataloader is not None:
-                        if self.pp_enabled:
-                            logger.warning("Validation is not supported for pipeline parallelism")
-                        else:
-                            val_log_data = self._run_validation_epoch(self.val_dataloader)
-                            val_loss["val_loss"] = val_log_data.metrics["val_loss"]
-                            self.log_val_metrics(val_log_data)
-                        for mp in self.model_parts:
-                            mp.train()
+                    if self.step_scheduler.is_val_step:
+                        val_loss = self._run_validation_loader()
+                        last_validation_step = self.step_scheduler.step
 
                     if self.step_scheduler.is_ckpt_step:
                         self.save_checkpoint(
@@ -801,7 +841,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
+            if self.step_scheduler.stream_exhausted and log_data is not None:
+                completed_step = self.step_scheduler.step - 1
+                if last_validation_step != completed_step:
+                    val_loss = self._run_validation_loader(step=completed_step)
+                # The closed-pass frontier cannot overwrite a periodic checkpoint.
+                self.save_checkpoint(
+                    self.step_scheduler.epoch,
+                    completed_step,
+                    log_data.metrics["loss"],
+                    val_loss,
+                    best_metric_key=self.best_metric_key,
+                )
         finally:
+            close_dataloader(self.dataloader)
+            close_dataloader(self.val_dataloader)
             if pbar is not None:
                 pbar.close()
 
@@ -922,7 +976,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         Args:
             idx: Microbatch index in the accumulation window.
-            batch: Input mapping with token IDs, labels, and physical NEAT
+            batch: Input mapping with token IDs, labels, and effective packed
                 document IDs of shape [batch, sequence]. NEAT attention metadata
                 is batch-major; legacy THD inputs are flattened by the sharder.
                 VLM media and position tensors retain the model's input layout.
@@ -953,7 +1007,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             prepare_host_metadata = getattr(self.model_parts[0], "prepare_host_batch_metadata", None)
             if prepare_host_metadata is not None:
                 batch = {**batch, **prepare_host_metadata(batch)}
-        batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
+        batch = move_batch_to_device(batch, self.dist_env.device)
         if _cp_active and not _is_first_or_no_pp and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
             # Non-first PP stages don't embed; drop raw multimodal inputs so their
             # forwards see only text.
@@ -1016,7 +1070,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
-        # Preserve physical NEAT document IDs before model-kwarg filtering. The
+        # Preserve effective document IDs before model-kwarg filtering. The
         # loss needs these even when the forward does not accept packing metadata.
         mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
         # Preserve packing metadata needed by the loss before model-kwarg filtering.
@@ -1319,10 +1373,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_tokens = 0
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                batch = {
-                    k: (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-                    for k, v in batch.items()
-                }
+                batch = move_batch_to_device(batch, self.dist_env.device)
                 num_label_tokens = _count_label_tokens(
                     batch["labels"], _get_loss_ignore_index(getattr(self, "loss_fn", None))
                 )

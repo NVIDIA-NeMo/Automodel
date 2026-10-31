@@ -755,7 +755,7 @@ class TestFA4Backend:
             ],
             packing=SimpleNamespace(
                 packed_mask_type="document_ids",
-                requires_packed_sequence_metadata=True,
+                return_packed_sequence_metadata=True,
             ),
         )
         attention_mask = collated["attention_mask"]

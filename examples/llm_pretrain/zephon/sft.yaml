@@ -1,0 +1,70 @@
+# Run from the repository root after prepare_tiny.py. Requires one CUDA GPU.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 42
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 2
+  max_steps: 1000
+  ckpt_every_steps: 20
+  preemption_signal: null
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.LlamaConfig
+    vocab_size: 64
+    hidden_size: 64
+    intermediate_size: 128
+    num_hidden_layers: 2
+    num_attention_heads: 4
+    num_key_value_heads: 2
+    max_position_embeddings: 128
+    bos_token_id: null
+    eos_token_id: 1
+    pad_token_id: 1
+  dtype: float32
+  attn_implementation: flash_attention_2
+  use_liger_kernel: false
+dataset:
+  column_mapping: {question: question, answer: answer}
+  answer_only_loss_mask: true
+  use_hf_chat_template: false
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDatasetConfig
+  tokenizer:
+    pretrained_model_name_or_path: work/zephon-tiny/tokenizer
+dataloader:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
+  zephon:
+    sources:
+    - name: instructions
+      path: work/zephon-tiny/instructions
+      fmt: jsonl
+    packing:
+      seq_len: 63
+      pack_algorithm: best_fit
+      pack_num_bins: 8
+    source:
+      chunk_size: 32
+      stop_after_passes: 1
+    checkpoint:
+      aggregate_store: torch://
+      run_id: zephon-tiny-sft
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  reduction: sum
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.001
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/zephon-tiny-sft
+dist_env:
+  backend: nccl
+
+ci:
+  cluster_tag: h100

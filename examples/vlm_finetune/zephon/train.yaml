@@ -1,0 +1,63 @@
+# Set dataloader.zephon.sources[0].path to your image-conversation JSONL directory.
+# Run: uv run automodel examples/vlm_finetune/zephon/train.yaml --nproc-per-node 1
+recipe: FinetuneRecipeForVLM
+seed: 42
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 2
+  max_steps: 100
+  ckpt_every_steps: 20
+  preemption_signal: null
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+  attn_implementation: sdpa
+processor:
+  min_pixels: 3136
+  max_pixels: 200704
+dataset:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonVlmSourceConfig
+dataloader:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonVlmDataloaderConfig
+  zephon:
+    sources:
+    - name: images
+      path: /data/image-conversations
+      fmt: jsonl
+    packing:
+      seq_len: 1024
+      pack_algorithm: first_fit
+      pack_num_bins: 16
+      drop_oversized: true
+    source:
+      chunk_size: 16
+      stop_after_passes: 1
+    checkpoint:
+      aggregate_store: torch://
+      run_id: zephon-vlm
+    training:
+      allow_cross_document_attention: false
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  reduction: sum
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.00001
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/zephon-vlm
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+ci:
+  cluster_tag: h100
+  recipe_owner: MaxiBoether
+  time: "00:30:00"
+  nodes: 1

@@ -24,6 +24,7 @@ from nemo_automodel.components.datasets.packing import (
     build_packed_sequence_metadata,
     resolve_packing_contract,
 )
+from nemo_automodel.shared.packed_seq import indexed_mask_to_4d_block_causal
 
 
 def batchify(tensor, default_tensor_cls=torch.LongTensor):
@@ -515,39 +516,6 @@ def packed_sequence_thd_collater_vlm(examples, processor=None, **kwargs):
     return packed_sequence_thd_collater(examples)
 
 
-def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Convert an indexed attention mask to a 4D block-causal mask.
-
-    Args:
-        attention_mask: Integer tensor of shape ``[B, S]`` where each
-            position contains the 1-based index of the sub-sequence it
-            belongs to (0 = padding).
-
-    Returns:
-        Bool tensor of shape ``[B, 1, S, S]`` suitable for
-        ``eager`` / ``sdpa`` attention backends.  ``True`` means the
-        position is **allowed** to attend.
-    """
-    # attention_mask: [B, S]
-    B, S = attention_mask.shape
-
-    # same_doc[b, i, j] = True iff positions i and j belong to the same sub-sequence
-    mask_q = attention_mask.unsqueeze(2)  # [B, S, 1]
-    mask_k = attention_mask.unsqueeze(1)  # [B, 1, S]
-    same_doc = mask_q == mask_k  # [B, S, S]
-
-    # causal: position i can attend to position j only if j <= i
-    causal = torch.ones(S, S, dtype=torch.bool, device=attention_mask.device).tril()  # [S, S]
-
-    # not_padding: both positions must be non-padding (index > 0)
-    not_padding_q = (attention_mask > 0).unsqueeze(2)  # [B, S, 1]
-    not_padding_k = (attention_mask > 0).unsqueeze(1)  # [B, 1, S]
-
-    mask_4d = same_doc & causal.unsqueeze(0) & not_padding_q & not_padding_k  # [B, S, S]
-
-    return mask_4d.unsqueeze(1)  # [B, 1, S, S]
-
-
 def neat_packed_collater(
     batch: list[dict],
     attn_implementation: str | None = None,
@@ -603,7 +571,7 @@ def neat_packed_collater(
     if packed_mask_type in ("document_ids", "flash_varlen"):
         mask_out = attention_mask
     elif packed_mask_type == "block_causal":
-        mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
+        mask_out = indexed_mask_to_4d_block_causal(attention_mask)
     else:
         raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
 
@@ -623,9 +591,9 @@ def neat_packed_collater(
         # mask. Native FA4's unpadded offsets below have a different contract.
         result.pop("attention_mask")
         result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
-    if packing.requires_packed_sequence_metadata:
+    if packing.return_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
-    if attention_mask.max() > 1 or packing.requires_packed_sequence_metadata:
+    if attention_mask.max() > 1 or packing.return_packed_sequence_metadata:
         result["_packed_seq_ids"] = attention_mask
     return result
 

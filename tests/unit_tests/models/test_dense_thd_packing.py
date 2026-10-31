@@ -304,3 +304,51 @@ def test_bshd_mask_call_matches_transformers_5_12_signature(model_kind, monkeypa
     ).logits
 
     assert logits.shape == (1, input_ids.shape[1], model.config.vocab_size)
+
+
+def test_zephon_thd_adapter_qwen3_logits_and_gradients(monkeypatch):
+    """The AutoModel batch adapter preserves packed Qwen3 execution in either xdoc mode."""
+    from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+    from nemo_automodel.components.datasets.zephon.attention import enable_xdoc_attention
+    from nemo_automodel.components.datasets.zephon.output import convert_batch_output
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+    from nemo_automodel.components.models.common.packing import validate_thd_packing_support
+
+    for xdoc in (False, True):
+        torch.manual_seed(234)
+        reference = _build_model("qwen3", monkeypatch).train()
+        model = _build_model("qwen3", monkeypatch).train()
+        model.load_state_dict(reference.state_dict())
+        validate_thd_packing_support([model])
+        tokens = torch.arange(1, 13).reshape(2, 6)
+        document_ids = torch.tensor([[1, 1, 1, 2, 2, 2]]).expand(2, -1)
+        batch = dict(
+            input_ids=tokens,
+            labels=tokens,
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]).expand(2, -1),
+            document_ids=document_ids,
+            attention_document_ids=document_ids,
+            padding_mask=tokens.eq(0),
+        )
+        if xdoc:
+            enable_xdoc_attention(batch, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT)
+        prepared = process_input_for_thd(convert_batch_output(batch, output_format="thd"))
+        prepared.pop("labels")
+        actual = model(**prepared).logits
+        pieces = []
+        width = 6 if xdoc else 3
+        for document in range(2):
+            for start in range(0, 6, width):
+                pieces.append(
+                    reference(
+                        input_ids=tokens[document : document + 1, start : start + width],
+                        position_ids=batch["position_ids"][document : document + 1, start : start + width],
+                        use_cache=False,
+                    ).logits
+                )
+        expected = torch.cat(pieces, dim=1)
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        for name, parameter in model.named_parameters():
+            torch.testing.assert_close(parameter.grad, reference.get_parameter(name).grad, atol=2e-6, rtol=2e-5)
