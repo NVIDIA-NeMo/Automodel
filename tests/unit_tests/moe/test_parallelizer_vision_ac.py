@@ -230,3 +230,49 @@ def test_apply_ac_leaves_text_only_models_unchanged():
     moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2)
 
     _assert_decoder_wrapped(model.model)
+
+
+def test_model_owned_full_layer_policy_wraps_vision_blocks_and_preserves_gradients(monkeypatch):
+    """The same model policy selects whole blocks on dense and expert-parallel paths."""
+    import copy
+
+    from nemo_automodel.components.models.deepseek_v41.fsdp import PARALLELIZER
+
+    torch.manual_seed(17)
+    reference = Qwen3VLMoeForConditionalGeneration()
+    candidate = copy.deepcopy(reference)
+    monkeypatch.setattr(Qwen3VLMoeForConditionalGeneration, "parallelizer", PARALLELIZER, raising=False)
+    moe_parallelizer.apply_ac(candidate, hidden_size=_DIM, num_experts=2)
+
+    _assert_decoder_wrapped(candidate.model.language_model)
+    for wrapped in candidate.model.visual.blocks:
+        assert isinstance(wrapped, CheckpointWrapper)
+        block = wrapped._checkpoint_wrapped_module
+        assert not isinstance(block.attn, CheckpointWrapper)
+        assert not isinstance(block.mlp, CheckpointWrapper)
+    inputs = torch.randn(7, _DIM)
+    expected = reference.model.visual(inputs)
+    actual = candidate.model.visual(inputs)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    upstream = torch.randn_like(expected)
+    expected.backward(upstream)
+    actual.backward(upstream)
+    for left, right in zip(reference.model.visual.parameters(), candidate.model.visual.parameters(), strict=True):
+        torch.testing.assert_close(left.grad, right.grad, atol=0, rtol=0)
+
+
+def test_model_owned_full_layer_policy_still_honors_vision_scope_and_frozen_towers(monkeypatch):
+    from nemo_automodel.components.models.deepseek_v41.fsdp import PARALLELIZER
+
+    monkeypatch.setattr(Qwen3VLMoeForConditionalGeneration, "parallelizer", PARALLELIZER, raising=False)
+    language_only = Qwen3VLMoeForConditionalGeneration()
+    moe_parallelizer.apply_ac(language_only, hidden_size=_DIM, num_experts=2, activation_checkpointing_scope="language")
+    _assert_vision_untouched(language_only.model.visual)
+    vision_only = Qwen3VLMoeForConditionalGeneration()
+    moe_parallelizer.apply_ac(vision_only, activation_checkpointing_scope="vision")
+    _assert_decoder_untouched(vision_only.model.language_model)
+    assert all(isinstance(block, CheckpointWrapper) for block in vision_only.model.visual.blocks)
+    frozen = Qwen3VLMoeForConditionalGeneration()
+    frozen.model.visual.requires_grad_(False)
+    moe_parallelizer.apply_ac(frozen, hidden_size=_DIM, num_experts=2)
+    _assert_vision_untouched(frozen.model.visual)
