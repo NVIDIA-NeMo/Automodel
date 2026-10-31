@@ -25,7 +25,7 @@ from nemo_automodel.components.datasets.zephon.loader import ZephonDataLoader
 
 
 def test_dcp_restores_opaque_loader_bytes_without_starting_destination_runtime(tmp_path):
-    expected = {"cursor": 17, "completed": False}
+    expected = b"opaque-zephon-checkpoint"
     source_pipeline = Mock(spec=["checkpoint", "restore", "close"])
     source_pipeline.checkpoint.return_value = expected
     destination_pipeline = Mock(spec=["checkpoint", "restore", "close"])
@@ -40,7 +40,7 @@ def test_dcp_restores_opaque_loader_bytes_without_starting_destination_runtime(t
     try:
         checkpointer.save_distributed_state(source, "loader", str(tmp_path))
         checkpointer.load_distributed_state(destination, "loader", str(tmp_path))
-        source_pipeline.checkpoint.assert_called_once()
+        source_pipeline.checkpoint.assert_called_once_with(as_bytes=True)
         destination_pipeline.checkpoint.assert_not_called()
         destination_pipeline.restore.assert_called_once_with(expected)
     finally:
