@@ -766,7 +766,7 @@ def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
 
     packing = SimpleNamespace(
         packed_mask_type="block_causal",
-        requires_packed_sequence_metadata=False,
+        return_packed_sequence_metadata=False,
     )
     result = config.build(
         pretrained_model_name_or_path="unused",
@@ -866,3 +866,33 @@ def test_build_source_forwards_bare_tokenizer_unchanged():
     config._build_source(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, dataset_build_context=None)
 
     assert ds_cfg.received_tokenizer is bare_tokenizer
+
+
+def test_native_build_uses_its_collator_without_resolving_stream_position_state():
+    events = []
+
+    def position_factory():
+        raise AssertionError("Native VLM collation must retain its existing RoPE callback")
+
+    def build_processor():
+        events.append("processor")
+        return DummyProcessor()
+
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig(events),
+        processor_config=VlmProcessorConfig(factory=build_processor),
+        collator=VlmCollatorConfig(factory=_collate_prefixed_examples, kwargs={"prefix": "item:"}),
+        shuffle=False,
+        num_workers=1,
+    )
+    result = config.build(
+        pretrained_model_name_or_path="unused",
+        dp_rank=0,
+        dp_world_size=1,
+        batch_size=2,
+        dataset_build_context=BuildContext(events),
+        position_state_factory=position_factory,
+        ignore_index=-321,
+    )
+    assert events == ["enter", "processor", "dataset", "exit"]
+    assert list(result.dataloader) == [(["item:one", "item:two"], 0)]

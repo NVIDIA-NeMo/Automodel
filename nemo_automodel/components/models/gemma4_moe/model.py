@@ -102,8 +102,10 @@ from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
+from nemo_automodel.shared.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+from .attention import prepare_gemma4_document_mask
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
 from .parallelization import PARALLELIZER
@@ -951,6 +953,60 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     (NeMo GroupedExperts + Gemma4Gate).  Otherwise falls through to vanilla HF.
     """
 
+    def packed_metadata_entry_module(self) -> nn.Module:
+        """Prepare packed masks before this model applies its vision policy."""
+        return self
+
+    def validate_packed_attention_backend(self, attn_implementation: str) -> None:
+        """Reject Flash packing that cannot preserve native vision attention."""
+        text_config = self.config.text_config
+        if (
+            attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+            and text_config.use_bidirectional_attention == "vision"
+        ):
+            raise ValueError(
+                "Gemma4 vision packing requires SDPA or eager attention; Flash varlen cannot preserve "
+                "native image-bidirectional sliding attention."
+            )
+
+    def prepare_document_attention_mask(
+        self,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None,
+        mm_token_type_ids: torch.Tensor | None,
+        document_ids: torch.Tensor | None,
+    ) -> torch.Tensor | dict[str, torch.Tensor] | None:
+        """Compose document attention with the native full/sliding vision policy.
+
+        Args:
+            attention_mask: Compact integer attention IDs [batch, sequence],
+                a mask [batch, 1, sequence, sequence], a prepared mapping of
+                masks with that layout, or None for native masking.
+            mm_token_type_ids: Modality IDs [batch, sequence], or None for text.
+            document_ids: Original document IDs [batch, sequence], or None.
+
+        Returns:
+            Prepared boolean SDPA or additive eager masks [batch, 1, sequence,
+            sequence] for full/sliding layers; otherwise the original input.
+            Native CP returns None because its ring consumer owns masks.
+            No input tensor or model position is modified.
+        """
+        if getattr(self, "_cp_enabled", False):
+            # Native CP owns ring masks; compact IDs already describe its local shard.
+            return None
+        if (
+            document_ids is not None
+            and isinstance(attention_mask, torch.Tensor)
+            and attention_mask.ndim == 2
+            and attention_mask.dtype != torch.bool
+            and not attention_mask.is_floating_point()
+        ):
+            attention_mask = indexed_mask_to_4d_block_causal(attention_mask)
+        if document_ids is not None and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4:
+            return prepare_gemma4_document_mask(
+                self.config.text_config, attention_mask, mm_token_type_ids, document_ids, dtype=self.dtype
+            )
+        return attention_mask
+
     @classmethod
     def get_capabilities(cls, config: "Gemma4Config") -> ModelCapabilities:
         """Return the capabilities for a specific config (no model instance needed).
@@ -1233,6 +1289,29 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
+        """Run Gemma4, retaining native image policy for document-causal inputs.
+
+        Args:
+            input_ids: Token IDs [batch, sequence], unless embeddings are supplied.
+            position_ids: Scalar decoder coordinates [batch, sequence].
+            attention_mask: Eligibility [batch, sequence] or an additive/boolean
+                mask [batch, 1, query, key]. A 4D document-causal mask marked by
+                ``_packed_seq_ids`` is composed with native image/window policy.
+            padding_mask: Boolean exclusions [batch, sequence] for native parallel paths.
+            inputs_embeds: Optional token embeddings [batch, sequence, hidden].
+            cache_position: Cache offsets [sequence].
+            pixel_values: Processor patches [images, patches, patch_features].
+            image_position_ids: Processor patch coordinates [images, patches, 2].
+            mm_token_type_ids: Processor modality IDs [batch, sequence].
+            logits_to_keep: Number of trailing logits or token indices [selected].
+            output_hidden_states: Whether to retain decoder hidden states.
+            **kwargs: Other native HF inputs, including original document IDs
+                ``_packed_seq_ids`` [batch, sequence] when packed.
+
+        Returns:
+            Native model output with logits [batch, selected_sequence, vocabulary]
+            and optional hidden states/cache/media features.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -1252,6 +1331,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 cache_position = torch.arange(seq_len, device=inputs_embeds.device)
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        if (
+            kwargs.get("_packed_seq_ids") is not None
+            and attention_mask is None
+            and not getattr(self, "_cp_enabled", False)
+        ) or any(kwargs.get(key) is not None for key in ("cu_seq_lens_q", "cu_seq_lens_k")):
+            self.validate_packed_attention_backend(text_config._attn_implementation)
+            if (
+                kwargs.get("_packed_seq_ids") is not None
+                and attention_mask is None
+                and not getattr(self, "_cp_enabled", False)
+            ):
+                raise ValueError("Configure packed attention before forwarding compact Gemma4 attention IDs")
         cp_enabled = getattr(self, "_cp_enabled", False)
         tp_e_series_enabled = bool(
             getattr(self, "_gemma4_tp_enabled", False) and getattr(text_config, "hidden_size_per_layer_input", 0)
@@ -1391,6 +1482,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # instead, which FSDP2 leaves as one shared object. setdefault avoids
             # overwriting a store a caller already provided (e.g. the drafter).
             kwargs.setdefault("shared_kv_states", _FSDPSafeSharedKVStates())
+            attention_mask = self.prepare_document_attention_mask(
+                attention_mask, mm_token_type_ids, kwargs.get("document_ids", kwargs.get("_packed_seq_ids"))
+            )
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,

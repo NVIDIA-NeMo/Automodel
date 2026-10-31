@@ -47,12 +47,25 @@ def chunk_vlm_media(
 ) -> tuple[list[torch.Tensor | list[torch.Tensor]], list[torch.Tensor]]:
     """Split VLM pixel values and media metadata into PP microbatch chunks.
 
-    Handles complete image lists as well as four tensor layouts:
-    1. ``[N, C, H, W]`` with ``N == batch_size`` -- one full image per sample.
-    2. ``[N, max_patches, D]`` with ``N == batch_size`` -- padded patches per image.
-    3. Flat patches ``[total_patches, D]`` with per-sample media counts from
-       ``n_images_per_sample``.
-    4. Flat patches with ``n_images == batch_size`` -- legacy one-image-per-sample.
+    Explicit image counts take precedence over a coincidental equality between
+    the number of images and documents. Text-only documents own empty chunks.
+
+    Args:
+        pixel_values: Image-major pixels [images, channels, height, width],
+            padded patches [images, max_patches, features], or flat patches
+            [total_patches, features], or a list of [channels, height, width]
+            tensors with possibly different image sizes.
+        image_grid: Per-image metadata [images, coordinates]. For flat patches,
+            the product of each grid gives the corresponding patch count.
+        batch_size: Number of batch documents owning the media.
+        n_microbatches: Number of document-axis chunks used by the PP schedule.
+        n_images_per_sample: Optional image counts [batch]. Without counts,
+            exactly one image per document is assumed.
+
+    Returns:
+        Pixel and metadata lists in microbatch order, retaining each input's
+        trailing axes. Tensor chunks are views; list chunks retain their tensor
+        references. Inputs are never mutated.
     """
     n_images = image_grid.shape[0]
     pixel_values_chunks: list[torch.Tensor | list[torch.Tensor]] = []
@@ -80,12 +93,16 @@ def chunk_vlm_media(
             begin, end = int(offsets[first]), int(offsets[stop])
             pixel_values_chunks.append(pixel_values[begin:end])
             image_grid_chunks.append(image_grid[begin:end])
-    elif pixel_values.shape[0] == batch_size and pixel_values.dim() in (3, 4):
+    elif (
+        pixel_values.shape[0] == batch_size
+        and pixel_values.dim() in (3, 4)
+        and (n_images_per_sample is None or bool(n_images_per_sample.eq(1).all()))
+    ):
         # 4D full-image tensors and 3D padded-patch tensors are indexed by sample.
         pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
         image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
-    elif pixel_values.dim() == 3 and n_images_per_sample is not None:
-        # Multi-image padded-patch layout: split by image counts per sample.
+    elif pixel_values.dim() in (3, 4) and n_images_per_sample is not None:
+        # Image-major layouts: explicit ownership also covers zero-image documents.
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
         # Match torch.chunk-style uneven splits so trailing samples are not dropped.
         samples_per_mb = -(-batch_size // n_microbatches)

@@ -63,39 +63,25 @@ class TestApplyPreloadOverridesPacked:
         )
         assert attn == impl
 
-    def test_packed_non_flash_falls_back_to_available_flash(self, monkeypatch):
-        monkeypatch.setattr(kernel_patches, "HAS_FA", True)
-        attn, _ = _apply_preload_overrides(
-            tp_size=1, cp_size=1, has_packed_sequence=True, attn_implementation="sdpa", use_liger_kernel=False
-        )
-        assert attn == "flash_attention_2"
-
-    def test_packed_non_flash_prefers_fa3_when_fa2_missing(self, monkeypatch):
-        monkeypatch.setattr(kernel_patches, "HAS_FA", False)
-        monkeypatch.setattr(kernel_patches, "HAS_FA3", True)
-        monkeypatch.setattr(kernel_patches, "HAS_FA4", False)
-        attn, _ = _apply_preload_overrides(
-            tp_size=1, cp_size=1, has_packed_sequence=True, attn_implementation="sdpa", use_liger_kernel=False
-        )
-        assert attn == "flash_attention_3"
-
-    def test_packed_non_flash_uses_fa4_as_last_resort(self, monkeypatch):
-        monkeypatch.setattr(kernel_patches, "HAS_FA", False)
-        monkeypatch.setattr(kernel_patches, "HAS_FA3", False)
-        monkeypatch.setattr(kernel_patches, "HAS_FA4", True)
-        attn, _ = _apply_preload_overrides(
-            tp_size=1, cp_size=1, has_packed_sequence=True, attn_implementation="sdpa", use_liger_kernel=False
-        )
-        assert attn == "flash_attention_4"
-
-    def test_packed_no_flash_available_asserts(self, monkeypatch):
+    @pytest.mark.parametrize("impl", ["sdpa", "eager"])
+    def test_packed_keeps_non_flash_without_flash_installed(self, impl, monkeypatch):
         monkeypatch.setattr(kernel_patches, "HAS_FA", False)
         monkeypatch.setattr(kernel_patches, "HAS_FA3", False)
         monkeypatch.setattr(kernel_patches, "HAS_FA4", False)
-        with pytest.raises(AssertionError):
-            _apply_preload_overrides(
-                tp_size=1, cp_size=1, has_packed_sequence=True, attn_implementation="sdpa", use_liger_kernel=False
-            )
+        attn, _ = _apply_preload_overrides(
+            tp_size=1, cp_size=1, has_packed_sequence=True, attn_implementation=impl, use_liger_kernel=False
+        )
+        assert attn == impl
+
+    def test_packing_does_not_override_existing_cp_backend_selection(self):
+        attn, _ = _apply_preload_overrides(
+            tp_size=1,
+            cp_size=2,
+            has_packed_sequence=True,
+            attn_implementation="sdpa",
+            use_liger_kernel=False,
+        )
+        assert attn == "sdpa"  # Model-owned packed-CP support is validated by the recipe.
 
     def test_cp_still_forces_sdpa(self):
         attn, _ = _apply_preload_overrides(
