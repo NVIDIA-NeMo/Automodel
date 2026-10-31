@@ -47,7 +47,7 @@ from nemo_automodel.components.models.deepseek_v4.optimized_kernels import (
     plan_dsv4_sparse_indices,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
-from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence
+from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, gather_window
 from nemo_automodel.components.models.deepseek_v41.indexer import indexer_scores
 from nemo_automodel.components.models.deepseek_v41.layers import DeepseekV41RMSNorm
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
@@ -60,11 +60,14 @@ class DeepseekV41AttentionState:
     """CSA2 state owned by one full-sequence model forward.
 
     Attributes:
+        global_valid: Optional batch validity [batch, global_sequence], shared across layers.
+        global_seq_ids: Optional global document IDs [batch, global_sequence].
         compressed_kv: Rotated KV tensor of shape [batch, compressed, head_dim].
         index_keys: Rotated index keys of shape [batch, compressed, index_head_dim].
         topk_indices: Compressed-relative indices of shape [batch, sequence, topk],
             with -1 denoting absent positions.
-        candidates: Optional candidate mask of shape [batch, sequence, compressed].
+        candidates: Optional block mask [batch, sequence, ceil(compressed / candidate_block_size)].
+            For packed input each query uses its own document's block coordinates.
         compressed_valid: Optional valid-group mask of shape [batch, compressed].
         compressed_seq_ids: Optional document IDs [batch, compressed], zero for padding.
         compression_ratio: Number of tokens represented by a compressed position.
@@ -79,6 +82,8 @@ class DeepseekV41AttentionState:
     A model creates an empty state for every forward, including every microbatch.
     """
 
+    global_valid: torch.Tensor | None = None
+    global_seq_ids: torch.Tensor | None = None
     compressed_kv: torch.Tensor | None = None
     index_keys: torch.Tensor | None = None
     topk_indices: torch.Tensor | None = None
@@ -109,7 +114,8 @@ class _SelectionRecord:
     Attributes:
         index_keys: Rotated index keys of shape [batch, compressed, index_head_dim], or ``None``.
         topk_indices: Compressed-relative selection of shape [batch, sequence, topk], ``-1`` absent, or ``None``.
-        candidates: Optional candidate mask of shape [batch, sequence, compressed].
+        candidates: Optional block mask [batch, sequence, ceil(compressed / candidate_block_size)].
+            For packed input each query uses its own document's block coordinates.
         sparse_plan: The lineage's :class:`SparseIndexPlan`, or ``None`` for the dense backends.
     """
 
@@ -312,7 +318,7 @@ def _select_candidate_blocks(
         block_size: Compressed positions per block.
 
     Returns:
-        Boolean candidate mask of shape [batch, sequence, compressed].
+        Boolean candidate-block mask [batch, sequence, ceil(compressed / block_size)].
     """
     width = scores.shape[-1]
     block_scores = F.pad(scores, (0, -width % block_size), value=-torch.inf)
@@ -322,7 +328,7 @@ def _select_candidate_blocks(
     block_scores = block_scores.masked_fill(block_ids == last_block, torch.inf)
     selected = block_scores.topk(min(topk_blocks, block_scores.shape[-1]), dim=-1)
     keep = torch.zeros_like(block_scores, dtype=torch.bool).scatter(-1, selected.indices, selected.values > -torch.inf)
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    return keep
 
 
 class _Indexer(nn.Module):
@@ -390,7 +396,7 @@ class _Indexer(nn.Module):
         Returns:
             New state with index_keys [batch, compressed, index_head_dim],
             topk_indices [batch, sequence, topk], and optional candidates
-            [batch, sequence, compressed]. Compressed KV storage is preserved;
+            [batch, sequence, candidate_blocks]. Compressed KV storage is preserved;
             the sparse-index plan is dropped because a new selection needs a new plan.
         """
         keys = state.index_keys
@@ -422,99 +428,105 @@ class _Indexer(nn.Module):
         weights = self.weights_proj(hidden_states) * (self.head_dim**-0.5 * self.num_heads**-0.5)
         if position_ids is None:
             position_ids = torch.arange(sequence, device=hidden_states.device).unsqueeze(0)
-        lengths = (position_ids + 1) // state.compression_ratio
-        visible_lengths = lengths.unsqueeze(-1).expand(batch, -1, -1)
-        allowed = torch.arange(width, device=hidden_states.device) < visible_lengths
-        if state.compressed_valid is not None:
-            allowed = allowed & state.compressed_valid.unsqueeze(1)
-        if packed_seq_ids is not None:
-            if state.compressed_seq_ids is None:
-                raise ValueError("Packed CSA2 state requires compressed document IDs")
-            allowed = allowed & (packed_seq_ids.unsqueeze(-1) == state.compressed_seq_ids.unsqueeze(1))
-            allowed = allowed & (packed_seq_ids.unsqueeze(-1) > 0)
-        if self.attn_backend in ("tilelang", "cudnn"):
-            # The cuDNN sparse backend keeps the TileLang indexer: cuDNN replaces the attention core only.
-            scores = indexer_scores(queries, keys, weights, allowed)
-        else:
-            # Preserve the reference's BF16 matmul result and reduction boundaries.
-            scores = torch.einsum("bshd,btd->bsht", queries, keys)
-            scores = (scores.relu() * weights.unsqueeze(-1)).sum(dim=2)
-            scores = scores.masked_fill(~allowed, -torch.inf)
-        if packed_seq_ids is not None:
-            return self._select_packed(scores, packed_seq_ids, replace(state, index_keys=keys))
-        candidates = state.candidates
-        if self.is_candidate_source:
-            candidates = (
-                _select_candidate_blocks(
-                    scores,
-                    visible_lengths,
-                    topk_blocks=self.candidate_topk_blocks,
-                    block_size=self.candidate_block_size,
-                )
-                & allowed
-            )
-        elif self.uses_candidates:
-            if candidates is None or candidates.shape != scores.shape:
-                raise ValueError("A hierarchical Reindex layer requires candidates from its source layer")
-            scores = scores.masked_fill(~candidates, -torch.inf)
-        selected = scores.topk(min(self.topk, width), dim=-1, sorted=False)
-        indices = selected.indices.sort(dim=-1).values
-        # Invalid entries remain -1 even when fewer candidates than top-k exist.
-        valid = torch.isfinite(scores.gather(-1, indices))
-        indices = torch.where(valid, indices, -1)
-        return replace(state, index_keys=keys, topk_indices=indices, candidates=candidates, sparse_plan=None)
+        return self._select_queries(
+            queries, keys, weights, position_ids.expand(batch, -1), packed_seq_ids, replace(state, index_keys=keys)
+        )
 
-    def _select_packed(
-        self, scores: torch.Tensor, sequence_ids: torch.Tensor, state: DeepseekV41AttentionState
+    def _select_queries(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        weights: torch.Tensor,
+        positions: torch.Tensor,
+        sequence_ids: torch.Tensor | None,
+        state: DeepseekV41AttentionState,
     ) -> DeepseekV41AttentionState:
-        """Run selection on each document's own key interval.
-
-        topk tie-breaking depends on the physical row width. Selecting over an entire
-        pack, even with other documents masked out, can therefore change a document's
-        attention. Local intervals also reset candidate blocks at document boundaries.
+        """Score query tiles against only their document's complete key interval.
 
         Args:
-            scores: Causal, document-masked scores [batch, local_sequence, global_compressed].
-            sequence_ids: Document IDs [batch, local_sequence], zero for padding.
-            state: Global compressed metadata and keys described by DeepseekV41AttentionState.
+            queries: Rotated BF16 index queries [batch, local_sequence, heads, index_dim].
+            keys: Global rotated index keys [batch, compressed, index_dim].
+            weights: BF16 per-head weights [batch, local_sequence, heads].
+            positions: Global physical query positions [batch, local_sequence].
+            sequence_ids: Optional local document IDs [batch, local_sequence].
+            state: Shared tensors documented by DeepseekV41AttentionState.
 
         Returns:
-            Immutable state with global-key topk indices [batch, local_sequence, topk]
-            and source candidates [batch, local_sequence, global_compressed].
+            Immutable state with top-k global key indices [batch, local_sequence, topk]
+            and candidate-block masks [batch, local_sequence, ceil(compressed / block_size)].
+            No global query-by-key scores or tokenwise candidate mask are retained.
         """
-        indices = torch.full(
-            (*scores.shape[:2], min(self.topk, scores.shape[-1])),
-            -1,
-            device=scores.device,
-            dtype=torch.long,
+        batch, sequence = queries.shape[:2]
+        width = keys.shape[1]
+        indices = torch.full((batch, sequence, min(self.topk, width)), -1, dtype=torch.long, device=queries.device)
+        block_count = (width + self.candidate_block_size - 1) // self.candidate_block_size
+        candidates = (
+            torch.zeros(batch, sequence, block_count, dtype=torch.bool, device=queries.device)
+            if self.is_candidate_source
+            else state.candidates
         )
-        candidates = torch.zeros_like(scores, dtype=torch.bool) if self.is_candidate_source else state.candidates
-        if self.uses_candidates and (candidates is None or candidates.shape != scores.shape):
+        if self.uses_candidates and (candidates is None or candidates.shape != (batch, sequence, block_count)):
             raise ValueError("A hierarchical Reindex layer requires candidates from its source layer")
-        for row in range(scores.shape[0]):
-            for document in sequence_ids[row].unique().tolist():
+        if sequence_ids is not None and (state.compressed_seq_ids is None or state.compressed_valid is None):
+            raise ValueError("Packed CSA2 state requires compressed document IDs and validity")
+        for row in range(batch):
+            documents = [None] if sequence_ids is None else sequence_ids[row].unique().tolist()
+            for document in documents:
                 if document == 0:
                     continue
-                queries = torch.where(sequence_ids[row] == document)[0]
-                keys = torch.where((state.compressed_seq_ids[row] == document) & state.compressed_valid[row])[0]
-                if keys.numel() == 0:
+                query_ids = (
+                    torch.arange(sequence, device=queries.device)
+                    if document is None
+                    else torch.where(sequence_ids[row] == document)[0]
+                )
+                key_ids = (
+                    torch.arange(width, device=keys.device)
+                    if document is None
+                    else torch.where((state.compressed_seq_ids[row] == document) & state.compressed_valid[row])[0]
+                )
+                if key_ids.numel() == 0:
                     continue
-                document_scores = scores[row, queries[:, None], keys]
-                if self.is_candidate_source:
-                    visible = torch.isfinite(document_scores).sum(-1, keepdim=True)
-                    keep = _select_candidate_blocks(
-                        document_scores.unsqueeze(0),
-                        visible.unsqueeze(0),
-                        topk_blocks=self.candidate_topk_blocks,
-                        block_size=self.candidate_block_size,
-                    ).squeeze(0) & torch.isfinite(document_scores)
-                    candidates[row, queries[:, None], keys] = keep
-                elif self.uses_candidates:
-                    document_scores = document_scores.masked_fill(~candidates[row, queries[:, None], keys], -torch.inf)
-                selected = document_scores.topk(min(self.topk, keys.numel()), dim=-1, sorted=False)
-                ordered = selected.indices.sort(-1).values
-                valid = torch.isfinite(document_scores.gather(-1, ordered))
-                indices[row, queries, : ordered.shape[-1]] = torch.where(valid, keys[ordered], -1)
+                document_keys = keys[row : row + 1, key_ids]
+                # Keep the entire document key width: topk tie-breaking depends on
+                # that width. Only the independent query axis is tiled.
+                # Small packed documents fit in one tile; long documents keep
+                # bounded score storage instead of paying one launch per 128 queries.
+                query_tile_size = max(128, 1024 * 1024 // key_ids.numel())
+                for query_tile in query_ids.split(query_tile_size):
+                    visible = (positions[row : row + 1, query_tile] + 1) // state.compression_ratio
+                    allowed = key_ids.view(1, 1, -1) < visible.unsqueeze(-1)
+                    if state.compressed_valid is not None:
+                        allowed = allowed & state.compressed_valid[row : row + 1, key_ids].unsqueeze(1)
+                    q = queries[row : row + 1, query_tile]
+                    w = weights[row : row + 1, query_tile]
+                    if self.attn_backend in ("tilelang", "cudnn"):
+                        scores = indexer_scores(q, document_keys, w, allowed)
+                    else:
+                        # Preserve the reference BF16 matmul and product rounding.
+                        scores = torch.einsum("bshd,btd->bsht", q, document_keys)
+                        scores = (scores.relu() * w.unsqueeze(-1)).sum(dim=2)
+                        scores = scores.masked_fill(~allowed, -torch.inf)
+                    if self.is_candidate_source:
+                        block_visible = (
+                            torch.isfinite(scores).sum(-1, keepdim=True)
+                            if document is not None
+                            else visible.unsqueeze(-1)
+                        )
+                        keep = _select_candidate_blocks(
+                            scores,
+                            block_visible,
+                            topk_blocks=self.candidate_topk_blocks,
+                            block_size=self.candidate_block_size,
+                        )
+                        candidates[row, query_tile, : keep.shape[-1]] = keep[0]
+                    elif self.uses_candidates:
+                        block_ids = torch.arange(key_ids.numel(), device=keys.device) // self.candidate_block_size
+                        keep = candidates[row, query_tile][:, block_ids]
+                        scores = scores.masked_fill(~keep.unsqueeze(0), -torch.inf)
+                    selected = scores.topk(min(self.topk, key_ids.numel()), dim=-1, sorted=False)
+                    ordered = selected.indices.sort(-1).values
+                    valid = torch.isfinite(scores.gather(-1, ordered))
+                    indices[row, query_tile, : ordered.shape[-1]] = torch.where(valid, key_ids[ordered], -1)[0]
         return replace(state, topk_indices=indices, candidates=candidates, sparse_plan=None)
 
 
@@ -662,6 +674,7 @@ class DeepseekV41Attention(nn.Module):
         global_seq_ids: torch.Tensor | None,
         packed_seq_ids: torch.Tensor | None,
         global_sequence: int,
+        window_start: int,
         all_rows_nonempty: bool,
     ) -> SparseIndexPlan:
         """Build the sparse slot indices of one selection lineage and prepare them for the backend.
@@ -680,12 +693,13 @@ class DeepseekV41Attention(nn.Module):
             global_valid: Boolean tensor of shape [batch, global_sequence] over the window keys.
             global_seq_ids: Optional document IDs [batch, global_sequence], zero for padding.
             packed_seq_ids: Optional document IDs [batch, sequence], zero for padding.
-            global_sequence: Number of window key positions per batch row.
+            global_sequence: Full physical token count per batch row.
+            window_start: Global index of the first locally retained window key.
             all_rows_nonempty: Whether every query has at least one valid slot.
 
         Returns:
             The backend plan built from slot indices [batch, sequence, padded_slots] (window slots, then
-            compressed slots offset by ``global_sequence``, ``-1`` masked, padded to a multiple of 64).
+            compressed slots offset by the retained window length, ``-1`` masked, padded to a multiple of 64).
         """
         batch = valid_tokens.shape[0]
         starts = (positions - self.window_size + 1).clamp_min(0).expand(batch, -1)
@@ -698,10 +712,13 @@ class DeepseekV41Attention(nn.Module):
         if packed_seq_ids is not None:
             key_seq_ids = global_seq_ids.gather(1, safe_slots.flatten(1)).view_as(slots)
             visible = visible & (key_seq_ids == packed_seq_ids.unsqueeze(-1))
-        indices = torch.where(visible, slots, -1)
+        indices = torch.where(visible, slots - window_start, -1)
         if self.compress_ratio:
             selected = next_state.topk_indices
-            indices = torch.cat((indices, torch.where(selected >= 0, selected + global_sequence, -1)), dim=-1)
+            indices = torch.cat(
+                (indices, torch.where(selected >= 0, selected + kv_sequence - next_state.compressed_kv.shape[1], -1)),
+                dim=-1,
+            )
         indices = indices.masked_fill(~valid_tokens.unsqueeze(-1), -1)
         indices = F.pad(indices, (0, -indices.shape[-1] % 64), value=-1)
         return plan_dsv4_sparse_indices(
@@ -769,17 +786,26 @@ class DeepseekV41Attention(nn.Module):
             if attention_mask is None
             else attention_mask.bool()
         )
-        global_valid = gather_sequence(valid_tokens, cp_group)
-        global_seq_ids = None if packed_seq_ids is None else gather_sequence(packed_seq_ids, cp_group)
+        global_valid = state.global_valid
+        if global_valid is None:
+            global_valid = gather_sequence(valid_tokens, cp_group)
+        global_seq_ids = state.global_seq_ids
+        if global_seq_ids is None and packed_seq_ids is not None:
+            global_seq_ids = gather_sequence(packed_seq_ids, cp_group)
         angles = self.rotary_emb(position_ids)
         query_latent = self.q_norm(self.wq_a(hidden_states))
         query = _apply_rope(self.wq_b(query_latent).unflatten(-1, (self.num_heads, self.head_dim)), angles)
         kv = quantize_cache(_apply_rope(self.kv_norm(self.wkv(hidden_states)), angles), format="fp8", block_size=32)
-        kv = gather_sequence(kv, cp_group)
+        kv, window_start = gather_window(kv, cp_group, window_size=self.window_size)
+        window_sequence = kv.shape[1]
         replay = csa2_selection_replay.current() if self.reuse_selection_on_recompute else None
         record: _SelectionRecord | None = None
         produces = False  # this layer adds a selection or a sparse-index plan to the state
-        next_state = state
+        next_state = (
+            state
+            if state.global_valid is not None
+            else replace(state, global_valid=global_valid, global_seq_ids=global_seq_ids)
+        )
         if self.compress_ratio:
             width = global_sequence // self.compress_ratio
             local_width = sequence // self.compress_ratio
@@ -795,6 +821,8 @@ class DeepseekV41Attention(nn.Module):
                     .all(dim=-1)
                 )
                 next_state = DeepseekV41AttentionState(
+                    global_valid=global_valid,
+                    global_seq_ids=global_seq_ids,
                     compressed_kv=gather_sequence(
                         quantize_cache(_apply_rope(latent, compressed_angles), format="nvfp4", block_size=16), cp_group
                     ),
@@ -871,6 +899,7 @@ class DeepseekV41Attention(nn.Module):
                             global_seq_ids=global_seq_ids,
                             packed_seq_ids=packed_seq_ids,
                             global_sequence=global_sequence,
+                            window_start=window_start,
                             # Without a padding mask every query sees at least its own slot; the cuDNN backward
                             # then skips its empty-row scan (a torch.nonzero host synchronisation).
                             all_rows_nonempty=attention_mask is None,
@@ -889,13 +918,17 @@ class DeepseekV41Attention(nn.Module):
             )
         else:
             # Dense masks are needed only by the eager/SDPA fallback; TileLang uses sparse indices.
-            key_positions = torch.arange(global_sequence, device=positions.device)
+            key_positions = torch.arange(window_sequence, device=positions.device) + window_start
             local_allowed = (key_positions.unsqueeze(0) <= positions.unsqueeze(1)) & (
                 key_positions.unsqueeze(0) > positions.unsqueeze(1) - self.window_size
             )
-            allowed = local_allowed.unsqueeze(0) & global_valid.unsqueeze(1)
+            window_valid = global_valid[:, window_start : window_start + window_sequence]
+            allowed = local_allowed.unsqueeze(0) & window_valid.unsqueeze(1)
             if packed_seq_ids is not None:
-                allowed = allowed & (packed_seq_ids.unsqueeze(-1) == global_seq_ids.unsqueeze(1))
+                allowed = allowed & (
+                    packed_seq_ids.unsqueeze(-1)
+                    == global_seq_ids[:, window_start : window_start + window_sequence].unsqueeze(1)
+                )
             if self.compress_ratio:
                 # A separate sentinel column makes -1 masking safe when valid index 0
                 # also occurs in the row; boolean scatter must never overwrite it.
