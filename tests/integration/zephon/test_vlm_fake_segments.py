@@ -23,7 +23,6 @@ import torch
 from PIL import Image
 from transformers import Mistral3ForConditionalGeneration, Qwen2_5_VLForConditionalGeneration, Qwen3VLProcessor
 
-from examples.vlm_finetune.zephon.prepare_mistral3 import build_model_config, build_processor
 from nemo_automodel._transformers.registry import resolve_image_position_state
 from nemo_automodel.components.datasets.vlm.datasets import encode_vlm_document
 from nemo_automodel.components.datasets.zephon.config import (
@@ -41,6 +40,7 @@ from nemo_automodel.components.models.common.packing import configure_packing
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from nemo_automodel.components.models.qwen3_vl.model import Qwen3VLForConditionalGeneration
 from tests.utils.gemma4_vlm_fixtures import gemma4_processor, tiny_gemma4_config
+from tests.utils.mistral3_vlm_fixtures import build_model_config, build_processor
 from tests.utils.qwen3_vlm_fixtures import tiny_qwen3_vl_config
 from tests.utils.vlm_fixtures import processor as processor
 from tests.utils.vlm_fixtures import tiny_vlm_config

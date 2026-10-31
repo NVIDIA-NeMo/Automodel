@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prepare an offline tiny untied Mistral3 model config, processor and image corpus."""
+"""Offline Mistral3 processor, model config and image corpus for VLM tests."""
 
-import argparse
 import json
 from pathlib import Path
 
@@ -128,9 +127,3 @@ def prepare(directory: Path, *, count: int = 128) -> None:
     corpus = directory / "corpus"
     corpus.mkdir(exist_ok=True)
     (corpus / "images.jsonl").write_text("".join(json.dumps(document) + "\n" for document in documents))
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, default=Path("work/zephon-mistral3"))
-    prepare(parser.parse_args().output_dir)

@@ -78,7 +78,7 @@ def test_image_recipe_rejects_explicit_non_image_packing(algorithm):
 
 
 def test_image_example_config_resolves():
-    path = Path(__file__).resolve().parents[4] / "examples/vlm_finetune/zephon/qwen2_5_vl.yaml"
+    path = Path(__file__).resolve().parents[4] / "examples/vlm_finetune/zephon/train.yaml"
     recipe = RecipeConfig(ConfigNode(yaml.safe_load(path.read_text())))
     config = recipe.vlm_dataloader
     assert isinstance(config, ZephonVlmDataloaderConfig)
