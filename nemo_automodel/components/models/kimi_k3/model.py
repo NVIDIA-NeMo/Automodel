@@ -1268,7 +1268,7 @@ class KimiK3MoE(MoE):
             beta=config.activation_situ_beta or 1.0,
             linear_beta=config.activation_situ_linear_beta,
         )
-        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() > 1:
+        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep", "nccl_ep") and get_world_size_safe() > 1:
             self.experts = GroupedExpertsDeepEP(
                 moe_config,
                 backend=backend,

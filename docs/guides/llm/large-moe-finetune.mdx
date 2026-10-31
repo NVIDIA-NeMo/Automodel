@@ -138,6 +138,57 @@ The following advanced settings apply only when `dispatcher: hybridep`:
 
 Leave the numeric tuning settings unset to use HybridEP defaults unless a matched benchmark demonstrates an improvement. A value that improves performance on one GPU architecture or topology might reduce performance on another.
 
+## Configure NCCL-EP
+
+NCCL-EP is an experimental, opt-in dispatcher for BF16 expert-parallel training
+on Hopper or newer GPUs. Select it with an explicit upper bound on the number
+of tokens entering each MoE layer on each rank per microbatch:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: nccl_ep
+    nccl_ep:
+      max_tokens_per_rank: 4096
+```
+
+Use the same bound on all EP ranks and layers. Include masked tokens and account
+for local batch size and sequence parallelism when choosing it. The transport
+rounds the bound up to a multiple of 64 and accepts any shorter input without
+padding; receive buffers are sized from the actual routing counts, so tokens are
+not dropped. The initial implementation uses eager dispatch and does not support
+capturing communication in CUDA Graphs or `dispatcher_async_dispatch: true`.
+
+NCCL-EP sizes its dispatch and combine kernels itself, so `dispatcher_num_sms`
+does not apply. To tune that budget, set `NCCL_EP_COMM_SMS` in the job
+environment. Received tokens use NCCL-EP's ordered
+expert layout, which activation-checkpoint recomputation requires and which keeps
+expert gradients reproducible from run to run.
+
+When all ranks of the EP group share one NVLink domain, such as one H100 node or
+one GB200 NVL72 rack, setting `NCCL_EP_HT_EM_PULL_PUSH=1` in the job environment
+selects NCCL-EP's NVLink pull-dispatch and push-combine kernels. They can reduce
+dispatch and combine time for balanced routing but can be slower when routing is
+heavily skewed. NCCL-EP rejects this setting when the EP group spans several
+NVLink domains.
+
+The runtime requires an NCCL-EP-enabled Transformer Engine build with
+`transformer_engine.pytorch.ep` and NCCL 2.30.4 or newer. CI builds enable
+`TE_WITH_NCCL_EP=1` on the PyTorch base image and verify the packaged library and
+JIT headers. Public-wheel installations retain `NVTE_WITH_NCCL_EP=0` because
+their PyTorch headers do not support that build. All NCCL-EP layers in a process
+must share the same EP group, token bound, hidden width, expert count, and top-k.
+Communication state is initialized during expert parallelization, before
+activation checkpointing, and released before process-group teardown.
+
+Run the focused two-GPU validation in an enabled container:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  tests/functional_tests/moe/run_nccl_ep_parity.py
+```
+
 ## Launch Training
 
 NeMo AutoModel supports direct Slurm submission, local interactive runs through the NeMo AutoModel CLI, and external `torchrun`. For full details on Slurm batch jobs, multi-node configuration, environment variables, and other launch options, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.

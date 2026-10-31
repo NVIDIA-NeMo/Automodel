@@ -26,6 +26,7 @@ from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.models.common.utils import NcclEpConfig
 from nemo_automodel.components.moe import swiglu_triton
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.megatron.fused_a2a import hybridep_combine_output_cached
@@ -1313,6 +1314,37 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         raise ValueError(f"Invalid expert activation: {config.expert_activation}")
 
 
+def _has_dispatched_rows(
+    hidden_states: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    *,
+    never_empty: bool,
+    dispatcher_backend: str,
+) -> bool:
+    """Return whether this rank received routed rows, reading the device only when needed.
+
+    Static routing and capacity buffers always dispatch rows. NCCL-EP sizes its receive
+    buffer to the routed rows, so the buffer's leading extent already answers on the
+    host. Other dispatchers need a device-to-host read of the per-expert counts.
+
+    Args:
+        hidden_states: Dispatched activations of shape [received_rows, hidden].
+        tokens_per_expert: Integer tensor of shape [local_experts] with the routed rows
+            of each local expert.
+        never_empty: Whether the dispatcher always returns rows (static routing or
+            capacity mode).
+        dispatcher_backend: Flex dispatcher backend that produced ``hidden_states``.
+
+    Returns:
+        True when the grouped expert GEMMs have routed rows to process.
+    """
+    if never_empty:
+        return True
+    if dispatcher_backend == "nccl_ep":
+        return hidden_states.shape[0] > 0
+    return bool(torch.count_nonzero(tokens_per_expert) > 0)
+
+
 def _stabilize_empty_routing_probs_dtype(permuted_probs: torch.Tensor, compute_dtype: torch.dtype) -> torch.Tensor:
     """Keep empty expert probabilities stable across checkpoint recomputation.
 
@@ -1503,6 +1535,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.nccl_ep = backend.nccl_ep if backend is not None else NcclEpConfig()
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1588,6 +1621,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            nccl_ep=self.nccl_ep,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -1615,6 +1649,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             local_expert_indices=local_expert_indices,
             config=config,
             ep_group=ep_group,
+            hidden_dim=self.config.expert_dim,
         )
         if self.dispatcher_backend == "deepep":
             self._init_deepep_buffer(ep_group)
@@ -1726,9 +1761,13 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         gate_and_up_projs = self.gate_and_up_projs.to_local().to(compute_dtype)
         down_projs = self.down_projs.to_local().to(compute_dtype)
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read.
         router_weight_already_applied = False
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if _has_dispatched_rows(
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            never_empty=self.dispatch_rows_never_empty,
+            dispatcher_backend=self.dispatcher_backend,
+        ):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             gate_up_output_bytes = (
                 permuted_local_hidden_states.shape[0]
@@ -1793,9 +1832,20 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
                     defer_down_proj=self.dispatcher_recompute_cache == "moe_tail" and post_expert_output is None,
                 )
         else:
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
+            # Preserve the dispatch autograd edge even when this rank receives no
+            # tokens: its backward must still participate in EP communication.
+            output1 = torch.matmul(permuted_local_hidden_states, gate_and_up_projs[0])
+            if self.expert_bias:
+                output1 = _apply_bias(output1, self.gate_up_proj_bias.to_local(), tokens_per_expert)
             output1_ = self.expert_activation(output1, activation_probs)
             output2 = torch.matmul(output1_, down_projs[0])
+            if self.expert_bias:
+                output2 = _apply_bias(
+                    output2,
+                    self.down_proj_bias.to_local(),
+                    tokens_per_expert,
+                    None if self.config.apply_router_weight_after_down else permuted_probs,
+                )
 
         if post_expert_output is not None:
             output2 = post_expert_output(output2)
@@ -1935,6 +1985,7 @@ class GroupedExpertsTE(nn.Module):
         self._static_m_splits: list | None = None
         if backend is not None and backend.compile_router_weight:
             _compile_router_weight_cores()
+        self.nccl_ep = backend.nccl_ep if backend is not None else NcclEpConfig()
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
@@ -2257,6 +2308,7 @@ class GroupedExpertsTE(nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            nccl_ep=self.nccl_ep,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -2278,6 +2330,7 @@ class GroupedExpertsTE(nn.Module):
             local_expert_indices=local_expert_indices,
             config=token_dispatcher_config,
             ep_group=ep_mesh.get_group(),
+            hidden_dim=self.config.expert_dim,
         )
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
@@ -2432,8 +2485,10 @@ class GroupedExpertsTE(nn.Module):
                 else:
                     return tensor
 
-            # Cast like the TE path above: FP32 master weights meet BF16 tokens here too.
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
+            # Empty dispatched rows retain the collective backward edge and also
+            # work when the local input itself has zero rows. Cast like the TE path
+            # above: FP32 master weights meet BF16 tokens here too.
+            output1 = torch.matmul(permuted_local_hidden_states, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).to(x.dtype).T)
             all_expert_dependency = output2.new_zeros(())

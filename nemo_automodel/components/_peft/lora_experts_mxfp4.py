@@ -32,6 +32,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
     _apply_bias,
+    _has_dispatched_rows,
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.components.moe.quantized_experts import MXFP4ExpertStorageMixin
@@ -299,9 +300,12 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
             _to_grouped_mm_operand(self.lora_down_B, x.dtype),
         )
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
-        # GroupedExpertsDeepEP.forward does.
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if _has_dispatched_rows(
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            never_empty=self.dispatch_rows_never_empty,
+            dispatcher_backend=self.dispatcher_backend,
+        ):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
 
@@ -329,13 +333,14 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
                 assert self.down_proj_bias is not None
                 output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
         else:
-            # Dummy computation for gradient flow; dequantize only expert 0.
+            # Preserve the dispatch backward edge; dequantize only expert 0.
             gate_up_w0 = self._mxfp4_dequant_expert0("gate_and_up_projs", x.dtype)
             down_w0 = self._mxfp4_dequant_expert0("down_projs", x.dtype)
-            output1 = torch.matmul(x[0] * 0, gate_up_w0)
+            output1 = torch.matmul(permuted_local_hidden_states, gate_up_w0)
             output1 = (
                 output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
+                + torch.matmul(torch.matmul(permuted_local_hidden_states, lora_gate_and_up_A[0]), lora_gate_and_up_B[0])
+                * self.scale
             )
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, down_w0)

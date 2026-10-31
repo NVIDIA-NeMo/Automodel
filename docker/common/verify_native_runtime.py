@@ -15,9 +15,11 @@
 """Verify native-extension compatibility while building the container image."""
 
 import argparse
+import ctypes
 import importlib
 import tempfile
 from importlib.metadata import version
+from pathlib import Path
 
 import torch
 from packaging.version import Version
@@ -28,6 +30,7 @@ def main() -> None:
     """Compile a C++20 PyTorch extension and load required native modules."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-image", choices=("cuda", "pytorch"), default="cuda")
+    parser.add_argument("--nccl-ep", choices=("0", "1"), default="0")
     args = parser.parse_args()
 
     if not hasattr(torch, "_grouped_mm"):
@@ -76,6 +79,25 @@ def main() -> None:
     # Importing the framework binding eagerly catches stale extensions whose
     # PyTorch or CUDA symbols cannot be resolved by the final image runtime.
     importlib.import_module("transformer_engine.pytorch")
+
+    if args.nccl_ep == "1":
+        if torch.cuda.nccl.version() < (2, 30, 4):
+            raise RuntimeError("NCCL-EP requires NCCL >= 2.30.4 in the final image")
+        ep = importlib.import_module("transformer_engine.pytorch.ep")
+        tex = importlib.import_module("transformer_engine_torch")
+        if not callable(getattr(tex, "ep_initialize", None)):
+            raise RuntimeError("Transformer Engine PyTorch bindings were built without NCCL-EP")
+        for name in ("EpBuffer", "ep_bootstrap", "is_ep_bootstrapped", "ep_dispatch", "ep_combine", "ep_finalize"):
+            if not callable(getattr(ep, name, None)):
+                raise RuntimeError(f"Transformer Engine NCCL-EP API is missing {name}")
+        te = importlib.import_module("transformer_engine")
+        package_dir = Path(te.__file__).parent
+        # Import alone can succeed with EP disabled. Load the packaged library
+        # and check the JIT headers while still on the container builder.
+        ctypes.CDLL(str(package_dir / "libnccl_ep.so"))
+        include_dir = package_dir / "nccl_ep/include"
+        if not (include_dir / "nccl_ep.h").is_file() or not (include_dir / "nccl_ep").is_dir():
+            raise RuntimeError("Transformer Engine is missing packaged NCCL-EP JIT headers")
 
     flash_mla_version = version("flash-mla")
     if flash_mla_version != "1.0.0+b7643bd":

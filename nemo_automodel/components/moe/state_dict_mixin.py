@@ -98,7 +98,7 @@ class MoESplitExpertsStateDictMixin:
         """
         if self.backend.dispatcher == "mok":
             return self.backend.experts != "te"
-        if self.backend.dispatcher not in {"deepep", "hybridep", "uccl_ep"}:
+        if self.backend.dispatcher not in {"deepep", "hybridep", "uccl_ep", "nccl_ep"}:
             return True
         if get_world_size_safe() == 1:
             return True
