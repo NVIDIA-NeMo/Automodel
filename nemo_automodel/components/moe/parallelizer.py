@@ -448,10 +448,9 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
     handling does not run for expert-parallel configs, so a trainable vision
     tower would otherwise keep every activation. Reuses the per-model
     layer-group mapping from the dense parallelizer and applies the same
-    model-owned whole-layer checkpoint policy as the dense FSDP2 path. Models
-    without that opt-in keep per-submodule wrapping (attention/MLP/norms), with
-    ``sdpa_backend_snapshot_context_fn`` on the attention/MLP wrappers so the
-    backward-time recompute reruns under the forward-time SDPA
+    per-submodule wrapping (attention/MLP/norms) as the generic FSDP2/DDP
+    path, with ``sdpa_backend_snapshot_context_fn`` on the attention/MLP
+    wrappers so the backward-time recompute reruns under the forward-time SDPA
     backend set. Fully frozen vision towers are left untouched, consistent
     with the generic path's frozen-tower behavior.
 
@@ -480,11 +479,9 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
     # Lazy imports keep the heavy, transformers-aware dense parallelizer module
     # off the text-only MoE call path.
     from nemo_automodel.components.distributed.activation_checkpointing import (
-        apply_full_layer_checkpointing_to_layers,
         apply_submodule_checkpointing,
         sdpa_backend_snapshot_context_fn,
     )
-    from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
     from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 
     layer_groups = get_model_layer_groups(model)
@@ -503,10 +500,7 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
         return
     # Vision towers have no KV cache, so KV-sharing (a text-decoder concern)
     # never applies here.
-    if get_model_parallelizer(model)._use_full_layer_activation_checkpointing(model):
-        apply_full_layer_checkpointing_to_layers(model, tower_layers)
-    else:
-        apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
+    apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
 
 
 def _replay_deepep_dispatch_on_recompute(

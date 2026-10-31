@@ -67,10 +67,6 @@ class DeepseekV41ModelParallelizer(ModelParallelizer):
 
     _customizes_moe_fsdp = True
 
-    def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
-        """Recompute replay-safe blocks, including vision residual and norm boundaries."""
-        return True
-
     def _fully_shard_module(self, module, **kwargs):
         return fully_shard_deepseek_v41(module, **kwargs)
 
