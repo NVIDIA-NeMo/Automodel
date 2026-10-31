@@ -243,7 +243,7 @@ def test_packing_contract_selects_collator_mask(causal_lm: bool, attn: str) -> N
     # Inspect the data contract without constructing optional TE kernels on CPU.
     model.backend.attn = attn
     contract = configure_packing_for_models([model])
-    assert contract.requires_packed_sequence_metadata
+    assert contract.return_packed_sequence_metadata
     assert contract.packed_mask_type == ("document_ids" if attn == "te" else "block_causal")
 
     pack = {
