@@ -814,25 +814,26 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
 
     model = _PackedModel()
 
-    dl, _ = _build_loader(
-        cfg_ds=cfg_ds,
-        cfg_dl=cfg_dl,
-        cfg_model=cfg_model,
-        cfg_ps=cfg_ps,
-        seed=123,
-        local_batch_size=1,
-        global_batch_size=1,
-        max_steps=None,
-        val_check_interval=None,
-        dp_rank=0,
-        dp_world_size=1,
-        pp_enabled=False,
-        cp_size=2,
-        model=model,
-    )
+    with nullcontext() if supports_thd else pytest.raises(ValueError, match="THD packing requires"):
+        dl, _ = _build_loader(
+            cfg_ds=cfg_ds,
+            cfg_dl=cfg_dl,
+            cfg_model=cfg_model,
+            cfg_ps=cfg_ps,
+            seed=123,
+            local_batch_size=1,
+            global_batch_size=1,
+            max_steps=None,
+            val_check_interval=None,
+            dp_rank=0,
+            dp_world_size=1,
+            pp_enabled=False,
+            cp_size=2,
+            model=model,
+        )
 
-    assert dl.dataset.__class__.__name__ == "DummyMapDataset"
     if supports_thd:
+        assert dl.dataset.__class__.__name__ == "DummyMapDataset"
         assert captured["cp_size"] == 2
     else:
         assert captured == {}
@@ -1065,7 +1066,10 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
             lambda self: SimpleNamespace(
                 build=lambda **k: "dl",
                 dataset_builds_on_all_ranks=False,
+                is_packed=False,
+                output_format="batched",
                 seed=42,
+                packed_sequence_length=0,
             )
         ),
     )
@@ -1336,6 +1340,8 @@ def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, exp
 
 def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     class _OneStepScheduler:
+        stream_exhausted = False
+
         def __init__(self):
             self.step = 0
             self.epoch = 0
@@ -1353,6 +1359,7 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
     trainer.model_parts = [MagicMock()]
     trainer.step_scheduler = _OneStepScheduler()
+    trainer.dataloader = []
     trainer.max_grad_norm = 1.0
     trainer.partial_cuda_graph_manager = None
     trainer._partial_cuda_graph_capture_pending = False
@@ -1378,6 +1385,7 @@ def test_run_train_validation_loop_reports_weighted_domain_validation():
     from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
 
     class _OneValidationStep:
+        stream_exhausted = False
         step = 1
         epoch = 0
         epochs = [0]
@@ -1394,6 +1402,7 @@ def test_run_train_validation_loop_reports_weighted_domain_validation():
     trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
     trainer.model_parts = [MagicMock()]
     trainer.step_scheduler = _OneValidationStep()
+    trainer.dataloader = []
     trainer.max_grad_norm = 1.0
     trainer.partial_cuda_graph_manager = None
     trainer._partial_cuda_graph_capture_pending = False
@@ -3852,7 +3861,7 @@ def test_mtp_recipe_preserves_document_targets(recipe_kind, packing_format, batc
         )
     batch = neat_packed_collater(
         samples,
-        packing=PackingCapabilities("block_causal", requires_packed_sequence_metadata=packing_format == "neat_varlen"),
+        packing=PackingCapabilities("block_causal", return_packed_sequence_metadata=packing_format == "neat_varlen"),
     )
     if packing_format in ("thd_padded", "thd_missing_padded", "thd_none_padded", "thd_native_padded"):
         batch.pop("_packed_seq_ids")
@@ -4104,3 +4113,122 @@ def test_pp_mtp_recipe_uses_physical_boundaries(batched_cu, internal_padding, is
         torch.testing.assert_close(model.logits.grad, reference_logits.grad)
     else:
         assert model.logits.grad is None
+
+
+class _FiniteStreamLoader:
+    synchronized_stream = True
+
+    def __init__(self) -> None:
+        self.values = iter({"value": i} for i in range(5))
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.values)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_recipe_saves_terminal_state_at_closed_pass_frontier() -> None:
+    from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    loader = _FiniteStreamLoader()
+    recipe.dataloader = loader
+    recipe.step_scheduler = StepSchedulerConfig(
+        global_batch_size=2, max_steps=99, ckpt_every_steps=2, preemption_signal=None
+    ).build(loader, 1, 1)
+    recipe.model_parts = [torch.nn.Linear(1, 1)]
+    recipe.max_grad_norm = 1.0
+    recipe.partial_cuda_graph_manager = None
+    recipe.domain_mixture = None
+    validation_loader = MagicMock()
+    recipe.val_dataloaders = {"validation": validation_loader}
+    recipe._run_validation_loaders = MagicMock(return_value={})
+    recipe.metric_logger_train = SimpleNamespace(close=MagicMock())
+    recipe.metric_logger_valid = {}
+    recipe.best_metric_key = "default"
+    recipe._make_progress_bar = MagicMock(return_value=None)
+    recipe._enable_qat_if_delayed = MagicMock()
+    recipe._run_train_optim_step = MagicMock(return_value=SimpleNamespace(metrics={"loss": 0.25}))
+    recipe._collect_moe_load_balance = MagicMock()
+    recipe.log_train_metrics = MagicMock()
+    recipe._update_progress_bar = MagicMock()
+    recipe._maybe_collect_garbage = MagicMock()
+    recipe._finalize_and_close_checkpointer = MagicMock()
+    saved = []
+
+    def record_checkpoint(epoch, step, train_loss, val_loss, best_metric_key):
+        assert not loader.closed
+        saved.append((epoch, step, recipe.step_scheduler.state_dict(), recipe.step_scheduler.is_last_step))
+
+    recipe.save_checkpoint = record_checkpoint
+    recipe.run_train_validation_loop()
+    assert recipe._run_train_optim_step.call_count == 2
+    assert saved == [
+        (0, 1, {"step": 2, "epoch": 0, "stream_exhausted": False}, False),
+        (1, 1, {"step": 2, "epoch": 1, "stream_exhausted": True}, True),
+    ]
+    assert loader.closed
+    validation_loader.close.assert_called_once()
+    recipe._finalize_and_close_checkpointer.assert_called_once()
+
+
+@pytest.mark.parametrize("recipe_kind", ["llm", "vlm"])
+@pytest.mark.parametrize("is_packed,output_format", [(False, "batched"), (True, "batched"), (True, "thd")])
+def test_setup_always_passes_return_contract_and_only_configures_packed_batched_inputs(
+    monkeypatch, recipe_kind, is_packed, output_format
+):
+    from nemo_automodel.components.models.common.packing import PackingCapabilities
+    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+    from tests.unit_tests.recipes.test_finetune_vlm_helpers import _minimal_vlm_cfg, _patch_vlm_setup_minimals
+
+    if recipe_kind == "llm":
+        _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
+        recipe_type = TrainFinetuneRecipeForNextTokenPrediction
+        raw = _minimal_cfg_with_nvtx(False)
+        config_property = "dataloader"
+        module = "nemo_automodel.recipes.llm.train_ft"
+    else:
+        _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+        recipe_type = FinetuneRecipeForVLM
+        raw = _minimal_vlm_cfg(cp_size=1, rope_fusion=False)
+        config_property = "vlm_dataloader"
+        module = "nemo_automodel.recipes.vlm.finetune"
+    contract = PackingCapabilities("block_causal", return_packed_sequence_metadata=True, return_document_ids=True)
+    queries = []
+    configured = []
+    thd_validated = []
+
+    def query(self):
+        queries.append(True)
+        return contract
+
+    class LoaderReached(Exception):
+        pass
+
+    def build(**kwargs):
+        assert kwargs["packing_contract"] is contract
+        raise LoaderReached
+
+    config = SimpleNamespace(
+        is_packed=is_packed,
+        output_format=output_format,
+        packed_sequence_length=0,
+        seed=42,
+        dataset_builds_on_all_ranks=True,
+        packing=None,
+        build=build,
+    )
+    monkeypatch.setattr(RecipeConfig, config_property, property(lambda self: config))
+    monkeypatch.setattr(recipe_type, "_get_packing_contract", query)
+    monkeypatch.setattr(f"{module}.configure_packing_for_models", lambda models: configured.append(True))
+    monkeypatch.setattr(f"{module}.validate_thd_packing_support", lambda models: thd_validated.append(True))
+    with pytest.raises(LoaderReached):
+        recipe_type(raw).setup()
+    assert queries == [True]
+    assert configured == ([True] if is_packed and output_format == "batched" else [])
+    assert thd_validated == ([True] if output_format == "thd" else [])

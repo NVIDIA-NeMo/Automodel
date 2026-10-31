@@ -34,6 +34,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from nemo_automodel.shared.batch import move_batch_to_device
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_MLFLOW, mlflow = safe_import(
@@ -64,8 +65,7 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
-from nemo_automodel.components.datasets.loader import DataloaderConfig
-from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+from nemo_automodel.components.datasets.loader import DataloaderConfig, TextDataloaderConfig, close_dataloader
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -92,7 +92,11 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
-from nemo_automodel.components.models.common.packing import PackingCapabilities
+from nemo_automodel.components.models.common.packing import (
+    PackingCapabilities,
+    configure_packing_for_models,
+    validate_thd_packing_support,
+)
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -143,16 +147,16 @@ def _get_model_name(cfg_model):
 
 
 def _should_pack_validation(
-    training_dataloader: DataloaderConfig | None,
+    training_dataloader: TextDataloaderConfig | None,
     validation_dataloader: DataloaderConfig,
     model: nn.Module,
 ) -> bool:
     """Return whether validation must use the configured training packer."""
     if validation_dataloader.packing is None:
         return False
-    if replace(validation_dataloader, packing=None).emits_thd:
+    if replace(validation_dataloader, packing=None).output_format == "thd":
         return True
-    if training_dataloader is None or not training_dataloader.emits_thd:
+    if training_dataloader is None or training_dataloader.output_format != "thd":
         return False
     model_requires_packing = bool(
         callable(getattr(model, "should_pack_validation_with_training", None))
@@ -549,11 +553,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         """Whether this rank owns the trainable model and its components."""
         return True
 
-    def _configure_packing(self) -> PackingCapabilities:
-        """Configure every local model stage and return its NEAT data requirements."""
-        from nemo_automodel.components.models.common.packing import configure_packing_for_models
+    def _get_packing_contract(self) -> PackingCapabilities:
+        """Query loader requests; KD can include a teacher constructed later."""
+        from nemo_automodel.components.models.common.packing import get_packing_capabilities_for_models
 
-        return configure_packing_for_models(self.model_parts)
+        return get_packing_capabilities_for_models(self.model_parts)
 
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
@@ -592,6 +596,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if not self._should_setup_training_components():
             return
+
+        dataloader_config = self.cfg.dataloader
+        packed_input_length = dataloader_config.packed_sequence_length
 
         # MagiAttention (FFA / context-parallel) backend, enabled via
         # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
@@ -655,10 +662,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
             if self.cfg.dataloader is None:
                 raise ValueError("domain_mixture requires a dataset/dataloader configuration")
-            # emits_thd is the canonical predicate: a config selecting
+            # output_format describes the selected representation: a config selecting
             # packed_sequence_thd_collater directly has packing=None but still
             # produces packed batches (and drops dataset_id).
-            if self.cfg.dataloader.emits_thd or self.cfg.dataloader.packing is not None:
+            if self.cfg.dataloader.output_format == "thd" or self.cfg.dataloader.packing is not None:
                 raise ValueError(
                     "domain_mixture does not support sequence packing because packed batches do not preserve "
                     "per-token dataset_id provenance"
@@ -693,7 +700,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 self.mesh_context.cp_size > 1
                 and self.cfg.get("model.backend.attn", self.cfg.get("model.attn_implementation", None)) == "te"
                 and self.cfg.dataloader is not None
-                and self.cfg.dataloader.emits_thd
+                and self.cfg.dataloader.output_format == "thd"
             ):
                 pp_microbatch_size = 1
                 pp_batch_size = pp_batch_size // self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
@@ -715,7 +722,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
             # Infer pp_seq_len from dataset config if not explicitly set
             if hasattr(self.pipeline_config, "pp_seq_len") and self.pipeline_config.pp_seq_len is None:
-                packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
+                packed_seq_size = packed_input_length
                 if packed_seq_size > 0:
                     self.pipeline_config.pp_seq_len = packed_seq_size
                 elif self.cfg.get("dataset.seq_len", None) is not None:
@@ -753,7 +760,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         model = build_model(
             self.cfg.model,
             self.peft_config,
-            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+            has_packed_sequence=dataloader_config.is_packed,
             seed=self.cfg.get("seed", 42),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
@@ -828,7 +835,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 stages=(self.pp.info.stages if self.pp is not None else None),
             )
 
-        _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
+        _packed_seq_size = packed_input_length
         if self.mesh_context.cp_size > 1 and _packed_seq_size > 0:
             _m = self.model_parts[0]
             if hasattr(_m, "supports") and not _m.supports_cp_with_sequence_packing:
@@ -847,42 +854,43 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
         # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        packing_contract = DEFAULT_PACKED_SEQUENCE_CONTRACT
-        if (
-            self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
-            and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
-        ):
-            packing_contract = self._configure_packing()
+        # Every loader receives model return requests; only packed batched input
+        # configures mask/Flash/gather adapters. THD owns its length-based route.
+        packing_contract = self._get_packing_contract()
+        if dataloader_config.output_format == "thd":
+            validate_thd_packing_support(self.model_parts)
+        elif dataloader_config.is_packed:
+            configure_packing_for_models(self.model_parts)
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
-        def materialize_loader(config):
+        def materialize_loader(config: TextDataloaderConfig):
             process_group = getattr(self.mesh_context, "process_group", None)
             build_context = (
                 nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode(group=process_group)
             )
-            with ScopedRNG(seed=config.seed, ranked=True):
-                return config.build(
-                    tokenizer=self.tokenizer,
-                    dataset_build_context=build_context,
-                    dp_rank=self._get_dp_rank(),
-                    dp_world_size=self._get_dp_group_size(),
-                    pp_enabled=self.pp_enabled,
-                    supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
-                    # Models and backends that own their CP dispatch do not need
-                    # TE's per-document ``2 * cp_size`` packing alignment.
-                    cp_size=(
-                        1
-                        if (
-                            getattr(self.model_parts[0], "_owns_cp_attention", False)
-                            or (self.magi.enabled and self.magi.custom)
-                        )
-                        else self.cfg.get("distributed.cp_size", 1)
-                    ),
-                    packing_contract=packing_contract,
-                    collate_wrapper=collate_wrapper,
-                )
+            return config.build(
+                tokenizer=self.tokenizer,
+                dataset_build_context=build_context,
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+                pp_enabled=self.pp_enabled,
+                supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
+                # Models and backends that own their CP dispatch do not need
+                # TE's per-document ``2 * cp_size`` packing alignment.
+                cp_size=(
+                    1
+                    if (
+                        getattr(self.model_parts[0], "_owns_cp_attention", False)
+                        or (self.magi.enabled and self.magi.custom)
+                    )
+                    else self.cfg.get("distributed.cp_size", 1)
+                ),
+                packing_contract=packing_contract,
+                collate_wrapper=collate_wrapper,
+                ignore_index=_get_loss_ignore_index(self.loss_fn),
+            )
 
-        self.dataloader = materialize_loader(self.cfg.dataloader)
+        self.dataloader = materialize_loader(dataloader_config)
         self.val_dataloaders = {
             name: materialize_loader(
                 dl_config
@@ -1108,6 +1116,47 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logger.warning("Failed to enable fake-quant: %s", e)
 
     # ------------------ main loop ------------------
+    def _run_validation_loaders(self, *, step: int | None = None) -> dict[str, float]:
+        """Validate all configured sources and restore training mode.
+
+        Args:
+            step: Completed optimizer-step index for terminal validation. Omit
+                during ordinary in-loop validation.
+
+        Returns:
+            Validation losses used by checkpoint selection.
+        """
+        val_losses = {}
+        total_validation_tokens = 0
+        for val_name, val_dataloader in self.val_dataloaders.items():
+            val_log_data = self._run_validation_epoch(val_dataloader)
+            if step is not None:
+                val_log_data.step = step
+            val_losses[val_name] = val_log_data.metrics["val_loss"]
+            total_validation_tokens += val_log_data.metrics["num_label_tokens"]
+            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+        if self.domain_mixture is not None and val_losses:
+            weighted_loss = self.domain_mixture.weighted_validation_loss(val_losses)
+            val_losses[WEIGHTED_AGGREGATE_NAME] = weighted_loss
+            weighted_log_data = MetricsSample(
+                step=self.step_scheduler.step if step is None else step,
+                epoch=self.step_scheduler.epoch,
+                metrics={
+                    "val_loss": weighted_loss,
+                    "lr": self.optimizer[0].param_groups[0]["lr"],
+                    "num_label_tokens": total_validation_tokens,
+                    "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                },
+            )
+            self.log_val_metrics(
+                WEIGHTED_AGGREGATE_NAME,
+                weighted_log_data,
+                self.metric_logger_valid[WEIGHTED_AGGREGATE_NAME],
+            )
+        for mp in self.model_parts:
+            mp.train()
+        return val_losses
+
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches.
 
@@ -1119,6 +1168,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.timestamp = time.perf_counter()
 
         pbar = self._make_progress_bar()
+        train_log_data = None
+        last_validation_step = None
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
@@ -1144,32 +1195,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # Run validation every val_every_steps
                     val_losses = {}
                     if self.step_scheduler.is_val_step:
-                        total_validation_tokens = 0
-                        for val_name, val_dataloader in self.val_dataloaders.items():
-                            val_log_data = self._run_validation_epoch(val_dataloader)
-                            val_losses[val_name] = val_log_data.metrics["val_loss"]
-                            total_validation_tokens += val_log_data.metrics["num_label_tokens"]
-                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
-                        if self.domain_mixture is not None and val_losses:
-                            weighted_loss = self.domain_mixture.weighted_validation_loss(val_losses)
-                            val_losses[WEIGHTED_AGGREGATE_NAME] = weighted_loss
-                            weighted_log_data = MetricsSample(
-                                step=self.step_scheduler.step,
-                                epoch=self.step_scheduler.epoch,
-                                metrics={
-                                    "val_loss": weighted_loss,
-                                    "lr": self.optimizer[0].param_groups[0]["lr"],
-                                    "num_label_tokens": total_validation_tokens,
-                                    "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                                },
-                            )
-                            self.log_val_metrics(
-                                WEIGHTED_AGGREGATE_NAME,
-                                weighted_log_data,
-                                self.metric_logger_valid[WEIGHTED_AGGREGATE_NAME],
-                            )
-                        for mp in self.model_parts:
-                            mp.train()
+                        val_losses = self._run_validation_loaders()
+                        last_validation_step = self.step_scheduler.step
 
                     # Save the checkpoint every ckpt_every_steps
                     if self.step_scheduler.is_ckpt_step:
@@ -1181,7 +1208,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             best_metric_key=self.best_metric_key,
                         )
                     self._maybe_collect_garbage()
+            if self.step_scheduler.stream_exhausted and train_log_data is not None:
+                completed_step = self.step_scheduler.step - 1
+                if last_validation_step != completed_step:
+                    val_losses = self._run_validation_loaders(step=completed_step)
+                # The closed-pass frontier has a distinct epoch from an in-loop save.
+                # Keep terminal loader state, final export and validation metrics.
+                self.save_checkpoint(
+                    self.step_scheduler.epoch,
+                    completed_step,
+                    train_log_data.metrics["loss"],
+                    val_losses,
+                    best_metric_key=self.best_metric_key,
+                )
         finally:
+            close_dataloader(self.dataloader)
+            for loader in self.val_dataloaders.values():
+                close_dataloader(loader)
             if pbar is not None:
                 pbar.close()
         # Close JSONL loggers after training loop completes
@@ -1215,7 +1258,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         Args:
             idx: Microbatch index in the accumulation window.
-            batch: Input mapping with token IDs, labels, and physical NEAT
+            batch: Input mapping with token IDs, labels, and effective packed
                 document IDs of shape [batch, sequence]. NEAT attention metadata
                 is batch-major; legacy THD inputs are flattened by the sharder.
                 THD MTP requires physical boundaries in cu_seqlens_padded of
@@ -1227,15 +1270,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_batches: Number of microbatches in the accumulation window.
             is_train: Whether to backpropagate the combined main and MTP loss.
         """
-        # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
-        batch = {
-            k: (
-                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
-                if isinstance(v, dict)
-                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            )
-            for k, v in batch.items()
-        }
+        batch = move_batch_to_device(batch, self.dist_env.device)
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         mtp_cp_enabled = not self.pp_enabled and self._get_cp_group_size() > 1 and model.supports.mtp_enabled
@@ -1270,7 +1305,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 cp_sharder.shard_token_tensor(targets, seq_dim=1, fill=ignore_index)
                 for targets in mtp_cp_inputs.targets
             )
-        # Preserve physical NEAT document IDs before model-kwarg filtering. The
+        # Preserve effective document IDs before model-kwarg filtering. The
         # loss needs these even when the forward does not accept packing metadata.
         mtp_seq_idx = batch.get("_packed_seq_ids") if mtp_per_depth_targets is None else None
         # Preserve packing metadata needed by the loss before model-kwarg filtering.

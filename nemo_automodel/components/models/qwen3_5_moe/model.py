@@ -883,6 +883,15 @@ class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_keep_self_forward: bool = True
 
+    def validate_packed_attention_backend(self, attn_implementation: str) -> None:
+        """Reject packed TE before loading data: this model lacks TE token gathering."""
+        if attn_implementation == "te":
+            raise ValueError(
+                "Packed Qwen3.5-MoE does not support Transformer Engine attention: "
+                "its full-attention blocks do not gather/scatter the unpadded token stream. "
+                "Use model.backend.attn='sdpa' or the native 'fa4' backend for packed inputs."
+            )
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -1205,6 +1214,15 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     # CP submesh, installed by Qwen3_5ModelParallelizer when context
     # parallelism is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
+
+    def validate_packed_attention_backend(self, attn_implementation: str) -> None:
+        """Reject packed TE before loading data: this model lacks TE token gathering."""
+        if attn_implementation == "te":
+            raise ValueError(
+                "Packed Qwen3.5-MoE does not support Transformer Engine attention: "
+                "its full-attention blocks do not gather/scatter the unpadded token stream. "
+                "Use model.backend.attn='sdpa' or the native 'fa4' backend for packed inputs."
+            )
 
     @dataclass(frozen=True)
     class ModelCapabilities:

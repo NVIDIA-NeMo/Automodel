@@ -25,7 +25,7 @@ from nemo_automodel.components.datasets.llm.neat_packing import (
     neat_pack_dataset,
 )
 from nemo_automodel.components.datasets.utils import (
-    _indexed_mask_to_4d_block_causal,
+    indexed_mask_to_4d_block_causal,
     neat_packed_collater,
 )
 
@@ -241,7 +241,7 @@ class TestIndexedMaskTo4dBlockCausal:
     def test_single_sample(self):
         """Single sample, no padding."""
         mask = torch.tensor([[1, 1, 1]])  # [1, 3]
-        result = _indexed_mask_to_4d_block_causal(mask)
+        result = indexed_mask_to_4d_block_causal(mask)
         assert result.shape == (1, 1, 3, 3)
 
         expected = torch.tensor(
@@ -256,7 +256,7 @@ class TestIndexedMaskTo4dBlockCausal:
     def test_two_sequences_with_padding(self):
         """Two sub-sequences and padding."""
         mask = torch.tensor([[1, 1, 2, 2, 0]])  # [1, 5]
-        result = _indexed_mask_to_4d_block_causal(mask)
+        result = indexed_mask_to_4d_block_causal(mask)
         assert result.shape == (1, 1, 5, 5)
 
         r = result[0, 0]
@@ -286,14 +286,14 @@ class TestIndexedMaskTo4dBlockCausal:
                 [1, 1, 1, 1],
             ]
         )
-        result = _indexed_mask_to_4d_block_causal(mask)
+        result = indexed_mask_to_4d_block_causal(mask)
         assert result.shape == (2, 1, 4, 4)
 
     def test_cross_sample_fully_invisible(self):
         """Exhaustive check: no position in sample X can attend to any position in sample Y."""
         # 3 sub-sequences of lengths 3, 2, 1 + 2 padding
         mask = torch.tensor([[1, 1, 1, 2, 2, 3, 0, 0]])
-        result = _indexed_mask_to_4d_block_causal(mask)
+        result = indexed_mask_to_4d_block_causal(mask)
         r = result[0, 0]  # [8, 8]
 
         # Define sample boundaries
@@ -355,7 +355,7 @@ class TestIndexedMaskTo4dBlockCausal:
 
         # 4D mask: cross-sample invisible
         mask_t = torch.tensor([mask])
-        mask_4d = _indexed_mask_to_4d_block_causal(mask_t)[0, 0]
+        mask_4d = indexed_mask_to_4d_block_causal(mask_t)[0, 0]
 
         # Sample B (pos 3,4) cannot see Sample A (pos 0,1,2)
         assert mask_4d[3, 0] == False
@@ -406,7 +406,7 @@ class TestNeatPackedCollater:
             batch,
             packing=SimpleNamespace(
                 packed_mask_type="block_causal",
-                requires_packed_sequence_metadata=False,
+                return_packed_sequence_metadata=False,
             ),
         )
 
@@ -443,7 +443,7 @@ class TestNeatPackedCollaterContracts:
     def test_document_ids_contract_keeps_indexed_2d_mask(self):
         packing = SimpleNamespace(
             packed_mask_type="document_ids",
-            requires_packed_sequence_metadata=False,
+            return_packed_sequence_metadata=False,
         )
 
         out = neat_packed_collater(self._batch(), packing=packing)
@@ -454,7 +454,7 @@ class TestNeatPackedCollaterContracts:
     def test_block_causal_contract_gets_4d_mask(self):
         packing = SimpleNamespace(
             packed_mask_type="block_causal",
-            requires_packed_sequence_metadata=False,
+            return_packed_sequence_metadata=False,
         )
 
         out = neat_packed_collater(self._batch(), packing=packing)
@@ -464,7 +464,7 @@ class TestNeatPackedCollaterContracts:
     def test_metadata_contract_emits_backend_neutral_varlen_metadata(self):
         packing = SimpleNamespace(
             packed_mask_type="document_ids",
-            requires_packed_sequence_metadata=True,
+            return_packed_sequence_metadata=True,
         )
 
         out = neat_packed_collater(self._batch(), packing=packing)
@@ -477,7 +477,7 @@ class TestNeatPackedCollaterContracts:
     def test_unknown_mask_type_is_rejected(self):
         packing = SimpleNamespace(
             packed_mask_type="unknown",
-            requires_packed_sequence_metadata=False,
+            return_packed_sequence_metadata=False,
         )
 
         with pytest.raises(ValueError, match="Unsupported packed_mask_type"):
