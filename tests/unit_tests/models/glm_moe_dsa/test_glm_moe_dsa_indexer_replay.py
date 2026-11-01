@@ -137,11 +137,19 @@ def test_full_layer_replays_selection_on_recompute_and_matches_plain_block():
     assert len(replayed_calls) == 2
 
 
-def test_shared_layer_hook_leaves_context_unchanged():
+def test_shared_layer_hook_binds_no_indexer_replay():
+    from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_gather_replay
+    from nemo_automodel.components.models.glm_moe_dsa.layers import glm_dsa_indexer_replay
+
     model = _model()
     shared_block = model.model.layers["2"]
     assert shared_block.skip_topk
-    sentinel = object()
-    assert shared_block.nemo_checkpoint_context_fn(sentinel) is sentinel
-    full_block = model.model.layers["1"]
-    assert full_block.nemo_checkpoint_context_fn(None) is not None
+    forward_ctx, _ = shared_block.nemo_checkpoint_context_fn(None)()
+    with forward_ctx:
+        # Every layer may replay its context-parallel gather; only full layers replay a selection.
+        assert glm_dsa_gather_replay.current() is not None
+        assert glm_dsa_indexer_replay.current() is None
+    forward_ctx, _ = model.model.layers["1"].nemo_checkpoint_context_fn(None)()
+    with forward_ctx:
+        assert glm_dsa_indexer_replay.current() is not None
+    assert glm_dsa_indexer_replay.current() is None and glm_dsa_gather_replay.current() is None

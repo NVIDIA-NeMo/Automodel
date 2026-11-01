@@ -37,7 +37,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.glm_moe_dsa.cp import shard_glm_dsa_packed_cp_batch
+from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_gather_replay, shard_glm_dsa_packed_cp_batch
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA, glm_dsa_indexer_replay
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
@@ -91,22 +91,23 @@ class Block(nn.Module):
         self,
         context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
     ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
-        """Replay this block's DSA selection in its activation-checkpoint recompute.
+        """Replay this block's DSA selection, and under context parallelism its gathered latent, in the recompute.
 
         The parallelizer composes this hook into the block's checkpoint context. A full indexer
         layer records its top-k indices in the checkpoint forward and returns them in the recompute
         (``GlmMoeDsaMLA._select_topk``); an IndexShare "shared" layer takes its indices from the
-        previous full layer and needs no replay.
+        previous full layer and needs no selection replay. Under context parallelism every layer
+        records its all-gathered latent K/V so the recompute does not communicate again.
 
         Args:
             context_fn: Existing forward/recompute context factory, or ``None``.
 
         Returns:
-            The factory wrapped with selection replay for a full indexer layer, otherwise unchanged.
+            The factory wrapped with the replays this layer uses.
         """
-        if self.skip_topk:
-            return context_fn
-        return glm_dsa_indexer_replay.checkpoint_context_fn(context_fn)
+        if not self.skip_topk:
+            context_fn = glm_dsa_indexer_replay.checkpoint_context_fn(context_fn)
+        return glm_dsa_gather_replay.checkpoint_context_fn(context_fn)
 
     def forward(
         self,

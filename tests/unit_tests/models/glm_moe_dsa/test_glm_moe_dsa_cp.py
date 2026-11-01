@@ -68,21 +68,65 @@ def test_glm_dsa_cp_all_gather_noops_when_cp_disabled():
     assert glm_cp.glm_dsa_cp_all_gather(tensor, dim=0, cp_group=None) is tensor
 
 
-def test_glm_dsa_cp_all_gather_concatenates_autograd_gather(monkeypatch):
+def test_glm_dsa_cp_all_gather_uses_one_autograd_collective(monkeypatch):
     tensor = torch.arange(4).view(2, 2)
     monkeypatch.setattr(glm_cp, "glm_dsa_cp_enabled", lambda cp_group: True)
+    calls = []
 
-    import torch.distributed.nn.functional as dist_nn_f
+    def fake_all_gather_tensor_autograd(received, gather_dim, group):
+        calls.append((gather_dim, group))
+        return torch.cat([received, received + 10], dim=gather_dim)
 
-    def fake_all_gather(received, group):
-        assert group == "cp-group"
-        return (received, received + 10)
-
-    monkeypatch.setattr(dist_nn_f, "all_gather", fake_all_gather)
+    monkeypatch.setattr(glm_cp.funcol, "all_gather_tensor_autograd", fake_all_gather_tensor_autograd)
 
     out = glm_cp.glm_dsa_cp_all_gather(tensor, dim=0, cp_group="cp-group")
 
     assert out.tolist() == [[0, 1], [2, 3], [10, 11], [12, 13]]
+    assert calls == [(0, "cp-group")]
+
+
+def test_glm_dsa_cp_all_gather_replays_recorded_gather_and_reduce_scatters_its_gradient(monkeypatch):
+    from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
+
+    monkeypatch.setattr(glm_cp, "glm_dsa_cp_enabled", lambda cp_group: True)
+    gathers = []
+
+    def fake_all_gather_tensor_autograd(received, gather_dim, group):
+        gathers.append(group)
+        return torch.cat([received, received + 10], dim=gather_dim)
+
+    reduce_scatters = []
+
+    def fake_reduce_scatter_tensor(grad, op, scatter_dim, group):
+        reduce_scatters.append((op, scatter_dim, group))
+        head, tail = grad.chunk(2, dim=scatter_dim)
+        return head + tail  # rank 0's shard receives both ranks' contributions
+
+    monkeypatch.setattr(glm_cp.funcol, "all_gather_tensor_autograd", fake_all_gather_tensor_autograd)
+    monkeypatch.setattr(glm_cp.funcol, "reduce_scatter_tensor", fake_reduce_scatter_tensor)
+    replay = RecomputeReplay("test gather")
+    recorder = RecomputeReplayRecorder()
+
+    local = torch.arange(4.0).view(2, 2).requires_grad_()
+    with replay.scope(recorder, "record"):
+        recorded = glm_cp.glm_dsa_cp_all_gather(local, dim=0, cp_group="cp-group", replay=replay)
+    assert gathers == ["cp-group"] and len(recorder) == 1
+
+    recorder.rewind()
+    replayed_local = torch.arange(4.0).view(2, 2).requires_grad_()
+    with replay.scope(recorder, "replay"):
+        out = glm_cp.glm_dsa_cp_all_gather(replayed_local, dim=0, cp_group="cp-group", replay=replay)
+    assert gathers == ["cp-group"], "the replay must not communicate"
+    torch.testing.assert_close(out, recorded.detach())
+
+    weights = torch.arange(1.0, 9.0).view(4, 2)
+    (out * weights).sum().backward()
+    assert reduce_scatters == [("sum", 0, "cp-group")]
+    torch.testing.assert_close(replayed_local.grad, weights[:2] + weights[2:])
+
+    # Outside a replay scope the gather communicates as usual.
+    glm_cp.glm_dsa_cp_all_gather(local, dim=0, cp_group="cp-group", replay=replay)
+    assert gathers == ["cp-group", "cp-group"]
 
 
 def test_slice_thd_chunk_requires_even_divisibility():

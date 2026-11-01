@@ -956,7 +956,7 @@ def test_cudnn_indexer_layer_gathers_cp_keys(monkeypatch: pytest.MonkeyPatch) ->
     indexer = GlmMoeDsaIndexer(config, backend)
     captured: dict[str, object] = {}
 
-    def fake_gather(tensor: torch.Tensor, *, dim: int, cp_group: object) -> torch.Tensor:
+    def fake_gather(tensor: torch.Tensor, *, dim: int, cp_group: object, replay: object = None) -> torch.Tensor:
         assert dim == 0 and cp_group == "cp-group"
         return torch.cat((tensor, tensor), dim=0)
 
@@ -1062,7 +1062,7 @@ def test_cudnn_mla_layer_gathers_cp_kv(monkeypatch: pytest.MonkeyPatch) -> None:
     gathered: list[tuple[int, ...]] = []
     captured: dict[str, torch.Tensor] = {}
 
-    def fake_gather(tensor: torch.Tensor, *, dim: int, cp_group: object) -> torch.Tensor:
+    def fake_gather(tensor: torch.Tensor, *, dim: int, cp_group: object, replay: object = None) -> torch.Tensor:
         assert dim == 0 and cp_group == "cp-group"
         gathered.append(tuple(tensor.shape))
         return torch.cat((tensor, tensor), dim=0)
@@ -1093,7 +1093,8 @@ def test_cudnn_mla_layer_gathers_cp_kv(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     assert result.shape == (4, config.num_attention_heads * config.v_head_dim)
-    assert gathered == [(4, config.kv_lora_rank), (4, config.qk_rope_head_dim)]
+    # One fused gather of the concatenated latent (kv | k_pe) per layer.
+    assert gathered == [(4, config.kv_lora_rank + config.qk_rope_head_dim)]
     assert captured["kv_latent"].shape == (8, 1, config.kv_lora_rank + config.qk_rope_head_dim)
     assert captured["topk_indices"] is topk
 

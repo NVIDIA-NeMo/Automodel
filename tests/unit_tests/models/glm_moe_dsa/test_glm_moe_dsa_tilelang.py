@@ -1000,7 +1000,7 @@ def test_indexer_cp_gathers_keys_before_tilelang_topk(monkeypatch):
     monkeypatch.setattr(layer_mod, "glm_dsa_cp_enabled", lambda group: group == "cp-group")
     captured = {}
 
-    def fake_cp_all_gather(tensor, *, dim, cp_group):
+    def fake_cp_all_gather(tensor, *, dim, cp_group, replay=None):
         captured.setdefault("gathered_shapes", []).append(tuple(tensor.shape))
         assert cp_group == "cp-group"
         return torch.cat([tensor, tensor], dim=dim)
@@ -1380,7 +1380,7 @@ def test_mla_tilelang_cp_gathers_kv_before_sparse_attention(monkeypatch):
     gathered = []
     captured = {}
 
-    def fake_cp_all_gather(tensor, *, dim, cp_group):
+    def fake_cp_all_gather(tensor, *, dim, cp_group, replay=None):
         assert cp_group == "cp-group"
         gathered.append(tuple(tensor.shape))
         return torch.cat([tensor, tensor], dim=dim)
@@ -1402,7 +1402,8 @@ def test_mla_tilelang_cp_gathers_kv_before_sparse_attention(monkeypatch):
     )
 
     assert out.shape == (4, config.num_attention_heads * config.v_head_dim)
-    assert gathered == [(4, config.kv_lora_rank), (4, config.qk_rope_head_dim)]
+    # One fused gather of the concatenated latent (kv | k_pe) per layer.
+    assert gathered == [(4, config.kv_lora_rank + config.qk_rope_head_dim)]
     assert captured["q"].shape[0] == 4
     assert captured["kv_latent"].shape == (8, 1, config.kv_lora_rank + config.qk_rope_head_dim)
     assert captured["topk_indices"] is topk_indices

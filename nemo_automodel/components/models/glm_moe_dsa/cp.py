@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import contextlib
+from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ShardLayout,
@@ -29,6 +31,13 @@ from nemo_automodel.components.distributed.thd_utils import (
     split_batch_into_thd_chunks,
     thd_padding_mask_from_token_ids,
 )
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
+
+# Record/replay channel for the gathered latent K/V of each layer across an activation-checkpoint
+# recompute (bound per checkpointed block call by ``Block.nemo_checkpoint_context_fn``): the recompute
+# reuses the forward's gathered tensor instead of communicating again, while its backward still
+# reduce-scatters the gradient to the owning ranks.
+glm_dsa_gather_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("GLM DSA CP gathered latent")
 
 
 def glm_dsa_cp_enabled(cp_group) -> bool:
@@ -41,21 +50,78 @@ def glm_dsa_cp_enabled(cp_group) -> bool:
     )
 
 
-def glm_dsa_cp_all_gather(tensor: torch.Tensor, *, dim: int, cp_group) -> torch.Tensor:
-    """All-gather activation tensors across CP ranks while preserving autograd."""
+def _wait(tensor: torch.Tensor) -> torch.Tensor:
+    """Complete an asynchronous functional collective result."""
+    if isinstance(tensor, funcol.AsyncCollectiveTensor):
+        return tensor.wait()
+    return tensor
+
+
+class _ReplayedAllGather(torch.autograd.Function):
+    """Return a recorded all-gather result while keeping the gradient path of the gather."""
+
+    @staticmethod
+    def forward(ctx: Any, local: torch.Tensor, gathered: torch.Tensor, dim: int, cp_group) -> torch.Tensor:
+        """Hand back ``gathered`` (the forward's all-gather of ``local``) without communicating.
+
+        Args:
+            ctx: Autograd context.
+            local: This rank's shard, only used for its gradient shape and dtype.
+            gathered: The recorded all-gather of ``local`` across the CP group along ``dim``.
+            dim: Gather dimension.
+            cp_group: CP process group.
+
+        Returns:
+            ``gathered`` as a fresh view.
+        """
+        del local
+        ctx.dim = dim
+        ctx.cp_group = cp_group
+        return gathered.view_as(gathered)
+
+    @staticmethod
+    def backward(ctx: Any, grad_gathered: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        """Reduce-scatter the gathered gradient back to each rank's shard, as the gather's backward does."""
+        grad_local = _wait(funcol.reduce_scatter_tensor(grad_gathered.contiguous(), "sum", ctx.dim, ctx.cp_group))
+        return grad_local, None, None, None
+
+
+def glm_dsa_cp_all_gather(
+    tensor: torch.Tensor,
+    *,
+    dim: int,
+    cp_group,
+    replay: RecomputeReplay[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """All-gather an activation across CP ranks along ``dim`` while preserving autograd.
+
+    One functional collective produces the concatenated result directly (no per-rank list and
+    concat copy), and its backward reduce-scatters the gradient to the owning ranks. With
+    ``replay`` bound in record mode the gathered tensor is recorded; in replay mode (the
+    activation-checkpoint recompute) the recorded tensor is returned without communication,
+    with the same gradient path.
+
+    Args:
+        tensor: This rank's shard; ``[local_tokens, ...]`` for ``dim=0``.
+        dim: Concatenation dimension.
+        cp_group: CP process group; a size-one or missing group returns ``tensor`` unchanged.
+        replay: Optional record/replay channel consulted inside a checkpointed block.
+
+    Returns:
+        Tensor whose ``dim`` holds every rank's shard in rank order.
+    """
     if not glm_dsa_cp_enabled(cp_group):
         return tensor
-
-    try:
-        from torch.distributed.nn.functional import all_gather
-    except (ImportError, AttributeError) as exc:  # pragma: no cover - version guard
-        raise RuntimeError(
-            "GLM MoE DSA context parallelism requires torch.distributed.nn.functional.all_gather "
-            "for differentiable activation gathers."
-        ) from exc
-
-    parts = all_gather(tensor.contiguous(), group=cp_group)
-    return torch.cat(tuple(parts), dim=dim)
+    local = tensor.contiguous()
+    state = replay.current() if replay is not None else None
+    if state is not None and state[1] == "replay":
+        recorded = state[0].take()
+        if recorded is not None:
+            return _ReplayedAllGather.apply(local, recorded, dim, cp_group)
+    gathered = _wait(funcol.all_gather_tensor_autograd(local, dim, cp_group))
+    if state is not None and state[1] == "record":
+        state[0].record(gathered.detach())
+    return gathered
 
 
 def _slice_thd_chunk_for_cp(

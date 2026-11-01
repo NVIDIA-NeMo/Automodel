@@ -72,7 +72,11 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.deepseek_v3.rope_utils import apply_rotary_emb
-from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather, glm_dsa_cp_enabled
+from nemo_automodel.components.models.glm_moe_dsa.cp import (
+    glm_dsa_cp_all_gather,
+    glm_dsa_cp_enabled,
+    glm_dsa_gather_replay,
+)
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
     cudnn_indexer_topk,
     cudnn_sparse_attention,
@@ -852,11 +856,19 @@ class GlmMoeDsaMLA(nn.Module):
         cp_group = attn_kwargs.get("_glm_dsa_cp_group")
         cp_enabled = glm_dsa_cp_enabled(cp_group)
         dsa_backend = _dsa_kernel_backend(self.backend)
+        kv_latent_global = None
         if cp_enabled:
             if qkv_format != "thd":
                 raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
-            kv = glm_dsa_cp_all_gather(kv, dim=0, cp_group=cp_group)
-            k_pe = glm_dsa_cp_all_gather(k_pe, dim=0, cp_group=cp_group)
+            if dsa_backend not in ("tilelang", "cudnn"):
+                raise NotImplementedError(
+                    "GLM DSA context parallelism is implemented only for backend.attn in {'tilelang', 'cudnn'}."
+                )
+            # One all-gather of the concatenated latent (kv | k_pe) per layer; a checkpointed block
+            # replays the gathered tensor in its recompute instead of communicating again.
+            kv_latent_global = glm_dsa_cp_all_gather(
+                torch.cat([kv, k_pe], dim=-1), dim=0, cp_group=cp_group, replay=glm_dsa_gather_replay
+            )
 
         # Optimized sparse paths run on the absorbed latent representation. The k_nope
         # up-projection is folded into the query, and w_vc maps the latent output back.
@@ -876,7 +888,8 @@ class GlmMoeDsaMLA(nn.Module):
             q_sparse = absorbed_sparse_query(q_nope, q_pe.to(q_nope.dtype), w_kc.to(q_nope.dtype))
             if q_sparse.dtype != torch.bfloat16:
                 q_sparse = q_sparse.to(torch.bfloat16)
-            kv_latent = torch.cat([kv, k_pe], dim=-1).unsqueeze(1).to(torch.bfloat16)
+            kv_latent = kv_latent_global if kv_latent_global is not None else torch.cat([kv, k_pe], dim=-1)
+            kv_latent = kv_latent.unsqueeze(1).to(torch.bfloat16)
             if dsa_backend == "tilelang":
                 if not should_use_tilelang(
                     "tilelang",
