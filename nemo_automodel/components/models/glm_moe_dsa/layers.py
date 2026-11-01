@@ -458,6 +458,75 @@ class GlmMoeDsaIndexer(nn.Module):
         self.k_norm.reset_parameters()
 
 
+class _AbsorbedSparseQuery(torch.autograd.Function):
+    """Build the absorbed sparse-attention query ``[tokens, heads, latent + rope]`` without a concat.
+
+    ``cat([einsum(q_nope, w_kc), q_pe])`` materializes the 1.2 GB (16k tokens) kernel input twice;
+    here the head-batched GEMM writes straight into the first ``latent`` columns of the kernel input
+    (cuBLAS accepts the strided output view) and the rotated rope slice is copied into the rest.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, q_nope: torch.Tensor, q_pe: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
+        """Absorb the key up-projection into the query.
+
+        Args:
+            ctx: Autograd context.
+            q_nope: Non-rope query of shape ``[tokens, heads, qk_nope_head_dim]``.
+            q_pe: Rotated rope query of shape ``[tokens, heads, qk_rope_head_dim]``, same dtype as ``q_nope``.
+            w_kc: Key up-projection of shape ``[heads, qk_nope_head_dim, latent]``, same dtype as ``q_nope``.
+
+        Returns:
+            Contiguous tensor of shape ``[tokens, heads, latent + qk_rope_head_dim]``.
+        """
+        tokens, heads, _ = q_nope.shape
+        latent = w_kc.shape[-1]
+        out = torch.empty(tokens, heads, latent + q_pe.shape[-1], dtype=q_nope.dtype, device=q_nope.device)
+        torch.bmm(q_nope.transpose(0, 1), w_kc, out=out[..., :latent].transpose(0, 1))
+        out[..., latent:].copy_(q_pe)
+        ctx.save_for_backward(q_nope, w_kc)
+        ctx.latent = latent
+        return out
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_out: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Route the latent columns' gradient through the GEMM and the rope columns' gradient straight to ``q_pe``.
+
+        Args:
+            ctx: Context holding ``q_nope`` and ``w_kc``.
+            grad_out: Gradient of shape ``[tokens, heads, latent + qk_rope_head_dim]``.
+
+        Returns:
+            Gradients for ``q_nope``, ``q_pe`` and ``w_kc`` (``None`` where not required).
+        """
+        q_nope, w_kc = ctx.saved_tensors
+        grad_latent = grad_out[..., : ctx.latent].transpose(0, 1)  # [heads, tokens, latent] view
+        grad_q_nope = grad_w_kc = grad_q_pe = None
+        if ctx.needs_input_grad[0]:
+            grad_q_nope = torch.bmm(grad_latent, w_kc.transpose(1, 2)).transpose(0, 1)
+        if ctx.needs_input_grad[1]:
+            grad_q_pe = grad_out[..., ctx.latent :]
+        if ctx.needs_input_grad[2]:
+            grad_w_kc = torch.bmm(q_nope.transpose(0, 1).transpose(1, 2), grad_latent)
+        return grad_q_nope, grad_q_pe, grad_w_kc
+
+
+def absorbed_sparse_query(q_nope: torch.Tensor, q_pe: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
+    """Return ``cat([q_nope @ w_kc (per head), q_pe], -1)`` as one contiguous tensor without the concat copy.
+
+    Args:
+        q_nope: Non-rope query of shape ``[tokens, heads, qk_nope_head_dim]``.
+        q_pe: Rotated rope query of shape ``[tokens, heads, qk_rope_head_dim]`` in ``q_nope``'s dtype.
+        w_kc: Key up-projection of shape ``[heads, qk_nope_head_dim, latent]`` in ``q_nope``'s dtype.
+
+    Returns:
+        Contiguous tensor of shape ``[tokens, heads, latent + qk_rope_head_dim]`` in ``q_nope``'s dtype.
+    """
+    return _AbsorbedSparseQuery.apply(q_nope, q_pe, w_kc)
+
+
 class GlmMoeDsaMLA(nn.Module):
     """Multi-head Latent Attention with Indexer for sparse attention.
 
@@ -804,8 +873,9 @@ class GlmMoeDsaMLA(nn.Module):
             w = kv_b_weight.view(self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
             w_kc = w[:, : self.qk_nope_head_dim, :]
             w_vc = w[:, self.qk_nope_head_dim :, :]
-            q_absorbed = torch.einsum("thd,hdc->thc", q_nope, w_kc.to(q_nope.dtype))
-            q_sparse = torch.cat([q_absorbed, q_pe], dim=-1).to(torch.bfloat16)
+            q_sparse = absorbed_sparse_query(q_nope, q_pe.to(q_nope.dtype), w_kc.to(q_nope.dtype))
+            if q_sparse.dtype != torch.bfloat16:
+                q_sparse = q_sparse.to(torch.bfloat16)
             kv_latent = torch.cat([kv, k_pe], dim=-1).unsqueeze(1).to(torch.bfloat16)
             if dsa_backend == "tilelang":
                 if not should_use_tilelang(
