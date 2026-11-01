@@ -105,6 +105,7 @@ optimizer:
 ci:
   cluster_tag: h100
   recipe_owner: akoumpa
-  # CuTe kernels compile on first use before the configured warmup iterations.
-  time: "01:00:00"
+  # Cold-cache QuACK autotuning can take about 48 minutes on B200 during iteration 0.
+  # Allow time for tuning, the remaining benchmark steps, and job setup.
+  time: "01:30:00"
   nodes: 1

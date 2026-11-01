@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Packed sliding-mask semantics follow Hugging Face Transformers (Apache-2.0):
+# https://github.com/huggingface/transformers/pull/46850
+# Revision: 1f3294c82c1d9153a531b7b21b178b432d52a6b4
+# Source: src/transformers/models/gemma4/modeling_gemma4.py, create_masks_for_vision_model.
 
 """Gemma4 MoE NeMo Automodel support.
 
@@ -245,6 +251,18 @@ class Gemma4Gate(nn.Module):
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
+        """Select experts using FP32 router arithmetic.
+
+        Args:
+            x: Tensor of shape [..., hidden] with arbitrary leading dimensions.
+            token_mask: Optional boolean tensor matching x's leading dimensions;
+                unused by this router.
+            cp_mesh: Optional context-parallel mesh; unused by this router.
+
+        Returns:
+            Weights in the input dtype and integer expert indices, each shaped
+            [..., topk], followed by None for auxiliary loss.
+        """
         # Router math runs in fp32 regardless of parameter/activation storage
         # dtype. With bf16 storage (e.g. bf16 weights + fp32 master weights via
         # TE FusedAdam), bf16 logits can flip top-k expert selection, so keep
@@ -259,7 +277,8 @@ class Gemma4Gate(nn.Module):
         x_norm = self.norm(x).to(torch.float32)
         x_norm = x_norm * self.scale.to(torch.float32) * self.scalar_root_size
 
-        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
@@ -551,7 +570,23 @@ def _build_packed_gemma4_causal_mask_mapping(
 
     ``packed_seq_ids`` contains 1-based document ids and 0 for padding.
     Full-attention layers remain plain packed causal attention. Sliding layers
-    also include Gemma4's same-image-token bidirectional edges.
+    also include Gemma4's same-image-token bidirectional edges, clipped at the
+    window's left boundary.
+
+    Args:
+        packed_seq_ids: Tensor of shape [batch, sequence] with document ids.
+        mm_token_type_ids: Tensor of shape [batch, sequence] with image tokens
+            marked as 1, on the same device as packed_seq_ids.
+        dtype: Floating-point dtype used for additive masks.
+        sliding_window: Maximum causal lookback including the query, or no limit.
+        as_additive: Return additive masks instead of boolean masks.
+        as_block_mask: Return FlexAttention block masks instead of dense masks.
+        flex_block_size: Query/key block sizes for FlexAttention.
+
+    Returns:
+        Full/sliding masks of shape [batch, 1, query, key], or BlockMask objects
+        with the same logical layout. Padding queries are fully masked in dense
+        masks and attend only key zero in block masks to keep FlexAttention safe.
     """
     if packed_seq_ids.ndim != 2:
         raise ValueError(f"_packed_seq_ids must be a 2D [B, S] tensor, got shape={tuple(packed_seq_ids.shape)}")
@@ -581,17 +616,30 @@ def _build_packed_gemma4_causal_mask_mapping(
             allowed = (q_pack_id == kv_pack_id) & (q_pack_id > 0) & (kv_idx <= q_idx)
             return torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
 
-        def _sliding_mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+        def _sliding_mask_mod(
+            batch_idx: torch.Tensor, head_idx: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ) -> torch.Tensor:
+            """Evaluate one sliding-attention edge.
+
+            Args:
+                batch_idx: Scalar tensor with the batch index.
+                head_idx: Scalar tensor with the head index (mask is head-independent).
+                q_idx: Scalar tensor with the query position in the packed sequence.
+                kv_idx: Scalar tensor with the key position in the packed sequence.
+
+            Returns:
+                Scalar boolean tensor indicating whether the edge is allowed.
+            """
             q_pack_id = packed_seq_ids[batch_idx, q_idx]
             kv_pack_id = packed_seq_ids[batch_idx, kv_idx]
             same_doc = (q_pack_id == kv_pack_id) & (q_pack_id > 0)
             allowed = same_doc & (kv_idx <= q_idx)
-            if sliding_window is not None:
-                allowed = allowed & ((q_idx - kv_idx) < sliding_window)
             q_group = vision_group_ids[batch_idx, q_idx]
             kv_group = vision_group_ids[batch_idx, kv_idx]
             same_vision_group = (q_group == kv_group) & (q_group >= 0)
             allowed = (allowed | same_vision_group) & same_doc
+            if sliding_window is not None:
+                allowed = allowed & ((q_idx - kv_idx) < sliding_window)
             return torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
 
         return {
@@ -621,14 +669,12 @@ def _build_packed_gemma4_causal_mask_mapping(
     causal = kv_positions <= q_positions
 
     full_mask = same_doc & causal
-    sliding_mask = full_mask
-    if sliding_window is not None:
-        sliding_mask = sliding_mask & ((q_positions - kv_positions) < sliding_window)
-
     same_vision_group = (vision_group_ids[:, :, None] == vision_group_ids[:, None, :]) & (
         vision_group_ids[:, :, None] >= 0
     )
-    sliding_mask = (sliding_mask | same_vision_group) & same_doc
+    sliding_mask = (full_mask | same_vision_group) & same_doc
+    if sliding_window is not None:
+        sliding_mask = sliding_mask & ((q_positions - kv_positions) < sliding_window)
 
     full_mask = full_mask.view(batch_size, 1, seq_len, seq_len)
     sliding_mask = sliding_mask.view(batch_size, 1, seq_len, seq_len)

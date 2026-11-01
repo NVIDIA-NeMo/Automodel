@@ -34,7 +34,6 @@ trap cleanup EXIT
 
 COMMON_ARGS=(
     --config tests/functional_tests/parallelism/qwen3_5_moe_proxy.yaml
-    --step_scheduler.max_steps 6
     --step_scheduler.global_batch_size 4
     --step_scheduler.local_batch_size 2
     --distributed.tp_size 1

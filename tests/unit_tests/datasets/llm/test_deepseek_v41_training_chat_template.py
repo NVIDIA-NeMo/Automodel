@@ -20,6 +20,7 @@ expected strings below are what the released template renders for each conversat
 """
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,18 @@ def test_tool_calls_and_results():
         + EOS
     )
     assert spans == ["call it</think>" + DSML_CALL + EOS, "done</think>It is sunny." + EOS]
+
+
+@pytest.mark.parametrize("arguments", [json.dumps(TOOL_CALLS[0]["function"]["arguments"]), ["Paris"], None])
+def test_non_object_tool_call_arguments_are_rejected(arguments):
+    # The released body would render any non-object as a single DSML parameter named "arguments".
+    function = {**TOOL_CALLS[0]["function"], "arguments": arguments}
+    messages = [
+        {"role": "user", "content": "weather?"},
+        {"role": "assistant", "content": "", "tool_calls": [{**TOOL_CALLS[0], "function": function}]},
+    ]
+    with pytest.raises(TemplateError, match="NeMoAutoTokenizer"):
+        _render(messages, thinking_mode="chat", tools=TOOLS)
 
 
 def test_mode_defaults_to_chat():

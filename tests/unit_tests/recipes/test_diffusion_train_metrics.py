@@ -41,6 +41,8 @@ from nemo_automodel.recipes.diffusion.train import (
     build_diffusion_pipeline,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_get_diffusion_microbatch_size_prefers_video_latents():
     batch = {
