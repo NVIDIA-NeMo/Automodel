@@ -126,6 +126,8 @@ class DeepseekV41TextConfig(PretrainedConfig):
         engram_capacity_mode: bool = False,
         compile_engram: bool = False,
         reuse_sparse_selection_on_recompute: bool = True,
+        sparse_attention_backward: str = "atomic",
+        sparse_attention_backward_workspace_bytes: int = 2 * 1024**3,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
@@ -236,6 +238,15 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # the checkpoint forward to the recompute instead of recomputing them (attention.csa2_selection_replay);
         # a DeepSeek-V4.1 knob like compile_cache_quant. Numerics are unchanged; False recomputes them.
         self.reuse_sparse_selection_on_recompute = bool(reuse_sparse_selection_on_recompute)
+        if sparse_attention_backward not in ("atomic", "deterministic"):
+            raise ValueError("sparse_attention_backward must be atomic or deterministic")
+        if (
+            not isinstance(sparse_attention_backward_workspace_bytes, int)
+            or sparse_attention_backward_workspace_bytes <= 0
+        ):
+            raise ValueError("sparse_attention_backward_workspace_bytes must be a positive integer")
+        self.sparse_attention_backward = sparse_attention_backward
+        self.sparse_attention_backward_workspace_bytes = sparse_attention_backward_workspace_bytes
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,

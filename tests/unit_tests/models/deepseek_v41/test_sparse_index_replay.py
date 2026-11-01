@@ -37,9 +37,21 @@ from tests.unit_tests.models.deepseek_v41.test_model import _build_model
 
 
 def reference_sparse_kernel(
-    q, kv, sinks, topk_idxs, sm_scale, *, backend, reference_rounding=False, all_rows_nonempty=False, plan=None
+    q,
+    kv,
+    sinks,
+    topk_idxs,
+    sm_scale,
+    *,
+    backend,
+    reference_rounding=False,
+    all_rows_nonempty=False,
+    plan=None,
+    backward_impl="atomic",
+    backward_workspace_bytes=2 * 1024**3,
 ):
     """Torch stand-in for the sparse kernels that understands a prepared plan (flat cuDNN or TileLang layout)."""
+    assert backward_impl == "atomic", "CPU reference does not exercise deterministic CUDA backward"
     batch, sequence = q.shape[:2]
     if plan is not None:
         assert plan.backend == backend and plan.kv_sequence == kv.shape[1]

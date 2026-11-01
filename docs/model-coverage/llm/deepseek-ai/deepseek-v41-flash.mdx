@@ -89,6 +89,23 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
 and communication prewarming must match the backend, topology, and local
 input shapes.
 
+## Experimental Fixed-Order Backward
+
+With `model.backend.attn: tilelang`, set
+`model.config.text_config.sparse_attention_backward: deterministic` to use fixed-order
+FP32 reduction of KV and sink gradients. The default `atomic` path is unchanged.
+The forward kernel, sparse selection and checkpoint parameter layout are unchanged.
+This option does not make unrelated model operations or distributed collectives
+deterministic; qualify full-model repeatability separately.
+
+`model.config.text_config.sparse_attention_backward_workspace_bytes` limits partial KV
+contributions (default 2147483648 bytes). Sorting buffers, contiguous input
+chunks, sink partials and final gradients are additional. Query chunks depend
+on tensor shapes and the configured cap. Smaller caps can increase launch and
+sorting overhead. This path requires CUDA BF16 TileLang execution and does not
+silently fall back to atomic reduction. Throughput, long-context memory and
+full-state recovery must be qualified for the intended workload before use.
+
 ## Context Parallelism
 
 Unpacked, right-padded text supports context parallelism with contiguous sequence
