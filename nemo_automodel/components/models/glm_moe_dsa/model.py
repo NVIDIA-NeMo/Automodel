@@ -37,7 +37,12 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_gather_replay, shard_glm_dsa_packed_cp_batch
+from nemo_automodel.components.models.glm_moe_dsa.cp import (
+    gather_order,
+    glm_dsa_gather_replay,
+    shard_glm_dsa_packed_cp_batch,
+    validate_gather_order,
+)
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA, glm_dsa_indexer_replay
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
@@ -275,6 +280,23 @@ class GlmMoeDsaModel(nn.Module):
         )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+
+        cp_size = int(attn_kwargs.get("cp_size", 1))
+        if cp_size > 1 and attn_kwargs.get("qkv_format") == "thd":
+            # The layers all-gather the indexer keys and the latent K/V in rank order. Every kernel then
+            # reads those rows by global token coordinate, so a layout whose rank order is not global
+            # order (head/tail) needs the gather permuted back; the order is derived once per forward
+            # from the configured layout and checked against the slice this rank actually received.
+            order = gather_order(self.backend.cp_query_layout, cp_size, h.shape[0] * cp_size, h.device)
+            if order is not None:
+                query_indices = attn_kwargs.get("glm_dsa_cp_query_indices")
+                if query_indices is None:
+                    raise ValueError(
+                        "cp_query_layout='head_tail' requires glm_dsa_cp_query_indices in the packed CP batch."
+                    )
+                validate_gather_order(order, int(attn_kwargs["cp_rank"]), h.shape[0], query_indices)
+            attn_kwargs = dict(attn_kwargs)
+            attn_kwargs["_glm_dsa_cp_gather_order"] = order
 
         if self.backend.attn == "cudnn" and attn_kwargs.get("qkv_format") == "thd":
             cu_seqlens = attn_kwargs.get("cu_seqlens")

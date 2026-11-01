@@ -47,6 +47,49 @@ glm_dsa_gather_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("GLM DSA 
 QueryLayout = Literal["contiguous", "head_tail"]
 QUERY_LAYOUTS: tuple[QueryLayout, ...] = ("contiguous", "head_tail")
 
+# ``(from_global, to_global)`` row maps between the rank-order all-gather of a layout's shards and
+# global token order, both int64 ``[total_tokens]``; see :func:`gather_order`.
+GatherOrder = tuple[torch.Tensor, torch.Tensor]
+
+
+def layout_indices_for_rank(
+    layout: QueryLayout, rank: int, cp_size: int, total_tokens: int, device: torch.device
+) -> torch.Tensor:
+    """Global query positions rank ``rank`` of ``cp_size`` owns under ``layout``, in its local order.
+
+    Mesh-free form of :func:`contiguous_local_indices` / :func:`round_robin_local_indices`, which the
+    batch slicer uses for the calling rank; this one serves every rank so :func:`gather_order` can
+    describe the whole gathered tensor.
+
+    Args:
+        layout: Query layout, see :data:`QueryLayout`.
+        rank: Context-parallel rank in ``[0, cp_size)``.
+        cp_size: Context-parallel world size.
+        total_tokens: Global padded token count; a multiple of ``cp_size`` (contiguous) or
+            ``2 * cp_size`` (head/tail).
+        device: Device of the returned index tensor.
+
+    Returns:
+        Int64 tensor of shape ``[total_tokens / cp_size]`` with the rank's global token positions in
+        local shard order (contiguous run, or head chunk then tail chunk).
+    """
+    if layout not in QUERY_LAYOUTS:
+        raise ValueError(f"Unknown GLM DSA CP query layout {layout!r}; expected one of {QUERY_LAYOUTS}")
+    if not 0 <= rank < cp_size:
+        raise ValueError(f"rank must lie in [0, cp_size), got {rank=} {cp_size=}")
+    if layout == "contiguous":
+        if total_tokens % cp_size != 0:
+            raise ValueError(f"total_tokens must be divisible by cp_size, got {total_tokens=} {cp_size=}")
+        local_tokens = total_tokens // cp_size
+        return torch.arange(rank * local_tokens, (rank + 1) * local_tokens, device=device, dtype=torch.long)
+    if total_tokens % (2 * cp_size) != 0:
+        raise ValueError(f"total_tokens must be divisible by 2 * cp_size, got {total_tokens=} {cp_size=}")
+    chunk_len = total_tokens // (2 * cp_size)
+    head = torch.arange(rank * chunk_len, (rank + 1) * chunk_len, device=device, dtype=torch.long)
+    tail_start = (2 * cp_size - 1 - rank) * chunk_len
+    tail = torch.arange(tail_start, tail_start + chunk_len, device=device, dtype=torch.long)
+    return torch.cat((head, tail))
+
 
 def local_query_indices(layout: QueryLayout, cp_mesh, total_tokens: int, device: torch.device) -> torch.Tensor:
     """Return this rank's global query positions for ``layout`` (see :data:`QueryLayout`)."""
@@ -55,6 +98,61 @@ def local_query_indices(layout: QueryLayout, cp_mesh, total_tokens: int, device:
     if layout == "contiguous":
         return contiguous_local_indices(cp_mesh, total_tokens, device)
     raise ValueError(f"Unknown GLM DSA CP query layout {layout!r}; expected one of {QUERY_LAYOUTS}")
+
+
+def gather_order(layout: QueryLayout, cp_size: int, total_tokens: int, device: torch.device) -> GatherOrder | None:
+    """Row maps between the rank-order all-gather of ``layout`` shards and global token order.
+
+    ``all_gather_tensor_autograd`` concatenates the ranks' shards in rank order, so gathered row
+    ``r * T/cp + j`` holds the ``j``-th local token of rank ``r``. Every consumer of the gathered K/V
+    (the cuDNN packed metadata's key sources and causal windows, the top-k coordinates FlashMLA and
+    cuDNN read ``kv_latent`` with, the TileLang causal windows) addresses rows by global token
+    position, which coincides with rank order only for the contiguous layout.
+
+    Args:
+        layout: Query layout the batch was sliced with.
+        cp_size: Context-parallel world size.
+        total_tokens: Global padded token count (local tokens times ``cp_size``).
+        device: Device of the returned index tensors.
+
+    Returns:
+        ``None`` when rank order already is global order (contiguous layout, or ``cp_size <= 1``);
+        otherwise ``(from_global, to_global)``: ``from_global[j]`` is the global token in gathered row
+        ``j`` and ``to_global[i]`` is the gathered row holding global token ``i``.
+    """
+    if layout not in QUERY_LAYOUTS:
+        raise ValueError(f"Unknown GLM DSA CP query layout {layout!r}; expected one of {QUERY_LAYOUTS}")
+    if cp_size <= 1 or layout == "contiguous":
+        return None
+    from_global = torch.cat(
+        [layout_indices_for_rank(layout, rank, cp_size, total_tokens, device) for rank in range(cp_size)]
+    )
+    to_global = torch.empty_like(from_global)
+    to_global[from_global] = torch.arange(total_tokens, device=device, dtype=torch.long)
+    return from_global, to_global
+
+
+def validate_gather_order(order: GatherOrder, cp_rank: int, local_tokens: int, query_indices: torch.Tensor) -> None:
+    """Check that ``order`` describes the shard this rank actually received.
+
+    Args:
+        order: Result of :func:`gather_order` for the model's configured layout.
+        cp_rank: This rank's index in the context-parallel group.
+        local_tokens: Number of local query rows.
+        query_indices: The batch's ``glm_dsa_cp_query_indices`` (global positions of the local rows).
+
+    Raises:
+        ValueError: If the batch was sliced with a different layout than the model's gather order
+            assumes, which would feed the kernels wrong key rows.
+    """
+    from_global, _ = order
+    expected = from_global[cp_rank * local_tokens : (cp_rank + 1) * local_tokens]
+    actual = query_indices.flatten().to(device=expected.device, dtype=expected.dtype)
+    if actual.numel() != local_tokens or not torch.equal(expected, actual):
+        raise ValueError(
+            "glm_dsa_cp_query_indices do not match BackendConfig.cp_query_layout: the batch was sliced with "
+            "a different context-parallel query layout than the one the model's K/V gather assumes."
+        )
 
 
 def glm_dsa_cp_enabled(cp_group) -> bool:
@@ -74,19 +172,57 @@ def _wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+class _GatherToGlobal(torch.autograd.Function):
+    """Permute a rank-order gather into global token order; the backward permutes the gradient back."""
+
+    @staticmethod
+    def forward(ctx: Any, gathered: torch.Tensor, from_global: torch.Tensor, to_global: torch.Tensor, dim: int):
+        """Reorder ``gathered`` so that index ``i`` along ``dim`` holds global token ``i``.
+
+        Args:
+            ctx: Autograd context.
+            gathered: Rank-order all-gather result.
+            from_global: Global token held by each gathered row (see :func:`gather_order`).
+            to_global: Gathered row holding each global token.
+            dim: Gather dimension.
+
+        Returns:
+            The gathered tensor in global token order.
+        """
+        ctx.dim = dim
+        ctx.save_for_backward(from_global)
+        return gathered.index_select(dim, to_global)
+
+    @staticmethod
+    def backward(ctx: Any, grad_global: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        """Map the global-order gradient back onto the rank-order gather."""
+        (from_global,) = ctx.saved_tensors
+        return grad_global.index_select(ctx.dim, from_global), None, None, None
+
+
 class _ReplayedAllGather(torch.autograd.Function):
     """Return a recorded all-gather result while keeping the gradient path of the gather."""
 
     @staticmethod
-    def forward(ctx: Any, local: torch.Tensor, gathered: torch.Tensor, dim: int, cp_group) -> torch.Tensor:
+    def forward(
+        ctx: Any,
+        local: torch.Tensor,
+        gathered: torch.Tensor,
+        dim: int,
+        cp_group,
+        from_global: torch.Tensor | None,
+    ) -> torch.Tensor:
         """Hand back ``gathered`` (the forward's all-gather of ``local``) without communicating.
 
         Args:
             ctx: Autograd context.
             local: This rank's shard, only used for its gradient shape and dtype.
-            gathered: The recorded all-gather of ``local`` across the CP group along ``dim``.
+            gathered: The recorded all-gather of ``local`` across the CP group along ``dim``, in global
+                token order when ``from_global`` is given and in rank order otherwise.
             dim: Gather dimension.
             cp_group: CP process group.
+            from_global: Global token held by each rank-order gathered row when the recorded tensor
+                was reordered into global order (see :func:`gather_order`); ``None`` for rank order.
 
         Returns:
             ``gathered`` as a fresh view.
@@ -94,13 +230,19 @@ class _ReplayedAllGather(torch.autograd.Function):
         del local
         ctx.dim = dim
         ctx.cp_group = cp_group
+        ctx.reordered = from_global is not None
+        if from_global is not None:
+            ctx.save_for_backward(from_global)
         return gathered.view_as(gathered)
 
     @staticmethod
-    def backward(ctx: Any, grad_gathered: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+    def backward(ctx: Any, grad_gathered: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
         """Reduce-scatter the gathered gradient back to each rank's shard, as the gather's backward does."""
+        if ctx.reordered:
+            (from_global,) = ctx.saved_tensors
+            grad_gathered = grad_gathered.index_select(ctx.dim, from_global)
         grad_local = _wait(funcol.reduce_scatter_tensor(grad_gathered.contiguous(), "sum", ctx.dim, ctx.cp_group))
-        return grad_local, None, None, None
+        return grad_local, None, None, None, None
 
 
 def glm_dsa_cp_all_gather(
@@ -109,6 +251,7 @@ def glm_dsa_cp_all_gather(
     dim: int,
     cp_group,
     replay: RecomputeReplay[torch.Tensor] | None = None,
+    order: GatherOrder | None = None,
 ) -> torch.Tensor:
     """All-gather an activation across CP ranks along ``dim`` while preserving autograd.
 
@@ -123,19 +266,26 @@ def glm_dsa_cp_all_gather(
         dim: Concatenation dimension.
         cp_group: CP process group; a size-one or missing group returns ``tensor`` unchanged.
         replay: Optional record/replay channel consulted inside a checkpointed block.
+        order: Optional :func:`gather_order` maps; when given, the result is permuted from rank
+            order into global token order (and the backward permutes the gradient back). Required
+            for every layout whose rank order is not global order, such as head/tail.
 
     Returns:
-        Tensor whose ``dim`` holds every rank's shard in rank order.
+        Tensor whose ``dim`` holds every rank's shard in rank order, or in global token order when
+        ``order`` is given.
     """
     if not glm_dsa_cp_enabled(cp_group):
         return tensor
     local = tensor.contiguous()
+    from_global = order[0] if order is not None else None
     state = replay.current() if replay is not None else None
     if state is not None and state[1] == "replay":
         recorded = state[0].take()
         if recorded is not None:
-            return _ReplayedAllGather.apply(local, recorded, dim, cp_group)
+            return _ReplayedAllGather.apply(local, recorded, dim, cp_group, from_global)
     gathered = _wait(funcol.all_gather_tensor_autograd(local, dim, cp_group))
+    if order is not None:
+        gathered = _GatherToGlobal.apply(gathered, order[0], order[1], dim)
     if state is not None and state[1] == "record":
         state[0].record(gathered.detach())
     return gathered

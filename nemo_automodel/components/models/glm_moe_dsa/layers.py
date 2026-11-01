@@ -325,7 +325,7 @@ class GlmMoeDsaIndexer(nn.Module):
         if cp_enabled:
             if qkv_format != "thd":
                 raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
-            k = glm_dsa_cp_all_gather(k, dim=0, cp_group=cp_group)
+            k = glm_dsa_cp_all_gather(k, dim=0, cp_group=cp_group, order=attn_kwargs.get("_glm_dsa_cp_gather_order"))
 
         if dsa_backend == "cudnn":
             if qkv_format != "thd":
@@ -867,7 +867,11 @@ class GlmMoeDsaMLA(nn.Module):
             # One all-gather of the concatenated latent (kv | k_pe) per layer; a checkpointed block
             # replays the gathered tensor in its recompute instead of communicating again.
             kv_latent_global = glm_dsa_cp_all_gather(
-                torch.cat([kv, k_pe], dim=-1), dim=0, cp_group=cp_group, replay=glm_dsa_gather_replay
+                torch.cat([kv, k_pe], dim=-1),
+                dim=0,
+                cp_group=cp_group,
+                replay=glm_dsa_gather_replay,
+                order=attn_kwargs.get("_glm_dsa_cp_gather_order"),
             )
 
         # Optimized sparse paths run on the absorbed latent representation. The k_nope

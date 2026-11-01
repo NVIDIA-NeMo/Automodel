@@ -12,15 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Head/tail (round-robin) context-parallel query layout for GLM DSA: batch slicing and cuDNN packed metadata."""
+"""Head/tail (round-robin) context-parallel query layout for GLM DSA: batch slicing, gather order, cuDNN metadata."""
 
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    contiguous_local_indices,
+    round_robin_local_indices,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm_moe_dsa import cp as glm_cp
 from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import is_cudnn_dsa_available
+from nemo_automodel.shared.recompute_replay import RecomputeReplay, RecomputeReplayRecorder
+
+_CPU = torch.device("cpu")
 
 
 class _FakeMesh:
@@ -76,9 +83,113 @@ def test_head_tail_slice_keeps_rank_chunks_and_global_metadata(rank, expected):
 
 def test_unknown_layout_is_rejected():
     with pytest.raises(ValueError, match="query layout"):
-        glm_cp.local_query_indices("zigzag", _FakeMesh(), 8, torch.device("cpu"))
+        glm_cp.local_query_indices("zigzag", _FakeMesh(), 8, _CPU)
+    with pytest.raises(ValueError, match="query layout"):
+        glm_cp.layout_indices_for_rank("zigzag", 0, 2, 8, _CPU)
+    with pytest.raises(ValueError, match="query layout"):
+        glm_cp.gather_order("zigzag", 2, 8, _CPU)
     with pytest.raises(ValueError, match="cp_query_layout"):
         BackendConfig(attn="cudnn", cp_query_layout="zigzag")
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 3, 4, 8])
+def test_layout_indices_for_rank_match_the_shared_sharder_helpers(cp_size):
+    total = 2 * cp_size * 5
+    for rank in range(cp_size):
+        mesh = _FakeMesh(size=cp_size, rank=rank)
+        assert torch.equal(
+            glm_cp.layout_indices_for_rank("head_tail", rank, cp_size, total, _CPU),
+            round_robin_local_indices(mesh, total, _CPU),
+        )
+        assert torch.equal(
+            glm_cp.layout_indices_for_rank("contiguous", rank, cp_size, total, _CPU),
+            contiguous_local_indices(mesh, total, _CPU),
+        )
+    with pytest.raises(ValueError, match="2 \\* cp_size"):
+        glm_cp.layout_indices_for_rank("head_tail", 0, cp_size, 2 * cp_size * 5 + 1, _CPU)
+    with pytest.raises(ValueError, match="rank"):
+        glm_cp.layout_indices_for_rank("head_tail", cp_size, cp_size, total, _CPU)
+
+
+@pytest.mark.parametrize("cp_size", [2, 3, 4, 8])
+def test_gather_order_inverts_the_rank_order_concatenation(cp_size):
+    total = 2 * cp_size * 3
+    from_global, to_global = glm_cp.gather_order("head_tail", cp_size, total, _CPU)
+    rank_order = torch.cat(
+        [glm_cp.layout_indices_for_rank("head_tail", rank, cp_size, total, _CPU) for rank in range(cp_size)]
+    )
+    assert torch.equal(from_global, rank_order)
+    everything = torch.arange(total)
+    assert torch.equal(from_global[to_global], everything)
+    assert torch.equal(to_global[from_global], everything)
+    # Rank order is not global order for any head/tail configuration with cp_size >= 2.
+    assert not torch.equal(from_global, everything)
+
+
+def test_gather_order_is_identity_for_contiguous_and_single_rank():
+    assert glm_cp.gather_order("contiguous", 4, 24, _CPU) is None
+    assert glm_cp.gather_order("head_tail", 1, 24, _CPU) is None
+    with pytest.raises(ValueError, match="2 \\* cp_size"):
+        glm_cp.gather_order("head_tail", 2, 6, _CPU)
+
+
+def test_validate_gather_order_rejects_a_batch_sliced_with_another_layout():
+    order = glm_cp.gather_order("head_tail", 2, 8, _CPU)
+    glm_cp.validate_gather_order(order, 0, 4, torch.tensor([0, 1, 6, 7], dtype=torch.int32))
+    glm_cp.validate_gather_order(order, 1, 4, torch.tensor([2, 3, 4, 5], dtype=torch.int32))
+    with pytest.raises(ValueError, match="cp_query_layout"):
+        # A contiguous slice handed to a head/tail model.
+        glm_cp.validate_gather_order(order, 1, 4, torch.tensor([4, 5, 6, 7], dtype=torch.int32))
+    with pytest.raises(ValueError, match="cp_query_layout"):
+        glm_cp.validate_gather_order(order, 0, 4, torch.tensor([0, 1, 6], dtype=torch.int32))
+
+
+# Three packed documents whose real lengths differ from their padded storage: pad rows at 7, 18, 19 and 23.
+_REAL_CU = torch.tensor([0, 7, 17, 20], dtype=torch.int32)
+_PADDED_CU = torch.tensor([0, 8, 20, 24], dtype=torch.int32)
+_PAD_ROWS = torch.tensor([7, 18, 19, 23])
+
+
+def _rank_order_gather(layout: str, cp_size: int, total: int, rows: torch.Tensor) -> torch.Tensor:
+    """What ``all_gather_tensor_autograd`` returns: every rank's local rows, rank after rank."""
+    return torch.cat(
+        [
+            rows.index_select(0, glm_cp.layout_indices_for_rank(layout, rank, cp_size, total, _CPU))
+            for rank in range(cp_size)
+        ]
+    )
+
+
+@pytest.mark.parametrize(("layout", "cp_size"), [("contiguous", 2), ("head_tail", 2), ("head_tail", 4)])
+def test_gathered_keys_match_the_global_coordinates_the_kernels_use(layout, cp_size):
+    total = int(_PADDED_CU[-1])
+    padding_mask = torch.zeros(total, dtype=torch.bool)
+    padding_mask[_PAD_ROWS] = True
+    identity = torch.arange(total)  # key row i carries its own global coordinate
+    gathered = _rank_order_gather(layout, cp_size, total, identity)
+    order = glm_cp.gather_order(layout, cp_size, total, _CPU)
+    kernel_view = gathered if order is None else gathered.index_select(0, order[1])
+    assert torch.equal(kernel_view, identity)
+
+    for rank in range(cp_size):
+        local = glm_cp.layout_indices_for_rank(layout, rank, cp_size, total, _CPU)
+        meta = prepare_cudnn_dsa_packed_metadata(
+            _REAL_CU,
+            total,
+            query_indices=local.to(torch.int32),
+            cu_seqlens_padded=_PADDED_CU,
+            padding_mask=padding_mask.index_select(0, local),
+        )
+        sources = meta.key_source_indices
+        assert sources is not None
+        # The indexer feeds ``index_k.index_select(0, key_source_indices)`` to the kernel: every row must be
+        # the global token the segment metadata means.
+        assert torch.equal(kernel_view.index_select(0, sources), identity.index_select(0, sources))
+        # Padding rows are invalid queries; real rows keep their causal prefix inside their own document.
+        assert torch.equal(meta.query_valid, ~padding_mask.index_select(0, local))
+        if layout == "head_tail":
+            # Without the reorder, the rank-order gather hands the kernel other ranks' tokens.
+            assert not torch.equal(gathered.index_select(0, sources), identity.index_select(0, sources))
 
 
 def test_packed_metadata_splits_head_and_tail_runs_into_segments():
@@ -123,6 +234,89 @@ def test_packed_metadata_requires_strictly_increasing_queries():
         prepare_cudnn_dsa_packed_metadata(cu_seqlens, 8, query_indices=torch.tensor([0, 1, 1, 2], dtype=torch.int32))
 
 
+def _fake_rank_order_all_gather(global_rows: torch.Tensor, layout: str, cp_size: int):
+    """A stand-in for ``all_gather_tensor_autograd``: rank 0 contributes the live tensor, the others constants."""
+    total = global_rows.shape[0]
+
+    def fake(received, gather_dim, group):
+        shards = [
+            received
+            if rank == 0
+            else global_rows.index_select(0, glm_cp.layout_indices_for_rank(layout, rank, cp_size, total, _CPU))
+            for rank in range(cp_size)
+        ]
+        return torch.cat(shards, dim=gather_dim)
+
+    return fake
+
+
+def test_glm_dsa_cp_all_gather_returns_head_tail_shards_in_global_order(monkeypatch):
+    cp_size, total = 2, 8
+    global_rows = torch.arange(total, dtype=torch.float32).view(total, 1).repeat(1, 3) + torch.tensor([0.0, 0.1, 0.2])
+    monkeypatch.setattr(glm_cp, "glm_dsa_cp_enabled", lambda cp_group: True)
+    monkeypatch.setattr(
+        glm_cp.funcol, "all_gather_tensor_autograd", _fake_rank_order_all_gather(global_rows, "head_tail", cp_size)
+    )
+    rank0 = glm_cp.layout_indices_for_rank("head_tail", 0, cp_size, total, _CPU)
+    local = global_rows.index_select(0, rank0).clone().requires_grad_()
+    order = glm_cp.gather_order("head_tail", cp_size, total, _CPU)
+
+    out = glm_cp.glm_dsa_cp_all_gather(local, dim=0, cp_group="cp-group", order=order)
+    torch.testing.assert_close(out, global_rows)
+    weights = torch.arange(1.0, total * 3 + 1).view(total, 3)
+    (out * weights).sum().backward()
+    # Every global row appears exactly once, so rank 0's rows receive exactly their own weights.
+    torch.testing.assert_close(local.grad, weights.index_select(0, rank0))
+
+    # Without the order the collective's rank order comes back unchanged (the contiguous-layout contract).
+    plain = glm_cp.glm_dsa_cp_all_gather(local.detach(), dim=0, cp_group="cp-group")
+    torch.testing.assert_close(plain, global_rows.index_select(0, order[0]))
+    assert not torch.equal(plain, global_rows)
+
+
+def test_replayed_head_tail_gather_permutes_the_gradient_back_before_the_reduce_scatter(monkeypatch):
+    cp_size, total = 2, 8
+    global_rows = torch.arange(total, dtype=torch.float32).view(total, 1).repeat(1, 2)
+    monkeypatch.setattr(glm_cp, "glm_dsa_cp_enabled", lambda cp_group: True)
+    monkeypatch.setattr(
+        glm_cp.funcol, "all_gather_tensor_autograd", _fake_rank_order_all_gather(global_rows, "head_tail", cp_size)
+    )
+    scattered: list[torch.Tensor] = []
+
+    def fake_reduce_scatter_tensor(grad, op, scatter_dim, group):
+        assert (op, scatter_dim, group) == ("sum", 0, "cp-group")
+        scattered.append(grad.clone())
+        head, tail = grad.chunk(cp_size, dim=scatter_dim)
+        return head + tail
+
+    monkeypatch.setattr(glm_cp.funcol, "reduce_scatter_tensor", fake_reduce_scatter_tensor)
+    order = glm_cp.gather_order("head_tail", cp_size, total, _CPU)
+    from_global, _ = order
+    rank0 = glm_cp.layout_indices_for_rank("head_tail", 0, cp_size, total, _CPU)
+    replay = RecomputeReplay("test gather")
+    recorder = RecomputeReplayRecorder()
+
+    local = global_rows.index_select(0, rank0).clone().requires_grad_()
+    with replay.scope(recorder, "record"):
+        recorded = glm_cp.glm_dsa_cp_all_gather(local, dim=0, cp_group="cp-group", replay=replay, order=order)
+    torch.testing.assert_close(recorded, global_rows)
+    assert len(recorder) == 1 and torch.equal(recorder.records[0], global_rows)
+
+    recorder.rewind()
+    replayed_local = global_rows.index_select(0, rank0).clone().requires_grad_()
+    with replay.scope(recorder, "replay"):
+        out = glm_cp.glm_dsa_cp_all_gather(replayed_local, dim=0, cp_group="cp-group", replay=replay, order=order)
+    torch.testing.assert_close(out, global_rows)
+
+    weights = torch.arange(1.0, total * 2 + 1).view(total, 2)
+    (out * weights).sum().backward()
+    # The reduce-scatter sees the gradient in the collective's rank order, not in global order.
+    assert len(scattered) == 1
+    torch.testing.assert_close(scattered[0], weights.index_select(0, from_global))
+    rank_order_weights = weights.index_select(0, from_global)
+    torch.testing.assert_close(replayed_local.grad, rank_order_weights[: total // 2] + rank_order_weights[total // 2 :])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or not is_cudnn_dsa_available(), reason="cuDNN DSA kernels")
 def test_cudnn_indexer_head_tail_queries_select_the_same_keys_as_the_full_sequence():
     from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import cudnn_indexer_topk
@@ -136,15 +330,16 @@ def test_cudnn_indexer_head_tail_queries_select_the_same_keys_as_the_full_sequen
     cu_seqlens = torch.tensor([0, 512, tokens], dtype=torch.int32, device=device)
     full = cudnn_indexer_topk(q, k, weights, cu_seqlens, topk)
 
-    cp_size, chunk = 2, tokens // 4
+    cp_size = 2
+    # The keys arrive through the rank-order all-gather; the model reorders them into global order first.
+    from_global, to_global = glm_cp.gather_order("head_tail", cp_size, tokens, device)
+    k_rank_order = k.index_select(0, from_global)
     for rank in range(cp_size):
-        head = torch.arange(rank * chunk, (rank + 1) * chunk, device=device)
-        tail_start = (2 * cp_size - 1 - rank) * chunk
-        local = torch.cat([head, torch.arange(tail_start, tail_start + chunk, device=device)]).to(torch.int32)
+        local = glm_cp.layout_indices_for_rank("head_tail", rank, cp_size, tokens, device).to(torch.int32)
         meta = prepare_cudnn_dsa_packed_metadata(cu_seqlens, tokens, query_indices=local)
         local_topk = cudnn_indexer_topk(
             q.index_select(0, local.long()),
-            k,
+            k_rank_order.index_select(0, to_global),
             weights.index_select(0, local.long()),
             cu_seqlens,
             topk,

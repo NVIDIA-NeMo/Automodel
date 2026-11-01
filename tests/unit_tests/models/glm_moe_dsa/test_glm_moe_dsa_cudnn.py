@@ -956,8 +956,10 @@ def test_cudnn_indexer_layer_gathers_cp_keys(monkeypatch: pytest.MonkeyPatch) ->
     indexer = GlmMoeDsaIndexer(config, backend)
     captured: dict[str, object] = {}
 
-    def fake_gather(tensor: torch.Tensor, *, dim: int, cp_group: object, replay: object = None) -> torch.Tensor:
-        assert dim == 0 and cp_group == "cp-group"
+    def fake_gather(
+        tensor: torch.Tensor, *, dim: int, cp_group: object, replay: object = None, order: object = None
+    ) -> torch.Tensor:
+        assert dim == 0 and cp_group == "cp-group" and order is None  # contiguous layout: no reorder
         return torch.cat((tensor, tensor), dim=0)
 
     def fake_indexer(
@@ -1062,8 +1064,10 @@ def test_cudnn_mla_layer_gathers_cp_kv(monkeypatch: pytest.MonkeyPatch) -> None:
     gathered: list[tuple[int, ...]] = []
     captured: dict[str, torch.Tensor] = {}
 
-    def fake_gather(tensor: torch.Tensor, *, dim: int, cp_group: object, replay: object = None) -> torch.Tensor:
-        assert dim == 0 and cp_group == "cp-group"
+    def fake_gather(
+        tensor: torch.Tensor, *, dim: int, cp_group: object, replay: object = None, order: object = None
+    ) -> torch.Tensor:
+        assert dim == 0 and cp_group == "cp-group" and order is None  # contiguous layout: no reorder
         gathered.append(tuple(tensor.shape))
         return torch.cat((tensor, tensor), dim=0)
 

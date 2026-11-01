@@ -1000,7 +1000,8 @@ def test_indexer_cp_gathers_keys_before_tilelang_topk(monkeypatch):
     monkeypatch.setattr(layer_mod, "glm_dsa_cp_enabled", lambda group: group == "cp-group")
     captured = {}
 
-    def fake_cp_all_gather(tensor, *, dim, cp_group, replay=None):
+    def fake_cp_all_gather(tensor, *, dim, cp_group, replay=None, order=None):
+        assert order is None  # contiguous layout: no reorder
         captured.setdefault("gathered_shapes", []).append(tuple(tensor.shape))
         assert cp_group == "cp-group"
         return torch.cat([tensor, tensor], dim=dim)
@@ -1380,7 +1381,8 @@ def test_mla_tilelang_cp_gathers_kv_before_sparse_attention(monkeypatch):
     gathered = []
     captured = {}
 
-    def fake_cp_all_gather(tensor, *, dim, cp_group, replay=None):
+    def fake_cp_all_gather(tensor, *, dim, cp_group, replay=None, order=None):
+        assert order is None  # contiguous layout: no reorder
         assert cp_group == "cp-group"
         gathered.append(tuple(tensor.shape))
         return torch.cat([tensor, tensor], dim=dim)
