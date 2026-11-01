@@ -440,21 +440,17 @@ def _topk_wrapper_chunked(scores: torch.Tensor, seq_lens: torch.Tensor, topk: in
 
 
 def _compact_and_sort_indices(indices: torch.Tensor, key_count: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Canonicalize global indices ``[T, K]`` and return valid lengths ``[T]``."""
+    """Canonicalize global indices ``[T, K]`` into an ascending valid prefix and return valid lengths ``[T]``.
+
+    One int32 sort does both jobs: valid coordinates ascend, and the ``key_count`` sentinel, which is
+    strictly above every valid coordinate (``key_count`` fits int32, see the caller), pushes invalid
+    entries behind them. The earlier compact-then-sort form ran two int64 argsorts and four gathers over
+    ``[T, K]``, which at 16k packed tokens cost more than the indexer score GEMM and top-k kernels together.
+    """
     valid = (indices >= 0) & (indices < key_count)
     topk_length = valid.sum(dim=-1, dtype=torch.int32)
-    positions = torch.arange(indices.size(-1), device=indices.device).view(1, -1)
-    compact_order = torch.where(valid, positions, torch.full_like(positions, indices.size(-1))).argsort(dim=-1)
-    indices = torch.gather(indices, -1, compact_order)
-    compact_valid = torch.gather(valid, -1, compact_order)
-    indices = indices.masked_fill(~compact_valid, -1)
-
-    prefix = positions < topk_length.unsqueeze(-1)
-    sort_key = torch.where(prefix, indices, torch.full_like(indices, key_count))
-    sort_order = sort_key.argsort(dim=-1)
-    indices = torch.gather(indices, -1, sort_order)
-    sorted_valid = torch.gather(prefix.expand_as(indices), -1, sort_order)
-    return indices.masked_fill(~sorted_valid, -1).to(torch.int32).contiguous(), topk_length.contiguous()
+    sorted_key, _ = torch.where(valid, indices, key_count).to(torch.int32).sort(dim=-1)
+    return sorted_key.masked_fill(sorted_key == key_count, -1).contiguous(), topk_length.contiguous()
 
 
 def cudnn_indexer_topk(
