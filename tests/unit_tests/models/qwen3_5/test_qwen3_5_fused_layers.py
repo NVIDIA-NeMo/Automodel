@@ -16,6 +16,7 @@
 
 import inspect
 import math
+from collections.abc import Iterator
 from unittest import mock
 
 import pytest
@@ -42,6 +43,17 @@ from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.components.moe.layers import MLP
 
 HIDDEN = 64
+
+
+@pytest.fixture
+def _ieee_matmul() -> Iterator[None]:
+    """Keep strict FP32 fusion comparisons independent of global TF32 defaults."""
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
 
 
 def _norm_pair(fused_cls, reference_cls, device, dtype):
@@ -236,6 +248,7 @@ def test_cpu_matches_replaced_computation_exactly(name, dtype):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernels run on CUDA")
+@pytest.mark.usefixtures("_ieee_matmul")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("name", CASES)
 def test_cuda_fused_kernel_matches_replaced_computation(name, dtype):
