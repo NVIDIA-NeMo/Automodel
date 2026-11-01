@@ -555,12 +555,19 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         Args:
             hidden: Final normalized hidden states in the backend layout (THD: ``[T, H]``;
                 bshd: ``[B, S, H]``).
-            logits_to_keep: Position selection forwarded to ``compute_lm_head_logits``.
+            logits_to_keep: Zero to project all positions, a positive integer to project the last
+                N positions, or an integer tensor of shape ``[selected_positions]`` indexing the
+                token/sequence axis. Ignored when returning hidden states; that branch keeps all
+                positions.
             is_thd: Whether the stage ran in THD layout; a 2D result regains its leading batch dim.
 
         Returns:
-            ``[B, S, V]`` logits, or ``[B, S, H]`` hidden states when ``_pp_return_hidden_states``
-            is set, matching the output meta declared by ``get_pipeline_stage_metas``.
+            Logits of shape ``[batch, selected_sequence, vocab]``, where ``selected_sequence``
+            follows ``logits_to_keep``, or final hidden states of shape ``[batch, sequence, hidden]``
+            when ``_pp_return_hidden_states`` is set. Packed THD output restores a leading batch
+            dimension of one. The hidden-state branch aliases ``hidden`` directly or through an
+            ``unsqueeze`` view and does not mutate it; both branches match the output meta declared
+            by ``get_pipeline_stage_metas``.
         """
         if not self._pp_return_hidden_states:
             return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
@@ -617,7 +624,9 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             Single-process execution returns a causal-LM output whose logits tensor has shape
             ``[batch, sequence, vocab]``. A non-last pipeline stage returns hidden states and
             float32 top-k carry tensors in the layouts described above; the last stage returns
-            a logits tensor of shape ``[batch, sequence, vocab]``.
+            a logits tensor of shape ``[batch, sequence, vocab]``, or the full-sequence final
+            hidden states of shape ``[batch, sequence, hidden]`` when a linear CE loss has set
+            ``_pp_return_hidden_states`` (THD restores a leading batch dimension of one).
         """
 
         output_hidden_states = (
@@ -674,12 +683,15 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             # torch.distributed.pipelining treats every float inter-stage tensor as an activation
             # and demands a gradient for it on backward. We add zero-weight autograd links so the
             # carry it RECEIVES and the carry it SENDS both get a DEFINED (zero) gradient instead of
-            # ``None`` — values are unchanged (``+ x.sum() * 0.0``).
+            # ``None`` — values are unchanged. The received carry's link multiplies before summing
+            # so its gradient is a dense zero tensor: ``sum()`` alone would hand back an expanded
+            # (stride-0) gradient, which the pipeline records as the receive-buffer layout and
+            # P2P backends reject as non-contiguous.
             if self.lm_head is not None:
                 # Last stage: emit logits (or hidden states for a linear CE loss) for the pipeline loss.
                 output = self._pipeline_last_stage_output(hidden, logits_to_keep, is_thd)
                 if carry_in is not None:
-                    output = output + (carry_in.float().sum() * 0.0).to(output.dtype)
+                    output = output + (carry_in.float() * 0.0).sum().to(output.dtype)
                 return output
             # Non-last stage: emit (hidden, float32 top-k carry) to the next stage. The tensors are
             # already in the backend's natural pipeline shape (THD: [T, H] + [T, 1, topk]; bshd:
@@ -689,7 +701,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             zero_from_hidden = hidden.float().sum() * 0.0  # connected to grad-bearing hidden
             carry_out = topk_indices.to(torch.float32) + zero_from_hidden  # requires grad, value unchanged
             if carry_in is not None:
-                hidden = hidden + (carry_in.float().sum() * 0.0).to(hidden.dtype)  # defines grad(carry_in)
+                hidden = hidden + (carry_in.float() * 0.0).sum().to(hidden.dtype)  # dense zero grad(carry_in)
             return hidden, carry_out
 
         return compute_lm_head_logits(

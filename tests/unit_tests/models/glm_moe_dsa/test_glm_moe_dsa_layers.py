@@ -543,3 +543,84 @@ def test_indexer_weights_proj_stays_plain_linear_with_fp32_matmul_under_te_linea
     weights = indexer._head_weights(x)
     assert weights.dtype == torch.float32
     torch.testing.assert_close(weights, x.float() @ indexer.weights_proj.weight.float().T)
+
+
+@pytest.mark.parametrize("autocast_enabled", [False, True])
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_head_weights_stay_fp32_under_bf16_autocast(config, sdpa_backend, autocast_enabled, ndim):
+    # The single-rank FSDP2 path wraps the model forward in a bf16 autocast; the head projection
+    # must still be an fp32 GEMM, not a bf16 GEMM whose result is cast afterwards.
+    indexer = GlmMoeDsaIndexer(config, sdpa_backend)
+    indexer.weights_proj.to(torch.bfloat16)
+    shape = (6, config.hidden_size) if ndim == 2 else (2, 3, config.hidden_size)
+    x = torch.randn(shape).to(torch.bfloat16)
+    oracle = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())  # autocast is off here
+
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast_enabled):
+        if autocast_enabled:
+            # Negative control: the unguarded cast-then-linear is autocast-eligible and comes back bf16.
+            unguarded = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
+            assert unguarded.dtype == torch.bfloat16
+        weights = indexer._head_weights(x)
+
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(weights, oracle, rtol=0, atol=0)
+
+
+def test_dense_indexer_forward_completes_under_bf16_autocast(config, sdpa_backend):
+    torch.manual_seed(3)
+    indexer = GlmMoeDsaIndexer(config, sdpa_backend).to(torch.bfloat16)
+    batch, seq_len = 2, 9
+    x = torch.randn(batch, seq_len, config.hidden_size).to(torch.bfloat16)
+    q_resid = torch.randn(batch, seq_len, config.q_lora_rank).to(torch.bfloat16)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = indexer(x, q_resid, _freqs(batch, seq_len, config.qk_rope_head_dim))
+
+    assert out.shape == (batch, seq_len, min(config.index_topk, seq_len))
+    assert out.dtype == torch.int64
+
+
+def test_head_weights_keep_installed_lora_adapter(config, sdpa_backend):
+    # LoRA patches ``weights_proj`` in place (it matches the default ``*_proj`` target); the head
+    # weights must include the adapter update instead of reading only the base weight.
+    from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+    from nemo_automodel.shared.peft_config import PeftConfig
+
+    torch.manual_seed(5)
+    indexer = GlmMoeDsaIndexer(config, sdpa_backend)
+    control = GlmMoeDsaIndexer(config, sdpa_backend)
+    control.load_state_dict(indexer.state_dict())
+    matched = apply_lora_to_linear_modules(
+        indexer,
+        PeftConfig(target_modules=["weights_proj"], dim=1, alpha=1, use_triton=False, use_memory_efficient_lora=False),
+    )
+    assert matched == 1
+    assert type(indexer.weights_proj) is not torch.nn.Linear
+    with torch.no_grad():
+        indexer.weights_proj.weight.zero_()
+        indexer.weights_proj.lora_A.weight.fill_(1.0)
+        indexer.weights_proj.lora_B.weight.fill_(1.0)
+
+    x = torch.ones(6, config.hidden_size)
+    adapted = indexer._head_weights(x)
+    assert adapted.dtype == torch.float32
+    # Zero base weight + rank-one all-ones adapter at scale alpha/dim = 1: every head sums the input.
+    torch.testing.assert_close(adapted, torch.full((6, config.index_n_heads), float(config.hidden_size)))
+    with torch.no_grad():
+        indexer.weights_proj.lora_B.weight.mul_(2.0)
+    torch.testing.assert_close(
+        indexer._head_weights(x), torch.full((6, config.index_n_heads), 2.0 * config.hidden_size)
+    )
+
+    # Unadapted control: the fp32 GEMM on the stored weight.
+    torch.testing.assert_close(control._head_weights(x), x @ control.weights_proj.weight.float().T)
+
+    # The adapted dense indexer still runs end to end.
+    batch, seq_len = 2, 5
+    out = indexer(
+        torch.randn(batch, seq_len, config.hidden_size),
+        torch.randn(batch, seq_len, config.q_lora_rank),
+        _freqs(batch, seq_len, config.qk_rope_head_dim),
+    )
+    assert out.shape == (batch, seq_len, min(config.index_topk, seq_len))

@@ -214,7 +214,14 @@ class GlmMoeDsaIndexer(nn.Module):
         self.weights_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False, dtype=dtype)
 
     def _head_weights(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-head indexer weights computed with an fp32 matmul.
+        """Per-head indexer weights in fp32.
+
+        The plain head runs one fp32 GEMM on the resident (bf16) weight with autocast disabled:
+        ``F.linear`` is autocast-eligible, so casting the operands alone would still produce bf16
+        under a bf16 autocast wrapper, and the dense scorer's autocast-disabled head reduction
+        needs fp32 operands. An installed adapter (LoRA/DoRA, possibly with dropout) overrides
+        ``forward``; it is called so its update, dropout and magnitude semantics are kept, and its
+        output is lifted to fp32.
 
         Args:
             x: Hidden states of shape ``[tokens, hidden]`` (THD) or ``[batch, sequence, hidden]``.
@@ -222,7 +229,11 @@ class GlmMoeDsaIndexer(nn.Module):
         Returns:
             fp32 tensor of shape ``x.shape[:-1] + [index_n_heads]``.
         """
-        return F.linear(x.float(), self.weights_proj.weight.float())
+        proj = self.weights_proj
+        if type(proj).forward is nn.Linear.forward:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                return F.linear(x.float(), proj.weight.float())
+        return proj(x).float()
 
     def forward(
         self,

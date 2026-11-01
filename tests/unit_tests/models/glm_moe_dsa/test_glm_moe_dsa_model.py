@@ -705,6 +705,10 @@ class TestPipelineHiddenStateOutput:
         torch.testing.assert_close(out, hidden, rtol=0, atol=0)  # the zero-weight carry link leaves values unchanged
         out.sum().backward()
         assert carry_in.grad is not None  # pipeline backward needs a defined gradient for the float32 carry
+        # ...and a dense one: an expanded (stride-0) zero gradient would become the pipeline's receive-buffer
+        # layout and be rejected as non-contiguous by the P2P backend.
+        assert carry_in.grad.is_contiguous()
+        torch.testing.assert_close(carry_in.grad, torch.zeros_like(carry_in), rtol=0, atol=0)
 
     def test_thd_last_stage_restores_batch_dim_for_hidden_output(self, config, backend_config):
         model = GlmMoeDsaForCausalLM(config, backend=backend_config)
