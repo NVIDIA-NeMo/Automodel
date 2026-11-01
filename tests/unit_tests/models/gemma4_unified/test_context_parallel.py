@@ -16,8 +16,7 @@
 
 With ``cp_mesh`` unset the contiguous shard is the identity and no ring is installed. The CP forward
 leaves all masking to the ring, so on a model whose sliding window covers the sequence it must
-reproduce the Hugging Face forward exactly; the ring itself is covered by the GPU parity test in
-``tests/functional_tests/context_parallel/run_gemma4_unified_cp.py``.
+reproduce the Hugging Face forward exactly; the ring itself needs two GPUs and is not exercised here.
 """
 
 import logging
