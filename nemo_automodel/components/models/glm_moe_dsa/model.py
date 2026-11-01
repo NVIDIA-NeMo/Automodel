@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from typing import Any, Union
 
@@ -36,7 +38,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     precompute_freqs_cis,
 )
 from nemo_automodel.components.models.glm_moe_dsa.cp import shard_glm_dsa_packed_cp_batch
-from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
+from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA, glm_dsa_indexer_replay
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -84,6 +86,27 @@ class Block(nn.Module):
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.layer_idx = layer_idx
+
+    def nemo_checkpoint_context_fn(
+        self,
+        context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Replay this block's DSA selection in its activation-checkpoint recompute.
+
+        The parallelizer composes this hook into the block's checkpoint context. A full indexer
+        layer records its top-k indices in the checkpoint forward and returns them in the recompute
+        (``GlmMoeDsaMLA._select_topk``); an IndexShare "shared" layer takes its indices from the
+        previous full layer and needs no replay.
+
+        Args:
+            context_fn: Existing forward/recompute context factory, or ``None``.
+
+        Returns:
+            The factory wrapped with selection replay for a full indexer layer, otherwise unchanged.
+        """
+        if self.skip_topk:
+            return context_fn
+        return glm_dsa_indexer_replay.checkpoint_context_fn(context_fn)
 
     def forward(
         self,

@@ -23,6 +23,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils._python_dispatch import _disable_current_modes
 
 # Try to import fast_hadamard_transform, fall back to torch implementation
 try:
@@ -82,7 +83,12 @@ from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
     tilelang_sparse_attention,
 )
 from nemo_automodel.components.models.glm_moe_dsa.rope_utils import mla_softmax_scale
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+# Record/replay channel for the frozen DSA selection across an activation-checkpoint recompute
+# (bound per checkpointed block call by ``Block.nemo_checkpoint_context_fn``).
+glm_dsa_indexer_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("GLM DSA frozen indexer selection")
 
 
 def _dsa_kernel_backend(backend: BackendConfig) -> str:
@@ -568,6 +574,49 @@ class GlmMoeDsaMLA(nn.Module):
         # reuse the previous full layer's top-k indices passed in via `prev_topk_indices`.
         self.indexer = None if skip_topk else GlmMoeDsaIndexer(config, backend)
 
+    def _select_topk(
+        self,
+        x: torch.Tensor,
+        q_resid: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        """Run the indexer, or replay its recorded selection during an activation-checkpoint recompute.
+
+        The selection is a deterministic function of the layer input and the indexer weights, and no
+        gradient reaches the indexer (its top-k indices are discrete and its scores feed nothing else),
+        so a checkpointed block records the indices in its forward and hands them back in the recompute
+        instead of re-running the score GEMM, the top-k and the index canonicalization. Outside a replay
+        scope (no activation checkpointing, or a block wrapped without ``Block.nemo_checkpoint_context_fn``)
+        the indexer runs as before.
+
+        Args:
+            x: Hidden states of shape ``[batch, sequence, hidden]`` or packed ``[tokens, hidden]``.
+            q_resid: Normalized query-LoRA residual with the token axes of ``x``.
+            freqs_cis: Rotary tensor for the indexer's rope slice.
+            attention_mask: Optional key mask forwarded to the indexer.
+            **attn_kwargs: Attention metadata forwarded to the indexer.
+
+        Returns:
+            Top-k index tensor in the layout documented by :meth:`GlmMoeDsaIndexer.forward`.
+        """
+        replay = glm_dsa_indexer_replay.current()
+        if replay is None:
+            return self.indexer(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
+        recorder, mode = replay
+        if mode == "replay":
+            recorded = recorder.take()
+            if recorded is not None:
+                return recorded
+        # Keep the recorded region out of selective-checkpointing op accounting: it has no
+        # differentiable output and the recompute deliberately skips it.
+        with _disable_current_modes(), torch.no_grad():
+            selected = self.indexer(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
+        if mode == "record":
+            recorder.record(selected)
+        return selected
+
     def _build_sparse_mask(
         self,
         topk_indices: torch.Tensor,
@@ -698,7 +747,7 @@ class GlmMoeDsaMLA(nn.Module):
         # Get top-k indices: run our own indexer ("full" layer), or reuse the previous
         # full layer's selection ("shared" layer, GLM IndexShare).
         if self.indexer is not None:
-            topk_indices = self.indexer(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
+            topk_indices = self._select_topk(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
         else:
             if prev_topk_indices is None:
                 raise ValueError(
