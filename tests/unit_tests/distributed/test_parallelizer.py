@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, create_autospec, patch
 import pytest
 import torch
 import torch.nn as nn
+from packaging.version import Version
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -30,6 +31,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
+from nemo_automodel.components.distributed import fsdp_patches
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 from nemo_automodel.components.distributed.parallelizer import (
@@ -65,6 +67,7 @@ def test_fsdp_accumulated_grad_guard_only_handles_missing_unsharded_param(monkey
 
     fake_module = SimpleNamespace(FSDPParam=FakeFSDPParam)
     monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_module)
+    monkeypatch.setattr(fsdp_patches, "get_torch_version", lambda: Version("2.14.1"))
 
     parallelizer._patch_fsdp_accumulated_grad_guard()
 
@@ -84,6 +87,22 @@ def test_fsdp_accumulated_grad_guard_only_handles_missing_unsharded_param(monkey
     wrapped = FakeFSDPParam.to_accumulated_grad_if_needed
     parallelizer._patch_fsdp_accumulated_grad_guard()
     assert FakeFSDPParam.to_accumulated_grad_if_needed is wrapped
+
+
+@pytest.mark.parametrize("version", ["2.15.0", "2.15.0a0+git1234.nv26.10"])
+def test_fsdp_accumulated_grad_guard_skips_torch_2_15(monkeypatch, version):
+    """torch 2.15 has no to_accumulated_grad_if_needed, so the guard leaves FSDPParam alone."""
+
+    class FakeFSDPParam:
+        pass
+
+    fake_module = SimpleNamespace(FSDPParam=FakeFSDPParam)
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_module)
+    monkeypatch.setattr(fsdp_patches, "get_torch_version", lambda: Version(version))
+
+    parallelizer._patch_fsdp_accumulated_grad_guard()
+
+    assert not hasattr(FakeFSDPParam, "to_accumulated_grad_if_needed")
 
 
 class MockModel(nn.Module):
@@ -2674,7 +2693,7 @@ class TestSingleGpuActivationCheckpointing:
         monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
         config = FSDP2Config(activation_checkpointing=activation_checkpointing)
         context = SimpleNamespace(
-            device_mesh=MagicMock(),
+            device_mesh=MagicMock(device_type="cpu"),
             cp_size=1,
             ep_size=1,
             strategy_config=config,

@@ -125,13 +125,13 @@ and audio inputs are not supported by that path.
 - Activation checkpointing and separate dense and MoE
   `reshard_after_forward` controls.
 - Transformer Engine and MagiAttention backends, TE linear layers, HybridEP
-  dispatch, and native `torch_mm` grouped experts.
+  dispatch, and native `torch_mm` or TE GroupedLinear (`experts: te`) grouped
+  experts.
 - Compiled normalization, QK-normalization/RoPE fusion, and
   output-normalization/gate fusion.
 - Fused LM head plus cross entropy with the checkpoint's logit soft cap of 20.
 
-Tensor parallelism greater than one and TE GroupedLinear experts are not
-supported for this architecture. Preserve each recipe's batch and parallelism
+Tensor parallelism greater than one is not supported for this architecture. Preserve each recipe's batch and parallelism
 relationships when adapting a launch.
 
 See the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared

@@ -103,14 +103,17 @@ The example tokenizes `messages`-format data with
 [`deepseek_v41_flash_training_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_training_chat_template.jinja),
 a copy of the checkpoint's released `chat_template.jinja` that renders the same
 prompt text and adds `{% generation %}` spans, so only assistant output is
-supervised. The DSpark recipe has no option for chat template arguments, so
-the copy defaults to chat (non-thinking) mode instead of the released thinking
-default, and it rejects assistant turns that carry `reasoning_content`, which
-chat mode would drop. For such data, set `default_thinking_mode` to
-`"thinking"` in the template so training matches thinking-mode serving. An
-offline cache built with a different template keeps its framing; when
-`chat_template` is set, training from that cache logs a warning until the
-cache is rebuilt.
+supervised. The copy defaults to chat (non-thinking) mode instead of the
+released thinking default, and it rejects assistant turns that carry
+`reasoning_content`, which chat mode would drop. For such data, set
+`chat_template_kwargs: {thinking_mode: thinking}` in `recipe_args` so training
+matches thinking-mode serving; the single-process `precompute_dspark` takes
+the same mapping as `--chat-template-kwargs '{"thinking_mode": "thinking"}'`.
+The cache manifest records the template and these arguments, and an offline
+cache keeps the framing it was built with. Training from a cache rejects
+`chat_template_kwargs` that differ from the recorded ones (unset counts as
+none), and logs a warning when `chat_template` is set to a different template;
+rebuild the cache to change either.
 
 The following settings are fixed by the released checkpoint and the recipe
 rejects mismatches:

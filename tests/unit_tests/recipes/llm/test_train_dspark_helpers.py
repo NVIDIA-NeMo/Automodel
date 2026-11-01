@@ -56,6 +56,7 @@ from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics
 from nemo_automodel.recipes.llm import train_dspark
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_backend,
+    chat_template_kwargs_from,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
     resolve_reduced_target_layers,
@@ -783,6 +784,7 @@ def _validate_cached_manifest(manifest=None, target_config=None, target_layer_id
         seq_length=kwargs.pop("seq_length", 8),
         compute_dtype=kwargs.pop("compute_dtype", torch.float32),
         chat_template_sha256=kwargs.pop("chat_template_sha256", "sha-current"),
+        chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
     )
 
 
@@ -803,6 +805,56 @@ def test_cached_dspark_manifest_warns_only_on_a_chat_template_mismatch(caplog, o
     caplog.set_level("WARNING")
     _validate_cached_manifest(manifest=_cached_manifest(**overrides), chat_template_sha256=configured)
     assert ("chat template (sha256 sha-old)" in caplog.text) == warns
+
+
+@pytest.mark.parametrize(
+    ("recipe_args", "expected"),
+    [
+        ({}, None),
+        ({"chat_template_kwargs": {"thinking_mode": "thinking"}}, {"thinking_mode": "thinking"}),
+        ({"chat_template_kwargs": "thinking"}, "thinking"),  # left for the dataset to reject
+    ],
+)
+def test_chat_template_kwargs_from_reads_a_plain_mapping(recipe_args, expected):
+    kwargs = chat_template_kwargs_from(ConfigNode({"recipe_args": recipe_args}).recipe_args)
+    assert kwargs == expected
+    assert kwargs is None or type(kwargs) in (dict, str)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "configured"),
+    [
+        ({}, None),
+        ({}, {}),
+        ({"chat_template_kwargs": {"thinking_mode": "chat"}}, {"thinking_mode": "chat"}),
+        # Top-level kwargs are read by name, so their order does not change the render.
+        ({"chat_template_kwargs": {"a": 1, "opts": {"y": 1, "x": 2}}}, {"opts": {"y": 1, "x": 2}, "a": 1}),
+    ],
+)
+def test_cached_dspark_manifest_accepts_matching_chat_template_kwargs(overrides, configured):
+    # A manifest without the field predates it; read_manifest reads it as {} (no kwargs).
+    _validate_cached_manifest(manifest=_cached_manifest(**overrides), chat_template_kwargs=configured)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "configured"),
+    [
+        # A run that sets none renders with none, so a cache built with kwargs does not match it.
+        ({"chat_template_kwargs": {"thinking_mode": "thinking"}}, None),
+        ({"chat_template_kwargs": {"thinking_mode": "chat"}}, {"thinking_mode": "thinking"}),
+        ({}, {"thinking_mode": "thinking"}),
+        ({}, "thinking"),
+        # Equal under Python ==, but a template renders them differently (tojson: false vs 0).
+        ({"chat_template_kwargs": {"mode": False}}, {"mode": 0}),
+        ({"chat_template_kwargs": {"opts": {"mode": 1}}}, {"opts": {"mode": 1.0}}),
+        # Equal under Python ==, but a template iterating the nested mapping renders another order.
+        ({"chat_template_kwargs": {"opts": {"b": 2, "a": 1}}}, {"opts": {"a": 1, "b": 2}}),
+        ({"chat_template_kwargs": {"opts": [{"b": 2, "a": 1}]}}, {"opts": [{"a": 1, "b": 2}]}),
+    ],
+)
+def test_cached_dspark_manifest_rejects_chat_template_kwargs_mismatch(overrides, configured):
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        _validate_cached_manifest(manifest=_cached_manifest(**overrides), chat_template_kwargs=configured)
 
 
 def test_cached_dspark_manifest_warns_on_target_path_mismatch(caplog):
