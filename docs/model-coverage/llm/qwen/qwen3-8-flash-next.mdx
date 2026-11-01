@@ -129,12 +129,30 @@ setup.
   `BlockMask`, avoiding materialized dense per-head attention scores; the same
   code path serves dense, packed, and context-parallel layouts. CPU execution
   retains a bounded-workspace PyTorch numerical oracle; tests can also call
-  that oracle directly. CUDA execution requires the `flex` backend and never
-  silently falls back. The
+  that oracle directly. CUDA execution never silently falls back. The
   discrete QSA indexers are frozen because the supplied inference reference
   and checkpoint define neither an indexer auxiliary loss nor a
   straight-through estimator; main attention Q/K/V and the rest of the
   backbone remain trainable.
+- `model.backend.attn=cudnn` selects experimental cuDNN Frontend indexed QSA forward and
+  backward on Blackwell SM100/SM103. Install the optional runtime with
+  `uv pip install "nvidia-cudnn-frontend[cutedsl]>=1.32.1"`. It requires BF16,
+  head dimension 256, 24Q/2KV (or 12Q/1KV),
+  `indexer_compress_ratio=4`, `indexer_budget<=2048`, and CP=1. The existing
+  frozen indexer, route IDs, softmax scale, and projection weights are retained.
+  Packed document offsets, right-tail padding and empty route rows are supported.
+  The adapter pads route width to a multiple of four and packs batch-local IDs;
+  it does not build a quadratic token-membership bitmap. The 24Q/2KV geometry
+  runs two independent 12Q/1KV calls and includes their packing/copy costs.
+  First-order autograd saves cuDNN's original FP32 output and natural-log LSE;
+  backward uses atomic accumulation and is not bitwise deterministic.
+  This adapter explicitly uses the general backward path; the specialized
+  `causal_topk` backward is not enabled. Strict BF16 agreement with Flex at
+  sequence length 4096 has not been established.
+  Deterministic training requests and CP>1 are rejected explicitly. Use `flex`
+  for context parallelism. Kernel support does not establish full-model MFU or
+  training-convergence parity; validate those for the intended recipe before
+  changing its backend.
 - Context parallelism uses contiguous rank-ordered sequence shards. QSA keeps
   queries local and gathers compressed index keys plus differentiable main
   K/V; GatedDeltaNet uses FLA's contiguous CP recurrence; Engram hashes replicated
