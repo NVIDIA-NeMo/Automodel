@@ -24,6 +24,7 @@ import importlib
 import inspect
 import logging
 import types
+from typing import Any, cast
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -150,6 +151,65 @@ def _patch_attention(obj, sdpa_method=None):
 
     logger.info("Patched model with SDPA method= %s", sdpa_method)
     return obj
+
+
+def _sdpa_with_mask_dtype(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """Align a dense additive mask to projected Q/K/V, including under autocast.
+
+    Args:
+        module: HF-dispatched attention module, including native dense models.
+        query: Projected queries [B, Hq, Sq, D].
+        key: Projected keys [B, Hkv, Sk, D].
+        value: Projected values [B, Hkv, Sk, D].
+        attention_mask: Additive or boolean mask [B, 1, Sq, Sk], or None.
+        **kwargs: Unmodified HF attention options, including dropout and scaling.
+
+    Returns:
+        Attention output [B, Sq, Hq, D] and no attention weights.
+    """
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    if attention_mask is not None and attention_mask.ndim == 4 and attention_mask.is_floating_point():
+        # Parameter/input dtypes can differ from Q/K/V under autocast. Keep bool
+        # masks boolean and leave the caller's reusable mask storage untouched.
+        # RoPE can promote Q/K back to FP32 before SDPA autocasts them again.
+        # Match the dtype at SDPA dispatch, not that intermediate promotion.
+        dtype = (
+            torch.get_autocast_dtype(query.device.type) if torch.is_autocast_enabled(query.device.type) else query.dtype
+        )
+        attention_mask = attention_mask.to(device=query.device, dtype=dtype)
+    return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)
+
+
+def configure_sdpa_mask_dtype(model: torch.nn.Module) -> None:
+    """Select a model-local SDPA adapter for a validated dense EOD-mask consumer.
+
+    Register a separate HF dispatch key rather than replacing the stock SDPA
+    entry or torch's function. Reuse SDPA's mask builder so 2D validity, causal
+    attention and boolean packing masks retain their existing interpretation.
+    Backend selection remains owned by the existing SDPA resolver.
+
+    Args:
+        model: Built model, after Megatron reset capability validation.
+    """
+    from transformers import PretrainedConfig
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    model = getattr(model, "module", model)
+    config = cast(PretrainedConfig, model.config)
+    if config._attn_implementation != "sdpa":
+        return
+    ALL_ATTENTION_FUNCTIONS.register("automodel_sdpa", _sdpa_with_mask_dtype)
+    ALL_MASK_ATTENTION_FUNCTIONS.register("automodel_sdpa", ALL_MASK_ATTENTION_FUNCTIONS["sdpa"])
+    config._attn_implementation = "automodel_sdpa"
 
 
 def _patch_liger_kernel(model):

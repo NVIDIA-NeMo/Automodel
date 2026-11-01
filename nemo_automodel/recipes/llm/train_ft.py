@@ -32,7 +32,7 @@ import pathlib
 import time
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -60,11 +60,12 @@ from nemo_automodel._transformers.infrastructure import (
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
+from nemo_automodel._transformers.kernel_patches import configure_sdpa_mask_dtype
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
-from nemo_automodel.components.datasets.loader import DataloaderConfig
+from nemo_automodel.components.datasets.loader import DataloaderConfig, NeatPackingConfig, ThdPackingConfig
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
@@ -92,7 +93,7 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
-from nemo_automodel.components.models.common.packing import PackingCapabilities
+from nemo_automodel.components.models.common.packing import PackingCapabilities, validate_megatron_reset_support
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -764,6 +765,54 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             sdpa_method=self.cfg.get("sdpa_method", None),
             load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
+        # CP drops Megatron's dense EOD mask; repacking rebuilds boundaries per sample.
+        from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretrainingConfig
+
+        training_loader = self.cfg.dataloader
+        for loader_config in (training_loader, *self.cfg.validation_dataloaders.values()):
+            if loader_config is None:
+                continue
+            dataset_config = loader_config.dataset_config
+            if not isinstance(dataset_config, MegatronPretrainingConfig):
+                continue
+            packing_model = model.parts[0] if isinstance(model, AutoPipeline) else cast(nn.Module, model)
+            repacks = (
+                isinstance(loader_config.packing, (NeatPackingConfig, ThdPackingConfig))
+                and not loader_config.packing.prepacked
+                and (isinstance(loader_config.packing, NeatPackingConfig) or _supports_seq_lens(packing_model))
+                and (
+                    loader_config is training_loader
+                    or _should_pack_validation(training_loader, loader_config, packing_model)
+                )
+            )
+            if dataset_config.reset_attention_mask and (self.mesh_context.cp_size > 1 or repacks):
+                if self.mesh_context.cp_size > 1:
+                    combination = f"cp_size={self.mesh_context.cp_size}"
+                    reason = "the dense attention_mask has no supported CP transport"
+                else:
+                    strategy = "NEAT" if isinstance(loader_config.packing, NeatPackingConfig) else "THD"
+                    combination = f"loader-side {strategy} packing"
+                    reason = f"{strategy} replaces intra-sample EOD attention boundaries with sample boundaries"
+                raise ValueError(
+                    "MegatronPretraining reset_attention_mask=True is not supported with "
+                    f"{combination} for {type(model).__name__}: {reason}, so intra-sample EOD document isolation "
+                    "cannot be guaranteed. Use cp_size=1 without loader-side sequence packing and with a "
+                    "mask-consuming backend such as HF eager or SDPA."
+                )
+            if dataset_config.reset_position_ids or dataset_config.reset_attention_mask:
+                validate_megatron_reset_support(
+                    packing_model,
+                    reset_position_ids=dataset_config.reset_position_ids,
+                    reset_attention_mask=dataset_config.reset_attention_mask,
+                    # Actual repacking overrides an explicitly configured collator.
+                    uses_thd=isinstance(loader_config.packing, ThdPackingConfig)
+                    if repacks
+                    else replace(loader_config, packing=None).emits_thd,
+                    repacks_neat=repacks and isinstance(loader_config.packing, NeatPackingConfig),
+                    cp_size=self.mesh_context.cp_size,
+                )
+                if dataset_config.reset_attention_mask:
+                    configure_sdpa_mask_dtype(packing_model)
         self.embedding_row_repair_report = None
         embedding_row_repair = self.cfg.embedding_row_repair
         if embedding_row_repair is not None and embedding_row_repair.enabled:

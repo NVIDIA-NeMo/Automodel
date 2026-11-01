@@ -339,6 +339,9 @@ def _model_attn_implementation(model: torch.nn.Module) -> str | None:
     # DDP does not proxy attribute access to the model it wraps, so read through it.
     model = getattr(model, "module", model)
     attn_implementation = getattr(getattr(model, "config", None), "_attn_implementation", None)
+    if attn_implementation == "automodel_sdpa":
+        # The EOD-mask adapter retains SDPA's attention and packing contracts.
+        return "sdpa"
     if attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS or attn_implementation in ("sdpa", "eager"):
         return attn_implementation
     try:
@@ -383,6 +386,92 @@ def get_model_attn_implementation(model: torch.nn.Module) -> str:
 
 # FlashAttentionKwargs the collater emits and the flash varlen path consumes.
 _PACKED_VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+
+
+def validate_megatron_reset_support(
+    model: torch.nn.Module,
+    *,
+    reset_position_ids: bool,
+    reset_attention_mask: bool,
+    uses_thd: bool,
+    repacks_neat: bool,
+    cp_size: int,
+) -> None:
+    """Validate independent EOD rotary positions and attention boundaries.
+
+    Packing/CP capability flags alone do not guarantee preservation of either
+    field. Inspect transport before attention: the sharder prioritizes backend.attn
+    even on native models that otherwise dispatch BSHD attention through HF.
+
+    Args:
+        model: Built model whose actual attention dispatch is inspected.
+        reset_position_ids: Whether EOD-relative rotary positions are requested.
+        reset_attention_mask: Whether intra-sample EOD isolation is requested.
+        uses_thd: Whether the resolved loader emits THD sequence lengths.
+        repacks_neat: Whether the loader actually constructs NEAT sample boundaries.
+        cp_size: Configured context-parallel world size.
+
+    Raises:
+        ValueError: If the consumer has no supported contract for these resets.
+    """
+    if not (reset_position_ids or reset_attention_mask):
+        return
+    model = getattr(model, "module", model)
+    backend = getattr(model, "backend", None)
+    native = isinstance(backend, AttentionBackendSelection)
+    hf_consumer = isinstance(model, _HFAttentionConsumer) and model._uses_hf_attention
+    implementation = get_model_attn_implementation(model)
+    transport = backend.attn if native else implementation
+    reason = None
+    if transport == "magi" and (not native or cp_size > 1):
+        reason = (
+            "magi dispatch rebuilds rotary positions from physical token indices and discards the EOD mask"
+            if not native or uses_thd
+            else "magi BSHD CP has no supported transport for independent EOD resets"
+        )
+    elif reset_attention_mask and uses_thd:
+        reason = "the THD collator cannot consume the dense EOD attention_mask as token validity or seq_lens"
+    elif native and not hf_consumer:
+        reason = "this native model has no validated contract preserving supplied rotary positions and dense EOD masks"
+    elif transport != "magi" and hasattr(model, "prepare_model_inputs_for_cp") and (cp_size > 1 or uses_thd):
+        reason = "model-owned CP/THD preparation has no validated transport for independent EOD resets"
+    elif (
+        uses_thd
+        and native
+        and hf_consumer
+        and transport == "te"
+        and (attention_layers := [module for name, module in model.named_modules() if name.endswith("self_attn")])
+        and all(getattr(module, "_te_thd_only", False) for module in attention_layers)
+    ):
+        # Dense native HF consumers use TE only for THD. The framework transports
+        # supplied positions alongside tokens; physical cu_seqlens control attention.
+        return
+    elif uses_thd:
+        reason = "HF attention does not consume THD seq_lens as physical attention boundaries"
+    elif not _model_attn_implementation(model):
+        reason = "the active HF attention dispatch is unresolved; a default backend name is not a reset contract"
+    elif cp_size > 1 and getattr(model, "_te_attention_injected", False):
+        reason = (
+            "injected TE BSHD CP does not install the HF causal-mask hooks required for independent position resets"
+        )
+    elif cp_size > 1 and (repacks_neat or implementation != "sdpa"):
+        reason = "BSHD CP requires SDPA causal attention without NEAT boundaries, which its mask-stripping hooks remove"
+    elif reset_attention_mask and implementation not in ("eager", "sdpa"):
+        reason = "this attention backend does not consume the dense additive EOD attention_mask"
+    elif implementation in _FLASH_ATTN_IMPLEMENTATIONS and not repacks_neat:
+        reason = "HF flash attention discards an all-valid mask and infers segmentation from reset positions"
+    elif implementation == "eager" and repacks_neat:
+        reason = "HF eager attention requires an additive mask, but NEAT supplies a boolean block mask"
+    elif implementation not in ("eager", "sdpa", *_FLASH_ATTN_IMPLEMENTATIONS):
+        reason = "this attention dispatch has no validated independent rotary-position and attention-mask contract"
+    if reason is not None:
+        raise ValueError(
+            f"reset_position_ids={reset_position_ids} with reset_attention_mask={reset_attention_mask} "
+            "is not supported by this "
+            f"{implementation} loader: {reason}. Rotary positions and EOD isolation must remain independent. "
+            "Use cp_size=1 with HF eager or SDPA, the default collator and no loader-side packing; "
+            "for position-only resets, SDPA or HF flash NEAT packing is also supported."
+        )
 
 
 def validate_flash_packing_support(attn_implementation: str = "sdpa", model: torch.nn.Module | None = None) -> None:

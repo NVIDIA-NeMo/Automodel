@@ -76,6 +76,32 @@ class TestGreedyKnapsack:
 
 
 class TestBuildPackedSample:
+    def test_preserves_supplied_positions(self):
+        positions = [0, 0, 1]
+        tensor_positions = torch.tensor([0, 0])
+        samples = [
+            {"input_ids": [99, 11, 12], "labels": [-100, 12, 99], "position_ids": positions},
+            {"input_ids": [99, 13], "labels": [-100, 14], "position_ids": tensor_positions},
+            {"input_ids": [15, 16], "labels": [16, 99]},
+        ]
+        packed = _build_packed_sample(samples, pack_size=9, padding_idx=0)
+        assert packed["position_ids"].tolist() == [0, 0, 1, 0, 0, 0, 1, 0, 0]
+        assert packed["labels"].tolist() == [-100, 12, 99, -100, 14, 16, 99, -100, -100]
+        assert packed["attention_mask"].tolist() == [1, 1, 1, 2, 2, 3, 3, 0, 0]
+        assert positions == [0, 0, 1]
+        assert tensor_positions.tolist() == [0, 0]
+
+    @pytest.mark.parametrize("positions", [[0], torch.zeros(3, 1)])
+    def test_rejects_misaligned_positions(self, positions):
+        """Reject positions that cannot describe the sample.
+
+        Args:
+            positions: Positions expected to have shape [sequence], with sequence=3.
+        """
+        sample = {"input_ids": [99, 11, 12], "labels": [11, 12, 99], "position_ids": positions}
+        with pytest.raises(ValueError, match="position_ids.*one.*input token"):
+            _build_packed_sample([sample], pack_size=3, padding_idx=0)
+
     def test_basic(self):
         samples = [
             {"input_ids": [1, 2, 3], "labels": [-100, -100, 10]},

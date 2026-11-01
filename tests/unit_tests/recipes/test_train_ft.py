@@ -20,6 +20,7 @@ import types
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -998,7 +999,7 @@ def _minimal_cfg_with_nvtx(nvtx_value: bool, optimizer_target: str | None = None
     )
 
 
-def _patch_setup_minimals(monkeypatch, patch_fn):
+def _patch_setup_minimals(monkeypatch, patch_fn, cp_size=1):
     """Patch heavy dependencies so TrainFinetuneRecipeForNextTokenPrediction.setup runs lightly."""
     # Lightweight distributed/env/logging
     monkeypatch.setattr(
@@ -1035,7 +1036,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
                 pp_enabled=False,
                 device_mesh=None,
                 moe_mesh=None,
-                cp_size=1,
+                cp_size=cp_size,
                 pp_size=1,
             ),
             strategy_config=None,
@@ -1064,6 +1065,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         property(
             lambda self: SimpleNamespace(
                 build=lambda **k: "dl",
+                dataset_config=None,
                 dataset_builds_on_all_ranks=False,
                 seed=42,
             )
@@ -1184,6 +1186,940 @@ def test_nvtx_false_skips_patching(monkeypatch):
 
     assert trainer.enable_nvtx is False
     assert patch_calls == []
+
+
+@pytest.mark.parametrize(
+    "split,cp_size,reset_attention,packing,error,reset_positions,backend",
+    [
+        (*case, True, "sdpa")
+        for case in [
+            ("train", 2, True, None, "cp_size=2"),
+            ("validation", 2, True, None, "cp_size=2"),
+            ("train", 2, False, None, None),
+            ("train", 1, True, None, None),
+            ("train", 2, False, "te", None),
+            ("train", 1, False, "native_te", None),
+            ("train", 2, False, "native_te", None),
+            ("train", 2, True, "te", "cp_size=2"),
+            ("train", 1, True, "neat", "NEAT"),
+            ("packed_validation", 1, True, "neat", "NEAT"),
+            ("validation", 1, True, "neat", None),
+            ("train", 1, False, "neat", None),
+            ("train", 1, True, "neat_prepacked", None),
+            ("packed_validation", 1, True, "thd", "THD"),
+            ("validation", 1, True, "thd", None),
+            ("train", 1, True, "thd_prepacked", None),
+        ]
+    ]
+    + [
+        ("train", 1, False, None, "magi", True, "magi"),
+        ("train", 1, True, None, "magi", False, "magi"),
+        ("validation", 1, True, None, "magi", True, "magi"),
+        ("train", 2, False, "thd", "magi", True, "native_magi"),
+        ("train", 2, False, None, "magi BSHD CP", True, "native_magi"),
+        ("packed_validation", 2, False, "thd", "magi", True, "native_magi"),
+        ("train", 1, True, "explicit_thd", "THD collator", False, "sdpa"),
+        ("validation", 1, True, "explicit_thd", "THD collator", True, "sdpa"),
+        ("train", 1, False, "explicit_thd", "THD", True, "injected_te"),
+        ("train", 1, False, None, "flash_attention_2", True, "injected_flash"),
+        ("train", 1, False, None, "native", True, "native_sdpa"),
+        ("train", 1, True, None, "native", False, "native_sdpa"),
+        ("train", 1, False, None, "flex_attention", True, "flex_attention"),
+        ("train", 2, False, None, "injected TE", True, "injected_te"),
+        ("train", 2, False, "neat", "BSHD CP", True, "native_hf_te"),
+        ("train", 2, False, None, "BSHD CP", True, "eager"),
+        ("train", 1, False, None, "unresolved", True, "unspecified"),
+        ("train", 1, True, None, "flash_attention_2", False, "flash_attention_2"),
+        ("train", 1, False, None, None, False, "magi"),
+        ("train", 1, False, None, None, False, "native_sdpa"),
+    ],
+)
+def test_setup_validates_megatron_attention_reset(
+    monkeypatch, split, cp_size, reset_attention, packing, error, reset_positions, backend
+):
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from nemo_automodel._transformers.capabilities import attach_capabilities_and_validate
+    from nemo_automodel.components.models.common import BackendConfig
+
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    cfg.distributed.cp_size = cp_size
+    if backend == "magi":
+        cfg.model.attn_implementation = "magi"
+    elif backend.startswith("native_") or packing == "native_te":
+        cfg.model.backend = ConfigNode(
+            {
+                "attn": "magi"
+                if backend == "native_magi"
+                else "te"
+                if backend == "native_hf_te" or packing == "native_te"
+                else "sdpa"
+            }
+        )
+    dataset = {
+        "_target_": "nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining",
+        "paths": "unused",
+        "create_attention_mask": reset_attention,
+        "reset_attention_mask": reset_attention,
+        "reset_position_ids": reset_positions,
+        "eod_mask_loss": True,
+    }
+    cfg.dataset = ConfigNode(
+        dataset if split == "train" else {**dataset, "reset_attention_mask": False, "reset_position_ids": False}
+    )
+    if split != "train":
+        cfg.validation_dataset = ConfigNode(dataset)
+    if split == "packed_validation":
+        # An explicit THD collator keeps validation packing enabled even when
+        # ordinary HF validation would discard its inherited packing config.
+        cfg.validation_dataloader.collate_fn = ConfigNode(
+            {"_target_": "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"}
+        )
+    if packing == "explicit_thd":
+        selected = cfg.dataloader if split == "train" else cfg.validation_dataloader
+        selected.collate_fn = ConfigNode(
+            {"_target_": "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"}
+        )
+    elif packing is not None:
+        if packing == "te" and not reset_attention:
+            cfg.dataset = ConfigNode({"_target_": "nemo_automodel.components.datasets.llm.squad.make_squad_dataset"})
+        cfg.packed_sequence = ConfigNode(
+            {
+                "packed_sequence_size": 8,
+                "packing_strategy": "thd" if packing in ("te", "native_te", "thd", "thd_prepacked") else "neat",
+                "prepacked": packing in ("neat_prepacked", "thd_prepacked"),
+            }
+        )
+    typed_cfg = RecipeConfig(cfg)
+    train_loader = typed_cfg.dataloader
+    val_loaders = typed_cfg.validation_dataloaders
+    _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None, cp_size=cp_size)
+    if backend in ("magi", "native_magi"):
+        from nemo_automodel.components.distributed.context_parallel import magi
+
+        # Real setup_magi still selects HF/custom transport; only optional
+        # kernel availability/registration is replaced on the CPU runner.
+        monkeypatch.setattr(magi, "is_magi_available", lambda: True)
+        monkeypatch.setattr(magi, "register_magi_attention", lambda: None)
+        monkeypatch.setattr(magi, "_ACTIVE_CP_GROUP", magi.get_active_cp_group())
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: train_loader))
+    monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: val_loaders))
+
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(123)
+        model_config = LlamaConfig(
+            vocab_size=32,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            attn_implementation="sdpa",
+            tie_word_embeddings=False,
+        )
+        if backend.startswith("native_") and backend != "native_hf_te":
+            from transformers import Qwen3MoeConfig
+
+            from nemo_automodel.components.models.qwen3_moe import layers
+            from nemo_automodel.components.models.qwen3_moe import model as native_qwen
+
+            rotary = native_qwen.RotaryEmbedding
+            monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+            monkeypatch.setattr(
+                native_qwen, "RotaryEmbedding", lambda **k: rotary(**{**k, "device": torch.device("cpu")})
+            )
+            # Only the unavailable Magi kernel constructor is replaced. Native
+            # model capabilities and the recipe's packed-CP checks remain real.
+            if backend == "native_magi":
+                monkeypatch.setattr(layers, "initialize_attn_module_and_func", lambda **k: (None, None))
+            model = native_qwen.Qwen3MoeForCausalLM(
+                Qwen3MoeConfig(
+                    vocab_size=32,
+                    hidden_size=8,
+                    intermediate_size=16,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    head_dim=4,
+                    num_experts=0,
+                    num_experts_per_tok=1,
+                    torch_dtype="float32",
+                    tie_word_embeddings=False,
+                ),
+                backend=BackendConfig(attn=backend.removeprefix("native_"), linear="torch", rms_norm="torch_fp32"),
+            )
+        elif packing == "native_te" or backend == "native_hf_te":
+            from nemo_automodel.components.models.llama import model as native_llama
+
+            monkeypatch.setattr(native_llama, "initialize_attn_module_and_func", lambda **k: (None, None))
+            model = native_llama.LlamaForCausalLM(
+                model_config, backend=BackendConfig(attn="te", linear="torch", rms_norm="torch_fp32")
+            )
+        else:
+            model = LlamaForCausalLM(model_config)
+            if backend in ("magi", "flex_attention", "flash_attention_2", "eager"):
+                model.config._attn_implementation = backend
+            if backend == "unspecified":
+                model.config._attn_implementation = None
+            if backend in ("injected_te", "injected_flash"):
+                from nemo_automodel._transformers import te_attention
+
+                monkeypatch.setattr(te_attention, "_create_te_dot_product_attention", lambda **k: nn.Identity())
+                te_attention.inject_te_attention(model)
+                assert model._te_attention_injected
+                if backend == "injected_flash":
+                    model.config._attn_implementation = "flash_attention_2"
+    # Keep real HF capability validation; only process-group/model placement and
+    # data construction are stubbed so setup can be exercised without GPUs/files.
+    if packing == "te":
+        # Exercise packed-CP admission without executing TE kernels.
+        model.backend = BackendConfig(attn="te")
+    attach_capabilities_and_validate(model, SimpleNamespace(cp_size=cp_size))
+    if packing == "te":
+        assert train_loader.emits_thd
+        assert model.supports_cp_with_sequence_packing
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *a, **k: model)
+    built_loaders = []
+
+    def build_loader(self, **kwargs):
+        built_loaders.append(self)
+        return "dl"
+
+    monkeypatch.setattr(DataloaderConfig, "build", build_loader)
+    forward = MagicMock(side_effect=AssertionError("setup must reject before forward"))
+    model.register_forward_pre_hook(forward)
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(typed_cfg)
+    if error is not None:
+        with pytest.raises(
+            ValueError, match=f"reset_.*{error}.*SDPA|reset_attention_mask=True.*{error}.*EOD.*cp_size=1"
+        ):
+            trainer.setup()
+        assert built_loaders == []
+    else:
+        trainer.setup()
+        assert len(built_loaders) == (1 if split == "train" else 2)
+        if split == "validation" and packing in ("neat", "thd"):
+            assert built_loaders[1].packing is None
+    forward.assert_not_called()
+    if backend in ("magi", "native_magi"):
+        assert trainer.magi.enabled
+        assert trainer.magi.custom is (backend == "native_magi")
+
+
+@pytest.fixture
+def _single_rank_gloo(tmp_path):
+    torch.distributed.init_process_group("gloo", init_method=(tmp_path / "gloo").as_uri(), rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.runtime_budget(
+    30, hard_timeout=120, reason="Builds real indexed data and loads the CPU indexing extension."
+)
+@pytest.mark.parametrize(
+    "route,attention_implementation,eod_mask_loss",
+    [
+        ("neat", "sdpa", False),
+        ("neat", "sdpa", True),
+        ("no_packing", "sdpa", True),
+        ("prepacked", "sdpa", True),
+        ("packed_validation", "sdpa", True),
+        ("validation", "sdpa", True),
+        ("no_positions", "sdpa", False),
+        ("no_eod", "sdpa", True),
+        ("thd_train", "eager", False),
+        ("thd_train", "sdpa", True),
+        ("thd_validation", "sdpa", False),
+        ("thd_validation", "sdpa", True),
+        ("thd_prepacked", "sdpa", True),
+        ("thd_packing_serial", "eager", False),
+        ("thd_packing_parallel", "sdpa", True),
+        ("thd_packing_validation_serial", "sdpa", True),
+        ("thd_packing_validation_parallel", "sdpa", False),
+        ("thd_packing_flags_off", "sdpa", False),
+        ("thd_packing_blended", "sdpa", True),
+        ("thd_packing_attention_reset", "sdpa", True),
+    ],
+)
+def test_megatron_positions_survive_loader_routes(
+    monkeypatch, tmp_path, request, route, attention_implementation, eod_mask_loss
+):
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    from nemo_automodel.components.datasets import utils as dataset_utils
+    from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import IndexedDatasetBuilder
+    from nemo_automodel.components.loss.utils import _count_label_tokens
+
+    thd_calls = []
+    original_thd_collater = dataset_utils.packed_sequence_thd_collater
+
+    @functools.wraps(original_thd_collater)
+    def traced_thd_collater(items):
+        """Trace and execute the real collator on token fields [sequence].
+
+        Args:
+            items: Sample mappings with input_ids/labels/position_ids [sequence]
+                and optional seq_lens/seq_lens_padded [documents].
+
+        Returns:
+            Unchanged production collator output with token fields [batch, sequence]
+            and THD metadata [batch, documents].
+        """
+        thd_calls.append("seq_lens" in items[0])
+        return original_thd_collater(items)
+
+    monkeypatch.setattr(dataset_utils, "packed_sequence_thd_collater", traced_thd_collater)
+    if route == "thd_packing_blended":
+        request.getfixturevalue("_single_rank_gloo")
+    # A leading EOD and consecutive EODs exercise boundaries within one sample.
+    tokens = [99, 11, 12, 99, 99, 13, 14, 15, 16] if route != "no_eod" else list(range(10, 19))
+    if route.startswith("thd_packing"):
+        tokens[-1] = tokens[0]
+    # Four requested samples must have identical contents regardless of sample shuffle.
+    indexed_tokens = tokens[:8] * 8 + tokens[-1:] if route.startswith("thd_packing") else tokens
+    prefix = str(tmp_path / "tiny")
+    writer = IndexedDatasetBuilder(prefix + ".bin")
+    writer.add_item(torch.tensor(indexed_tokens))
+    writer.end_document()
+    writer.finalize(prefix + ".idx")
+    if route == "thd_packing_blended":
+        other_prefix = str(tmp_path / "other")
+        writer = IndexedDatasetBuilder(other_prefix + ".bin")
+        writer.add_item(torch.tensor(indexed_tokens))
+        writer.end_document()
+        writer.finalize(other_prefix + ".idx")
+    tokenizer = SimpleNamespace(name_or_path="tiny", eos_token_id=99, pad_token_id=0)
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    cfg.step_scheduler.max_steps = 1
+    dataset = {
+        "_target_": "nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining",
+        "paths": ["1", prefix, "1", other_prefix] if route == "thd_packing_blended" else [prefix],
+        "seq_length": 8,
+        "split": "1,0,0",
+        "splits_to_build": "train",
+        "num_train_samples": 4 if route.startswith("thd_packing") else 1,
+        "index_mapping_dir": str(tmp_path / "indices"),
+        "reset_position_ids": route not in ("no_positions", "thd_packing_flags_off"),
+        "reset_attention_mask": route == "thd_packing_attention_reset",
+        "create_attention_mask": route == "thd_packing_attention_reset",
+        "eod_mask_loss": eod_mask_loss,
+    }
+    cfg.dataset = ConfigNode(dataset)
+    if route not in ("no_packing", "thd_train", "thd_validation"):
+        cfg.packed_sequence = ConfigNode(
+            {
+                "packed_sequence_size": 12,
+                "packing_strategy": "thd" if route == "thd_prepacked" or route.startswith("thd_packing") else "neat",
+                "prepacked": route in ("prepacked", "thd_prepacked"),
+                "num_proc": 2 if route.startswith("thd_packing") and not route.endswith("serial") else 1,
+            }
+        )
+    if route in ("thd_train", "thd_prepacked"):
+        cfg.dataloader.collate_fn = ConfigNode(
+            {"_target_": "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"}
+        )
+    if route in ("validation", "packed_validation", "thd_validation") or route.startswith("thd_packing_validation"):
+        cfg.validation_dataset = ConfigNode(
+            {
+                **dataset,
+                "split": "0,1,0",
+                "splits_to_build": "validation",
+                "num_val_samples": 4 if route.startswith("thd_packing") else 1,
+            }
+        )
+        if route in ("packed_validation", "thd_validation") or route.startswith("thd_packing_validation"):
+            cfg.validation_dataloader.collate_fn = ConfigNode(
+                {"_target_": "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"}
+            )
+    typed_cfg = RecipeConfig(cfg)
+    train_config, val_configs = typed_cfg.dataloader, typed_cfg.validation_dataloaders
+    selected_config = next(iter(val_configs.values())) if val_configs else train_config
+    source = selected_config.dataset_config.build(
+        tokenizer=tokenizer, training_schedule=selected_config.dataset_build_schedule
+    )[0]
+    expected = torch.tensor(
+        [0, 0, 1, 2, 0, 0, 1, 2] if route not in ("no_positions", "no_eod", "thd_packing_flags_off") else list(range(8))
+    )
+    assert source["input_ids"].tolist() == tokens[:8]
+    if route in ("no_positions", "thd_packing_flags_off"):
+        assert "position_ids" not in source
+    else:
+        torch.testing.assert_close(source["position_ids"], expected, rtol=0, atol=0)
+    expected_labels = torch.tensor(tokens[1:])
+    if eod_mask_loss:
+        expected_labels[torch.tensor(tokens[:8]) == 99] = -100
+    torch.testing.assert_close(source["labels"], expected_labels, rtol=0, atol=0)
+
+    # Stub unrelated recipe infrastructure; config, indexed data, packing,
+    # sampler, collator and loader construction/iteration all execute production code.
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: train_config))
+    monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: val_configs))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._build_tokenizer", lambda *a: ({}, tokenizer))
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(123)
+        model = GPT2LMHeadModel(
+            GPT2Config(
+                vocab_size=100,
+                n_positions=16,
+                n_embd=8,
+                n_layer=1,
+                n_head=2,
+                attn_pdrop=0,
+                resid_pdrop=0,
+                embd_pdrop=0,
+                tie_word_embeddings=False,
+                attn_implementation=attention_implementation,
+                bos_token_id=99,
+                eos_token_id=99,
+            )
+        ).eval()
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *a, **k: model)
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(typed_cfg)
+    if route == "thd_packing_attention_reset":
+        assert source["attention_mask"].shape == (1, 8, 8)
+        with patch.object(DataloaderConfig, "build", autospec=True, side_effect=DataloaderConfig.build) as build_loader:
+            with pytest.raises(ValueError, match="reset_attention_mask=True.*THD.*EOD.*cp_size=1"):
+                trainer.setup()
+            build_loader.assert_not_called()
+        assert thd_calls == []
+        return
+    unsupported_hf_thd = route.startswith("thd_") and route != "thd_packing_flags_off"
+    if unsupported_hf_thd:
+        # THD field preservation is still required for native consumers. This
+        # HF model, however, does not consume seq_lens: assert early rejection,
+        # then exercise the production data conversion independently below.
+        with patch.object(DataloaderConfig, "build", autospec=True, side_effect=DataloaderConfig.build) as build_loader:
+            with pytest.raises(ValueError, match="reset_position_ids=True.*THD.*SDPA"):
+                trainer.setup()
+            build_loader.assert_not_called()
+        loader = selected_config.build(dp_rank=0, dp_world_size=1, tokenizer=tokenizer)
+    else:
+        trainer.setup()
+        loader = next(iter(trainer.val_dataloaders.values())) if val_configs else trainer.dataloader
+    assert model.config._attn_implementation == attention_implementation
+    if route.startswith("thd_"):
+        assert loader.collate_fn is traced_thd_collater
+    elif route in ("neat", "packed_validation", "no_positions", "no_eod"):
+        # NEAT's real override wins even when packed_validation explicitly names THD.
+        assert isinstance(loader.collate_fn, functools.partial)
+        assert loader.collate_fn.func is dataset_utils.neat_packed_collater
+    else:
+        assert loader.collate_fn is dataset_utils.default_collater
+    converted, batch = loader.dataset[0], next(iter(loader))
+    assert thd_calls == ([route.startswith("thd_packing")] if route.startswith("thd_") else [])
+    repacked = route in ("neat", "packed_validation", "no_positions", "no_eod") or route.startswith("thd_packing")
+    sequence_length = 12 if repacked else 8
+    expected_positions = torch.nn.functional.pad(expected, (0, sequence_length - 8))
+    if route.startswith("thd_packing"):
+        # THD pack padding retains the existing continuation from the last position.
+        expected_positions[8:] = torch.arange(8, 12) if route == "thd_packing_flags_off" else torch.arange(3, 7)
+    expected_targets = torch.nn.functional.pad(expected_labels, (0, sequence_length - 8), value=-100)
+    assert batch["position_ids"].shape == (1, sequence_length)
+    torch.testing.assert_close(torch.as_tensor(converted["position_ids"]), expected_positions, rtol=0, atol=0)
+    torch.testing.assert_close(batch["position_ids"][0], expected_positions, rtol=0, atol=0)
+    torch.testing.assert_close(batch["labels"][0], expected_targets, rtol=0, atol=0)
+    assert _count_label_tokens(batch["labels"], -100) == (expected_labels != -100).sum().item()
+    if route.startswith("thd_"):
+        assert batch["qkv_format"] == "thd"
+        assert batch["seq_lens"].tolist() == [[8]]
+        assert batch["seq_lens_padded"].tolist() == [[sequence_length]]
+        assert "attention_mask" not in batch
+    elif repacked:
+        assert batch["attention_mask"].shape == (1, 1, 12, 12)
+        torch.testing.assert_close(batch["attention_mask"][0, 0, :8, :8], torch.ones(8, 8, dtype=torch.bool).tril())
+        assert not batch["attention_mask"][..., 8:].any()
+    else:
+        torch.testing.assert_close(batch["attention_mask"], torch.ones_like(batch["input_ids"]))
+
+
+@pytest.mark.runtime_budget(30, hard_timeout=90, reason="Real indexed loader and two-layer CPU HF Llama.")
+@pytest.mark.parametrize(
+    "case,backend,consumer,compute_dtype",
+    [
+        (case, backend, "hf", torch.float32)
+        for case, backend in [
+            (case, backend)
+            for case in (
+                "position_only",
+                "eod_loss",
+                "validation",
+                "attention_reset",
+                "attention_only",
+                "attention_reset_loss",
+                "flags_off",
+                "no_eod",
+                "create_mask",
+                "neat",
+            )
+            for backend in ("eager", "sdpa")
+        ]
+        + [(case, "flash_attention_2") for case in ("position_only", "validation", "prepacked", "neat")]
+        + [
+            (case, "sdpa")
+            for case in (
+                "cancelled_thd_validation",
+                "validation_attention",
+                "loss_only",
+                "te_injected",
+                "te_injected_attention",
+                "te_injected_neat",
+                "native_thd",
+                "native_thd_prepacked",
+                "native_magi_bshd",
+            )
+        ]
+    ]
+    + [
+        (case, "sdpa", consumer, compute_dtype)
+        for consumer in ("hf", "native")
+        for compute_dtype in (torch.float32, torch.bfloat16, torch.float16)
+        for case in ("attention_only", "attention_reset", "position_only")
+        if consumer != "hf" or compute_dtype != torch.float32
+    ]
+    + [
+        ("attention_reset_loss", "sdpa", "hf", torch.bfloat16),
+        ("validation_attention", "sdpa", "native", torch.bfloat16),
+    ],
+    ids=lambda value: str(value).removeprefix("torch."),
+)
+def test_megatron_llama_attention_policy(
+    monkeypatch, tmp_path, record_property, backend, case, consumer, compute_dtype
+):
+    from transformers import LlamaConfig
+
+    from nemo_automodel import NeMoAutoModelForCausalLM
+    from nemo_automodel.components.datasets import utils as dataset_utils
+    from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import IndexedDatasetBuilder
+    from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+
+    neat = case in ("neat", "te_injected_neat")
+    autocast = compute_dtype != torch.float32 and case in ("attention_reset_loss", "validation_attention")
+    storage_dtype = torch.float32 if autocast else compute_dtype
+    tokens = [11, 12, 99, 13, 14, 15, 16, 17]
+    if case == "no_eod":
+        tokens[2] = 19
+    prefix = str(tmp_path / "connectivity")
+    writer = IndexedDatasetBuilder(prefix + ".bin")
+    writer.add_item(torch.tensor(tokens * 4 + [11]))
+    writer.end_document()
+    writer.finalize(prefix + ".idx")
+    tokenizer = SimpleNamespace(name_or_path="tiny", eos_token_id=99, pad_token_id=0)
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    cfg.step_scheduler.max_steps = 1
+    dataset = {
+        "_target_": "nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining",
+        "paths": [prefix],
+        "seq_length": 8,
+        "split": "1,0,0",
+        "splits_to_build": "train",
+        "num_train_samples": 2,
+        "index_mapping_dir": str(tmp_path / "indices"),
+        "reset_position_ids": case not in ("flags_off", "attention_only", "validation_attention", "loss_only"),
+        "reset_attention_mask": case
+        in (
+            "attention_reset",
+            "attention_only",
+            "attention_reset_loss",
+            "validation_attention",
+            "te_injected_attention",
+        ),
+        "create_attention_mask": case
+        in (
+            "attention_reset",
+            "attention_only",
+            "attention_reset_loss",
+            "validation_attention",
+            "te_injected_attention",
+            "create_mask",
+        ),
+        "eod_mask_loss": case in ("eod_loss", "attention_reset_loss", "loss_only"),
+    }
+    cfg.dataset = ConfigNode(dataset)
+    validation = case in ("validation", "cancelled_thd_validation", "validation_attention")
+    if validation:
+        cfg.validation_dataset = ConfigNode(
+            {**dataset, "split": "0,1,0", "splits_to_build": "validation", "num_val_samples": 2}
+        )
+        if case == "validation_attention":
+            # Admission must also install the consumer for validation-only EOD masks.
+            cfg.dataset.reset_attention_mask = False
+            cfg.dataset.create_attention_mask = False
+    if neat or case == "prepacked":
+        cfg.packed_sequence = ConfigNode({"packing_strategy": "neat", "packed_sequence_size": 16, "num_proc": 1})
+        if case == "prepacked":
+            cfg.packed_sequence.prepacked = True
+    if case == "cancelled_thd_validation":
+        cfg.packed_sequence = ConfigNode({"packing_strategy": "thd", "packed_sequence_size": 16})
+        # Keep the training source ordinary; validation inherits a THD config
+        # but the recipe removes it before constructing its default collator.
+        cfg.dataset.reset_position_ids = False
+    if case.startswith("native_thd"):
+        cfg.packed_sequence = ConfigNode(
+            {
+                "packing_strategy": "thd",
+                "packed_sequence_size": 16,
+                "num_proc": 1,
+                "prepacked": case == "native_thd_prepacked",
+            }
+        )
+        cfg.dataloader.collate_fn = ConfigNode(
+            {"_target_": "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"}
+        )
+    typed = RecipeConfig(cfg)
+    train_config, val_configs = typed.dataloader, typed.validation_dataloaders
+    selected = next(iter(val_configs.values())) if val_configs else train_config
+    source = selected.dataset_config.build(tokenizer=tokenizer, training_schedule=selected.dataset_build_schedule)[0]
+    expected_positions = (
+        list(range(8)) if not dataset["reset_position_ids"] or case == "no_eod" else [0, 1, 2, 0, 1, 2, 3, 4]
+    )
+    if dataset["reset_position_ids"]:
+        assert source["position_ids"].tolist() == expected_positions
+
+    # Only the builder's CUDA device selection is redirected to CPU. Native
+    # model initialization, capabilities and infrastructure still execute.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(123)
+        model = NeMoAutoModelForCausalLM.from_config(
+            LlamaConfig(
+                vocab_size=100,
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                attention_dropout=0.0,
+                use_cache=False,
+                tie_word_embeddings=False,
+                architectures=["LlamaForCausalLM"],
+            ),
+            force_hf=consumer == "hf",
+            dtype=storage_dtype,
+            attn_implementation="sdpa" if backend.startswith("flash_") else backend,
+            use_liger_kernel=False,
+            use_sdpa_patching=False,
+            **(
+                {"backend": BackendConfig(attn="sdpa", linear="torch", rms_norm="torch")}
+                if consumer == "native"
+                else {}
+            ),
+        ).eval()
+    assert type(model).__module__.startswith("transformers." if consumer == "hf" else "nemo_automodel.")
+    assert all(parameter.dtype == storage_dtype for parameter in model.parameters())
+    sdpa_calls = []
+    inspect_sdpa = backend == "sdpa" and not case.startswith(("native_", "te_injected"))
+    if inspect_sdpa:
+        original_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+        def capture_sdpa(query, key, value, **kwargs):
+            """Observe the real post-projection consumer; execute the original SDPA."""
+            mask = kwargs.get("attn_mask")
+            assert value.dtype == compute_dtype
+            assert query.dtype == key.dtype
+            if not autocast:
+                assert query.dtype == value.dtype
+            if mask is not None and mask.is_floating_point():
+                assert mask.ndim == 4
+                assert mask.dtype == compute_dtype
+                assert mask.device == query.device
+            sdpa_calls.append(None if mask is None else mask.dtype)
+            return original_sdpa(query, key, value, **kwargs)
+
+        monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", capture_sdpa)
+    if case.startswith("native_") or case.startswith("te_injected"):
+        from nemo_automodel._transformers import te_attention
+        from nemo_automodel.components.models.llama import model as native_llama
+
+        if case == "native_magi_bshd":
+            from nemo_automodel.components.distributed.context_parallel import magi
+
+            monkeypatch.setattr(magi, "_ACTIVE_ATTN_SPEC", magi.get_active_attn_spec())
+        cpu_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+        class CPUAttention(nn.Module):
+            """Replace only the unavailable TE kernel, using its physical boundaries."""
+
+            def forward(
+                self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: Any
+            ) -> torch.Tensor:
+                """Compute causal attention for BSHD or variable-length THD.
+
+                Args:
+                    query: Queries [B, S, Hq, D] or [T, Hq, D].
+                    key: Keys [B, S, Hkv, D] or [T, Hkv, D].
+                    value: Values with the same layout as key.
+                    **kwargs: Physical cu_seqlens_q [documents + 1] for THD,
+                        or attn_mask_type for BSHD.
+
+                Returns:
+                    Attention output with the query layout.
+                """
+                if query.ndim == 4:
+                    return cpu_sdpa(
+                        query.transpose(1, 2),
+                        key.transpose(1, 2),
+                        value.transpose(1, 2),
+                        is_causal=kwargs["attn_mask_type"] == "causal",
+                        enable_gqa=True,
+                    ).transpose(1, 2)
+                cu = kwargs["cu_seqlens_q"].tolist()
+                return torch.cat(
+                    [
+                        cpu_sdpa(
+                            query[start:end].transpose(0, 1)[None],
+                            key[start:end].transpose(0, 1)[None],
+                            value[start:end].transpose(0, 1)[None],
+                            is_causal=True,
+                            enable_gqa=True,
+                        )[0].transpose(0, 1)
+                        for start, end in zip(cu, cu[1:])
+                    ]
+                )
+
+        if case.startswith("te_injected"):
+            monkeypatch.setattr(te_attention, "_TE_STATS", te_attention._TE_STATS.copy())
+            monkeypatch.setattr(te_attention, "_create_te_dot_product_attention", lambda **k: CPUAttention())
+            te_attention.inject_te_attention(model)
+            assert model._te_attention_injected
+        else:
+            monkeypatch.setattr(native_llama, "initialize_attn_module_and_func", lambda **k: (CPUAttention(), None))
+            with torch.random.fork_rng(devices=[]):
+                native = native_llama.LlamaForCausalLM(
+                    model.config,
+                    backend=BackendConfig(
+                        attn="magi" if case == "native_magi_bshd" else "te", linear="torch", rms_norm="torch_fp32"
+                    ),
+                ).eval()
+            native.load_state_dict(model.state_dict())
+            model = native
+    if backend.startswith("flash_"):
+        # Admission/metadata checks only: no FlashAttention kernel runs on CPU.
+        model.config._attn_implementation = backend
+    assert model.config._attn_implementation == backend
+    assert model.config.use_cache is False
+    assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: train_config))
+    monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: val_configs))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._build_tokenizer", lambda *a: ({}, tokenizer))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", lambda *a, **k: model)
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(typed)
+    rejected = (case == "neat" and backend == "eager") or (backend.startswith("flash_") and case != "neat")
+    if rejected:
+        with patch.object(DataloaderConfig, "build", autospec=True, side_effect=DataloaderConfig.build) as build_loader:
+            with pytest.raises(ValueError, match="reset_position_ids=True.*" + backend + ".*SDPA"):
+                trainer.setup()
+            build_loader.assert_not_called()
+        return
+    trainer.setup()
+    trainer.loss_fn = MaskedCrossEntropy()
+    loader = next(iter(trainer.val_dataloaders.values())) if val_configs else trainer.dataloader
+    batch = next(iter(loader))
+    original_mask = batch["attention_mask"].clone() if "attention_mask" in batch else None
+    repeats = 2 if neat or case == "native_thd" else 1
+    assert batch["input_ids"][0].tolist() == tokens * repeats
+    if dataset["reset_position_ids"] or case.startswith("native_thd"):
+        assert batch["position_ids"][0].tolist() == expected_positions * repeats
+    assert (
+        torch.as_tensor(loader.dataset[0].get("position_ids", expected_positions)).tolist()
+        == expected_positions * repeats
+    )
+    assert (batch["labels"][0, 2].item() == -100) is dataset["eod_mask_loss"]
+    if case.startswith("native_thd"):
+        assert loader.collate_fn is dataset_utils.packed_sequence_thd_collater
+    elif neat:
+        assert loader.collate_fn.func is dataset_utils.neat_packed_collater
+    else:
+        assert loader.collate_fn is dataset_utils.default_collater
+    if backend.startswith("flash_"):
+        for batch_size in (1, 2):
+            flash_batch = loader.collate_fn([loader.dataset[0]] * batch_size)
+            assert "attention_mask" not in flash_batch
+            assert flash_batch["cu_seq_lens_q"].tolist() == list(range(0, 16 * batch_size + 1, 8))
+            assert flash_batch["cu_seq_lens_k"].tolist() == flash_batch["cu_seq_lens_q"].tolist()
+            assert flash_batch["max_length_q"] == flash_batch["max_length_k"] == 8
+        return
+
+    sequence = batch["input_ids"].shape[1]
+    physical = torch.arange(sequence)
+    allowed = physical[:, None] >= physical[None, :]
+    if neat or case == "native_thd":
+        allowed &= physical[:, None] // 8 == physical[None, :] // 8
+    if dataset["reset_attention_mask"]:
+        allowed &= (physical[:, None] < 3) == (physical[None, :] < 3)
+    # Oracle uses physical token order and known fixture boundaries, never positions.
+    reference_mask = torch.zeros(sequence, sequence, dtype=compute_dtype).masked_fill(~allowed, float("-inf"))[
+        None, None
+    ]
+
+    def measure(inputs):
+        """Measure logits [batch, sequence, vocab] and input gradients [batch, sequence, hidden].
+
+        Args:
+            inputs: Model mapping with input_ids/position_ids [batch, sequence]
+                and optional attention_mask [batch, sequence] or [batch, 1, sequence, sequence].
+
+        Returns:
+            Detached logits [batch, sequence, vocab] and gradients [batch, sequence, hidden].
+        """
+        embeddings = []
+        rotary_positions = []
+
+        def capture(module, args, output):
+            """Retain input-position gradients for the connectivity oracle.
+
+            Args:
+                module: Input embedding module.
+                args: Tuple containing token IDs of shape [batch, sequence].
+                output: Embeddings of shape [batch, sequence, hidden].
+            """
+            output.retain_grad()
+            embeddings.append(output)
+
+        def capture_rotary(module: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            """Observe the supplied [B, S] or [T] positions at the RoPE consumer.
+
+            Args:
+                module: Real HF or native rotary module.
+                args: Hidden states [B, S, H] or [T, H] and optional positions.
+                kwargs: May contain position_ids [B, S] or [T].
+            """
+            rotary_positions.append((kwargs["position_ids"] if "position_ids" in kwargs else args[1]).clone())
+
+        model.zero_grad(set_to_none=True)
+        with (
+            model.get_input_embeddings().register_forward_hook(capture),
+            model.model.rotary_emb.register_forward_pre_hook(capture_rotary, with_kwargs=True),
+        ):
+            with torch.autocast("cpu", dtype=compute_dtype, enabled=autocast):
+                logits = model(**inputs, use_cache=False).logits
+        if "position_ids" in inputs:
+            torch.testing.assert_close(rotary_positions[0], inputs["position_ids"], rtol=0, atol=0)
+        else:
+            observed = rotary_positions[0].reshape(-1, sequence)
+            torch.testing.assert_close(observed, torch.arange(sequence).expand_as(observed), rtol=0, atol=0)
+        # Native THD outputs/embeddings flatten the original batch rows.
+        logits = logits.reshape(-1, sequence, 100)
+        targets = batch["labels"][:, 3:8].expand(logits.shape[0], -1)
+        torch.nn.functional.cross_entropy(logits[:, 3:8].float().reshape(-1, 100), targets.reshape(-1)).backward()
+        return logits.detach(), embeddings[0].grad.detach().reshape(logits.shape[0], sequence, -1).clone()
+
+    first = None
+    for batch_size in (1, 2):
+        duplicated_batch = loader.collate_fn([loader.dataset[0]] * batch_size)
+        sharder = ContextParallelSharder(model=model, device_mesh=None, batch=dict(duplicated_batch))
+        _, sharded = sharder.shard(dict(duplicated_batch))
+        if "position_ids" in duplicated_batch:
+            torch.testing.assert_close(
+                sharded["position_ids"].reshape(batch_size, sequence), duplicated_batch["position_ids"], rtol=0, atol=0
+            )
+        torch.testing.assert_close(sharded["labels"].reshape(batch_size, sequence), duplicated_batch["labels"])
+        inputs = filter_forward_kwargs(model, {key: value for key, value in sharded.items() if key != "labels"})
+        reference_inputs = {
+            key: value for key, value in duplicated_batch.items() if key in ("input_ids", "position_ids")
+        }
+        reference_inputs["attention_mask"] = reference_mask.expand(batch_size, -1, -1, -1)
+        actual = measure(inputs)
+        reference = measure(reference_inputs)
+        changed = inputs["input_ids"].clone()
+        changed.reshape(batch_size, sequence)[:, 0] = 21
+        altered = measure({**inputs, "input_ids": changed})[0]
+        reference_altered = measure({**reference_inputs, "input_ids": changed.reshape(batch_size, sequence)})[0]
+        delta = (actual[0][:, 3:8] - altered[:, 3:8]).abs().max().item()
+        gradient = actual[1][:, 0].abs().max().item()
+        reference_delta = (reference[0][:, 3:8] - reference_altered[:, 3:8]).abs().max().item()
+        reference_gradient = reference[1][:, 0].abs().max().item()
+        assert actual[1][:, 3].abs().max().item() > 1e-5
+        record_property(
+            f"connectivity_B{batch_size}",
+            f"actual=({delta}, {gradient}); reference=({reference_delta}, {reference_gradient})",
+        )
+        if dataset["reset_attention_mask"]:
+            assert delta == 0 and gradient == 0
+            assert reference_delta == 0 and reference_gradient == 0
+        else:
+            assert reference_delta > 1e-4 and reference_gradient > 1e-5
+            assert delta > 1e-4 and gradient > 1e-5
+        torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
+        if case == "position_only" and batch_size == 1:
+            wrong_positions = torch.arange(sequence).unsqueeze(0)
+            wrong = measure({**inputs, "position_ids": wrong_positions, "attention_mask": reference_mask})
+            assert not torch.allclose(reference[0], wrong[0], rtol=1e-5, atol=1e-7)
+            assert not torch.allclose(reference[1], wrong[1], rtol=1e-5, atol=1e-7)
+        if neat or case == "native_thd":
+            torch.testing.assert_close(actual[0][:, 8:], altered[:, 8:], rtol=0, atol=0)
+        if first is not None:
+            torch.testing.assert_close(actual[0][0], first, rtol=1e-5, atol=1e-6)
+        first = actual[0][0]
+
+    # Exercise actual recipe input filtering/sharding and train/validation forward.
+    seen, recipe_logits = [], []
+
+    def capture_inputs(module, args, kwargs):
+        """Observe the actual recipe inputs without changing them.
+
+        Args:
+            module: Built causal language model.
+            args: Empty positional-input tuple for the recipe call.
+            kwargs: Token IDs and positions of shape [batch, sequence], with an
+                optional mask [batch, sequence] or [batch, 1, sequence, sequence].
+        """
+        seen.append(dict(kwargs))
+
+    def capture_logits(module, args, output):
+        """Observe the output consumed by the recipe loss.
+
+        Args:
+            module: Built causal language model.
+            args: Empty positional-input tuple for the recipe call.
+            output: Model output containing logits [batch, sequence, vocab].
+        """
+        recipe_logits.append(output.logits.detach())
+
+    with (
+        model.register_forward_pre_hook(capture_inputs, with_kwargs=True),
+        model.register_forward_hook(capture_logits),
+        torch.autocast("cpu", dtype=compute_dtype, enabled=autocast),
+    ):
+        trainer._forward_backward_step(
+            0,
+            dict(batch),
+            loss_buffer=[],
+            num_label_tokens=(batch["labels"] != -100).sum(),
+            num_batches=1,
+            is_train=not validation,
+        )
+    if "position_ids" in batch:
+        torch.testing.assert_close(seen[0]["position_ids"].reshape_as(batch["position_ids"]), batch["position_ids"])
+    if "attention_mask" in batch and not case.startswith("native_thd"):
+        torch.testing.assert_close(seen[0]["attention_mask"], batch["attention_mask"])
+    torch.testing.assert_close(recipe_logits[0][0], first, rtol=1e-5, atol=1e-6)
+    if inspect_sdpa:
+        assert sdpa_calls
+        if dataset["reset_attention_mask"]:
+            # Reuse the configured adapter with a boolean block mask, then with
+            # ordinary causal attention. Neither may acquire additive semantics.
+            boolean = measure({**reference_inputs, "attention_mask": allowed[None, None]})
+            torch.testing.assert_close(boolean, reference, rtol=1e-5, atol=1e-6)
+            continuous = {**reference_inputs, "position_ids": physical[None], "attention_mask": None}
+            causal = measure(continuous)
+            physical_causal = torch.zeros_like(reference_mask).masked_fill(
+                ~torch.ones(sequence, sequence, dtype=torch.bool).tril(), float("-inf")
+            )
+            explicit = measure({**continuous, "attention_mask": physical_causal})
+            torch.testing.assert_close(causal, explicit, rtol=1e-5, atol=1e-6)
+            assert torch.bool in sdpa_calls and None in sdpa_calls
+        record_property("sdpa_mask_dtypes", str(sdpa_calls))
+    if original_mask is not None:
+        torch.testing.assert_close(batch["attention_mask"], original_mask, rtol=0, atol=0)
+    if case.startswith("te_injected"):
+        counter = "fallback_mask" if dataset["reset_attention_mask"] or neat else "te_hits"
+        assert te_attention.get_te_attention_stats()[counter] > 0
 
 
 def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):

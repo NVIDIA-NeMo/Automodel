@@ -14,6 +14,7 @@
 
 import logging
 import math
+from collections.abc import Mapping
 
 import torch
 from datasets import Dataset, DatasetDict
@@ -318,7 +319,10 @@ def pack_dataset(
     Continue until max_packs or end of dataset.
 
     Args:
-        dataset: Actual dataset (can be 'train', 'val' or 'test')
+        dataset: Samples with already-shifted input_ids and labels [sequence],
+            as lists or 1D CPU tensors. Optional loss_mask [sequence] masks labels
+            where zero; optional position_ids [sequence] are preserved. Input
+            records and their tensor storage are not modified.
         split (str): Whether the dataset is 'train', 'val' or 'test'
         packed_sequence_size (int): Number of tokens in a pack
         max_packs (int): Maximum number of packs. Default: None
@@ -332,7 +336,9 @@ def pack_dataset(
     Returns:
         Arrow dataset of fixed-length input_ids, already-shifted labels and position_ids
         [packed_sequence_size], plus real seq_lens and physical seq_lens_padded [documents]
-        per row. Position IDs restart for each document; padded labels equal -100.
+        per row. Missing position IDs restart for each sample. Per-sample alignment
+        padding uses physical indices; trailing pack padding continues the last
+        position, clamped to the pack budget. Padded labels equal -100.
     """
     packs: list[PACK_TYPE] = []
     if isinstance(dataset, DatasetDict):
@@ -357,8 +363,13 @@ def pack_dataset(
     cp_divisibility_factor = math.lcm(2 * cp_size if cp_size > 1 else 1, pad_to_multiple_of)
 
     for sample in dataset:
+        if not isinstance(sample, Mapping):
+            raise TypeError("pack_dataset requires mapping samples with input_ids and labels; select a valid split")
         input_ids, labels = sample["input_ids"], sample["labels"]
-        if loss_mask := sample.pop("loss_mask", None):
+        input_ids = input_ids.tolist() if isinstance(input_ids, torch.Tensor) else list(input_ids)
+        labels = labels.tolist() if isinstance(labels, torch.Tensor) else list(labels)
+        loss_mask = sample.get("loss_mask")
+        if loss_mask is not None:
             labels = _fill_labels_with_cross_entropy_ignore_idx(labels, loss_mask)
         # If the dataset outputs samples that are larger than the specified
         # packed_sequence_size and we're unable to split it, user needs to modify
@@ -391,8 +402,18 @@ def pack_dataset(
         # "position_ids" is the pos ids, "seq_lens" is the len of each seq within the pack
         current_pack["input_ids"] += input_ids
         current_pack["labels"] += labels
-        # Position IDs should continue for the actual length (including CP padding)
-        current_pack["position_ids"] += [x % packed_sequence_size for x in range(len(input_ids))]
+        position_ids = [x % packed_sequence_size for x in range(len(input_ids))]
+        if "position_ids" in sample:
+            if sample["position_ids"] is None:
+                raise ValueError("position_ids must be a 1D sequence matching input_ids, got None")
+            supplied_positions = torch.as_tensor(sample["position_ids"])
+            if supplied_positions.ndim != 1 or supplied_positions.numel() != seq_len:
+                raise ValueError(
+                    f"position_ids must have shape ({seq_len},) matching input_ids, "
+                    f"got {tuple(supplied_positions.shape)}"
+                )
+            position_ids[:seq_len] = supplied_positions.tolist()
+        current_pack["position_ids"] += position_ids
         # Always store original length in seq_lens
         current_pack["seq_lens"] += [seq_len]
 
