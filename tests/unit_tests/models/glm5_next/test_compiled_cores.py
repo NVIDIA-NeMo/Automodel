@@ -324,8 +324,12 @@ def test_compiled_mhc_cores_cuda_match_eager_arithmetic_and_vjps(monkeypatch: py
 
 def test_compile_options_use_a_division_rounding_key_the_installed_inductor_accepts() -> None:
     """Every requested option must exist in this PyTorch's Inductor config, or torch.compile rejects it."""
+    known = set(torch._inductor.config.get_config_copy())
     options = optimized_kernels._compile_options()
-    assert set(options) <= set(torch._inductor.config.get_config_copy())
+    if options is None:
+        assert optimized_kernels._division_rounding_option(known) is None or "emulate_precision_casts" not in known
+        return
+    assert set(options) <= known
     assert all(options.values())
     assert len(options) == 2
 
@@ -334,3 +338,37 @@ def test_compile_options_use_a_division_rounding_key_the_installed_inductor_acce
 def test_division_rounding_option_follows_both_pytorch_spellings(spelling: str) -> None:
     """Older PyTorch only knows the legacy key; newer PyTorch rejects it."""
     assert optimized_kernels._division_rounding_option({"emulate_precision_casts", spelling}) == spelling
+    assert optimized_kernels._compile_options_for({"emulate_precision_casts", spelling}) == {
+        "emulate_precision_casts": True,
+        spelling: True,
+    }
+
+
+@pytest.mark.parametrize(
+    "known_options",
+    [{"emulate_precision_casts"}, {"emulate_divison_rounding"}, set()],
+    ids=["no-division-rounding", "no-precision-casts", "neither"],
+)
+def test_compile_options_are_none_without_both_precision_controls(known_options: set[str]) -> None:
+    """PyTorch 2.8's Inductor registers no division-rounding key; no partial option set is requested."""
+    assert optimized_kernels._compile_options_for(known_options) is None
+
+
+def test_compiled_factories_keep_eager_cores_without_precision_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the controls, compile flags select the eager cores and never call torch.compile."""
+    factories = (optimized_kernels.hc_cores, optimized_kernels.rms_norm_core, optimized_kernels.rms_norm_gated_core)
+
+    def reject_compile(*args, **kwargs):
+        raise AssertionError("torch.compile must not run without the precision controls")
+
+    monkeypatch.setattr(optimized_kernels, "_compile_options", lambda: None)
+    monkeypatch.setattr(torch, "compile", reject_compile)
+    for factory in factories:
+        factory.cache_clear()
+    try:
+        assert optimized_kernels.hc_cores(True) == optimized_kernels.hc_cores(False)
+        assert optimized_kernels.rms_norm_core(True) is norm_core
+        assert optimized_kernels.rms_norm_gated_core(True) is optimized_kernels.gated_norm_core
+    finally:
+        for factory in factories:
+            factory.cache_clear()

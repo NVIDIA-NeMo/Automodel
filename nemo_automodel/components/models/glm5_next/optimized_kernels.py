@@ -14,6 +14,7 @@
 
 """Optional model-owned mHC and RMSNorm compilation for GLM-5.3-Flash."""
 
+import logging
 from collections.abc import Callable, Collection
 from functools import cache
 
@@ -21,34 +22,58 @@ import torch
 import torch._inductor.config
 import torch.nn.functional as F
 
+logger = logging.getLogger(__name__)
 
-def _division_rounding_option(known_options: Collection[str]) -> str:
+
+def _division_rounding_option(known_options: Collection[str]) -> str | None:
     """Name Inductor's eager division-rounding control as the given PyTorch spells it.
 
     Newer PyTorch spells it ``eager_numerics.division_rounding``; older releases
-    still inside the supported range only accept the legacy
-    ``emulate_divison_rounding`` key, and ``torch.compile`` rejects unknown keys.
+    such as 2.10 only accept the legacy ``emulate_divison_rounding`` key, and
+    releases such as 2.8 have neither. ``torch.compile`` rejects unknown keys.
 
     Args:
         known_options: Option names of the installed Inductor config.
 
     Returns:
-        The division-rounding option name present in ``known_options``.
+        The division-rounding option name present in ``known_options``, or
+        ``None`` when this PyTorch has no such control.
     """
-    if "eager_numerics.division_rounding" in known_options:
-        return "eager_numerics.division_rounding"
-    return "emulate_divison_rounding"
+    for name in ("eager_numerics.division_rounding", "emulate_divison_rounding"):
+        if name in known_options:
+            return name
+    return None
 
 
-def _compile_options() -> dict[str, bool]:
+def _compile_options_for(known_options: Collection[str]) -> dict[str, bool] | None:
     """Inductor options that preserve the eager BF16 truncation points between fused operations.
 
+    Args:
+        known_options: Option names of the installed Inductor config.
+
     Returns:
-        Option mapping for ``torch.compile(options=...)``, using the
-        division-rounding key the installed Inductor recognizes.
+        Option mapping for ``torch.compile(options=...)``, or ``None`` when
+        ``known_options`` lacks either precision control. Without them a
+        compiled core would not reproduce the eager rounding, so callers keep
+        the eager core instead.
     """
-    division_rounding = _division_rounding_option(torch._inductor.config.get_config_copy())
+    division_rounding = _division_rounding_option(known_options)
+    if division_rounding is None or "emulate_precision_casts" not in known_options:
+        return None
     return {"emulate_precision_casts": True, division_rounding: True}
+
+
+@cache
+def _compile_options() -> dict[str, bool] | None:
+    """Precision-preserving options for the installed Inductor, or ``None`` if it cannot honor them."""
+    options = _compile_options_for(torch._inductor.config.get_config_copy())
+    if options is None:
+        logger.warning(
+            "PyTorch %s Inductor lacks the eager division-rounding/precision-cast controls; "
+            "GLM-5-Next compile_hc/compile_norm run the eager cores instead.",
+            torch.__version__,
+        )
+    return options
 
 
 def project_core(hidden_streams: torch.Tensor, fn: torch.Tensor, eps: float) -> torch.Tensor:
@@ -182,10 +207,11 @@ def hc_cores(compiled: bool) -> tuple[ProjectionCore, CollapseCore, ExpandCore]:
     Static shapes match the model-owned DeepSeek V4.1 compilation pattern.
     Past Dynamo's recompile limit, its normal eager fallback remains available.
     Base/scale parameters and their FSDP holder are outside these functions.
+    PyTorch without the precision controls also keeps the eager functions.
     """
-    if not compiled:
+    options = _compile_options() if compiled else None
+    if options is None:
         return project_core, collapse_core, expand_core
-    options = _compile_options()
     return (
         torch.compile(project_core, dynamic=False, options=options),
         torch.compile(collapse_core, dynamic=False, options=options),
@@ -196,14 +222,16 @@ def hc_cores(compiled: bool) -> tuple[ProjectionCore, CollapseCore, ExpandCore]:
 @cache
 def rms_norm_core(compiled: bool) -> NormCore:
     """Select the decoder/final RMSNorm core, retaining GLM's cast order."""
-    if not compiled:
+    options = _compile_options() if compiled else None
+    if options is None:
         return norm_core
-    return torch.compile(norm_core, dynamic=False, options=_compile_options())
+    return torch.compile(norm_core, dynamic=False, options=options)
 
 
 @cache
 def rms_norm_gated_core(compiled: bool) -> GatedNormCore:
     """Select the KDA gated norm core with the same cast policy as decoder norms."""
-    if not compiled:
+    options = _compile_options() if compiled else None
+    if options is None:
         return gated_norm_core
-    return torch.compile(gated_norm_core, dynamic=False, options=_compile_options())
+    return torch.compile(gated_norm_core, dynamic=False, options=options)
