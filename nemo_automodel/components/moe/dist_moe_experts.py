@@ -115,9 +115,21 @@ class GroupedExpertsDistMoE(torch.nn.Module):
                 local.copy_(native)
 
     def _save_to_state_dict(self, destination: OrderedDict[str, torch.Tensor], prefix: str, keep_vars: bool) -> None:
-        """Expose canonical checkpoint keys as views of native parameter storage."""
-        for name in ("gate_and_up_projs", "down_projs"):
-            value = self.gate_and_up_projs if name == "gate_and_up_projs" else self.down_projs
+        """Expose canonical checkpoint keys with grouped-expert placements.
+
+        Unsharded and expert-only sharded keys are views of native storage. Expert
+        FSDP shards native dimension one, which the transposed view carries as a
+        feature shard on canonical dimension two. Checkpoint consumers such as the
+        HF adapter assume GroupedExperts' canonical dimension-one shard, so those
+        keys are redistributed copies on the parameter's mesh.
+        """
+        for name, parameter in (
+            ("gate_and_up_projs", self.routed_gate_up_weights),
+            ("down_projs", self.routed_down_weights),
+        ):
+            value = parameter.transpose(-1, -2)
+            if isinstance(value, DTensor) and value.placements != parameter.placements:
+                value = value.redistribute(value.device_mesh, parameter.placements)
             destination[prefix + name] = value if keep_vars else value.detach()
 
     def _load_from_state_dict(
@@ -132,9 +144,11 @@ class GroupedExpertsDistMoE(torch.nn.Module):
     ) -> None:
         """Copy canonical checkpoint tensors into the existing native parameters.
 
-        Canonical tensors may be DTensors or rank-local tensors. DCP can fill
-        either alias in place and omit that key from its later rebuild pass, so
-        the two keys are loaded independently without replacing parameters.
+        Canonical tensors may be rank-local tensors or DTensors with any placement
+        on the parameter's mesh; DTensors are redistributed to the destination's
+        transposed placement before taking local shards. DCP can fill either alias
+        in place and omit that key from its later rebuild pass, so the two keys
+        are loaded independently without replacing parameters.
         """
         del local_metadata
         projections = {
@@ -149,7 +163,20 @@ class GroupedExpertsDistMoE(torch.nn.Module):
                         missing_keys.append(key)
                     continue
                 source = state_dict[key]
-                source = source.to_local() if isinstance(source, DTensor) else source
+                if isinstance(source, DTensor):
+                    if isinstance(parameter, DTensor):
+                        # Match the destination's transposed feature shard before localizing;
+                        # checkpoint producers use GroupedExperts' canonical placement.
+                        canonical = parameter.transpose(-1, -2)
+                        if source.shape != canonical.shape or source.device_mesh != canonical.device_mesh:
+                            error_msgs.append(
+                                f"layout mismatch for {key}: checkpoint {tuple(source.shape)} on "
+                                f"{source.device_mesh}, canonical parameter {tuple(canonical.shape)} on "
+                                f"{canonical.device_mesh}"
+                            )
+                            continue
+                        source = source.redistribute(canonical.device_mesh, canonical.placements)
+                    source = source.to_local()
                 target = parameter.to_local() if isinstance(parameter, DTensor) else parameter
                 source = source.transpose(-1, -2)
                 if source.shape != target.shape:
