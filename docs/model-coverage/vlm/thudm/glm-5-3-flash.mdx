@@ -23,7 +23,7 @@ Manifold-Constrained Hyper-Connections (mHC).
 | **Experts** | 288 routed experts, top-8 routing, plus one shared expert |
 | **Context Length** | 1,048,576 in the checkpoint configuration; validated here at 2,048 and 4,096 tokens |
 | **Training Precision** | BF16 after FP8 checkpoint dequantization |
-| **HF Org** | [zai-org](https://huggingface.co/zai-org) |
+| **Hugging Face Org** | [zai-org](https://huggingface.co/zai-org) |
 
 ## Architecture
 
@@ -35,13 +35,13 @@ Manifold-Constrained Hyper-Connections (mHC).
 - The first three decoder layers use dense feed-forward networks. The remaining
   42 layers use 288 routed experts with top-8 routing and one shared expert.
 - KPool-DSA selects up to 2,048 token positions through four-token pools before
-  running sparse latent attention over a shared 512-wide K/V representation.
+  running sparse latent attention over a shared 512-wide key-value representation.
 
 ## Supported Training Path
 
 NeMo AutoModel provides a native configuration, image processor, vision tower,
 language model, and Hugging Face state-dict adapter. The implementation runs on
-the repository's pinned `transformers==5.15.1`; users do not need Transformers
+the repository's pinned `transformers==5.15.1`; you do not need Transformers
 5.16, a nightly Transformers build, or `trust_remote_code`.
 
 The supported base-checkpoint initialization path uses distributed checkpoint
@@ -49,8 +49,8 @@ loading and dequantizes the released FP8 weights for BF16 training. Full-model
 single-GPU checkpoint loading and training are not supported.
 
 The current path supports image training with FSDP2, activation checkpointing,
-expert parallelism, and contiguous packed context parallelism. Tensor
-parallelism, pipeline parallelism, and video training are not enabled. An EP
+expert parallelism (EP), and contiguous packed context parallelism (CP). Tensor
+parallelism (TP), pipeline parallelism (PP), and video training are not enabled. An EP
 size must evenly divide the model's 288 routed experts and fit the available GPU
 memory; EP72 is the published validated topology, not a model requirement.
 
@@ -143,7 +143,7 @@ sequence length 4,096 over the full 154,880-token vocabulary. The reference
 side needs a Transformers build that includes `glm5_next` (5.17.0 or later);
 the training path does not. All 135 tensors NeMo AutoModel expects for this
 model (110 language, 25 vision) loaded with no missing, unexpected, or
-shape-mismatched keys. The Transformers-side key count differs, because the
+shape-mismatched keys. The Transformers-side key count differs because the
 state-dict adapter changes the parameter layout.
 
 | Metric | Result |
@@ -154,7 +154,7 @@ state-dict adapter changes the parameter layout.
 | Logits cosine similarity | 0.9999251899 |
 | Top-1 token agreement | 98.33984375% |
 
-### Packed CP1 / CP8 Training Parity
+### Packed CP1 and CP8 Training Parity
 
 The full model trained for 100 steps with the same MedPix packed-2K workload,
 global batch size 144, EP144, TP1, PP1, and the SDPA DSA reference backend.
@@ -165,11 +165,11 @@ global batch size 144, EP144, TP1, PP1, and the SDPA DSA reference backend.
 | CP8 | 18 nodes / 144 H100s | 41.04 GiB | 1.2328 | [21yl4mj9](https://wandb.ai/Nemo-automodel/huiyingl_workspace/runs/21yl4mj9) |
 
 Across all 100 matched steps, the loss curves had mean absolute difference
-0.001879, RMSE 0.002800, and maximum absolute difference 0.0130.
+0.001879, root mean square error (RMSE) 0.002800, and maximum absolute difference 0.0130.
 
 ### cuDNN Sparse Attention Performance
 
-The SDPA and cuDNN backends were compared end to end with the published EP72 / CP2
+The SDPA and cuDNN backends were compared end to end with the published EP72 and CP2
 topology. Both trained for 100 steps on the same MedPix packed-2K workload; the
 throughput window covers steps 10 through 99.
 
