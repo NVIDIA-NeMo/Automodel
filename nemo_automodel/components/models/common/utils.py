@@ -428,16 +428,16 @@ class NcclEpConfig:
             needs. Dispatch then skips its per-layer host synchronization, and rows past
             the routed count are left unused. A rank that receives more rows than the
             capacity aborts with a device-side trap rather than dropping tokens, so choose
-            a factor that covers the expected routing skew. Requires the ``torch_mm``
-            experts backend, or ``te`` with ``te_grouped_tensor``, without expert bias.
+            a factor that covers the expected routing skew. Requires the ``torch_mm`` or
+            ``te`` experts backend, without expert bias.
             ``None`` (default) sizes receive buffers per dispatch.
         zero_copy: Let dispatch write tokens straight into the experts' input and combine
             read the experts' output from symmetric-memory windows, skipping NCCL-EP's
             staging copies. The experts write their down projection and their input
             gradient into two symmetric buffers of the receive capacity that all layers
-            share. Requires ``recv_capacity_factor`` and the ``te`` experts backend with
-            ``te_grouped_tensor``, without expert bias, router weighting after the down
-            projection, or a model hook between the experts and combine.
+            share. Requires ``recv_capacity_factor`` and the ``te`` experts backend, without
+            expert bias, router weighting after the down projection, or a model hook between
+            the experts and combine.
     """
 
     max_tokens_per_rank: int | None = None
@@ -498,11 +498,13 @@ class BackendConfig:
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
-        te_grouped_tensor: Prefer TE 2.19 native grouped-tensor GEMMs for ``experts="te"``.
+        te_grouped_tensor: Use TE 2.19 native grouped-tensor GEMMs for ``experts="te"``.
             Requires ``dispatcher="deepep"``, ``"hybridep"``, ``"uccl_ep"``, or
-            ``"nccl_ep"``; with NCCL-EP the GEMMs read the per-expert row counts on the
-            device. Device and precision support follows TE's ``GroupedLinear`` contract.
-            Parameters and checkpoints retain their existing layouts.
+            ``"nccl_ep"``. ``None`` (default) resolves to True for ``experts="te"`` with
+            ``dispatcher="nccl_ep"`` and to False otherwise. NCCL-EP always uses these GEMMs,
+            which read its per-expert row counts on the device, and rejects False. Device and
+            precision support follows TE's ``GroupedLinear`` contract. Parameters and
+            checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
             "nccl_ep" uses Transformer Engine NCCL-EP,
@@ -616,7 +618,7 @@ class BackendConfig:
         else "torch"
     )
     nccl_ep: NcclEpConfig = field(default_factory=NcclEpConfig)
-    te_grouped_tensor: bool = False
+    te_grouped_tensor: bool | None = None
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
@@ -733,22 +735,30 @@ class BackendConfig:
             self.nccl_ep = NcclEpConfig(**self.nccl_ep)
         elif not isinstance(self.nccl_ep, NcclEpConfig):
             raise TypeError("nccl_ep must be an NcclEpConfig or mapping")
+        if self.te_grouped_tensor is None:
+            self.te_grouped_tensor = self.dispatcher == "nccl_ep" and self.experts == "te"
         if self.dispatcher == "nccl_ep":
             if self.nccl_ep.max_tokens_per_rank is None:
                 raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
-            te_grouped = self.experts == "te" and self.te_grouped_tensor
-            if self.nccl_ep.recv_capacity_factor is not None and not (
-                te_grouped or self.experts in ("torch_mm", "gmm", "torch_mm_mxfp8")
+            if self.experts == "te" and not self.te_grouped_tensor:
+                raise ValueError(
+                    "dispatcher='nccl_ep' with experts='te' always uses TE grouped-tensor GEMMs, which read the "
+                    "per-expert row counts on the device; remove te_grouped_tensor=False"
+                )
+            if self.nccl_ep.recv_capacity_factor is not None and self.experts not in (
+                "te",
+                "torch_mm",
+                "gmm",
+                "torch_mm_mxfp8",
             ):
                 raise ValueError(
-                    "nccl_ep.recv_capacity_factor requires experts='torch_mm', or experts='te' with "
-                    "te_grouped_tensor=True: the grouped GEMMs must bound the routed rows with device-side "
-                    f"offsets; got experts={self.experts!r}"
+                    "nccl_ep.recv_capacity_factor requires experts='te' or 'torch_mm': the grouped GEMMs must "
+                    f"bound the routed rows with device-side offsets; got experts={self.experts!r}"
                 )
-            if self.nccl_ep.zero_copy and not te_grouped:
+            if self.nccl_ep.zero_copy and self.experts != "te":
                 raise ValueError(
-                    "nccl_ep.zero_copy requires experts='te' with te_grouped_tensor=True: only those grouped "
-                    f"GEMMs write into the shared symmetric buffers; got experts={self.experts!r}"
+                    "nccl_ep.zero_copy requires experts='te': only its grouped GEMMs write into the shared "
+                    f"symmetric buffers; got experts={self.experts!r}"
                 )
             if self.dispatcher_async_dispatch:
                 raise ValueError("dispatcher_async_dispatch is not supported by NCCL-EP")

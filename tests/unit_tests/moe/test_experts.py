@@ -2550,23 +2550,49 @@ def _fake_recipe(kind: str) -> SimpleNamespace:
     return SimpleNamespace(mxfp8=lambda: kind == "mxfp8", float8_block_scaling=lambda: kind == "block")
 
 
-@pytest.mark.parametrize(
-    "recipe,native,alignment",
-    [(None, True, 1), ("current", False, 16), ("current", True, 16), ("mxfp8", False, 32)]
-    + [("mxfp8", True, 128), ("block", False, 16), ("block", True, 128)],
-)
-def test_te_nccl_ep_alignment_follows_te_fp8(moe_config, fake_native_te, monkeypatch, recipe, native, alignment):
+@pytest.mark.parametrize("recipe,alignment", [(None, 1), ("current", 16), ("mxfp8", 128), ("block", 128)])
+def test_te_nccl_ep_alignment_follows_te_fp8(moe_config, fake_native_te, monkeypatch, recipe, alignment):
     from nemo_automodel.components.moe.experts import GroupedExpertsTE
 
     monkeypatch.setattr("nemo_automodel.components.models.common.utils.HAVE_TE", True)
     te_fp8 = None if recipe is None else {"recipe": _fake_recipe(recipe)}
-    backend = BackendConfig(
-        experts="te", dispatcher="nccl_ep", te_grouped_tensor=native, nccl_ep={"max_tokens_per_rank": 8}, te_fp8=te_fp8
-    )
-    assert GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="nccl_ep").expert_alignment == alignment
+    backend = BackendConfig(experts="te", dispatcher="nccl_ep", nccl_ep={"max_tokens_per_rank": 8}, te_fp8=te_fp8)
+    experts = GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="nccl_ep")
+    # NCCL-EP always runs the grouped-tensor GEMMs and pads the rows for them.
+    assert experts.use_grouped_tensor and experts.device_m_splits
+    assert experts.expert_alignment == alignment
     # Other dispatchers pack expert rows unpadded; TE's padding modules align them.
-    deepep = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native, te_fp8=te_fp8)
-    assert GroupedExpertsTE(moe_config, backend=deepep).expert_alignment == 1
+    for native in (False, True):
+        deepep = BackendConfig(experts="te", dispatcher="deepep", te_grouped_tensor=native, te_fp8=te_fp8)
+        assert GroupedExpertsTE(moe_config, backend=deepep).expert_alignment == 1
+
+
+def test_te_nccl_ep_requires_grouped_tensor(moe_config, fake_native_te):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    legacy = BackendConfig(experts="te", dispatcher="deepep")
+    with pytest.raises(ValueError, match="requires te_grouped_tensor=True"):
+        GroupedExpertsTE(moe_config, backend=legacy, dispatcher_backend="nccl_ep")
+
+
+def test_te_nccl_ep_reports_unsupported_grouped_tensor_recipes(moe_config, fake_native_te):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    backend = BackendConfig(experts="te", dispatcher="nccl_ep", nccl_ep={"max_tokens_per_rank": 8})
+    experts = GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="nccl_ep")
+    experts.ep_size = 1
+    experts.token_dispatcher = SimpleNamespace(
+        token_permutation2=lambda hidden_states, token_probs, **kwargs: (
+            hidden_states,
+            torch.tensor([hidden_states.shape[0]] + [0] * 7),
+            token_probs[:, 0],
+        )
+    )
+    fake_native_te.supported.return_value = False
+    x = torch.randn(3, moe_config.dim, dtype=moe_config.dtype)
+    # NCCL-EP has no legacy path to fall back to, so the error must not suggest one.
+    with pytest.raises(ValueError, match="NCCL-EP has no legacy TE path"):
+        experts(x, torch.ones(3, dtype=torch.bool), torch.ones(3, 1), torch.zeros(3, 1, dtype=torch.long))
 
 
 @pytest.mark.parametrize("zero_copy", [False, True])

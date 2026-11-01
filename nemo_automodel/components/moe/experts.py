@@ -1392,20 +1392,19 @@ def _routed_rows_swiglu(
     return partial(swiglu_routed_rows, routed_rows=tokens_per_expert.sum(dim=0, keepdim=True), limit=limit)
 
 
-def _te_grouped_gemm_alignment(recipe: "Recipe | None", use_grouped_tensor: bool) -> int:
-    """Return the row multiple that TE's grouped expert GEMMs need in each expert segment.
+def _te_grouped_gemm_alignment(recipe: "Recipe | None") -> int:
+    """Return the row multiple that TE's grouped-tensor expert GEMMs need in each expert segment.
 
     Args:
         recipe: Active Transformer Engine quantization recipe, or None for unquantized GEMMs.
-        use_grouped_tensor: Whether the GEMMs use TE's native grouped-tensor path.
 
     Returns:
-        1 without quantization; 128 for MXFP8 and FP8 block scaling on the native
-        grouped-tensor path; otherwise Transformer Engine's alignment for the recipe.
+        1 without quantization; 128 for MXFP8 and FP8 block scaling; otherwise Transformer
+        Engine's alignment for the recipe.
     """
     if recipe is None:
         return 1
-    if use_grouped_tensor and (recipe.mxfp8() or recipe.float8_block_scaling()):
+    if recipe.mxfp8() or recipe.float8_block_scaling():
         return 128
     from transformer_engine.pytorch.quantization import get_align_size_for_quantization
 
@@ -2120,18 +2119,17 @@ class GroupedExpertsTE(nn.Module):
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
         nccl_ep = dispatcher_backend == "nccl_ep"
-        # The native grouped GEMMs read NCCL-EP's per-expert row counts on the device, so the
-        # forward never copies them to the host.
-        self.device_m_splits = nccl_ep and self.use_grouped_tensor
-        if nccl_ep and self.nccl_ep.recv_capacity_factor is not None:
-            if not self.use_grouped_tensor:
-                raise ValueError("nccl_ep.recv_capacity_factor with experts='te' requires te_grouped_tensor=True")
-            if self.expert_bias:
-                # The down-bias correction expands the bias by the routed counts over every buffer row.
-                raise ValueError(
-                    "nccl_ep.recv_capacity_factor is not supported for experts with expert_bias=True; "
-                    "leave it at None (per-dispatch receive buffers) for this model."
-                )
+        # NCCL-EP always runs the native grouped GEMMs. They read its per-expert row counts on the
+        # device, so the forward never copies them to the host.
+        if nccl_ep and not self.use_grouped_tensor:
+            raise ValueError("dispatcher='nccl_ep' with experts='te' requires te_grouped_tensor=True")
+        self.device_m_splits = nccl_ep
+        if nccl_ep and self.nccl_ep.recv_capacity_factor is not None and self.expert_bias:
+            # The down-bias correction expands the bias by the routed counts over every buffer row.
+            raise ValueError(
+                "nccl_ep.recv_capacity_factor is not supported for experts with expert_bias=True; "
+                "leave it at None (per-dispatch receive buffers) for this model."
+            )
         self.zero_copy = nccl_ep and self.nccl_ep.zero_copy
         if self.zero_copy and config.apply_router_weight_after_down:
             raise ValueError(
@@ -2142,7 +2140,7 @@ class GroupedExpertsTE(nn.Module):
         # without TE's padding and unpadding copies. Other dispatchers pack rows unpadded.
         self.expert_alignment = 1
         if nccl_ep and backend is not None and backend.te_fp8 is not None:
-            self.expert_alignment = _te_grouped_gemm_alignment(backend.te_fp8.build_recipe(), self.use_grouped_tensor)
+            self.expert_alignment = _te_grouped_gemm_alignment(backend.te_fp8.build_recipe())
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -2589,15 +2587,18 @@ class GroupedExpertsTE(nn.Module):
             signature = (recipe, dtype)
             if signature != self._grouped_tensor_signature:
                 if not is_module_grouped_tensor_path_supported(recipe, dtype):
+                    fallback = (
+                        "NCCL-EP has no legacy TE path; use experts='torch_mm' or another dispatcher."
+                        if self.device_m_splits
+                        else "Set te_grouped_tensor=False to use the legacy TE path."
+                    )
                     raise ValueError(
-                        f"te_grouped_tensor=True does not support {recipe!r} with {dtype} on this device. "
-                        "Set te_grouped_tensor=False to use the legacy TE path."
+                        f"te_grouped_tensor=True does not support {recipe!r} with {dtype} on this device. {fallback}"
                     )
                 self._grouped_tensor_signature = signature
         # NCCL-EP already padded each expert's rows for the te_fp8 recipe; other dispatchers pack them unpadded.
         rows_aligned = recipe is None or (
-            self.expert_alignment > 1
-            and self.expert_alignment % _te_grouped_gemm_alignment(recipe, self.use_grouped_tensor) == 0
+            self.expert_alignment > 1 and self.expert_alignment % _te_grouped_gemm_alignment(recipe) == 0
         )
         actual_m_splits = None
         unpadding = self.fp8_unpadding

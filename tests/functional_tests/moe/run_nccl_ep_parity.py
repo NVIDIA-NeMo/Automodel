@@ -241,7 +241,6 @@ def _te_step(
     rank: int,
     world_size: int,
     nccl_ep: dict,
-    te_grouped_tensor: bool,
     te_fp8: str | None,
     outer_recipe: str | None = None,
     checkpointed: bool = False,
@@ -253,9 +252,10 @@ def _te_step(
         rank: EP rank.
         world_size: EP size.
         nccl_ep: ``BackendConfig.nccl_ep`` settings.
-        te_grouped_tensor: Whether the experts use TE's native grouped-tensor GEMMs.
         te_fp8: ``BackendConfig.te_fp8`` recipe, for which NCCL-EP aligns the expert rows.
-        outer_recipe: Recipe enabled outside the backend instead, leaving the rows to TE's padding.
+        outer_recipe: Recipe enabled outside the backend instead. NCCL-EP then leaves the rows
+            unaligned, and as a reference the experts copy the row counts to the host and align
+            the rows with TE's padding, the path that other dispatchers take.
         checkpointed: Whether to recompute the layer in backward.
 
     Returns:
@@ -283,7 +283,6 @@ def _te_step(
     backend = BackendConfig(
         dispatcher="nccl_ep",
         experts="te",
-        te_grouped_tensor=te_grouped_tensor,
         nccl_ep=nccl_ep,
         te_fp8=None if te_fp8 is None else {"recipe": te_fp8},
         attn="sdpa",
@@ -292,6 +291,8 @@ def _te_step(
     recipe = te_fp8 or outer_recipe
     with torch.device("meta"):
         experts = MoE(config, backend).experts
+    if outer_recipe is not None:
+        experts.device_m_splits = False
     experts.init_token_dispatcher(mesh)
     experts.to_empty(device="cuda")
     generator = torch.Generator(device="cuda").manual_seed(43 + rank)
@@ -357,14 +358,13 @@ def _check_te_experts(mesh, *, rank: int, world_size: int) -> None:
         if recipe == "mxfp8" and not blackwell:
             continue
         name = recipe or "bf16"
-        if recipe is not None:
-            padded = step(nccl_ep=max_tokens, te_grouped_tensor=False, te_fp8=None, outer_recipe=recipe)
-            aligned = step(nccl_ep=max_tokens, te_grouped_tensor=False, te_fp8=recipe)
-            same(f"{name} aligned rows", padded, aligned)
         te_recipe = None if recipe is None else TEFp8Config(recipe=recipe).build_recipe()
         if not is_module_grouped_tensor_path_supported(te_recipe, torch.bfloat16):
             continue
-        reference = step(nccl_ep=max_tokens, te_grouped_tensor=True, te_fp8=recipe)
+        reference = step(nccl_ep=max_tokens, te_fp8=recipe)
+        if recipe is not None:
+            padded = step(nccl_ep=max_tokens, te_fp8=None, outer_recipe=recipe)
+            same(f"{name} aligned rows", padded, reference)
         cases = [
             ("recompute", max_tokens, True),
             ("fixed capacity", fixed, False),
@@ -374,7 +374,7 @@ def _check_te_experts(mesh, *, rank: int, world_size: int) -> None:
             zero_copy = {**fixed, "zero_copy": True}
             cases += [("zero copy", zero_copy, False), ("zero copy recompute", zero_copy, True)]
         for label, nccl_ep, checkpointed in cases:
-            actual = step(nccl_ep=nccl_ep, te_grouped_tensor=True, te_fp8=recipe, checkpointed=checkpointed)
+            actual = step(nccl_ep=nccl_ep, te_fp8=recipe, checkpointed=checkpointed)
             same(f"{name} {label}", reference, actual)
 
 

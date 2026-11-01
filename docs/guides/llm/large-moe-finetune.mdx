@@ -167,9 +167,8 @@ expert layout, which activation-checkpoint recomputation requires and which keep
 expert gradients reproducible from run to run.
 
 By default each dispatch sizes its receive buffer from the routing counts, which
-requires one host synchronization per MoE layer. With the `torch_mm` experts
-backend, or `experts: te` with `te_grouped_tensor: true`,
-`nccl_ep.recv_capacity_factor` instead gives every dispatch a fixed receive
+requires one host synchronization per MoE layer. With the `torch_mm` or `te`
+experts backend, `nccl_ep.recv_capacity_factor` instead gives every dispatch a fixed receive
 buffer of `max_tokens_per_rank` (rounded up to a multiple of 64) times top-k
 times the factor rows, plus the expert padding described below, and removes that
 synchronization:
@@ -192,14 +191,17 @@ choose a factor that covers the routing skew of the model; balanced routing
 needs about 1.0. The fixed buffers increase expert activation memory by up to
 the same factor. Experts with bias terms do not support this mode.
 
-With `experts: te`, NCCL-EP zero-pads each local expert's received rows to the
-multiple that the `te_fp8` recipe needs: 16 rows for FP8 current scaling, 32 for
-MXFP8, and 128 for MXFP8 and FP8 block scaling with `te_grouped_tensor: true`.
-The grouped GEMMs then skip Transformer Engine's padding and unpadding copies
-and produce the same results. Enable FP8 through `te_fp8`, not an outer Transformer
-Engine autocast, so that NCCL-EP knows the alignment. With `te_grouped_tensor: true`,
-the experts also read the per-expert row counts on the device instead of copying
-them to the host.
+With `experts: te`, NCCL-EP always uses Transformer Engine's grouped-tensor
+GEMMs: `te_grouped_tensor` defaults to true for NCCL-EP, and NCCL-EP rejects
+false. These GEMMs run all local experts in one launch and read NCCL-EP's
+per-expert row counts on the device, so the experts never copy them to the host.
+Their device and precision support follows Transformer Engine's grouped-tensor
+path; for example, it does not support FP8 delayed scaling, or FP8 block scaling
+on Blackwell. NCCL-EP zero-pads each local expert's received rows to the
+multiple that the `te_fp8` recipe needs: 16 rows for FP8 current scaling and 128
+for MXFP8 and FP8 block scaling. The GEMMs then skip Transformer Engine's padding
+and unpadding copies and produce the same results. Enable FP8 through `te_fp8`,
+not an outer Transformer Engine autocast, so that NCCL-EP knows the alignment.
 
 `nccl_ep.zero_copy` lets dispatch write received tokens into symmetric memory
 that the experts read directly, and lets combine read the expert output from
@@ -210,7 +212,6 @@ NCCL-EP's staging buffers:
 model:
   backend:
     experts: te
-    te_grouped_tensor: true
     dispatcher: nccl_ep
     nccl_ep:
       max_tokens_per_rank: 4096

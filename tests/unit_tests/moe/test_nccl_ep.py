@@ -500,7 +500,10 @@ def test_nccl_ep_row_check_reads_the_host_extent(rows):
         ({"nccl_ep": {"max_tokens_per_rank": 0}}, "positive"),
         ({"nccl_ep": {"max_tokens_per_rank": 5}, "dispatcher_async_dispatch": True}, "async_dispatch"),
         ({"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 0.5}}, "recv_capacity_factor"),
-        ({"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 2.0}, "experts": "te"}, "te_grouped_tensor"),
+        (
+            {"nccl_ep": {"max_tokens_per_rank": 5}, "experts": "te", "te_grouped_tensor": False},
+            "te_grouped_tensor=False",
+        ),
         ({"nccl_ep": {"max_tokens_per_rank": 5, "zero_copy": True}}, "recv_capacity_factor"),
         (
             {"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 1.5, "zero_copy": True}},
@@ -672,13 +675,14 @@ def test_backend_preserves_explicit_selection(experts):
     assert config.experts == experts
     assert isinstance(config.nccl_ep, NcclEpConfig)
     assert config.nccl_ep.max_tokens_per_rank == 17
+    # TE experts always run the grouped-tensor GEMMs under NCCL-EP.
+    assert config.te_grouped_tensor is (experts == "te")
 
 
-def test_backend_accepts_te_grouped_capacity_and_zero_copy():
+def test_backend_accepts_te_capacity_and_zero_copy():
     config = BackendConfig(
         dispatcher="nccl_ep",
         experts="te",
-        te_grouped_tensor=True,
         nccl_ep={"max_tokens_per_rank": 17, "recv_capacity_factor": 1.25, "zero_copy": True},
     )
     assert config.te_grouped_tensor and config.nccl_ep.zero_copy
