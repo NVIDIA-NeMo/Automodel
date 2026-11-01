@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.08-py3
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.10-cuda13.4-devel-ubuntu24.04
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -120,8 +120,8 @@ FROM update_base_container AS automodel_dep
 
 # Install TE
 ARG INSTALL_TE=True
-ARG TE_COMMIT=v2.19.0
-# TE 2.19 expands the 100 family target to 107a when CUDA 13.4+ is used.
+ARG TE_COMMIT=v2.20.2
+# TE 2.19+ expands the 100 family target to 107a when CUDA 13.4+ is used.
 ARG TE_CUDA_ARCHS="80;90;100;120"
 ARG TE_BUILD_MAX_JOBS=8
 ARG TE_BUILD_THREADS_PER_JOB=8
@@ -129,7 +129,7 @@ ARG TE_BUILD_THREADS_PER_JOB=8
 # binding is already compatible. Otherwise rebuild it against the exact
 # PyTorch/CUDA stack in this image to avoid carrying a stale native extension.
 RUN if [ "$INSTALL_TE" = "True" ] || \
-        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.19.0'); import transformer_engine.pytorch"; then \
+        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.20.2'); import transformer_engine.pytorch"; then \
     pip uninstall -y transformer-engine transformer-engine-cu12 transformer-engine-cu13 transformer-engine-torch && \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
@@ -385,15 +385,32 @@ RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi
 
+# Backport PyTorch #198292: the optional NVGEMM probe must tolerate CUTLASS
+# operators that cannot import against the FA4/FFPA-compatible CuTe DSL version.
+# This preserves torch.compile's other GEMM backends and all compiled tests.
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        torch_dir=$(python -c "from pathlib import Path; import torch; print(Path(torch.__file__).parent)") && \
+        patch_file=/opt/Automodel/docker/common/pytorch-nvgemm-availability.patch && \
+        if git -C "$torch_dir" apply --check "$patch_file" 2>/dev/null; then \
+            git -C "$torch_dir" apply "$patch_file"; \
+        else \
+            git -C "$torch_dir" apply --reverse --check "$patch_file"; \
+        fi && \
+        python -c "from torch._inductor.utils import ensure_nv_universal_gemm_available; ensure_nv_universal_gemm_available()"; \
+    fi
+
 # Fail the image build before publication if PyTorch headers cannot compile as
 # C++20, torch._grouped_mm is unavailable, or a bundled native extension has
 # unresolved PyTorch/CUDA symbols. MoK links libcuda directly; use the toolkit's
 # stub only for this import check on builders without an NVIDIA driver.
+# Load installed pytest entry points too: system-site-packages can expose a
+# base-image plugin whose module is shadowed by an older venv dependency.
 RUN mkdir -p /tmp/cuda-driver-stubs && \
     ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-driver-stubs/libcuda.so.1 && \
     LD_LIBRARY_PATH=/tmp/cuda-driver-stubs:${LD_LIBRARY_PATH} \
-        MAX_JOBS=2 python docker/common/verify_native_runtime.py && \
-    rm -rf /tmp/cuda-driver-stubs
+        MAX_JOBS=2 python docker/common/verify_native_runtime.py --base-image "$BASE_IMAGE" && \
+    rm -rf /tmp/cuda-driver-stubs && \
+    python -c "from _pytest.config import get_config; get_config().pluginmanager.load_setuptools_entrypoints('pytest11')"
 
 WORKDIR /opt/Automodel
 

@@ -54,7 +54,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import select_qsa_t
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 
 class _FakeMesh:

@@ -30,7 +30,7 @@ from nemo_automodel.components.models.gemma4_moe.state_dict_adapter import Gemma
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 N_EXPERTS = 4
 HIDDEN = 64

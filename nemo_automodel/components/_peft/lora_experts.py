@@ -117,6 +117,7 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         self.gate_and_up_projs = orig_module.gate_and_up_projs
         self.down_projs = orig_module.down_projs
+        self.expert_activation_grouped = orig_module.expert_activation_grouped
 
         if self.expert_bias:
             self.gate_up_proj_bias = orig_module.gate_up_proj_bias
@@ -598,6 +599,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
         self.gate_and_up_projs = orig_module.gate_and_up_projs
         self.down_projs = orig_module.down_projs
+        self.expert_activation = orig_module.expert_activation
 
         if self.expert_bias:
             self.gate_up_proj_bias = orig_module.gate_up_proj_bias
