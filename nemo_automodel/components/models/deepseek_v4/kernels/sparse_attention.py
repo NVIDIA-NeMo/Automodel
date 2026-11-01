@@ -91,24 +91,31 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
         """
         q, kv, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        backward_fn = sparse_mla_bwd.sparse_mqa_bwd_interface
-        options = {}
         if ctx.backward_impl == "deterministic":
             from nemo_automodel.components.models.deepseek_v4.kernels.fixed_order_sparse_mla import fixed_order_backward
 
-            backward_fn = fixed_order_backward
-            options["workspace_bytes"] = ctx.backward_workspace_bytes
-        grad_q, grad_kv, grad_attn_sink = backward_fn(
-            q,
-            kv,
-            attn_sink,
-            output.contiguous(),
-            grad_output,
-            topk_idxs,
-            lse,
-            sm_scale=ctx.sm_scale,
-            **options,
-        )
+            grad_q, grad_kv, grad_attn_sink = fixed_order_backward(
+                q,
+                kv,
+                attn_sink,
+                output.contiguous(),
+                grad_output,
+                topk_idxs,
+                lse,
+                sm_scale=ctx.sm_scale,
+                workspace_bytes=ctx.backward_workspace_bytes,
+            )
+        else:
+            grad_q, grad_kv, grad_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
+                q,
+                kv,
+                attn_sink,
+                output.contiguous(),
+                grad_output,
+                topk_idxs,
+                lse,
+                sm_scale=ctx.sm_scale,
+            )
         gradients = (grad_q, grad_kv, grad_attn_sink, None, None, None, None, None)
         # Direct .apply callers may omit optional arguments. Autograd requires
         # one entry per argument actually supplied, including optional flags.
@@ -232,27 +239,37 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
         grad_kv = torch.zeros_like(kv, dtype=torch.float32)
         grad_attn_sink_full = torch.empty_like(attn_sink)
         max_heads = ctx.max_heads_per_kernel
-        backward_fn = sparse_mla_bwd.sparse_mqa_bwd_interface
-        options = {}
-        if ctx.backward_impl == "deterministic":
-            from nemo_automodel.components.models.deepseek_v4.kernels.fixed_order_sparse_mla import fixed_order_backward
-
-            backward_fn = fixed_order_backward
-            options["workspace_bytes"] = ctx.backward_workspace_bytes
         for start in range(0, q.shape[2], max_heads):
             end = min(start + max_heads, q.shape[2])
-            grad_q_chunk, grad_kv_chunk, grad_attn_sink = backward_fn(
-                q[:, :, start:end, :].contiguous(),
-                kv,
-                attn_sink[start:end].contiguous(),
-                output[:, :, start:end, :].contiguous(),
-                grad_output[:, :, start:end, :].contiguous(),
-                topk_idxs,
-                lse[:, :, start:end].contiguous(),
-                sm_scale=ctx.sm_scale,
-                return_dkv_accum_dtype=True,
-                **options,
-            )
+            if ctx.backward_impl == "deterministic":
+                from nemo_automodel.components.models.deepseek_v4.kernels.fixed_order_sparse_mla import (
+                    fixed_order_backward,
+                )
+
+                grad_q_chunk, grad_kv_chunk, grad_attn_sink = fixed_order_backward(
+                    q[:, :, start:end, :].contiguous(),
+                    kv,
+                    attn_sink[start:end].contiguous(),
+                    output[:, :, start:end, :].contiguous(),
+                    grad_output[:, :, start:end, :].contiguous(),
+                    topk_idxs,
+                    lse[:, :, start:end].contiguous(),
+                    sm_scale=ctx.sm_scale,
+                    workspace_bytes=ctx.backward_workspace_bytes,
+                    return_dkv_accum_dtype=True,
+                )
+            else:
+                grad_q_chunk, grad_kv_chunk, grad_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
+                    q[:, :, start:end, :].contiguous(),
+                    kv,
+                    attn_sink[start:end].contiguous(),
+                    output[:, :, start:end, :].contiguous(),
+                    grad_output[:, :, start:end, :].contiguous(),
+                    topk_idxs,
+                    lse[:, :, start:end].contiguous(),
+                    sm_scale=ctx.sm_scale,
+                    return_dkv_accum_dtype=True,
+                )
             grad_q_full[:, :, start:end, :].copy_(grad_q_chunk)
             grad_kv += grad_kv_chunk
             grad_attn_sink_full[start:end].copy_(grad_attn_sink)

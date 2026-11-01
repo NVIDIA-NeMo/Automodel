@@ -39,6 +39,12 @@ def _reduce_kv(D: int):
         offsets: T.Tensor([B, N + 1], T.int64),
         result: T.Tensor([B, N, D], T.float32),
     ):
+        """Add FP32 [B, E, D] partials into FP32 [B, N, D] result in place.
+
+        Int64 order [B, E] stably orders query/slot edges by key. Int64
+        offsets [B, N + 1] delimit each key's valid edges; invalid edges
+        are excluded. Inputs are read-only; result accumulates one chunk.
+        """
         with T.Kernel(N, B, T.ceildiv(D, 128), threads=128) as (key, batch, feature):
             start = offsets[batch, key]
             end = offsets[batch, key + 1]
@@ -75,6 +81,11 @@ def _reduce_sink(H: int):
         partials: T.Tensor([R, H], T.float32),
         result: T.Tensor([H], T.float32),
     ):
+        """Add FP32 [R, H] partials into FP32 [H] result in place.
+
+        R flattens batch and query rows of the current chunk. Partials are
+        read-only; result accumulates their fixed-tree, fixed-order sum.
+        """
         with T.Kernel(T.ceildiv(H, 16), threads=128) as block:
             values = T.alloc_fragment([32, 16], T.float32)
             reduced = T.alloc_fragment([16], T.float32)
@@ -155,7 +166,12 @@ def fixed_order_backward(
     for start in range(0, sequence, chunk_size):
         stop = min(start + chunk_size, sequence)
         count = stop - start
-        indices = topk_idxs[:, start:stop].to(torch.int32).contiguous()
+        indices = topk_idxs[:, start:stop]
+        if indices.dtype != torch.int32:
+            # Mask before narrowing: out-of-range int64 values can wrap onto
+            # valid keys. Native int32 model plans retain their existing path.
+            indices = torch.where((indices >= 0) & (indices < keys), indices, -1).to(torch.int32)
+        indices = indices.contiguous()
         if indices.shape[-1] != slots:
             indices = torch.nn.functional.pad(indices, (0, slots - indices.shape[-1]), value=-1)
         valid = ((indices >= 0) & (indices < keys)).to(torch.int32)

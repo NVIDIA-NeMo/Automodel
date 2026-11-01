@@ -17,9 +17,49 @@
 import pytest
 import torch
 
-from nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention import sparse_attn_tilelang
+from nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention import (
+    sparse_attn_tilelang,
+    sparse_attn_tilelang_head_chunked,
+)
 
 pytestmark = pytest.mark.gpu
+
+
+@pytest.mark.parametrize("heads", [16, 128])
+@pytest.mark.parametrize("reference_rounding", [False, True])
+@pytest.mark.parametrize("invalid_index", [2**32, -(2**32)])
+@pytest.mark.parametrize("control_dtype", [torch.int32, torch.int64])
+def test_fixed_order_masks_int64_overflow(
+    heads: int, reference_rounding: bool, invalid_index: int, control_dtype: torch.dtype
+) -> None:
+    """An invalid wide index must behave exactly like the masked sentinel."""
+    results = []
+    for index, dtype in ((-1, control_dtype), (invalid_index, torch.int64)):
+        q = torch.zeros(1, 1, heads, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        kv = torch.stack((torch.zeros(128, device="cuda"), torch.ones(128, device="cuda")))
+        kv = kv.unsqueeze(0).to(torch.bfloat16).requires_grad_()
+        sink = torch.zeros(heads, device="cuda", requires_grad=True)
+        indices = torch.tensor([[[1, index]]], device="cuda", dtype=dtype)
+        if heads > 64:
+            output = sparse_attn_tilelang_head_chunked(
+                q, kv, sink, indices, 64,
+                reference_rounding=reference_rounding,
+                backward_impl="deterministic",
+                backward_workspace_bytes=32 * 128 * 4,
+            )
+        else:
+            output = sparse_attn_tilelang(
+                q, kv, sink, indices,
+                reference_rounding=reference_rounding,
+                backward_impl="deterministic",
+                backward_workspace_bytes=32 * 128 * 4,
+            )
+        gradients = torch.autograd.grad(output, (q, kv, sink), torch.ones_like(output))
+        assert torch.equal(output, torch.full_like(output, 0.5))
+        assert torch.count_nonzero(gradients[1][:, 0]) == 0
+        assert torch.equal(gradients[1][:, 1], torch.full_like(gradients[1][:, 1], heads / 2))
+        results.append((output.detach(), *(value.detach() for value in gradients)))
+    assert all(torch.equal(actual, control) for actual, control in zip(results[1], results[0], strict=True))
 
 
 def _reference(q, kv, sink, indices, incoming):

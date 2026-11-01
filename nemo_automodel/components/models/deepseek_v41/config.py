@@ -580,6 +580,9 @@ class DeepseekV41DSparkConfig:
             raise ValueError("DeepSeek V4.1 DSpark requires confidence_head_with_markov=true")
 
         draft_config = copy.deepcopy(self.text_config)
+        # The dense draft uses SDPA, so it does not inherit the target's
+        # TileLang-only sparse backward selector. Preserve the target config.
+        draft_config.sparse_attention_backward = "atomic"
         draft_config.architectures = ["DeepseekV41DSparkModel"]
         draft_config.quantization_config = copy.deepcopy(self.quantization_config)
         return DeepseekV41DSparkModel(

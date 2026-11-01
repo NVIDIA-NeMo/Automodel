@@ -518,17 +518,28 @@ def dsv4_sparse_attention(
         if q.shape[2] > max_heads_per_kernel:
             if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
                 raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
-            kwargs = {"reference_rounding": True} if reference_rounding else {}
-            if backward_impl == "deterministic":
-                kwargs.update(backward_impl=backward_impl, backward_workspace_bytes=backward_workspace_bytes)
             output = _miles_sparse_attn_tilelang_head_chunked(
-                q, kv, sinks, topk_idxs, max_heads_per_kernel, sm_scale, **kwargs
+                q,
+                kv,
+                sinks,
+                topk_idxs,
+                max_heads_per_kernel,
+                sm_scale,
+                reference_rounding=reference_rounding,
+                backward_impl=backward_impl,
+                backward_workspace_bytes=backward_workspace_bytes,
             )
         else:
-            kwargs = {"reference_rounding": True} if reference_rounding else {}
-            if backward_impl == "deterministic":
-                kwargs.update(backward_impl=backward_impl, backward_workspace_bytes=backward_workspace_bytes)
-            output = _miles_sparse_attn_tilelang(q, kv, sinks, topk_idxs, sm_scale, **kwargs)
+            output = _miles_sparse_attn_tilelang(
+                q,
+                kv,
+                sinks,
+                topk_idxs,
+                sm_scale,
+                reference_rounding=reference_rounding,
+                backward_impl=backward_impl,
+                backward_workspace_bytes=backward_workspace_bytes,
+            )
         return output[:, :, :original_heads, :]
     if backward_impl == "deterministic":
         raise ValueError("deterministic sparse attention backward requires CUDA BF16 TileLang execution")
