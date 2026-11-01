@@ -29,7 +29,7 @@ import pytest
 
 pytest_plugins = ["pytester"]
 
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 _CONFTEST_SOURCE = Path(__file__).with_name("conftest.py").read_text()
 # The short soft budget exercises confirmation without making traceback
