@@ -454,6 +454,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ) -> dict[str, Any]:
         """Attach GLM DSA's packed THD context-parallel batch sharder.
 
+        ``BackendConfig.cp_query_layout`` picks the query shard each rank owns: contiguous
+        (rank r keeps tokens ``[r * T/cp, (r + 1) * T/cp)``) or head/tail (rank r keeps chunks r and
+        ``2 * cp - 1 - r`` of ``2 * cp``, which balances the indexer's causal work across ranks).
+
         Args:
             batch: The batch dict.
             num_chunks: Number of chunks for load-balanced CP sharding.
@@ -463,6 +467,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
             ContextParallelSharder,
             contiguous_local_indices,
+            round_robin_local_indices,
         )
 
         attn_backend = getattr(self.backend, "attn", None)
@@ -472,14 +477,16 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 f"got backend.attn={attn_backend!r}."
             )
 
+        query_layout = self.backend.cp_query_layout
         cp_sharder = ContextParallelSharder(
             shard_batch=partial(
                 shard_glm_dsa_packed_cp_batch,
                 num_chunks=int(num_chunks),
+                query_layout=query_layout,
             ),
-            # Contiguous over the packed THD token axis: rank r keeps
-            # tokens [r * T/cp, (r + 1) * T/cp).
-            local_token_global_indices=contiguous_local_indices,
+            local_token_global_indices=(
+                round_robin_local_indices if query_layout == "head_tail" else contiguous_local_indices
+            ),
         )
         return {"cp_sharder": cp_sharder}
 

@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import contextlib
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -26,6 +26,7 @@ import torch.distributed._functional_collectives as funcol
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ShardLayout,
     contiguous_local_indices,
+    round_robin_local_indices,
 )
 from nemo_automodel.components.distributed.thd_utils import (
     split_batch_into_thd_chunks,
@@ -38,6 +39,22 @@ from nemo_automodel.shared.recompute_replay import RecomputeReplay
 # reuses the forward's gathered tensor instead of communicating again, while its backward still
 # reduce-scatters the gradient to the owning ranks.
 glm_dsa_gather_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("GLM DSA CP gathered latent")
+
+# Which global query positions a CP rank owns. "contiguous": rank r keeps tokens
+# [r * T/cp, (r + 1) * T/cp). "head_tail": the sequence is cut into 2 * cp chunks and rank r keeps
+# chunks r and 2 * cp - 1 - r, so the causal (quadratic) indexer work is the same on every rank;
+# the top-k sparse attention itself is uniform per query and does not care.
+QueryLayout = Literal["contiguous", "head_tail"]
+QUERY_LAYOUTS: tuple[QueryLayout, ...] = ("contiguous", "head_tail")
+
+
+def local_query_indices(layout: QueryLayout, cp_mesh, total_tokens: int, device: torch.device) -> torch.Tensor:
+    """Return this rank's global query positions for ``layout`` (see :data:`QueryLayout`)."""
+    if layout == "head_tail":
+        return round_robin_local_indices(cp_mesh, total_tokens, device)
+    if layout == "contiguous":
+        return contiguous_local_indices(cp_mesh, total_tokens, device)
+    raise ValueError(f"Unknown GLM DSA CP query layout {layout!r}; expected one of {QUERY_LAYOUTS}")
 
 
 def glm_dsa_cp_enabled(cp_group) -> bool:
@@ -132,9 +149,10 @@ def _slice_thd_chunk_for_cp(
     cp_size: int,
     cp_rank: int,
     padding_token_id: int,
+    query_layout: QueryLayout = "contiguous",
 ) -> dict[str, torch.Tensor]:
     total_tokens = int(chunk["input_ids"].shape[0])
-    query_indices = contiguous_local_indices(cp_mesh, total_tokens, chunk["input_ids"].device)
+    query_indices = local_query_indices(query_layout, cp_mesh, total_tokens, chunk["input_ids"].device)
 
     out: dict[str, torch.Tensor | int | str | object] = {
         "input_ids": chunk["input_ids"].index_select(0, query_indices).to(torch.int64).contiguous(),
@@ -183,13 +201,14 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
+    query_layout: QueryLayout = "contiguous",
 ):
-    """Convert packed GLM DSA batches to THD and keep a contiguous query shard per CP rank.
+    """Convert packed GLM DSA batches to THD and keep one query shard per CP rank.
 
     GLM DSA sparse attention gathers K/V activations inside the model. The batch
-    side only slices local query tokens and carries the full packed-sequence
-    ``cu_seqlens`` plus per-query global token indices for TileLang's causal
-    top-k window.
+    side only slices local query tokens (``query_layout`` decides which, see
+    :data:`QueryLayout`) and carries the full packed-sequence ``cu_seqlens`` plus
+    per-query global token indices for the kernels' causal top-k windows.
     """
     del tp_mesh, loss_mask
 
@@ -211,6 +230,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
             cp_size=cp_size,
             cp_rank=cp_rank,
             padding_token_id=padding_token_id,
+            query_layout=query_layout,
         )
         return contextlib.nullcontext, sliced
 
@@ -225,6 +245,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
                 cp_size=cp_size,
                 cp_rank=cp_rank,
                 padding_token_id=padding_token_id,
+                query_layout=query_layout,
             )
         )
 
@@ -246,6 +267,7 @@ def shard_glm_dsa_packed_cp_batch(
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
+    query_layout: QueryLayout = "contiguous",
 ):
     """``ContextParallelSharder.shard_batch`` wrapper for GLM DSA packed CP."""
     layout = _packed_cp_layout(batch, num_chunks=num_chunks)
@@ -257,5 +279,6 @@ def shard_glm_dsa_packed_cp_batch(
         padding_token_id=padding_token_id,
         num_chunks=num_chunks,
         seq_lens_padding_value=seq_lens_padding_value,
+        query_layout=query_layout,
     )
     return ctx_factory, sharded_batch, layout

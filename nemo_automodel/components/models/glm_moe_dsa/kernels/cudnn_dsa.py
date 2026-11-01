@@ -138,8 +138,9 @@ def prepare_cudnn_dsa_packed_metadata(
         max_seqlen: Optional precomputed maximum sequence length as a Python integer or
             scalar integer tensor. Its value is checked against ``cu_seqlens``.
         query_indices: Optional contiguous integer tensor of shape ``[T_q]`` with
-            global padded-storage coordinates for the local query rows. When absent,
-            queries cover all global key tokens (CP=1).
+            strictly increasing global padded-storage coordinates for the local query
+            rows: one interval (contiguous CP shard) or the head and tail intervals of
+            the round-robin CP layout. When absent, queries cover all global key tokens (CP=1).
         cu_seqlens_padded: Optional cumulative padded-storage boundaries, int32 tensor
             of shape ``[sequences + 1]``. When absent, ``cu_seqlens`` also defines
             storage coordinates.
@@ -197,14 +198,21 @@ def prepare_cudnn_dsa_packed_metadata(
         if padding_mask.device != cu_seqlens.device or not padding_mask.is_contiguous():
             raise ValueError("padding_mask and cu_seqlens must be contiguous on the same device.")
 
-    # AutoModel CP keeps one contiguous interval of global padded-token rows per rank.
-    # Filter non-intersecting documents, then pair each local Q segment with that
-    # document's K prefix. cuDNN Frontend 1.27+ requires the first local query's
-    # document-relative position explicitly for rectangular Q/K segments.
+    # A segment is a run of consecutive global query coordinates inside one document, paired with
+    # that document's K prefix up to the segment's last query. A contiguous CP shard gives one
+    # segment per intersected document; the head/tail (round-robin) CP layout gives two runs per
+    # document, each with its own causal offset. cuDNN Frontend 1.27+ requires the first local
+    # query's document-relative position explicitly for rectangular Q/K segments.
     document_ids = torch.searchsorted(layout_cu, global_queries, right=True).sub(1)
     safe_document_ids = document_ids.clamp(0, real_lengths.numel() - 1).to(torch.long)
-    segment_documents, query_counts = torch.unique_consecutive(safe_document_ids, return_counts=True)
+    segment_start = torch.ones_like(safe_document_ids, dtype=torch.bool)
+    segment_start[1:] = (safe_document_ids[1:] != safe_document_ids[:-1]) | (
+        global_queries[1:] != global_queries[:-1] + 1
+    )
+    segment_ids = segment_start.to(torch.int64).cumsum(0).sub(1)
+    query_counts = torch.bincount(segment_ids)
     segment_cu_q64 = torch.nn.functional.pad(query_counts.cumsum(0), (1, 0))
+    segment_documents = safe_document_ids.index_select(0, segment_cu_q64[:-1])
     segment_query_starts = global_queries.index_select(0, segment_cu_q64[:-1])
     segment_document_starts = layout_cu.to(torch.int64).index_select(0, segment_documents)
     q_causal_offsets64 = segment_query_starts - segment_document_starts
@@ -286,10 +294,12 @@ def prepare_cudnn_dsa_packed_metadata(
         )
     if min_padding < 0:
         raise ValueError("Every padded sequence length must be at least its real sequence length.")
-    if query_first < 0 or query_last >= total_key_tokens or min_query_delta != 1 or max_query_delta != 1:
+    if query_first < 0 or query_last >= total_key_tokens or min_query_delta < 1:
         raise ValueError(
-            "query_indices must be one contiguous increasing interval inside the global padded THD layout."
+            "query_indices must be strictly increasing coordinates inside the global padded THD layout "
+            "(one contiguous interval, or the head/tail intervals of the round-robin CP layout)."
         )
+    del max_query_delta
     if min_document_id < 0 or max_document_id >= real_lengths.numel():
         raise ValueError("query_indices contain positions outside the global padded THD layout.")
     if min_query_count <= 0 or min_key_count <= 0:
