@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _build_packed_vlm_sample, _shift_sample
+from nemo_automodel.components.models.deepseek_v41 import attention
 from nemo_automodel.components.models.deepseek_v41.cp import shard_cp_batch
 from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
 from nemo_automodel.components.models.deepseek_v41.processing import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
@@ -144,9 +145,27 @@ def test_batched_vision_matches_independent_equations_and_all_gradients(
 @pytest.mark.parametrize("alignment", [1, 4, 64])
 @pytest.mark.parametrize("full_schedule", [False, True])
 @pytest.mark.parametrize("ratio,engram", [(2, False), (3, True)])
-def test_packed_images_match_independent_documents_and_updates(
-    alignment: int, full_schedule: bool, ratio: int, engram: bool
+def test_packed_images_match_independent_documents_and_updates_without_cache_rounding(
+    alignment: int, full_schedule: bool, ratio: int, engram: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Different GEMM shapes can straddle an FP8/FP4 midpoint even in FP32.
+    # Isolate document-boundary semantics here, retaining strict logits,
+    # gradient and update comparisons. Quantized isolation is checked below;
+    # encoding and STE semantics are covered in test_quantization.py.
+    def without_cache_rounding(values: torch.Tensor, *, format: str, block_size: int) -> torch.Tensor:
+        """Preserve the cache values and their gradient without discrete rounding.
+
+        Args:
+            values: Tensor of shape [..., channels], with arbitrary leading dimensions.
+            format: Cache encoding normally applied to the final axis.
+            block_size: Number of channels per quantization block.
+
+        Returns:
+            Tensor of shape [..., channels], with independent storage and unchanged dtype.
+        """
+        return values.clone()
+
+    monkeypatch.setattr(attention, "quantize_cache", without_cache_rounding)
     torch.set_num_threads(1)
     torch.manual_seed(202)
     model = _model(full_schedule, ratio=ratio, engram=engram)
@@ -203,6 +222,27 @@ def test_previous_document_image_and_length_cannot_change_next_document() -> Non
         batch.pop("n_images_per_sample", None)
         outputs.append(model(**batch).logits[batch["packed_seq_ids"] == 2])
     torch.testing.assert_close(outputs[0], outputs[1], atol=5e-6, rtol=5e-5)
+
+
+def test_quantized_packed_target_is_independent_of_other_document() -> None:
+    """Keep native cache quantization and GEMM shapes fixed while changing another document."""
+    torch.set_num_threads(1)
+    torch.manual_seed(202)
+    model = _model(True, ratio=3, engram=True)
+    source = _sample(((3, 5),), prefix=2, ratio=3)
+    target = _sample(((1, 1), (2, 3)), prefix=3, ratio=3)
+    changed = {key: value.clone() for key, value in source.items()}
+    changed["pixel_values"].neg_()
+    text = changed["vision_token_types"] < 0
+    changed["input_ids"][text] = changed["input_ids"][text] % 7 + 1
+    outputs = []
+    for previous in (source, changed):
+        _, batch, _ = shard_cp_batch(None, None, _batch([previous, target], length=256), packed_alignment=2)
+        batch.pop("labels")
+        batch.pop("n_images_per_sample")
+        with torch.no_grad():
+            outputs.append(model(**batch).logits[batch["packed_seq_ids"] == 2])
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
