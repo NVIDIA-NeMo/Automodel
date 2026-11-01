@@ -114,7 +114,7 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.HfImageConversationDatasetConfig
   path_or_dataset: HuggingFaceH4/llava-instruct-mix-vsft
-  revision: 4c04c8302cb25a9c7ee48d2dfda99308d432f87c
+  revision: 4c04c8302cb25a9c7ee48d2dfda99308d432f87c  # pragma: allowlist secret (public dataset commit SHA)
   split: train
   seed: 1234
   truncate: false
