@@ -181,9 +181,14 @@ def transport(monkeypatch):
     nccl_ep.finalize_nccl_ep()
 
 
+def _lending_group():
+    """EP group whose CUDA backend exposes the raw communicator, as classic ProcessGroupNCCL does."""
+    return SimpleNamespace(size=lambda: 2, _get_backend=lambda device: SimpleNamespace(_comm_ptr=lambda: 1))
+
+
 @pytest.fixture
 def group():
-    return SimpleNamespace(size=lambda: 2)
+    return _lending_group()
 
 
 def _manager(group, *, max_tokens=5, hidden_dim=4):
@@ -281,7 +286,7 @@ def test_context_reuse_rejection_and_cleanup(transport, group):
     assert transport.bootstraps[0][1]["max_tokens_per_rank"] == 64
     assert transport.bootstraps[0][1]["recv_capacity_per_rank"] is None
     with pytest.raises(ValueError, match="one EP group"):
-        _manager(SimpleNamespace(size=lambda: 2))
+        _manager(_lending_group())
     with pytest.raises(ValueError, match="one EP group"):
         _manager(group, hidden_dim=8)
     nccl_ep.finalize_nccl_ep()
@@ -289,6 +294,38 @@ def test_context_reuse_rejection_and_cleanup(transport, group):
     assert transport.finalized == 1
     _manager(group, hidden_dim=8)
     assert len(transport.bootstraps) == 2
+
+
+def test_groups_without_a_lendable_communicator_use_a_legacy_group(transport, monkeypatch):
+    # PyTorch 2.15's default ProcessGroupNCCL2 backend has no _comm_ptr for Transformer Engine to borrow.
+    group = SimpleNamespace(size=lambda: 2, _get_backend=lambda device: SimpleNamespace())
+    legacy = SimpleNamespace(size=lambda: 2)
+    # ProcessGroupNCCL2 binds the default group to a device, which would make new_group split from it.
+    world = SimpleNamespace(bound_device_id="cuda:0")
+    calls = []
+    # Route the runtime's torch.distributed calls to fakes so that torch's default group stays untouched.
+    fake_dist = SimpleNamespace(
+        group=SimpleNamespace(WORLD=world),
+        get_backend=lambda pg: "nccl",
+        get_process_group_ranks=lambda pg: [3, 7] if pg is group else None,
+        new_group=lambda *args, **kwargs: calls.append(("new", args, kwargs, world.bound_device_id)) or legacy,
+        barrier=lambda **kwargs: calls.append(("barrier", kwargs)),
+    )
+    monkeypatch.setattr(nccl_ep, "dist", fake_dist)
+    _manager(group)
+    _manager(group)
+    # NCCL-EP runs on the legacy group, while layers keep matching the caller's group.
+    assert [bootstrap[0] for bootstrap in transport.bootstraps] == [legacy]
+    nccl_ep.finalize_nccl_ep()
+    # The legacy group outlives finalize, like the EP group it mirrors, and a new bootstrap reuses it.
+    _manager(group)
+    assert [bootstrap[0] for bootstrap in transport.bootstraps] == [legacy, legacy]
+    # The legacy group is created unbound, so it builds its own communicator, and the binding comes back.
+    assert calls == [
+        ("new", ([3, 7],), {"backend": "nccl-legacy", "use_local_synchronization": True}, None),
+        ("barrier", {"group": legacy, "device_ids": [0]}),
+    ]
+    assert world.bound_device_id == "cuda:0"
 
 
 @pytest.mark.parametrize("previous", [None, "0"])

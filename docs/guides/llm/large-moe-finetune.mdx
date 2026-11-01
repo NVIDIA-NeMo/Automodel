@@ -181,6 +181,10 @@ their PyTorch headers do not support that build. All NCCL-EP layers in a process
 must share the same EP group, token bound, hidden width, expert count, and top-k.
 Communication state is initialized during expert parallelization, before
 activation checkpointing, and released before process-group teardown.
+Transformer Engine 2.20 borrows the EP group's NCCL communicator, which the
+`ProcessGroupNCCL2` backend that PyTorch 2.15 uses for `backend="nccl"` does
+not expose. In that case NCCL-EP creates a classic `nccl-legacy` group over the
+same ranks, which adds one NCCL communicator per EP group.
 
 Run the focused two-GPU validation in an enabled container:
 
