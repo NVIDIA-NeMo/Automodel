@@ -506,7 +506,14 @@ def test_nccl_ep_row_check_reads_the_host_extent(rows):
         ),
         ({"nccl_ep": {"max_tokens_per_rank": 5, "zero_copy": True}}, "recv_capacity_factor"),
         (
-            {"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 1.5, "zero_copy": True}},
+            {"nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 1.5}, "experts": "torch"},
+            "recv_capacity_factor requires experts='te' or 'torch_mm'",
+        ),
+        (
+            {
+                "nccl_ep": {"max_tokens_per_rank": 5, "recv_capacity_factor": 1.5, "zero_copy": True},
+                "experts": "torch_mm",
+            },
             "zero_copy requires experts='te'",
         ),
     ],
