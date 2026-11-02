@@ -138,6 +138,14 @@ def _init_named_mesh(
     device_type = _mesh_device_type()
     backend_override = _nccl_backend_override(spec.axes, device_type=device_type, timeout_minutes=timeout_minutes)
     if ranks is None:
+        if backend_override is not None:
+            # A world-sized axis reuses the default process group, which already has the
+            # configured timeout. Overriding it would allocate another world-sized communicator.
+            backend_override = {
+                axis: backend_override[axis]
+                for axis, size in zip(spec.axes, spec.shape)
+                if not _can_reuse_default_group(size)
+            } or None
         device_mesh = init_device_mesh(
             device_type=device_type,
             mesh_shape=spec.shape,
@@ -197,7 +205,7 @@ def _nccl_backend_override(
 
 
 def _can_reuse_default_group(group_size: int) -> bool:
-    """Return whether a derived mesh dimension spans the default process group."""
+    """Return whether a mesh dimension spans the default process group."""
     return dist.is_initialized() and group_size == dist.get_world_size()
 
 

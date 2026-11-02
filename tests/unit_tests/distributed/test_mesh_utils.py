@@ -74,6 +74,7 @@ def test_init_named_mesh_sets_nccl_timeout_backend_override(
 
     monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: default_backend is not None)
     monkeypatch.setattr(mesh_utils.dist, "get_backend", lambda: default_backend)
+    monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 8)
 
     result = _init_named_mesh(_MeshSpec(shape=(2,), axes=(MeshAxisName.PP,)), timeout_minutes=30)
 
@@ -81,6 +82,42 @@ def test_init_named_mesh_sets_nccl_timeout_backend_override(
     backend, options = captured["backend_override"][MeshAxisName.PP]
     assert backend == (default_backend or "nccl")
     assert options._timeout == datetime.timedelta(minutes=30)
+
+
+@pytest.mark.parametrize(
+    ("shape", "axes", "expected_override_axes"),
+    [
+        ((1, 8), (MeshAxisName.PP, MeshAxisName.DP_SHARD), {MeshAxisName.PP}),
+        ((8,), (MeshAxisName.DP_SHARD,), None),
+    ],
+    ids=["mixed", "world-only"],
+)
+def test_init_named_mesh_reuses_default_group_for_world_sized_axes(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, ...],
+    axes: tuple[MeshAxisName, ...],
+    expected_override_axes: set[MeshAxisName] | None,
+) -> None:
+    captured: dict = {}
+
+    def fake_init_device_mesh(**kwargs):
+        captured.update(kwargs)
+        return Mock()
+
+    monkeypatch.setattr(mesh_utils, "init_device_mesh", fake_init_device_mesh)
+    monkeypatch.setattr(mesh_utils, "_mesh_device_type", lambda: "cuda")
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_backend", lambda: "cuda:nccl,cpu:gloo")
+    monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 8)
+
+    _init_named_mesh(_MeshSpec(shape=shape, axes=axes), timeout_minutes=30)
+
+    # PyTorch reuses the default group only for a world-sized axis without an override.
+    backend_override = captured["backend_override"]
+    if expected_override_axes is None:
+        assert backend_override is None
+    else:
+        assert set(backend_override) == expected_override_axes
 
 
 def test_init_named_mesh_omits_backend_override_for_cpu(monkeypatch):

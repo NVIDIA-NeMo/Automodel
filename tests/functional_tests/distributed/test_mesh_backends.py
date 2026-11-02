@@ -53,8 +53,10 @@ def _check_mesh_backends(rank: int, store_path: str, bind_device: bool, layout: 
         for mesh in meshes:
             for axis in mesh.mesh_dim_names:
                 group = mesh[axis].get_group()
-                # World-sized derived axes may reuse the default group, which
-                # already owns its timeout. All newly created groups use 45 min.
+                # World-sized axes reuse the default group, which already owns its
+                # timeout, instead of allocating another communicator. All newly
+                # created groups use 45 min.
+                assert (group is dist.group.WORLD) == (mesh[axis].size() == dist.get_world_size())
                 expected_timeout = default_timeout if group is dist.group.WORLD else datetime.timedelta(minutes=45)
                 for device_type in ("cpu", "cuda"):
                     tensor = torch.ones(1, device=device_type)
