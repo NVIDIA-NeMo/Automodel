@@ -365,7 +365,7 @@ def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypat
     local_root = tmp_path / "local"
     (local_root / "encoder").mkdir(parents=True)
     assert sentence_transformer_export._resolve_cached_source_model_path(
-        str(local_root), SimpleNamespace(), {"subfolder": "encoder"}
+        str(local_root), {"subfolder": "encoder"}
     ) == str(local_root / "encoder")
     assert sentence_transformer_export._resolve_cached_source_repository_path(
         str(local_root), str(local_root / "encoder"), {"subfolder": "encoder"}
@@ -379,8 +379,7 @@ def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypat
 
     result = sentence_transformer_export._resolve_cached_source_model_path(
         "org/model",
-        SimpleNamespace(_commit_hash="exact-commit"),
-        {"cache_dir": "/cache", "revision": "branch", "subfolder": "encoder"},
+        {"cache_dir": "/cache", "revision": "exact-commit", "subfolder": "encoder"},
     )
 
     assert result == str(cached_config.parent)
@@ -401,10 +400,9 @@ def test_cache_hub_source_legal_assets_uses_exact_loaded_revision(monkeypatch):
 
     result = sentence_transformer_export._cache_hub_source_legal_assets(
         "org/model",
-        SimpleNamespace(_commit_hash="exact-commit"),
         {
             "cache_dir": "/cache",
-            "revision": "branch",
+            "revision": "exact-commit",
             "use_auth_token": "token",
             "local_files_only": True,
         },

@@ -319,6 +319,66 @@ def test_fused_cross_entropy_torch_compile_impl_omits_cce_options(monkeypatch):
     assert "filter_eps" not in captured
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the cce dtype check applies to CUDA inputs")
+@pytest.mark.parametrize("fp32_operand", ["hidden_states", "lm_weight"])
+def test_fused_cross_entropy_cce_rejects_fp32_operands(monkeypatch, fp32_operand):
+    """An fp32 lm_head cannot train through the cce kernel; the loss says so up front."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", lambda *a, **k: torch.tensor(1.0), raising=False)
+    hidden = torch.randn(1, 2, 3, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(5, 3, device="cuda", dtype=torch.bfloat16)
+    if fp32_operand == "hidden_states":
+        hidden = hidden.float()
+    else:
+        weight = weight.float()
+    labels = torch.zeros(1, 2, dtype=torch.long, device="cuda")
+
+    with pytest.raises(ValueError, match=f"requires bf16/fp16 {fp32_operand}"):
+        linear_ce_mod.FusedLinearCrossEntropy()(hidden, labels, weight)
+    # torch_compile projects with a plain matmul and keeps accepting fp32.
+    linear_ce_mod.FusedLinearCrossEntropy(impl="torch_compile")(hidden, labels, weight)
+
+
+def _torch_compile_stand_in(hidden, weight, targets=None, *, ignore_index=-100, reduction="sum", **_):
+    """cut-cross-entropy's ``torch_compile`` projection, ``e @ c.T``, which aligns no dtypes itself."""
+    assert hidden.dtype == weight.dtype, f"mixed operands reached the kernel: {hidden.dtype} vs {weight.dtype}"
+    logits = (hidden @ weight.T).float()
+    return F.cross_entropy(
+        logits.view(-1, logits.shape[-1]), targets.view(-1), ignore_index=ignore_index, reduction=reduction
+    )
+
+
+@pytest.mark.parametrize(
+    ("hidden_dtype", "weight_dtype"),
+    [(torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16)],
+    ids=["bf16-backbone-fp32-head", "fp32-states-bf16-head"],
+)
+def test_fused_cross_entropy_projects_hidden_states_in_the_weight_dtype(monkeypatch, hidden_dtype, weight_dtype):
+    """The loss projects in the dtype of the weight it consumes, so a bf16 backbone meets an fp32 head
+    (DeepSeek V4.1, ``lm_head_precision: float32``) and fp32 FSDP outputs meet a gathered master weight."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _torch_compile_stand_in, raising=False)
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 5, 8, dtype=hidden_dtype, requires_grad=True)
+    weight = torch.randn(11, 8, dtype=weight_dtype, requires_grad=True)
+    labels = torch.randint(0, 11, (2, 5))
+    labels[0, 0] = -100
+
+    loss = linear_ce_mod.FusedLinearCrossEntropy(impl="torch_compile")(hidden, labels, weight, num_label_tokens=9)
+    loss.backward()
+
+    expected = F.cross_entropy(
+        (hidden.detach().to(weight_dtype) @ weight.detach().T).float().view(-1, 11), labels.view(-1), reduction="sum"
+    )
+    torch.testing.assert_close(loss, expected / 9)
+    assert hidden.grad is not None and hidden.grad.dtype == hidden_dtype  # the cast is differentiable
+    assert weight.grad is not None and weight.grad.dtype == weight_dtype
+
+
 def test_fused_cross_entropy_rejects_unknown_impl():
     with pytest.raises(ValueError, match="impl must be"):
         FusedLinearCrossEntropy(impl="cce_exact")

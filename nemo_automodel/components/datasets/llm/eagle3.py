@@ -154,6 +154,7 @@ def build_eagle3_dataloader(
     packed_sequence_size: int = 0,
     dp_mesh=None,
     mask_generation_prompt: bool = False,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> DataLoader:
     """Build a dataloader backed by the repo's chat formatting utilities.
 
@@ -165,6 +166,9 @@ def build_eagle3_dataloader(
     sampler then distributes by data-parallel rank so the ``cp_size`` ranks within
     a dp group receive the identical sample (CP shards its sequence across them).
     When ``None`` the sampler falls back to the full-world default (pure DP).
+
+    ``chat_template_kwargs`` are extra chat template variables passed to every render
+    (see :class:`ChatDataset`).
     """
     collate_fn = _stack_batch
     if packed_sequence_size > 0:
@@ -180,6 +184,7 @@ def build_eagle3_dataloader(
             unshifted=True,
             mask_reasoning_content=mask_reasoning_content,
             mask_generation_prompt=mask_generation_prompt,
+            chat_template_kwargs=chat_template_kwargs,
         )
         dataset = build_packed_eagle3_dataset(
             source,
@@ -199,6 +204,7 @@ def build_eagle3_dataloader(
             unshifted=True,
             mask_reasoning_content=mask_reasoning_content,
             mask_generation_prompt=mask_generation_prompt,
+            chat_template_kwargs=chat_template_kwargs,
         )
     sampler = None
     if distributed:

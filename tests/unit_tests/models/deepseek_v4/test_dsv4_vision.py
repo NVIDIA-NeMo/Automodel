@@ -89,6 +89,7 @@ def _sparse_attention_torch_module_oracle(
     sm_scale: float,
     *,
     backend: str,
+    all_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run the Torch sparse-attention oracle behind the module's TileLang dispatch.
 
@@ -99,11 +100,12 @@ def _sparse_attention_torch_module_oracle(
         topk_indices: Sparse key indices of shape [batch, sequence, selected_keys].
         sm_scale: Attention score scaling factor.
         backend: Module-selected backend, ignored by this CPU oracle.
+        all_rows_nonempty: cuDNN empty-row hint, ignored by this CPU oracle.
 
     Returns:
         Attention output tensor of shape [batch, sequence, heads, head_dim].
     """
-    del backend
+    del backend, all_rows_nonempty
     return dsv4_sparse_attention(q, kv, sinks, topk_indices, sm_scale, backend="sparse_torch")
 
 
@@ -253,23 +255,16 @@ def test_sparse_visual_window_indices_match_released_reference(types):
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize(
-    ("device", "dtype", "uses_tilelang"),
-    [
-        pytest.param("cpu", torch.float32, False, id="torch_sparse_oracle"),
-        pytest.param(
-            "cuda",
-            torch.bfloat16,
-            True,
-            id="tilelang",
-            marks=pytest.mark.skipif(
-                not _can_run_tilelang_sparse_attention(),
-                reason="TileLang sparse attention requires CUDA compute capability 8.9 or newer",
-            ),
-        ),
-    ],
-)
-def test_visual_sparse_attention_module_matches_dense_forward_backward(monkeypatch, device, dtype, uses_tilelang):
+def test_visual_sparse_attention_module_matches_dense_forward_backward(monkeypatch: pytest.MonkeyPatch) -> None:
+    check_visual_sparse_attention_module_matches_dense_forward_backward(
+        monkeypatch, device="cpu", dtype=torch.float32, uses_tilelang=False
+    )
+
+
+def check_visual_sparse_attention_module_matches_dense_forward_backward(
+    monkeypatch: pytest.MonkeyPatch, *, device: str, dtype: torch.dtype, uses_tilelang: bool
+) -> None:
+    """Check image visibility and all gradients against dense attention on CPU or CUDA."""
     torch.manual_seed(123)
     if uses_tilelang:
         hidden_size, num_heads, head_dim, seq_len, window_size = 128, 16, 512, 192, 128

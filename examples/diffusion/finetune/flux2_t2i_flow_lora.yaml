@@ -123,3 +123,6 @@ checkpoint:
   model_save_format: torch_save
   save_consolidated: false
   restore_from: null
+
+ci:
+  cluster_tag: h100

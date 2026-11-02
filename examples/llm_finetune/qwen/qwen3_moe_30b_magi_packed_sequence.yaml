@@ -116,4 +116,5 @@ optimizer:
   foreach: false
 
 ci:
+  cluster_tag: h100
   recipe_owner: huiyingl

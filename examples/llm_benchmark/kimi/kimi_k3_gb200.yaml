@@ -157,7 +157,8 @@ ci:
   recipe_owner: huiyingl
   nodes: 64
   cluster_tag: gb200
-  time: "01:00:00"
+  time: "02:00:00"
   env_vars:
     # Keep each EP32 group within one NVLink block: 8 nodes x 4 GPUs.
     SBATCH_SEGMENT_SIZE: "8"
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

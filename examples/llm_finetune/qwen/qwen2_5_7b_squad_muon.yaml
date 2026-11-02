@@ -110,4 +110,5 @@ optimizer:
 #   name: <your_wandb_exp_name>
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi

@@ -14,7 +14,7 @@
 
 import sys
 import types
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -373,10 +373,19 @@ def _import_parallelizer_with_stubs(monkeypatch):
         "nemo_automodel.components.distributed.mesh_utils",
         "nemo_automodel.components.distributed.parallelizer_utils",
     ]:
-        if mod in sys.modules:
-            sys.modules.pop(mod)
+        # Restore both import caches after the test. Otherwise later files keep
+        # collected classes while imports/patches resolve freshly loaded ones.
+        parent_name, _, attribute = mod.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            monkeypatch.delattr(parent, attribute, raising=False)
+        monkeypatch.delitem(sys.modules, mod, raising=False)
 
     _install_torch_and_layers_stubs(monkeypatch)
+
+    # parallelizer imports the real fsdp_patches; load it before the package below is replaced by a stub whose
+    # __path__ is empty, so this file also passes when it runs first (or alone) in a pytest process.
+    importlib.import_module("nemo_automodel.components.distributed.fsdp_patches")
 
     # Stub the distributed package, config normalization, pipelining module, and hf_utils.
     distributed_stub = types.ModuleType("nemo_automodel.components.distributed")
@@ -445,26 +454,9 @@ def _import_parallelizer_with_stubs(monkeypatch):
         shard_module(module, **kwargs)
 
     parallelizer_utils_stub.fully_shard_by_dtype = fully_shard_by_dtype
+    parallelizer_utils_stub.fully_shard_across_blocks = lambda blocks, module_names, **kwargs: set()
     parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
-
-    def reject_unsupported_mtp_cp(model):
-        if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
-            raise RuntimeError("Model does not support MTP with context parallelism")
-
-    parallelizer_utils_stub.reject_unsupported_mtp_cp = reject_unsupported_mtp_cp
-
-    def reject_unsupported_mtp_cp_pp(model):
-        is_pp_stage_fn = getattr(model, "_is_pipeline_parallel_stage", None)
-        if (
-            model.supports.mtp_enabled
-            and not model.supports.supports_mtp_cp_pp
-            and callable(is_pp_stage_fn)
-            and is_pp_stage_fn()
-        ):
-            raise NotImplementedError("MTP with context and pipeline parallelism is not supported")
-
-    parallelizer_utils_stub.reject_unsupported_mtp_cp_pp = reject_unsupported_mtp_cp_pp
 
     monkeypatch.setitem(
         sys.modules,
@@ -486,6 +478,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
     activation_checkpointing_stub.ensure_fsdp_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
+    activation_checkpointing_stub.ensure_moe_recompute_cache_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: (
         context_fn() if context_fn is not None else (nullcontext(), nullcontext())
     )
@@ -495,25 +488,15 @@ def _import_parallelizer_with_stubs(monkeypatch):
         activation_checkpointing_stub,
     )
 
-    # apply_ac wraps each block's context in the DeepEP dispatch-replay recorder,
+    # apply_ac wraps each block's context in the DeepEP dispatch-replay channel,
     # which imports fused_a2a lazily. Stub it so this module does not depend on
     # some earlier test having imported it under the real torch.
+    from nemo_automodel.shared.recompute_replay import RecomputeReplay
+
     fused_a2a_stub = types.ModuleType("nemo_automodel.components.moe.megatron.fused_a2a")
-
-    class _StubDispatchReplayRecorder:
-        def __init__(self):
-            self.replay_misses = 0
-            self.rewind_count = 0
-
-        def rewind(self):
-            self.rewind_count += 1
-
-    @contextmanager
-    def _stub_dispatch_replay_scope(recorder, mode):
-        yield
-
-    fused_a2a_stub.DispatchReplayRecorder = _StubDispatchReplayRecorder
-    fused_a2a_stub.dispatch_replay_scope = _stub_dispatch_replay_scope
+    fused_a2a_stub.deepep_dispatch_replay = RecomputeReplay("DeepEP dispatch (stub)")
+    fused_a2a_stub.hybridep_dispatch_replay = RecomputeReplay("HybridEP dispatch (stub)")
+    fused_a2a_stub.moe_combine_replay = RecomputeReplay("MoE combine (stub)")
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.moe.megatron.fused_a2a",
@@ -539,6 +522,24 @@ def _import_parallelizer_with_stubs(monkeypatch):
     )
 
     return importlib.import_module("nemo_automodel.components.moe.parallelizer")
+
+
+def test_stub_import_restores_real_module_identity() -> None:
+    import importlib
+
+    module_names = (
+        "nemo_automodel.components.moe.layers",
+        "nemo_automodel.components.distributed.pipelining.config",
+        "nemo_automodel.components.distributed.mesh_utils",
+    )
+    original_modules = {name: importlib.import_module(name) for name in module_names}
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _import_parallelizer_with_stubs(monkeypatch)
+
+    for name, module in original_modules.items():
+        assert importlib.import_module(name) is module
+        parent_name, _, attribute = name.rpartition(".")
+        assert getattr(importlib.import_module(parent_name), attribute) is module
 
 
 def test_expert_parallel_apply_calls_distribute_module(monkeypatch):
@@ -845,6 +846,43 @@ def test_apply_ac_replays_hybridep_layout_for_full_and_selective_ac(monkeypatch,
     replay_wrapper.assert_called_once()
 
 
+@pytest.mark.parametrize("ignore_router", [True, False])
+@pytest.mark.parametrize("selective", [True, False])
+def test_apply_ac_rejects_capacity_mode_only_on_the_path_without_replay(monkeypatch, ignore_router, selective):
+    """Capacity mode needs the dispatch layout replayed on recompute: full AC with ignore_router=False has no
+    recorder, so the recompute dispatch would be sized to the capacity while the calibration dispatch was not."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+    expert.dispatcher_capacity_factor = 1.5
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    if selective:
+        activation_checkpointing_stub = sys.modules["nemo_automodel.components.distributed.activation_checkpointing"]
+        activation_checkpointing_stub.make_selective_checkpoint_context_fn = lambda: (
+            lambda: (nullcontext(), nullcontext())
+        )
+        activation_checkpointing_stub.SELECTIVE_AC_WRAPPER_FLAG = "_nemo_selective_ac"
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    run = lambda: P.apply_ac(  # noqa: E731
+        HybridEPModel([DummyBlock()]),
+        ignore_router=ignore_router,
+        hidden_size=7168,
+        num_experts=384,
+        selective=selective,
+    )
+    if not ignore_router and not selective:
+        with pytest.raises(ValueError, match="dispatcher_capacity_factor needs the routing pinned"):
+            run()
+    else:
+        run()
+
+
 def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_available(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
 
@@ -1096,6 +1134,78 @@ def test_apply_fsdp_routes_strict_fp32_contract_and_expert_exclusions_to_shared_
         ignored_params=set(block.mlp.experts.parameters()),
         model_parallelizer=None,
     )
+
+
+class _HolderBlock(DummyBlock):
+    """A block with one fp32 holder parameter beside its MoE experts."""
+
+    def __init__(self):
+        super().__init__(mlp=DummyMoE())
+        self.sinks = DummyParam()
+
+    def parameters(self):
+        yield self.sinks
+        yield from self.mlp.experts.parameters()
+
+
+def test_apply_fsdp_routes_declared_cross_block_holders_to_one_shared_unit(monkeypatch):
+    """Holders named in ``_fsdp_shard_across_blocks`` go to ``fully_shard_across_blocks`` once, before the
+    per-block units, and the parameters it owns stay out of the block's dtype unit."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    shared_sharder_mock = MagicMock()
+    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_by_dtype", shared_sharder_mock)
+    block = _HolderBlock()
+    cross_block_mock = MagicMock(return_value={block.sinks})
+    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_across_blocks", cross_block_mock)
+    model = DummyModel([block])
+    model._fsdp_shard_across_blocks = ["attn.sinks_param"]
+    fsdp_mesh = object()
+    mp_policy = MagicMock()
+    offload_policy = object()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=True,
+    )
+
+    cross_block_mock.assert_called_once_with(
+        [block],
+        ("attn.sinks_param",),
+        mesh=fsdp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        shard_module=fully_shard_mock,
+    )
+    ignored = shared_sharder_mock.call_args.kwargs["ignored_params"]
+    assert block.sinks in ignored
+    assert set(block.mlp.experts.parameters()) <= ignored
+
+
+def test_apply_fsdp_without_cross_block_declaration_leaves_the_shared_unit_alone(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    cross_block_mock = MagicMock(return_value=set())
+    monkeypatch.setattr(P.parallelizer_utils, "fully_shard_across_blocks", cross_block_mock)
+
+    P.apply_fsdp(
+        model=DummyModel([DummyBlock(mlp=DummyMoE())]),
+        fsdp_mesh=object(),
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        mp_policy=MagicMock(),
+        offload_policy=object(),
+    )
+
+    cross_block_mock.assert_not_called()
 
 
 def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):
@@ -1606,7 +1716,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(
-        model, ignore_router=True, selective=False, activation_checkpointing_scope="all"
+        model, ignore_router=True, selective=False, activation_checkpointing_scope="all", moe_only=False
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
@@ -1882,82 +1992,6 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
         tp_shard_plan=None,
         tp_size=2,
     )
-
-
-def test_parallelize_model_rejects_cp_mtp_pipeline_stage_before_ep_or_cp(monkeypatch):
-    """The MoE/EP path must reject the same unsupported topology on every PP stage."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    apply_cp_mock = MagicMock()
-    apply_ep_mock = MagicMock()
-    monkeypatch.setattr(P, "apply_cp", apply_cp_mock)
-    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
-
-    world_mesh = FakeWorldMesh(
-        {"cp": 2, ("dp",): 2},
-        mesh_dim_names=["dp", "cp"],
-    )
-    moe_mesh = FakeMoeMesh({"ep": 2})
-    model = type(
-        "PipelineStage",
-        (),
-        {
-            "supports": types.SimpleNamespace(mtp_enabled=True, supports_mtp_cp_pp=False),
-            "mtp_config": type("MTP", (), {"enabled": True})(),
-            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
-            "_is_pipeline_parallel_stage": lambda self: True,
-        },
-    )()
-
-    with pytest.raises(NotImplementedError, match="MTP with context and pipeline parallelism"):
-        P.parallelize_model(
-            model=model,
-            world_mesh=world_mesh,
-            moe_mesh=moe_mesh,
-            dp_axis_names=("dp",),
-            cp_axis_name="cp",
-            ep_axis_name="ep",
-        )
-
-    apply_cp_mock.assert_not_called()
-    apply_ep_mock.assert_not_called()
-
-
-def test_parallelize_model_rejects_cp_mtp_without_capability_before_ep_or_cp(monkeypatch):
-    """The MoE/EP path must enforce the same MTP+CP capability as the dense path."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    apply_cp_mock = MagicMock()
-    apply_ep_mock = MagicMock()
-    monkeypatch.setattr(P, "apply_cp", apply_cp_mock)
-    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
-
-    world_mesh = FakeWorldMesh({"cp": 2, ("dp",): 2}, mesh_dim_names=["dp", "cp"])
-    moe_mesh = FakeMoeMesh({"ep": 2})
-    model = type(
-        "UnsupportedMTPModel",
-        (),
-        {
-            "supports": types.SimpleNamespace(
-                mtp_enabled=True,
-                supports_mtp_cp=False,
-                supports_mtp_cp_pp=False,
-            ),
-            "mtp_config": type("MTP", (), {"enabled": True})(),
-            "moe_config": type("MC", (), {"n_routed_experts": 4})(),
-        },
-    )()
-
-    with pytest.raises(RuntimeError, match="does not support MTP with context parallelism"):
-        P.parallelize_model(
-            model=model,
-            world_mesh=world_mesh,
-            moe_mesh=moe_mesh,
-            dp_axis_names=("dp",),
-            cp_axis_name="cp",
-            ep_axis_name="ep",
-        )
-
-    apply_cp_mock.assert_not_called()
-    apply_ep_mock.assert_not_called()
 
 
 def test_parallelize_model_forwards_offload_policy_to_fsdp(monkeypatch):
@@ -3750,3 +3784,68 @@ def test_apply_cp_mixed_full_and_linear_attention(monkeypatch):
     te_attn.set_context_parallel_group.assert_called_once()
     # linear_attention block: cp_mesh attached
     assert linear_attn._cp_mesh is cp_mesh
+
+
+@pytest.mark.parametrize("ignore_router", [True, False])
+def test_apply_ac_installs_the_moe_recompute_cache_for_both_router_modes(monkeypatch, ignore_router):
+    """BackendConfig.dispatcher_recompute_cache: the cache scope is installed whether the router is saved
+    (layout replay active) or recomputed (ignore_router_for_ac=False: no layout replay)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+    expert.dispatcher_recompute_cache = "combine"
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    cache_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_cache_moe_combine_on_recompute", cache_wrapper)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", MagicMock(side_effect=lambda c: c))
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    P.apply_ac(HybridEPModel([DummyBlock()]), ignore_router=ignore_router, hidden_size=7168, num_experts=384)
+
+    cache_wrapper.assert_called_once()
+
+
+def test_apply_ac_leaves_the_moe_recompute_cache_out_for_moe_only_regions(monkeypatch):
+    """checkpoint_moe_only (#4231) wraps the MoE sub-block alone: that region ends at the combine, whose output is
+    held by the consumer outside the region, so its recompute never re-runs the combine and the cache stays out."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+    expert.dispatcher_recompute_cache = "moe_tail"
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    cache_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_cache_moe_combine_on_recompute", cache_wrapper)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", MagicMock(side_effect=lambda c: c))
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    P.apply_ac(HybridEPModel([DummyBlock()]), ignore_router=True, moe_only=True, hidden_size=7168, num_experts=384)
+
+    cache_wrapper.assert_not_called()
+
+
+def test_apply_ac_leaves_the_moe_recompute_cache_out_when_no_expert_asks_for_it(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+    expert.dispatcher_recompute_cache = "none"
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    cache_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_cache_moe_combine_on_recompute", cache_wrapper)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", MagicMock(side_effect=lambda c: c))
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    P.apply_ac(HybridEPModel([DummyBlock()]), ignore_router=False, hidden_size=7168, num_experts=384)
+
+    cache_wrapper.assert_not_called()

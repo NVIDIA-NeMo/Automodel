@@ -16,6 +16,11 @@
 # WORLD64 / EP64 / Engram owner64 on 16 four-GPU nodes in one NVLink domain.
 # CP8 uses contiguous 512-token shards and 8 accumulated microbatches; CP1
 # uses 4096-token sequences and 1 microbatch. Both use GBS64 and LBS1.
+# defer_fsdp_grad_sync is false: with eight microbatches the deferred variant
+# keeps every FSDP unit's unsharded parameters and gradients resident across
+# the update and OOMs in the first backward of update 1 on 16 x 4 GB200
+# (184 GiB), once the optimizer state exists. Per-microbatch gradient sync
+# trains the same recipe at about 130 GiB; CP1 (one microbatch) is unaffected.
 # Override distributed.cp_size=1 for the reference run. Keep data, seeds,
 # optimizer, and the remaining parallelism sizes identical for comparison.
 #
@@ -82,7 +87,7 @@ distributed:
   pp_size: 1
   cp_size: 8
   ep_size: 64
-  defer_fsdp_grad_sync: true
+  defer_fsdp_grad_sync: false
   sequence_parallel: false
   activation_checkpointing: true
   moe:

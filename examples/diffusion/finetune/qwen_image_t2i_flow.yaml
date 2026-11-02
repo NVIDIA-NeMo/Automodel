@@ -84,5 +84,6 @@ dist_env:
 seed: 42
 
 ci:
+  cluster_tag: h100
   recipe_owner: pthombre
   time: "00:30:00"

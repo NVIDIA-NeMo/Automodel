@@ -544,7 +544,7 @@ def test_deepseek_v4_registered_in_arch_mapping():
         "DSV4 checkpoints declare this architecture and need it routed to the "
         "in-tree model implementation."
     )
-    module_path, cls_name = MODEL_ARCH_MAPPING["DeepseekV4ForCausalLM"]
+    module_path, cls_name = MODEL_ARCH_MAPPING["DeepseekV4ForCausalLM"][:2]
     assert module_path == "nemo_automodel.components.models.deepseek_v4.model"
     assert cls_name == "DeepseekV4ForCausalLM"
 

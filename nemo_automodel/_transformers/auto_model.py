@@ -37,8 +37,8 @@ from torch.nn.attention import SDPBackend
 from nemo_automodel.shared.torch_patches import apply_torch_patches
 
 apply_torch_patches()
+from huggingface_hub import ResolvedRevision, snapshot_download
 from huggingface_hub import constants as hf_constants  # noqa: E402
-from huggingface_hub import snapshot_download
 from transformers import (  # noqa: E402
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -204,7 +204,6 @@ def _patch_remote_code_compat():
 
 _AUTO_CONFIG_HUB_KWARG_KEYS = (
     "revision",
-    "_commit_hash",
     "force_download",
     "subfolder",
     "token",
@@ -423,6 +422,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         kwargs = dict(kwargs)  # Defensive copy so retries get clean state
         has_packed_sequence = kwargs.pop("has_packed_sequence", False)
         freeze_config = kwargs.pop("freeze_config", None)
+        load_metadata_with_gloo = kwargs.pop("load_metadata_with_gloo", False)
         cache_dir = kwargs.pop("cache_dir", hf_constants.HF_HUB_CACHE)
         if isinstance(pretrained_model_name_or_path_or_config, str):
             # Hub loaders need the cache location; from_config constructors do not.
@@ -436,6 +436,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 **kwargs,
                 "has_packed_sequence": has_packed_sequence,
                 "freeze_config": freeze_config,
+                "load_metadata_with_gloo": load_metadata_with_gloo,
                 "cache_dir": cache_dir,
             }
             return cls._build_model(
@@ -621,12 +622,18 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         # during init.  Custom models and meta-device initialization do not load weights
         # here; they rely on apply_model_infrastructure to load the checkpoint later.
         weights_already_loaded = not is_custom_model and not is_meta_device and load_base_model
-        if load_base_model and pretrained_path and not os.path.isdir(pretrained_path) and _hf_config._commit_hash:
+        revision = kwargs.get("revision")
+        if (
+            load_base_model
+            and pretrained_path
+            and not os.path.isdir(pretrained_path)
+            and isinstance(revision, ResolvedRevision)
+        ):
             # Give the checkpointer the selected snapshot, not a repo id whose
             # cache may also contain an unrelated (or newer) weight index.
             pretrained_path = snapshot_download(
                 pretrained_path,
-                revision=_hf_config._commit_hash,
+                revision=revision,
                 cache_dir=cache_dir,
                 local_files_only=True,
             )
@@ -656,6 +663,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             freeze_config=freeze_config,
             weights_already_loaded=weights_already_loaded,
             inject_te_attention=inject_te_attention,
+            load_metadata_with_gloo=load_metadata_with_gloo,
         )
 
         return model
@@ -711,11 +719,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 ``"flash_attention_2"``, ``"eager"``). Only applied when the
                 base model supports this kwarg. Defaults to ``"flash_attention_2"``,
                 if flash attention is not available, defaults to ``"sdpa"``.
+                Explicit native ``backend.attn`` takes precedence on attention paths
+                owned by the native model; retained HF components use HF dispatch.
             quantization_config (optional): BitsAndBytesConfig configuration object that
                 specifies all quantization settings. If provided, quantization
                 will be applied to the model.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
+                AutoModel training infrastructure and applicable runtime patches still apply.
             distributed_setup (DistributedSetup | None, optional): Resolved distributed
                 topology and policy object. Default: None.
             device_mesh (DeviceMesh | None, optional): Pre-created Hugging Face-style
@@ -736,6 +747,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                   over ``torch_dtype`` when not ``None``; accepts ``auto``.
                 - has_packed_sequence (bool): Whether using packed sequences. Default: False.
                 - cache_dir (str): Cache directory for model weights.
+                - load_metadata_with_gloo (bool): Use a CPU process group for checkpoint
+                  load planning while retaining the training group. Default: False.
 
         Returns:
             transformers.PreTrainedModel: The loaded (and possibly patched)
@@ -767,6 +780,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         )
         loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
 
+        kwargs["revision"] = AutoConfig.resolve_revision(
+            pretrained_model_name_or_path,
+            kwargs.get("revision"),
+            cache_dir=kwargs.get("cache_dir"),
+            token=kwargs.get("token", kwargs.get("use_auth_token")),
+            local_files_only=kwargs.get("local_files_only", False),
+            subfolder=kwargs.get("subfolder", ""),
+            force_download=kwargs.get("force_download", False),
+        )
         try:
             hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
         except Exception as e:
@@ -776,10 +798,6 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 hf_config = get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
             else:
                 raise
-        # Keep config rereads, remote code, and weights on the same snapshot.
-        if hf_config._commit_hash is not None:
-            kwargs["revision"] = hf_config._commit_hash
-            kwargs["_commit_hash"] = hf_config._commit_hash
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
         # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the
@@ -847,6 +865,8 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Deprecated alias for ``dtype``. Defaults to ``auto``, which selects ``torch.bfloat16``.
             **kwargs: Additional arguments documented in ``from_pretrained``.
                 ``dtype`` takes precedence over ``torch_dtype`` when not ``None``.
+                When loading weights for a separately loaded config, pass the same
+                resolved ``revision`` used to load that config.
         """
         _reject_separate_distributed_kwargs(kwargs)
         if (dtype := kwargs.pop("dtype", None)) is not None:
@@ -882,6 +902,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         kwargs["trust_remote_code"] = kwargs.get(
             "trust_remote_code", resolve_trust_remote_code(name_or_path) if name_or_path else False
         )
+        if isinstance(config, str) or kwargs.get("load_base_model", False):
+            kwargs["revision"] = AutoConfig.resolve_revision(
+                name_or_path,
+                kwargs.get("revision"),
+                cache_dir=kwargs.get("cache_dir"),
+                token=kwargs.get("token", kwargs.get("use_auth_token")),
+                local_files_only=kwargs.get("local_files_only", False),
+                subfolder=kwargs.get("subfolder", ""),
+                force_download=kwargs.get("force_download", False),
+            )
         if isinstance(config, str):
             try:
                 config = get_hf_config(config, attn_implementation, **kwargs)

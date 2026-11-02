@@ -1,0 +1,150 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# 8 HSG nodes / 32 GB200 GPUs; EP32, PP1, CP1, TP1, DP32.
+# MedPix non-packed 4K; LoRA r8 attention + experts; LBS1 GBS32 GA1.
+recipe: FinetuneRecipeForVLM
+seed: 1234
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 5
+  num_epochs: null
+  max_steps: 100
+  log_remote_every_steps: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: meta-models/Muse-Spark-open-816B-A42B
+  dtype: bfloat16
+  config:
+    residual_dtype: fp32
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    compile_norm: true
+    experts: torch_mm
+    dispatcher: hybridep
+    compile_router_weight: true
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: false
+    fake_gate_noise: 0.0
+    benchmark_static_routing: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+checkpoint:
+  enabled: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  reduction: sum
+  logit_softcapping: 20.0
+processor:
+  _target_: nemo_automodel.components.models.muse_spark.processing.build_muse_spark_processor
+  pretrained_model_name_or_path: meta-models/Muse-Spark-open-816B-A42B
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+packed_sequence:
+  packed_sequence_size: 0
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  persistent_workers: true
+  pin_memory: true
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 4097
+validation_dataset: none
+validation_dataloader: none
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 5.0e-06
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: float32
+  store_param_remainders: true
+  exp_avg_dtype: bfloat16
+  exp_avg_sq_dtype: bfloat16
+lr_scheduler:
+  lr_decay_style: constant
+clip_grad_norm:
+  max_norm: 1.0
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: automodel-muse-spark
+  name: muse-spark-open-medpix-hsg-32gpu-lora-ep32
+  dir: logs/muse_spark_open_medpix_nonpacked4k_lora_ep32/wandb
+  mode: online
+  tags:
+  - muse-spark-open
+  - lora-r8
+  - medpix
+  - nonpacked4k
+  - hsg
+  - gb200
+  - ep32
+  - pp1
+  - te-fused-adam
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+  - model.layers.*.self_attn.q_proj
+  - model.layers.*.self_attn.k_proj
+  - model.layers.*.self_attn.v_proj
+  - model.layers.*.self_attn.o_proj
+  - model.layers.*.feed_forward.experts
+  dim: 8
+  alpha: 32
+  dropout: 0.0
+  lora_dtype: bfloat16
+  use_memory_efficient_lora: true
+  use_triton: false
+  moe_rank_scaling: false
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 8
+  nproc_per_node: 4
+  cluster_tag: gb200
+  time: "01:00:00"
+  max_steps: 2
+  env_vars:
+    SBATCH_SEGMENT_SIZE: "8"
+    RDZV_TIMEOUT: "900"
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
