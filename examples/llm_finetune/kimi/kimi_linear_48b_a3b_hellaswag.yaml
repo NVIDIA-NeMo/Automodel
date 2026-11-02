@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 4K packed training with grouped expert GEMMs (torch_mm).
 # To run this recipe:
 #   HF_HOME=$PWD/.hf_cache automodel examples/llm_finetune/kimi/kimi_linear_48b_a3b_hellaswag.yaml --nproc-per-node 8 --wandb.enable=true
 
@@ -52,13 +53,20 @@ model:
   trust_remote_code: true
   torch_dtype: bfloat16
   load_base_model: true
+  output_hidden_states: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: eager
+    # Non-CP MLA requires CUDA fp16/bf16 and INSTALL_FA4=true in the container.
+    # FA4 requires attention_dropout=0; use eager for attention dropout.
+    # NEAT metadata isolates documents in both KDA and shared native FA4 MLA.
+    # Pre-packed THD and dense attention masks are unsupported by FA4.
+    # CP retains compressed-KV gather and FlexAttention.
+    attn: fa4
     linear: torch
     rms_norm: torch_fp32
-    experts: torch
-    dispatcher: torch
+    experts: torch_mm
+    # HybridEP dispatch for EP=8.
+    dispatcher: hybridep
     gate_precision: float32
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -77,31 +85,34 @@ distributed:
   pp_size: 1
   ep_size: 8
   sequence_parallel: false
-  activation_checkpointing: false
+  activation_checkpointing: true
   moe:
     reshard_after_forward: true
     wrap_outer_model: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
+  pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
     trust_remote_code: true
 
 packed_sequence:
-  packed_sequence_size: 0
+  # NEAT delivers document boundaries to both MLA attention and KDA recurrence.
+  packing_strategy: neat
+  packed_sequence_size: 4096
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
+    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
   num_workers: 2
 
@@ -109,7 +120,8 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  num_samples_limit: 1024
+  pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
@@ -118,8 +130,7 @@ validation_dataset:
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 64
+    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: false
   drop_last: true
   num_workers: 2
@@ -139,6 +150,7 @@ wandb:
   dir: result/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: huiyingl
   nodes: 1
   time: "00:40:00"

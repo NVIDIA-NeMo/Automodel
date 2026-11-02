@@ -478,6 +478,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     activation_checkpointing_stub = types.ModuleType("nemo_automodel.components.distributed.activation_checkpointing")
     activation_checkpointing_stub.ensure_fsdp_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.ensure_profiler_ops_sac_ignored = lambda: None
+    activation_checkpointing_stub.ensure_moe_recompute_cache_ops_sac_ignored = lambda: None
     activation_checkpointing_stub.transformer_engine_attention_backend_snapshot_context_fn = lambda context_fn=None: (
         context_fn() if context_fn is not None else (nullcontext(), nullcontext())
     )
@@ -495,6 +496,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     fused_a2a_stub = types.ModuleType("nemo_automodel.components.moe.megatron.fused_a2a")
     fused_a2a_stub.deepep_dispatch_replay = RecomputeReplay("DeepEP dispatch (stub)")
     fused_a2a_stub.hybridep_dispatch_replay = RecomputeReplay("HybridEP dispatch (stub)")
+    fused_a2a_stub.moe_combine_replay = RecomputeReplay("MoE combine (stub)")
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.moe.megatron.fused_a2a",
@@ -3782,3 +3784,68 @@ def test_apply_cp_mixed_full_and_linear_attention(monkeypatch):
     te_attn.set_context_parallel_group.assert_called_once()
     # linear_attention block: cp_mesh attached
     assert linear_attn._cp_mesh is cp_mesh
+
+
+@pytest.mark.parametrize("ignore_router", [True, False])
+def test_apply_ac_installs_the_moe_recompute_cache_for_both_router_modes(monkeypatch, ignore_router):
+    """BackendConfig.dispatcher_recompute_cache: the cache scope is installed whether the router is saved
+    (layout replay active) or recomputed (ignore_router_for_ac=False: no layout replay)."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+    expert.dispatcher_recompute_cache = "combine"
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    cache_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_cache_moe_combine_on_recompute", cache_wrapper)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", MagicMock(side_effect=lambda c: c))
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    P.apply_ac(HybridEPModel([DummyBlock()]), ignore_router=ignore_router, hidden_size=7168, num_experts=384)
+
+    cache_wrapper.assert_called_once()
+
+
+def test_apply_ac_leaves_the_moe_recompute_cache_out_for_moe_only_regions(monkeypatch):
+    """checkpoint_moe_only (#4231) wraps the MoE sub-block alone: that region ends at the combine, whose output is
+    held by the consumer outside the region, so its recompute never re-runs the combine and the cache stays out."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+    expert.dispatcher_recompute_cache = "moe_tail"
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    cache_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_cache_moe_combine_on_recompute", cache_wrapper)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", MagicMock(side_effect=lambda c: c))
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    P.apply_ac(HybridEPModel([DummyBlock()]), ignore_router=True, moe_only=True, hidden_size=7168, num_experts=384)
+
+    cache_wrapper.assert_not_called()
+
+
+def test_apply_ac_leaves_the_moe_recompute_cache_out_when_no_expert_asks_for_it(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    expert = P.GroupedExpertsDeepEP()
+    expert.dispatcher_backend = "hybridep"
+    expert.dispatcher_recompute_cache = "none"
+
+    class HybridEPModel(DummyModel):
+        def modules(self):
+            return iter((self, expert))
+
+    cache_wrapper = MagicMock(side_effect=lambda context_fn: context_fn)
+    monkeypatch.setattr(P, "_cache_moe_combine_on_recompute", cache_wrapper)
+    monkeypatch.setattr(P, "_replay_hybridep_dispatch_on_recompute", MagicMock(side_effect=lambda c: c))
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kwargs: block))
+
+    P.apply_ac(HybridEPModel([DummyBlock()]), ignore_router=False, hidden_size=7168, num_experts=384)
+
+    cache_wrapper.assert_not_called()

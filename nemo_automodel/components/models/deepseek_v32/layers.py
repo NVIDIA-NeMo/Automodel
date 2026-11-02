@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Indexer key-normalization epsilon follows the HuggingFace implementation (Apache-2.0).
+# Copyright 2025 the HuggingFace Team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/41251
+# Revision: 513146c175a534a913b8cfd448b9a06f0caf9365
+# Original file: src/transformers/models/deepseek_v32/modeling_deepseek_v32.py
+
 """DeepSeek V3.2 Layers.
 
 Contains the DeepseekV32Indexer for top-k sparse attention selection
@@ -145,7 +151,7 @@ class DeepseekV32Indexer(nn.Module):
         )
 
         # LayerNorm for K (official uses LayerNorm, not RMSNorm)
-        self.k_norm = nn.LayerNorm(self.head_dim, dtype=dtype)
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype)
 
         # Per-head weight projection from hidden states
         self.weights_proj = initialize_linear_module(
@@ -169,8 +175,10 @@ class DeepseekV32Indexer(nn.Module):
         Args:
             x: Hidden states [B, S, hidden] or [T, hidden] for thd format
             q_resid: Q lora residual from MLA [B, S, q_lora_rank] or [T, q_lora_rank]
-            freqs_cis: RoPE frequencies
-            attention_mask: Optional attention mask
+            freqs_cis: Complex RoPE tensor [B, S, rope_head_dim / 2] or packed
+                [T, rope_head_dim / 2].
+            attention_mask: Optional additive tensor [B, 1, S, S] for BSHD,
+                or [T, T] or [1, 1, T, T] for packed THD.
             **attn_kwargs: Additional attention kwargs (cu_seqlens, etc.)
 
         Returns:
@@ -229,7 +237,8 @@ class DeepseekV32Indexer(nn.Module):
             q = q.transpose(0, 1)
             k = k.transpose(0, 1)
             # scores: [H, T, T]
-            scores = torch.bmm(q.float(), k.float().transpose(-2, -1))
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                scores = torch.bmm(q.float(), k.float().transpose(-2, -1))
             # Apply ReLU activation (per training implementation)
             scores = torch.relu(scores)
             # Apply per-head weights: [T, H] -> [H, T, 1]
@@ -242,7 +251,8 @@ class DeepseekV32Indexer(nn.Module):
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             # scores: [B, H, S, S]
-            scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
             # Apply ReLU activation (per training implementation)
             scores = torch.relu(scores)
             # Apply per-head weights: [B, S, H] -> [B, H, S, 1]

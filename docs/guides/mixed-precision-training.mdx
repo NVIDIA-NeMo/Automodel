@@ -5,7 +5,7 @@ description: "Recommended dtype patterns for fp32 master weights and optimizer s
 
 NeMo AutoModel uses FSDP2's [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) to control compute precision during forward and backward, and the model's storage dtype (`model.dtype`) to control the precision of the *resident* sharded parameter. Together, these decide what numeric precision the optimizer state ends up in, which is the part that determines whether long full-parameter training runs converge cleanly.
 
-This page describes the recommended precision patterns and the pattern to avoid. For any long full-parameter training run (pre-training or extended fine-tuning), the key rule is: do not combine `torch.optim.AdamW` with bf16 resident parameters unless you have explicitly accepted bf16 master weights and Adam state.
+This page describes the recommended precision patterns and the pattern to avoid. For any long full-parameter training run (pretraining or extended fine-tuning), the key rule is: do not combine `torch.optim.AdamW` with bf16 resident parameters unless you have explicitly accepted bf16 master weights and Adam state.
 
 For `NeMoAutoModel` loaders, use `model.dtype` to select storage precision. The deprecated `model.torch_dtype` spelling remains supported. If both are supplied, a non-null `dtype` takes precedence, including `dtype: auto`; `dtype: null` falls back to `torch_dtype`. String values such as `float32` and `torch.float32`, and Python `torch.dtype` values, are accepted by both spellings. Choose the storage dtype explicitly for full-parameter training; the optimizer does not select it for you. Diffusion pipelines use their separate `model.torch_dtype` and `model.compute_dtype` settings.
 
@@ -23,9 +23,88 @@ Precision settings have distinct effects:
 
 When `model.dtype: bfloat16` is used with `torch.optim.AdamW`, the AdamW EMA buffers (`exp_avg` and `exp_avg_sq`) are also stored in bf16. This is fragile for long full-parameter training runs: bf16 has only a 7-bit mantissa, so small EMA updates can be rounded away even though the values themselves are still in range. Symptoms range from silent degradation (slower convergence, that is, higher final loss at the same step count, with no visible instability) to overt failure: unstable `grad_norm`, loss bumps, loss spikes, or divergence.
 
+## Freeze Exact Parameters Before Checkpoint Loading
+
+Use `freeze_config.freeze_parameters` for exact parameter exclusions alongside
+existing module freezes. Only named parameters are frozen; unlisted parameters
+retain their existing trainability. Use the loader's `dtype` argument for
+trainable storage precision and FSDP2's mixed-precision policy for compute.
+
+```python
+import torch
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from nemo_automodel import NeMoAutoModelForCausalLM
+from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config
+from nemo_automodel.components.utils.model_utils import FreezeConfig
+
+model = NeMoAutoModelForCausalLM.from_pretrained(
+    "/path/to/nemotron-checkpoint",
+    dtype=torch.float32,
+    freeze_config=FreezeConfig(
+        freeze_parameters=("model.layers.0.norm.weight",),
+    ),
+    distributed_setup=DistributedSetup.build(
+        FSDP2Config(mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
+        )),
+    ),
+)
+```
+
+This freezes the first block's norm weight. Other parameters retain their
+existing trainability, including model-required freezes. Names match canonical
+parameter paths, ignoring activation-checkpoint and compile wrappers. Freezing
+any alias of a tied parameter freezes that shared parameter. Empty exclusions
+are a no-op; duplicate or unknown names raise an error. Exact parameter freezes
+are applied after module selectors, so they remain frozen even when their
+containing module is explicitly unfrozen.
+
+The policy is applied before checkpoint loading and rebound after module
+replacement, before distributed wrappers capture parameters. Construct the
+optimizer after the loader returns. Exact exclusions of TE expert parameters
+with expert parallelism are rejected because repartitioning renumbers local
+expert parameters; freeze their owning module instead.
+
+For sharded FSDP2 with exact parameter selectors, the existing frozen-storage
+preparation reduces ordinary frozen parameters to the safe compute dtype while
+retaining trainable storage and model-protected FP32 parameters. With
+`dtype=torch.float32` and BF16 compute, trainable weights load directly into FP32
+destinations without rounding through BF16. Frozen buffers follow existing
+compute-dtype rules and precision protections. Existing guards for differing
+root/MoE compute policies remain authoritative.
+
+For an exact update surface, freeze all modules and then enable only the named
+parameters. This keeps unselected biases and other siblings frozen:
+
+```python
+from nemo_automodel.components.utils.model_utils import ModuleSelector
+
+freeze_config = FreezeConfig(
+    freeze_modules=[ModuleSelector(glob="*")],
+    unfreeze_parameters=("model.layers.0.norm.weight",),
+)
+```
+
+Pass this configuration with `dtype=torch.float32` and the BF16 FSDP2 compute
+policy shown above. Exact exclusions take precedence over exact unfreezes;
+framework-required freezes remain protected. Unknown and duplicate unfreeze
+names are rejected. Exact TE expert selections require the same restrictions
+as exact exclusions.
+
+On one rank, FSDP2 skips its mixed-precision wrappers. Exact parameter freezes
+therefore retain uniform loader storage and compute in that storage dtype,
+without introducing a mixed plain-tensor dtype boundary.
+
+Nemotron V3 also accepts `compute_mtp=False` during an off-pipeline-parallel
+forward call. This skips auxiliary MTP computation while retaining all MTP
+parameters for checkpoint loading and saving. Response-only RL callers can
+combine it with `compute_logits=False, output_hidden_states=True` to consume
+the final hidden states without materializing full-vocabulary logits. The
+existing empty-vocabulary logits tensor remains the return contract.
+
 ## Recommended fp32 Master Weight and Optimizer-State Patterns
 
-Use one of these patterns for long full-parameter training (pre-training or extended fine-tuning):
+Use one of these patterns for long full-parameter training (pretraining or extended fine-tuning):
 
 | Pattern | Model Storage Dtype | Optimizer State | When to Use |
 | --- | --- | --- | --- |
@@ -33,6 +112,19 @@ Use one of these patterns for long full-parameter training (pre-training or exte
 | torch AdamW with `model.dtype: float32` | fp32 | fp32 master weight (the resident param) and fp32 Adam EMA buffers | Robust starting point for new or precision-sensitive models. Parameters, gradients, and optimizer state are all fp32. Trade-off: writes fp32 training checkpoints. |
 
 Both patterns keep forward and backward compute in bf16 through FSDP2 mixed precision. They differ in where the fp32 master weight lives, how much peak memory they use for a specific model, and what dtype is written to the training checkpoint.
+
+On a single-rank or single-element mesh, AutoModel skips FSDP2 sharding and
+applies the policy's compute dtype through forward autocast instead. This also
+applies to direct model calls. Resident parameters and buffers retain their
+storage precision, and activation-checkpoint recomputation retains autocast.
+An explicit `distributed.autocast_dtype` overrides the policy's compute dtype
+on this unsharded path.
+This path does not apply `mp_policy.output_dtype`. Native AutoModel
+implementations protect explicitly fp32 math, including routing, rotary angle
+construction, sparse indexer scores, and hyperconnections, inside the forward
+autocast region. Models loaded with `force_hf=True` or through the Hugging Face
+fallback use the upstream implementation's autocast behavior; AutoModel does
+not add fp32 compatibility patches to those implementations.
 
 ### Pattern A Using TE FusedAdam and bf16 Model Storage
 
@@ -132,13 +224,13 @@ distributed:
   strategy: fsdp2
 ```
 
-This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared to the torch AdamW and `model.dtype: float32` pattern. It is common in existing fine-tuning example configs, but convergence should be validated for the intended workload. It is **not** recommended for long full-parameter training (pre-training or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence. For LoRA/PEFT, check adapter storage separately as described below.
+This keeps the resident model parameters in bf16 instead of fp32, so it can reduce memory usage compared to the torch AdamW and `model.dtype: float32` pattern. It is common in existing fine-tuning example configs, but convergence should be validated for the intended workload. It is **not** recommended for long full-parameter training (pretraining or extended fine-tuning): bf16 EMA quantization can quietly slow convergence (higher final loss at the same step count) and, in worse cases, produce unstable `grad_norm`, loss bumps, loss spikes, or divergence. For LoRA/PEFT, check adapter storage separately as described below.
 
 ## LoRA Adapter Storage and Precision Warnings
 
 Frozen base parameters do not receive optimizer updates or acquire Adam state. Keeping them in bf16 therefore does not reduce the precision of adapter updates. With `torch.optim.Adam` or `AdamW`, it is the **trainable adapter storage dtype** that determines the precision of adapter updates and EMA buffers.
 
-For multi-rank, unquantized FSDP2 LoRA training, set the adapter dtype explicitly to keep adapter storage and Adam moments in fp32 while allowing frozen base storage and forward/backward compute to remain bf16:
+For multi-rank, unquantized FSDP2 LoRA training, set the adapter dtype explicitly to keep adapter storage and Adam moments in fp32 while allowing frozen base storage and forward and backward compute to remain bf16:
 
 ```yaml
 peft:
@@ -151,6 +243,7 @@ On a single-rank FSDP2 setup, parameters remain unsharded and mixed LoRA submodu
 
 <Warning>
 The automatic warning about torch Adam/AdamW with trainable bf16 parameters currently skips PEFT runs. Absence of this warning does not mean your adapters or their optimizer state are fp32. Check `peft.lora_dtype` and the actual trainable parameter dtypes; use `peft.lora_dtype: float32` to request fp32 adapter storage with torch Adam/AdamW on multi-rank FSDP2 runs.
+
 </Warning>
 
 ## Example Configs

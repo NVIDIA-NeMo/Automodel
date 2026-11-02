@@ -91,3 +91,6 @@ optimizer:
 
 checkpoint:
   enabled: false                 # smoke: don't write checkpoints
+
+ci:
+  cluster_tag: h100

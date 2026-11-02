@@ -19,11 +19,12 @@ from __future__ import annotations
 import copy
 import inspect
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5DecoderLayer,
@@ -37,11 +38,19 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model as HFQwen3_5Model,
 )
+from transformers.utils import torch_compilable_check
+from transformers.vision_utils import (
+    get_vision_cu_seqlens,
+    get_vision_interpolation_indices_and_weights,
+    get_vision_position_ids,
+)
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
+    contiguous_local_indices,
     round_robin_local_indices,
     shard_batch_aux_only,
+    shard_sequence_for_cp_contiguous,
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.cp_vision_frame_shard import (
@@ -67,13 +76,20 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.qwen3_5.layers import (
+    Qwen3_5FusedMLP,
+    Qwen3_5FusedRMSNorm,
+    Qwen3_5FusedRMSNormGated,
+    Qwen3_5FusedSSMGate,
+)
 from nemo_automodel.components.models.qwen3_5.packing import (
     GatedDeltaPackedMetadata,
+    HostTensor,
     prepare_gated_delta_packed_metadata,
 )
 from nemo_automodel.components.models.qwen3_5.parallelization import PARALLELIZER
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
-from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
+from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
@@ -117,6 +133,50 @@ def _qwen3_5_backend(backend: BackendConfig | None = None) -> BackendConfig:
     resolved = copy.copy(backend) if backend is not None else BackendConfig()
     resolved.rope_fusion = False
     return resolved
+
+
+def _splice_multimodal_features(
+    inputs_embeds: torch.Tensor,
+    input_ids: torch.Tensor,
+    features: torch.Tensor,
+    token_id: int,
+    modality: str,
+) -> torch.Tensor:
+    """Replace multimodal placeholder rows without dynamic-size indexing.
+
+    ``masked_scatter`` implements its source gradient through ``masked_select``.
+    On CUDA that dynamic-size selection synchronizes the stream before allocating
+    its result. The feature row count is already known, so use fixed-size
+    ``nonzero_static`` indices and ``index_copy`` instead. Its backward is the
+    asynchronous ``index_fill``/``index_select`` pair.
+
+    Args:
+        inputs_embeds: Tensor of shape [..., hidden], with arbitrary leading token dimensions.
+        input_ids: Tensor of shape [...], matching the leading dimensions of ``inputs_embeds``
+            and on the same device.
+        features: Tensor of shape [num_placeholder_tokens, hidden], with the same device and
+            dtype as ``inputs_embeds``. Rows follow the flattened placeholder order.
+        token_id: Token ID marking the positions to replace.
+        modality: Modality name used in the count-mismatch error.
+
+    Returns:
+        Tensor of shape [..., hidden] with placeholder rows replaced by ``features``.
+
+    Raises:
+        ValueError: The placeholder count differs from ``num_placeholder_tokens``.
+    """
+    token_mask = input_ids.eq(token_id).reshape(-1)
+    num_features = features.shape[0]
+    num_tokens = token_mask.sum()
+    torch_compilable_check(
+        num_tokens.eq(num_features),
+        lambda: (
+            f"{modality} features and placeholder tokens do not match, tokens: {num_tokens}, features: {num_features}"
+        ),
+    )
+    token_indices = torch.nonzero_static(token_mask, size=num_features).squeeze(-1)
+    flat_embeds = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
+    return flat_embeds.index_copy(0, token_indices, features).view_as(inputs_embeds)
 
 
 def build_mtp_config_from_hf(
@@ -369,6 +429,45 @@ def _dense_moe_config(config: Qwen3_5TextConfig, dtype: torch.dtype) -> MoEConfi
     )
 
 
+class _Qwen3_5Attention(Qwen3NextAttention):
+    """Qwen3.5 full attention with packed block-diagonal CP dispatch."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._base_attn_func = self.attn_func
+        self.attn_func = self._dispatch_attention
+
+    def _dispatch_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        """Route preprocessed QKV through packed CP or the configured backend.
+
+        Args:
+            query: Query states of shape ``[batch, heads, local_sequence, head_dim]``.
+            key: Key states of shape ``[batch, kv_heads, local_sequence, head_dim]``.
+            value: Value states with the same layout as ``key``.
+            **attn_kwargs: Keyword arguments produced by the parent attention's
+                backend preprocessing.
+
+        Returns:
+            Attention output of shape ``[batch, heads, local_sequence, head_dim]``.
+        """
+        from nemo_automodel.components.distributed.blockdiag_cp import (
+            cp_blockdiag_sdpa,
+            current_blockdiag_cp_state,
+        )
+
+        if current_blockdiag_cp_state() is not None:
+            if self.backend.attn != "sdpa":
+                raise ValueError("Qwen3.5 packed context parallelism requires model.backend.attn='sdpa'")
+            return cp_blockdiag_sdpa(query, key, value, **attn_kwargs)
+        return self._base_attn_func(query, key, value, **attn_kwargs)
+
+
 class Qwen3_5DenseBlock(Block):
     """Qwen3.5 dense decoder block on top of the Qwen3-Next ``Block``.
 
@@ -379,8 +478,29 @@ class Qwen3_5DenseBlock(Block):
 
     def __init__(self, layer_idx, config, moe_config, backend):
         super().__init__(layer_idx, config, moe_config, backend)
+        # Same parameters and math as the inherited modules, with elementwise chains fused on CUDA.
+        self.input_layernorm = Qwen3_5FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = Qwen3_5FusedMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            backend.linear,
+            dtype=get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16),
+        )
         if self.layer_type == "linear_attention":
             self.linear_attn = CPAwareGatedDeltaNet(config, layer_idx)
+            self.linear_attn.norm = Qwen3_5FusedRMSNormGated(
+                self.linear_attn.head_v_dim, eps=self.linear_attn.layer_norm_epsilon
+            )
+            # Move the fp32 A_log/dt_bias parameters into a gate that fuses the decay computation.
+            gate = self.linear_attn._fp32_params
+            fused_gate = Qwen3_5FusedSSMGate(gate.A_log.shape[0], dtype=gate.A_log.dtype)
+            fused_gate.A_log, fused_gate.dt_bias = gate.A_log, gate.dt_bias
+            self.linear_attn._fp32_params = fused_gate
+        elif self.layer_type == "full_attention":
+            self.self_attn = _Qwen3_5Attention(config, layer_idx, backend)
+            self.self_attn.q_norm = Qwen3_5FusedRMSNorm(self.self_attn.head_dim, eps=config.rms_norm_eps)
+            self.self_attn.k_norm = Qwen3_5FusedRMSNorm(self.self_attn.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -430,14 +550,16 @@ class Qwen3_5DenseBlock(Block):
                 freqs_cis = freqs_cis.flatten(0, 1)[indices]
                 attention_mask = None
                 padding_mask = None
-            output = super().forward(
-                x,
-                freqs_cis=freqs_cis,
+            # Mirrors the inherited ``Block.forward`` so the residual add can fuse into the MLP norm.
+            if attention_mask is not None and padding_mask is None:
+                padding_mask = attention_mask.bool().logical_not()
+            attn_out = self.self_attn(
+                x=self.input_layernorm(x),
                 attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                position_ids=position_ids,
+                freqs_cis=freqs_cis,
                 **attn_kwargs,
             )
+            output = self._post_attention(x, attn_out, padding_mask)
             if padded_x is not None:
                 output = padded_x.flatten(0, 1).index_copy(0, indices, output).view_as(padded_x)
             return output
@@ -452,6 +574,7 @@ class Qwen3_5DenseBlock(Block):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                compute_device=x.device,
                 packed_token_indices=attn_kwargs.get("packed_token_indices"),
                 cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
@@ -472,9 +595,26 @@ class Qwen3_5DenseBlock(Block):
             cu_seqlens_cpu=packed_gdn_metadata.cu_seqlens_cpu if packed_gdn_metadata is not None else None,
             indices=packed_gdn_metadata.indices if packed_gdn_metadata is not None else None,
         )
-        x = x + attn_out
-        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
-        return x + mlp_out
+        return self._post_attention(x, attn_out, padding_mask)
+
+    def _post_attention(
+        self, x: torch.Tensor, attn_out: torch.Tensor, padding_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Add the attention output to the residual stream, then apply the MLP sub-block.
+
+        The residual add is fused into the post-attention norm.
+
+        Args:
+            x: Residual stream of shape [batch, sequence, hidden], or [tokens, hidden]
+                for the unpadded TE stream.
+            attn_out: Attention or GatedDeltaNet output with x's shape.
+            padding_mask: Optional padding mask of shape [batch, sequence].
+
+        Returns:
+            Hidden states with x's shape.
+        """
+        x, normed = self.post_attention_layernorm(attn_out, residual=x)
+        return x + self._mlp(x=normed, padding_mask=padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -519,7 +659,7 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         self.layers = nn.ModuleDict(
             {str(i): Qwen3_5DenseBlock(i, config, moe_config, backend) for i in range(config.num_hidden_layers)}
         )
-        self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Fp32SafeQwen3_5TextRotaryEmbedding(config=config)
 
     def forward(
@@ -618,11 +758,17 @@ class Qwen3_5DenseTextBackbone(nn.Module):
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
+        from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+
         packed_gdn_metadata = None
-        if not getattr(self, "_cp_enabled", False):
+        # Block-diagonal CP strips the full-pack metadata; each block reads its documents from the CP state.
+        if not getattr(self, "_cp_enabled", False) and current_blockdiag_cp_state() is None:
+            host_packed_seq_ids = attn_kwargs.pop("_host_packed_seq_ids", None)
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                compute_device=inputs_embeds.device,
+                host_packed_seq_ids=host_packed_seq_ids,
                 packed_token_indices=attn_kwargs.get("packed_token_indices"),
                 cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
@@ -663,8 +809,9 @@ class Qwen3_5DenseTextBackbone(nn.Module):
 
 class Qwen3_5Model(HFQwen3_5Model):
     """Thin VLM wrapper exposing ``language_model`` internals as properties and
-    routing the forward: HF vision+scatter path when media is present, else the
-    NeMo dense backbone directly. Mirrors ``Qwen3_5MoeModel``."""
+    routing the forward: vision encoding and a fixed-size splice when media and
+    token IDs are present, mask-based splicing for embedded media, and the NeMo dense
+    backbone for text only."""
 
     @property
     def layers(self):
@@ -677,6 +824,122 @@ class Qwen3_5Model(HFQwen3_5Model):
     @property
     def norm(self):
         return self.language_model.norm
+
+    def get_image_features(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor | None = None,
+        host_image_grid_thw: HostTensor | None = None,
+        **kwargs: Any,
+    ) -> tuple | BaseModelOutputWithPooling:
+        """Encode image patches, keeping SDPA segment lengths on the host.
+
+        Args:
+            pixel_values: Tensor of shape [patches, patch_features], in image order.
+            image_grid_thw: Integer tensor of shape [images, 3], with temporal,
+                height, and width grid sizes in that order.
+            host_image_grid_thw: Matching CPU grid retained before the
+                distributed wrapper moves tensor inputs to CUDA.
+            **kwargs: Additional Hugging Face vision-forward arguments.
+
+        Returns:
+            Vision output whose ``last_hidden_state`` has shape [patches, hidden]
+            and whose ``pooler_output`` contains one tensor of shape
+            [image_tokens, hidden] per image, or the equivalent tuple when
+            ``return_dict=False``. The return contract matches the HF method.
+        """
+        if self.visual.config._attn_implementation == "sdpa" and image_grid_thw is not None:
+            # HF's vision helpers use host lengths for attention, interpolation,
+            # positions, and output splitting. Compute them from one host grid
+            # rather than reading CUDA scalars repeatedly in each helper/block.
+            grid_cpu = (
+                host_image_grid_thw.tensor
+                if host_image_grid_thw is not None
+                else image_grid_thw.detach().to(device="cpu")
+            )
+            kwargs["cu_seqlens"] = get_vision_cu_seqlens(grid_cpu)
+            interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+                grid_cpu,
+                num_grid_per_side=self.visual.num_grid_per_side,
+                mode=self.visual.interpolation_mode,
+                align_corners=self.visual.interpolation_align_corners,
+                spatial_merge_size=self.visual.config.spatial_merge_size,
+            )
+            position_ids = get_vision_position_ids(grid_cpu, self.visual.spatial_merge_size)
+            device = pixel_values.device
+            if pixel_values.is_cuda:
+                interp_indices = interp_indices.pin_memory()
+                interp_weights = interp_weights.pin_memory()
+                position_ids = position_ids.pin_memory()
+            kwargs["interp_indices"] = interp_indices.to(device=device, non_blocking=True)
+            kwargs["interp_weights"] = interp_weights.to(device=device, non_blocking=True)
+            kwargs["position_ids"] = position_ids.to(device=device, non_blocking=True)
+            image_grid_thw = grid_cpu
+        return super().get_image_features(pixel_values, image_grid_thw, **kwargs)
+
+    def get_placeholder_mask(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor,
+        image_features: torch.Tensor | None = None,
+        video_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return image and video masks while checking token counts on device.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or ``None`` when
+                only embeddings are available.
+            inputs_embeds: Token embeddings of shape [batch, sequence, hidden].
+            image_features: Optional image features of shape [image_tokens, hidden].
+            video_features: Optional video features of shape [video_tokens, hidden].
+
+        Returns:
+            Image and video boolean masks, each of shape [batch, sequence, 1].
+        """
+        if input_ids is None:
+            image_token = torch.full((), self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+            video_token = torch.full((), self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
+            image_mask = (inputs_embeds == self.get_input_embeddings()(image_token)).all(-1)
+            video_mask = (inputs_embeds == self.get_input_embeddings()(video_token)).all(-1)
+        else:
+            image_mask = input_ids == self.config.image_token_id
+            video_mask = input_ids == self.config.video_token_id
+
+        if image_features is not None:
+            torch._assert_async(
+                image_mask.sum() * inputs_embeds.shape[-1] == image_features.numel(),
+                "Image features and image tokens do not match",
+            )
+        if video_features is not None:
+            torch._assert_async(
+                video_mask.sum() * inputs_embeds.shape[-1] == video_features.numel(),
+                "Video features and video tokens do not match",
+            )
+        return image_mask.unsqueeze(-1).to(inputs_embeds.device), video_mask.unsqueeze(-1).to(inputs_embeds.device)
+
+    @staticmethod
+    def _scatter_media_embeddings(
+        inputs_embeds: torch.Tensor,
+        media_embeds: torch.Tensor,
+        media_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace selected token embeddings without dynamic-size backward ops.
+
+        Args:
+            inputs_embeds: Token embeddings of shape [batch, sequence, hidden].
+            media_embeds: Media embeddings of shape [media_tokens, hidden], in
+                the order of true entries in ``media_mask``.
+            media_mask: Boolean mask of shape [batch, sequence, 1].
+
+        Returns:
+            Combined token embeddings of shape [batch, sequence, hidden].
+        """
+        if media_embeds.numel() == 0:
+            return inputs_embeds
+        token_mask = media_mask.reshape(-1)
+        source_indices = (token_mask.to(torch.long).cumsum(0) - 1).clamp_min_(0)
+        selected = media_embeds.index_select(0, source_indices).reshape_as(inputs_embeds)
+        return torch.where(media_mask, selected, inputs_embeds)
 
     def forward(
         self,
@@ -718,6 +981,7 @@ class Qwen3_5Model(HFQwen3_5Model):
             Model output with ``last_hidden_state`` of shape [batch, sequence,
             hidden] and, on the HF media path, ``rope_deltas`` of shape [batch, 1].
         """
+        host_image_grid_thw = kwargs.pop("_host_image_grid_thw", None)
         # Media present + vision encoder: full HF VL forward (vision encode +
         # multimodal scatter), which then calls self.language_model (NeMo backbone).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
@@ -741,16 +1005,70 @@ class Qwen3_5Model(HFQwen3_5Model):
             for key in ("cu_seqlens", "max_seqlen"):
                 if key in kwargs:
                     kwargs[f"_text_{key}"] = kwargs.pop(key)
+            if inputs_embeds_for_super is None:
+                inputs_embeds_for_super = embed_tokens(input_ids_for_super)
+
+            vision_kwargs = {
+                key: value for key, value in kwargs.items() if key not in {"_host_packed_seq_ids", "return_dict"}
+            }
+            if pixel_values is not None:
+                image_outputs = self.get_image_features(
+                    pixel_values,
+                    image_grid_thw,
+                    host_image_grid_thw=host_image_grid_thw,
+                    return_dict=True,
+                    **vision_kwargs,
+                )
+                image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
+                    inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                )
+                if input_ids_for_super is not None:
+                    inputs_embeds_for_super = _splice_multimodal_features(
+                        inputs_embeds_for_super, input_ids_for_super, image_embeds, self.config.image_token_id, "Image"
+                    )
+                else:
+                    image_mask, _ = self.get_placeholder_mask(None, inputs_embeds_for_super, image_embeds)
+                    inputs_embeds_for_super = self._scatter_media_embeddings(
+                        inputs_embeds_for_super, image_embeds, image_mask
+                    )
+            if pixel_values_videos is not None:
+                video_outputs = self.get_video_features(
+                    pixel_values_videos, video_grid_thw, return_dict=True, **vision_kwargs
+                )
+                video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
+                    inputs_embeds_for_super.device, inputs_embeds_for_super.dtype
+                )
+                if input_ids_for_super is not None:
+                    inputs_embeds_for_super = _splice_multimodal_features(
+                        inputs_embeds_for_super, input_ids_for_super, video_embeds, self.config.video_token_id, "Video"
+                    )
+                else:
+                    _, video_mask = self.get_placeholder_mask(
+                        None, inputs_embeds_for_super, video_features=video_embeds
+                    )
+                    inputs_embeds_for_super = self._scatter_media_embeddings(
+                        inputs_embeds_for_super, video_embeds, video_mask
+                    )
+            if position_ids is None:
+                position_ids = self.compute_3d_position_ids(
+                    input_ids=input_ids_for_super,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    inputs_embeds=inputs_embeds_for_super,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    mm_token_type_ids=kwargs.get("mm_token_type_ids"),
+                )
             return super().forward(
-                input_ids=input_ids_for_super,
+                input_ids=None,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds_for_super,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
+                pixel_values=None,
+                pixel_values_videos=None,
+                image_grid_thw=None,
+                video_grid_thw=None,
                 cache_position=cache_position,
                 **kwargs,
             )
@@ -1019,8 +1337,8 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
 class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditionalGeneration):
     """Qwen3.5/Qwen3.6 dense VLM with optional Megatron-style MTP head.
 
-    The base VLM stays on the upstream HF implementation so image/video feature
-    insertion, M-RoPE position handling, and generation helpers remain intact.
+    The base VLM retains upstream image/video and M-RoPE semantics, with
+    model-owned host metadata and media insertion paths to avoid CUDA syncs.
     MTP is added as an auxiliary train-time module over the final language
     hidden states, matching the dense text-only MTP architecture.
     """
@@ -1141,11 +1459,46 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
+    def prepare_host_batch_metadata(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Retain host metadata outside distributed tensor input transfers."""
+        metadata: dict[str, Any] = {}
+        for key, host_key in (
+            ("image_grid_thw", "_host_image_grid_thw"),
+            ("_packed_seq_ids", "_host_packed_seq_ids"),
+        ):
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                metadata[host_key] = HostTensor(value)
+        input_ids = batch.get("input_ids")
+        if (
+            not isinstance(input_ids, torch.Tensor)
+            or input_ids.device.type != "cpu"
+            or torch.is_floating_point(input_ids)
+        ):
+            return metadata
+        token_ids = (self.config.image_token_id, self.config.video_token_id, self.config.vision_start_token_id)
+        metadata["_vlm_token_presence"] = tuple(
+            bool((input_ids == token_id).any()) if token_id is not None else False for token_id in token_ids
+        )
+        return metadata
+
     def _pop_staged_vlm_media(
         self,
         input_ids: torch.Tensor | None,
         kwargs: dict[str, Any],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Resolve media for the current sequence and pipeline chunk.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or ``None``.
+            kwargs: Forward arguments with optional image and video patch tensors
+                of shape [patches, patch_features] and grids of shape [entries, 3].
+
+        Returns:
+            Image patches [image_patches, patch_features], video patches
+            [video_patches, patch_features], image grid [images, 3], and video
+            grid [videos, 3], each optionally ``None``.
+        """
         pixel_values = kwargs.get("pixel_values", None)
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
@@ -1154,21 +1507,19 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
-        has_image_tokens = (
-            bool((input_ids == image_token_id).any().item())
-            if input_ids is not None and image_token_id is not None
-            else False
-        )
-        has_video_tokens = (
-            bool((input_ids == video_token_id).any().item())
-            if input_ids is not None and video_token_id is not None
-            else False
-        )
-        has_vision_start_tokens = (
-            bool((input_ids == vision_start_token_id).any().item())
-            if input_ids is not None and vision_start_token_id is not None
-            else False
-        )
+        has_image_tokens = has_video_tokens = has_vision_start_tokens = False
+        token_presence = kwargs.pop("_vlm_token_presence", None)
+        if input_ids is not None and token_presence is None:
+            # The staged-media decision needs host booleans. Transfer the three
+            # results together so it has one CUDA synchronization per forward.
+            token_presence = torch.stack(
+                [
+                    (input_ids == token_id).any() if token_id is not None else input_ids.new_zeros((), dtype=torch.bool)
+                    for token_id in (image_token_id, video_token_id, vision_start_token_id)
+                ]
+            ).tolist()
+        if input_ids is not None:
+            has_image_tokens, has_video_tokens, has_vision_start_tokens = token_presence
         has_media_tokens = input_ids is not None and (has_image_tokens or has_video_tokens or has_vision_start_tokens)
         if input_ids is not None:
             if pixel_values is not None and image_token_id is not None and not has_image_tokens:
@@ -1268,17 +1619,24 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         Embedding and the VLM->LM multimodal scatter now run inside ``forward``
         per microbatch (see :meth:`_embed_and_splice_for_cp`), so this hook only
         (a) computes the mRoPE ``position_ids`` on the *full* (unsharded) sequence
-        via ``get_rope_index`` and returns them for :func:`shard_batch_aux_only`
-        to round-robin-shard on the mRoPE axis, and (b) returns the
-        :class:`ContextParallelSharder`. ``input_ids`` and the media inputs are
-        left in the batch for the forward; ``mm_token_type_ids`` is consumed here
-        (only ``get_rope_index`` needs it) so the sharded forward never sees a
-        full-length copy.
+        via ``get_rope_index`` when the batch has none, and (b) returns the
+        :class:`ContextParallelSharder`. Packed batches (``_packed_seq_ids`` or a
+        4D mask) get block-diagonal CP over contiguous chunks so attention and the
+        GatedDeltaNet keep per-document boundaries; other batches get round-robin
+        CP. ``input_ids`` and the media inputs are left in the batch for the
+        forward; ``mm_token_type_ids`` is consumed here (only ``get_rope_index``
+        needs it) so the sharded forward never sees a full-length copy.
 
         Args:
             batch: The batch dict (with ``input_ids`` and optional multimodal
-                keys). ``input_ids`` is ``[batch, sequence]``.
-            num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
+                keys). ``input_ids`` is ``[batch, sequence]``; ``_packed_seq_ids``,
+                when present, is ``[batch, sequence]`` with 1-based document IDs and
+                zero padding.
+            num_chunks: Accepted for hook-signature parity; unused.
+
+        Raises:
+            ValueError: Packed batches with a full-attention backend other than SDPA.
+            NotImplementedError: Packed batches with an MTP head.
         """
         input_ids = batch.get("input_ids")
         if input_ids is None:
@@ -1325,11 +1683,32 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
             self.model.rope_deltas = rope_deltas
 
-        return {
-            "cp_sharder": ContextParallelSharder(
+        packed_seq_ids = batch.get("_packed_seq_ids")
+        uses_blockdiag_cp = isinstance(packed_seq_ids, torch.Tensor) or (
+            isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4
+        )
+        if uses_blockdiag_cp and self.backend.attn != "sdpa":
+            raise ValueError("Qwen3.5 packed context parallelism requires model.backend.attn='sdpa'")
+        if uses_blockdiag_cp and self.mtp is not None:
+            # The MTP sublayer's attention cannot see other ranks' document chunks.
+            raise NotImplementedError(
+                "Qwen3.5 packed context parallelism does not support MTP; set num_nextn_predict_layers=0"
+            )
+        if uses_blockdiag_cp:
+            from nemo_automodel.components.distributed.blockdiag_cp import make_cp_blockdiag_batch_and_ctx
+
+            cp_sharder = ContextParallelSharder(
+                shard_batch=partial(make_cp_blockdiag_batch_and_ctx, shard_primary=False),
+                local_token_global_indices=contiguous_local_indices,
+            )
+        else:
+            cp_sharder = ContextParallelSharder(
                 shard_batch=shard_batch_aux_only,
                 local_token_global_indices=round_robin_local_indices,
-            ),
+            )
+
+        return {
+            "cp_sharder": cp_sharder,
             "position_ids": position_ids,
             "mm_token_type_ids": None,
             **promoted,
@@ -1373,8 +1752,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         The VLM->LM multimodal scatter runs on the full (unsharded) sequence
         inside the forward before the CP sequence shard, so it is identical to
         the pre-CP-refactor pre-embed. Vision features may be frame-sharded
-        across the CP group before ``get_placeholder_mask`` scatters them into
-        the full ``input_ids`` sequence.
+        across the CP group before the fixed-size splice inserts them into the
+        full ``input_ids`` sequence.
 
         Args:
             input_ids: Token ids ``[batch, sequence]`` (full, unsharded).
@@ -1406,12 +1785,13 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     image_grid_thw,
                     is_video=False,
                 ).to(inputs_embeds.device, inputs_embeds.dtype)
-                image_mask, _ = self.model.get_placeholder_mask(
+                inputs_embeds = _splice_multimodal_features(
+                    inputs_embeds,
                     input_ids,
-                    inputs_embeds=inputs_embeds,
-                    image_features=image_embeds,
+                    image_embeds,
+                    self.config.image_token_id,
+                    "Image",
                 )
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
                 if hasattr(self.model.visual, "rotary_pos_emb"):
@@ -1421,12 +1801,13 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     video_grid_thw,
                     is_video=True,
                 ).to(inputs_embeds.device, inputs_embeds.dtype)
-                _, video_mask = self.model.get_placeholder_mask(
+                inputs_embeds = _splice_multimodal_features(
+                    inputs_embeds,
                     input_ids,
-                    inputs_embeds=inputs_embeds,
-                    video_features=video_embeds,
+                    video_embeds,
+                    self.config.video_token_id,
+                    "Video",
                 )
-                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         return inputs_embeds
 
@@ -1531,9 +1912,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         is_last_stage = getattr(self, "lm_head", None) is not None
 
         # Context-parallel: embed + vision-splice the full sequence, then keep this
-        # rank's round-robin chunk pair (aux streams + mRoPE aligned by
-        # shard_batch_aux_only). The local shard matches the old dispatch-level
-        # pre-embed and stays differentiable (gradients reach embeddings/vision).
+        # rank's chunk: a contiguous chunk under packed block-diagonal CP, otherwise the
+        # round-robin chunk pair (aux streams + mRoPE aligned by the selected sharder).
+        # The local shard stays differentiable (gradients reach embeddings/vision).
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         mtp_embed_inputs = None
         if (
@@ -1555,6 +1936,13 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
             )
+            from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+
+            shard_sequence = (
+                shard_sequence_for_cp_contiguous
+                if current_blockdiag_cp_state() is not None
+                else shard_sequence_for_cp_round_robin
+            )
             if self.mtp is not None and self.training:
                 if (
                     mtp_per_depth_input_ids is None
@@ -1565,14 +1953,14 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                         "Context-parallel Qwen3.5 MTP requires precomputed per-depth inputs, positions, and masks"
                     )
                 mtp_embed_inputs = tuple(
-                    shard_sequence_for_cp_round_robin(self.cp_mesh, embed_input, seq_dim=1)[0]
+                    shard_sequence(self.cp_mesh, embed_input, seq_dim=1)[0]
                     for embed_input in _rolled_embed_inputs(inputs_embeds, self.mtp.num_depths)
                 )
                 mtp_embed_inputs = _mask_mtp_embed_inputs(
                     mtp_embed_inputs,
                     mtp_per_depth_valid_masks,
                 )
-            inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
+            inputs_embeds, _, _ = shard_sequence(self.cp_mesh, inputs_embeds, seq_dim=1)
             input_ids = None
             pixel_values = None
             pixel_values_videos = None
@@ -1672,6 +2060,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     "packed_token_indices",
                     "max_seqlen",
                     "mm_token_type_ids",
+                    "_host_packed_seq_ids",
                     "padding_mask",
                     "qkv_format",
                 }

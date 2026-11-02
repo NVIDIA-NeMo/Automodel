@@ -116,5 +116,6 @@ optimizer:
   foreach: false
 
 ci:
+  cluster_tag: h100
   time: "00:15:00"
   nodes: 1

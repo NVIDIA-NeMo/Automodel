@@ -381,7 +381,8 @@ class GlmMoeDsaIndexer(nn.Module):
         # Combine the query and head axes so all queries share one GEMM per batch,
         # avoiding a batch of small [H, D] @ [D, T] products. Restore the reference
         # [B, S, H, T] (or packed [T, H, T]) layout before reducing over heads.
-        scores = torch.matmul(q.float().flatten(-3, -2), k.float().transpose(-1, -2))
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            scores = torch.matmul(q.float().flatten(-3, -2), k.float().transpose(-1, -2))
         scores = scores.unflatten(-2, (seq_len, self.num_heads))
         # The GEMM result is newly owned; keep the reference operation order while
         # reusing its storage instead of creating two full FP32 score copies.
@@ -390,7 +391,8 @@ class GlmMoeDsaIndexer(nn.Module):
         scores = scores.mul_(self.softmax_scale).relu_()
 
         # Head-weighted sum via matmul: weights[..., 1, H] @ scores[..., H, T] -> [..., 1, T].
-        scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
 
         # Apply attention mask if provided. Convert a {0,1} keep-mask to an additive key mask
         # (kept -> 0, padding -> finfo.min) so padding keys are excluded from the top-k selection,

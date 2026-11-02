@@ -153,6 +153,7 @@ clip_grad_norm:
 #   dir: logs/mimo_v2_6_flash_rl_medpix_nonpacked4k_ep64_100steps/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: huiyingl
   nodes: 8
   time: "01:00:00"

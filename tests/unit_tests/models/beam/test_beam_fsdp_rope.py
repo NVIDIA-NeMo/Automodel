@@ -30,7 +30,7 @@ from .utils import capture_rope_calls, hf_model_and_checkpoint, native_from_hf
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FSDP2 needs a CUDA device")
 
-# Whichever FSDP test runs first in a process (pytest-shard picks an arbitrary subset) creates the single-rank NCCL
+# Whichever FSDP test runs first in a process (test selection decides which one) creates the single-rank NCCL
 # communicator on its first collective; measured up to 6.5 s on H200, the warm tests take 0.2-1.4 s.
 first_nccl_collective = pytest.mark.runtime_budget(
     20, reason="The first FSDP test in a process creates the NCCL communicator on its first collective."
