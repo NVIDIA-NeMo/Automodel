@@ -73,6 +73,15 @@ Full-length mock sequences; no padding.
 - Full-length mock sequences; balanced MoE routing.
 - Qwen3.8-Flash-Next: 20 warmup and 30 measured steps; label-token rate; TFLOPs derived from MFU.
 
+### GPU: NVIDIA GB200, Precision: BF16
+
+| Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| [Qwen3 MoE 30B](https://github.com/NVIDIA-NeMo/Automodel/blob/4efe60c457798d92d891a3391e5e0455b72f18d1/examples/llm_benchmark/qwen/qwen3_moe_30b_te_bf16_gb200.yaml) | Mock, balanced routing | 8 | 512 | 16 | 16 | 4 | 4096 | 1 | 1 | 1 | 8 | - | 8 | TE + HybridEP | 9.505 | 634.49 | 220,637 | 27,579.59 |
+
+- Full-length mock sequences; balanced MoE routing; 10 warmup and 20 measured steps.
+- TFLOPs derive from MFU and the 2,500 TFLOPs/s GB200 BF16 dense peak set in the recipe; the H100 BF16 rows use 989.
+
 ### GPU: NVIDIA H100 80GB, Precision: FP8
 
 | Model | Workload | #GPUs | GBS | MBS | LBS | GA | Seq Length | TP | PP | CP | EP | VP | FSDP | Kernel Optimizations | Time per Global Step (s) | Model TFLOPs/sec/GPU | Tokens/sec | Tokens/sec/GPU |
@@ -137,6 +146,6 @@ Model names in the tables link directly to their YAML recipes. Mock-data benchma
 
 ## Version Information
 
-- **Last Updated**: 2026-10-14
+- **Last Updated**: 2026-11-02
 - **Default Recipe Snapshot**: [`b203f3f9`](https://github.com/NVIDIA-NeMo/Automodel/tree/b203f3f9f9f3140c660942a088ff36bbc3a5e856)
 - **Measurements**: Historical development and benchmark runs; source commits vary.
