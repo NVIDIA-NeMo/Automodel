@@ -208,25 +208,24 @@ class GlmMoeDsaIndexer(nn.Module):
         # LayerNorm for K (official uses LayerNorm, not RMSNorm). eps=1e-6 matches the reference / HF.
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype)
 
-        # Per-head weight projection from hidden states. Always a plain torch Linear: its output drives
-        # top-k key selection, so it never runs through the FP8 GEMM that ``backend.linear='te'`` would
-        # pick for it. Under an FP8 recipe (``backend.te_fp8``) the projection is evaluated in fp32 like
-        # the GLM-5.3 RL trainer; otherwise it keeps the reference rounding (see ``_head_weights``).
+        # Per-head weight projection from hidden states. Always a plain torch Linear whose GEMM runs in
+        # fp32 (see ``_head_weights``): its output drives top-k key selection, so it never runs through
+        # the FP8 GEMM that ``backend.linear='te'`` would pick for it, and it follows the GLM-5.3 RL
+        # trainer / SGLang precision in every configuration.
         self.weights_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False, dtype=dtype)
-        self.fp32_head_projection = backend.te_fp8 is not None
 
     def _head_weights(self, x: torch.Tensor) -> torch.Tensor:
         """Per-head indexer weights in fp32.
 
-        Without an FP8 recipe the head keeps the reference rounding: the resident module computes the
-        projection in its own dtype (bf16 for the bf16 recipes, as the HF implementation does) and the
-        result is lifted to fp32, so the keys selected by the existing non-FP8 configurations do not
-        change. Under ``backend.te_fp8`` a plain head follows the GLM-5.3 RL trainer and runs one fp32
-        GEMM on the resident (bf16) weight with autocast disabled: ``F.linear`` is autocast-eligible, so
-        casting the operands alone would still produce bf16 under a bf16 autocast wrapper, and the dense
-        scorer's autocast-disabled head reduction needs fp32 operands. An installed adapter (LoRA/DoRA,
-        possibly with dropout) overrides ``forward``; it is always called so its update, dropout and
-        magnitude semantics are kept, and its output is lifted to fp32.
+        The projection follows the GLM-5.3 RL trainer / SGLang: one fp32 GEMM on the resident (bf16)
+        weight, in every configuration. HF Transformers lists ``indexer.weights_proj`` in
+        ``_keep_in_fp32_modules`` but enforces it only for fp16 loads, so a bf16 HF model rounds the
+        projection to bf16; that rounding is deliberately not reproduced (it only moves near-tied keys).
+        The GEMM runs with autocast disabled: ``F.linear`` is autocast-eligible, so casting the operands
+        alone would still produce bf16 under a bf16 autocast wrapper, and the dense scorer's
+        autocast-disabled head reduction needs fp32 operands. An installed adapter (LoRA/DoRA, possibly
+        with dropout) overrides ``forward``; it is always called so its update, dropout and magnitude
+        semantics are kept, and its output is lifted to fp32.
 
         Args:
             x: Hidden states of shape ``[tokens, hidden]`` (THD) or ``[batch, sequence, hidden]``.
@@ -235,7 +234,7 @@ class GlmMoeDsaIndexer(nn.Module):
             fp32 tensor of shape ``x.shape[:-1] + [index_n_heads]``.
         """
         proj = self.weights_proj
-        if self.fp32_head_projection and type(proj).forward is nn.Linear.forward:
+        if type(proj).forward is nn.Linear.forward:
             with torch.autocast(device_type=x.device.type, enabled=False):
                 return F.linear(x.float(), proj.weight.float())
         return proj(x).float()

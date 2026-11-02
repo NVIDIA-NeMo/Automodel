@@ -916,13 +916,9 @@ def test_cudnn_indexer_layer_preserves_fp32_reference_scaling(
     monkeypatch.setattr(layer_mod, "cudnn_indexer_topk", fake_indexer)
     x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16)
     q_resid = torch.randn(4, config.q_lora_rank, dtype=torch.bfloat16)
-    # Independent oracle: under the FP8 recipe the head weights are an fp32 GEMM over the bf16 weight
-    # (never FP8 themselves); otherwise the reference bf16 projection lifted to fp32.
-    projection = (
-        torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
-        if fp8_recipe
-        else torch.nn.functional.linear(x, indexer.weights_proj.weight).float()
-    )
+    # Independent oracle: the head weights are an fp32 GEMM over the bf16 weight in every configuration
+    # (never FP8 themselves, never the bf16 rounding).
+    projection = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
     expected_weights = projection * config.index_n_heads**-0.5 * config.index_head_dim**-0.5
     packed_metadata = (
         torch.zeros(4, dtype=torch.int32),

@@ -58,7 +58,7 @@ model:
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: tilelang
-    linear: te  # q/kv/o proj, indexer wq_b/wk, dense+shared MLP -> FP8 (indexer weights_proj and lm_head stay bf16/fp32)
+    linear: te  # q/kv/o proj, indexer wq_b/wk, dense+shared MLP -> FP8 (indexer weights_proj runs an fp32 GEMM, lm_head stays bf16)
     rms_norm: torch_fp32
     rope_fusion: false
     experts: te  # GroupedExpertsTE -> FP8 grouped GEMM
