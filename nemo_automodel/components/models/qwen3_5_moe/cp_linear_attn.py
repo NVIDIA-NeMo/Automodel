@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Packed fallback guards adapted from Hugging Face Transformers (Apache-2.0):
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+# src/transformers/integrations/hub_kernels.py at
+# https://github.com/huggingface/transformers/commit/01f16c0e835edb224b11fb8596c6b13bb29bd515
+
 """Context-Parallel-aware wrapper for Qwen3.5 MoE GatedDeltaNet linear attention.
 
 When a CP mesh is attached (via ``apply_cp``), the forward pass:
@@ -42,6 +47,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
@@ -123,23 +129,18 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         # Transformers 5.15 moved kernel callables from instance attributes to decorated
         # module-level fallbacks. Prefer the installed kernels, matching the pre-5.15
         # behavior and the FLA implementation used by the context-parallel path.
-        try:
-            from causal_conv1d import causal_conv1d_fn as fast_causal_conv1d_fn
-            from causal_conv1d import causal_conv1d_update as fast_causal_conv1d_update
-        except ImportError:
-            fast_causal_conv1d_fn = causal_conv1d_fn
-            fast_causal_conv1d_update = causal_conv1d_update
-
-        try:
-            from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-        except ImportError:
-            chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-            fused_recurrent_gated_delta_rule = torch_recurrent_gated_delta_rule
-
-        self.causal_conv1d_fn = fast_causal_conv1d_fn
-        self.causal_conv1d_update = fast_causal_conv1d_update
-        self.chunk_gated_delta_rule = chunk_gated_delta_rule
-        self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule
+        has_causal_conv1d, fast_causal_conv1d_fn = safe_import_from("causal_conv1d", "causal_conv1d_fn")
+        _, self.causal_conv1d_update = safe_import_from(
+            "causal_conv1d", "causal_conv1d_update", alt=causal_conv1d_update
+        )
+        has_fla, chunk_gated_delta_rule = safe_import_from("fla.ops.gated_delta_rule", "chunk_gated_delta_rule")
+        _, self.recurrent_gated_delta_rule = safe_import_from(
+            "fla.ops.gated_delta_rule", "fused_recurrent_gated_delta_rule", alt=torch_recurrent_gated_delta_rule
+        )
+        # A decorated HF reference is callable even when its fast dependency is
+        # absent. Keep that distinct from kernels that support packed boundaries.
+        self.causal_conv1d_fn = fast_causal_conv1d_fn if has_causal_conv1d else None
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule if has_fla else None
         # HF created bare ``A_log``/``dt_bias`` in ``_parameters``; move them into a
         # native fp32 ``SSMGate`` submodule (built directly, not relocated at runtime).
         install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config))
@@ -202,6 +203,19 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             raise ValueError("cu_seqlens_cpu must reside on CPU for FLA host-side chunk planning.")
 
         is_packed = (not use_precomputed_states) and cu_seqlens is not None
+        if is_packed and self.causal_conv1d_fn is None:
+            raise ValueError(
+                "`causal_conv1d_fn` can't keep packed sequences apart without `causal-conv1d`. Install "
+                "`causal-conv1d` to train on packed sequences."
+            )
+        if is_packed and self.chunk_gated_delta_rule is None:
+            raise ValueError(
+                "`chunk_gated_delta_rule` can't keep packed sequences apart without `flash-linear-attention`. Install "
+                "`flash-linear-attention` to train on packed sequences."
+            )
+        chunk_gated_delta_rule = (
+            self.chunk_gated_delta_rule if self.chunk_gated_delta_rule is not None else torch_chunk_gated_delta_rule
+        )
         # Only unpad when there is actually padding to remove. For B=1 packs
         # without padding, ``indices`` covers ``[0, B*T)`` and we keep the
         # ``[B, T, ...]`` layout (bit-for-bit identical to the prior fast path).
@@ -274,7 +288,12 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                     seq_idx=seq_idx_for_conv,
                 )
             else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :eff_seq_len])
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    weight=self.conv1d.weight.squeeze(1),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                )
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
@@ -300,7 +319,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                     value = value.reshape(1, batch_size * seq_len, *value.shape[2:])
                     g = g.reshape(1, batch_size * seq_len, *g.shape[2:])
                     beta = beta.reshape(1, batch_size * seq_len, *beta.shape[2:])
-                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                     query,
                     key,
                     value,
@@ -315,7 +334,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 if not needs_unpad:
                     core_attn_out = core_attn_out.reshape(batch_size, seq_len, *core_attn_out.shape[2:])
             else:
-                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                     query,
                     key,
                     value,
