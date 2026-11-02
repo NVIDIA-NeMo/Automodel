@@ -743,7 +743,8 @@ class DataloaderConfig:
             attn_implementation: Deprecated attention-backend name retained for
                 Python-call compatibility during the packing-contract migration.
             packing_contract: Structural model contract used by NEAT packing.
-                Defaults to block-causal masking without packed-sequence metadata.
+                Native mask/Flash collation requires a model-derived contract supplying
+            the attention conversion; recipes provide it automatically.
             collate_wrapper: Optional recipe-owned wrapper around the resolved collator.
             ignore_index: Stream-backend label exclusion value. Native collators retain
                 their own configured supervision policy and do not consume this value.

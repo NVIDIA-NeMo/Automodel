@@ -29,13 +29,13 @@ from typing import Any, Literal, Protocol, runtime_checkable
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.common.utils import AttentionBackend
-from nemo_automodel.shared.packed_seq import (
+from nemo_automodel.components.models.common.packed_seq import (
     FLASH_VARLEN_KWARGS,
     indexed_mask_to_4d_block_causal,
     packed_seq_params_from_doc_ids,
     to_flash_attention_kwargs,
 )
+from nemo_automodel.components.models.common.utils import AttentionBackend
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,29 @@ class PackingCapabilities:
     uses_native_fa4: bool = False
     return_document_ids: bool = False
     max_sequence_length: int | None = None
+
+    def prepare_attention_inputs(self, document_ids: torch.Tensor) -> dict[str, torch.Tensor | int]:
+        """Convert native collator document IDs using the selected model interface.
+
+        Args:
+            document_ids: Integer tensor [batch, sequence], with positive IDs
+                for document membership and zero for padding. CPU collation stays
+                on CPU; model-entry preparation independently handles transfer.
+
+        Returns:
+            An attention mask [batch, 1, sequence, sequence], compact document
+            IDs [batch, sequence], or HF cumulative lengths [segments + 1] and
+            integer maximum lengths. Inputs are read-only; compact IDs may alias
+            the input. This bound callback retains only this scalar contract,
+            never the model, and can run in spawned dataloader workers.
+        """
+        if self.packed_mask_type == "block_causal":
+            return {"attention_mask": indexed_mask_to_4d_block_causal(document_ids)}
+        if self.packed_mask_type == "document_ids":
+            return {"attention_mask": document_ids}
+        if self.packed_mask_type == "flash_varlen":
+            return to_flash_attention_kwargs(packed_seq_params_from_doc_ids(document_ids))
+        raise ValueError(f"Unsupported packed_mask_type: {self.packed_mask_type!r}")
 
 
 @runtime_checkable

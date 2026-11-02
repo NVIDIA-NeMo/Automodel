@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import sys
 import types
 from contextlib import nullcontext
@@ -32,6 +33,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.models.qwen3_5.packing import HostTensor
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
@@ -3716,7 +3718,7 @@ def _patches_for_packing(neat_pack_side_effect):
     processor = MagicMock()
     processor.tokenizer.pad_token_id = 0
     processor.chat_template = "{{ x }}"
-    packing_contract = SimpleNamespace(
+    packing_contract = PackingCapabilities(
         packed_mask_type="document_ids",
         return_packed_sequence_metadata=True,
     )
