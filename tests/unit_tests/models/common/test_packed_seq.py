@@ -15,12 +15,12 @@
 import pytest
 import torch
 
-from nemo_automodel.components.datasets.packed_seq import (
+from nemo_automodel.components.models.common.packed_seq import (
     PackedSeqParams,
+    indexed_mask_to_4d_block_causal,
     packed_seq_params_from_doc_ids,
     to_flash_attention_kwargs,
 )
-from nemo_automodel.components.datasets.utils import indexed_mask_to_4d_block_causal
 
 
 def _block_causal_from_cu_seqlens(cu_seqlens: torch.Tensor, total: int) -> torch.Tensor:

@@ -31,7 +31,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Protocol
 
-from nemo_automodel.shared.batch import move_batch_to_device
+from nemo_automodel.components.training.batch import move_batch_to_device
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_MLFLOW, mlflow = safe_import(
