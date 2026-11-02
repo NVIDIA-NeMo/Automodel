@@ -335,7 +335,6 @@ class DeepseekV41Engram(nn.Module):
         nn.init.normal_(self.wkv.weight, mean=0.0, std=self.initializer_range)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
-        self.embed.mark_sharding_contract()
 
     def _validates_on_device(self, hash_ids: torch.Tensor) -> bool:
         """Whether hash IDs are checked with device-side asserts (CUDA, strict validation off).

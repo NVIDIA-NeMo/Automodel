@@ -1293,44 +1293,6 @@ def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
     assert block_kwargs.get("ignored_params") is None
 
 
-def test_apply_fsdp_excludes_model_owned_shard_from_block_and_root(monkeypatch):
-    """A model-owned parameter shard must not be sharded again by FSDP."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    monkeypatch.setattr(P, "MoE", DummyMoE)
-    fully_shard_mock = MagicMock()
-    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
-    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
-
-    owner_weight = DummyParam()
-    owner_weight._nemo_model_owned_grad_divisor = 1.0
-
-    class OwnerShardedBlock(DummyBlock):
-        def parameters(self):
-            yield owner_weight
-
-    class OwnerShardedModel(DummyModel):
-        def parameters(self):
-            yield owner_weight
-
-    block = OwnerShardedBlock(mlp=DummyMoE())
-    model = OwnerShardedModel([block])
-    fsdp_mesh = object()
-
-    P.apply_fsdp(
-        model=model,
-        fsdp_mesh=fsdp_mesh,
-        ep_enabled=False,
-        ep_shard_enabled=False,
-    )
-
-    block_call = _find_call_by_first_arg(fully_shard_mock, block)
-    assert block_call is not None
-    assert block_call[1]["ignored_params"] == {owner_weight}
-    root_call = _find_call_by_first_arg(fully_shard_mock, model)
-    assert root_call is not None
-    assert root_call[1]["ignored_params"] == {owner_weight}
-
-
 def test_apply_fsdp_prepares_and_excludes_final_model_owned_dtensor_identity(monkeypatch):
     """The model hook runs before every FSDP unit snapshots ignored params."""
     P = _import_parallelizer_with_stubs(monkeypatch)
@@ -1344,7 +1306,6 @@ def test_apply_fsdp_prepares_and_excludes_final_model_owned_dtensor_identity(mon
     # exercises the production type guard instead of mixing the real and
     # stubbed torch modules.
     distributed_weight = P.nn.Parameter()
-    distributed_weight._nemo_model_owned_grad_divisor = 2.0
 
     class ModelOwnedDTensorBlock(DummyBlock):
         def parameters(self):

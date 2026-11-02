@@ -23,8 +23,6 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
 
-from nemo_automodel.shared.model_owned_sharding import model_owned_grad_divisor
-
 _TP_REPLICA_GRAD_REDUCTION_ATTR = "_nemo_tp_replica_grad_reduction"
 _MAX_FLAT_BUFFER_BYTES = 256 * 1024 * 1024
 
@@ -130,8 +128,6 @@ def _iter_unique_parameters(
             if reduction not in ("mean", "sum"):
                 raise ValueError(f"Unsupported TP replica gradient reduction: {reduction!r}")
             for parameter in module.parameters(recurse=False):
-                if model_owned_grad_divisor(parameter) is not None:
-                    continue
                 parameter_id = id(parameter)
                 prior_reduction = seen.get(parameter_id)
                 if prior_reduction is not None:

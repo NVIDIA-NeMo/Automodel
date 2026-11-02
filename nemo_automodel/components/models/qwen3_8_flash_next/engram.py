@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -27,13 +27,13 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
+from nemo_automodel.components.distributed.tp_replicas import exclude_from_tp_replica_sync
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_left_halo,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGroupedRMSNorm
-from nemo_automodel.shared.model_owned_sharding import stamp_model_owned_grad_divisor
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 QWEN3_8_FLASH_NEXT_LAYER_MULTIPLIERS = (
@@ -209,7 +209,15 @@ def _fixed_capacity_all_to_all(
 
 
 class _FixedCapacityAllToAll(torch.autograd.Function):
-    """Autograd-aware equal-split All-to-All for compact routed values."""
+    """Autograd-aware equal-split All-to-All for compact routed values.
+
+    The backward routes every requester's gradient back to the owner and divides
+    it by the owner-group size, so the owner accumulates the mean of the
+    per-rank contributions: the same average the data-parallel gradient
+    reduction gives every other parameter. Summing per-micro-batch means equals
+    the mean of the accumulated sum, so gradient accumulation needs no further
+    scaling.
+    """
 
     @staticmethod
     def forward(
@@ -261,7 +269,7 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
         ctx: Any,
         grad_output: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
-        """Route output gradients back to the ranks that supplied the rows.
+        """Route output gradients back to the ranks that supplied the rows, averaged over the group.
 
         Args:
             ctx: PyTorch autograd context populated by :meth:`forward`.
@@ -269,8 +277,9 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
                 source-rank segmentation as the forward output.
 
         Returns:
-            A gradient tensor of shape ``[input_rows, ...]`` followed by four
-            ``None`` entries for the non-tensor split and process-group inputs.
+            A gradient tensor of shape ``[input_rows, ...]``, divided by the
+            process-group size, followed by six ``None`` entries for the
+            non-tensor split, process-group and row-map inputs.
         """
         grad_input = _fixed_capacity_all_to_all(
             grad_output,
@@ -282,6 +291,7 @@ class _FixedCapacityAllToAll(torch.autograd.Function):
             input_rows=ctx.output_rows,
             output_rows=ctx.input_rows,
         )
+        grad_input.div_(dist.get_world_size(ctx.process_group))
         return grad_input, None, None, None, None, None, None
 
 
@@ -289,7 +299,9 @@ class _PaddedAllToAll(torch.autograd.Function):
     """Equal-split All-to-All of an already padded ``[world_size * capacity, ...]`` buffer, both directions.
 
     The capacity-mode lookup keeps the owner side in the padded layout, so the value exchange and its backward are the
-    same symmetric collective on identically shaped buffers; nothing is read on the host.
+    same symmetric collective on identically shaped buffers; nothing is read on the host. As in
+    :class:`_FixedCapacityAllToAll`, the backward divides the routed gradient by the process-group size so the owner
+    accumulates the mean of the per-rank contributions.
     """
 
     @staticmethod
@@ -303,6 +315,7 @@ class _PaddedAllToAll(torch.autograd.Function):
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
         grad_input = torch.empty_like(grad_output)
         dist.all_to_all_single(grad_input, grad_output.contiguous(), group=ctx.process_group)
+        grad_input.div_(dist.get_world_size(ctx.process_group))
         return grad_input, None
 
 
@@ -398,7 +411,10 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
     request rank groups global row IDs by owner and sends them in the first
     All-to-All. Owners perform a local embedding lookup. An autograd-aware
     second All-to-All returns values to request ranks and reverses direction in
-    backward, so only the owner accumulates and updates a row's gradient.
+    backward, so only the owner accumulates and updates a row's gradient. That
+    backward divides the routed gradient by the owner-group size, so the owner
+    row holds the mean of the per-rank contributions and the training loop
+    treats the table like any other data-parallel parameter.
 
     Args:
         config: Global table shape and initialization settings.
@@ -451,7 +467,6 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
                     dtype=dtype,
                 )
             )
-        self.mark_sharding_contract()
         self.reset_parameters()
 
     def _set_owner_geometry(self, process_group: dist.ProcessGroup | None) -> None:
@@ -509,36 +524,6 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         if placeholder.device.type != "meta":
             self.reset_parameters()
 
-    def _apply(
-        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
-    ) -> Qwen3_8_FlashNextOwnerShardedEmbedding:
-        """Restore ownership metadata after a module device or dtype conversion.
-
-        Args:
-            fn: Tensor conversion applied by ``Module.to`` or ``Module.to_empty``.
-            recurse: Whether to convert child modules as well.
-
-        Returns:
-            This module after the normal PyTorch conversion, with the current
-            row-sharded weight marked for owner-gradient averaging. Shapes,
-            placements and values follow ``fn`` without an additional copy.
-        """
-        result = super()._apply(fn, recurse=recurse)
-        self.mark_sharding_contract()
-        return result
-
-    def mark_sharding_contract(self) -> None:
-        """Stamp the model-owned contract on the current weight.
-
-        DTensor conversion can discard custom attributes even when PyTorch
-        preserves the Parameter identity. Ordinary module conversions restore
-        the marker through ``_apply``; the checkpoint materialization helper
-        carries it over itself, and model initialization stamps it as well.
-        The single-rank reference table needs no contract.
-        """
-        if isinstance(self.weight, DTensor):
-            stamp_model_owned_grad_divisor(self.weight, self.owner_world_size)
-
     def parallelize_weight(self, fsdp_mesh: DeviceMesh) -> nn.Parameter:
         """Represent the already-local owner shard as one global DTensor.
 
@@ -546,7 +531,9 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         method uses :meth:`DTensor.from_local` rather than redistributing or
         slicing it again.  It runs before FSDP records its ignored parameters;
         the returned parameter identity must be passed unchanged to every FSDP
-        unit containing the table.
+        unit containing the table. The module is also excluded from tensor-
+        parallel replica synchronization: its local tensor is an owner shard,
+        not a replica.
 
         Args:
             fsdp_mesh: One-dimensional FSDP shard/CP mesh of the pipeline stage
@@ -597,7 +584,7 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
                     "Engram DTensor is already attached to a different mesh: "
                     f"current={current_mesh_ranks}, requested={mesh_ranks}"
                 )
-            self.mark_sharding_contract()
+            exclude_from_tp_replica_sync(self)
             return self.weight
 
         if tuple(self.weight.shape) != expected_local_shape:
@@ -616,7 +603,7 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             stride=(self.embedding_dim, 1),
         )
         self.weight = nn.Parameter(distributed_weight, requires_grad=requires_grad)
-        self.mark_sharding_contract()
+        exclude_from_tp_replica_sync(self)
         return self.weight
 
     @torch.no_grad()

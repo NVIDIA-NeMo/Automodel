@@ -39,7 +39,6 @@ from nemo_automodel.components.models.qwen3_8_flash_next.engram import (
     Qwen3_8_FlashNextOwnerShardedEmbedding,
     Qwen3_8_FlashNextPLELayer,
 )
-from nemo_automodel.shared.model_owned_sharding import model_owned_grad_divisor
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
@@ -325,7 +324,6 @@ def test_local_engram_table_matches_torch_embedding_forward_and_backward() -> No
     ).build(process_group=None, dtype=torch.float32)
     assert table.global_row_start == table.local_row_start == 0
     assert table.global_row_end == table.local_row_end == 12
-    assert not hasattr(table.weight, "_nemo_model_owned_grad_divisor")
     reference_weight = torch.arange(36, dtype=torch.float32).view(12, 3) / 10
     table.weight.detach().copy_(reference_weight)
     global_ids = torch.tensor([[0, 7, 7], [11, 1, 6]])
@@ -383,7 +381,11 @@ def _owner_sharded_gradient_worker(rank: int, world_size: int, store_path: str) 
 
         actual.backward(upstream)
         expected.backward(upstream)
+        # The owner holds the mean of the per-rank contributions: the value
+        # route's backward divides by the owner-group size, so the table needs
+        # no further scaling in the training loop.
         dist.all_reduce(expected_weight.grad, group=dist.group.WORLD)
+        expected_weight.grad.div_(world_size)
         expected_local_grad = expected_weight.grad[table.vocab_start_index : table.vocab_end_index]
         assert isinstance(table.weight.grad, DTensor)
         torch.testing.assert_close(table.weight.grad.to_local(), expected_local_grad, rtol=0, atol=0)
@@ -437,13 +439,8 @@ def _engram_meta_dtensor_lifecycle_worker(rank: int, world_size: int, store_path
         assert table.weight.to_local().device.type == "cpu"
         assert tuple(table.weight.shape) == (12, 3)
         assert tuple(table.weight.placements) == (Shard(0),)
-        # Materialization rebuilds the parameter storage but carries over the
-        # owner-group gradient divisor; a pipeline stage that loads pretrained
-        # weights never re-runs the model initialization that also stamps it.
-        assert model_owned_grad_divisor(table.weight) == float(world_size)
         table.reset_parameters()
         assert torch.isfinite(table.weight.to_local()).all()
-        assert model_owned_grad_divisor(table.weight) == float(world_size)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -1024,6 +1021,7 @@ def _owner_sharded_empty_requester_worker(rank: int, world_size: int, store_path
                 expected_weight = full_weight.clone().requires_grad_(True)
                 F.embedding(ids, expected_weight).backward(upstream)
                 dist.all_reduce(expected_weight.grad, group=dist.group.WORLD)
+                expected_weight.grad.div_(world_size)  # owner rows hold the owner-group mean
                 torch.testing.assert_close(
                     table.weight.grad.to_local(),
                     expected_weight.grad[table.vocab_start_index : table.vocab_end_index],

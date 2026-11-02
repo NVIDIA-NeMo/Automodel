@@ -93,7 +93,6 @@ def _pending_table_binds_stage_mesh_worker(rank: int, world_size: int, store_pat
                 .unsqueeze(1)
                 .expand(-1, 3)
             )
-        table.mark_sharding_contract()
         ids = torch.tensor([[11, 0, 7], [6, 5, 1]]) if rank == 0 else torch.tensor([[2, 9, 4], [8, 3, 10]])
         values = table(ids)
         torch.testing.assert_close(values, ids.unsqueeze(-1).expand(-1, -1, 3).to(torch.float32))

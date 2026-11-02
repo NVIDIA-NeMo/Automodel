@@ -875,9 +875,6 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             std = self.config.text_config.hidden_size**-0.5
             nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
-        for layer in self.model.language_model.layers.values():
-            if layer.ple is not None:
-                layer.ple.ple_embedding.ngram_embedding.mark_sharding_contract()
 
 
 ModelClass = Qwen3_8_FlashNextForConditionalGeneration
