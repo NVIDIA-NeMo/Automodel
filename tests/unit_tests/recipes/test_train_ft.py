@@ -4485,7 +4485,7 @@ def test_common_loader_build_keeps_rng_owned_by_loader_and_rank_order(monkeypatc
         config = ZephonDataloaderConfig(zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),)))
     monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: config))
     recipe_type = TrainFinetuneRecipeForNextTokenPrediction
-    monkeypatch.setattr(recipe_type, "_get_packing_contract", lambda self: DEFAULT_PACKED_SEQUENCE_CONTRACT)
+    monkeypatch.setattr(recipe_type, "_packing_contract", property(lambda self: DEFAULT_PACKED_SEQUENCE_CONTRACT))
     original_setup = recipe_type._create_distributed_setup
 
     def setup(self):
@@ -4578,7 +4578,7 @@ def test_setup_always_passes_return_contract_and_only_configures_packed_batched_
         build=build,
     )
     monkeypatch.setattr(RecipeConfig, config_property, property(lambda self: config))
-    monkeypatch.setattr(recipe_type, "_get_packing_contract", query)
+    monkeypatch.setattr(recipe_type, "_packing_contract", property(query))
     monkeypatch.setattr(f"{module}.configure_packing_for_models", lambda models: configured.append(True))
     monkeypatch.setattr(f"{module}.validate_thd_packing_support", lambda models: thd_validated.append(True))
     with pytest.raises(LoaderReached):

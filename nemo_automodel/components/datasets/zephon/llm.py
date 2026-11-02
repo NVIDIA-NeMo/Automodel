@@ -68,13 +68,16 @@ def resolve_token_ids(tokenizer: PreTrainedTokenizerBase, *, pad_token_id: int |
         candidate = vocab.get(name)
         if candidate is not None and candidate != eos:
             return TokenIds(bos, eos, candidate)
-    reserved = sorted(
-        index
-        for index, token in tokenizer.added_tokens_decoder.items()
-        if token.special and "reserved" in token.content.lower() and index != eos and index in valid_ids
+    reserved = min(
+        (
+            index
+            for index, token in tokenizer.added_tokens_decoder.items()
+            if token.special and "reserved" in token.content.lower() and index != eos and index in valid_ids
+        ),
+        default=None,
     )
-    if reserved:
-        return TokenIds(bos, eos, reserved[0])
+    if reserved is not None:
+        return TokenIds(bos, eos, reserved)
     unknown = tokenizer.unk_token_id
     if unknown is not None and unknown in valid_ids and unknown != eos:
         return TokenIds(bos, eos, unknown)

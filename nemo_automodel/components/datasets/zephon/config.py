@@ -23,7 +23,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypedDict
 
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
@@ -383,10 +383,8 @@ class ZephonLoaderConfig:
         if self.output_format not in ("batched", "thd"):
             raise ValueError("output_format must be batched or thd")
 
-    @property
-    def is_packed(self) -> bool:
-        """Delivery carries document metadata, including for offline-packed input."""
-        return True
+    # Delivery carries document metadata, including for offline-packed input.
+    is_packed: ClassVar[bool] = True
 
     def resolve_sequence_length(self, *, packing_contract: PackedSequenceContract) -> int:
         """Resolve the shifted input limit before starting source workers.
@@ -621,10 +619,8 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
             output_format=loader_values.get("output_format", "batched"),
         )
 
-    @property
-    def dataset_builds_on_all_ranks(self) -> bool:
-        """Keep Zephon initialization and calibration outside rank-first ordering."""
-        return True
+    # Keep Zephon initialization and calibration outside rank-first ordering.
+    dataset_builds_on_all_ranks: ClassVar[bool] = True
 
     @property
     def packed_sequence_length(self) -> int:
