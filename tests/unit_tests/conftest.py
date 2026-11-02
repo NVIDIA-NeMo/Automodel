@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ast
+import fnmatch
 import importlib
+import json
 import math
 import multiprocessing
 import os
 import re
+import statistics
 import subprocess
 import sys
 import types
@@ -62,6 +65,11 @@ _DEFAULT_HARD_TIMEOUT_SECONDS = 70.0
 _TIMEOUT_MULTIPLIER = 3
 _RUNTIME_BUDGET_ATTRIBUTE = "_automodel_runtime_budget_seconds"
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+# Directories whose tests never use CUDA. L0_Unit_Tests_CPU runs them, so the GPU shards deselect them.
+_CPU_ONLY_DIRECTORIES = frozenset({"ci_tests", "tools"})
+# Seconds each test file took in the GPU unit-test shards; refresh with tools/update_gpu_shard_durations.py.
+_GPU_SHARD_DURATIONS_PATH = Path(__file__).parent / "gpu_shard_durations.json"
+_FILE_SHARDS = pytest.StashKey[dict[str, int]]()
 
 
 def _run_git(repo_root: Path, *args: str) -> str | None:
@@ -301,6 +309,79 @@ def _apply_runtime_policy(config: pytest.Config, items: list[pytest.Item]) -> No
             item.add_marker(pytest.mark.timeout(hard_timeout), append=False)
 
 
+def _assign_file_shards(paths: list[str], durations: dict[str, float], num_shards: int) -> dict[str, int]:
+    """Assign whole test files to shards, longest first, each to the least-loaded shard.
+
+    A file without a recorded duration weighs as much as the median recorded file. Ties
+    break on the path and the lowest shard index, so every shard computes the same split.
+
+    Args:
+        paths: Test file paths relative to the unit-test root.
+        durations: Recorded seconds per test file, keyed like ``paths``.
+        num_shards: Number of shards to fill.
+
+    Returns:
+        The shard index of every path.
+    """
+    default_seconds = statistics.median(durations.values()) if durations else 1.0
+    loads = [0.0] * num_shards
+    assignment = {}
+    for path in sorted(paths, key=lambda path: (-durations.get(path, default_seconds), path)):
+        shard = loads.index(min(loads))
+        assignment[path] = shard
+        loads[shard] += durations.get(path, default_seconds)
+    return assignment
+
+
+def _file_shard_assignment(config: pytest.Config) -> dict[str, int] | None:
+    """Return the shard of every unit-test file, or ``None`` when the suite is not split."""
+    num_shards = config.getoption("file_num_shards")
+    if num_shards == 1:
+        return None
+    if _FILE_SHARDS not in config.stash:
+        unit_tests_root = Path(__file__).parent
+        patterns = config.getini("python_files")
+        paths = [
+            path.relative_to(unit_tests_root).as_posix()
+            for path in unit_tests_root.rglob("*.py")
+            if any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns)
+        ]
+        durations = json.loads(_GPU_SHARD_DURATIONS_PATH.read_text())["seconds"]
+        config.stash[_FILE_SHARDS] = _assign_file_shards(paths, durations, num_shards)
+    return config.stash[_FILE_SHARDS]
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    """Skip test files that belong to another file shard, before importing them."""
+    unit_tests_root = Path(__file__).parent
+    assignment = _file_shard_assignment(config)
+    if assignment is None or unit_tests_root not in collection_path.parents:
+        return None
+    shard = assignment.get(collection_path.relative_to(unit_tests_root).as_posix())
+    if shard is None or shard == config.getoption("file_shard_id"):
+        return None
+    return True
+
+
+def pytest_report_collectionfinish(config: pytest.Config) -> str | None:
+    """Name this session's file shard in the collection summary."""
+    assignment = _file_shard_assignment(config)
+    if assignment is None:
+        return None
+    shard_id = config.getoption("file_shard_id")
+    owned = sum(shard == shard_id for shard in assignment.values())
+    return f"file shard {shard_id + 1}/{config.getoption('file_num_shards')}: {owned} of {len(assignment)} test files"
+
+
+def pytest_itemcollected(item: pytest.Item) -> None:
+    """Mark tests under CUDA-free directories so the GPU shards can deselect them."""
+    unit_tests_root = Path(__file__).parent
+    if unit_tests_root not in item.path.parents:
+        return
+    if item.path.relative_to(unit_tests_root).parts[0] in _CPU_ONLY_DIRECTORIES:
+        item.add_marker(pytest.mark.cpu_only)
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Resolve configured limits, then allow three times each limit in unit tests."""
     _apply_runtime_policy(config, items)
@@ -430,6 +511,20 @@ def pytest_addoption(parser):
         type=float,
         default=_DEFAULT_RUNTIME_BUDGET_SECONDS,
         help="Configured runtime budget including fixtures; enforced at 3x with one confirmation (default: 30s -> 90s).",
+    )
+    parser.addoption(
+        "--file-shard-id",
+        dest="file_shard_id",
+        type=int,
+        default=0,
+        help="0-based shard to collect when --file-num-shards splits the suite (default: 0).",
+    )
+    parser.addoption(
+        "--file-num-shards",
+        dest="file_num_shards",
+        type=int,
+        default=1,
+        help="Split whole test files across this many shards, balanced by gpu_shard_durations.json (default: 1).",
     )
     parser.addoption(
         "--unit-test-hard-timeout",
@@ -644,3 +739,10 @@ def pytest_configure(config):
         "markers",
         "runtime_budget(seconds, hard_timeout=None, reason=None): configured soft budget and hard watchdog, enforced at 3x",
     )
+    config.addinivalue_line(
+        "markers",
+        "cpu_only: the test never uses CUDA; L0_Unit_Tests_CPU runs it, so the GPU unit-test shards deselect it",
+    )
+    num_shards = config.getoption("file_num_shards")
+    if num_shards < 1 or not 0 <= config.getoption("file_shard_id") < num_shards:
+        raise pytest.UsageError("--file-num-shards must be at least 1 and --file-shard-id in [0, --file-num-shards)")

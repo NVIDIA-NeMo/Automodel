@@ -35,7 +35,7 @@ from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCaus
 from nemo_automodel.components.utils.model_utils import freeze_deepseek_v4_indexer_params
 
 # Real checkpoint save/load and PEFT construction exceed the default 5-second budget on cold CI workers.
-pytestmark = pytest.mark.timeout(120)
+pytestmark = [pytest.mark.timeout(120), pytest.mark.cpu_only]
 
 
 @pytest.fixture
