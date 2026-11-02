@@ -38,6 +38,12 @@ recipe_args:
   block_size: 16                      # tokens drafted in parallel per block
   num_anchors: 256                    # blocks sampled per sequence per step
   loss_decay_gamma: 7.0               # block-position loss decay: exp(-k/gamma)
+  # loss_type: dflash                 # "dflash" (fixed decay) or a D-PACE variant ("dpace",
+  #                                   # "dpace-cumulative-confidence-only", "dpace-continuation-value-only":
+  #                                   # same block, both loss terms reweighted by the draft's own
+  #                                   # confidence). "variable_prefix" is rejected -- the selector
+  #                                   # teacher-forces the predecessor from the fixed-anchor block layout.
+  # dpace_alpha: 0.5                  # smoothing alpha for the D-PACE confidence products
   mask_token_id: 151669               # REQUIRED: token used for non-anchor block positions.
   #                                   # Pick a reserved / unused token id (do NOT rely on pad:
   #                                   # pad often aliases eos, which silently degrades quality).

@@ -56,7 +56,12 @@ model:
   output_hidden_states: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: eager
+    # Non-CP MLA requires CUDA fp16/bf16 and INSTALL_FA4=true in the container.
+    # FA4 requires attention_dropout=0; use eager for attention dropout.
+    # NEAT metadata isolates documents in both KDA and shared native FA4 MLA.
+    # Pre-packed THD and dense attention masks are unsupported by FA4.
+    # CP retains compressed-KV gather and FlexAttention.
+    attn: fa4
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm

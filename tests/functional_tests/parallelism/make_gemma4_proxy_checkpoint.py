@@ -64,8 +64,8 @@ import torch
 TEXT_CONFIG: dict = {
     "vocab_size": 262144,
     "vocab_size_per_layer_input": 262144,
-    "hidden_size": 512,
-    "intermediate_size": 1024,
+    "hidden_size": 128,
+    "intermediate_size": 256,
     "num_hidden_layers": 6,
     "num_attention_heads": 8,
     "num_key_value_heads": 4,
@@ -97,8 +97,8 @@ TEXT_CONFIG: dict = {
 
 VISION_CONFIG: dict = {
     "model_type": "gemma4_vision",
-    "hidden_size": 256,
-    "intermediate_size": 512,
+    "hidden_size": 128,
+    "intermediate_size": 256,
     "num_hidden_layers": 2,
     # 31B keeps num_key_value_heads == num_attention_heads and
     # global_head_dim == head_dim in the vision tower; both must be set

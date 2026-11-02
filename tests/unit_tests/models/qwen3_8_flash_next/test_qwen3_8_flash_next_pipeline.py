@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    causal_conv1d_fn,
     torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
 )
@@ -138,12 +139,12 @@ def _build_model() -> Qwen3_8_FlashNextForConditionalGeneration:
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.eval()
     # The GDN layer prefers installed CUDA kernels; on CPU use the reference ops.
-    # ``causal_conv1d_fn=None`` selects the layer's own torch convolution path.
+    # Bind the reference directly: None falls back to the kernel-hub dispatcher.
     for layer in model.model.language_model.layers.values():
         linear_attn = getattr(layer, "linear_attn", None)
         if linear_attn is None:
             continue
-        linear_attn.causal_conv1d_fn = None
+        linear_attn.causal_conv1d_fn = _reference_kernel(causal_conv1d_fn)
         linear_attn.causal_conv1d_update = None
         linear_attn.chunk_gated_delta_rule = _reference_kernel(torch_chunk_gated_delta_rule)
         linear_attn.recurrent_gated_delta_rule = _reference_kernel(torch_recurrent_gated_delta_rule)

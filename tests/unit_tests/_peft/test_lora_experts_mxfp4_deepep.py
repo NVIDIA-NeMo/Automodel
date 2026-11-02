@@ -285,7 +285,10 @@ def test_frozen_deepep_mxfp4_forward_matches_bf16(moe_config, device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_lora_deepep_mxfp4_forward_matches_bf16(moe_config, device):
+@pytest.mark.parametrize("with_callback", [False, True])
+def test_lora_deepep_mxfp4_forward_matches_bf16(
+    moe_config: MoEConfig, device: torch.device, with_callback: bool
+) -> None:
     """LoRA mxfp4 DeepEP forward must match the bf16 DeepEP LoRA forward with the same adapters."""
     orig = _make_deepep(moe_config, device, representable=True)
 
@@ -312,9 +315,10 @@ def test_lora_deepep_mxfp4_forward_matches_bf16(moe_config, device):
     indices = torch.zeros(num_tokens, 1, dtype=torch.long, device=device)
     token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
 
-    y_mx = mx(x, token_mask, weights, indices)
+    callback = torch.tanh if with_callback else None
+    y_mx = mx(x, token_mask, weights, indices, post_expert_output=callback)
     with torch.no_grad(), patch.object(torch.Tensor, "to_local", new=lambda self: self, create=True):
-        y_ref = ref(x, token_mask, weights, indices)
+        y_ref = ref(x, token_mask, weights, indices, post_expert_output=callback)
 
     assert y_mx.shape == (num_tokens, moe_config.dim)
     torch.testing.assert_close(y_mx, y_ref, atol=1e-2, rtol=1e-2)

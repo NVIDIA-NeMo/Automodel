@@ -425,7 +425,9 @@ class BackendConfig:
             Inputs must use BSHD layout; pre-packed THD is unsupported. Packed
             Qwen3Next and DeepSeek V3.2 sparse attention do not support FA4.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
-            indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
+            indexer, and Sinkhorn kernels together; "cudnn" keeps the TileLang
+            indexer/Sinkhorn and selects FlashMLA forward with cuDNN backward.
+            For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
             CUDA BF16; CPU execution retains the PyTorch numerical oracle.
@@ -436,7 +438,7 @@ class BackendConfig:
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch", "quack" or "triton"). QuACK is currently
             integrated for Llama-family rotary embeddings; "triton" selects the fused
-            Triton rotation of DeepSeek-V4.1 (other models keep the torch path).
+            Triton rotation of DeepSeek V4 / V4.1 (other models keep the torch path).
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "torch_mm" uses torch._grouped_mm,
@@ -518,7 +520,7 @@ class BackendConfig:
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
         compile_hc: torch.compile the mHC (hyper-connection) cores of models that opt in
-            (currently DeepSeek V4.1): coefficient projection, stream collapse and stream expand,
+            (currently DeepSeek V4 / V4.1): coefficient projection, stream collapse and stream expand,
             one fused kernel each, static shapes (a new sequence length compiles them again; past
             dynamo's recompile limit a core runs eager). Same lazy once-per-process pattern as
             ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
@@ -526,7 +528,7 @@ class BackendConfig:
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
         compile_router_weight: torch.compile the fp32 router-weight multiply applied to
-            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP``, all MoE models),
+            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP`` / ``GroupedExpertsTE``, all MoE models),
             so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
             cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
             numerics are allclose to eager but not bitwise-identical.
@@ -610,7 +612,7 @@ class BackendConfig:
     # not bitwise-identical. Default False.
     compile_norm: bool = False
     # When True, torch.compile the mHC projection / collapse / expand cores of opted-in models
-    # (currently DeepSeek V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
+    # (currently DeepSeek V4 / V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
     # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_hc: bool = False
     # When True, torch.compile DeepSeek V4.1's cache quantize/dequantize core (fp8 SWA KV, mxfp4 index
@@ -1504,7 +1506,8 @@ def compute_lm_head_logits(
             else:
                 sliced = hidden_states[:, slice_indices, :]
         if fp32_lm_head:
-            logits = lm_head(sliced.float()).to(hidden_states.dtype)
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                logits = lm_head(sliced.float()).to(hidden_states.dtype)
         else:
             compute_dtype = None
             if isinstance(lm_head, FSDPModule):
