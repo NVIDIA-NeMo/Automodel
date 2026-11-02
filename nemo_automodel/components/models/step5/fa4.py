@@ -522,9 +522,11 @@ def fa4_attention(
     if not query.is_cuda or any(x.dtype != torch.bfloat16 for x in (query, key, value)):
         raise ValueError("Step5 FA4 requires CUDA BF16 Q/K/V")
     capability = torch.cuda.get_device_capability(query.device)
-    if capability not in ((9, 0), (10, 0)):
+    # FA4 runs its SM100 kernels on every 10.x device, including 10.3 (B300).
+    sm100_family = capability[0] == 10
+    if capability != (9, 0) and not sm100_family:
         raise RuntimeError("Step5 FA4 supports SM90 and SM100")
-    split_values = capability == (10, 0)
+    split_values = sm100_family
     if split_values and query.shape[-1] != 192:
         raise ValueError("Step5 SM100 FA4 requires head_dim=192")
     if query.shape[-1] not in (192, 256):
