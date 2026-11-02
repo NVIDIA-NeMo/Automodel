@@ -796,8 +796,8 @@ def test_cudnn_sparse_attention_compacts_zero_length_rows(
     assert fake_dsa.called
 
 
-def test_cudnn_sparse_attention_all_empty_rows_use_only_dummy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A CP rank containing only padding still produces shape-stable zero gradients."""
+def test_cudnn_sparse_attention_all_empty_rows_skip_the_backward_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CP rank containing only padding gets zero gradients without running the backward kernel."""
     topk_length = torch.zeros(SPARSE_TOKENS, dtype=torch.int32)
     fake_flash_mla = _FakeZeroLengthFlashMla(topk_length)
     fake_dsa = _FakeCompactedSparseDsa(valid_rows=0, dkv_value=0)
@@ -827,7 +827,8 @@ def test_cudnn_sparse_attention_all_empty_rows_use_only_dummy(monkeypatch: pytes
     assert kv_latent.grad is not None
     torch.testing.assert_close(q.grad, torch.zeros_like(q.grad))
     torch.testing.assert_close(kv_latent.grad, torch.zeros_like(kv_latent.grad))
-    assert fake_dsa.called
+    # The SM100 backward rejects size-1 dummy tensors, so the adapter returns zeros without a kernel call.
+    assert not fake_dsa.called
 
 
 def _small_dsa_config() -> GlmMoeDsaConfig:

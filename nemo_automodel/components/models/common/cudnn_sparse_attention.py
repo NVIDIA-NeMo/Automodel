@@ -292,23 +292,34 @@ class _CudnnSparseAttention(torch.autograd.Function):
         lse_input = lse
         indices_kernel = indices
         topk_length_kernel = topk_length
-        used_dummy = False
         if valid_row_indices is not None:
             if valid_row_indices.numel() == 0:
-                used_dummy = True
-                q_input = torch.zeros_like(q[:1])
-                out_input = torch.zeros_like(out[:1])
-                grad_input = torch.zeros_like(grad_output[:1])
-                lse_input = torch.zeros_like(lse[:1])
-                indices_kernel = torch.zeros_like(indices[:1])
-                topk_length_kernel = torch.ones_like(topk_length[:1])
-            else:
-                q_input = q.index_select(0, valid_row_indices)
-                out_input = out.index_select(0, valid_row_indices)
-                grad_input = grad_output.index_select(0, valid_row_indices)
-                lse_input = lse.index_select(0, valid_row_indices)
-                indices_kernel = indices.index_select(0, valid_row_indices)
-                topk_length_kernel = topk_length.index_select(0, valid_row_indices)
+                # No local query attends to any key (a context-parallel shard made of pack padding, for
+                # example): every gradient is zero and nothing runs. The SM100 backward rejects the
+                # size-1 dummy tensors this branch used to build ("stride_order is not consistent"), and the
+                # zero latent gradient still takes part in the CP reduce-scatter of the gathered K/V.
+                grad_sink = (
+                    torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)
+                    if ctx.has_sink and ctx.needs_input_grad[8]
+                    else None
+                )
+                return (
+                    torch.zeros_like(q),
+                    torch.zeros_like(kv).unsqueeze(1),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    grad_sink,
+                )
+            q_input = q.index_select(0, valid_row_indices)
+            out_input = out.index_select(0, valid_row_indices)
+            grad_input = grad_output.index_select(0, valid_row_indices)
+            lse_input = lse.index_select(0, valid_row_indices)
+            indices_kernel = indices.index_select(0, valid_row_indices)
+            topk_length_kernel = topk_length.index_select(0, valid_row_indices)
 
         q_kernel, sink_kernel = _pad_attention_heads(q_input, attn_sink, ctx.padded_heads)
         if ctx.padded_heads == q.shape[1]:
@@ -337,9 +348,8 @@ class _CudnnSparseAttention(torch.autograd.Function):
         if valid_row_indices is None:
             grad_q = result["dq"][:, : q.shape[1]].contiguous()
         else:
-            grad_q_valid = result["dq"][:0, : q.shape[1]] if used_dummy else result["dq"][:, : q.shape[1]]
             grad_q = torch.zeros_like(q)
-            grad_q.index_copy_(0, valid_row_indices, grad_q_valid)
+            grad_q.index_copy_(0, valid_row_indices, result["dq"][:, : q.shape[1]])
         grad_kv = result["dkv"].unsqueeze(1).contiguous()
         grad_sink = None
         if ctx.has_sink and ctx.needs_input_grad[8]:
