@@ -18,15 +18,15 @@ uv run automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
 ```
 
 - Loads `roberta-large` with `num_labels: 2`
-- Builds GLUE MRPC datasets (train/validation)
-- Optionally, enables LoRA via the `peft` block
+- Builds GLUE MRPC datasets (train and validation)
+- Optionally, enables LoRA through the `peft` block
 - Trains and validates per `step_scheduler`
 
 ## What is the Sequence Classification Recipe?
 
 `TrainFinetuneRecipeForSequenceClassification` is a config-driven trainer that orchestrates:
 - Model and optimizer construction
-- Dataset/Dataloader setup
+- Dataset and dataloader setup
 - Training and validation loops
 - Checkpointing and logging
 
@@ -125,4 +125,5 @@ optimizer:
 ```bash
 uv run automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml --nproc-per-node 2
 ```
+
 You can adjust the number of GPUs as necessary using the `--nproc-per-node` knob.
