@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import nullcontext
+import copy
+from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -169,6 +171,57 @@ class TestTEFp8Config:
         cfg = TEFp8Config()
         with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
             assert cfg.build_recipe() is None
+
+    def test_filter_fqns_default_and_normalization(self):
+        assert TEFp8Config().filter_fqns == ("lm_head",)
+        assert TEFp8Config(filter_fqns=["lm_head", "model.score"]).filter_fqns == ("lm_head", "model.score")
+        assert TEFp8Config(filter_fqns="score").filter_fqns == ("score",)
+        assert TEFp8Config(filter_fqns=()).filter_fqns == ()
+        with pytest.raises(ValueError, match="filter_fqns"):
+            TEFp8Config(filter_fqns=[""])
+        cfg = BackendConfig(te_fp8={"recipe": "block", "filter_fqns": ["lm_head"]}, experts="te", dispatcher="deepep")
+        assert cfg.te_fp8.filter_fqns == ("lm_head",)
+
+    def test_module_filtered_uses_substring_match_like_torchao(self):
+        cfg = TEFp8Config(filter_fqns=["lm_head"])
+        assert cfg.module_filtered("lm_head")
+        assert cfg.module_filtered("model.language_model.lm_head")
+        assert not cfg.module_filtered("model.layers.0.mlp.gate")
+
+    def test_apply_module_filter_wraps_matching_forwards_once(self):
+        """Filtered modules run inside the disabled scope, others do not; idempotent; survives deepcopy."""
+        entered: list[str] = []
+
+        @contextmanager
+        def recording():
+            entered.append("disabled")
+            yield
+
+        model = nn.Sequential(OrderedDict(body=nn.Linear(4, 4), lm_head=nn.Linear(4, 3)))
+        x = torch.randn(2, 4)
+        expected = model(x)
+        cfg = TEFp8Config(recipe="block")
+        module = "nemo_automodel.components.models.common.utils"
+        with patch(f"{module}.HAVE_TE", True), patch(f"{module}._fp8_disabled_autocast", recording):
+            assert cfg.apply_module_filter(model) == ["lm_head"]
+            assert cfg.apply_module_filter(model) == ["lm_head"]  # idempotent: one wrapper, not two
+            torch.testing.assert_close(model(x), expected)
+            assert entered == ["disabled"]  # lm_head once, body never
+            clone = copy.deepcopy(model)
+            assert clone.lm_head.forward.__self__ is clone.lm_head
+            torch.testing.assert_close(clone(x), expected)
+            assert entered == ["disabled", "disabled"]
+        assert list(model.state_dict()) == ["body.weight", "body.bias", "lm_head.weight", "lm_head.bias"]
+        assert "forward" not in vars(model.body)
+
+    def test_apply_module_filter_is_a_no_op_without_te_or_filters(self):
+        model = nn.Sequential(OrderedDict(lm_head=nn.Linear(2, 2)))
+        module = "nemo_automodel.components.models.common.utils"
+        with patch(f"{module}.HAVE_TE", False):
+            assert TEFp8Config().apply_module_filter(model) == []
+        with patch(f"{module}.HAVE_TE", True):
+            assert TEFp8Config(filter_fqns=()).apply_module_filter(model) == []
+        assert "forward" not in vars(model.lm_head)
 
 
 class TestBackendConfigTeFp8:
