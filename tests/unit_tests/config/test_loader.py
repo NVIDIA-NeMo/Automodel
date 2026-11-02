@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from nemo_automodel.components.config.loader import (
     ConfigNode,
@@ -320,6 +321,17 @@ def test_to_yaml_dict_uses_live_callable_when_original_target_cannot_resolve():
     cfg._original_strings["_target_"] = "missing.module.target"
 
     assert cfg.to_yaml_dict(use_orig_values=True)["_target_"] == "builtins.sorted"
+
+
+def test_to_yaml_dict_emits_tuples_as_safe_loadable_lists():
+    """A tuple CLI value must not dump as `!!python/tuple`, which yaml.safe_load rejects."""
+    cfg = ConfigNode({"optimizer": {"betas": [0.9, 0.999]}})
+    cfg.set_by_dotted("optimizer.betas", translate_value("(0.9, 0.95)"))
+
+    out = cfg.to_yaml_dict(use_orig_values=True)
+
+    assert out["optimizer"]["betas"] == [0.9, 0.95]
+    assert yaml.safe_load(yaml.dump(out)) == out
 
 
 def test_load_yaml_config(tmp_path):

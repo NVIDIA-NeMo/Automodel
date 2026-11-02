@@ -185,15 +185,25 @@ class RecipeConfig:
         node = self._raw.get("lr_scheduler", None)
         return LRSchedulerConfig(**_section_kwargs(node)) if node else None
 
-    @cached_property
-    def optimizer(self) -> "OptimizerConfig" | None:
+    def _optimizer_config(self, section: str) -> "OptimizerConfig" | None:
+        """Resolve one optimizer section through the shared typed boundary."""
         from nemo_automodel.components.optim.optimizer import build_optimizer_config
 
-        node = self._raw.get("optimizer", None)
+        node = self._raw.get(section, None)
         if node is None:
             return None
         factory, kwargs = _callable_and_kwargs(node)
         return build_optimizer_config(factory, kwargs)
+
+    @cached_property
+    def optimizer(self) -> "OptimizerConfig" | None:
+        """Return the primary model's configured optimizer policy."""
+        return self._optimizer_config("optimizer")
+
+    @cached_property
+    def head_optimizer(self) -> "OptimizerConfig" | None:
+        """Return the separately configured replicated decision-head optimizer."""
+        return self._optimizer_config("head_optimizer")
 
     @cached_property
     def dataloader(self) -> "DataloaderConfig" | None:
@@ -642,9 +652,14 @@ class RecipeConfig:
         # output / get_mtp_loss_scaling_factor; ignore_index comes from the loss)
         # and are not exposed via YAML. This typed accessor lets recipes build MTP through
         # the typed-config boundary like the other sections.
+        # distillation_mode is the one experimental exception: an opt-in YAML
+        # `mtp:` block lets a test config select the soft-distillation prototype
+        # without touching the model-driven fields.
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
-        return MTPLossConfig()
+        node = self._raw.get("mtp", None)
+        distillation_mode = _section_kwargs(node).get("distillation_mode", "hard") if node is not None else "hard"
+        return MTPLossConfig(distillation_mode=distillation_mode)
 
     @cached_property
     def prewarm(self) -> "PrewarmConfig | None":

@@ -29,6 +29,7 @@ import os
 import pathlib
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -53,6 +54,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.dspark_cache import (
     DTYPE_MAP,
     build_cached_dspark_dataloader,
+    manifest_value_identity,
     read_manifest,
     read_target_weight_modules,
     tokenizer_chat_template_sha256,
@@ -72,7 +74,13 @@ from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppre
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v4.dspark_target import (
+    dspark_packed_forward as deepseek_v4_dspark_packed_forward,
+)
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41DSparkTargetConfig
+from nemo_automodel.components.models.deepseek_v41.dspark_target import (
+    dspark_packed_forward as deepseek_v41_dspark_packed_forward,
+)
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
 from nemo_automodel.components.optim.optimizer import build_optimizer
 from nemo_automodel.components.speculative.dspark.config import (
@@ -125,6 +133,7 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_target,
     build_glm_5_2_target,
     build_kimi_k3_target,
+    chat_template_kwargs_from,
     distributed_section_dict,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
@@ -166,6 +175,18 @@ def _packing_kwargs(batch: dict) -> dict:
         "seq_lens": batch["seq_lens"],
         "doc_remaining": batch["doc_remaining"],
     }
+
+
+def _validate_draft_packing(draft_model: torch.nn.Module) -> None:
+    """Reject sequence packing for a draft whose forward ignores the packing metadata.
+
+    Such a draft would silently let anchors cross document boundaries.
+    """
+    if not getattr(draft_model, "supports_sequence_packing", False):
+        raise NotImplementedError(
+            f"Sequence packing (packed_sequence_size>0) is not supported by the "
+            f"{type(draft_model).__name__} DSpark draft."
+        )
 
 
 def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
@@ -332,11 +353,15 @@ def _validate_cached_dspark_manifest(
     seq_length: int,
     compute_dtype: torch.dtype,
     chat_template_sha256: str | None,
+    chat_template_kwargs: dict[str, Any] | None,
 ) -> None:
     """Validate that a DSpark offline cache matches the configured target/draft run.
 
     ``chat_template_sha256`` is the hash of the template the run configured, or ``None`` when it
-    configured none and so has no framing to compare against the cache's.
+    configured none and so has no framing to compare against the cache's; a mismatch only warns,
+    since an edit to a template comment changes the hash too. ``chat_template_kwargs`` are the
+    template arguments the run configured (``None`` means none, i.e. ``{}``); like the mask
+    options they shape the cached supervision, so a mismatch raises.
     """
     if str(manifest["target_model"]) != str(target_model):
         logger.warning(
@@ -357,6 +382,16 @@ def _validate_cached_dspark_manifest(
             cache_dir,
             recorded_template_sha256,
             chat_template_sha256,
+        )
+    # read_manifest fills in {} for caches written before the manifest recorded the kwargs.
+    recorded_template_kwargs = manifest.get("chat_template_kwargs", {})
+    run_template_kwargs = {} if chat_template_kwargs is None else chat_template_kwargs
+    if manifest_value_identity(recorded_template_kwargs) != manifest_value_identity(run_template_kwargs):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was tokenized with chat_template_kwargs={recorded_template_kwargs!r}, "
+            f"but this run sets {run_template_kwargs!r}. The cached samples keep the framing they were built "
+            "with, so rebuild the cache with precompute_dspark under the recipe's chat_template_kwargs or match "
+            "them in the recipe."
         )
     if str(manifest["target_model_type"]) != str(target_model_type):
         raise ValueError(
@@ -711,10 +746,15 @@ class TrainDSparkRecipe(BaseRecipe):
         # explicit override so saved checkpoints carry the requested tokenizer state.
         if self.cached_target_path is None or chat_template is not None:
             _apply_target_chat_template(self.tokenizer, chat_template)
+        chat_template_kwargs = chat_template_kwargs_from(recipe_cfg)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         load_metadata_with_gloo = read_load_metadata_with_gloo(self.cfg.get("checkpoint", None))
 
+        # V4 and V4.1 isolate packed documents through their own packing metadata
+        # instead of the generic block-causal mask.
+        target_packed_forward = None
         if is_deepseek_v4_target:
+            target_packed_forward = deepseek_v4_dspark_packed_forward
             if load_target:
                 # Full V4-Flash target loaded with the same expert-parallel / FSDP and
                 # FP8-dequant path as the V4 finetune recipe, so the 256 experts shard
@@ -740,6 +780,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV4ForCausalLM"])
         elif is_deepseek_v41_target:
+            target_packed_forward = deepseek_v41_dspark_packed_forward
             if load_target:
                 target_options = DeepseekV41DSparkTargetConfig(
                     target_path=target_path,
@@ -954,7 +995,10 @@ class TrainDSparkRecipe(BaseRecipe):
                 logger.info("DSpark REMOTE target: %d server(s) at %s.", len(remote_urls), remote_urls)
         elif self.target_model is not None:
             self.target_wrapper = HFDSparkTargetModel(
-                self.target_model, target_layer_ids=target_layer_ids, cp_mesh=self.cp_mesh
+                self.target_model,
+                target_layer_ids=target_layer_ids,
+                cp_mesh=self.cp_mesh,
+                packed_forward=target_packed_forward,
             )
         else:
             self.target_wrapper = None
@@ -1013,6 +1057,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                     mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
                     mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
+                    chat_template_kwargs=chat_template_kwargs,
                     packed_sequence_size=self.packed_sequence_size,
                     dp_mesh=self.dp_mesh,
                 )
@@ -1030,6 +1075,7 @@ class TrainDSparkRecipe(BaseRecipe):
                         shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                         mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
                         mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
+                        chat_template_kwargs=chat_template_kwargs,
                         packed_sequence_size=self.packed_sequence_size,
                     )
         else:
@@ -1045,6 +1091,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 compute_dtype=self.compute_dtype,
                 # Without a configured template the tokenizer keeps the checkpoint's, which this run never renders.
                 chat_template_sha256=None if chat_template is None else tokenizer_chat_template_sha256(self.tokenizer),
+                chat_template_kwargs=chat_template_kwargs,
             )
             # The cached loss masks are used as stored, so the options that shaped them must match.
             ensure_supervision_options_match(
@@ -1169,13 +1216,8 @@ class TrainDSparkRecipe(BaseRecipe):
             draft_model = draft_cls(draft_config_obj)
         self.draft_model = draft_model.to(device=self.device)
         cast_model_to_dtype(self.draft_model, self.compute_dtype)
-        if self.packed_sequence_size > 0 and type(self.draft_model).__name__ != "Qwen3DSparkModel":
-            # Only the Qwen3 draft forward threads the packing metadata so far; the
-            # other DSpark drafts would silently let anchors cross document boundaries.
-            raise NotImplementedError(
-                f"Sequence packing (packed_sequence_size>0) is only supported by the Qwen3 DSpark draft, "
-                f"not {type(self.draft_model).__name__}."
-            )
+        if self.packed_sequence_size > 0:
+            _validate_draft_packing(self.draft_model)
 
         # training only the backbone, fc, Markov head, and confidence head.
         if embed_src is None or head_src is None:
@@ -1453,7 +1495,7 @@ class TrainDSparkRecipe(BaseRecipe):
         def write_recipe_metadata() -> None:
             self._save_extra_state(path, epoch=epoch)
             try:
-                save_config(self.cfg.raw_config, path)
+                save_config(self.cfg.to_yaml_dict(use_orig_values=True), path)
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
 

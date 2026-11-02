@@ -571,3 +571,29 @@ class TestBackendConfigHybridEPSyncFree:
                 benchmark_static_routing=True,
                 dispatcher_capacity_factor=1.5,
             )
+
+
+class TestDispatcherRecomputeCache:
+    """BackendConfig.dispatcher_recompute_cache: HybridEP-only recompute cache of the MoE combine output."""
+
+    def test_default_is_none(self):
+        assert BackendConfig().dispatcher_recompute_cache == "none"
+
+    @pytest.mark.parametrize("value", ["combine", "moe_tail"])
+    def test_accepts_the_two_modes_with_hybridep_and_torch_mm(self, value):
+        config = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache=value)
+        assert config.dispatcher_recompute_cache == value
+
+    def test_rejects_unknown_value(self):
+        with pytest.raises(ValueError, match="dispatcher_recompute_cache must be one of"):
+            BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache="all")
+
+    def test_requires_hybridep(self):
+        with pytest.raises(ValueError, match="dispatcher_recompute_cache requires dispatcher='hybridep'"):
+            BackendConfig(experts="torch_mm", dispatcher="deepep", dispatcher_recompute_cache="combine")
+
+    def test_moe_tail_requires_torch_mm_experts(self):
+        with pytest.raises(ValueError, match="moe_tail' requires experts='torch_mm'"):
+            BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="moe_tail")
+        # the combine cache alone does not care about the expert kernel
+        assert BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="combine")

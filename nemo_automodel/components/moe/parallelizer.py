@@ -520,25 +520,9 @@ def _replay_deepep_dispatch_on_recompute(
     dispatches separate, and the recompute consumes them in the order the
     matching forward produced them.
     """
-    from nemo_automodel.components.moe.megatron.fused_a2a import (
-        DispatchReplayRecorder,
-        dispatch_replay_scope,
-    )
+    from nemo_automodel.components.moe.megatron.fused_a2a import deepep_dispatch_replay
 
-    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
-        forward_context, recompute_context = context_fn()
-        recorder = DispatchReplayRecorder()
-
-        @contextmanager
-        def scoped(mode: str, inner: AbstractContextManager):
-            if mode == "replay":
-                recorder.rewind()
-            with dispatch_replay_scope(recorder, mode), inner:
-                yield
-
-        return scoped("record", forward_context), scoped("replay", recompute_context)
-
-    return checkpoint_context_fn
+    return deepep_dispatch_replay.checkpoint_context_fn(context_fn)
 
 
 def _replay_hybridep_dispatch_on_recompute(
@@ -552,38 +536,33 @@ def _replay_hybridep_dispatch_on_recompute(
     still redispatching the recomputed activations, so activation memory remains
     checkpointed.
     """
-    from nemo_automodel.components.moe.megatron.fused_a2a import (
-        HybridEPDispatchReplayRecorder,
-        hybridep_dispatch_replay_scope,
-    )
+    from nemo_automodel.components.moe.megatron.fused_a2a import hybridep_dispatch_replay
 
-    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
-        forward_context, recompute_context = context_fn()
-        recorder = HybridEPDispatchReplayRecorder()
+    return hybridep_dispatch_replay.checkpoint_context_fn(context_fn)
 
-        @contextmanager
-        def scoped(mode: str, inner: AbstractContextManager):
-            if mode == "replay":
-                recorder.rewind()
-                # Read the dispatch extents here, before the recompute op context
-                # opens: the copies started at the end of the checkpoint forward
-                # have normally completed by now, so this is at most a wait on an
-                # event that has already fired (once per microbatch, never once per
-                # layer), and no aten op enters the recompute trace.
-                recorder.resolve()
-            with hybridep_dispatch_replay_scope(recorder, mode):
-                with inner:
-                    yield
-                if mode == "record":
-                    # Start the extent copies only after the selective-op context
-                    # exits (no extra aten.sum in the forward trace) and without a
-                    # host synchronization — reading them per block stalled the
-                    # launch queue once per layer per microbatch.
-                    recorder.finalize()
 
-        return scoped("record", forward_context), scoped("replay", recompute_context)
+def _cache_moe_combine_on_recompute(
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]],
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]]:
+    """Serve each MoE layer's combine output of the checkpoint forward to its backward recompute.
 
-    return checkpoint_context_fn
+    ``BackendConfig.dispatcher_recompute_cache``: the block's forward keeps a clone of the HybridEP combine
+    output ([tokens, hidden]); the recompute returns it instead of re-running the unpermute, the EP-group
+    barrier and the combine all-to-all (and, with ``moe_tail``, the down projection's GEMM). One cache per
+    checkpointed call, bound for the forward in ``record`` mode and for the recompute in ``replay`` mode.
+    Independent of the dispatch layout replay, so it is installed whether or not the router is recomputed.
+    """
+    from nemo_automodel.components.moe.megatron.fused_a2a import moe_combine_replay
+
+    return moe_combine_replay.checkpoint_context_fn(context_fn)
+
+
+def _uses_moe_recompute_cache(model: nn.Module) -> bool:
+    """Return whether any expert module asked for the combine recompute cache."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    return any(getattr(module, "dispatcher_recompute_cache", "none") != "none" for module in modules())
 
 
 def _uses_hybridep_dispatch(model: nn.Module) -> bool:
@@ -673,6 +652,7 @@ def apply_ac(
             f"selective={selective}, ignore_router={ignore_router}"
         )
     uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
+    uses_moe_recompute_cache = checkpoint_decoder and _uses_moe_recompute_cache(model)
     if checkpoint_decoder and not ignore_router and not selective and _uses_hybridep_capacity_mode(model):
         # Without a replay recorder the recompute dispatch runs in capacity mode (``capacity`` rows)
         # while the first forward dispatch was the blocking calibration (``actual`` rows), and
@@ -795,12 +775,17 @@ def apply_ac(
 
     from nemo_automodel.components.distributed.activation_checkpointing import (
         ensure_fsdp_ops_sac_ignored,
+        ensure_moe_recompute_cache_ops_sac_ignored,
         ensure_profiler_ops_sac_ignored,
         transformer_engine_attention_backend_snapshot_context_fn,
     )
 
     ensure_profiler_ops_sac_ignored()
     ensure_fsdp_ops_sac_ignored()
+    if uses_moe_recompute_cache:
+        # moe_tail allocates the skipped down projection's output in the recompute only; the router-saving
+        # context below indexes every recompute op against the forward's stream (review of #4395).
+        ensure_moe_recompute_cache_ops_sac_ignored()
 
     def _with_attention_backend_snapshot(context_fn=None):
         return functools.partial(transformer_engine_attention_backend_snapshot_context_fn, context_fn)
@@ -847,6 +832,11 @@ def apply_ac(
                 )
                 block.register_module(child_name, wrapped_moe)
                 continue
+            if uses_moe_recompute_cache:
+                # Full-block regions only: an MoE-only region ends at the combine, whose output is held by the
+                # consumer outside the region, so its recompute never re-runs the combine and the cache would
+                # only cost the clone.
+                block_context_fn = _cache_moe_combine_on_recompute(block_context_fn)
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
@@ -855,6 +845,8 @@ def apply_ac(
             )
         else:
             block_context_fn = _preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot())
+            if uses_moe_recompute_cache:
+                block_context_fn = _cache_moe_combine_on_recompute(block_context_fn)
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
@@ -950,6 +942,21 @@ def apply_fsdp(
             len(externally_sharded_params),
         )
 
+    # fp32 parameter holders whose forward ignores its input (DeepSeek-V4 attention sinks) share one FSDP
+    # unit across all blocks instead of one per block: FSDP2 can only run their post-backward in the root
+    # callback after the whole backward, serially — see fully_shard_across_blocks.
+    cross_block_names = tuple(getattr(model, "_fsdp_shard_across_blocks", None) or ())
+    cross_block_params: set[nn.Parameter] = set()
+    if cross_block_names:
+        cross_block_params = parallelizer_utils.fully_shard_across_blocks(
+            list(_iter_moe_blocks(model, _model)),
+            cross_block_names,
+            mesh=fsdp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            shard_module=shard_module,
+        )
+
     multimodal_modules: list[tuple[str, nn.Module, set[nn.Parameter], bool]] = []
     for module_name, module in iter_multimodal_modules(model):
         module_params = set(module_parameters(module))
@@ -1040,6 +1047,8 @@ def apply_fsdp(
             ignored_params.update(moe_module.experts.parameters())
         if externally_sharded_params:
             ignored_params.update(externally_sharded_params.intersection(block.parameters()))
+        if cross_block_params:
+            ignored_params.update(cross_block_params.intersection(block.parameters()))
 
         # Reuse the dense dtype-aware path for model-owned fp32 contracts while
         # leaving EP-owned experts out of the block's dtype and FSDP ownership.

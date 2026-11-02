@@ -116,6 +116,7 @@ checkpoint:
   restore_from: null
 
 ci:
+  cluster_tag: h100
   recipe_owner: khazic
   time: "01:00:00"
   nodes: 4

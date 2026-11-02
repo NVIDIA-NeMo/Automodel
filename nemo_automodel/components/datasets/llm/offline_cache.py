@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -76,11 +77,16 @@ def existing_shard_indices(cache_dir: str) -> set[int]:
 
 
 def write_manifest(cache_dir: str, manifest: dict[str, Any], format_version: int) -> str:
-    """Persist an offline-cache manifest atomically."""
+    """Persist an offline-cache manifest atomically.
+
+    Top-level fields are written sorted by name. Nested values keep their order, which a
+    recorded chat template argument (a mapping the template iterates) can depend on.
+    """
+    record = dict(sorted({"format_version": format_version, **manifest}.items()))
 
     def _write(tmp_path: str) -> None:
         with open(tmp_path, "w") as f:
-            json.dump({"format_version": format_version, **manifest}, f, indent=2, sort_keys=True)
+            json.dump(record, f, indent=2)
 
     return atomic_write(manifest_path(cache_dir), _write)
 
@@ -112,7 +118,8 @@ def read_manifest(
             f"{cache_name} cache at {cache_dir} has format_version={version}, expected {format_version}. "
             f"Regenerate the cache with the current {producer}."
         )
-    return {**(defaults or {}), **manifest}
+    # Copied so a mutable default (e.g. a dict) is never shared between manifests.
+    return {**copy.deepcopy(defaults or {}), **manifest}
 
 
 def ensure_supervision_options_match(

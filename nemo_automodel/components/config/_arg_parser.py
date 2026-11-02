@@ -48,6 +48,14 @@ def parse_cli_argv(default_cfg_path: str | None = None, argv: list[str] | None =
             i += 2
             continue
 
+        # --config=<path>
+        if tok.startswith("--config="):
+            cfg_path = tok.split("=", 1)[1]
+            if not cfg_path:
+                raise ValueError("Expected a path after --config")
+            i += 1
+            continue
+
         # any other --option or --dotted.path
         if tok.startswith("--"):
             key = tok.lstrip("-")

@@ -83,3 +83,6 @@ checkpoint:
   checkpoint_dir: ./outputs/dspark_qwen3_0.6b_remote/checkpoints
   model_save_format: safetensors
   save_consolidated: final
+
+ci:
+  cluster_tag: h100

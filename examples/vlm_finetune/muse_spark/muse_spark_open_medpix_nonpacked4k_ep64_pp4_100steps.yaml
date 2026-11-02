@@ -47,6 +47,7 @@ model:
     compile_norm: true
     experts: torch_mm
     dispatcher: hybridep
+    compile_router_weight: true
     rope_fusion: false
     gate_precision: float32
     fake_balanced_gate: false
@@ -141,6 +142,7 @@ wandb:
   tags: [muse-spark-open, medpix, nonpacked4k, ep64, pp4, fp32-residual]
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 32
   time: "01:00:00"

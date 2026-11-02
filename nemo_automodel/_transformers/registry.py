@@ -36,6 +36,11 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
+            "Lfm2VlForConditionalGeneration",
+            ("nemo_automodel.components.models.d1.vl_model", "Lfm2VlForConditionalGeneration"),
+        ),
+        ("D1OmniModel", ("nemo_automodel.components.models.d1.model", "D1OmniModel")),
+        (
             "BagelForUnifiedMultimodal",
             (
                 "nemo_automodel.components.models.bagel.model",
@@ -80,6 +85,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Ernie4_5_MoeForCausalLM",
             ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
+        ),
+        (
+            "FlintForCausalLM",
+            ("nemo_automodel.components.models.flint.model", "FlintForCausalLM"),
         ),
         (
             "Glm4MoeForCausalLM",
@@ -217,6 +226,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
                 "Mistral3VLBidirectionalForSequenceClassification",
                 {"retrieval"},
             ),
+        ),
+        (
+            "MistralLarge4ForConditionalGeneration",
+            ("nemo_automodel.components.models.mistral_large4.multimodal", "MistralLarge4ForConditionalGeneration"),
+        ),
+        (
+            "MistralLarge4ForCausalLM",
+            ("nemo_automodel.components.models.mistral_large4.model", "MistralLarge4ForCausalLM"),
         ),
         (
             "Mistral4ForCausalLM",
@@ -400,6 +417,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "d1_omni": ("nemo_automodel.components.models.d1.config", "D1OmniConfig"),
     "step5": ("nemo_automodel.components.models.step5.configuration", "Step5Config"),
     "step5_vl": ("nemo_automodel.components.models.step5.configuration", "Step5VLConfig"),
     "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
@@ -409,6 +427,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41Config"),
     "deepseek_v41_text": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41TextConfig"),
     "deepseek_v41_vision": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41VisionConfig"),
+    "flint": ("nemo_automodel.components.models.flint.config", "FlintConfig"),
     "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
     "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
@@ -435,6 +454,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
         "Mistral3BidirectionalConfig",
     ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "mistral_large4": ("nemo_automodel.components.models.mistral_large4.config", "MistralLarge4Config"),
     "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),
     "muse_spark": (
         "nemo_automodel.components.models.muse_spark.configuration_muse_spark",
@@ -464,6 +484,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 
 # Checkpoint model_type to local image/text processor implementation.
 _CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
+    "kimi_k3": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
 }
 

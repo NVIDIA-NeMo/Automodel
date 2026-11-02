@@ -52,8 +52,8 @@ It trains all weights with EP64 on the same Tulu-3 data, packed to 4096 tokens, 
 | Hardware | 8x H200 (141 GB) |
 | Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1, ep_size=8 |
 | Nodes | 1 |
-| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), LoRA, Packed sequences (packed_sequence_size=2048), Transformer Engine |
-| Advanced | bfloat16, attention=te, linear=torch, experts=torch_mm, dispatcher=torch |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), LoRA, Packed sequences (packed_sequence_size=2048), Transformer Engine, HybridEP (dispatcher=hybridep) |
+| Advanced | bfloat16, attention=te, linear=torch, experts=torch_mm, dispatcher=hybridep |
 
 ## Model Reference
 

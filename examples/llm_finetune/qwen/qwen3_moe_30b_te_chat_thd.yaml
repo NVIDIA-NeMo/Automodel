@@ -132,6 +132,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: hemildesai
   # pp_size=2 splits the model across 2 pipeline stages; needs 2 nodes (16xH100)
   # so each stage's shard fits in 80GB (pp=2 on a single node is memory-neutral

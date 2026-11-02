@@ -151,6 +151,7 @@ optimizer:
   exp_avg_sq_dtype: torch.bfloat16
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 1
   time: "01:00:00"

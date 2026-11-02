@@ -157,6 +157,7 @@ lr_scheduler:
 #   dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   # cp_size(1) with ep_size(128) => 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: HuiyingLi
   nodes: 16

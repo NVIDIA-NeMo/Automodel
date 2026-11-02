@@ -28,7 +28,6 @@ from torch.nn.attention.flex_attention import BlockMask
 from torch.utils._python_dispatch import _disable_current_modes
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
-from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.step3p5.layers import Step3p5RMSNorm
 from nemo_automodel.components.models.step5.configuration import Step5Config
@@ -44,6 +43,7 @@ from nemo_automodel.components.models.step5.sparse import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 
 
 def _rms_norm_with_rstd(
@@ -488,7 +488,7 @@ class Step5Attention(nn.Module):
                 # Padding is local: transport still exchanges exactly window - 1.
                 tile_width = (
                     128
-                    if hidden.is_cuda and torch.cuda.get_device_capability(hidden.device) == (10, 0)
+                    if hidden.is_cuda and torch.cuda.get_device_capability(hidden.device)[0] == 10
                     else (112 if self.head_dim == 192 else 80)
                 )
                 left_padding = first_key % tile_width if self.backend.attn == "fa4" else 0
@@ -579,9 +579,10 @@ class Step5Attention(nn.Module):
                     allowed = allowed & (ids.gather(-1, slots) == targets)
                 mask = allowed.reshape(batch * groups, 1, stop - start, key_length)
                 if self.backend.attn == "eager":
-                    logits = torch.matmul(local_q.float(), key.float().transpose(-1, -2)) * dim**-0.5
-                    probabilities = logits.masked_fill(~mask, float("-inf")).softmax(-1).nan_to_num(0.0)
-                    out = torch.matmul(probabilities, value.float()).to(hidden.dtype)
+                    with torch.autocast(device_type=hidden.device.type, enabled=False):
+                        logits = torch.matmul(local_q.float(), key.float().transpose(-1, -2)) * dim**-0.5
+                        probabilities = logits.masked_fill(~mask, float("-inf")).softmax(-1).nan_to_num(0.0)
+                        out = torch.matmul(probabilities, value.float()).to(hidden.dtype)
                 else:
                     out = F.scaled_dot_product_attention(local_q, key, value, attn_mask=mask, enable_gqa=True)
                 out = out.view(batch, groups, heads, stop - start, dim).permute(0, 3, 1, 2, 4)
