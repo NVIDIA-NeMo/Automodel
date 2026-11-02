@@ -2925,6 +2925,7 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert os.access(script_path, os.X_OK)
         assert 'NPROC_PER_NODE="${NPROC_PER_NODE:-1}"' in script
         assert 'NUM_THREADS="${NUM_THREADS:-5}"' in script
+        assert 'TIMEOUT_MINUTES="${TIMEOUT_MINUTES:-30}"' in script
         assert 'CAST_DTYPE="${CAST_DTYPE:-}"' in script
         assert 'PYTHON="${PYTHON:-python3}"' in script
         assert 'CONSOLIDATION_TOOL="${CONSOLIDATION_TOOL:-tools/offline_hf_consolidation.py}"' in script
@@ -2938,6 +2939,7 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert '"${PYTHON}" "${CONSOLIDATION_TOOL}" \\' in script
         assert "Run from the AutoModel repo root or set CONSOLIDATION_TOOL=" in script
         assert "--backend gloo \\" in script
+        assert '--timeout-minutes "${TIMEOUT_MINUTES}" \\' in script
         assert '--model-name "test/model" \\' in script
         assert f'--input-dir "{model_dir}" \\' in script
         assert f'--output-dir "{model_dir / "consolidated"}"' in script
