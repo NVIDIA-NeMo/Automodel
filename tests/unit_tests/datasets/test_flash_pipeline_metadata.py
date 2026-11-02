@@ -19,7 +19,11 @@ import torch
 
 from nemo_automodel.components.datasets.utils import neat_packed_collater
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
-from nemo_automodel.components.models.common.packing import PackingCapabilities, configure_packing
+from nemo_automodel.components.models.common.packing import (
+    PackingCapabilities,
+    configure_packing,
+    get_packing_capabilities,
+)
 
 
 @pytest.mark.parametrize("collater", [neat_packed_collater, neat_packed_vlm_collater])
@@ -68,8 +72,8 @@ def test_deferred_native_offsets_match_direct_microbatch_collation(collater):
 
 def test_deferral_does_not_change_dense_native_mask():
     document = {"input_ids": [1, 2], "labels": [2, 3], "position_ids": [0, 1], "attention_mask": [1, 1]}
-    ordinary = neat_packed_collater([document])
-    deferred = neat_packed_collater([document], defer_flash_metadata=True)
+    ordinary = neat_packed_collater([document], packing=get_packing_capabilities("sdpa"))
+    deferred = neat_packed_collater([document], defer_flash_metadata=True, packing=get_packing_capabilities("sdpa"))
     assert ordinary.keys() == deferred.keys()
     for key in ordinary:
         torch.testing.assert_close(ordinary[key], deferred[key])
@@ -84,5 +88,5 @@ def test_text_collater_keeps_single_document_boundaries():
             "attention_mask": torch.tensor([1, 1, 0]),
         }
     ]
-    result = neat_packed_collater(batch)
+    result = neat_packed_collater(batch, packing=get_packing_capabilities("sdpa"))
     assert result["_packed_seq_ids"].tolist() == [[1, 1, 0]]

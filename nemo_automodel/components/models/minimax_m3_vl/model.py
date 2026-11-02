@@ -33,6 +33,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
 )
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -58,7 +59,6 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
-from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
 
 
 @dataclass

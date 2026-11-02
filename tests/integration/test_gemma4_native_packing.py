@@ -32,7 +32,7 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     validate_hf_model_for_pipeline_support,
 )
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.common.packing import configure_packing
+from nemo_automodel.components.models.common.packing import configure_packing, get_packing_capabilities
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 from tests.utils.gemma4_vlm_fixtures import gemma4_processor, tiny_gemma4_config
 
@@ -84,7 +84,7 @@ def test_native_image_packing_matches_separate_logits_loss_and_gradients(attenti
         bins=[[0, 1]],
         padding_idx=processor.tokenizer.pad_token_id,
     )
-    packed = neat_packed_vlm_collater([packed_dataset[0]])
+    packed = neat_packed_vlm_collater([packed_dataset[0]], packing=get_packing_capabilities("sdpa"))
     assert packed["pixel_values"].shape[0] == 2
     assert packed["image_position_ids"].shape[0] == 2
     assert packed["_packed_seq_ids"].max() == 2

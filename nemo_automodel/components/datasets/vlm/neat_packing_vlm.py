@@ -43,7 +43,7 @@ import torch
 import torch.utils.data
 from PIL import Image
 
-from nemo_automodel.shared.vlm_media import pad_image_tensors
+from nemo_automodel.components.datasets.vlm.media import pad_image_tensors
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin

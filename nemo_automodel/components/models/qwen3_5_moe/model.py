@@ -73,6 +73,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
     cp_vision_frame_sharding_active,
     maybe_distribute_visual,
 )
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import (
@@ -97,7 +98,6 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
-from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
 
 from .cp_linear_attn import CPAwareGatedDeltaNet
 from .state_dict_adapter import Qwen3_5MoeStateDictAdapter
