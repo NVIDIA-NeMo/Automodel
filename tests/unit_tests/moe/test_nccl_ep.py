@@ -15,10 +15,12 @@
 """CPU contract tests; the emulated transport does not validate NCCL kernels."""
 
 import os
+import weakref
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils.checkpoint import checkpoint
 
 import nemo_automodel.components.moe.nccl_ep as nccl_ep
@@ -276,6 +278,52 @@ def test_roundtrip_gradients_and_inflight_buffers(transport, group, checkpointed
     followup = _roundtrip(manager, hidden, weights, indices, scales)
     torch.testing.assert_close(followup, expected[0], rtol=0, atol=0)
     assert manager._buffer is None
+
+
+def test_abandoned_recompute_releases_its_activations_and_handle(transport, group, monkeypatch):
+    # Checkpoint recompute stops inside the experts, so replayed dispatches are never combined.
+    # Their routing tensors would keep the recomputed activations alive through backward, and each
+    # layer would hold its replayed handle buffer until its next forward.
+    handles, activations = [], []
+
+    class Handle(SimpleNamespace):
+        pass
+
+    def buffer(**kwargs):
+        handle = Handle(**kwargs)
+        handles.append(weakref.ref(handle))
+        return handle
+
+    def layer(manager, hidden):
+        """Route with router-like weights computed from the layer input.
+
+        Args:
+            manager: NCCL-EP manager of this layer.
+            hidden: BF16 tensor of shape [tokens, hidden].
+
+        Returns:
+            BF16 tensor of shape [tokens, hidden].
+        """
+        activation = hidden.float()
+        # Recompute saves detached aliases, so track the storage rather than this tensor object.
+        activations.append(StorageWeakRef(activation.untyped_storage()))
+        return _roundtrip(manager, hidden, torch.sigmoid(activation @ gate), indices, scales)
+
+    monkeypatch.setattr(transport, "EpBuffer", buffer)
+    first, second = _manager(group), _manager(group)
+    gate = torch.randn(4, 2, requires_grad=True)
+    indices = torch.tensor([[1, 0]] * 3)
+    scales = torch.tensor([2.0, 4.0], dtype=torch.bfloat16, requires_grad=True)
+    hidden = torch.randn(3, 4, dtype=torch.bfloat16, requires_grad=True)
+    out = checkpoint(layer, first, hidden, use_reentrant=False)
+    checkpoint(layer, second, out, use_reentrant=False).float().sum().backward()
+    # Forward dispatched first and second; backward replayed second, then first.
+    assert len(handles) == len(activations) == 4
+    assert all(ref.expired() for ref in activations)
+    assert handles[2]() is None and handles[3]() is not None
+    # The next dispatch, from any layer, releases the last replay's handle.
+    _roundtrip(second, hidden.detach(), torch.full((3, 2), 0.5), indices, scales.detach())
+    assert handles[3]() is None
 
 
 def test_context_reuse_rejection_and_cleanup(transport, group):

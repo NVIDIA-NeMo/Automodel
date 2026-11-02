@@ -46,6 +46,8 @@ class _Runtime:
     # and process-group teardown destroys it.
     legacy_source: dist.ProcessGroup | None = None
     legacy_group: dist.ProcessGroup | None = None
+    # Manager whose latest dispatch has not been combined.
+    pending: NcclEpManager | None = None
 
 
 _runtime = _Runtime()
@@ -53,6 +55,8 @@ _runtime = _Runtime()
 
 def finalize_nccl_ep() -> None:
     """Release the owned NCCL-EP context before destroying its process group."""
+    if _runtime.pending is not None:
+        _runtime.pending._release_dispatch_state()
     if _runtime.api is not None:
         _runtime.api.ep_finalize()
         _runtime.api = None
@@ -253,6 +257,11 @@ class NcclEpManager:
             raise ValueError("NCCL-EP indices and probabilities must have shape [local_tokens, top_k]")
         # Recompute may abandon a forward before combine. Never reuse its handle:
         # backward for another layer or microbatch can still own the old routing.
+        # A rank dispatches one layer at a time, so another layer's uncombined dispatch
+        # was abandoned that way. Release it now: otherwise every layer keeps its last
+        # handle buffer until its next forward.
+        if _runtime.pending is not None and _runtime.pending is not self:
+            _runtime.pending._release_dispatch_state()
         buffer = self.api.EpBuffer(
             top_k=self.top_k,
             max_tokens_per_rank=self.capacity,
@@ -266,8 +275,12 @@ class NcclEpManager:
             self.token_indices.to(torch.int64).contiguous(),
             self.token_probs.float().contiguous(),
         )
+        # Drop the consumed routing tensors. Their autograd graph reaches back through the
+        # layer, so after an abandoned recompute they would keep its recomputed activations alive.
+        self.token_indices = self.token_probs = None
         self._buffer = buffer
         self._num_tokens = num_tokens
+        _runtime.pending = self
         return received
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -283,7 +296,9 @@ class NcclEpManager:
         """
         if self.dispatched_probs is None:
             raise RuntimeError("NCCL-EP dispatch has not completed")
-        return hidden_states, self.dispatched_probs
+        # Hand the weights to the experts and stop holding their autograd graph here.
+        dispatched_probs, self.dispatched_probs = self.dispatched_probs, None
+        return hidden_states, dispatched_probs
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
         """Return device counts of shape [local_experts] for the packed rows."""
@@ -325,9 +340,15 @@ class NcclEpManager:
         if self._buffer is None:
             raise RuntimeError("NCCL-EP combine requires a matching dispatch")
         result = self.api.ep_combine(self._buffer, hidden_states.contiguous(), num_local_tokens=self._num_tokens)
+        self._release_dispatch_state()
+        return result
+
+    def _release_dispatch_state(self) -> None:
+        """Drop the handle buffer and routing tensors of this manager's latest dispatch."""
         self._buffer = None
         self.dispatched_probs = None
         self.tokens_per_expert = None
         self.token_indices = None
         self.token_probs = None
-        return result
+        if _runtime.pending is self:
+            _runtime.pending = None
