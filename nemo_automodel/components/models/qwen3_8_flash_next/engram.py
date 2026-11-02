@@ -456,18 +456,26 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             self.owner_world_size = 0
             self.owner_rank = 0
             self.num_embeddings_per_rank = 0
-            self.weight = nn.Parameter(torch.empty(0, self.embedding_dim, device=device, dtype=dtype))
         else:
             self._set_owner_geometry(process_group)
-            self.weight = nn.Parameter(
-                torch.empty(
-                    self.num_embeddings_per_rank,
-                    self.embedding_dim,
-                    device=device,
-                    dtype=dtype,
-                )
-            )
+        self.weight = self._new_local_shard(device=device, dtype=dtype, requires_grad=True)
         self.reset_parameters()
+
+    def _new_local_shard(
+        self,
+        *,
+        device: torch.device | str | None,
+        dtype: torch.dtype | None,
+        requires_grad: bool,
+    ) -> nn.Parameter:
+        """Allocate an uninitialized ``[num_embeddings_per_rank, embedding_dim]`` parameter.
+
+        A pending table has no rows yet, so its shard is the ``[0, embedding_dim]`` placeholder.
+        """
+        return nn.Parameter(
+            torch.empty(self.num_embeddings_per_rank, self.embedding_dim, device=device, dtype=dtype),
+            requires_grad=requires_grad,
+        )
 
     def _set_owner_geometry(self, process_group: dist.ProcessGroup | None) -> None:
         """Record the owner group and this rank's contiguous global row range.
@@ -511,14 +519,8 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
             raise RuntimeError("The Engram owner group is already bound")
         self._set_owner_geometry(process_group)
         placeholder = self.weight
-        self.weight = nn.Parameter(
-            torch.empty(
-                self.num_embeddings_per_rank,
-                self.embedding_dim,
-                device=placeholder.device,
-                dtype=placeholder.dtype,
-            ),
-            requires_grad=placeholder.requires_grad,
+        self.weight = self._new_local_shard(
+            device=placeholder.device, dtype=placeholder.dtype, requires_grad=placeholder.requires_grad
         )
         self.owner_group_pending = False
         if placeholder.device.type != "meta":
@@ -584,25 +586,21 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
                     "Engram DTensor is already attached to a different mesh: "
                     f"current={current_mesh_ranks}, requested={mesh_ranks}"
                 )
-            exclude_from_tp_replica_sync(self)
-            return self.weight
-
-        if tuple(self.weight.shape) != expected_local_shape:
-            raise ValueError(
-                "Engram local weight shape does not match its contiguous owner range: "
-                f"{tuple(self.weight.shape)} != {expected_local_shape}"
+        else:
+            if tuple(self.weight.shape) != expected_local_shape:
+                raise ValueError(
+                    "Engram local weight shape does not match its contiguous owner range: "
+                    f"{tuple(self.weight.shape)} != {expected_local_shape}"
+                )
+            distributed_weight = DTensor.from_local(
+                self.weight.detach(),
+                device_mesh=fsdp_mesh,
+                placements=(Shard(0),),
+                run_check=False,
+                shape=torch.Size(expected_global_shape),
+                stride=(self.embedding_dim, 1),
             )
-        local_weight = self.weight.detach()
-        requires_grad = self.weight.requires_grad
-        distributed_weight = DTensor.from_local(
-            local_weight,
-            device_mesh=fsdp_mesh,
-            placements=(Shard(0),),
-            run_check=False,
-            shape=torch.Size(expected_global_shape),
-            stride=(self.embedding_dim, 1),
-        )
-        self.weight = nn.Parameter(distributed_weight, requires_grad=requires_grad)
+            self.weight = nn.Parameter(distributed_weight, requires_grad=self.weight.requires_grad)
         exclude_from_tp_replica_sync(self)
         return self.weight
 

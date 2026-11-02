@@ -119,6 +119,9 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         collapses it back to ``[batch, sequence, hidden_size]``.
     """
 
+    # Set to True by the MoE parallelizer when context parallelism is enabled.
+    _cp_enabled: bool = False
+
     def __init__(
         self,
         config: Qwen3_8_FlashNextTextConfig,
@@ -311,7 +314,7 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
                 loader_seq_lens,
                 total_tokens=packed_reference.shape[1],
             )
-        if getattr(self, "_cp_enabled", False) and _qwen3_8_flash_next_cp_context is None:
+        if self._cp_enabled and _qwen3_8_flash_next_cp_context is None:
             raise RuntimeError(
                 "Qwen3.8-Flash-Next context parallelism is enabled, but the model-owned contiguous batch context is missing"
             )
@@ -519,6 +522,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     # Pipeline stages run this forward unchanged: a later stage receives the
     # flattened HC state in place of token IDs and routes it as inputs_embeds.
     _pp_keep_self_forward: bool = True
+    # Set to True by the MoE parallelizer when context parallelism is enabled.
+    _cp_enabled: bool = False
     parallelizer = PARALLELIZER
 
     @dataclass(frozen=True)
@@ -727,7 +732,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             ``[batch, sequence, vocab]`` on the stage that owns ``lm_head`` and
             ``[batch, sequence, hc_count * hidden]`` otherwise.
         """
-        if getattr(self, "_cp_enabled", False):
+        if self._cp_enabled:
             raise NotImplementedError(
                 "Qwen3.8-Flash-Next pipeline parallelism has not been validated with context parallelism"
             )
@@ -820,12 +825,11 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         del labels
         if use_cache:
             raise NotImplementedError("Qwen3.8-Flash-Next training does not support caches")
-        if (
-            inputs_embeds is None
-            and self.model.language_model.embed_tokens is None
-            and input_ids is not None
-            and torch.is_floating_point(input_ids)
-        ):
+        # A non-first pipeline stage receives the previous stage's floating-point
+        # HC state in the input_ids slot.
+        if input_ids is not None and input_ids.is_floating_point():
+            if inputs_embeds is not None:
+                raise ValueError("Pipeline hidden states and inputs_embeds cannot both be specified")
             inputs_embeds = input_ids
             input_ids = None
         capture_all_hidden_states = output_hidden_states is True
