@@ -24,7 +24,6 @@ from nemo_automodel.components.datasets.packing import (
     build_packed_sequence_metadata,
     resolve_packing_contract,
 )
-from nemo_automodel.shared.packed_seq import indexed_mask_to_4d_block_causal
 
 
 def batchify(tensor, default_tensor_cls=torch.LongTensor):
@@ -539,7 +538,8 @@ def neat_packed_collater(
         attn_implementation: Deprecated attention-backend name retained for
             Python-call compatibility during the packing-contract migration.
         packing: Structural model contract selecting the packed mask representation.
-            Defaults to block-causal masking without packed-sequence metadata.
+            Native mask/Flash collation requires a model-derived contract supplying
+            the attention conversion; recipes provide it automatically.
 
     Returns:
         Mapping with ``input_ids``, ``labels``, and ``position_ids`` of shape
@@ -568,29 +568,13 @@ def neat_packed_collater(
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
     packed_mask_type = packing.packed_mask_type
 
-    if packed_mask_type in ("document_ids", "flash_varlen"):
-        mask_out = attention_mask
-    elif packed_mask_type == "block_causal":
-        mask_out = indexed_mask_to_4d_block_causal(attention_mask)
-    else:
+    if packed_mask_type not in ("document_ids", "flash_varlen", "block_causal"):
         raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
-
-    result = {
-        "input_ids": input_ids,
-        "labels": labels,
-        "position_ids": position_ids,
-        "attention_mask": mask_out,
-    }
-    if packed_mask_type == "flash_varlen":
-        from nemo_automodel.components.datasets.packed_seq import (
-            packed_seq_params_from_doc_ids,
-            to_flash_attention_kwargs,
-        )
-
-        # HF consumes physical offsets, including padding, without an attention
-        # mask. Native FA4's unpadded offsets below have a different contract.
-        result.pop("attention_mask")
-        result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
+    result = {"input_ids": input_ids, "labels": labels, "position_ids": position_ids}
+    prepare_attention = packing.prepare_attention_inputs
+    if prepare_attention is None:
+        raise ValueError("Native packed collation requires a model-derived packing contract")
+    result.update(prepare_attention(attention_mask))
     if packing.return_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
     if attention_mask.max() > 1 or packing.return_packed_sequence_metadata:

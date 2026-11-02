@@ -1617,7 +1617,8 @@ def neat_packed_vlm_collater(
         attn_implementation: Deprecated attention-backend name retained in its
             original positional slot for Python-call compatibility.
         packing: Structural model contract selecting the packed mask representation.
-            Defaults to block-causal masking without packed-sequence metadata.
+            Native mask/Flash collation requires a model-derived contract supplying
+            the attention conversion; recipes provide it automatically.
         materialize_4d_mask: Whether SDPA/eager packing should expand the
             indexed ``[B, S]`` document map into a dense
             ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
@@ -1682,15 +1683,6 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
-    if packed_mask_type != "block_causal" or not materialize_4d_mask:
-        # Keep the compact indexed [B, S] map for native attention or CP.
-        # The HF varlen path replaces it with explicit cumulative lengths below.
-        attention_mask_out = attention_mask
-    else:
-        from nemo_automodel.components.datasets.utils import indexed_mask_to_4d_block_causal
-
-        attention_mask_out = indexed_mask_to_4d_block_causal(attention_mask)
-
     # Handle position_ids: 1D [seq_len] or 3D mRoPE [3, seq_len]
     pos_sample = torch.as_tensor(batch[0]["position_ids"])
     if pos_sample.ndim == 2:
@@ -1711,26 +1703,23 @@ def neat_packed_vlm_collater(
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
-        "attention_mask": attention_mask_out,
         "mm_token_type_ids": mm_token_type_ids,
     }
-    if packed_mask_type == "flash_varlen":
-        from nemo_automodel.components.datasets.packed_seq import (
-            packed_seq_params_from_doc_ids,
-            to_flash_attention_kwargs,
-        )
-
-        # HF consumes physical offsets, including padding, without an attention
-        # mask. Native FA4's unpadded offsets below have a different contract.
-        result.pop("attention_mask")
-        result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
+    if packed_mask_type == "block_causal" and not materialize_4d_mask:
+        # Native CP consumes compact IDs and constructs its local attention policy.
+        result["attention_mask"] = attention_mask
+    else:
+        prepare_attention = packing.prepare_attention_inputs
+        if prepare_attention is None:
+            raise ValueError("Native packed collation requires a model-derived packing contract")
+        result.update(prepare_attention(attention_mask))
     if packing.return_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
 
     # Store indexed attention mask for loss functions that need per-sample
     # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
-    # ``attention_mask_out`` is already converted to 4D, so keep a copy.
+    # ``attention_mask`` is already converted to 4D, so keep a copy.
     has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
     if has_multiple_docs or not materialize_4d_mask or packing.return_packed_sequence_metadata:
         result["_packed_seq_ids"] = attention_mask

@@ -15,6 +15,7 @@
 """Dataset-owned packed-sequence construction contracts and helpers."""
 
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, Literal, Protocol, TypedDict
 
@@ -70,6 +71,19 @@ class PackedSequenceContract(Protocol):
         ...
 
     @property
+    def prepare_attention_inputs(self) -> Callable[[torch.Tensor], dict[str, torch.Tensor | int]] | None:
+        """Model-owned conversion supplied by the recipe for native collation.
+
+        The callback accepts integer document IDs [batch, sequence] and returns
+        an attention mask [batch, 1, sequence, sequence], compact IDs of shape
+        [batch, sequence], or HF Flash offsets [segments + 1] and integer maxima.
+        It preserves the input device and does not mutate the IDs. It must be
+        serializable without capturing a model or GPU state. Deferred PP and
+        THD inputs do not invoke this conversion.
+        """
+        ...
+
+    @property
     def max_sequence_length(self) -> int | None:
         """Decoder input-token limit, or None when the model does not declare one."""
         ...
@@ -83,6 +97,9 @@ class _DefaultPackedSequenceContract:
     return_packed_sequence_metadata: bool = False
     return_document_ids: bool = False
     max_sequence_length: int | None = None
+    # Model-independent defaults serve unpacked/THD and compact streaming paths.
+    # Native mask/Flash collation requires the model-derived runtime contract.
+    prepare_attention_inputs: Callable[[torch.Tensor], dict[str, torch.Tensor | int]] | None = None
 
 
 DEFAULT_PACKED_SEQUENCE_CONTRACT: Final[PackedSequenceContract] = _DefaultPackedSequenceContract()
