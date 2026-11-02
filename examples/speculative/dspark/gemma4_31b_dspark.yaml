@@ -82,3 +82,6 @@ checkpoint:
   checkpoint_dir: ./outputs/dspark_gemma4_31b/checkpoints
   model_save_format: safetensors
   save_consolidated: final
+
+ci:
+  cluster_tag: h100

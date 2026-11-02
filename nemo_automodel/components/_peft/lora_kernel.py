@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import TypedDict
 from unittest.mock import MagicMock
 
 import torch
@@ -23,14 +24,14 @@ try:
     import triton
     import triton.language as tl
 
-    if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
-        HAVE_TRITON = False
-    else:
-        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
+    if version.parse(triton.__version__) < version.parse("2.0.0") or (
+        version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available()
+    ):
+        raise ImportError("Installed Triton version is unsupported on this device")
+    # Python launchers validate availability; JIT kernels must not read this runtime bool.
+    HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
-
-if not HAVE_TRITON:
     triton = MagicMock()
     triton.jit = null_decorator
     triton.autotune = null_decorator
@@ -38,7 +39,14 @@ if not HAVE_TRITON:
     tl = MagicMock()
 
 
-def forward_autotune_configs():
+class _GridMeta(TypedDict):
+    """Integer block sizes read from the full Triton launch-argument mapping."""
+
+    BLOCK_SIZE_M: int
+    BLOCK_SIZE_N: int
+
+
+def forward_autotune_configs() -> list[triton.Config]:
     """
     Method for generating Triton configs for lora_forward_kernel.
     """
@@ -57,13 +65,12 @@ def forward_autotune_configs():
 
 
 @triton.jit
-def get_pid_coords(M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+def get_pid_coords(
+    M: tl.tensor, N: tl.tensor, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr
+) -> tuple[tl.tensor, tl.tensor]:
     """
     Converts one-dimensional triton pids into two dimensions.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     pid = tl.program_id(axis=0)
 
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -79,31 +86,28 @@ def get_pid_coords(M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
 
 @triton.jit
 def inner_kernel(
-    pid_m,
-    pid_n,
-    a_ptr,
-    b_ptr,
-    M,
-    K,
-    N,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
+    pid_m: tl.tensor,
+    pid_n: tl.tensor,
+    a_ptr: tl.tensor,
+    b_ptr: tl.tensor,
+    M: tl.tensor,
+    K: tl.tensor,
+    N: tl.tensor,
+    stride_am: tl.tensor,
+    stride_ak: tl.tensor,
+    stride_bk: tl.tensor,
+    stride_bn: tl.tensor,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    scale,
-):
+    scale: tl.tensor,
+) -> tl.tensor:
     """
     Performs the matrix multiplication AB.
 
     A is an M x K matrix and B is an N x K matrix.
     The result is returned to be stored by the calling method.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -128,30 +132,27 @@ def inner_kernel(
 
 @triton.jit
 def block_vector_mul(
-    pid_m,
-    pid_n,
-    ab_result,
-    c_ptr,
-    d_ptr,
-    M,
-    N,
-    L,
-    stride_cn,
-    stride_cl,
-    stride_dm,
-    stride_dl,
+    pid_m: tl.tensor,
+    pid_n: tl.tensor,
+    ab_result: tl.tensor,
+    c_ptr: tl.tensor,
+    d_ptr: tl.tensor,
+    M: tl.tensor,
+    N: tl.tensor,
+    L: tl.tensor,
+    stride_cn: tl.tensor,
+    stride_cl: tl.tensor,
+    stride_dm: tl.tensor,
+    stride_dl: tl.tensor,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_L: tl.constexpr,
-):
+) -> None:
     """
     Multiplies an M x N vector AB and and N x L vector C and adds the result to the output vector D.
 
     N is assumed to be smaller than BLOCK_SIZE_N.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_l = tl.arange(0, BLOCK_SIZE_L)
     offs_dm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -180,40 +181,37 @@ def block_vector_mul(
 @triton.heuristics(values={"BLOCK_SIZE_N": lambda args: max(triton.next_power_of_2(args["N"]), 16)})
 @triton.jit
 def lora_forward_kernel(
-    x_ptr,
-    la_ptr,
-    lb_ptr,
-    res_ptr,
-    M,
-    N,
-    K,
-    L,
-    stride_x_m,
-    stride_x_k,
-    stride_la_k,
-    stride_la_n,
-    stride_lb_n,
-    stride_lb_l,
-    stride_res_m,
-    stride_res_l,
+    x_ptr: tl.tensor,
+    la_ptr: tl.tensor,
+    lb_ptr: tl.tensor,
+    res_ptr: tl.tensor,
+    M: tl.tensor,
+    N: tl.tensor,
+    K: tl.tensor,
+    L: tl.tensor,
+    stride_x_m: tl.tensor,
+    stride_x_k: tl.tensor,
+    stride_la_k: tl.tensor,
+    stride_la_n: tl.tensor,
+    stride_lb_n: tl.tensor,
+    stride_lb_l: tl.tensor,
+    stride_res_m: tl.tensor,
+    stride_res_l: tl.tensor,
     # scale factor
-    scale,
+    scale: tl.tensor,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  #
     BLOCK_SIZE_L: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,  #
-):
+) -> None:
     """
     Kernel for computing the matmul D = A x B x C.
 
     A has shape (M, K), B has shape (K, N), C has shape (N, L), and D has shape (M, L)
     N, the LoRA dimension must be less than or equal to than BLOCK_SIZE_N.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     pid_m, pid_n = get_pid_coords(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
 
     ab_result = inner_kernel(
@@ -254,17 +252,27 @@ def lora_forward_kernel(
     )
 
 
-def lora_forward_wrapper(x, lora_A, lora_B, res, scale, dtype=torch.float32):
+def lora_forward_wrapper(
+    x: torch.Tensor,
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    res: torch.Tensor | None,
+    scale: float,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     """
     Computes LoRA forward pass.
 
     Args:
-        x: input activations,  (M x K)
-        lora_A: LoRA A weights (K x N)
-        lora_B: LoRA B weights (N x L)
-        res (optional(torch.Tensor)): output tensor
+        x: Tensor of shape [tokens, input_features].
+        lora_A: Tensor of shape [input_features, rank].
+        lora_B: Tensor of shape [rank, output_features].
+        res: Tensor of shape [tokens, output_features], overwritten in place, or None to allocate.
         scale: LoRA scale factor (scalar)
         dtype: dtype for output
+
+    Returns:
+        Tensor of shape [tokens, output_features], aliasing res when supplied.
     """
     if not HAVE_TRITON:
         raise ImportError(MISSING_TRITON_MSG)
@@ -282,7 +290,9 @@ def lora_forward_wrapper(x, lora_A, lora_B, res, scale, dtype=torch.float32):
     if res is None:
         res = torch.empty((M, L), device=x.device, dtype=dtype)
 
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)  # noqa: E731
+    def grid(meta: _GridMeta) -> tuple[int]:
+        return (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
+
     lora_forward_kernel[grid](
         x,
         lora_A,
@@ -306,7 +316,7 @@ def lora_forward_wrapper(x, lora_A, lora_B, res, scale, dtype=torch.float32):
     return res
 
 
-def da_dx_autotune_configs():
+def da_dx_autotune_configs() -> list[triton.Config]:
     """
     Method for generating Triton configs for lora_da_dx_kernel.
     """
@@ -334,32 +344,32 @@ def da_dx_autotune_configs():
 @triton.heuristics(values={"BLOCK_SIZE_N": lambda args: max(triton.next_power_of_2(args["N"]), 16)})
 @triton.jit
 def lora_da_dx_kernel(
-    dy_ptr,
-    b_ptr,
-    a_ptr,
-    dx_ptr,
-    dyb_ptr,
-    M,
-    K,
-    N,
-    L,
-    stride_dy_m,
-    stride_dy_k,
-    stride_lorab_k,
-    stride_lorab_n,
-    stride_loraa_n,
-    stride_loraa_l,
-    stride_dx_m,
-    stride_dx_l,
-    stride_dyb_m,
-    stride_dyb_n,
-    scale,
+    dy_ptr: tl.tensor,
+    b_ptr: tl.tensor,
+    a_ptr: tl.tensor,
+    dx_ptr: tl.tensor,
+    dyb_ptr: tl.tensor,
+    M: tl.tensor,
+    K: tl.tensor,
+    N: tl.tensor,
+    L: tl.tensor,
+    stride_dy_m: tl.tensor,
+    stride_dy_k: tl.tensor,
+    stride_lorab_k: tl.tensor,
+    stride_lorab_n: tl.tensor,
+    stride_loraa_n: tl.tensor,
+    stride_loraa_l: tl.tensor,
+    stride_dx_m: tl.tensor,
+    stride_dx_l: tl.tensor,
+    stride_dyb_m: tl.tensor,
+    stride_dyb_n: tl.tensor,
+    scale: tl.tensor,
     BLOCK_SIZE_M: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_L: tl.constexpr,
-):
+) -> None:
     """
     Kernel for computing the matmul DYB = DY x B and DX = DY * B * A.
 
@@ -367,9 +377,6 @@ def lora_da_dx_kernel(
     N, the LoRA dimension must be less than or equal to than BLOCK_SIZE_N.
     The result returned by this kernel is reduced in the wrapper.
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     pid_m, pid_n = get_pid_coords(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
     dyb = inner_kernel(
         pid_m,
@@ -416,15 +423,27 @@ def lora_da_dx_kernel(
     tl.store(dyb_ptrs, dyb, mask=dyb_mask)
 
 
-def lora_da_dx_update_wrapper(xt, dy, lora_B, lora_A, scale, dtype=torch.float32):
+def lora_da_dx_update_wrapper(
+    xt: torch.Tensor,
+    dy: torch.Tensor,
+    lora_B: torch.Tensor,
+    lora_A: torch.Tensor,
+    scale: float,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Computes dlora_A and dx.
 
-    xt: input activation weights, transposed (S x M)
-    dy: gradients (M x K)
-    lora_B: LoRA B weights (K x N)
-    lora_A: LoRA A weights (N x L)
-    scale: LoRA scale factor (scalar)
-    dtype: dtype for output
+    Args:
+        xt: Tensor of shape [input_features, tokens], transposed input activations.
+        dy: Tensor of shape [tokens, output_features].
+        lora_B: Tensor of shape [output_features, rank].
+        lora_A: Tensor of shape [rank, input_features].
+        scale: LoRA scale factor.
+        dtype: Output dtype.
+
+    Returns:
+        LoRA A gradient of shape [input_features, rank] and input gradient of
+        shape [tokens, input_features].
     """
     if not HAVE_TRITON:
         raise ImportError(MISSING_TRITON_MSG)
@@ -440,7 +459,10 @@ def lora_da_dx_update_wrapper(xt, dy, lora_B, lora_A, scale, dtype=torch.float32
 
     dx = torch.empty((M, L), device=xt.device, dtype=dtype)
     dyb = torch.empty((M, N), device=xt.device, dtype=dtype)
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)  # noqa: E731
+
+    def grid(meta: _GridMeta) -> tuple[int]:
+        return (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
+
     lora_da_dx_kernel[grid](
         dy,
         lora_B,
@@ -467,7 +489,7 @@ def lora_da_dx_update_wrapper(xt, dy, lora_B, lora_A, scale, dtype=torch.float32
     return dlora_A, dx
 
 
-def db_autotune_configs():
+def db_autotune_configs() -> list[triton.Config]:
     """
     Method for generating Triton configs for lora_db_kernel.
     """
@@ -490,36 +512,33 @@ def db_autotune_configs():
 
 @triton.autotune(
     configs=db_autotune_configs() if HAVE_TRITON else list(),
-    key=["S", "M", "K"],
+    key=["M", "K"],
 )
 @triton.jit
 def lora_db_kernel(
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    M,
-    K,
-    N,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    scale,
+    a_ptr: tl.tensor,
+    b_ptr: tl.tensor,
+    c_ptr: tl.tensor,
+    M: tl.tensor,
+    K: tl.tensor,
+    N: tl.tensor,
+    stride_am: tl.tensor,
+    stride_ak: tl.tensor,
+    stride_bk: tl.tensor,
+    stride_bn: tl.tensor,
+    stride_cm: tl.tensor,
+    stride_cn: tl.tensor,
+    scale: tl.tensor,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-):
+) -> None:
     """
     Kernel for computing the matmul AXT = A x X^T.
 
     A has shape (M, K), X has shape (N, K).
     """
-    if not HAVE_TRITON:
-        raise ImportError(MISSING_TRITON_MSG)
-
     pid_m, pid_n = get_pid_coords(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
     ab = inner_kernel(
         pid_m,
@@ -546,14 +565,20 @@ def lora_db_kernel(
     tl.store(c_ptrs, ab, mask=c_mask)
 
 
-def lora_db_update_wrapper(lora_A, xt, dy, scale, dtype=torch.float32):
+def lora_db_update_wrapper(
+    lora_A: torch.Tensor, xt: torch.Tensor, dy: torch.Tensor, scale: float, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
     """Computes d_lora_B.
 
-    lora_A: LoRA A weights (M x K)
-    xt: input activation weights, transposed (K x N)
-    dy: gradients (N x S)
-    scale: LoRA scale factor (scalar)
-    dtype: dtype for output
+    Args:
+        lora_A: Tensor of shape [rank, input_features].
+        xt: Tensor of shape [input_features, tokens], transposed input activations.
+        dy: Tensor of shape [tokens, output_features].
+        scale: LoRA scale factor.
+        dtype: Output dtype.
+
+    Returns:
+        LoRA B gradient of shape [output_features, rank].
     """
     if not HAVE_TRITON:
         raise ImportError(MISSING_TRITON_MSG)
@@ -567,7 +592,8 @@ def lora_db_update_wrapper(lora_A, xt, dy, scale, dtype=torch.float32):
 
     axt = torch.empty((M, N), device=dy.device, dtype=dtype)
 
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
+    def grid(meta: _GridMeta) -> tuple[int]:
+        return (triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
 
     lora_db_kernel[grid](
         lora_A,

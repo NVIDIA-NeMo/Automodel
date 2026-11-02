@@ -22,7 +22,7 @@ from functools import cached_property
 from typing import Any
 
 import torch
-from huggingface_hub import try_to_load_from_cache
+from huggingface_hub import ResolvedRevision, try_to_load_from_cache
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
@@ -143,10 +143,10 @@ def _read_index_tp_size(model_path: str | None, revision: str | None = None) -> 
     return tp_size
 
 
-def _resolve_checkpoint_tp_size(config: Any) -> int:
+def _resolve_checkpoint_tp_size(config: Any, revision: str | None = None) -> int:
     """Return the fused-QKV checkpoint TP degree from the index of the checkpoint ``config`` was loaded from."""
     model_path = getattr(config, "_name_or_path", None) or getattr(config, "name_or_path", None)
-    return _read_index_tp_size(model_path, getattr(config, "_commit_hash", None))
+    return _read_index_tp_size(model_path, revision.resolved if isinstance(revision, ResolvedRevision) else revision)
 
 
 def _fused_qkv_sizes(config: Any, layer_idx: int, checkpoint_tp_size: int) -> tuple[int, int, int]:
@@ -260,8 +260,12 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
         moe_config: MoEConfig,
         backend: BackendConfig,
         dtype: torch.dtype = torch.bfloat16,
-    ):
+        *,
+        revision: str | None = None,
+    ) -> None:
+        """Keep the checkpoint revision with adapter runtime state."""
         self.config = config
+        self.revision = revision
         self.moe_config = moe_config
         self.backend = backend
         self.dtype = dtype
@@ -300,7 +304,7 @@ class MiMoV2FlashStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapte
     @cached_property
     def checkpoint_tp_size(self) -> int:
         """TP degree interleaving fused QKV rows in the source checkpoint, resolved once."""
-        return _resolve_checkpoint_tp_size(self.config)
+        return _resolve_checkpoint_tp_size(self.config, self.revision)
 
     def from_hf(
         self,

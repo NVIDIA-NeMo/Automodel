@@ -18,7 +18,7 @@ import inspect
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from copy import copy
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 import torch.nn as nn
@@ -36,6 +36,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import ModelOutput, logging
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.sentence_transformer_export import (
     SentenceTransformerExportConfig,
@@ -50,6 +51,10 @@ from nemo_automodel._transformers.sentence_transformer_export import (
 )
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.checkpoint.addons import _ConsolidatedHFMetadataExporter
+
 
 logger = logging.get_logger(__name__)
 
@@ -469,6 +474,15 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
+    hf_kwargs["revision"] = NeMoAutoConfig.resolve_revision(
+        model_name_or_path,
+        hf_kwargs.get("revision"),
+        cache_dir=hf_kwargs.get("cache_dir"),
+        token=hf_kwargs.get("token", hf_kwargs.get("use_auth_token")),
+        local_files_only=hf_kwargs.get("local_files_only", False),
+        subfolder=hf_kwargs.get("subfolder", ""),
+        force_download=hf_kwargs.get("force_download", False),
+    )
     config = loaded_config
     if config is None:
         config = AutoConfig.from_pretrained(
@@ -629,11 +643,14 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     model.model.save_pretrained(save_directory)
     if deploy_config is not None:
         deploy_config.save_pretrained(save_directory)
-    if tokenizer is not None:
+    if tokenizer is not None and cross_encoder_exporter is None:
         tokenizer.save_pretrained(save_directory)
     if cross_encoder_exporter is not None:
-        cross_encoder_exporter._save_sentence_transformer_assets(
-            hf_metadata_dir=save_directory, tokenizer=tokenizer, original_model_path=original_model_path
+        cross_encoder_exporter.save(
+            hf_metadata_dir=save_directory,
+            tokenizer=tokenizer,
+            original_model_path=original_model_path,
+            v4_compatible=False,
         )
     if export_config is None:
         return
@@ -689,7 +706,7 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")
-    encoder.state_dict_adapter = EncoderStateDictAdapter()
+    encoder.state_dict_adapter = EncoderStateDictAdapter(getattr(model, "state_dict_adapter", None))
     configure_encoder_metadata(model, model.config)
 
 
@@ -768,17 +785,22 @@ class BiEncoderModel(nn.Module):
             raise ValueError("task must be specified when calling build()")
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
+        hf_kwargs["revision"] = NeMoAutoConfig.resolve_revision(
+            model_name_or_path,
+            hf_kwargs.get("revision"),
+            cache_dir=hf_kwargs.get("cache_dir"),
+            token=hf_kwargs.get("token", hf_kwargs.get("use_auth_token")),
+            local_files_only=hf_kwargs.get("local_files_only", False),
+            subfolder=hf_kwargs.get("subfolder", ""),
+            force_download=hf_kwargs.get("force_download", False),
+        )
         config = AutoConfig.from_pretrained(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
             **hf_kwargs,
         )
         is_causal = _resolve_is_causal(config, is_causal)
-        metadata_kwargs = dict(hf_kwargs)
-        commit_hash = getattr(config, "_commit_hash", None)
-        if commit_hash is not None:
-            metadata_kwargs["revision"] = commit_hash
-        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, metadata_kwargs)
+        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, hf_kwargs)
         pooling, l2_normalize = _resolve_bi_encoder_options(
             config,
             saved_options,
@@ -810,7 +832,6 @@ class BiEncoderModel(nn.Module):
             )
         encoder.source_model_path = _resolve_cached_source_model_path(
             model_name_or_path,
-            backbone.config,
             hf_kwargs,
         )
         encoder.source_repository_path = _resolve_cached_source_repository_path(
@@ -820,7 +841,7 @@ class BiEncoderModel(nn.Module):
         )
         if encoder.sentence_transformer_export_config is not None:
             encoder.source_repository_path = (
-                _cache_hub_source_legal_assets(model_name_or_path, config, hf_kwargs) or encoder.source_repository_path
+                _cache_hub_source_legal_assets(model_name_or_path, hf_kwargs) or encoder.source_repository_path
             )
         return encoder
 
@@ -994,12 +1015,15 @@ class CrossEncoderModel(nn.Module):
 
     def _get_consolidated_hf_metadata_exporter(
         self, *, tokenizer: object, original_model_path: str | None
-    ) -> _CrossEncoderMetadataExporter | None:
+    ) -> "_ConsolidatedHFMetadataExporter | None":
         """Use the same CrossEncoder metadata contract for direct and consolidated saves."""
         # Generative backbones keep their language-model export contract. Classifier
         # metadata would load a different head instead of preserving their scoring rule.
         if tokenizer is None or self.model.can_generate():
             return None
+        get_exporter = getattr(self.model, "_get_consolidated_hf_metadata_exporter", None)
+        if callable(get_exporter):
+            return get_exporter(tokenizer=tokenizer, original_model_path=original_model_path)
         return _CrossEncoderMetadataExporter(self)
 
     @property

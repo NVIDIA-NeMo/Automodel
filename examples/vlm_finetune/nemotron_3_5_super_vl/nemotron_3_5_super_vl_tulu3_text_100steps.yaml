@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Nemotron 3.5 Super VL (vision-pretrained checkpoint, architectures =
+# Nemotron 3.5 Super VL (BF16 checkpoint, architectures =
 # NemotronH_Omni_Reasoning_V3: a "Nemotron Super" NemotronH hybrid
 # Mamba+Attention MoE LLM backbone + the Nemotron Omni RADIO vision head)
 # text-only SFT on Tulu-3.
@@ -135,6 +135,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 4
   time: "01:00:00"

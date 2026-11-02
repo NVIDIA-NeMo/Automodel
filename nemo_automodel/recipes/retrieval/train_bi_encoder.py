@@ -100,10 +100,8 @@ def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None)
                     "does not expose static query_prefix and passage_prefix metadata."
                 )
             return
-        export_config = getattr(model, "sentence_transformer_export_config", None)
-        prompt_separator = "" if getattr(export_config, "input_mode", "text") == "structured_multimodal" else " "
-        query_prompt = f"{collate_fn.query_prefix}{prompt_separator}" if collate_fn.query_prefix else ""
-        document_prompt = f"{collate_fn.passage_prefix}{prompt_separator}" if collate_fn.passage_prefix else ""
+        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
+        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
 
     configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt, tokenizer=tokenizer)
 
@@ -303,6 +301,14 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 run_config=self.cfg.to_dict(), model_name=self.cfg.model.pretrained_model_name_or_path
             )
             logging.info("🚀 View run at {}".format(run.url))
+
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True),
+                model_name=self.cfg.model.pretrained_model_name_or_path,
+            )
+            logging.info("Trackio experiment tracking enabled")
 
         self._log_experiment_details()
         self._log_library_versions()
@@ -764,6 +770,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
 
         self.metric_logger_train.log(log_data)
 
@@ -788,6 +797,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
 
         self.metric_logger_valid.log(log_data)
 

@@ -137,6 +137,7 @@ class AutoPipeline:
         )
         self._model_config = None
         self._pp_current_seq_len: int | None = None
+        self._pp_runtime_num_tokens: int = 0
         self._runtime_initializers: list[PipelineRuntimeInitializer] = []
 
     def build(
@@ -152,23 +153,6 @@ class AutoPipeline:
         assert isinstance(model, nn.Module), "model must be a PyTorch module"
 
         validate_hf_model_for_pipeline_support(model)
-
-        if self.pp_recv_buffer_pool:
-            from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
-                install_recv_buffer_pool,
-                schedule_supports_recv_pool,
-            )
-
-            # Only 1F1B's bounded in-flight depth makes the ring size proof valid;
-            # schedules with unbounded in-flight microbatches would silently
-            # corrupt gradients through reused recv buffers.
-            if self.pp_schedule_csv is None and schedule_supports_recv_pool(self.pp_schedule):
-                install_recv_buffer_pool(slack=self.pp_recv_buffer_pool_slack)
-            else:
-                logger.warning(
-                    "pp_recv_buffer_pool ignored: schedule %s has no bounded in-flight depth proof",
-                    self.pp_schedule_csv or self.pp_schedule,
-                )
 
         pp_schedule_obj, model_parts, pp_has_first_stage, pp_has_last_stage, stages = pipeline_model(
             model,
@@ -198,6 +182,25 @@ class AutoPipeline:
             seq_len=self.pp_seq_len,
             tensor_dtype=self.dtype,
         )
+
+        if self.pp_recv_buffer_pool:
+            from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B
+
+            from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
+                install_interleaved_recv_pool,
+                install_recv_buffer_pool,
+                schedule_supports_recv_pool,
+            )
+
+            if self.pp_schedule_csv is None and type(pp_schedule_obj) is ScheduleInterleaved1F1B:
+                install_interleaved_recv_pool(pp_schedule_obj, slack=self.pp_recv_buffer_pool_slack)
+            elif self.pp_schedule_csv is None and schedule_supports_recv_pool(self.pp_schedule):
+                install_recv_buffer_pool(slack=self.pp_recv_buffer_pool_slack)
+            else:
+                logger.warning(
+                    "pp_recv_buffer_pool ignored: schedule %s has no validated receive-lifetime plan",
+                    self.pp_schedule_csv or self.pp_schedule,
+                )
 
         # Update PipelineInfo state
         self._info.enabled = True
@@ -236,7 +239,7 @@ class AutoPipeline:
         if seq_len != self._pp_current_seq_len:
             if self._model_config is None:
                 raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
-            reset_pp_stage_shapes(
+            self._pp_runtime_num_tokens = reset_pp_stage_shapes(
                 self._info.schedule,
                 self._info.stages,
                 self._model_config,
@@ -249,7 +252,9 @@ class AutoPipeline:
 
         for initializer in self._runtime_initializers:
             initializer.prepare(
-                num_tokens=self.pp_microbatch_size * seq_len,
+                # Model-owned CP can keep input IDs global while stage activations
+                # and MoE dispatch are local. Reuse the stage metadata's token count.
+                num_tokens=self._pp_runtime_num_tokens,
                 device=self.device,
             )
 

@@ -45,6 +45,9 @@ def _resolve_ddp_device() -> torch.device:
 
     rank = dist.get_rank()
     backend = str(dist.get_backend()).lower()
+    if backend == "gloo" and dist.get_world_size() == 1 and torch.cuda.is_available():
+        # Single-rank initialization uses Gloo even when it has selected a CUDA device.
+        return torch.device("cuda", index=torch.cuda.current_device())
     if "nccl" in backend and torch.cuda.is_available():
         local_gpu = rank % torch.cuda.device_count()
         torch.cuda.set_device(local_gpu)

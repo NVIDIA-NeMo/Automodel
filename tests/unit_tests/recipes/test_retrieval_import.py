@@ -20,7 +20,7 @@ import pytest
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 
 def test_retrieval_package_imports_without_wandb():

@@ -198,8 +198,8 @@ def test_setup_validates_structured_export_processor(
     if valid_processor:
         with pytest.raises(_ReachedExportValidation):
             recipe.setup()
-        assert model.sentence_transformer_export_config.query_prompt == "query:"
-        assert model.sentence_transformer_export_config.document_prompt == "passage:"
+        assert model.sentence_transformer_export_config.query_prompt == "query: "
+        assert model.sentence_transformer_export_config.document_prompt == "passage: "
     else:
         with pytest.raises(ValueError, match="processor with a tokenizer"):
             recipe.setup()

@@ -137,6 +137,7 @@ wandb:
   mode: online
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   # pp_size(1) * ep_size(8) = 8 GPUs => 1 node (8 H100/node).
   nodes: 1

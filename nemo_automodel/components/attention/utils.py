@@ -164,6 +164,7 @@ def initialize_attn_module_and_func(
             common: dict[str, Any] = {
                 "softmax_scale": softmax_scale,
                 "causal": cast(bool, call_kwargs.get("causal", default_causal)),
+                "deterministic": torch.are_deterministic_algorithms_enabled(),
                 "window_size": call_kwargs.get("window_size", (None, None)),
             }
             # The pinned FA4 SM100/SM110 dedicated HD256 forward kernel has no
@@ -188,6 +189,14 @@ def initialize_attn_module_and_func(
             if cu_seqlens_q is None:
                 output, _lse = flash_attn_func(q, k, v, **common)
                 return output
+
+            if q.shape[0] == 0:
+                # Empty reductions retain all gradient paths without reading discarded
+                # FP16 values, whose full reductions could overflow before multiplying by zero.
+                zero = q[:0].sum() + k[:0].sum() + v[:0].sum()
+                empty = torch.zeros_like(v) + zero
+                padded_shape = call_kwargs.get("_fa4_padded_output_shape")
+                return empty if padded_shape is None else v.new_zeros(padded_shape) + zero
 
             cu_seqlens_kv = call_kwargs.get("cu_seqlens_kv", cu_seqlens_q)
             max_seqlen_q = call_kwargs.get("max_seqlen_q")
@@ -264,13 +273,18 @@ def preprocess_args_and_kwargs_for_attn(
             distinct value head dimension.
         attention_mask: Optional tensor of shape [batch, sequence] for padding
             or indexed packing, or [batch, 1, sequence, sequence] for an
-            explicit dense mask.
+            explicit dense mask. TE accepts only a binary [batch, sequence]
+            padding mask (1/True for valid tokens, 0/False for padding).
+            Packed TE inputs require None and THD sequence metadata instead.
         attn_impl: Attention backend name.
         **kwargs: Backend metadata. Packed FA4 accepts ``cu_seqlens`` of shape
             [documents + 1] and ``packed_token_indices`` of shape [tokens].
             For SDPA and FA4, a positive left ``window_size`` counts visible
             keys including the current token; negative/None means unbounded.
             The legacy TE branch forwards its backend-specific distances unchanged.
+            Packed TE accepts ``cu_seqlens`` of shape [documents + 1] and
+            optional ``cu_seqlens_padded`` with the same shape, both int32,
+            together with an integer ``max_seqlen``.
 
     Returns:
         Query, key, and value tensors in the backend layout plus its keyword
@@ -280,6 +294,9 @@ def preprocess_args_and_kwargs_for_attn(
         Packed BSHD FA4 tensors are unpadded to [tokens, heads,
         head_dim]; the FA4 callable restores its output to BSHD using the value
         head dimension.
+
+    Raises:
+        ValueError: If the selected backend cannot consume the input layout.
     """
     attn_kwargs: dict[str, Any]
     # Create attention kwargs based on backend
@@ -288,6 +305,12 @@ def preprocess_args_and_kwargs_for_attn(
             "window_size": kwargs.get("window_size", (-1, 0)),
         }
         if attention_mask is not None:
+            if attention_mask.ndim != 2:
+                raise ValueError(
+                    "attn_impl='te' expects a 2D [batch, sequence] padding mask; "
+                    f"got attention_mask with shape {tuple(attention_mask.shape)}. "
+                    "For packed sequences, use THD with cu_seqlens and attention_mask=None."
+                )
             padding_mask = attention_mask.logical_not()
             attn_kwargs.update(
                 {
@@ -304,12 +327,17 @@ def preprocess_args_and_kwargs_for_attn(
                     "cu_seqlens_kv": kwargs["cu_seqlens"],
                 }
             )
-            if "cu_seqlens_padded" in kwargs:
+            if kwargs.get("cu_seqlens_padded") is not None:
+                pad_between_seqs = kwargs.get("pad_between_seqs")
+                if pad_between_seqs is None:
+                    # Direct callers may not have run THD batch/model preparation.
+                    # Include the final offset so tail-only padding is detected.
+                    pad_between_seqs = not torch.equal(kwargs["cu_seqlens_padded"], kwargs["cu_seqlens"])
                 attn_kwargs.update(
                     {
                         "cu_seqlens_q_padded": kwargs["cu_seqlens_padded"],
                         "cu_seqlens_kv_padded": kwargs["cu_seqlens_padded"],
-                        "pad_between_seqs": True,
+                        "pad_between_seqs": pad_between_seqs,
                     }
                 )
             if "max_seqlen" in kwargs:
@@ -382,11 +410,9 @@ def preprocess_args_and_kwargs_for_attn(
             valid_tokens = attention_mask.bool()
             seqlens = valid_tokens.sum(dim=-1)
             seqlens = seqlens[seqlens > 0]
-            if seqlens.numel() == 0:
-                raise ValueError("FA4 attention_mask must contain at least one valid token")
             unpad_indices = torch.nonzero(valid_tokens.flatten(), as_tuple=False).flatten()
             cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
-            max_seqlen = int(seqlens.max().item())
+            max_seqlen = int(seqlens.max().item()) if seqlens.numel() else 0
 
         if cu_seqlens is not None and unpad_indices is not None and (cu_seqlens.ndim != 1 or unpad_indices.ndim != 1):
             raise ValueError(

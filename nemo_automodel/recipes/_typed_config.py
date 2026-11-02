@@ -20,7 +20,7 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
-``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
+``apply()``: ``wandb``/``trackio``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
 ``embedding_row_repair``/``mfu``/``domain_mixture`` map to component config
 dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
@@ -46,7 +46,7 @@ from dataclasses import fields, is_dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
@@ -133,7 +133,7 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
-    ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
+    ``wandb``, ``trackio``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
     ``loss_fn``, ``domain_mixture`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
@@ -158,6 +158,11 @@ class RecipeConfig:
         return WandbConfig.from_kwargs(**_section_kwargs(node)) if node else None
 
     @cached_property
+    def trackio(self) -> TrackioConfig | None:
+        node = self._raw.get("trackio", None)
+        return TrackioConfig.from_kwargs(**_section_kwargs(node)) if node else None
+
+    @cached_property
     def mlflow(self) -> MLflowConfig | None:
         node = self._raw.get("mlflow", None)
         return MLflowConfig(**_section_kwargs(node)) if node else None
@@ -180,15 +185,25 @@ class RecipeConfig:
         node = self._raw.get("lr_scheduler", None)
         return LRSchedulerConfig(**_section_kwargs(node)) if node else None
 
-    @cached_property
-    def optimizer(self) -> "OptimizerConfig" | None:
+    def _optimizer_config(self, section: str) -> "OptimizerConfig" | None:
+        """Resolve one optimizer section through the shared typed boundary."""
         from nemo_automodel.components.optim.optimizer import build_optimizer_config
 
-        node = self._raw.get("optimizer", None)
+        node = self._raw.get(section, None)
         if node is None:
             return None
         factory, kwargs = _callable_and_kwargs(node)
         return build_optimizer_config(factory, kwargs)
+
+    @cached_property
+    def optimizer(self) -> "OptimizerConfig" | None:
+        """Return the primary model's configured optimizer policy."""
+        return self._optimizer_config("optimizer")
+
+    @cached_property
+    def head_optimizer(self) -> "OptimizerConfig" | None:
+        """Return the separately configured replicated decision-head optimizer."""
+        return self._optimizer_config("head_optimizer")
 
     @cached_property
     def dataloader(self) -> "DataloaderConfig" | None:
@@ -524,11 +539,14 @@ class RecipeConfig:
         )
 
     @staticmethod
-    def resolve_diffusion_dataloader(node: Any) -> "DiffusionDataloaderConfig":
+    def resolve_diffusion_dataloader(
+        node: Any, *, default_drop_last: bool | None = None
+    ) -> "DiffusionDataloaderConfig":
         """Resolve a diffusion dataloader YAML target to its typed config.
 
         Args:
-            node: ``data.dataloader`` config node containing a supported legacy builder target.
+            node: Training or validation config node containing a supported dataloader target.
+            default_drop_last: Override the loader default when the node omits ``drop_last``.
 
         Returns:
             Typed dataloader config whose ``build`` accepts runtime rank and batch-size values.
@@ -565,6 +583,8 @@ class RecipeConfig:
         unknown = sorted(set(kwargs) - valid)
         if unknown:
             raise TypeError(f"Unexpected diffusion dataloader config field(s): {', '.join(unknown)}")
+        if default_drop_last is not None and "drop_last" in valid:
+            kwargs.setdefault("drop_last", default_drop_last)
         if "base_resolution" in kwargs:
             kwargs["base_resolution"] = tuple(kwargs["base_resolution"])
         return config_type(**kwargs)
@@ -579,7 +599,8 @@ class RecipeConfig:
     def diffusion_validation_dataloader(self) -> "DiffusionDataloaderConfig" | None:
         """Typed diffusion validation dataloader config resolved from ``data.validation_dataloader``."""
         node = self._raw.get("data.validation_dataloader", None)
-        return self.resolve_diffusion_dataloader(node) if node is not None else None
+        # Validation retains bucket tails without changing existing training/component defaults.
+        return self.resolve_diffusion_dataloader(node, default_drop_last=False) if node is not None else None
 
     @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:
@@ -631,9 +652,14 @@ class RecipeConfig:
         # output / get_mtp_loss_scaling_factor; ignore_index comes from the loss)
         # and are not exposed via YAML. This typed accessor lets recipes build MTP through
         # the typed-config boundary like the other sections.
+        # distillation_mode is the one experimental exception: an opt-in YAML
+        # `mtp:` block lets a test config select the soft-distillation prototype
+        # without touching the model-driven fields.
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
-        return MTPLossConfig()
+        node = self._raw.get("mtp", None)
+        distillation_mode = _section_kwargs(node).get("distillation_mode", "hard") if node is not None else "hard"
+        return MTPLossConfig(distillation_mode=distillation_mode)
 
     @cached_property
     def prewarm(self) -> "PrewarmConfig | None":

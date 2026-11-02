@@ -563,6 +563,7 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
 
 
 def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(encoder_module.NeMoAutoConfig, "resolve_revision", lambda *args, **kwargs: None)
     # Patch ModelClass.from_pretrained to return FakeLM for hub path
     class FakeBidirectionalModel(FakeLM):
         @classmethod

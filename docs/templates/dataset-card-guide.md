@@ -48,19 +48,13 @@ uv run --no-project --with detect-secrets==1.5.0 detect-secrets-hook \
   --baseline .github/workflows/config/.secrets.baseline docs/dataset-coverage/catalog.json
 ```
 
-## Data Preview Navigation
+## Preview the Cards
 
-The automatic preview accepts only `section`, `page`, `path`, `slug`, and
-`contents` keys in the Data section. `contents` must be a list; all other values
-must be nonempty strings matching `[A-Za-z0-9 /_.()+,-]+`. This allows ASCII
-letters, digits, spaces, and the listed punctuation. For example, use
-`Packing and Masking` instead of `Packing & Masking`.
-
-Paths must resolve to existing Markdown or MDX pages within staged `docs/`.
-Hidden files, hidden directories, and `components/` are excluded. Links, icons, folder discovery,
-and extra Fern settings are not accepted in this section. Run
-`make -C docs/fern docs-preview-navigation` when changing Data navigation;
-`docs-check` also runs these checks.
+Approved PR previews validate the PR's nightly navigation and use it in place of
+the navigation on `main`, so a new card appears under **Data > Dataset Catalog**.
+Add each card as a `page` entry whose `path` points to the card's MDX file; see the
+[Fern docs skill](../../.agents/contributor-skills/fern-docs/SKILL.md) for the
+preview rules.
 
 ## Content Contract
 
@@ -86,12 +80,19 @@ component licenses or conflicting metadata.
 
 ## Validate the Cards
 
-From the repository root, run `make -C docs/fern docs-dataset-cards`, followed by
-`make -C docs/fern docs-check`. The dataset-card target requires `uv` and uses it
-to provision the pinned `PyYAML==6.0.3` dependency. It validates all registered
-cards, detects unregistered Markdown and MDX cards, parses the
-synthetic JSON examples, and checks repository links and navigation entries. It
-detects uncovered Hub IDs in example YAMLs under `dataset_name`, `path_or_dataset`,
+From the repository root, run the shared documentation check:
+
+```bash
+uv run --script tools/docs/check_docs.py
+```
+
+Its source validation includes `tools/docs/checks/dataset_cards.py`, which
+validates all registered cards, detects unregistered Markdown and MDX cards,
+parses the synthetic JSON examples, and checks card paths, repository links,
+navigation entries, and catalog index links. For a faster offline check of only
+the dataset catalog, run
+`uv run --no-project --with pyyaml==6.0.3 python -m tools.docs.checks.dataset_cards`.
+The validator detects uncovered Hub IDs in example YAMLs under `dataset_name`, `path_or_dataset`,
 `path_or_dataset_id`, `train_data_path`, `val_data_path`, and `schema_dataset`, as well as IDs in
 AutoModel retrieval URIs of the form `hf://ORGANIZATION/DATASET/SUBSET`.
 Recipe PRs that introduce a new Hub ID must add its card and catalog registration.
