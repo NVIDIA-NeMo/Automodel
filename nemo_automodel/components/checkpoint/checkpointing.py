@@ -1137,11 +1137,13 @@ class Checkpointer:
                 is_safetensors=True,
             )
             if candidate_storage_reader is not None:
-                # *_extra_state entries are DCP metadata, not checkpoint tensors; the
-                # full-state path preserves them separately, and part destinations are
-                # tensor-only.
+                # *_extra_state entries are DCP/FSDP bookkeeping, not checkpoint tensors; the
+                # full-state path preserves them separately, so part destinations are
+                # tensor-only and exclude them even when a backend stores them as tensors.
                 candidate_state_dict = {
-                    key: value for key, value in model_state.state_dict().items() if isinstance(value, torch.Tensor)
+                    key: value
+                    for key, value in model_state.state_dict().items()
+                    if isinstance(value, torch.Tensor) and "_extra_state" not in key
                 }
                 candidate_parts = state_dict_adapter.iter_checkpoint_load_parts(
                     candidate_state_dict,

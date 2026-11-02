@@ -738,7 +738,10 @@ def test_part_loading_rejects_incomplete_checkpoints_in_the_loader(tmp_path: Pat
 
     # Without the wq_a destination, the orphan scale is never requested and the load
     # completes through the part-by-part path with every destination decoded.
+    # Tensor-valued *_extra_state entries (FSDP2 bookkeeping, absent from released
+    # checkpoints) must be excluded from part destinations rather than rejected.
     lean_tensors = {key: value for key, value in model_tensors.items() if "wq_a" not in key}
+    lean_tensors["model.norm._extra_state"] = torch.full((8,), -77.0)
     lean = _CheckpointOnlyV41(adapter.config, lean_tensors)
     lean.state_dict_adapter = adapter
     logs = _load(lean, {"layers.0.attn.wq_a.weight"}, "dump_orphan_scale")
@@ -747,6 +750,7 @@ def test_part_loading_rejects_incomplete_checkpoints_in_the_loader(tmp_path: Pat
     )
     gate_up = lean_tensors["model.layers.0.ffn.experts.gate_and_up_projs"]
     assert (gate_up == 2.0).all(), "expert projections must be decoded away from the -101 sentinel"
+    assert (lean_tensors["model.norm._extra_state"] == -77).all(), "extra_state bookkeeping keeps its value"
 
 
 def _stacked_expert_storage_worker(rank: int, rendezvous: str) -> None:
