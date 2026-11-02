@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``te_fp8.filter_fqns`` keeps real Transformer Engine modules out of the FP8 autocast."""
+"""``te_fp8.exclude_fqns`` keeps real Transformer Engine modules out of the FP8 autocast."""
 
+import types
 from collections import OrderedDict
 
 import pytest
@@ -31,20 +32,23 @@ def _fp8_capable() -> bool:
 pytestmark = pytest.mark.skipif(not HAVE_TE or not _fp8_capable(), reason="requires Transformer Engine and an FP8 GPU")
 
 
-def test_filtered_te_linear_runs_in_the_model_dtype_inside_the_fp8_autocast():
+def _two_te_linears() -> nn.Sequential:
     import transformer_engine.pytorch as te
 
     torch.manual_seed(0)
-    device = torch.device("cuda")
-    model = nn.Sequential(
+    return nn.Sequential(
         OrderedDict(
             body=te.Linear(256, 256, bias=False, params_dtype=torch.bfloat16),
             lm_head=te.Linear(256, 512, bias=False, params_dtype=torch.bfloat16),
         )
-    ).to(device)
-    x = torch.randn(64, 256, device=device, dtype=torch.bfloat16)
+    ).to("cuda")
+
+
+def test_excluded_te_linear_runs_in_the_model_dtype_inside_the_fp8_autocast():
+    model = _two_te_linears()
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
     cfg = TEFp8Config(recipe="current")
-    assert cfg.apply_module_filter(model) == ["lm_head"]
+    assert cfg.exclude_modules(model) == ["lm_head"]
 
     with torch.no_grad():
         hidden = model.body(x)  # plain bf16 GEMM, outside any FP8 scope
@@ -53,9 +57,9 @@ def test_filtered_te_linear_runs_in_the_model_dtype_inside_the_fp8_autocast():
             fp8_body = model.body(x)
             head_inside_autocast = model.lm_head(hidden)
 
-    # The unfiltered module really ran in FP8 (its output deviates from the bf16 GEMM) ...
+    # The module left in FP8 really ran in FP8 (its output deviates from the bf16 GEMM) ...
     assert not torch.equal(fp8_body, hidden)
-    # ... while the filtered module produced the bf16 GEMM result inside the same autocast.
+    # ... while the excluded module produced the bf16 GEMM result inside the same autocast.
     torch.testing.assert_close(head_inside_autocast, reference_head)
     assert model.lm_head.fp8 is False and model.body.fp8 is True
 
@@ -63,3 +67,24 @@ def test_filtered_te_linear_runs_in_the_model_dtype_inside_the_fp8_autocast():
     with cfg.maybe_te_autocast():
         model(x).float().sum().backward()
     assert model.lm_head.weight.grad is not None and torch.isfinite(model.lm_head.weight.grad).all()
+
+
+def test_excluded_te_linear_keeps_an_installed_instance_forward():
+    """A forward installed before the exclusion, as tensor-parallel styles do, still runs and runs outside FP8."""
+
+    def doubled_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        return type(module).forward(module, x) * 2
+
+    model = _two_te_linears()
+    model.lm_head.forward = types.MethodType(doubled_forward, model.lm_head)
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    cfg = TEFp8Config(recipe="current")
+    assert cfg.exclude_modules(model) == ["lm_head"]
+
+    with torch.no_grad():
+        reference = 2 * F.linear(x, model.lm_head.weight)
+        with cfg.maybe_te_autocast():
+            out = model.lm_head(x)
+    torch.testing.assert_close(out, reference)
+    assert model.lm_head.fp8 is False
+    assert model.lm_head._te_fp8_excluded_forward.__func__ is doubled_forward
