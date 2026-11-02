@@ -32,6 +32,8 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _shard_features(parameter: nn.Parameter) -> Shard:
     """Match the production expert FSDP placement.

@@ -41,6 +41,7 @@ from nemo_automodel.components.models.qwen3_5.model import (
     Fp32SafeQwen3_5TextRotaryEmbedding,
     Qwen3_5DenseTextBackbone,
 )
+from nemo_automodel.components.models.qwen3_5_moe import cp_linear_attn
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import (
     CPAwareGatedDeltaNet,
     SSMGate,
@@ -349,7 +350,7 @@ class TestDenseTextBackbone:
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
         assert out.past_key_values is None
 
-    def test_forward_shape_mixed_layers(self):
+    def test_forward_shape_mixed_layers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import inspect
 
         from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf_modeling
@@ -364,6 +365,9 @@ class TestDenseTextBackbone:
         backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
         linear_attn = backbone.layers["1"].linear_attn
         # Shape coverage uses the real CPU math even when FLA is installed.
+        # HF resolves optional kernels at import time; setting the instance
+        # callable to None alone does not clear its decorated CUDA fallback.
+        monkeypatch.setattr(cp_linear_attn, "causal_conv1d_fn", inspect.unwrap(hf_modeling.causal_conv1d_fn))
         linear_attn.causal_conv1d_fn = None
         linear_attn.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
         with torch.no_grad():
@@ -373,7 +377,9 @@ class TestDenseTextBackbone:
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
         assert torch.isfinite(out.last_hidden_state).all()
 
-    def test_linear_attention_torch_convolution_fallback_forward_backward(self):
+    def test_linear_attention_torch_convolution_fallback_forward_backward(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """HF's convolution fallback matches the local grouped-convolution path."""
         import copy
         import inspect
@@ -393,15 +399,35 @@ class TestDenseTextBackbone:
             actual._fp32_params.A_log.zero_()
             actual._fp32_params.dt_bias.zero_()
         # Exercise the CPU references even when optional CUDA kernels are installed.
-        actual.causal_conv1d_fn = inspect.unwrap(hf_modeling.causal_conv1d_fn)
+        fallback_convolution = MagicMock(wraps=inspect.unwrap(hf_modeling.causal_conv1d_fn))
+        monkeypatch.setattr(cp_linear_attn, "causal_conv1d_fn", fallback_convolution)
+        actual.causal_conv1d_fn = None
         actual.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
         reference = copy.deepcopy(actual)
-        reference.causal_conv1d_fn = None
+
+        def grouped_convolution_reference(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor | None,
+            activation: str,
+            seq_idx: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            """Keep the pre-port grouped-convolution oracle independent of HF."""
+            assert activation == "silu"
+            assert seq_idx is None
+            return torch.nn.functional.silu(
+                torch.nn.functional.conv1d(
+                    x, weight.unsqueeze(1), bias, padding=weight.shape[-1] - 1, groups=x.shape[1]
+                )[:, :, : x.shape[-1]]
+            )
+
+        reference.causal_conv1d_fn = grouped_convolution_reference
         hidden = torch.randn(2, 7, cfg.hidden_size, requires_grad=True)
         reference_hidden = hidden.detach().clone().requires_grad_()
 
         actual_output = actual(hidden)
         reference_output = reference(reference_hidden)
+        fallback_convolution.assert_called_once()
         torch.testing.assert_close(actual_output, reference_output, rtol=1e-5, atol=1e-6)
         gradient = torch.randn_like(actual_output)
         actual_output.backward(gradient)
@@ -418,6 +444,23 @@ class TestDenseTextBackbone:
         embeds = torch.randn(1, 4, cfg.hidden_size)
         out = backbone(inputs_embeds=embeds)
         assert out.last_hidden_state.shape == (1, 4, cfg.hidden_size)
+
+    def test_blockdiag_cp_skips_full_pack_metadata(self, monkeypatch):
+        import nemo_automodel.components.distributed.blockdiag_cp as blockdiag_cp
+
+        cfg = _tiny_config(layer_types=("full_attention",))
+        backbone = Qwen3_5DenseTextBackbone(cfg, _backend())
+        layer_kwargs = []
+        backbone.layers["0"].forward = lambda x, **kwargs: layer_kwargs.append(kwargs) or x
+        # The block-diagonal CP sharder keeps local document IDs but strips packed_token_indices and cu_seqlens.
+        inputs = {"inputs_embeds": torch.randn(1, 4, cfg.hidden_size), "_packed_seq_ids": torch.tensor([[1, 1, 2, 2]])}
+
+        with pytest.raises(ValueError, match="dataset-provided packed_token_indices and cu_seqlens"):
+            backbone(**inputs)
+        monkeypatch.setattr(blockdiag_cp, "current_blockdiag_cp_state", lambda: object())
+        backbone(**inputs)
+
+        assert layer_kwargs[-1]["packed_gdn_metadata"] is None
 
     def test_reuses_packed_metadata_across_checkpointed_layers(self):
         torch.manual_seed(123)

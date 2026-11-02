@@ -1506,7 +1506,8 @@ def compute_lm_head_logits(
             else:
                 sliced = hidden_states[:, slice_indices, :]
         if fp32_lm_head:
-            logits = lm_head(sliced.float()).to(hidden_states.dtype)
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                logits = lm_head(sliced.float()).to(hidden_states.dtype)
         else:
             compute_dtype = None
             if isinstance(lm_head, FSDPModule):

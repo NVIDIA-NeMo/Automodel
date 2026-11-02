@@ -458,6 +458,17 @@ class DeepseekV4HashGate(nn.Module):
         token_mask: torch.Tensor | None = None,
         cp_mesh: "DeviceMesh | None" = None,  # noqa: F821 — MoE passes it but we do not need it
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """Route local states by the pending hash table or FP32 scores.
+
+        Args:
+            x: Tensor of shape [tokens, hidden].
+            token_mask: Optional boolean tensor [tokens]; unused by this router.
+            cp_mesh: Optional context-parallel mesh; unused by this router.
+
+        Returns:
+            Weights in the input dtype and integer expert indices, each shaped
+            [tokens, topk], followed by None for auxiliary loss.
+        """
         import torch.nn.functional as F
 
         input_ids = self._pending_input_ids
@@ -465,7 +476,8 @@ class DeepseekV4HashGate(nn.Module):
         # forward that forgets to set it.
         self._pending_input_ids = None
 
-        scores = F.linear(x.float(), self.weight.float())
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            scores = F.linear(x.float(), self.weight.float())
         if self.score_func == "sqrtsoftplus":
             scores = F.softplus(scores).sqrt()
         elif self.score_func == "sigmoid":

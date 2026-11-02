@@ -56,9 +56,25 @@ def _hc_project_core(
     norm_eps: float,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Coefficient projection up to the Sinkhorn input: pre, post and the [streams, streams] combination logits."""
+    """Project FP32 hyperconnection coefficients before Sinkhorn normalization.
+
+    Args:
+        hidden_states: Tensor of shape [batch, sequence, streams, hidden].
+        fn: Projection tensor of shape [2 * streams + streams * streams,
+            streams * hidden].
+        base: FP32 tensor of shape [2 * streams + streams * streams].
+        scale: FP32 tensor of shape [3], one scale per coefficient group.
+        streams: Number of residual streams.
+        norm_eps: Input RMS normalization epsilon.
+        eps: Positive offset for pre-mix coefficients.
+
+    Returns:
+        FP32 pre and post tensors of shape [batch, sequence, streams], and
+        combination logits of shape [batch, sequence, streams, streams].
+    """
     flat = hidden_states.flatten(2).float()
-    mixes = F.linear(flat, fn.float()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+    with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+        mixes = F.linear(flat, fn.float()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
     scales = torch.cat((scale[0].expand(streams), scale[1].expand(streams), scale[2].expand(streams * streams)))
     # The released kernel fuses the affine multiply/add before sigmoid and
     # Sinkhorn. Separate operations round its FP32 coefficients differently;
