@@ -121,10 +121,10 @@ checkpoint: EP64 without PP against EP32 with PP2 (1F1B, micro-batch 1), both
 with global batch 64 of 128-token padded HellaSwag samples, gradient clipping
 at 1.0, and identical batches for 10 optimizer steps. The Engram table was
 owned by all 64 ranks in the first run and by the 32 first-stage ranks in the
-second. Step-0 losses were 2.8140 and 2.8183 with gradient norms 41.92 and
-42.00; over the 10 steps the maximum absolute loss difference was 0.012 and
-the maximum relative gradient-norm difference 0.032, and the validation losses
-after step 9 were 2.2131 and 2.2058. Rank-0 peak memory was 39.7 GiB without
+second. Step-0 losses were 2.8137 and 2.8132 with gradient norms 41.86 and
+42.01; over the 10 steps the maximum absolute loss difference was 0.015 and
+the maximum relative gradient-norm difference 0.026, and the validation losses
+after step 9 were 2.2206 and 2.2121. Rank-0 peak memory was 39.7 GiB without
 PP and 63.5 GiB on the first pipeline stage, which holds the 32-way Engram
 shard and twice the local batch.
 
