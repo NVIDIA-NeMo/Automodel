@@ -86,6 +86,19 @@ fp8:
   filter_fqns: ["lm_head"]  # Skip these modules
 ```
 
+The Transformer Engine path (`model.backend.te_fp8`, used with the `te` `linear` / `experts` backends) has the
+same knob with the same substring matching, and it defaults to `["lm_head"]`: the output head runs in the model
+dtype unless the list is overridden. The train recipe applies it to every model part after construction.
+
+```yaml
+model:
+  backend:
+    linear: te
+    te_fp8:
+      recipe: block
+      filter_fqns: ["lm_head"]  # default; add names to keep more modules out of FP8
+```
+
 ### Speed and Convergence
 
 FP8 quantization provides measurable performance improvements while maintaining model convergence:

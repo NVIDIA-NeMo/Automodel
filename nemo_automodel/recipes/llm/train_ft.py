@@ -803,6 +803,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
+        if self.te_fp8 is not None:
+            # Modules named in te_fp8.filter_fqns (lm_head by default) run outside the FP8 autocast.
+            filtered = [name for part in self.model_parts for name in self.te_fp8.apply_module_filter(part)]
+            if filtered:
+                logging.info(
+                    "te_fp8: %d module(s) kept out of the FP8 autocast: %s", len(filtered), ", ".join(filtered)
+                )
 
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()

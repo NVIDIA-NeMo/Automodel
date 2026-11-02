@@ -16,6 +16,7 @@ import importlib.util
 import logging
 import math
 import os
+import types
 import warnings
 from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
@@ -226,6 +227,23 @@ def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
         return True
 
 
+def _fp8_disabled_autocast():
+    """Context manager that switches the Transformer Engine FP8 autocast off for the enclosed forward."""
+    from transformer_engine.pytorch.quantization import autocast as te_autocast
+
+    return te_autocast(enabled=False)
+
+
+def _forward_outside_fp8(module: nn.Module, *args, **kwargs):
+    """Run ``module``'s class ``forward`` with the FP8 autocast disabled.
+
+    Bound per instance by :meth:`TEFp8Config.apply_module_filter`; calling the class ``forward``
+    rather than a captured bound method keeps the binding valid after ``copy.deepcopy``.
+    """
+    with _fp8_disabled_autocast():
+        return type(module).forward(module, *args, **kwargs)
+
+
 @dataclass(kw_only=True)
 class TEFp8Config:
     """Configuration for Transformer Engine FP8 quantization.
@@ -241,6 +259,53 @@ class TEFp8Config:
     """
 
     recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    filter_fqns: tuple[str, ...] = ("lm_head",)
+    """Module names kept out of the FP8 autocast (their GEMMs run in the model dtype).
+
+    Same contract as the torchao ``fp8.filter_fqns`` block: a module is filtered when any entry is a
+    substring of its qualified name, so ``"lm_head"`` covers ``lm_head`` and
+    ``model.language_model.lm_head``. The default keeps the output head in high precision, as the
+    FP8 checkpoints' ``modules_to_not_convert`` lists do. The train recipe applies the filter to
+    every model part once the parts exist (:meth:`apply_module_filter`).
+    """
+
+    def __post_init__(self) -> None:
+        """Normalize ``filter_fqns`` from YAML lists or a single string into a tuple of names."""
+        if isinstance(self.filter_fqns, str):
+            self.filter_fqns = (self.filter_fqns,)
+        self.filter_fqns = tuple(self.filter_fqns)
+        if any(not isinstance(fqn, str) or not fqn for fqn in self.filter_fqns):
+            raise ValueError(f"te_fp8.filter_fqns must be non-empty module-name strings, got {self.filter_fqns!r}")
+
+    def module_filtered(self, name: str) -> bool:
+        """Whether the module with qualified name ``name`` stays out of the FP8 autocast."""
+        return any(fqn in name for fqn in self.filter_fqns)
+
+    def apply_module_filter(self, model: nn.Module) -> list[str]:
+        """Keep the modules matching :attr:`filter_fqns` out of the FP8 autocast.
+
+        Each matching module gets an instance ``forward`` that runs its class ``forward`` under
+        ``te_autocast(enabled=False)``; its parameters, state-dict keys and FSDP/pipeline wrapping are
+        untouched. Idempotent, and the binding follows the instance through ``copy.deepcopy``.
+
+        Args:
+            model: Model (or pipeline stage) whose modules are inspected by qualified name.
+
+        Returns:
+            Qualified names of the modules now kept out of FP8, in ``named_modules`` order; empty
+            without Transformer Engine or without filters.
+        """
+        if not HAVE_TE or not self.filter_fqns:
+            return []
+        filtered: list[str] = []
+        for name, module in model.named_modules():
+            if not name or not self.module_filtered(name):
+                continue
+            bound = vars(module).get("forward")
+            if not (isinstance(bound, types.MethodType) and bound.__func__ is _forward_outside_fp8):
+                module.forward = types.MethodType(_forward_outside_fp8, module)
+            filtered.append(name)
+        return filtered
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
