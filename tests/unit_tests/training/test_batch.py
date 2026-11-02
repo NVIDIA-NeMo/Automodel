@@ -16,7 +16,7 @@
 
 import torch
 
-from nemo_automodel.shared.batch import move_batch_to_device
+from nemo_automodel.components.training.batch import move_batch_to_device
 
 
 def test_deferred_ids_remain_cpu_while_nested_model_tensors_move():

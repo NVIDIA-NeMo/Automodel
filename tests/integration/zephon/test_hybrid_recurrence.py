@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import configure_packing_for_models
-from nemo_automodel.shared.batch import move_batch_to_device
+from nemo_automodel.components.training.batch import move_batch_to_device
 from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 

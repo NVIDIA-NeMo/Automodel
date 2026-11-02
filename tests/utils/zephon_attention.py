@@ -21,8 +21,8 @@ import torch
 from transformers import PreTrainedModel
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.components.models.common.packing import configure_packing
-from nemo_automodel.shared.packed_seq import indexed_mask_to_4d_block_causal
 
 
 def compare_decoder_attention(
