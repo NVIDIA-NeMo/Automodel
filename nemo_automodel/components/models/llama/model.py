@@ -539,6 +539,11 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @property
+    def _uses_hf_attention(self) -> bool:
+        """BSHD and NEAT use HF dispatch; TE handles only pre-packed THD."""
+        return True
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""

@@ -18,15 +18,15 @@ import pytest
 import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gpt_oss.layers import (
     GptOssAttention,
 )
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.shared.import_utils import is_te_min_version
 
 # Over the default 5s budget on purpose: CUDA FlexAttention compilation takes longer on a cold worker.
 # Reduce cold compiler startup before lowering this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 @pytest.fixture
@@ -149,6 +149,7 @@ class TestGptOssAttention:
         assert attention.o_proj.out_features == gpt_config.hidden_size
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.runtime_budget(60, hard_timeout=70, reason="compiles CUDA FlexAttention on a cold worker")
     def test_forward_shape_correctness(self, gpt_config, backend_config, device):
         """Test forward pass output shapes."""
         attention = GptOssAttention(gpt_config, backend_config)
@@ -162,7 +163,12 @@ class TestGptOssAttention:
         with patch.object(attention.attn_module, "__call__") as mock_attn:
             # Mock attention module to return expected shape
             mock_attn.return_value = torch.randn(
-                batch_size, gpt_config.num_attention_heads, seq_len, gpt_config.head_dim, dtype=torch.bfloat16, device=device
+                batch_size,
+                gpt_config.num_attention_heads,
+                seq_len,
+                gpt_config.head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
 
             output = attention(x, freqs_cis)
@@ -256,9 +262,12 @@ class TestGptOssAttention:
         assert attention.yarn_concentration is None
 
     @pytest.mark.skip(reason="TE fused RoPE force-disabled globally in BackendConfig.__post_init__; see #3027")
-    def test_yarn_concentration_set_with_rope_fusion(self, gpt_config_with_rope_scaling, backend_config_with_rope_fusion):
+    def test_yarn_concentration_set_with_rope_fusion(
+        self, gpt_config_with_rope_scaling, backend_config_with_rope_fusion
+    ):
         """Test that yarn_concentration is correctly computed when rope_fusion is True."""
         import math
+
         attention = GptOssAttention(gpt_config_with_rope_scaling, backend_config_with_rope_fusion)
 
         assert hasattr(attention, "yarn_concentration")
@@ -270,6 +279,7 @@ class TestGptOssAttention:
     def test_yarn_concentration_different_scaling_factors(self, backend_config_with_rope_fusion):
         """Test yarn_concentration with different scaling factors."""
         import math
+
         for factor in [1.5, 2.0, 4.0, 8.0]:
             config = GptOssConfig(
                 vocab_size=1000,
@@ -318,8 +328,12 @@ class TestGptOssAttentionWithTE:
 
         # Mock TE version check to simulate old version
         from unittest.mock import patch
+
         with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=False):
-            with pytest.raises(ValueError, match="Transformer Engine DotProductAttention for GPT-OSS is only supported for TE version 2.8.0 or higher"):
+            with pytest.raises(
+                ValueError,
+                match="Transformer Engine DotProductAttention for GPT-OSS is only supported for TE version 2.8.0 or higher",
+            ):
                 GptOssAttention(gpt_config, te_backend)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -329,6 +343,7 @@ class TestGptOssAttentionWithTE:
 
         # Mock version check to allow initialization
         from unittest.mock import patch
+
         with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config)
 
@@ -346,6 +361,7 @@ class TestGptOssAttentionWithTE:
         pytest.importorskip("transformer_engine")
 
         from unittest.mock import patch
+
         with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config)
 
@@ -363,6 +379,7 @@ class TestGptOssAttentionWithTE:
         pytest.importorskip("transformer_engine")
 
         from unittest.mock import patch
+
         with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config)
             attention = attention.to(device)
@@ -385,6 +402,7 @@ class TestGptOssAttentionWithTE:
         pytest.importorskip("transformer_engine")
 
         from unittest.mock import patch
+
         with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config)
             attention = attention.to(device)
@@ -413,6 +431,7 @@ class TestGptOssAttentionWithTE:
         gpt_config.sliding_window = 256
 
         from unittest.mock import patch
+
         with patch("nemo_automodel.components.models.gpt_oss.layers.is_te_min_version", return_value=True):
             attention = GptOssAttention(gpt_config, te_backend_config, use_sliding_attention=True)
             attention = attention.to(device)

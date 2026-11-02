@@ -14,7 +14,7 @@
 
 """Gemma4's opt-in to whole-block activation checkpointing for KV-shared models.
 
-``DefaultParallelizationStrategy`` keeps KV-shared models off whole-block
+``ModelParallelizer`` keeps KV-shared models off whole-block
 checkpointing unless the model class declares its shared-K/V store safe under
 checkpoint replay. Gemma4 E2B/E4B depend on that declaration to keep attention
 inside the recomputed region; without it they drop to
@@ -27,10 +27,13 @@ name to the class that has to carry it: deleting the attribute from
 These tests are that tie.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from nemo_automodel.components.distributed.parallelizer import _kv_sharing_survives_checkpoint_replay
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
+from nemo_automodel.components.models.gemma4_moe.parallelization import PARALLELIZER
 
 ATTRIBUTE = "kv_sharing_survives_checkpoint_replay"
 
@@ -48,6 +51,32 @@ def test_parallelizer_sees_the_opt_in_on_a_gemma4_instance():
     """
     model = Gemma4ForConditionalGeneration.__new__(Gemma4ForConditionalGeneration)
     assert _kv_sharing_survives_checkpoint_replay(model) is True
+
+
+def test_gemma4_sidecar_owns_full_layer_checkpointing_opt_in():
+    model = SimpleNamespace(kv_sharing_survives_checkpoint_replay=True)
+
+    assert PARALLELIZER._use_full_layer_activation_checkpointing(model) is True
+
+
+def test_gemma4_sidecar_validates_per_layer_attention_heads():
+    """Gemma4's sidecar must not read its ambiguous global KV-head property."""
+
+    class TextConfig:
+        enable_moe_block = False
+        per_layer_config = [
+            SimpleNamespace(num_attention_heads=8, num_key_value_heads=4),
+            SimpleNamespace(num_attention_heads=8, num_key_value_heads=2),
+        ]
+
+        @property
+        def num_key_value_heads(self):
+            raise AssertionError("global KV-head property is ambiguous")
+
+    model = SimpleNamespace(config=SimpleNamespace(text_config=TextConfig()))
+    mesh = SimpleNamespace(size=lambda: 2)
+
+    PARALLELIZER._validate_tp_mesh(model, mesh)
 
 
 @pytest.mark.parametrize(

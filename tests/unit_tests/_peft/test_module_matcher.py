@@ -70,6 +70,33 @@ class TestWildcardMatch:
         assert wildcard_match("*.*.*", "a.b.c") is True
         assert wildcard_match("*.b.*", "a.b") is True
 
+    def test_segment_wildcard_does_not_extend_layer_index(self):
+        # ".*" after a name segment matches that segment's children, not longer
+        # segments that share its prefix: layer 1 must not also select layers 10-19.
+        assert wildcard_match("*.layers.1.*.linear_qkv", "decoder.layers.1.self_attention.linear_qkv") is True
+        assert wildcard_match("*.layers.1.*.linear_qkv", "decoder.layers.10.self_attention.linear_qkv") is False
+        assert wildcard_match("*.layers.1.*", "model.layers.12.mlp.down_proj") is False
+        assert wildcard_match("*.layers.1.*", "model.layers.1.mlp.down_proj") is True
+
+    @pytest.mark.parametrize("pattern", ["*layers.1.*", ".*layers.1.*", "model.layers.1.*"])
+    def test_layer_index_wildcard_spellings_select_only_that_layer(self, pattern):
+        assert wildcard_match(pattern, "model.layers.1.mlp.down_proj") is True
+        assert wildcard_match(pattern, "model.layers.12.mlp.down_proj") is False
+
+    def test_fully_qualified_pattern_matches_through_a_layer_wildcard(self):
+        assert wildcard_match("model.layers.*.self_attn.q_proj", "model.layers.7.self_attn.q_proj") is True
+        assert wildcard_match("model.layers.*.self_attn.q_proj", "model.layers.7.self_attn.k_proj") is False
+        # A pattern that starts with a full segment path matches its children, not a longer sibling name.
+        assert wildcard_match("model.layers.*", "model.layers.3.mlp.up_proj") is True
+        assert wildcard_match("model.layers.*", "model.layers_norm") is False
+
+    def test_fragment_wildcard_still_matches_any_text(self):
+        # The regex-style fragment documented for apply_lora_to_linear_modules must keep matching fc1/fc2.
+        assert wildcard_match(".*fc.*", "model.decoder.layers.0.fc1") is True
+        assert wildcard_match(".*fc.*", "vision_model.encoder.layers.3.mlp.fc2") is True
+        assert wildcard_match("*mlp.*", "model.layers.0.mlp_gate.proj") is True
+        assert wildcard_match("*mlp.fc.*", "model.layers.0.mlp.fc1") is True
+
 
 # ------------------------------------------------------------------ #
 # ModuleMatcher validation tests                                      #
@@ -194,3 +221,18 @@ class TestModuleMatcherMatch:
             name="linear_proj",
             prefix="decoder.layers.0.self_attention",
         )
+
+    def test_target_modules_layer_wildcards_select_only_those_layers(self):
+        # Documented usage: LoRA on linear_qkv of the first two layers only.
+        matcher = ModuleMatcher(target_modules=["*.layers.0.*.linear_qkv", "*.layers.1.*.linear_qkv"])
+        matched = [
+            i
+            for i in range(24)
+            if matcher.match(nn.Linear(10, 10), name=f"decoder.layers.{i}.self_attention.linear_qkv")
+        ]
+        assert matched == [0, 1]
+
+    def test_exclude_modules_layer_wildcard_excludes_only_that_layer(self):
+        matcher = ModuleMatcher(exclude_modules=["*.layers.1.*"])
+        excluded = [i for i in range(24) if not matcher.match(nn.Linear(10, 10), name=f"model.layers.{i}.mlp.up_proj")]
+        assert excluded == [1]

@@ -853,6 +853,8 @@ class LagunaModel(nn.Module):
 class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal LM wrapper for Laguna with Automodel checkpoint adapters."""
 
+    _uses_hf_attention: bool = True
+
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "rotary_emb"]
     _skip_init_weights_on_load = True

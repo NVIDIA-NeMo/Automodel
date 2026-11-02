@@ -65,7 +65,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-235B-A22B
   trust_remote_code: true
   backend:
@@ -115,3 +115,6 @@ ci:
   nodes: 8
   cluster_tag: gb200
   ep_size: 32
+  env_vars:
+    # Keep each worker on the CPUs local to its GPU across NCCL runtime versions.
+    TORCHRUN_NUMA_BINDING: "node"

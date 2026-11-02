@@ -100,6 +100,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  cluster_tag: h100
   recipe_owner: adil-a
   time: "00:25:00"
   known_issue_id: AM-153

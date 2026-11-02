@@ -152,7 +152,7 @@ def _cpu_worker(rank, rendezvous):
 
 @pytest.mark.runtime_budget(
     30,
-    hard_timeout=60,
+    hard_timeout=70,
     reason="two spawned workers import the model stack and check real CP gradients and optimizer updates",
 )
 def test_cp2_attention_gradients_clipping_update_and_padding(tmp_path: Path):

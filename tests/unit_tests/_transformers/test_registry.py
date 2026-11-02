@@ -544,7 +544,7 @@ def test_deepseek_v4_registered_in_arch_mapping():
         "DSV4 checkpoints declare this architecture and need it routed to the "
         "in-tree model implementation."
     )
-    module_path, cls_name = MODEL_ARCH_MAPPING["DeepseekV4ForCausalLM"]
+    module_path, cls_name = MODEL_ARCH_MAPPING["DeepseekV4ForCausalLM"][:2]
     assert module_path == "nemo_automodel.components.models.deepseek_v4.model"
     assert cls_name == "DeepseekV4ForCausalLM"
 
@@ -574,7 +574,7 @@ def test_nemotron_h_omni_reasoning_v3_registered_in_arch_mapping():
 
     assert "NemotronH_Omni_Reasoning_V3" in MODEL_ARCH_MAPPING, (
         "NemotronH_Omni_Reasoning_V3 missing from MODEL_ARCH_MAPPING. "
-        "nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained (and other "
+        "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 (and other "
         "Super-scale omni checkpoints) declare this architecture and need it routed "
         "to the in-tree model implementation."
     )

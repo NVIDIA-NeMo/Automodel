@@ -53,8 +53,8 @@ class CachedTeacherEmbeddings:
         self.num_queries = int(index["num_queries"])
         self.num_docs = int(index["num_docs"])
 
-        self._queries = np.load(queries_path, mmap_mode="r")
-        self._docs = np.load(docs_path, mmap_mode="r")
+        self._queries = np.load(queries_path, mmap_mode="r", allow_pickle=False)
+        self._docs = np.load(docs_path, mmap_mode="r", allow_pickle=False)
         if self._queries.shape != (self.num_queries, self.dim):
             raise RuntimeError(
                 f"queries.npy shape {self._queries.shape} does not match index ({self.num_queries}, {self.dim})"

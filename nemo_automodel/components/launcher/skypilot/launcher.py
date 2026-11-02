@@ -14,6 +14,7 @@
 
 import logging
 import os
+import shlex
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -70,15 +71,15 @@ class SkyPilotLauncher(Launcher):
             parts += [
                 "--nnodes=$SKYPILOT_NUM_NODES",
                 "--node_rank=$SKYPILOT_NODE_RANK",
-                "--rdzv_backend=c10d",
-                "--master_addr=$(echo $SKYPILOT_NODE_IPS | head -n1)",
+                '--master_addr="$(echo "$SKYPILOT_NODE_IPS" | head -n1)"',
                 "--master_port=12375",
             ]
 
         parts += [script_path, "-c", job_conf_path]
 
         if extra_args:
-            parts.extend(extra_args)
+            # ``run`` is executed by bash, so quote each override to pass it through verbatim.
+            parts.extend(shlex.quote(arg) for arg in extra_args)
 
         return " ".join(parts)
 

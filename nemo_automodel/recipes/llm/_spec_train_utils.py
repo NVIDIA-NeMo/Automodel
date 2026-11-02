@@ -29,6 +29,7 @@ from typing import Any
 
 import torch.nn as nn
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_selective_checkpointing_to_layers,
     apply_submodule_checkpointing,
@@ -81,7 +82,7 @@ def apply_draft_activation_checkpointing(draft_model: nn.Module, mode: bool | st
     used for the target (so ``"off"``/``"none"``/``"disabled"``/``"no"`` disable the
     draft too, not just a literal ``false``); no-op once normalized to ``False``.
     These recipes wrap the draft with plain ``DistributedDataParallel`` /
-    ``fully_shard`` instead of the FSDP2Manager/DDPManager path that applies AC
+    ``fully_shard`` instead of the ModelParallelizer path that applies AC
     automatically, so it must be requested explicitly here, before the draft is
     wrapped.
     """
@@ -96,11 +97,34 @@ def apply_draft_activation_checkpointing(draft_model: nn.Module, mode: bool | st
         apply_selective_checkpointing_to_layers(draft_model, layers, has_kv_sharing=False)
         logger.info("Enabled selective activation checkpointing on %d draft layers", len(layers))
     else:
-        # These recipes bypass the FSDP2Manager/DDPManager parallelize() path that
+        # These recipes bypass the ModelParallelizer path that
         # would otherwise pick HF-native gradient checkpointing automatically, so
         # wrap the submodules directly instead.
         apply_submodule_checkpointing(layers, has_kv_sharing=False)
         logger.info("Enabled full activation checkpointing on %d draft layers", len(layers))
+
+
+def read_load_metadata_with_gloo(checkpoint_cfg: ConfigNode | None) -> bool:
+    """Read ``checkpoint.load_metadata_with_gloo`` for the frozen target load.
+
+    Speculative-decoding recipes load the target before they build the draft
+    ``CheckpointingConfig``, so the YAML ``checkpoint`` section is read directly here.
+
+    Args:
+        checkpoint_cfg: The recipe's ``checkpoint`` config section, or ``None`` when absent.
+
+    Returns:
+        Whether DCP load planning for the target should use a shared Gloo group.
+
+    Raises:
+        ValueError: If the resolved option is not a boolean.
+    """
+    if checkpoint_cfg is None:
+        return False
+    enabled = checkpoint_cfg.get("load_metadata_with_gloo", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("checkpoint.load_metadata_with_gloo must be a boolean")
+    return enabled
 
 
 def raise_if_peft_configured(cfg: Any, recipe_name: str) -> None:

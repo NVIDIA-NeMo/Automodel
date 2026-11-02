@@ -223,6 +223,17 @@ class KimiK3DFlashDraftModel(nn.Module):
         self.norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Output transform some targets apply around the frozen lm_head; identity
+        # unless the target's ``dflash_config`` sets these (see compute_logits).
+        multiplier = float(dflash_config.get("output_multiplier", 1.0))
+        if multiplier <= 0:
+            raise ValueError(f"output_multiplier must be > 0 when set, got {multiplier}.")
+        self.output_multiplier = multiplier
+        softcap = dflash_config.get("final_logit_softcapping", None)
+        if softcap is not None and float(softcap) <= 0:
+            raise ValueError(f"final_logit_softcapping must be > 0 when set, got {softcap}.")
+        self.final_logit_softcapping = None if softcap is None else float(softcap)
+        self.input_embedding_scale = float(dflash_config.get("input_embedding_scale", 1.0))
 
     def forward(
         self,
@@ -258,6 +269,28 @@ class KimiK3DFlashDraftModel(nn.Module):
                 attention_mask=attention_mask,
             )
         return self.norm(hidden_states)
+
+    def compute_logits(self, hidden: torch.Tensor, output_head: nn.Module) -> torch.Tensor:
+        """Project draft hidden states to logits, applying the target's output transform.
+
+        See ``Qwen3DFlashDraftModel.compute_logits`` -- same contract, identity
+        unless the target's ``dflash_config`` sets ``output_multiplier`` /
+        ``final_logit_softcapping``.
+
+        Args:
+            hidden: Tensor of shape [..., hidden]; draft hidden states with
+                arbitrary leading dimensions.
+            output_head: The frozen target's output projection.
+
+        Returns:
+            Tensor of shape [..., vocab].
+        """
+        logits = output_head(hidden)
+        if self.output_multiplier != 1.0:
+            logits = logits * self.output_multiplier
+        if self.final_logit_softcapping is not None:
+            logits = torch.tanh(logits / self.final_logit_softcapping) * self.final_logit_softcapping
+        return logits
 
 
 def build_kimi_k3_dflash_draft_config(

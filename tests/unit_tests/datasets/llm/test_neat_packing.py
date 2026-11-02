@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from datasets import Dataset
@@ -389,6 +391,7 @@ class TestNeatPackedCollater:
         assert result["position_ids"].shape == (2, 4)
         assert result["attention_mask"].shape == (2, 1, 4, 4)
         assert result["attention_mask"].dtype == torch.bool
+        assert "packed_token_indices" not in result
 
     def test_sdpa_preserves_indexed_packed_seq_ids(self):
         batch = [
@@ -399,15 +402,21 @@ class TestNeatPackedCollater:
                 "position_ids": torch.tensor([0, 1, 0, 1]),
             },
         ]
-        result = neat_packed_collater(batch, attn_implementation="sdpa")
+        result = neat_packed_collater(
+            batch,
+            packing=SimpleNamespace(
+                packed_mask_type="block_causal",
+                requires_packed_sequence_metadata=False,
+            ),
+        )
 
         assert result["attention_mask"].shape == (1, 1, 4, 4)
         assert result["attention_mask"].dtype == torch.bool
         assert result["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
 
 
-class TestNeatPackedCollaterFlashVersions:
-    """The indexed 2D mask must be kept for every flash-attention version (4D only for sdpa/eager)."""
+class TestNeatPackedCollaterContracts:
+    """The structural packing contract selects mask layout and metadata."""
 
     def _batch(self):
         return [
@@ -420,11 +429,66 @@ class TestNeatPackedCollaterFlashVersions:
         ]
 
     @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
-    def test_flash_versions_keep_indexed_2d_mask(self, impl):
+    def test_flash_versions_emit_varlen_kwargs_and_no_mask(self, impl):
         out = neat_packed_collater(self._batch(), attn_implementation=impl)
+        # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
+        assert "attention_mask" not in out
+        # cu_seqlens spans the full flattened batch: doc1 (2) + doc2 (2) = 4 tokens.
+        assert out["cu_seq_lens_q"].tolist() == [0, 2, 4]
+        assert torch.equal(out["cu_seq_lens_q"], out["cu_seq_lens_k"])
+        assert out["max_length_q"] == out["max_length_k"] == 2
+        # Per-document ids preserved for loss / context-parallel consumers.
+        assert out["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
+
+    def test_document_ids_contract_keeps_indexed_2d_mask(self):
+        packing = SimpleNamespace(
+            packed_mask_type="document_ids",
+            requires_packed_sequence_metadata=False,
+        )
+
+        out = neat_packed_collater(self._batch(), packing=packing)
+
         assert out["attention_mask"].dim() == 2
         assert out["attention_mask"].tolist() == [[1, 1, 2, 2]]
 
-    def test_sdpa_gets_4d_mask(self):
-        out = neat_packed_collater(self._batch(), attn_implementation="sdpa")
+    def test_block_causal_contract_gets_4d_mask(self):
+        packing = SimpleNamespace(
+            packed_mask_type="block_causal",
+            requires_packed_sequence_metadata=False,
+        )
+
+        out = neat_packed_collater(self._batch(), packing=packing)
+
         assert out["attention_mask"].dim() == 4
+
+    def test_metadata_contract_emits_backend_neutral_varlen_metadata(self):
+        packing = SimpleNamespace(
+            packed_mask_type="document_ids",
+            requires_packed_sequence_metadata=True,
+        )
+
+        out = neat_packed_collater(self._batch(), packing=packing)
+
+        assert out["attention_mask"].tolist() == [[1, 1, 2, 2]]
+        assert out["packed_token_indices"].tolist() == [[0, 1, 2, 3]]
+        assert out["cu_seqlens"].tolist() == [[0, 2, 4]]
+        assert out["max_seqlen"] == 2
+
+    def test_unknown_mask_type_is_rejected(self):
+        packing = SimpleNamespace(
+            packed_mask_type="unknown",
+            requires_packed_sequence_metadata=False,
+        )
+
+        with pytest.raises(ValueError, match="Unsupported packed_mask_type"):
+            neat_packed_collater(self._batch(), packing=packing)
+
+    def test_deprecated_attention_keyword_is_translated(self):
+        with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
+            out = neat_packed_collater(
+                self._batch(),
+                attn_implementation="flash_attention_2",
+            )
+
+        assert "attention_mask" not in out
+        assert out["cu_seq_lens_q"].tolist() == [0, 2, 4]

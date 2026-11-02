@@ -33,6 +33,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-8B
   pooling: avg
+  is_causal: false
   torch_dtype: bfloat16
 
 tokenizer:
@@ -103,3 +104,6 @@ distributed:
 dist_env:
   backend: nccl
   timeout_minutes: 30
+
+ci:
+  cluster_tag: h100

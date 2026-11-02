@@ -46,6 +46,36 @@ model:
 - **Dotted paths**: `pkg.module.symbol`
 - **Local file paths**: `/abs/path/to/file.py:symbol`
 
+### Load a Hugging Face Model Configuration
+
+For a nested model configuration, use the explicit NeMo target:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: openai-community/gpt2
+    n_layer: 6
+```
+
+`NeMoAutoConfig` retains the commit selected by the Hub download so concurrent
+updates to a shared cache's branch reference cannot change the config lookup.
+It preserves normal online freshness checks and the Transformers options
+`revision`, `cache_dir`, `subfolder`, `token`, `local_files_only`,
+`force_download`, and `trust_remote_code`. Nested model overrides continue to
+work, including CLI overrides such as `--model.config.n_layer 6`.
+
+The NeMo model API uses the same resolution internally and keeps subsequent
+config and pretrained-weight reads on the selected commit. To make separate
+jobs or independently starting ranks use a predetermined version, set `revision`
+to an immutable Hub commit in the model-loading arguments.
+
+`ConfigNode` invokes the configured callable without applying library-specific
+cache policy. Existing `transformers.AutoConfig.from_pretrained` targets remain
+valid and retain upstream behavior; change their target to `NeMoAutoConfig` to
+use the shared-cache fix.
+
 ### Target Resolution and Code Execution
 
 Target resolution is intentionally permissive and should be treated as code execution:
@@ -58,6 +88,60 @@ Target resolution is intentionally permissive and should be treated as code exec
 Only load configuration files and `_target_` values from trusted sources. A YAML file that names an importable package or Python file can execute arbitrary Python code during target resolution.
 
 </Warning>
+
+## Select Attention Backends
+
+Attention selection follows the implementation that owns each attention path:
+
+| Setting | Scope |
+| --- | --- |
+| `model.backend.attn` | Native AutoModel attention that consumes `BackendConfig`, for example `sdpa`, `te`, or `fa4`. Supported choices depend on the model. |
+| `model.attn_implementation` | Hugging Face attention dispatch. In a VLM with a native text decoder and retained HF vision tower, this can select vision attention independently of native text attention. |
+| `model.force_hf: true` | Selects HF model construction instead of a registered native model. AutoModel still provides training, distributed infrastructure, and applicable runtime patches. |
+
+An explicit native backend remains authoritative for paths it owns. Setting
+`attn_implementation: flash_attention_4` alongside `backend.attn: sdpa` does
+not change native text attention to FlashAttention-4. On native models that
+declare FA4 support, `attn_implementation: flash_attention_4` also supplies
+`backend.attn: fa4` when the entire `backend` setting is absent or `null`.
+If a backend is supplied, select its attention explicitly.
+
+For example, the native Qwen3.5-VL path can combine native FA4 full attention
+with HF FA4 vision attention:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.5-4B
+  attn_implementation: flash_attention_4
+  backend:
+    _target_: nemo_automodel.components.models.common.utils.BackendConfig
+    attn: fa4
+```
+
+Changing `backend.attn` to `te` selects native Transformer Engine full
+attention while retaining HF FA4 vision dispatch. These different selections
+are intentional. Install the selected optional kernels in the training image;
+setting a flag does not install them. Model-specific recurrent, sparse, and
+auxiliary attention paths can have their own implementation constraints. For
+example, Qwen3.5 Gated DeltaNet blocks are separate from full attention, and
+its MTP attention uses a model-owned SDPA path.
+
+To compare against HF model construction, set `model.force_hf: true` and
+remove the native `model.backend` section; use `model.attn_implementation` to
+select the HF attention implementation. This retains the AutoModel training
+recipe and is not a switch to an Accelerate training loop.
+
+Startup logs report `Model construction attention: primary text/BSHD=...`
+from the built model's packing-relevant attention selection. For VLMs with a
+`vision_config`, they also report its HF dispatch key, qualified by whether
+HF vision attention is retained. A warning highlights explicit native SDPA
+or eager selection paired with an HF FlashAttention request. Native TE with
+HF FlashAttention remains a valid mixed selection and does not trigger this
+warning. These messages describe construction-time selection, not every
+executed kernel: later runtime patches, model-owned paths, and the attention
+library's own kernel dispatch can affect execution. Use Nsight Systems to
+verify the kernels in a performance investigation.
 
 ## Distributed Section (Strategy-Based)
 
@@ -205,6 +289,38 @@ Hardware detection cannot determine the effective training precision, so FP8
 and structured-sparse runs must provide the appropriate peak explicitly. An
 unknown device emits a warning and reports 0% MFU until you configure a
 supported `device` value or an explicit `peak_tflops` value.
+
+## Profile VLM Training with NVTX
+
+Set the top-level `nvtx` option to annotate VLM model forwards with module names:
+
+```yaml
+nvtx: true
+```
+
+The option defaults to `false`. It annotates each local model part, including
+pipeline stages and activation-checkpoint recomputation. VLM profiling uses
+forward hooks only; it does not add module-level backward ranges. Nsight Systems
+still captures the CUDA kernels launched during backward.
+
+With the NeMo AutoModel environment activated in a checkout, run the following
+command on a single GPU with [Nsight Systems](https://developer.nvidia.com/nsight-systems)
+available on `PATH`:
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt --output=vlm-profile \
+  python -m nemo_automodel.recipes.vlm.finetune \
+  --config examples/vlm_finetune/qwen3_5/qwen3_5_4b_neat_packing.yaml \
+  --nvtx true --step_scheduler.max_steps 10 \
+  --checkpoint.enabled false --step_scheduler.validate_on_checkpoint false
+```
+
+Use the generated `vlm-profile.nsys-rep` timeline to correlate module ranges with
+CUDA kernels and gaps between steps. Separate setup and compilation from later
+training steps when investigating steady-state throughput. Profiling adds
+overhead; measure throughput separately with `nvtx: false` and the same checkpoint
+and validation overrides. These overrides disable checkpoint auto-resume, saves,
+and checkpoint-triggered validation so repeated runs execute the training steps.
 
 ## Repair Near-Zero Input Embeddings
 

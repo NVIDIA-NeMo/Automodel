@@ -295,7 +295,9 @@ class InklingGate(nn.Module):
         if compute_dtype is not None:
             flat = flat.to(compute_dtype)
             weight = weight.to(compute_dtype)
-        router_logits = F.linear(flat, weight)
+        # Explicit gate precision must override an enclosing model autocast.
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            router_logits = F.linear(flat, weight)
 
         scores = router_logits.sigmoid()
         routed_scores = scores[..., : -self.n_shared_experts]

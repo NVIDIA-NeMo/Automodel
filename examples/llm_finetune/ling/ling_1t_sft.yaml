@@ -122,6 +122,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  cluster_tag: h100
   recipe_owner: Hayden727
   nodes: 32
   time: "01:00:00"

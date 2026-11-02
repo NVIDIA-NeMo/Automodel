@@ -13,8 +13,13 @@
 # limitations under the License.
 
 
+import json
+import logging
+from pathlib import Path
+
 import pytest
 import torch
+from transformers import PretrainedConfig
 from transformers.models.donut.modeling_donut_swin import DonutSwinModelOutput
 
 from nemo_automodel.components.models.nemotron_parse import model as np_model
@@ -71,6 +76,102 @@ def test_radio_with_neck_respects_processor_normalization(monkeypatch, image_pro
     assert radio_encoder.input_dtypes == [torch.float32, torch.float32]
     assert first_output.last_hidden_state.shape == (1, 2, 1024)
     assert second_output.last_hidden_state.shape == (1, 2, 1024)
+
+
+@pytest.mark.parametrize("config_source", ["checkpoint", "encoder_config"])
+@pytest.mark.parametrize(
+    "flags, normalizes, warns",
+    [
+        pytest.param({}, False, False, id="missing"),
+        pytest.param({"image_processor_normalizes": True}, True, False, id="v1_1"),
+        pytest.param({"image_processor_normalizes": False}, False, False, id="legacy_false"),
+        pytest.param({"processor_normalizes": True}, True, False, id="v1_2_and_v2_0"),
+        pytest.param({"processor_normalizes": False}, False, False, id="current_false"),
+        pytest.param(
+            {"processor_normalizes": None, "image_processor_normalizes": True}, True, False, id="null_fallback"
+        ),
+        pytest.param({"processor_normalizes": True, "image_processor_normalizes": True}, True, False, id="both_true"),
+        pytest.param(
+            {"processor_normalizes": False, "image_processor_normalizes": False}, False, False, id="both_false"
+        ),
+        pytest.param(
+            {"processor_normalizes": False, "image_processor_normalizes": True}, False, True, id="current_false_wins"
+        ),
+        pytest.param(
+            {"processor_normalizes": True, "image_processor_normalizes": False}, True, True, id="current_true_wins"
+        ),
+        pytest.param({"processor_normalizes": None, "image_processor_normalizes": None}, False, False, id="both_null"),
+    ],
+)
+def test_normalization_contract_survives_config_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    config_source: str,
+    flags: dict[str, bool | None],
+    normalizes: bool,
+    warns: bool,
+) -> None:
+    """Normalize once after native checkpoint loading or a preloaded HF encoder config."""
+    encoder_fields = {"_name_or_path": "nvidia/C-RADIOv2-H", "patch_size": 1, **flags}
+    if config_source == "checkpoint":
+        # RADIO's base config lacks both flags; only the Parse checkpoint carries them.
+        monkeypatch.setattr(
+            np_model.AutoConfig, "from_pretrained", lambda *args, **kwargs: PretrainedConfig(patch_size=1)
+        )
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "nemotron_parse", "encoder": encoder_fields}))
+        config = np_model.NemotronParseConfig.from_pretrained(tmp_path)
+        saved_path = tmp_path / "saved"
+        config.save_pretrained(saved_path)
+        saved_encoder = json.loads((saved_path / "config.json").read_text())["encoder"]
+        for key, value in flags.items():
+            assert key in saved_encoder
+            assert saved_encoder[key] is value
+        encoder_config = np_model.NemotronParseConfig.from_pretrained(saved_path).encoder
+    else:
+        # The HF remote config constructs RADIOConfig(**encoder), preserving extra fields.
+        encoder_config = PretrainedConfig(**encoder_fields)
+
+    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+    std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+
+    class ConditioningRadioEncoder(_DummyRadioEncoder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conditioned_inputs: list[torch.Tensor] = []
+
+        def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            """Apply the internal conditioner unless the wrapper externalized it.
+
+            Args:
+                pixel_values: Tensor of shape [batch, channels, height, width].
+
+            Returns:
+                Summary features of shape [batch, 3840] and patch features of shape
+                [batch, height * width, 1280].
+            """
+            conditioned = pixel_values if self.externalize_calls else (pixel_values - mean) / std
+            self.conditioned_inputs.append(conditioned.detach().clone())
+            return super().forward(conditioned)
+
+    radio_encoder = ConditioningRadioEncoder()
+    monkeypatch.setattr(np_model.AutoModel, "from_config", lambda *args, **kwargs: radio_encoder)
+    with caplog.at_level(logging.WARNING, logger=np_model.__name__):
+        encoder = np_model.RadioWithNeck(encoder_config)
+    assert ("processor_normalizes and image_processor_normalizes disagree" in caplog.text) is warns
+
+    white_image = torch.ones(1, 3, 1, 4)
+    normalized = (white_image - mean) / std
+    pixel_values = normalized if normalizes else white_image
+    with torch.no_grad():
+        encoder(pixel_values)
+        encoder(pixel_values)
+
+    assert encoder.image_processor_normalizes is normalizes
+    assert radio_encoder.externalize_calls == int(normalizes)
+    assert len(radio_encoder.conditioned_inputs) == 2
+    for conditioned in radio_encoder.conditioned_inputs:
+        torch.testing.assert_close(conditioned, normalized)
 
 
 def test_radio_with_neck_requires_external_preprocessor_support(monkeypatch):

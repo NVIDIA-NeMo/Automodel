@@ -46,10 +46,17 @@ from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
 logger = logging.getLogger(__name__)
 
 
-class _ServerClient:
-    """HTTP + NCCL connection to a single remote target server."""
+class TargetServerClient:
+    """HTTP + NCCL connection to a single remote target server.
 
-    def __init__(self, url: str, timeout: int, max_retries: int, nccl_rank_offset: int = 0):
+    ``enable_nccl=False`` keeps this client on the wire data plane even when
+    ``NEMO_EAGLE_ENABLE_NCCL`` allows NCCL; the server keeps one NCCL group, so
+    only one client per server can use it.
+    """
+
+    def __init__(
+        self, url: str, timeout: int, max_retries: int, nccl_rank_offset: int = 0, *, enable_nccl: bool = True
+    ):
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
@@ -61,7 +68,7 @@ class _ServerClient:
         # ``no_proxy`` configuration on every node.
         self._session.trust_env = False
         self._nccl_rank_offset = nccl_rank_offset
-        self._nccl_enabled = os.environ.get("NEMO_EAGLE_ENABLE_NCCL", "1") == "1"
+        self._nccl_enabled = enable_nccl and os.environ.get("NEMO_EAGLE_ENABLE_NCCL", "1") == "1"
         self._nccl: NCCLTransport | None = None
         self._nccl_attempted = False
         self._nccl_lock = threading.Lock()
@@ -79,7 +86,7 @@ class _ServerClient:
             base = int(env)
         else:
             http_port = self.url.rsplit(":", 1)[-1].split("/", 1)[0]
-            base = (int(http_port) if http_port.isdigit() else 8000) + 100
+            base = (int(http_port) if http_port.isdigit() else 8000) + protocol.NCCL_PORT_OFFSET
         return base + self._nccl_rank_offset
 
     def request(self, endpoint: str, payload: bytes, *, content_type: str = "application/octet-stream") -> bytes:
@@ -205,23 +212,76 @@ class _AsyncHandle:
         return self._future.cancel()
 
 
+class RemoteTargetPool:
+    """Round-robin connections to the target servers of one remote training backend.
+
+    Owns what every remote target backend shares: the per-server clients, server
+    selection, input encoding, weight fetching, and shutdown.
+
+    Args:
+        urls: One ``http://host:port`` URL per target server.
+        timeout: Per-request HTTP timeout in seconds.
+        max_retries: Retries for idempotent requests on connection errors.
+        enable_nccl: Whether the clients may use the NCCL data plane; see
+            :class:`TargetServerClient`.
+    """
+
+    def __init__(self, urls: list[str], *, timeout: int, max_retries: int, enable_nccl: bool = True):
+        if not urls:
+            raise ValueError("A remote target backend requires at least one server URL (recipe_args.remote_urls).")
+        # A distinct NCCL port offset per server gives each server its own rendezvous port.
+        self.clients = [
+            TargetServerClient(u, timeout, max_retries, nccl_rank_offset=i, enable_nccl=enable_nccl)
+            for i, u in enumerate(urls)
+        ]
+        self._next = itertools.cycle(self.clients)
+
+    def next_client(self) -> TargetServerClient:
+        """Return the server to send the next request to (round-robin)."""
+        return next(self._next)
+
+    def fetch_weight(self, endpoint: str) -> torch.Tensor:
+        """Fetch one full target weight, of shape [vocab, hidden], to CPU from the first server."""
+        return wire.decode(self.clients[0].request(endpoint, b""), map_location="cpu")["weight"]
+
+    @staticmethod
+    def encode_inputs(input_ids: torch.Tensor, attention_mask: torch.Tensor, loss_mask: torch.Tensor) -> bytes:
+        """Encode one ``/generate`` request.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence] containing target tokens.
+            attention_mask: Binary tensor of shape [batch, sequence], one for valid tokens.
+            loss_mask: Tensor of shape [batch, sequence] selecting supervised tokens.
+
+        Returns:
+            Wire bytes holding CPU copies of the three tensors.
+        """
+        return wire.encode_to_bytes(
+            {
+                "input_ids": input_ids.cpu(),
+                "attention_mask": attention_mask.cpu(),
+                "loss_mask": loss_mask.cpu(),
+            }
+        )
+
+    def close(self) -> None:
+        """Disconnect from every server; a server shuts down when a client disconnects."""
+        for client in self.clients:
+            client.close()
+
+
 class RemoteEagle3TargetModel(Eagle3TargetBackend):
     """EAGLE-3 target backend that delegates forward passes to remote servers."""
 
     def __init__(self, urls: list[str], *, device: torch.device, timeout: int = 120, max_retries: int = 3):
-        if not urls:
-            raise ValueError("RemoteEagle3TargetModel requires at least one server URL")
-        # A distinct NCCL rank offset per server lets a multi-rank training job
-        # pair each rank with its own server (1:1) without port collisions.
-        self._clients = [_ServerClient(u, timeout, max_retries, nccl_rank_offset=i) for i, u in enumerate(urls)]
-        self._next = itertools.cycle(range(len(self._clients)))
+        self._pool = RemoteTargetPool(urls, timeout=timeout, max_retries=max_retries)
         self._device = device
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._embeddings: SimpleNamespace | None = None
 
     @property
     def num_remote_servers(self) -> int:
-        return len(self._clients)
+        return len(self._pool.clients)
 
     @property
     def supports_async(self) -> bool:
@@ -232,7 +292,7 @@ class RemoteEagle3TargetModel(Eagle3TargetBackend):
         return cls(urls=urls, device=torch.device(device), **kwargs)
 
     def model_info(self) -> dict:
-        return json.loads(self._clients[0].request(protocol.EP_MODEL_INFO, b"").decode())
+        return json.loads(self._pool.clients[0].request(protocol.EP_MODEL_INFO, b"").decode())
 
     def get_input_embeddings(self):
         """Fetch the target input-embedding weight once and cache it.
@@ -241,8 +301,7 @@ class RemoteEagle3TargetModel(Eagle3TargetBackend):
         ``copy_embeddings_from_target`` reads), matching the offline-cache path.
         """
         if self._embeddings is None:
-            raw = self._clients[0].request(protocol.EP_INPUT_EMBEDDINGS, b"")
-            weight = wire.decode(raw, map_location="cpu")["weight"]
+            weight = self._pool.fetch_weight(protocol.EP_INPUT_EMBEDDINGS)
             self._embeddings = SimpleNamespace(weight=weight.to(self._device))
         return self._embeddings
 
@@ -253,18 +312,8 @@ class RemoteEagle3TargetModel(Eagle3TargetBackend):
                 "selected_token_mask": selected_token_mask.cpu(),
             }
         )
-        for client in self._clients:
+        for client in self._pool.clients:
             client.request(protocol.EP_SET_VOCAB_MAPPING, payload)
-
-    @staticmethod
-    def _build_payload(input_ids, attention_mask, loss_mask) -> bytes:
-        return wire.encode_to_bytes(
-            {
-                "input_ids": input_ids.cpu(),
-                "attention_mask": attention_mask.cpu(),
-                "loss_mask": loss_mask.cpu(),
-            }
-        )
 
     def _to_batch(self, result: dict, attention_mask: torch.Tensor) -> Eagle3TargetBatch:
         dev = self._device
@@ -279,9 +328,8 @@ class RemoteEagle3TargetModel(Eagle3TargetBackend):
 
     @torch.no_grad()
     def generate_batch(self, input_ids, attention_mask, loss_mask) -> Eagle3TargetBatch:
-        payload = self._build_payload(input_ids, attention_mask, loss_mask)
-        client = self._clients[next(self._next)]
-        result = client.generate(payload)
+        payload = self._pool.encode_inputs(input_ids, attention_mask, loss_mask)
+        result = self._pool.next_client().generate(payload)
         return self._to_batch(result, attention_mask)
 
     def generate_batch_async(self, input_ids, attention_mask, loss_mask) -> _AsyncHandle:
@@ -289,14 +337,12 @@ class RemoteEagle3TargetModel(Eagle3TargetBackend):
             self._executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(2, self.num_remote_servers), thread_name_prefix="eagle-target"
             )
-        payload = self._build_payload(input_ids, attention_mask, loss_mask)
-        client = self._clients[next(self._next)]
-        future = self._executor.submit(client.generate, payload)
+        payload = self._pool.encode_inputs(input_ids, attention_mask, loss_mask)
+        future = self._executor.submit(self._pool.next_client().generate, payload)
         return _AsyncHandle(future, lambda result: self._to_batch(result, attention_mask))
 
     def close(self) -> None:
         if self._executor is not None:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
-        for client in self._clients:
-            client.close()
+        self._pool.close()

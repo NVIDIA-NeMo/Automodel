@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ring-pooled point-to-point recv buffers for torch pipeline stages.
+"""Pooled point-to-point recv buffers for torch pipeline stages.
 
 ``torch.distributed.pipelining`` pre-allocates one full-size recv buffer per
 microbatch and per direction (activations forward, gradients backward). At
@@ -39,9 +39,19 @@ recognized. Only schedules with bounded in-flight depth are safe — see
 :func:`schedule_supports_recv_pool`; schedules with unbounded in-flight
 microbatches (e.g. GPipe) would silently corrupt gradients (verified by the
 CPU parity harness in the unit tests).
+
+Native interleaved 1F1B uses a separate, instance-local implementation in
+:func:`install_interleaved_recv_pool`. Its pools are colored from the actual lowered schedule. Copies give each
+microbatch independent input and gradient storage before receive-slot reuse.
 """
 
 import logging
+from collections import deque
+from types import MethodType
+
+import torch
+from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B, _Action, _ComputationType
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +64,7 @@ _INSTALLED_LAYOUT: str | None = None
 # Schedules whose in-flight microbatch count per stage is bounded by
 # num_stages - stage_index, making the ring size proof valid. Interleaved /
 # looped / zero-bubble schedules and CSV schedules have different (or
-# unknown) in-flight envelopes and are intentionally not supported.
+# unknown) envelopes and cannot use this ordinary 1F1B implementation.
 _SUPPORTED_SCHEDULES = frozenset({"1f1b"})
 
 
@@ -216,3 +226,159 @@ def _is_rank_zero() -> bool:
         return not dist.is_initialized() or dist.get_rank() == 0
     except Exception:  # noqa: BLE001 - logging must never fail install
         return True
+
+
+def _recv_slots(
+    actions: list[_Action], stage_index: int, num_microbatches: int, slack: int, *, forward: bool = False
+) -> tuple[tuple[int, ...], int]:
+    """Color receive lifetimes through the compute action that copies them.
+
+    The copied forward input remains live through backward independently of
+    its receive slot. A copied gradient may outlive its backward and send.
+    """
+    receive_kind = _ComputationType.RECV_F if forward else _ComputationType.RECV_B
+    consume_kind = _ComputationType.FORWARD if forward else _ComputationType.FULL_BACKWARD
+    if slack < 0:
+        raise ValueError("Recv pool slack must be nonnegative")
+    events: list[tuple[bool, int]] = []
+    pending: set[int] = set()
+    received: set[int] = set()
+    peak = 0
+    for action in actions:
+        if action.sub_actions is not None:
+            raise ValueError("Backward recv pooling does not support overlapping compute actions")
+        if action.stage_index != stage_index:
+            continue
+        kind = action.computation_type
+        if kind in (_ComputationType.BACKWARD_INPUT, _ComputationType.BACKWARD_WEIGHT):
+            raise ValueError("Backward recv pooling requires full backward actions")
+        if kind not in (receive_kind, consume_kind):
+            continue
+        microbatch = action.microbatch_index
+        if microbatch is None or not 0 <= microbatch < num_microbatches:
+            raise ValueError("Invalid microbatch in recv pool schedule")
+        is_receive = kind == receive_kind
+        events.append((is_receive, microbatch))
+        if is_receive:
+            if microbatch in received:
+                raise ValueError("Duplicate receive in recv pool schedule")
+            received.add(microbatch)
+            pending.add(microbatch)
+            peak = max(peak, len(pending))
+        else:
+            if microbatch not in pending:
+                raise ValueError("Compute action precedes its receive in recv pool schedule")
+            pending.remove(microbatch)
+    if pending or received != set(range(num_microbatches)):
+        raise ValueError("Recv pool schedule must receive and consume every microbatch exactly once")
+    count = min(num_microbatches, peak + slack)
+    free = deque(range(count))
+    live_slots: dict[int, int] = {}
+    slots = [-1] * num_microbatches
+    for is_receive, microbatch in events:
+        if is_receive:
+            slot = free.popleft()
+            slots[microbatch] = slot
+            live_slots[microbatch] = slot
+        else:
+            free.append(live_slots.pop(microbatch))
+    return tuple(slots), count
+
+
+def _pool_stage_backward_recvs(stage: PipelineStage, slots: tuple[int, ...], count: int) -> None:
+    """Install instance-local allocation and ownership rules before stage setup."""
+    original_setup = stage._setup_backward_recv_info
+    original_retrieve = stage._retrieve_recv_grads
+
+    def setup(self: PipelineStage, num_microbatches: int) -> None:
+        if num_microbatches != len(slots):
+            raise ValueError("Rebuild the backward recv pool when the microbatch count changes")
+        original_setup(count)
+        buffers = tuple(self.grad_recv_info[index] for index in range(count))
+        self.grad_recv_info = {microbatch: buffers[slot] for microbatch, slot in enumerate(slots)}
+        # Native stage logic uses chunks to identify the final gradient sync.
+        self.chunks = num_microbatches
+
+    def retrieve(self: PipelineStage, microbatch: int) -> tuple[torch.Tensor | None, ...]:
+        # Autograd may retain an alias as an input/parameter gradient, and a
+        # backward send can outlive this backward. Give those uses owned storage.
+        # NCCL and the copy observe normal PyTorch current-stream dependencies.
+        return tuple(gradient.clone() if gradient is not None else None for gradient in original_retrieve(microbatch))
+
+    stage._setup_backward_recv_info = MethodType(setup, stage)
+    stage._retrieve_recv_grads = MethodType(retrieve, stage)
+    logger.info("interleaved backward recv pool: stage %d uses %d/%d buffer sets", stage.stage_index, count, len(slots))
+
+
+def _pool_stage_forward_recvs(stage: PipelineStage, slots: tuple[int, ...], count: int) -> None:
+    """Copy received inputs into independent leaves for each microbatch."""
+    original_setup = stage._setup_forward_recv_info
+    original_retrieve = stage._retrieve_recv_activations
+
+    def setup(self: PipelineStage, num_microbatches: int, has_backward: bool) -> None:
+        if num_microbatches != len(slots):
+            raise ValueError("Rebuild the forward recv pool when the microbatch count changes")
+        original_setup(count, has_backward)
+        buffers = tuple(self.args_recv_info[index] for index in range(count))
+        self.args_recv_info = {microbatch: buffers[slot] for microbatch, slot in enumerate(slots)}
+        self.chunks = num_microbatches
+
+    def retrieve(self: PipelineStage, microbatch: int) -> tuple[torch.Tensor, ...]:
+        # Checkpoint recomputation and even parameter gradients may retain inputs.
+        # Copy to independent leaves: backward must stop at this pipeline boundary,
+        # without linking multiple microbatches through the pooled receive tensor.
+        return tuple(
+            activation.detach().clone().requires_grad_(activation.requires_grad)
+            for activation in original_retrieve(microbatch)
+        )
+
+    stage._setup_forward_recv_info = MethodType(setup, stage)
+    stage._retrieve_recv_activations = MethodType(retrieve, stage)
+    logger.info("interleaved forward recv pool: stage %d uses %d/%d buffer sets", stage.stage_index, count, len(slots))
+
+
+def install_interleaved_recv_pool(schedule: ScheduleInterleaved1F1B, slack: int = 2) -> None:
+    """Pool receives using this interleaved schedule's actual actions.
+
+    Call once after schedule construction and before the first step. Received
+    activations become independent leaves before forward, while gradients are
+    copied before backward. These owned copies protect checkpoint recomputation,
+    escaping parameter gradients and asynchronous sends from slot reuse.
+
+    Pooling removes preallocation for every microbatch but retains owned inputs
+    until their actual consumers finish. The resulting peak memory depends on
+    the schedule and model, including whether outputs alias stage inputs.
+
+    Args:
+        schedule: Native interleaved 1F1B schedule with lowered P2P actions.
+        slack: Additional slots above the posted-receive lifetime bound.
+    """
+    if _INSTALLED:
+        raise RuntimeError("Interleaved recv pooling cannot share the process-wide ordinary 1F1B pool")
+    if type(schedule) is not ScheduleInterleaved1F1B:
+        raise ValueError("Recv pooling requires the native interleaved 1F1B schedule")
+    # PyTorch's older prepare-infra layout does not expose the per-direction
+    # allocation seam used here. Keep native buffers on that third-party API.
+    if not all(hasattr(PipelineStage, name) for name in ("_setup_forward_recv_info", "_setup_backward_recv_info")):
+        logger.warning("interleaved recv pool requires per-direction stage setup; keeping stock buffers")
+        return
+    forward_plans: list[tuple[PipelineStage, tuple[int, ...], int]] = []
+    backward_plans: list[tuple[PipelineStage, tuple[int, ...], int]] = []
+    for stage in schedule._stages:
+        if not isinstance(stage, PipelineStage):
+            raise TypeError("Recv pooling requires manually constructed PipelineStage instances")
+        if stage.grad_recv_info or stage.args_recv_info:
+            raise RuntimeError("Install recv pooling before the first pipeline step")
+        actions = schedule.pipeline_order_with_comms[stage.group_rank]
+        if not stage.is_first:
+            slots, count = _recv_slots(actions, stage.stage_index, schedule._n_microbatches, slack, forward=True)
+            if count < schedule._n_microbatches:
+                forward_plans.append((stage, slots, count))
+        if not stage.is_last:
+            slots, count = _recv_slots(actions, stage.stage_index, schedule._n_microbatches, slack)
+            if count < schedule._n_microbatches:
+                backward_plans.append((stage, slots, count))
+    for stage, slots, count in forward_plans:
+        _pool_stage_forward_recvs(stage, slots, count)
+    for stage, slots, count in backward_plans:
+        _pool_stage_backward_recvs(stage, slots, count)

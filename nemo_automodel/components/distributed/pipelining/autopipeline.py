@@ -33,6 +33,10 @@ from nemo_automodel.components.distributed.pipelining.functional import (
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     validate_hf_model_for_pipeline_support,
 )
+from nemo_automodel.components.distributed.pipelining.runtime import (
+    PipelineRuntimeInitializer,
+    collect_pipeline_runtime_initializers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +137,8 @@ class AutoPipeline:
         )
         self._model_config = None
         self._pp_current_seq_len: int | None = None
+        self._pp_runtime_num_tokens: int = 0
+        self._runtime_initializers: list[PipelineRuntimeInitializer] = []
 
     def build(
         self,
@@ -147,23 +153,6 @@ class AutoPipeline:
         assert isinstance(model, nn.Module), "model must be a PyTorch module"
 
         validate_hf_model_for_pipeline_support(model)
-
-        if self.pp_recv_buffer_pool:
-            from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
-                install_recv_buffer_pool,
-                schedule_supports_recv_pool,
-            )
-
-            # Only 1F1B's bounded in-flight depth makes the ring size proof valid;
-            # schedules with unbounded in-flight microbatches would silently
-            # corrupt gradients through reused recv buffers.
-            if self.pp_schedule_csv is None and schedule_supports_recv_pool(self.pp_schedule):
-                install_recv_buffer_pool(slack=self.pp_recv_buffer_pool_slack)
-            else:
-                logger.warning(
-                    "pp_recv_buffer_pool ignored: schedule %s has no bounded in-flight depth proof",
-                    self.pp_schedule_csv or self.pp_schedule,
-                )
 
         pp_schedule_obj, model_parts, pp_has_first_stage, pp_has_last_stage, stages = pipeline_model(
             model,
@@ -194,6 +183,25 @@ class AutoPipeline:
             tensor_dtype=self.dtype,
         )
 
+        if self.pp_recv_buffer_pool:
+            from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B
+
+            from nemo_automodel.components.distributed.pipelining.recv_buffer_pool import (
+                install_interleaved_recv_pool,
+                install_recv_buffer_pool,
+                schedule_supports_recv_pool,
+            )
+
+            if self.pp_schedule_csv is None and type(pp_schedule_obj) is ScheduleInterleaved1F1B:
+                install_interleaved_recv_pool(pp_schedule_obj, slack=self.pp_recv_buffer_pool_slack)
+            elif self.pp_schedule_csv is None and schedule_supports_recv_pool(self.pp_schedule):
+                install_recv_buffer_pool(slack=self.pp_recv_buffer_pool_slack)
+            else:
+                logger.warning(
+                    "pp_recv_buffer_pool ignored: schedule %s has no validated receive-lifetime plan",
+                    self.pp_schedule_csv or self.pp_schedule,
+                )
+
         # Update PipelineInfo state
         self._info.enabled = True
         self._info.schedule = pp_schedule_obj
@@ -201,6 +209,8 @@ class AutoPipeline:
         self._info.has_last_stage = pp_has_last_stage
         self._info.model_parts = model_parts
         self._info.stages = stages
+
+        self._runtime_initializers = collect_pipeline_runtime_initializers(model_parts)
 
         # Store model config for runtime shape updates
         self._model_config = model.config
@@ -220,25 +230,33 @@ class AutoPipeline:
         with different seq_lens.
 
         Call this before every ``schedule.step()`` to update the stage shapes without
-        running an expensive forward pass.  A no-op when seq_len has not changed.
+        running an expensive forward pass.  Stage reset is a no-op when ``seq_len``
+        has not changed; model-owned runtime initializers are still prepared.
 
         Args:
             seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
         """
-        if seq_len == self._pp_current_seq_len:
-            return
-        if self._model_config is None:
-            raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
-        reset_pp_stage_shapes(
-            self._info.schedule,
-            self._info.stages,
-            self._model_config,
-            self.pp_microbatch_size,
-            seq_len,
-            tensor_dtype=self.dtype,
-        )
-        self._pp_current_seq_len = seq_len
-        logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
+        if seq_len != self._pp_current_seq_len:
+            if self._model_config is None:
+                raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
+            self._pp_runtime_num_tokens = reset_pp_stage_shapes(
+                self._info.schedule,
+                self._info.stages,
+                self._model_config,
+                self.pp_microbatch_size,
+                seq_len,
+                tensor_dtype=self.dtype,
+            )
+            self._pp_current_seq_len = seq_len
+            logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
+
+        for initializer in self._runtime_initializers:
+            initializer.prepare(
+                # Model-owned CP can keep input IDs global while stage activations
+                # and MoE dispatch are local. Reuse the stage metadata's token count.
+                num_tokens=self._pp_runtime_num_tokens,
+                device=self.device,
+            )
 
     def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
         """Build pipeline microbatch chunking metadata for keyword inputs.

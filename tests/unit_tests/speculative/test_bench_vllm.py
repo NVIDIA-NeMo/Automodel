@@ -221,6 +221,7 @@ def _args(**overrides) -> argparse.Namespace:
         max_new_tokens=8,
         temperature=0.0,
         top_p=1.0,
+        top_k=0,
         messages_column="messages",
         split="train",
         dataset_name=None,

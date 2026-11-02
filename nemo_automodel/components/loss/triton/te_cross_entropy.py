@@ -260,6 +260,7 @@ def element_mul_kernel(
     grad_output_ptr,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
+    PER_ROW: tl.constexpr = False,
 ):
     """
     This function multiplies each element of the tensor pointed by X_ptr with the value pointed by grad_output_ptr.
@@ -268,7 +269,8 @@ def element_mul_kernel(
     Parameters:
     X_ptr: Pointer to the input tensor.
     X_stride (int): The stride of the input tensor.
-    grad_output_ptr: Pointer to the gradient output value.
+    grad_output_ptr: Pointer to a scalar or contiguous [tokens] upstream gradient.
+    PER_ROW: Whether the upstream gradient has one entry per token.
     n_cols (int): The number of columns in the input tensor.
     BLOCK_SIZE (int): The block size for Triton operations.
     """
@@ -279,7 +281,7 @@ def element_mul_kernel(
     X_ptr += program_id * X_stride
 
     # Load the gradient output value
-    grad_output = tl.load(grad_output_ptr)
+    grad_output = tl.load(grad_output_ptr + program_id if PER_ROW else grad_output_ptr)
 
     # Perform the element-wise multiplication
     for i in range(0, n_cols, BLOCK_SIZE):
@@ -371,7 +373,17 @@ def cross_entropy_forward(
 
 
 def cross_entropy_backward(_input: torch.Tensor, grad_output: torch.Tensor):
-    """Backward implementation of cross entropy loss kernel"""
+    """Scale the saved CE gradient by its upstream gradient in place.
+
+    Args:
+        _input: Tensor of shape [batch, sequence, local_vocab] holding the saved
+            gradient; each row must be contiguous. Updated in place.
+        grad_output: Scalar tensor for reduced loss, or tensor of shape
+            [batch, sequence] for unreduced loss. May be noncontiguous.
+
+    Returns:
+        Tensor of shape [batch, sequence, local_vocab], aliasing ``_input``.
+    """
     if not HAVE_TRITON:
         raise ImportError(MISSING_TRITON_MSG)
 
@@ -387,9 +399,10 @@ def cross_entropy_backward(_input: torch.Tensor, grad_output: torch.Tensor):
         element_mul_kernel[(n_rows,)](
             _input,
             _input.stride(-2),
-            grad_output,
+            grad_output.contiguous(),
             V,
             BLOCK_SIZE=BLOCK_SIZE,
+            PER_ROW=grad_output.numel() != 1,
             num_warps=32,
         )
 

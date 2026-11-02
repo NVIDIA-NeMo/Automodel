@@ -65,7 +65,7 @@ parallelizer:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
   backend:
@@ -114,6 +114,7 @@ optimizer:
   foreach: false
 
 ci:
+  cluster_tag: h100
   time: "00:15:00"
   nodes: 1
   known_issue_id: AM-150

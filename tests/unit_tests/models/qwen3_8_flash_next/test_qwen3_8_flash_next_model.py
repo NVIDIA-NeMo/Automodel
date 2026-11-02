@@ -17,7 +17,9 @@
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.backend import Qwen3_8_FlashNextBackendConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.config import (
     Qwen3_8_FlashNextConfig,
     Qwen3_8_FlashNextTextConfig,
@@ -96,6 +98,70 @@ def _tiny_moe_config(config: Qwen3_8_FlashNextTextConfig) -> MoEConfig:
     )
 
 
+def test_pretrained_build_preserves_generation_config_in_export(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A from_pretrained build must round-trip the checkpoint's generation metadata into the export."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from transformers.generation import GenerationConfig
+
+    from nemo_automodel._transformers import model_init
+    from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    GenerationConfig(
+        eos_token_id=[2, 1],
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.95,
+        top_k=20,
+    ).save_pretrained(checkpoint_dir)
+
+    _tiny_config().save_pretrained(checkpoint_dir)
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=False,
+    )
+    monkeypatch.setattr(
+        model_init, "_resolve_custom_model_cls_for_config", lambda _: Qwen3_8_FlashNextForConditionalGeneration
+    )
+    monkeypatch.setattr(model_init, "_download_model_weights", lambda *args, **kwargs: None)
+
+    is_custom, model = model_init._init_model(
+        cls=MagicMock(),
+        pretrained_model_name_or_path_or_config=str(checkpoint_dir),
+        attn_implementation="sdpa",
+        torch_dtype=torch.float32,
+        quantization_config=None,
+        force_hf=False,
+        backend=backend,
+    )
+    assert is_custom is True
+
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[model]),
+        hf_metadata_dir=str(export_dir),
+        fqn_to_file_index_mapping={},
+        tokenizer=None,
+        original_model_path=str(checkpoint_dir),
+        v4_compatible=False,
+    )
+    exported = GenerationConfig.from_pretrained(export_dir)
+
+    assert exported.eos_token_id == [2, 1]
+    assert exported.do_sample is True
+    assert exported.temperature == 0.7
+    assert exported.top_p == 0.95
+    assert exported.top_k == 20
+
+
 def test_model_class_alias_selects_qwen3_8_flash_next_conditional_generation() -> None:
     assert ModelClass is Qwen3_8_FlashNextForConditionalGeneration
 
@@ -112,28 +178,49 @@ def test_multimodal_configuration_fails_closed() -> None:
         )
 
 
-def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout() -> None:
+@pytest.mark.parametrize("backend_source", ["shared", "cute_yaml", "cute_typed"])
+def test_tiny_qwen3_8_flash_next_forward_backward_and_state_layout(backend_source: str) -> None:
     config = _tiny_config()
-    backend = BackendConfig(
+    settings = dict(
         linear="torch",
-        attn="sdpa",
+        attn="sdpa" if backend_source == "shared" else "cute",
         rms_norm="torch",
         experts="torch",
         dispatcher="torch",
         enable_hf_state_dict_adapter=False,
     )
+    if backend_source == "shared":
+        backend = BackendConfig(**settings)
+    elif backend_source == "cute_yaml":
+        backend = ConfigNode(
+            {
+                "_target_": "nemo_automodel.components.models.qwen3_8_flash_next.backend.Qwen3_8_FlashNextBackendConfig",
+                **settings,
+            }
+        ).instantiate()
+    else:
+        backend = Qwen3_8_FlashNextBackendConfig(**settings)
+    if backend_source != "shared":
+        assert isinstance(backend, Qwen3_8_FlashNextBackendConfig)
+        assert backend.attn == "cute"
     model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
         config,
         moe_config=_tiny_moe_config(config.text_config),
         backend=backend,
     )
+    assert model.backend is not backend
+    assert model.backend.attn == settings["attn"]
+    assert model.model.language_model.layers["0"].self_attn.backend.attn == settings["attn"]
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.train()
 
     input_ids = torch.randint(2, config.text_config.vocab_size, (2, 6))
-    output = model(input_ids=input_ids, output_hidden_states=True)
-    loss = output.logits.square().mean()
-    loss.backward()
+    # This CPU test checks configuration wiring and model math. Avoid spending
+    # its runtime budget compiling the model's internal pointwise helpers.
+    with torch.compiler.set_stance("force_eager"):
+        output = model(input_ids=input_ids, output_hidden_states=True)
+        loss = output.logits.square().mean()
+        loss.backward()
 
     assert output.logits.shape == (2, 6, config.text_config.vocab_size)
     assert output.hidden_states[0].shape == (2, 6, config.text_config.hidden_size)
@@ -271,3 +358,71 @@ def test_engram_owner_markers_are_restored_after_meta_materialization() -> None:
     assert torch.isfinite(table.weight).all()
     assert torch.count_nonzero(table.weight) > 0
     assert not hasattr(table.weight, "_nemo_model_owned_dtensor_spec")
+
+
+def test_generation_config_is_initialized_from_model_config() -> None:
+    config = _tiny_config()
+    config.eos_token_id = [1, 2]
+    config.bos_token_id = 1
+    config.pad_token_id = 0
+    config.do_sample = True
+    config.top_p = 0.95
+    config.top_k = 20
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=False,
+    )
+
+    model = Qwen3_8_FlashNextForConditionalGeneration.from_config(
+        config,
+        moe_config=_tiny_moe_config(config.text_config),
+        backend=backend,
+    )
+
+    assert model.generation_config.eos_token_id == [1, 2]
+    assert model.generation_config.bos_token_id == 1
+    assert model.generation_config.pad_token_id == 0
+    assert model.generation_config.do_sample is True
+    assert model.generation_config.top_p == 0.95
+    assert model.generation_config.top_k == 20
+
+
+def test_from_pretrained_restores_checkpoint_generation_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _tiny_config()
+    monkeypatch.setattr(
+        Qwen3_8_FlashNextConfig,
+        "from_pretrained",
+        classmethod(lambda cls, *args, **kwargs: config),
+    )
+    restored: list[tuple[object, str]] = []
+
+    def fake_restore(model: object, checkpoint: str) -> None:
+        restored.append((model, checkpoint))
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.models.qwen3_8_flash_next.model.restore_pretrained_generation_config",
+        fake_restore,
+    )
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        experts="torch",
+        dispatcher="torch",
+        enable_hf_state_dict_adapter=False,
+    )
+
+    model = Qwen3_8_FlashNextForConditionalGeneration.from_pretrained(
+        "/tmp/qwen-checkpoint",
+        moe_config=_tiny_moe_config(config.text_config),
+        backend=backend,
+    )
+
+    assert model.generation_config is not None
+    assert len(restored) == 1
+    assert restored[0][0] is model
+    assert restored[0][1] == "/tmp/qwen-checkpoint"

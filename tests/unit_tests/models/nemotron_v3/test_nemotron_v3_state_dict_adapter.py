@@ -221,6 +221,25 @@ class TestNemotronV3AdapterDense:
         assert not any(k.endswith("norm_f.weight") for k in native)
         assert adapter._uses_model_prefix is False
 
+    @pytest.mark.parametrize("embed_key", ["backbone.embedding.weight", "backbone.embeddings.weight", "model.embedding.weight"])
+    def test_from_hf_accepts_singular_or_plural_embedding(self, adapter, embed_key):
+        """RL#4211: transformers save_pretrained may emit singular ``embedding``."""
+        tensor = torch.randn(100, 256)
+        native = adapter.from_hf({embed_key: tensor})
+
+        assert set(native) == {"model.embed_tokens.weight"}
+        torch.testing.assert_close(native["model.embed_tokens.weight"], tensor, rtol=0, atol=0)
+
+    def test_singular_embedding_exports_as_plural(self, adapter):
+        """Canonical HF export stays plural to match released nvidia checkpoints."""
+        tensor = torch.randn(100, 256)
+        native = adapter.from_hf({"backbone.embedding.weight": tensor})
+        exported = adapter.to_hf(dict(native))
+
+        assert set(exported) == {"backbone.embeddings.weight"}
+        torch.testing.assert_close(exported["backbone.embeddings.weight"], tensor, rtol=0, atol=0)
+        assert "backbone.embedding.weight" not in exported
+
     def test_round_trip_dense(self, adapter):
         hf_sd = {
             "backbone.embeddings.weight": torch.randn(100, 256),
