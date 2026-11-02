@@ -1,0 +1,142 @@
+# 128 GPUs: EP64, PP2, expert shard1. Nonpacked MedPix, 4096 model tokens.
+# GBS2048, local batch32, PP microbatch1, BF16, AdamW LR5e-6.
+# Interleaved1F1B: four logical stages of 18 layers. Source layer35 KV crosses the middle cut.
+# Checkpoint every five updates and restore LATEST; choose a unique W&B run ID before launch.
+# HybridEP; BF16 token communication. Requires the installed HybridEP runtime.
+# Leave NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN unset for topology auto-detection.
+# GB200 NVLink domains can span multiple four-GPU Slurm nodes.
+recipe: FinetuneRecipeForVLM
+seed: 1234
+step_scheduler:
+  global_batch_size: 2048
+  local_batch_size: 32
+  ckpt_every_steps: 5
+  val_every_steps: 1000
+  gc_every_steps: 5
+  num_epochs: null
+  max_steps: 100
+  log_remote_every_steps: 1
+  save_checkpoint_every_epoch: false
+  validate_on_checkpoint: false
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: mistralai/Mistral-Large-4-1T-A52B
+  dtype: bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope: torch
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    enable_hf_state_dict_adapter: true
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 2
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    scale_grads_in_schedule: false
+    layers_per_stage: 18
+    patch_inner_model: false
+    patch_causal_lm_model: false
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/mistral-large4-medpix-hybridep-ep64pp2
+  is_peft: false
+  dequantize_base_checkpoint: true
+  load_metadata_with_gloo: true
+  model_save_format: safetensors
+  save_consolidated: false
+  is_async: false
+  cpu_offload: true
+  max_recent_checkpoints: 2
+  restore_from: LATEST
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  reduction: sum
+  logit_softcapping: 30.0
+processor:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: mistralai/Mistral-Large-4-1T-A52B
+  mode: finetuning
+  padding_side: right
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+packed_sequence:
+  packed_sequence_size: 0
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  persistent_workers: true
+  pin_memory: true
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 4097
+validation_dataset: none
+validation_dataloader: none
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  lr: 5.0e-06
+  weight_decay: 0.1
+lr_scheduler:
+  lr_decay_style: constant
+clip_grad_norm:
+  max_norm: 1.0
+wandb:
+  enable: false
+  entity: nvidia
+  project: automodel
+  name: mistral-large4-sft-medpix4k-hybridep-ep64pp2
+  group: mistral-large4-real-medpix
+  resume: allow
+  mode: online
+  dir: logs/mistral-large4-medpix-hybridep-ep64pp2/wandb
+  tags:
+  - mistral-large4
+  - full-sft
+  - hybridep
+  - medpix
+  - ep64
+  - pp2
+  - 128-gpu
+
+ci:
+  recipe_owner: snowmanwwg
+  cluster_tag: gb200
+  nodes: 32
+  time: "04:00:00"
+  env_vars:
+    SBATCH_SEGMENT_SIZE: "16"
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

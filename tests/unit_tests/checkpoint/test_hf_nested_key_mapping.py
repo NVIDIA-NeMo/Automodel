@@ -36,6 +36,8 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.checkpoint.conversion_mapping import get_combined_key_mapping
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def reference() -> InternVLForConditionalGeneration:

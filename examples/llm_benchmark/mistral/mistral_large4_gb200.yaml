@@ -1,0 +1,171 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Mistral Large 4 (1T-A52B: 72 layers, 128 routed experts top-4 + 1 shared,
+# DSA sparse MLA with index_topk 2048) throughput benchmark on
+# 32 nodes x 4 GB200 (128 GPUs): EP64 x PP2, DP64, CP1.
+#
+# - Random init from the config below; no checkpoint is read. Vision and the
+#   MTP/DSpark head are not built (text-only MistralLarge4ForCausalLM).
+# - fake_balanced_gate routes tokens uniformly; a random-init learned gate routes degenerately.
+# - Mock fixed 4096-token BSHD rows keep tokens per step constant (512 x 4096 = 2,097,152).
+#   The TileLang CP path requires packed THD input, so this benchmark runs without CP.
+# - Attention is TileLang sparse MLA; experts are torch_mm over HybridEP.
+# - MFU uses the model FLOPs counter (exact top-k key counts, per-layer NoPE / shared-KV /
+#   shared-indexer accounting, frozen indexer forward only).
+#
+# To run on 32 GB200 NVL72 nodes:
+#   automodel examples/llm_benchmark/mistral/mistral_large4_gb200.yaml --nnodes 32 --nproc-per-node 4
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+seed: 1234
+
+benchmark:
+  warmup_steps: 3
+  peak_tflops: 2500   # GB200 BF16 dense peak (NVL72: 180 PF dense / 72 GPUs)
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 32
+
+step_scheduler:
+  global_batch_size: 512   # GA = 512 / (local_batch_size 8 x dp 64) = 1
+  local_batch_size: 8      # 8 PP microbatches of 1 per DP rank (1F1B, pp 2)
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  max_steps: 12
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.mistral_large4.config.MistralLarge4Config
+    architectures: [MistralLarge4ForCausalLM]
+    hidden_size: 6144
+    intermediate_size: 24576
+    num_hidden_layers: 72
+    num_attention_heads: 64
+    vocab_size: 204800
+    kv_lora_rank: 512
+    qk_nope_head_dim: 64
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    rms_norm_eps: 1.0e-5
+    rope_theta: 10000.0
+    max_position_embeddings: 1048576
+    yarn_factor: 2048.0
+    yarn_original_max_position_embeddings: 512
+    yarn_beta_fast: 32.0
+    yarn_beta_slow: 1.0
+    final_logit_softcapping: 30.0
+    index_topk: 2048
+    index_n_heads: 32
+    index_head_dim: 128
+    first_k_dense_replace: 1
+    n_routed_experts: 128
+    n_shared_experts: 1
+    num_experts_per_tok: 4
+    moe_intermediate_size: 6144
+    routed_scaling_factor: 1.0
+    norm_topk_prob: true
+    tie_word_embeddings: false
+    dtype: bfloat16
+    # nope_layer_flags, kv_source_layers, index_sharing and indexer_nope_layer_flags
+    # are omitted: the class defaults equal the released config (NoPE every fourth layer,
+    # KV source 35 for layers 39+ with i%4==3, shared indexer for i>=17 with i%4 in (1,2)).
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: torch
+    rms_norm: torch_fp32
+    rope: torch
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: true
+    enable_hf_state_dict_adapter: true   # required by Mistral Large 4 EP
+    enable_fsdp_optimizations: false
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 2
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 36
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    pp_seq_len: 4096
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  reduction: sum
+  impl: cce
+  logit_softcapping: 30.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  vocab_size: 204800   # = model.config.vocab_size; not auto-inferred because the config has no pretrained path
+  seq_len: 4096
+  num_samples: 1000000
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null  # Dataset already yields batches
+  num_workers: 0
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+wandb:
+  enable: false
+
+clip_grad_norm:
+  max_norm: 1.0
+
+ci:
+  recipe_owner: huiyingl
+  nodes: 32
+  cluster_tag: gb200
+  time: "02:00:00"
+  env_vars:
+    # Keep each EP64 pipeline stage (16 nodes x 4 GPUs) inside one NVLink domain.
+    SBATCH_SEGMENT_SIZE: "16"
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
