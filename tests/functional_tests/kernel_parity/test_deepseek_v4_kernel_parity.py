@@ -14,6 +14,8 @@
 
 """DeepSeek V4 CUDA kernel forward/backward parity with the Torch references."""
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -308,14 +310,13 @@ def test_visual_sparse_attention_module_matches_dense_forward_backward(monkeypat
     reason="Vendored DSV4 sparse-attention CUDA kernel is unavailable",
 )
 @pytest.mark.parametrize("compress_ratio", [0, 4, 128])
-def test_flash_full_shape_sparse_attention_graph(compress_ratio: int) -> None:
+def test_flash_full_shape_sparse_attention_graph(compress_ratio: int, tmp_path: Path) -> None:
     """Check full Flash attention shapes against a dense FP32 Torch oracle.
 
     This isolates fixed-key attention arithmetic and graph replay. It does not
     validate the learned indexer or pretrained checkpoint loading.
     """
     import json
-    from pathlib import Path
 
     from nemo_automodel.components.models.deepseek_v4.optimized_kernels import dense_attention_topk_torch
 
@@ -407,7 +408,7 @@ def test_flash_full_shape_sparse_attention_graph(compress_ratio: int) -> None:
             {name: metrics(a, b) for name, a, b in zip(labels, row, eager[0], strict=True)} for row in graph_results
         ],
     }
-    Path(f"flash_attention_graph_ratio{compress_ratio}.json").write_text(json.dumps(result, indent=2))
+    (tmp_path / f"flash_attention_graph_ratio{compress_ratio}.json").write_text(json.dumps(result, indent=2))
     for row in (eager[0], *graph_results):
         torch.testing.assert_close(row[0].float(), reference[0], rtol=2e-2, atol=2e-2)
         for actual, expected in zip(row[1:], reference[1:], strict=True):
