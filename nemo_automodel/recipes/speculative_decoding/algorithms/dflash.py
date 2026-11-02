@@ -125,12 +125,6 @@ class _DFlashTrainWindow:
     # Metric name -> [numerator, denominator] from ``_extra_train_metric_sums``.
     extra: dict[str, list[float]] = field(default_factory=dict)
 
-    def reset(self) -> None:
-        """Clear every sum."""
-        self.loss = self.correct_tokens = self.valid_tokens = 0.0
-        self.micro_batches = 0
-        self.extra.clear()
-
 
 class TrainDFlashRecipe(SpecDecodeRecipeBase):
     """Recipe for DFlash draft-model training on Qwen3-style dense / MoE and Kimi K3 targets."""
@@ -770,7 +764,7 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
             totals[1] += denominator
 
     def _log_train_window(self, window: _DFlashTrainWindow, epoch_idx: int, grad_norm, pbar) -> None:
-        """Log the data-parallel mean loss and accuracy of ``window``, then reset it.
+        """Log the data-parallel mean loss and accuracy of ``window``.
 
         Loss averages over the micro-batches accumulated since the last log, not
         over optimizer steps: with ``grad_accumulation_steps > 1`` (or skipped short
@@ -817,7 +811,6 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
                     }
                 )
                 self._wandb_log(wandb_data, step=self.runtime.global_step)
-        window.reset()
 
     def _report_epoch(self, epoch_idx: int, completed_steps: int, eval_metrics):
         """Log the epoch summary with the skipped-micro-batch count and validation metrics."""

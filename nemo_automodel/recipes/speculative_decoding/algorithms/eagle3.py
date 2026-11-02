@@ -222,15 +222,6 @@ class _Eagle3TrainWindow:
             self.step_valid += metrics.step_valid.float()
         self.steps += 1
 
-    def reset(self) -> None:
-        """Zero every sum in place."""
-        self.loss.zero_()
-        self.accuracy.zero_()
-        if self.step_prefix_hits is not None:
-            self.step_prefix_hits.zero_()
-            self.step_valid.zero_()
-        self.steps = 0
-
 
 def _validate_cp_gates(
     cp_size: int,
@@ -1897,24 +1888,26 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
             return self._prefetched_batches(self.train_dataloader)
         return ((batch, None) for batch in self.train_dataloader)
 
-    def _train_micro_batch(self, item, sync_ctx):
-        """Run forward and backward for one ``(batch, target_batch)`` item.
+    def _forward_micro_batch(self, item):
+        """Return the draft metrics of one ``(batch, target_batch)`` item.
 
         Args:
             item: ``(batch, target_batch)`` from :meth:`_iter_train_batches`; see
                 :meth:`_forward_batch` for both layouts.
-            sync_ctx: Context that gates this micro-batch's gradient all-reduce.
         """
         batch, target_batch = item
+        return self._forward_batch(batch, target_batch)
+
+    def _train_micro_batch(self, item, sync_ctx):
+        """Run forward and backward for one ``(batch, target_batch)`` item.
+
+        P-EAGLE sequence partitioning owns its per-segment backward and its own
+        ``no_sync`` (the all-reduce fires on the last segment), so it runs outside
+        the grad-accum sync context.
+        """
         if self._peagle_partitioned:
-            # P-EAGLE sequence partitioning owns its per-segment backward and its
-            # own no_sync (the all-reduce fires on the last segment), so it runs
-            # outside the grad-accum sync context.
-            return self._peagle_partitioned_step(batch)
-        with sync_ctx:
-            metrics = self._forward_batch(batch, target_batch)
-            (metrics.loss / float(self.grad_accumulation_steps)).backward()
-        return metrics
+            return self._peagle_partitioned_step(item[0])
+        return super()._train_micro_batch(item, sync_ctx)
 
     def _sync_grads_before_clip(self) -> None:
         """Sum the draft gradients over context parallelism, then reduce TP replicas.
@@ -1941,12 +1934,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
         """Return an empty training-metric window on ``self.device``."""
         return _Eagle3TrainWindow.empty(self.device)
 
-    def _accumulate_train_metrics(self, window: _Eagle3TrainWindow, metrics) -> None:
-        """Add one micro-batch's loss, accuracy and per-TTT-step prefix hits to ``window``."""
-        window.add(metrics)
-
     def _log_window(self, window: _Eagle3TrainWindow, epoch_idx: int, grad_norm, pbar, *, suffix: str = "") -> None:
-        """All-reduce and log ``window``'s means, then reset it; every rank must call this."""
+        """All-reduce and log ``window``'s means; every rank must call this."""
         mean_loss = all_reduce_mean(window.loss / max(window.steps, 1))
         mean_acc = all_reduce_mean(window.accuracy / max(window.steps, 1))
         tau_sim = _window_tau_sim(window.step_prefix_hits, window.step_valid)
@@ -1981,7 +1970,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
             if tau_sim is not None:
                 wandb_data["train/tau_sim"] = tau_sim
             self._wandb_log(wandb_data, step=self.runtime.global_step)
-        window.reset()
 
     def _log_train_window(self, window: _Eagle3TrainWindow, epoch_idx: int, grad_norm, pbar) -> None:
         """Log ``window`` and collect or launch the periodic decode evaluation."""

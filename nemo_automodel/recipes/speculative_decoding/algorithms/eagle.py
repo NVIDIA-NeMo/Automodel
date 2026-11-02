@@ -66,12 +66,6 @@ class _Eagle1TrainWindow:
     # Loss-component name -> summed value from ``_loss_components``.
     components: dict[str, float] = field(default_factory=dict)
 
-    def reset(self) -> None:
-        """Clear every sum."""
-        self.loss = self.accuracy = 0.0
-        self.micro_batches = 0
-        self.components = {}
-
 
 class TrainEagle1Recipe(SpecDecodeRecipeBase):
     """Recipe for EAGLE-1 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
@@ -391,7 +385,7 @@ class TrainEagle1Recipe(SpecDecodeRecipeBase):
             window.components[name] = window.components.get(name, 0.0) + value
 
     def _log_train_window(self, window: _Eagle1TrainWindow, epoch_idx: int, grad_norm, pbar) -> None:
-        """Log rank 0's window means and the pre-clip gradient norm, then reset ``window``."""
+        """Log rank 0's window means and the pre-clip gradient norm."""
         if self.dist_env.is_main:
             n = max(1, window.micro_batches)
             avg_loss = window.loss / n
@@ -425,7 +419,6 @@ class TrainEagle1Recipe(SpecDecodeRecipeBase):
                 },
                 step=self.runtime.global_step,
             )
-        window.reset()
 
     def _report_epoch(self, epoch_idx: int, completed_steps: int, eval_metrics):
         """Log the epoch summary and the validation loss and accuracy."""

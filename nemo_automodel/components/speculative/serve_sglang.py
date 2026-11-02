@@ -15,7 +15,7 @@
 """Serve an Automodel-trained EAGLE / EAGLE-3 drafter with SGLang.
 
 The EAGLE drafter checkpoints produced by the EAGLE recipes
-(``recipes/speculative_decoding/train_eagle{1,2,3}.py``) are written by the consolidated
+(``recipes/speculative_decoding/algorithms/eagle.py`` and ``eagle3.py``) are written by the consolidated
 checkpointer as an HF-style ``model/`` directory (``model.safetensors`` +
 ``config.json``) inside each ``epoch_<E>_step_<S>/`` checkpoint, alongside the
 EAGLE-3 vocab metadata (``eagle_meta.pt``). This script resolves that directory

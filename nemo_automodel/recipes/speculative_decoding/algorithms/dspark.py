@@ -52,7 +52,6 @@ from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
-from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -1418,13 +1417,6 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         finally:
             self.wandb_run = None
 
-    def _grad_sync_context(self, pending_micro_batches: int, batch_idx: int, num_batches: int | None, is_ddp: bool):
-        """Gate the gradient all-reduce under DDP (``no_sync``) and FSDP2 (deferred reduce-scatter)."""
-        is_optim_step = pending_micro_batches + 1 == self.grad_accumulation_steps or (
-            num_batches is not None and batch_idx == num_batches - 1
-        )
-        return get_sync_ctx(self.trainer_module, is_optim_step, self.defer_fsdp_grad_sync)
-
     def _forward_micro_batch(self, batch):
         """Return the DSpark step metrics of one micro-batch.
 
@@ -1448,16 +1440,11 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         """Return an empty DSpark metric window."""
         return _DSparkMetricWindow(block_size=self.block_size, device=self.device)
 
-    def _accumulate_train_metrics(self, window: _DSparkMetricWindow, metrics: DSparkStepMetrics) -> None:
-        """Add one micro-batch's DSpark metrics to ``window``."""
-        window.add(metrics)
-
     def _log_train_window(self, window: _DSparkMetricWindow, epoch_idx: int, grad_norm, pbar) -> None:
-        """Log the data-parallel mean of ``window`` to the metric logger, W&B and stdout, then reset it."""
+        """Log the data-parallel mean of ``window`` to the metric logger, W&B and stdout."""
         # Every rank enters the window's single collective, so it cannot sit inside
         # the rank-0 logging guard below.
         avg = window.unpack(self._dp_allreduce(window.pack()))
-        window.reset()
         if not self.dist_env.is_main:
             return
         current_lr = self.lr_scheduler.get_last_lr()[0]

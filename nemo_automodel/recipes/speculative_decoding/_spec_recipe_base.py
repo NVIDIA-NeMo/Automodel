@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
-from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -45,6 +44,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
+from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
@@ -505,14 +505,13 @@ class SpecDecodeRecipeBase(BaseRecipe):
             False when ``stop_at_step_budget`` stopped the run inside this epoch.
         """
         window = self._new_train_window()
-        is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
         # Summed on the loss's device; read once at the epoch checkpoint so the hot
         # loop never blocks on a host sync.
         epoch_loss: torch.Tensor | float = 0.0
         micro_steps = 0
         batches_seen = 0
         pending_micro_batches = 0
-        completed_steps = 0
+        start_step = self.runtime.global_step
         reached_budget = False
 
         segment_done = False
@@ -528,7 +527,7 @@ class SpecDecodeRecipeBase(BaseRecipe):
                 num_batches = None
             for batch_idx, batch in enumerate(self._iter_train_batches()):
                 batches_seen += 1
-                sync_ctx = self._grad_sync_context(pending_micro_batches, batch_idx, num_batches, is_ddp)
+                sync_ctx = self._grad_sync_context(pending_micro_batches, batch_idx, num_batches)
                 metrics = self._train_micro_batch(batch, sync_ctx)
                 if metrics is None:
                     # Skipped on every rank (see TrainDFlashRecipe); not part of the window.
@@ -541,9 +540,9 @@ class SpecDecodeRecipeBase(BaseRecipe):
                 if pending_micro_batches == self.grad_accumulation_steps:
                     grad_norm = self._optimizer_step(epoch_idx, pbar, pending_micro_batches)
                     pending_micro_batches = 0
-                    completed_steps += 1
                     if self.runtime.global_step % self.log_every_steps == 0:
                         self._log_train_window(window, epoch_idx, grad_norm, pbar)
+                        window = self._new_train_window()
                     # Window boundary: the only safe point to stop on the step budget
                     # or rebind the dataloader. Both branch on ``global_step``, which
                     # is identical on every rank.
@@ -564,12 +563,11 @@ class SpecDecodeRecipeBase(BaseRecipe):
         # length; a variable-length sampler would desync the flush collectives.
         if pending_micro_batches > 0:
             grad_norm = self._optimizer_step(epoch_idx, pbar, pending_micro_batches)
-            completed_steps += 1
             self._after_trailing_flush(window, epoch_idx, grad_norm)
 
         self._on_epoch_end(epoch_idx, batches_seen)
         eval_metrics = self._run_eval()
-        val_metrics = self._report_epoch(epoch_idx, completed_steps, eval_metrics)
+        val_metrics = self._report_epoch(epoch_idx, self.runtime.global_step - start_step, eval_metrics)
         if getattr(self, "save_checkpoint_every_epoch", False) and batches_seen > 0:
             self.save_checkpoint(
                 epoch=epoch_idx + 1,
@@ -614,6 +612,9 @@ class SpecDecodeRecipeBase(BaseRecipe):
     #: Stop once ``global_step`` reaches ``total_optim_steps`` instead of when the
     #: epoch range is exhausted (EAGLE-3: regen splits an epoch into segments).
     stop_at_step_budget: ClassVar[bool] = False
+    #: FSDP2 drafts defer the gradient reduce-scatter to the last micro-batch of a
+    #: window unless ``distributed.defer_fsdp_grad_sync`` turns it off (DSpark).
+    defer_fsdp_grad_sync: bool = True
 
     def _on_train_start(self, start_epoch: int) -> None:
         """Called once before the first epoch that trains."""
@@ -629,20 +630,21 @@ class SpecDecodeRecipeBase(BaseRecipe):
         """Return the iterable of training items for the current segment."""
         return self.train_dataloader
 
-    def _grad_sync_context(self, pending_micro_batches: int, batch_idx: int, num_batches: int | None, is_ddp: bool):
-        """Return the context that gates this micro-batch's gradient all-reduce.
+    def _grad_sync_context(self, pending_micro_batches: int, batch_idx: int, num_batches: int | None):
+        """Return the context that gates this micro-batch's gradient reduction.
 
-        Under DDP only the micro-batch an optimizer step follows needs to
-        all-reduce; the others run under ``no_sync()``.
+        Only the micro-batch an optimizer step follows needs to reduce gradients:
+        DDP runs the others under ``no_sync()`` and FSDP2 defers their
+        reduce-scatter (see ``get_sync_ctx``). A single-process draft never syncs.
         """
-        sync = should_sync_grads(
+        is_optim_step = should_sync_grads(
             pending_micro_batches=pending_micro_batches,
             grad_accumulation_steps=self.grad_accumulation_steps,
             batch_idx=batch_idx,
             batches_per_epoch=num_batches,
-            is_ddp=is_ddp,
+            is_ddp=True,
         )
-        return nullcontext() if sync else self.trainer_module.no_sync()
+        return get_sync_ctx(self.trainer_module, is_optim_step, self.defer_fsdp_grad_sync)
 
     def _forward_micro_batch(self, batch):
         """Return the training metrics (with a differentiable ``loss``) of one micro-batch."""
@@ -684,10 +686,10 @@ class SpecDecodeRecipeBase(BaseRecipe):
 
     def _accumulate_train_metrics(self, window, metrics) -> None:
         """Add one micro-batch's metrics to ``window``."""
-        raise NotImplementedError
+        window.add(metrics)
 
     def _log_train_window(self, window, epoch_idx: int, grad_norm, pbar) -> None:
-        """Report and reset ``window``; called on every rank at the log cadence."""
+        """Report ``window``; called on every rank at the log cadence, which then starts a new window."""
         raise NotImplementedError
 
     def _after_trailing_flush(self, window, epoch_idx: int, grad_norm) -> None:
