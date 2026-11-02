@@ -1053,6 +1053,7 @@ class Gemma4ForConditionalGeneration(
     (NeMo GroupedExperts + Gemma4Gate).  Otherwise falls through to vanilla HF.
     """
 
+    @property
     def packed_metadata_entry_module(self) -> nn.Module:
         """Prepare packed masks before this model applies its vision policy."""
         return self
