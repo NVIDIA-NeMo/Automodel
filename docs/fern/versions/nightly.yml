@@ -1095,6 +1095,9 @@ navigation:
               - page: "nyu-mll/glue"
                 path: ../../dataset-coverage/nyu-mll/glue.mdx
                 slug: nyu-mll/glue
+              - page: "open-thoughts/OpenThoughts3-1.2M"
+                path: ../../dataset-coverage/open-thoughts/openthoughts3-1-2m.mdx
+                slug: open-thoughts/OpenThoughts3-1.2M
               - page: "openai/gsm8k"
                 path: ../../dataset-coverage/openai/gsm8k.mdx
                 slug: openai/gsm8k

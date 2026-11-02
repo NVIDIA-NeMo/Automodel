@@ -420,5 +420,16 @@
     "aliases": [
       "lambdalabs/naruto-blip-captions"
     ]
+  },
+  {
+    "id": "open-thoughts/OpenThoughts3-1.2M",
+    "card": "docs/dataset-coverage/open-thoughts/openthoughts3-1-2m.mdx",
+    "task": "Reasoning response generation",
+    "recipes": [
+      "examples/dllm_sft/qwen3_8b_uno.yaml"
+    ],
+    "source": "nemo_automodel/components/datasets/llm/chat_dataset.py",
+    "evidence": [],
+    "revision": "61bcf9d4eb38b30295efc2021227a63cc5bb34c8"
   }
 ]
