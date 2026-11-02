@@ -36,7 +36,7 @@ from nemo_automodel.components.models.qwen3_5.parallelization import Qwen3_5Mode
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 
 class _ToyLM(nn.Module):
