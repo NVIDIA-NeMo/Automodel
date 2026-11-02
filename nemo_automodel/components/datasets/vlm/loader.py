@@ -357,7 +357,8 @@ class VlmDataloaderConfig:
             packing_attn_implementation: Deprecated attention-backend name
                 retained for Python-call compatibility.
             packing_contract: Structural model contract used for packed-mask construction.
-                Defaults to block-causal masking without packed-sequence metadata.
+                Native mask/Flash collation requires a model-derived contract supplying
+            the attention conversion; recipes provide it automatically.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
                 compact document IDs instead of a dense quadratic attention mask;

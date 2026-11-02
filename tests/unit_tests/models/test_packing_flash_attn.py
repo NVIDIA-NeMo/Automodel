@@ -105,7 +105,7 @@ def test_collater_sdpa_returns_4d_mask():
             "n_videos": 0,
         },
     ]
-    result = neat_packed_vlm_collater(batch, attn_implementation="sdpa")
+    result = neat_packed_vlm_collater(batch, attn_implementation="sdpa", packing=get_packing_capabilities("sdpa"))
     assert result["attention_mask"].ndim == 4  # [B, 1, S, S]
     assert result["attention_mask"].shape == (1, 1, 5, 5)
 
