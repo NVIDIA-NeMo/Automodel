@@ -22,7 +22,6 @@ import pytest
 from nemo_automodel.components.launcher.interactive import (
     InteractiveLauncher,
     _get_repo_root,
-    _recipe_module_path,
     resolve_recipe_cls,
 )
 
@@ -43,29 +42,6 @@ def test_resolve_recipe_cls_valid():
 def test_resolve_recipe_cls_builtin_module():
     cls = resolve_recipe_cls("os.path.join")
     assert cls is os.path.join
-
-
-# ---------------------------------------------------------------------------
-# _recipe_module_path
-# ---------------------------------------------------------------------------
-def test_recipe_module_path():
-    target = "nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction"
-    repo_root = Path("/opt/Automodel")
-    result = _recipe_module_path(target, repo_root)
-    assert result == Path("/opt/Automodel/nemo_automodel/recipes/llm/train_ft.py")
-
-
-def test_recipe_module_path_vlm():
-    target = "nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM"
-    repo_root = Path("/workspace")
-    result = _recipe_module_path(target, repo_root)
-    assert result == Path("/workspace/nemo_automodel/recipes/vlm/finetune.py")
-
-
-def test_recipe_module_path_short_target():
-    target = "pkg.mod.Cls"
-    result = _recipe_module_path(target, Path("/root"))
-    assert result == Path("/root/pkg/mod.py")
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +205,9 @@ def test_interactive_launcher_multi_device(tmp_path):
     assert rc == 0
     mock_dist.run.assert_called_once()
     assert mock_args.nproc_per_node == 4
-    assert mock_args.training_script_args == ["-c", str(cfg_file)]
+    assert mock_args.module is True
+    assert mock_args.training_script == "nemo_automodel.cli.app"
+    assert mock_args.training_script_args == [str(cfg_file)]
 
 
 def test_interactive_launcher_multi_device_with_extra_args(tmp_path):
