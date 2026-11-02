@@ -42,6 +42,11 @@ class _Runtime:
     api: ModuleType | None = None
     group: dist.ProcessGroup | None = None
     settings: tuple[int | bool | None, ...] | None = None
+    # Classic NCCL group that NCCL-EP runs on when ``legacy_source`` cannot lend its communicator.
+    # It outlives finalize, like the EP group it mirrors: later bootstraps on that group reuse it,
+    # and process-group teardown destroys it.
+    legacy_source: dist.ProcessGroup | None = None
+    legacy_group: dist.ProcessGroup | None = None
     # Zero-copy symmetric buffers of shape [recv_capacity, hidden], shared by every layer:
     # each layer's combine reads the expert output before the next layer writes it, and
     # each layer's dispatch backward reads the input gradient before the next combine
@@ -63,6 +68,38 @@ def finalize_nccl_ep() -> None:
         _runtime.api = None
         _runtime.group = None
         _runtime.settings = None
+
+
+def _legacy_group_for(group: dist.ProcessGroup) -> dist.ProcessGroup | None:
+    """Create a classic NCCL group over ``group``'s ranks when ``group`` cannot lend its communicator.
+
+    Transformer Engine 2.20 borrows the raw NCCL communicator through the CUDA backend's
+    ``_comm_ptr()``. PyTorch 2.15 builds ``backend="nccl"`` groups on ``ProcessGroupNCCL2``,
+    which does not expose it, so NCCL-EP then runs on a ``nccl-legacy`` group of the same ranks.
+
+    Args:
+        group: NCCL expert-parallel group.
+
+    Returns:
+        An initialized ``nccl-legacy`` group, or None when ``group`` lends its communicator.
+    """
+    if hasattr(group._get_backend(torch.device("cuda")), "_comm_ptr"):
+        return None
+    # ProcessGroupNCCL2 binds the default group to a device, and new_group then splits every new
+    # group's communicator from the default group's, which ProcessGroupNCCL cannot do. Unbind it
+    # meanwhile so that the legacy group creates its own communicator.
+    world = dist.group.WORLD
+    bound_device = world.bound_device_id
+    world.bound_device_id = None
+    try:
+        legacy = dist.new_group(
+            dist.get_process_group_ranks(group), backend="nccl-legacy", use_local_synchronization=True
+        )
+    finally:
+        world.bound_device_id = bound_device
+    # ProcessGroupNCCL creates its communicator on first use, and NCCL-EP borrows it at bootstrap.
+    dist.barrier(group=legacy, device_ids=[torch.cuda.current_device()])
+    return legacy
 
 
 @contextmanager
@@ -121,9 +158,12 @@ def _join_transport(
     if _runtime.api is None:
         if api.is_ep_bootstrapped():
             raise RuntimeError("NCCL-EP is already initialized outside AutoModel; finalize that context first")
+        if _runtime.legacy_source is not group:
+            _runtime.legacy_source, _runtime.legacy_group = group, _legacy_group_for(group)
+        transport_group = group if _runtime.legacy_group is None else _runtime.legacy_group
         with _ordered_layout_environment():
             api.ep_bootstrap(
-                group,
+                transport_group,
                 num_experts=num_experts,
                 max_tokens_per_rank=capacity,
                 hidden_dim=hidden_dim,
@@ -137,9 +177,11 @@ def _join_transport(
             )
         _runtime.api, _runtime.group, _runtime.settings = api, group, settings
         if zero_copy:
-            # Collective: every EP rank registers each buffer as one window.
-            _runtime.expert_output = api.symm_mem_alloc((recv_capacity, hidden_dim), torch.bfloat16, group)
-            _runtime.expert_input_grad = api.symm_mem_alloc((recv_capacity, hidden_dim), torch.bfloat16, group)
+            # Collective: every EP rank registers each buffer as one window on the group NCCL-EP uses.
+            _runtime.expert_output = api.symm_mem_alloc((recv_capacity, hidden_dim), torch.bfloat16, transport_group)
+            _runtime.expert_input_grad = api.symm_mem_alloc(
+                (recv_capacity, hidden_dim), torch.bfloat16, transport_group
+            )
     elif _runtime.group is not group or _runtime.settings != settings:
         raise ValueError("NCCL-EP supports one EP group and one capacity/shape configuration per process")
     return api
