@@ -40,6 +40,7 @@ distributed:
   sequence_parallel: false
   mp_policy:
     param_dtype: bfloat16
+    reduce_dtype: float32
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
