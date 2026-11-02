@@ -4409,7 +4409,7 @@ def test_setup_always_passes_return_contract_and_only_configures_packed_batched_
         build=build,
     )
     monkeypatch.setattr(RecipeConfig, config_property, property(lambda self: config))
-    monkeypatch.setattr(recipe_type, "_get_packing_contract", query)
+    monkeypatch.setattr(recipe_type, "_packing_contract", property(query))
     monkeypatch.setattr(f"{module}.configure_packing_for_models", lambda models: configured.append(True))
     monkeypatch.setattr(f"{module}.validate_thd_packing_support", lambda models: thd_validated.append(True))
     with pytest.raises(LoaderReached):
