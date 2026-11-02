@@ -315,6 +315,10 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
         self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
         self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
         self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
+        # The combine cache (BackendConfig.dispatcher_recompute_cache) is read by the shared dispatcher's config as
+        # well: a frozen layer next to a LoRA one must carry the same mode, or the shared-manager check rejects the
+        # pair and an all-frozen conversion silently loses the request (review of #4395).
+        self.dispatcher_recompute_cache = orig_module.dispatcher_recompute_cache
         # These fresh parameters have no autograd history or optimizer references.
         for name in self._MXFP4_BASE_NAMES:
             getattr(self, name).data = _to_local(getattr(orig_module, name)).clone()

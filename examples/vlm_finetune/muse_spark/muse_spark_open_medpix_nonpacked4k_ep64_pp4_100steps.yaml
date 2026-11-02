@@ -47,6 +47,7 @@ model:
     compile_norm: true
     experts: torch_mm
     dispatcher: hybridep
+    compile_router_weight: true
     rope_fusion: false
     gate_precision: float32
     fake_balanced_gate: false
