@@ -454,6 +454,7 @@ def test_compact_dense_mask_materializes_at_model_owned_entry(backend):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.ones(1, dtype=torch.float64))
 
+        @property
         def packed_metadata_entry_module(self):
             return self
 

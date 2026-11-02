@@ -186,7 +186,11 @@ class _EncodeImageDocuments(BaseOp):
                 continue
             if "pixel_values_videos" in document or "video_grid_thw" in document:
                 raise ValueError("The image VLM Zephon adapter does not support video documents.")
-            token_types = document.get("mm_token_type_ids", torch.zeros_like(document["input_ids"]))
+            token_types = (
+                document["mm_token_type_ids"]
+                if "mm_token_type_ids" in document
+                else torch.zeros_like(document["input_ids"])
+            )
             document["position_ids"] = self._positions.positions(
                 document["input_ids"],
                 mm_token_type_ids=token_types.unsqueeze(0),
@@ -222,7 +226,9 @@ def prepare_fake_image_document(processor: ProcessorMixin, positions: ImagePosit
         processor,
         inject_fake_images=False,
     )
-    token_types = document.get("mm_token_type_ids", torch.zeros_like(document["input_ids"]))
+    token_types = (
+        document["mm_token_type_ids"] if "mm_token_type_ids" in document else torch.zeros_like(document["input_ids"])
+    )
     document["position_ids"] = positions.positions(
         document["input_ids"],
         mm_token_type_ids=token_types.unsqueeze(0),
