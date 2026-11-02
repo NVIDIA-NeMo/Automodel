@@ -20,13 +20,15 @@ from typing import TYPE_CHECKING, Callable, Union
 import torch
 import torch.nn as nn
 
-from nemo_automodel.shared.packed_seq import FLASH_VARLEN_KWARGS
-from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+# Public Hugging Face FlashAttention argument names belong to this HF adapter.
+_FLASH_VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
 
 # Constants for identifying text/language modules in multimodal models
 TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
@@ -183,7 +185,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
 
         if hasattr(text_module, "layers") and text_module.layers is not None:
             # Preserve the public FlashAttention metadata for this microbatch.
-            flash_kwargs = {key: kwargs[key] for key in FLASH_VARLEN_KWARGS if key in kwargs}
+            flash_kwargs = {key: kwargs[key] for key in _FLASH_VARLEN_KWARGS if key in kwargs}
             # Works for dict-like or list-like containers
             layer_iter = text_module.layers.values() if hasattr(text_module.layers, "values") else text_module.layers
             for decoder_layer in layer_iter:

@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config
@@ -34,7 +35,6 @@ from nemo_automodel.components.models.kimi_k3.vision import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
-from nemo_automodel.shared.vlm_media import next_vlm_media_chunk
 
 
 def _vision_tower_config(config: KimiK3Config):
