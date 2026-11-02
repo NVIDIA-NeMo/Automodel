@@ -2636,3 +2636,38 @@ def test_mistral3_reranker_finetune_from_head_layouts(tmp_path, legacy):
     loss = restored(input_ids=torch.tensor([[1, 2, 3]]), attention_mask=torch.ones(1, 3)).logits.sum()
     loss.backward()
     assert torch.isfinite(restored.model.score.weight.grad).all()
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("from_config", [False, True])
+def test_ministral_optional_outputs_and_gradients_match_hf(is_causal, from_config):
+    from copy import deepcopy
+
+    config = tiny_bidirectional_config()
+    config.num_hidden_layers = 2
+    config.is_causal = is_causal
+    config.use_cache = False
+    config.output_hidden_states = from_config
+    config.output_attentions = from_config
+    actual = Ministral3BidirectionalModel(config)
+    reference = HFMinistral3Model(deepcopy(config))
+    reference.load_state_dict(actual.state_dict())
+    ids = torch.tensor([[2, 3, 4, 5], [6, 7, 0, 0]])
+    mask = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]])
+    options = {} if from_config else {"output_hidden_states": True, "output_attentions": True}
+    outputs = actual(input_ids=ids, attention_mask=mask, **options)
+    expected = reference(input_ids=ids, attention_mask=mask, **options)
+    assert len(outputs.hidden_states) == 3
+    assert len(outputs.attentions) == 2
+    for field in ("hidden_states", "attentions"):
+        for value, ref in zip(getattr(outputs, field), getattr(expected, field)):
+            torch.testing.assert_close(value, ref, rtol=1e-5, atol=1e-6)
+    upstream = torch.randn_like(outputs.last_hidden_state) * mask.unsqueeze(-1)
+    (outputs.last_hidden_state * upstream).sum().backward()
+    (expected.last_hidden_state * upstream).sum().backward()
+    for parameter, ref_parameter in zip(actual.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=1e-5, atol=1e-6)
+    with torch.no_grad():
+        result = actual(input_ids=ids, attention_mask=mask, return_dict=False, **options)
+    assert isinstance(result, tuple)
+    torch.testing.assert_close(result[0], expected.last_hidden_state)

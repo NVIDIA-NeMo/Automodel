@@ -266,3 +266,77 @@ def test_optimizer_checkpoint_restores_group_mults(tmp_path, native):
     assert [g["weight_decay"] for g in resumed_optimizer.param_groups] == pytest.approx([0.1, 0.0, 0.0])
     assert [g["lr"] for g in resumed_optimizer.param_groups] == pytest.approx([1e-3, 1e-3, 5e-3])
     _assert_adam_states_equal(resumed_optimizer, optimizer)
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["flattened", "native"])
+@pytest.mark.parametrize("keep_lr_mult", [False, True])
+def test_legacy_scheduler_checkpoint_preserves_next_update(tmp_path, native, keep_lr_mult):
+    model, optimizer, scheduler = _grouped_adamw_with_scheduler()
+    # Legacy schedulers did not insert multiplier keys. Explicit user multipliers
+    # were supported, and must survive independently of missing defaults.
+    for group in optimizer.param_groups:
+        if not keep_lr_mult:
+            group.pop("lr_mult")
+        group.pop("wd_mult")
+    scheduler.step(1)
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    checkpointer = Checkpointer(
+        CheckpointingConfig(
+            checkpoint_dir=tmp_path, model_save_format="safetensors", save_consolidated=False, is_peft=native
+        ),
+        dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=object() if native else None,
+    )
+    try:
+        checkpointer.save_optimizer(optimizer, model, str(tmp_path), [scheduler])
+        resumed_model, resumed_optimizer, resumed_scheduler = _grouped_adamw_with_scheduler()
+        resumed_model.load_state_dict(model.state_dict())
+        checkpointer.load_optimizer(resumed_optimizer, resumed_model, str(tmp_path), [resumed_scheduler])
+        assert [g["wd_mult"] for g in resumed_optimizer.param_groups] == [1.0, 1.0, 1.0]
+        assert [g["lr_mult"] for g in resumed_optimizer.param_groups] == (
+            [1.0, 1.0, 5.0] if keep_lr_mult else [1.0, 1.0, 1.0]
+        )
+        for m, o, s in ((model, optimizer, scheduler), (resumed_model, resumed_optimizer, resumed_scheduler)):
+            m(torch.tensor([[0.25, -0.5]])).square().sum().backward()
+            o.step()
+            s.step(1)
+        for expected, actual in zip(model.parameters(), resumed_model.parameters()):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert resumed_scheduler.num_steps == scheduler.num_steps
+        for expected, actual in zip(optimizer.param_groups, resumed_optimizer.param_groups):
+            assert actual["lr"] == expected["lr"]
+            assert actual["weight_decay"] == expected["weight_decay"]
+        for expected, actual in zip(optimizer.state.values(), resumed_optimizer.state.values()):
+            for key in expected:
+                torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+    finally:
+        checkpointer.close()
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["flattened", "native"])
+def test_legacy_multiplier_compatibility_keeps_missing_moments_strict(tmp_path, native):
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    model, optimizer, scheduler = _grouped_adamw_with_scheduler()
+    for group in optimizer.param_groups:
+        group.pop("lr_mult")
+        group.pop("wd_mult")
+    state = OptimizerState(
+        model, optimizer, [scheduler], is_peft=native, has_expert_parallelism=native
+    ).state_dict()
+    if native:
+        del state["optim"]["state"][0]["exp_avg"]
+    else:
+        del state["optim"][next(key for key in state["optim"] if key.endswith(".exp_avg"))]
+    checkpointer = Checkpointer(
+        CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False, is_peft=native),
+        dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=object() if native else None,
+    )
+    try:
+        checkpointer._do_save(state, str(tmp_path / "optim"))
+        resumed_model, resumed_optimizer, resumed_scheduler = _grouped_adamw_with_scheduler()
+        with pytest.raises(CheckpointException, match="Missing key.*exp_avg"):
+            checkpointer.load_optimizer(resumed_optimizer, resumed_model, str(tmp_path), [resumed_scheduler])
+    finally:
+        checkpointer.close()

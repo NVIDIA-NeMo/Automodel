@@ -31,6 +31,8 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3PreTrainedModel,
 )
 from transformers.utils import logging
+from transformers.utils.generic import merge_with_config_defaults
+from transformers.utils.output_capturing import capture_outputs
 
 from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
 
@@ -113,8 +115,9 @@ class Ministral3BidirectionalModel(Ministral3Model):
         Returns:
             Output with floating-point last_hidden_state [batch, sequence, hidden],
             where hidden is config.hidden_size, and the optional Transformers cache.
-            In causal mode, optional hidden states and attentions follow the Hugging
-            Face Ministral3Model.forward output contract.
+            Optional hidden states [batch, sequence, hidden] and attentions
+            [batch, heads, sequence, key_sequence] follow the Hugging Face
+            Ministral3Model.forward output contract in both attention modes.
         """
         if getattr(self.config, "is_causal", False):
             return super().forward(
@@ -128,6 +131,35 @@ class Ministral3BidirectionalModel(Ministral3Model):
                 **kwargs,
             )
 
+        return self._forward_bidirectional(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+    @merge_with_config_defaults
+    @capture_outputs
+    def _forward_bidirectional(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Any,
+    ) -> BaseModelOutputWithPast:
+        """Apply the public forward tensor contract with bidirectional attention.
+
+        Uses the HF output-capture contract for optional hidden states and
+        attentions, including config defaults and tuple returns.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 

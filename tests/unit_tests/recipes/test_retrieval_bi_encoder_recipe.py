@@ -599,3 +599,15 @@ def test_checkpoint_flushes_metrics_to_disk_mid_run(tmp_path):
     assert seen[4] == [1, 2, 3], "the checkpoint flush must have made the covered steps durable"
     assert seen[6] == [1, 2, 3], "and no further flush happens until the run ends"
     assert _durable_steps(logfile) == [1, 2, 3, 4, 5, 6], "close() drains the remainder"
+
+
+@pytest.mark.parametrize("template,side", [("{query} {passage} </s>", "right"), ("{query} {passage}", "left")])
+def test_reranker_export_restrictions_only_apply_when_requested(template, side):
+    from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
+
+    tokenizer = SimpleNamespace(truncation_side=side, chat_template="original")
+    collator = CrossEncoderCollator(128, tokenizer=tokenizer, prompt_template=template)
+    _configure_sentence_transformer_export(SimpleNamespace(), collator, export_reranker=False)
+    assert tokenizer.chat_template == "original"
+    with pytest.raises(ValueError, match="Text reranker export requires"):
+        _configure_sentence_transformer_export(SimpleNamespace(), collator, export_reranker=True)

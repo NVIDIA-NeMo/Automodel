@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
 from nemo_automodel.components.datasets.llm.retrieval_types import PASSAGE_MODALITY_NAMES
@@ -85,11 +86,12 @@ def _unwrap_model_for_attrs(model):
     return getattr(model, "module", model)
 
 
-def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None) -> None:
+def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None, export_reranker: bool = True) -> None:
     """Bind static prompts and validate export against the runtime tokenizer or processor."""
     model = _unwrap_model_for_attrs(model)
     if isinstance(collate_fn, CrossEncoderCollator):
-        collate_fn.configure_tokenizer_for_export()
+        if export_reranker:
+            collate_fn.configure_tokenizer_for_export()
         return
     configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
     if configure_prompts is None:
@@ -437,7 +439,14 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self.dataloader = materialize_loader(dataloader_config)
         _configure_sentence_transformer_export(
-            self.model_parts[0], self.dataloader.collate_fn, tokenizer=self.tokenizer
+            self.model_parts[0],
+            self.dataloader.collate_fn,
+            tokenizer=self.tokenizer,
+            export_reranker=(
+                checkpoint_config.enabled
+                and checkpoint_config.model_save_format.value == "safetensors"
+                and checkpoint_config.save_consolidated != SaveConsolidatedMode.FALSE
+            ),
         )
         self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
         self.log_modality_loss = bool(self.cfg.get("log_modality_loss", False))
