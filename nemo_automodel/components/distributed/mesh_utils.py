@@ -176,21 +176,23 @@ def _nccl_backend_override(
     device_type: str,
     timeout_minutes: int | None,
 ):
-    """Create per-axis NCCL options for DeviceMesh subgroups.
+    """Create per-axis timeout options without replacing the default backend.
 
     ``init_process_group(timeout=...)`` configures the default process group, but
     ``init_device_mesh`` creates additional per-axis process groups. Without a
     backend override those groups keep PyTorch's default NCCL timeout.
+    Preserve composite backends so CPU-offloaded tensors can still use Gloo.
     """
     if timeout_minutes is None or device_type != "cuda":
         return None
 
     timeout = datetime.timedelta(minutes=timeout_minutes)
+    backend = dist.get_backend() if dist.is_initialized() else "nccl"
     override = {}
     for axis in axes:
         options = dist.ProcessGroupNCCL.Options()
         options._timeout = timeout
-        override[axis] = ("nccl", options)
+        override[axis] = (backend, options)
     return override
 
 

@@ -58,7 +58,10 @@ def test_distributed_package_exports_user_entrypoints():
     assert distributed.initialize_distributed is initialize_distributed
 
 
-def test_init_named_mesh_sets_nccl_timeout_backend_override(monkeypatch):
+@pytest.mark.parametrize("default_backend", [None, "nccl", "cuda:nccl,cpu:gloo"])
+def test_init_named_mesh_sets_nccl_timeout_backend_override(
+    monkeypatch: pytest.MonkeyPatch, default_backend: str | None
+) -> None:
     captured: dict = {}
     fake_mesh = Mock()
 
@@ -69,11 +72,14 @@ def test_init_named_mesh_sets_nccl_timeout_backend_override(monkeypatch):
     monkeypatch.setattr(mesh_utils, "init_device_mesh", fake_init_device_mesh)
     monkeypatch.setattr(mesh_utils, "_mesh_device_type", lambda: "cuda")
 
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: default_backend is not None)
+    monkeypatch.setattr(mesh_utils.dist, "get_backend", lambda: default_backend)
+
     result = _init_named_mesh(_MeshSpec(shape=(2,), axes=(MeshAxisName.PP,)), timeout_minutes=30)
 
     assert result is fake_mesh
     backend, options = captured["backend_override"][MeshAxisName.PP]
-    assert backend == "nccl"
+    assert backend == (default_backend or "nccl")
     assert options._timeout == datetime.timedelta(minutes=30)
 
 
@@ -104,6 +110,7 @@ def test_flattened_axes_inherit_nccl_timeout(monkeypatch):
     device_mesh._flatten_mapping = {}
     device_mesh.__getitem__ = Mock(return_value=source_mesh)
     monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_backend", lambda: "nccl")
     monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 8)
 
     _register_flattened_axes(
@@ -128,6 +135,7 @@ def test_flattened_world_axis_reuses_default_process_group(monkeypatch):
     device_mesh._flatten_mapping = {}
     device_mesh.__getitem__ = Mock(return_value=source_mesh)
     monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_backend", lambda: "nccl")
     monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 8)
 
     _register_flattened_axes(
@@ -193,6 +201,7 @@ def test_moe_ep_groups_inherit_nccl_timeout(monkeypatch):
     device_mesh.device_type = "cuda"
     device_mesh.__getitem__ = Mock(return_value=source_mesh)
     monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_backend", lambda: "nccl")
     monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 64)
 
     result = _create_moe_mesh(device_mesh, ep_shard_size=4, ep_size=32, timeout_minutes=30)
@@ -217,6 +226,7 @@ def test_moe_world_size_ep_reuses_default_process_group(monkeypatch):
     device_mesh.device_type = "cuda"
     device_mesh.__getitem__ = Mock(return_value=source_mesh)
     monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_backend", lambda: "nccl")
     monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 8)
 
     result = _create_moe_mesh(device_mesh, ep_shard_size=1, ep_size=8, timeout_minutes=30)
