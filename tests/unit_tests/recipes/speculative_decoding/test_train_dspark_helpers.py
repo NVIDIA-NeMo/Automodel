@@ -60,7 +60,7 @@ from nemo_automodel.recipes.speculative_decoding._dspark_target_build import (
     validate_dspark_parallelism_axes,
 )
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import resolve_warmup_steps
-from nemo_automodel.recipes.speculative_decoding.train_dspark import (
+from nemo_automodel.recipes.speculative_decoding.algorithms.dspark import (
     _DSPARK_WINDOW_SCALARS,
     TrainDSparkRecipe,
     _add_accept_rate_per_position,
@@ -807,7 +807,7 @@ def test_cached_dspark_manifest_accepts_bf16_cache_on_cuda_dtype():
 
 def test_recipe_cached_path_does_not_load_target_model(monkeypatch, tmp_path):
     """The recipe-level offline path must skip building the live target wrapper."""
-    import nemo_automodel.recipes.speculative_decoding.train_dspark as train_dspark_module
+    import nemo_automodel.recipes.speculative_decoding.algorithms.dspark as train_dspark_module
 
     vocab_size = 64
     hidden_size = 32

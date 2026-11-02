@@ -36,7 +36,6 @@ from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     load_hf_safetensors_state_dict,
 )
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import (
     build_eagle3_dataloader,
     load_or_build_eagle3_token_mapping,
@@ -81,7 +80,7 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     read_load_metadata_with_gloo,
     submesh_or_none,
 )
-from nemo_automodel.recipes.speculative_decoding.peagle_recipe import PeagleRecipeMixin
+from nemo_automodel.recipes.speculative_decoding.algorithms.peagle import PeagleRecipeMixin
 
 logger = logging.getLogger(__name__)
 
@@ -2054,15 +2053,3 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
             _best_effort("finishing W&B run", self.wandb_run.finish)
         if getattr(self, "trackio_logger", None) is not None:
             _best_effort("finishing Trackio run", self.trackio_logger.finish)
-
-
-def main(config_path=None):
-    """Main entry point for the EAGLE-3 recipe."""
-    cfg = parse_args_and_load_config(config_path)
-    trainer = TrainEagle3Recipe(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()

@@ -35,7 +35,6 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
@@ -835,15 +834,3 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
                 )
             logger.info(msg)
         return eval_metrics
-
-
-def main(config_path: str | None = None):
-    """Entrypoint for ``TrainDFlashRecipe``."""
-    cfg = parse_args_and_load_config(config_path)
-    trainer = TrainDFlashRecipe(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()

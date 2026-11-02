@@ -37,7 +37,6 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.dspark_cache import (
     DTYPE_MAP,
     build_cached_dspark_dataloader,
@@ -1519,15 +1518,3 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             self.metric_logger.close()
         self._finish_wandb()
         self._close_remote_target()
-
-
-def main(config_path: str | None = None):
-    """Entrypoint for ``TrainDSparkRecipe``."""
-    cfg = parse_args_and_load_config(config_path)
-    trainer = TrainDSparkRecipe(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()

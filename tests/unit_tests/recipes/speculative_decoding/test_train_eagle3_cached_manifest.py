@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import pytest
 
 from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import _validate_cached_eagle3_manifest
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import _validate_cached_eagle3_manifest
 
 _CONFIG = SimpleNamespace(vocab_size=64, hidden_size=32)
 _OPTIONS = ("mask_reasoning_content", "mask_generation_prompt")

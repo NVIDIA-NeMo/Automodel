@@ -212,7 +212,7 @@ def _find_eagle_meta(checkpoint_dir: Path) -> Path | None:
     The recipes write the metadata as ``eagle_meta.pt``; older hand-exported
     checkpoints used ``eagle3_meta.pt``. Prefer the current name and fall back to
     the legacy one, mirroring the recipe's own loader (``_load_extra_state`` in
-    ``recipes/speculative_decoding/train_eagle3.py``).
+    ``recipes/speculative_decoding/algorithms/eagle3.py``).
     """
     for name in ("eagle_meta.pt", "eagle3_meta.pt"):
         candidate = checkpoint_dir / name

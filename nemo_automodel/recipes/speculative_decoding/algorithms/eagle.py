@@ -25,7 +25,6 @@ from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
@@ -115,7 +114,7 @@ class TrainEagle1Recipe(SpecDecodeRecipeBase):
         # Optional ``distributed:`` YAML section. Required for targets that
         # do not fit on a single GPU (e.g. Qwen3-30B-A3B MoE). Absent =>
         # original single-GPU-per-rank behavior, preserved for 8B-class dense.
-        # ``force_hf`` opt-in; see the train_eagle3 recipe for rationale.
+        # ``force_hf`` opt-in; see TrainEagle3Recipe for rationale.
         target_kwargs = dict(
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
@@ -450,13 +449,10 @@ class TrainEagle1Recipe(SpecDecodeRecipeBase):
             self.trackio_logger.finish()
 
 
-def main(config_path: str | None = None):
-    """Entrypoint for ``TrainEagle1Recipe``."""
-    cfg = parse_args_and_load_config(config_path)
-    trainer = TrainEagle1Recipe(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
+class TrainEagle2Recipe(TrainEagle1Recipe):
+    """EAGLE-2 draft training.
 
-
-if __name__ == "__main__":
-    main()
+    EAGLE-2 trains its draft with the same objective as EAGLE-1; the difference is
+    the dynamic draft-tree policy at inference time. The separate recipe name lets
+    a config state which deployment workflow its checkpoint targets.
+    """

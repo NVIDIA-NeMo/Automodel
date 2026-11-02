@@ -261,7 +261,7 @@ CUDA_VISIBLE_DEVICES=0 python -m nemo_automodel.recipes.speculative_decoding.ser
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 -m nemo_automodel.recipes.speculative_decoding.train_dspark -c examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
+CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node=1 -m nemo_automodel.cli.app examples/speculative/dspark/qwen3_0.6b_dspark_remote.yaml
 ```
 
 The server listens on `target_server.host` and `target_server.port` (default
@@ -710,9 +710,9 @@ nemo_automodel/components/speculative/
   bench_vllm.py            # acceptance-length / speedup benchmark (vLLM)
   bench_sweep.py           # multi-dataset acceptance-length sweep (either engine)
 nemo_automodel/recipes/speculative_decoding/
-  train_eagle1.py  train_eagle2.py  train_eagle3.py  peagle_recipe.py
-  train_dflash.py  train_dflash2.py  train_domino.py  train_jetspec.py
-  train_dspark.py  train_vispec.py
+  _spec_recipe_base.py                      # shared training loop, checkpointing, LR schedule
+  algorithms/                               # one module per algorithm family (no per-algorithm entry point)
+    eagle.py  eagle3.py  peagle.py  dflash.py  dflash2.py  domino.py  jetspec.py  dspark.py  vispec.py
   precompute_dspark_dist.py                 # offline DSpark target precompute
   serve_dspark_target.py                    # remote DSpark target server
 ```

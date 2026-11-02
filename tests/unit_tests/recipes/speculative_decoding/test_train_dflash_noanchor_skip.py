@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.speculative.dflash.core import NoValidAnchorsError
-from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
 
 
 class _FakeTrainerModule(nn.Module):

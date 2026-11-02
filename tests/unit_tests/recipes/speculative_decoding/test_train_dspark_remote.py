@@ -35,14 +35,14 @@ os.environ["NEMO_EAGLE_ENABLE_NCCL"] = "0"
 
 from http.server import ThreadingHTTPServer  # noqa: E402
 
-import nemo_automodel.recipes.speculative_decoding.train_dspark as train_dspark_module  # noqa: E402
+import nemo_automodel.recipes.speculative_decoding.algorithms.dspark as train_dspark_module  # noqa: E402
 from nemo_automodel.components.speculative.dspark.remote import (  # noqa: E402
     DSparkTargetModelServer,
     RemoteDSparkTargetModel,
 )
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel  # noqa: E402
 from nemo_automodel.components.speculative.eagle.remote.server import _make_request_handler  # noqa: E402
-from nemo_automodel.recipes.speculative_decoding.train_dspark import (  # noqa: E402
+from nemo_automodel.recipes.speculative_decoding.algorithms.dspark import (  # noqa: E402
     TrainDSparkRecipe,
     _validate_remote_target_options,
 )

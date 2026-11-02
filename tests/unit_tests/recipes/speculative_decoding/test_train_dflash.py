@@ -32,8 +32,8 @@ from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
-from nemo_automodel.recipes.speculative_decoding import train_dflash
-from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms import dflash
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
 
 _VOCAB = 64
 _HIDDEN = 32
@@ -392,22 +392,22 @@ def test_run_eval_all_batches_short_returns_zero_metrics():
 
 def test_all_ranks_have_valid_single_process_passes_local_flag():
     # No DDP -> the local flag passes through unchanged (no collective).
-    assert train_dflash._all_ranks_have_valid(1, is_ddp=False, device="cpu") is True
-    assert train_dflash._all_ranks_have_valid(0, is_ddp=False, device="cpu") is False
+    assert dflash._all_ranks_have_valid(1, is_ddp=False, device="cpu") is True
+    assert dflash._all_ranks_have_valid(0, is_ddp=False, device="cpu") is False
 
 
 def test_all_ranks_have_valid_ddp_min_reduces_across_ranks(monkeypatch):
     """Under DDP the flag is MIN-reduced: one rank without anchors makes all skip."""
-    monkeypatch.setattr(train_dflash.dist, "is_available", lambda: True)
-    monkeypatch.setattr(train_dflash.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dflash.dist, "is_available", lambda: True)
+    monkeypatch.setattr(dflash.dist, "is_initialized", lambda: True)
 
     # Another rank skipped -> the collective drives the flag to 0 -> all skip.
-    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: t.fill_(0))
-    assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is False
+    monkeypatch.setattr(dflash.dist, "all_reduce", lambda t, op=None: t.fill_(0))
+    assert dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is False
 
     # Every rank valid -> MIN leaves the 1 in place -> all run the backward.
-    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: None)
-    assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True
+    monkeypatch.setattr(dflash.dist, "all_reduce", lambda t, op=None: None)
+    assert dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True
 
 
 def test_wandb_log_forwards_metrics_when_run_exists():

@@ -26,7 +26,7 @@ from unittest import mock
 
 import pytest
 
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import TrainEagle3Recipe
 
 
 def _make_recipe(**overrides) -> TrainEagle3Recipe:

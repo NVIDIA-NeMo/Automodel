@@ -29,8 +29,8 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.domino_core import DominoStepMetrics, DominoTrainerModule
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
-from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
-from nemo_automodel.recipes.speculative_decoding.train_domino import TrainDominoRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.domino import TrainDominoRecipe
 
 VOCAB = 64
 HIDDEN = 32
@@ -260,17 +260,6 @@ def test_setup_reads_lambda_base_schedule(monkeypatch):
     assert recipe.lambda_base_start == 0.8
     assert recipe.lambda_base_decay_ratio == 0.25
     assert recipe._last_domino_metrics is None
-
-
-def test_main_runs_setup_then_loop(monkeypatch):
-    from nemo_automodel.recipes.speculative_decoding import train_domino
-
-    calls = []
-    monkeypatch.setattr(train_domino, "parse_args_and_load_config", lambda p: SimpleNamespace())
-    monkeypatch.setattr(TrainDominoRecipe, "setup", lambda self: calls.append("setup"))
-    monkeypatch.setattr(TrainDominoRecipe, "run_train_validation_loop", lambda self: calls.append("loop"))
-    train_domino.main("cfg.yaml")
-    assert calls == ["setup", "loop"]
 
 
 def test_build_trainer_module_rejects_loss_type():

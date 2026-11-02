@@ -34,8 +34,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle import TrainEagle1Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import TrainEagle3Recipe
 
 RECIPE_CLASSES = [TrainEagle1Recipe, TrainEagle3Recipe]
 
