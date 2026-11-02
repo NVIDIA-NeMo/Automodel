@@ -103,6 +103,13 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
     param_group.foreach_reduce = foreach_reduce_uniform_dtype
 
 
+def _has_local_unsharded_grad(fsdp_param: Any) -> bool:
+    """Whether this rank's backward produced a gradient for ``fsdp_param`` since its last reduction."""
+    if not hasattr(fsdp_param, "_unsharded_param"):
+        return False
+    return fsdp_param.unsharded_accumulated_grad is not None or fsdp_param.unsharded_param.grad is not None
+
+
 def patch_fsdp_unused_param_reduction() -> None:
     """Backport FSDP2 unused-parameter reduction when the public API is absent.
 
@@ -129,16 +136,19 @@ def patch_fsdp_unused_param_reduction() -> None:
     original_post_backward = FSDPParamGroup.post_backward
     if getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False):
         return
+    if getattr(original_post_backward, "_automodel_unused_param_probe", False):
+        raise RuntimeError(
+            "patch_fsdp_unused_param_reduction must be installed before patch_fsdp_restore_unused_param_grads: "
+            "a zero fill wrapped outside the usage probe would make every parameter look used."
+        )
 
     def _post_backward_with_unused_param_reduction(self, *args, **kwargs):
         if self.reduce_grads and self._training_state == TrainingState.PRE_BACKWARD:
             for fsdp_param in self.fsdp_params:
-                if not hasattr(fsdp_param, "_unsharded_param"):
-                    continue
-                if fsdp_param.unsharded_accumulated_grad is not None:
+                if not hasattr(fsdp_param, "_unsharded_param") or _has_local_unsharded_grad(fsdp_param):
                     continue
                 param = fsdp_param.unsharded_param
-                if param.requires_grad and param.grad is None:
+                if param.requires_grad:
                     # ``zeros_like`` on the *unsharded* parameter is the dtype
                     # autograd would have produced under any precision policy
                     # (bf16 compute over fp32 storage, an fp32-pinned unit, or no
@@ -149,6 +159,138 @@ def patch_fsdp_unused_param_reduction() -> None:
 
     _post_backward_with_unused_param_reduction._automodel_reduce_scatter_unused_params = True
     FSDPParamGroup.post_backward = _post_backward_with_unused_param_reduction
+
+
+def _fsdp_state_param_groups(state: Any) -> list[Any]:
+    """Return an FSDP2 state's parameter groups across PyTorch versions that keep one or several."""
+    groups = getattr(state, "_fsdp_param_groups", None)
+    if groups is not None:
+        return list(groups)
+    group = getattr(state, "_fsdp_param_group", None)
+    return [group] if group is not None else []
+
+
+def _restore_unused_param_grads(param_groups: list[Any]) -> None:
+    """Reset the gradients that a reduction created for parameters no rank of its domain used.
+
+    Args:
+        param_groups: FSDP2 parameter groups holding a usage probe from this backward, in the same
+            order on every rank of their reduction domains.
+    """
+    import torch
+    import torch.distributed as dist
+    from torch.distributed.fsdp._fully_shard._fsdp_common import DDPMeshInfo, FSDPMeshInfo
+
+    entries_by_domain: dict[tuple[Any, Any, Any], list[tuple[Any, bool, bool]]] = {}
+    for group in param_groups:
+        reduce_scatter_group = (
+            group._reduce_scatter_process_group if isinstance(group.mesh_info, FSDPMeshInfo) else None
+        )
+        all_reduce_group = group._all_reduce_process_group if isinstance(group.mesh_info, DDPMeshInfo) else None
+        domain = (reduce_scatter_group, all_reduce_group, group.device)
+        entries_by_domain.setdefault(domain, []).extend(group._automodel_unused_param_probe)
+        group._automodel_unused_param_probe = None
+
+    # Issue every domain's reduction before reading any back, so the backward pays one host sync.
+    used_by_domain = []
+    for (reduce_scatter_group, all_reduce_group, device), entries in entries_by_domain.items():
+        used = torch.tensor([used_locally for _, used_locally, _ in entries], dtype=torch.int32, device=device)
+        for process_group in (reduce_scatter_group, all_reduce_group):
+            if process_group is not None:
+                dist.all_reduce(used, op=dist.ReduceOp.MAX, group=process_group)
+        used_by_domain.append((entries, used))
+    for entries, used in used_by_domain:
+        for (fsdp_param, _, grad_was_none), used_anywhere in zip(entries, used.tolist()):
+            if grad_was_none and not used_anywhere:
+                fsdp_param.sharded_param.grad = None
+
+
+def patch_fsdp_restore_unused_param_grads() -> None:
+    """Keep ``grad is None`` for parameters that no rank of their reduction used.
+
+    The unused-parameter fill (PyTorch's public API or
+    :func:`patch_fsdp_unused_param_reduction`) gives a locally unused parameter a
+    zero contribution so every rank issues the same reduce-scatter. When no rank
+    of the parameter's reduction domain used it, that reduction turns a missing
+    gradient into an exact zero, which an optimizer treats as a real gradient:
+    AdamW advances its step, applies decoupled weight decay and keeps moving the
+    weight with residual momentum. Without the fill the gradient stays ``None``
+    and the optimizer skips the parameter.
+
+    Each reducing post-backward records which parameters had a local gradient,
+    and the root's final backward callback reduces those flags over the reduction
+    domain and resets the sharded gradients this reduction created for parameters
+    no rank used. Usage comes from gradient presence, never from a zero value.
+    Install it after the fill so the probe runs before the zero fill; the patch is
+    process-global and idempotent. Under HSDP with a deferred all-reduce, a reduction
+    that folds into a pending partial reduce is not treated as creating the gradient,
+    so a window in which no rank used the parameter in any micro-batch keeps the
+    reduced zero there.
+
+    Raises:
+        RuntimeError: If the installed PyTorch lacks the FSDP2 internals the patch wraps.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+        from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
+    except ImportError as error:
+        raise RuntimeError(
+            "FSDP unused-parameter reduction keeps gradients of parameters no rank used as None, but this "
+            "PyTorch "
+            "version does not provide the compatible FSDP2 implementation."
+        ) from error
+
+    original_final_callback = FSDPState._root_post_backward_final_callback
+    if getattr(original_final_callback, "_automodel_restore_unused_param_grads", False):
+        return
+    original_post_backward = FSDPParamGroup.post_backward
+    legacy_fill = getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False)
+
+    def _post_backward_recording_param_usage(self, *args, **kwargs):
+        zero_fills = legacy_fill or getattr(self, "reduce_scatter_unused_params", False)
+        if zero_fills and self.reduce_grads and self._training_state != TrainingState.POST_BACKWARD:
+            # An HSDP reduction whose all-reduce was deferred holds earlier micro-batches' real
+            # contributions outside ``sharded_param.grad``, so this reduction does not create the gradient.
+            pending_partial_reduce = self._partial_reduce_output is not None
+            self._automodel_unused_param_probe = [
+                (
+                    fsdp_param,
+                    _has_local_unsharded_grad(fsdp_param),
+                    fsdp_param.sharded_param.grad is None and not pending_partial_reduce,
+                )
+                for fsdp_param in self.fsdp_params
+                if fsdp_param.sharded_param.requires_grad
+            ]
+        try:
+            return original_post_backward(self, *args, **kwargs)
+        except BaseException:
+            # A post-backward that failed reduced nothing; callers that tolerate the failure (a
+            # never-forwarded group) must not leave this probe for a later backward.
+            self._automodel_unused_param_probe = None
+            raise
+
+    def _root_post_backward_final_callback_restoring_unused_grads(self, *args, **kwargs):
+        try:
+            return original_final_callback(self, *args, **kwargs)
+        finally:
+            # Also on failure: callers that tolerate a never-forwarded root still step the optimizer.
+            _restore_unused_param_grads(
+                [
+                    group
+                    for state in self._state_ctx.all_states
+                    for group in _fsdp_state_param_groups(state)
+                    if getattr(group, "_automodel_unused_param_probe", None) is not None
+                ]
+            )
+
+    # Keep the fill's marker visible so a repeated fill install stays a no-op under this wrapper, and mark
+    # the probe so a fill installed only now refuses to wrap outside it.
+    _post_backward_recording_param_usage._automodel_reduce_scatter_unused_params = legacy_fill
+    _post_backward_recording_param_usage._automodel_unused_param_probe = True
+    _root_post_backward_final_callback_restoring_unused_grads._automodel_restore_unused_param_grads = True
+    FSDPParamGroup.post_backward = _post_backward_recording_param_usage
+    FSDPState._root_post_backward_final_callback = _root_post_backward_final_callback_restoring_unused_grads
 
 
 def patch_fsdp_accumulated_grad_guard() -> None:
@@ -189,6 +331,7 @@ def patch_fsdp_accumulated_grad_guard() -> None:
 
 __all__ = [
     "patch_fsdp_accumulated_grad_guard",
+    "patch_fsdp_restore_unused_param_grads",
     "patch_fsdp_uniform_reduce_dtype",
     "patch_fsdp_unused_param_reduction",
 ]
