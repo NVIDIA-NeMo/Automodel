@@ -112,5 +112,6 @@ optimizer:
 
 
 ci:
+  cluster_tag: h100
   time: "01:00:00"
   nodes: 128

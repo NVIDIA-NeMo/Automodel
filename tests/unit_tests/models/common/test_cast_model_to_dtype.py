@@ -14,6 +14,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -699,3 +700,125 @@ class TestRestoreFp32Buffers:
         _restore_fp32_buffers(model, ["norm"])
 
         assert model.linear.scale.dtype == torch.bfloat16
+
+
+class TestFrozenStoragePreparation:
+    @pytest.mark.parametrize("compute_dtype", [None, torch.float32, torch.bfloat16])
+    def test_keeps_trainable_storage_when_frozen_reduction_does_not_change_storage(self, compute_dtype):
+        from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+
+        model = SimpleModel()
+        model.linear1.requires_grad_(False)
+        model.linear1.to(torch.bfloat16)
+
+        prepare_frozen_parameters_for_sharding(model, compute_dtype)
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.linear1.weight.dtype == torch.bfloat16
+        assert model.linear2.weight.dtype == torch.float32
+        assert model.linear2.bias.dtype == torch.float32
+
+    def test_keeps_trainable_storage_when_all_frozen_parameters_are_protected(self):
+        from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+
+        model = SimpleModel()
+        model.linear1.requires_grad_(False)
+        model._keep_in_fp32_modules = ["linear1"]
+
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.linear1.weight.dtype == torch.float32
+        assert model.linear2.weight.dtype == torch.float32
+        assert model.linear2.bias.dtype == torch.float32
+
+    @pytest.mark.parametrize("base_dtype", [torch.float32, torch.bfloat16])
+    def test_preserves_identity_values_and_trainable_storage_through_initialization(self, base_dtype):
+        from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+
+        model = SimpleModel()
+        model.linear1.requires_grad_(False)
+        model.linear1.to(base_dtype)
+        before = dict(model.named_parameters())
+        values = {name: parameter.detach().clone() for name, parameter in before.items()}
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+        # Both directions occur in model initializers, including yield_fp32_model.
+        cast_model_to_dtype(model, torch.float32)
+        cast_model_to_dtype(model, torch.bfloat16)
+        for name, parameter in model.named_parameters():
+            expected_dtype = torch.float32 if parameter.requires_grad else torch.bfloat16
+            assert parameter is before[name]
+            assert parameter.dtype == expected_dtype
+            torch.testing.assert_close(parameter, values[name].to(expected_dtype), rtol=0, atol=0)
+
+    def test_respects_fp32_precision_requirements_and_shared_parameters(self):
+        from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+
+        model = SimpleModel().requires_grad_(False)
+        model._keep_in_fp32_modules = ["norm"]
+        model.linear2.weight._hf_compute_dtype = torch.float32
+        model.register_parameter("tied_weight", model.linear1.weight)
+        model.register_parameter("norm_alias", model.norm.weight)
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+        cast_model_to_dtype(model, torch.float32)
+        assert model.tied_weight is model.linear1.weight
+        assert model.linear1.weight.dtype == torch.bfloat16
+        assert model.norm.weight.dtype == torch.float32
+        assert model.linear2.weight.dtype == torch.float32
+
+    def test_meta_initialization_keeps_mixed_storage(self):
+        from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+
+        with torch.device("meta"):
+            model = SimpleModel()
+            model.linear1.requires_grad_(False)
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+        model.to_empty(device="cpu")
+        cast_model_to_dtype(model, torch.float32)
+        assert model.linear1.weight.dtype == torch.bfloat16
+        assert model.linear2.weight.dtype == torch.float32
+
+    def test_full_finetuning_and_fp32_compute_are_unchanged(self):
+        from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+
+        model = SimpleModel()
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+        assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+        assert not hasattr(model, "_preserve_parameter_dtypes")
+        model.requires_grad_(False)
+        for dtype in (None, torch.float32):
+            prepare_frozen_parameters_for_sharding(model, dtype)
+            assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+
+    def test_fp32_initialization_context_restores_mixed_storage(self):
+        from nemo_automodel.components.models.common.utils import (
+            prepare_frozen_parameters_for_sharding,
+            yield_fp32_model,
+        )
+
+        model = SimpleModel()
+        model.linear1.requires_grad_(False)
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+        with yield_fp32_model(model, torch.bfloat16):
+            assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+        assert model.linear1.weight.dtype == torch.bfloat16
+        assert model.linear2.weight.dtype == torch.float32
+
+    def test_fp32_initialization_context_with_activation_checkpoint_wrapper(self):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+        from nemo_automodel.components.models.common.utils import (
+            prepare_frozen_parameters_for_sharding,
+            yield_fp32_model,
+        )
+
+        model = SimpleModel()
+        model.linear1.requires_grad_(False)
+        prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+        model.linear1 = checkpoint_wrapper(model.linear1)
+
+        with yield_fp32_model(model, torch.bfloat16):
+            assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+
+        assert model.linear1.weight.dtype == torch.bfloat16
+        assert model.linear2.weight.dtype == torch.float32

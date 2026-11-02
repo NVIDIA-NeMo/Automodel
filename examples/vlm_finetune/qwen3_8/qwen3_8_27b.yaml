@@ -123,6 +123,7 @@ wandb:
   dir: logs/qwen3_8_27b_sft_medpix/wandb
 
 ci:
+  cluster_tag: h100
   recipe_owner: akoumpa
   nodes: 1
   time: "00:40:00"

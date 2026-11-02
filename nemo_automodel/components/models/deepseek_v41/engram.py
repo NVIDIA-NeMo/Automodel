@@ -87,6 +87,62 @@ def _next_prime(start: int, seen: set[int]) -> int:
         candidate += 1
 
 
+def _engram_gate_core(
+    hidden_states: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    token_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Inject the normalized, signed-square-root-gated memory value into the fp32 streams.
+
+    Args:
+        hidden_states: Tensor of shape [batch, sequence, hc_mult, hidden] in the model dtype.
+        key: Tensor of shape [batch, sequence, hc_mult * hidden], the key half of the ``wkv`` projection.
+        value: Tensor of shape [batch, sequence, hidden], the value half of the ``wkv`` projection.
+        q_weight: Learned branch normalization weight of shape [hc_mult, hidden].
+        k_weight: Learned branch normalization weight of shape [hc_mult, hidden].
+        eps: RMS normalization epsilon.
+        token_mask: Optional bool tensor of shape [batch, sequence]; masked tokens keep their streams.
+
+    Returns:
+        Tensor of shape [batch, sequence, hc_mult, hidden] in the dtype of ``hidden_states``.
+    """
+    hc_mult, hidden_size = q_weight.shape
+    key = key.float().unflatten(-1, (hc_mult, hidden_size))
+    hidden = hidden_states.float()
+    weights = q_weight.float() * k_weight.float()
+    rstd = torch.rsqrt(hidden.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
+    dot = (hidden * weights * key).sum(-1) * rstd * hidden_size**-0.5
+    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+    if token_mask is not None:
+        gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
+    return (hidden + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(hidden_states.dtype)
+
+
+_engram_gate = _engram_gate_core
+_ENGRAM_GATE_COMPILED = False
+
+
+def compile_engram_gate() -> None:
+    """Wrap the Engram gate core with ``torch.compile`` (``BackendConfig.compile_engram``).
+
+    Runs once per process; static shapes (``dynamic=False``): one specialization per Engram call shape and mask
+    presence. No ``fullgraph``: past dynamo's recompile limit a shape runs eager instead of raising. Inductor fuses
+    the three reductions over the hidden dimension (stream and key RMS, stream-key dot) into one kernel that reads
+    the fp32 streams once, the gated residual into another, and the backward through AOTAutograd; the eager chain
+    is about a dozen elementwise / reduction kernels per Engram layer plus the ``pow`` backward's full-size clone.
+    Numerics are allclose to eager, not bitwise (fused reductions change the summation order).
+    """
+    global _engram_gate, _ENGRAM_GATE_COMPILED
+    if _ENGRAM_GATE_COMPILED:
+        return
+    _engram_gate = torch.compile(_engram_gate_core, dynamic=False)
+    _ENGRAM_GATE_COMPILED = True
+
+
 class DeepseekV41NgramHash(nn.Module):
     """Build all Engram layers' hashes from complete, uncached input sequences.
 
@@ -101,6 +157,8 @@ class DeepseekV41NgramHash(nn.Module):
         self.max_ngram_size = config.engram_max_ngram_size
         self.n_heads = config.engram_n_heads
         self.layer_ids = tuple(config.engram_layer_ids)
+        # Host-side (synchronising) input validation; see Qwen3_8_FlashNextEngramTableConfig.strict_validation.
+        self.strict_validation = bool(getattr(config, "engram_strict_validation", False))
         if not self.layer_ids or self.max_ngram_size < 2 or self.n_heads < 1 or config.engram_vocab_size < 2:
             raise ValueError(
                 "Engram hashing requires enabled layers, n-gram order >= 2, heads >= 1, and bucket size >= 2"
@@ -181,8 +239,14 @@ class DeepseekV41NgramHash(nn.Module):
         """
         if input_ids.ndim != 2 or input_ids.dtype not in (torch.int32, torch.int64):
             raise ValueError("Engram input_ids must be an int32/int64 tensor of shape [batch, sequence]")
-        if input_ids.numel() and bool(((input_ids < 0) | (input_ids >= self.token_map.numel())).any()):
-            raise ValueError("Engram input_ids contains a token ID outside the tokenizer vocabulary")
+        if input_ids.numel():
+            out_of_vocab = ((input_ids < 0) | (input_ids >= self.token_map.numel())).any()
+            if input_ids.is_cuda and not self.strict_validation:
+                torch._assert_async(
+                    ~out_of_vocab, "Engram input_ids contains a token ID outside the tokenizer vocabulary"
+                )
+            elif bool(out_of_vocab):
+                raise ValueError("Engram input_ids contains a token ID outside the tokenizer vocabulary")
         batch, sequence = input_ids.shape
         compressed = self.token_map[input_ids.long()]
         if token_mask is not None:
@@ -244,6 +308,8 @@ class DeepseekV41Engram(nn.Module):
         self.embed = Qwen3_8_FlashNextEngramTableConfig(
             num_embeddings=padded_rows,
             embedding_dim=config.engram_head_dim,
+            strict_validation=bool(getattr(config, "engram_strict_validation", False)),
+            capacity_mode=bool(getattr(config, "engram_capacity_mode", False)),
             initializer_range=config.initializer_range,
         ).build(process_group=process_group, dtype=dtype)
         self.wkv = initialize_linear_module(
@@ -271,6 +337,20 @@ class DeepseekV41Engram(nn.Module):
         nn.init.ones_(self.k_weight)
         self.embed.mark_sharding_contract()
 
+    def _validates_on_device(self, hash_ids: torch.Tensor) -> bool:
+        """Whether hash IDs are checked with device-side asserts (CUDA, strict validation off).
+
+        The choice depends on the device and the table's flag only, never on this rank's request count: an empty
+        requester must take the same path, and the same collectives, as its peers.
+
+        Args:
+            hash_ids: Integer tensor of shape [batch, sequence, hash_heads]; only its device matters here.
+
+        Returns:
+            True for the device-side path, False for the host-side, cross-rank-symmetric checks.
+        """
+        return hash_ids.is_cuda and not self.embed.strict_validation
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -297,25 +377,28 @@ class DeepseekV41Engram(nn.Module):
         if hash_ids.shape != (*hidden_states.shape[:2], self.hash_heads):
             raise ValueError("Engram hash_ids must have shape [batch, sequence, hash_heads] matching hidden_states")
         valid = hash_ids.dtype in (torch.int32, torch.int64)
-        if valid and hash_ids.numel():
-            valid = bool(((hash_ids >= 0) & (hash_ids < self.num_embeddings)).all())
-        validity = torch.tensor(int(valid), device=hash_ids.device, dtype=torch.int32)
-        if self.embed.process_group is not None:
-            dist.all_reduce(validity, op=dist.ReduceOp.MIN, group=self.embed.process_group)
-        if not bool(validity):
-            raise ValueError(
-                f"Engram hash_ids must be integer logical row IDs in [0, {self.num_embeddings}) on every rank"
-            )
+        if self._validates_on_device(hash_ids):
+            # Device-side assert on CUDA (no host read, no validity collective); the
+            # table's own lookup asserts the physical range the same way.
+            if not valid:
+                raise ValueError(f"Engram hash_ids must be an int32/int64 tensor, got {hash_ids.dtype}")
+            if hash_ids.numel():
+                torch._assert_async(
+                    ((hash_ids >= 0) & (hash_ids < self.num_embeddings)).all(),
+                    f"Engram hash_ids must be logical row IDs in [0, {self.num_embeddings})",
+                )
+        else:
+            if valid and hash_ids.numel():
+                valid = bool(((hash_ids >= 0) & (hash_ids < self.num_embeddings)).all())
+            validity = torch.tensor(int(valid), device=hash_ids.device, dtype=torch.int32)
+            if self.embed.process_group is not None:
+                dist.all_reduce(validity, op=dist.ReduceOp.MIN, group=self.embed.process_group)
+            if not bool(validity):
+                raise ValueError(
+                    f"Engram hash_ids must be integer logical row IDs in [0, {self.num_embeddings}) on every rank"
+                )
         if token_mask is not None and (token_mask.shape != hidden_states.shape[:2] or token_mask.dtype != torch.bool):
             raise ValueError("Engram token_mask must be bool with shape [batch, sequence]")
         embeddings = self.embed(hash_ids).flatten(-2).to(hidden_states.dtype)
         key, value = self.wkv(embeddings).split((self.hc_mult * self.hidden_size, self.hidden_size), dim=-1)
-        key = key.float().unflatten(-1, (self.hc_mult, self.hidden_size))
-        hidden = hidden_states.float()
-        weights = self.q_weight.float() * self.k_weight.float()
-        rstd = torch.rsqrt(hidden.square().mean(-1) + self.eps) * torch.rsqrt(key.square().mean(-1) + self.eps)
-        dot = (hidden * weights * key).sum(-1) * rstd * self.hidden_size**-0.5
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
-        if token_mask is not None:
-            gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
-        return (hidden + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(hidden_states.dtype)
+        return _engram_gate(hidden_states, key, value, self.q_weight, self.k_weight, self.eps, token_mask)

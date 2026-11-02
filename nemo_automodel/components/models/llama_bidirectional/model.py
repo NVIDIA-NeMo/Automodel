@@ -57,9 +57,9 @@ class LlamaBidirectionalConfig(LlamaConfig):
 
         Args:
             pooling: Pooling strategy ('avg', 'cls', 'last', etc.)
-            temperature: Temperature for scaling logits.
+            temperature: Temperature for scaling logits
             is_causal: Whether to use causal rather than bidirectional attention.
-            **kwargs: Additional arguments passed to LlamaConfig.
+            **kwargs: Additional arguments passed to LlamaConfig
         """
         self.pooling = pooling
         self.temperature = temperature
@@ -67,14 +67,10 @@ class LlamaBidirectionalConfig(LlamaConfig):
 
 
 class LlamaBidirectionalModel(LlamaModel):
-    """Legacy Llama retrieval model with configurable attention.
+    """
+    Llama retrieval model with a configurable attention mode.
 
-    The model defaults to bidirectional attention for embedding and retrieval
-    workloads. Setting ``config.is_causal`` enables standard causal attention.
-    Both modes use the Hugging Face forward path and its tensor/output contract.
-
-    The model is auto-discovered by ModelRegistry via the ModelClass export,
-    enabling it to be loaded via NeMoAutoModelBiEncoder.from_pretrained().
+    False preserves legacy bidirectional behavior; true uses the stock Llama causal mask.
     """
 
     config_class = LlamaBidirectionalConfig
@@ -96,7 +92,7 @@ class LlamaBidirectionalModel(LlamaModel):
             config: Model configuration
         """
         super().__init__(config)
-        # Stock Transformers masking and output capture support both attention modes.
+        # Transformers mask builders read this per-attention flag; dual-mode parity tests guard that upstream contract.
         is_causal = getattr(config, "is_causal", False)
         config.is_causal = is_causal
         for layer in self.layers:
@@ -151,6 +147,15 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
         self.model = LlamaBidirectionalModel(config)
         # Initialize weights and apply final processing
         self.post_init()
+
+    @property
+    def effective_score_temperature(self) -> float:
+        """Return the temperature applied to score logits by this model.
+
+        Returns:
+            The divisor applied inside the scoring backbone.
+        """
+        return float(self.config.temperature)
 
     # TODO: remove this once we upgrade to transformers 5.9.x
     @torch.no_grad()

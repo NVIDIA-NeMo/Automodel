@@ -38,7 +38,7 @@ from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSpa
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
 # Keep a hard watchdog for spawned workers; each distributed test declares its runtime budget below.
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 _WORLD_SIZE = 2
 
@@ -93,6 +93,8 @@ def _fully_shard_model(model: DeepseekV41DSparkModel, mesh: DeviceMesh, dtype: t
 
 
 def _worker(rank: int, port: int, activation_checkpointing: bool, checkpoint_dir: str) -> None:
+    # Each spawned rank runs tiny CPU tensors; avoid competing intra-op pools.
+    torch.set_num_threads(1)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)

@@ -140,6 +140,32 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 ```
 
+### Reduce KD Intermediate Memory
+
+Set `kd_loss_fn.chunk_size` to a positive number of valid tokens to bound the
+FP32 working set during loss computation:
+
+```yaml
+kd_loss_fn:
+  _target_: nemo_automodel.components.loss.kd_loss.KDLoss
+  temperature: 1.0
+  fp32_upcast: true
+  chunk_size: 512
+```
+
+Each chunk keeps the full vocabulary. With a Python scalar temperature and
+multi-chunk logits up to 32 bits, upcasting and temperature scaling happen
+inside each chunk. Autograd retains the intermediates needed for backward;
+the loss runs once, with no backward recomputation. Token chunks share one
+gradient concatenation instead of each materializing a full token-axis gradient.
+
+Smaller chunks reduce the temporary working set and increase the number of
+launches. Compare complete training-step memory and time when choosing a size;
+teacher and student output logits occupy memory throughout the loss.
+The default `chunk_size: 0` disables chunking. Tensor-parallel loss ignores this
+setting. Tensor-valued temperatures, logits wider than 32 bits, and a single chunk
+covering all valid tokens retain full-token preprocessing.
+
 ### Current Constraints
 
 * Pipeline parallelism requires `pp_microbatch_size` to equal `pp_batch_size` so each student microbatch uses the correct teacher logits.

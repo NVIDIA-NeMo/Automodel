@@ -34,12 +34,23 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
-from transformers import AutoConfig, PretrainedConfig
 
+from nemo_automodel import NeMoAutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41DSparkTargetConfig
+from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
+from nemo_automodel.components.speculative.dspark.registry import build_target_layer_ids
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V4_MODEL_TYPE,
+    DEEPSEEK_V41_MODEL_TYPE,
+    GEMMA4_MODEL_TYPES,
+    GLM_5_2_MODEL_TYPE,
+    KIMI_K3_MODEL_TYPES,
+    MINIMAX_M3_MODEL_TYPES,
+)
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+from nemo_automodel.recipes.llm._spec_train_utils import read_load_metadata_with_gloo
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +66,17 @@ def distributed_section_dict(cfg) -> dict:
     if section is None:
         return {}
     return section.to_dict() if hasattr(section, "to_dict") else dict(section)
+
+
+def chat_template_kwargs_from(recipe_cfg) -> dict[str, Any] | None:
+    """Return ``recipe_args.chat_template_kwargs`` as a plain dict, or ``None`` when unset.
+
+    DSpark training and the distributed precompute both read it here, so the kwargs a cache
+    records and the ones a cached run compares them with are read the same way. A value that
+    is not a mapping is returned unchanged for the dataset to reject.
+    """
+    kwargs = recipe_cfg.get("chat_template_kwargs", None)
+    return kwargs.to_dict() if hasattr(kwargs, "to_dict") else kwargs
 
 
 def unsupported_parallel_axes(sizes: dict, axes: tuple[str, ...]) -> dict[str, int]:
@@ -205,12 +227,15 @@ def build_deepseek_v4_target(
             "with the expert-parallel / FSDP distributed path."
         )
     # Build the device_mesh + moe_mesh from the recipe's `distributed` block
-    # (strategy, ep_size, moe, ...). DeepseekV4Config.from_pretrained is used
-    # because the custom V4 model_type is not registered with stock AutoConfig.
+    # (strategy, ep_size, moe, ...). NeMoAutoConfig resolves the registered local
+    # config; pass the resolved revision to both config and weight loading.
     distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
     # Pass name_or_path explicitly (as the V4 finetune recipe does) so from_config
     # resolves the base checkpoint to load and dequantize from.
-    target_config = DeepseekV4Config.from_pretrained(target_path, name_or_path=target_path, num_nextn_predict_layers=0)
+    revision = NeMoAutoConfig.resolve_revision(target_path)
+    target_config = NeMoAutoConfig.from_pretrained(
+        target_path, revision=revision, name_or_path=target_path, num_nextn_predict_layers=0
+    )
     # Diagnostic / CI knob: a full 43-layer V4-Flash target dequantizes to
     # ~63 GiB of experts per rank at ep_size=8 and does NOT fit on a single
     # 8x80GB node. Shrinking the layer count loads only the first N layers, so the
@@ -233,6 +258,8 @@ def build_deepseek_v4_target(
         backend=backend,
         distributed_setup=distributed_setup,
         load_base_model=True,
+        load_metadata_with_gloo=read_load_metadata_with_gloo(cfg.get("checkpoint", None)),
+        revision=revision,
         torch_dtype=compute_dtype,
         trust_remote_code=trust_remote_code,
     )
@@ -296,10 +323,13 @@ def build_glm_5_2_target(
             "GLM-5.2 DSpark target requires CUDA: the target is loaded "
             "with the expert-parallel / FSDP distributed path."
         )
-    target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+    revision = NeMoAutoConfig.resolve_revision(target_path)
+    target_config = NeMoAutoConfig.from_pretrained(target_path, revision=revision, trust_remote_code=trust_remote_code)
     # The published config's head_dim=192 clobbers qk_rope_head_dim on load via the
     # HF attribute_map, breaking checkpoint shape validation (see the helper).
-    raw_config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
+    raw_config_dict, _ = NeMoAutoConfig.get_config_dict(
+        target_path, trust_remote_code=trust_remote_code, revision=revision
+    )
     repair_glm_5_2_qk_rope_head_dim(target_config, raw_config_dict)
     n_reduced = resolve_reduced_target_layers(
         target_config.num_hidden_layers,
@@ -320,6 +350,8 @@ def build_glm_5_2_target(
         backend=backend,
         distributed_setup=distributed_setup,
         load_base_model=True,
+        load_metadata_with_gloo=read_load_metadata_with_gloo(cfg.get("checkpoint", None)),
+        revision=revision,
         torch_dtype=compute_dtype,
         trust_remote_code=trust_remote_code,
     )
@@ -386,7 +418,8 @@ def build_kimi_k3_target(
             "Kimi K3 DSpark target requires CUDA: the target is loaded with the "
             "expert-parallel / FSDP distributed path."
         )
-    target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+    revision = NeMoAutoConfig.resolve_revision(target_path)
+    target_config = NeMoAutoConfig.from_pretrained(target_path, revision=revision, trust_remote_code=trust_remote_code)
     text_config = getattr(target_config, "text_config", target_config)
     n_reduced = resolve_reduced_target_layers(
         text_config.num_hidden_layers,
@@ -417,15 +450,124 @@ def build_kimi_k3_target(
         backend=build_kimi_k3_backend(recipe_cfg),
         distributed_setup=distributed_setup,
         load_base_model=True,
+        load_metadata_with_gloo=read_load_metadata_with_gloo(cfg.get("checkpoint", None)),
+        revision=revision,
         torch_dtype=compute_dtype,
         trust_remote_code=trust_remote_code,
     )
     return text_config, target_model, distributed_setup
 
 
+def build_dspark_target(
+    *,
+    cfg,
+    recipe_cfg,
+    world_size: int,
+    device: torch.device,
+    compute_dtype: torch.dtype,
+    model_type: str,
+    target_path: str,
+    trust_remote_code: bool,
+) -> tuple[Any, torch.nn.Module]:
+    """Build the frozen DSpark target for capture outside training, dispatching on model type.
+
+    Used by the entry points that run the target without a draft: the distributed
+    offline precompute and the remote target server. DeepSeek V4/V4.1, GLM-5.2, and
+    Kimi K3 load through the sharded EP/FSDP path; other text targets (Qwen3, Gemma4)
+    load whole on ``device``. MiniMax M3 is rejected because its features need image
+    inputs, which these entry points do not carry.
+
+    Returns:
+        ``(target_text_config, target_model)``, where ``target_text_config`` is the
+        config holding the text stack's ``num_hidden_layers``, ``hidden_size``, and
+        ``vocab_size``.
+    """
+    if model_type in MINIMAX_M3_MODEL_TYPES:
+        raise ValueError(
+            "MiniMax M3 is a multimodal target; DSpark offline precompute and remote target serving "
+            "are text-only. Use the colocated online MiniMax M3 training path instead."
+        )
+    if model_type == DEEPSEEK_V4_MODEL_TYPE:
+        target_config, target_model, _ = build_deepseek_v4_target(
+            cfg=cfg,
+            world_size=world_size,
+            device=device,
+            compute_dtype=compute_dtype,
+            target_path=target_path,
+            recipe_cfg=recipe_cfg,
+            trust_remote_code=trust_remote_code,
+        )
+        return target_config, target_model
+    if model_type == DEEPSEEK_V41_MODEL_TYPE:
+        target_options = DeepseekV41DSparkTargetConfig(
+            target_path=target_path,
+            trust_remote_code=trust_remote_code,
+            target_num_hidden_layers=recipe_cfg.get("target_num_hidden_layers", None),
+        )
+        target_options.attn_backend = str(recipe_cfg.get("target_attn_backend", target_options.attn_backend))
+        target_options.dispatcher = str(recipe_cfg.get("target_dispatcher", target_options.dispatcher))
+        target_options.experts = str(recipe_cfg.get("target_experts", target_options.experts))
+        target_options.enable_fsdp_optimizations = bool(
+            recipe_cfg.get("target_enable_fsdp_optimizations", target_options.enable_fsdp_optimizations)
+        )
+        distributed_setup = create_distributed_setup_from_config(cfg, world_size=world_size)
+        target_model = target_options.build(
+            device=device,
+            compute_dtype=compute_dtype,
+            distributed_setup=distributed_setup,
+        )
+        return target_model.config.text_config, target_model
+    if model_type == GLM_5_2_MODEL_TYPE:
+        target_config, target_model, _ = build_glm_5_2_target(
+            cfg=cfg,
+            world_size=world_size,
+            device=device,
+            compute_dtype=compute_dtype,
+            target_path=target_path,
+            recipe_cfg=recipe_cfg,
+            trust_remote_code=trust_remote_code,
+        )
+        return target_config, target_model
+    if model_type in KIMI_K3_MODEL_TYPES:
+        target_config, target_model, _ = build_kimi_k3_target(
+            cfg=cfg,
+            world_size=world_size,
+            device=device,
+            compute_dtype=compute_dtype,
+            target_path=target_path,
+            recipe_cfg=recipe_cfg,
+            trust_remote_code=trust_remote_code,
+        )
+        return target_config, target_model
+    # Single-process text target (Qwen3, Gemma4): every process holds a full copy.
+    target_kwargs = {}
+    target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+    if target_attn_implementation is not None:
+        target_kwargs["attn_implementation"] = target_attn_implementation
+    target_model = NeMoAutoModelForCausalLM.from_pretrained(
+        target_path,
+        trust_remote_code=trust_remote_code,
+        torch_dtype=compute_dtype,
+        force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+        **target_kwargs,
+    ).to(device)
+    text_config = target_model.config.text_config if model_type in GEMMA4_MODEL_TYPES else target_model.config
+    return text_config, target_model
+
+
+def resolve_dspark_target_layer_ids(recipe_cfg, num_target_layers: int) -> list[int]:
+    """Return ``recipe_args.target_layer_ids``, or the default spread for the draft depth, validated."""
+    target_layer_ids = list(
+        recipe_cfg.get("target_layer_ids", None)
+        or build_target_layer_ids(num_target_layers, int(recipe_cfg.get("draft_num_hidden_layers", 5)))
+    )
+    return validate_target_layer_ids(target_layer_ids, num_target_layers)
+
+
 __all__ = [
     "build_deepseek_v4_backend",
     "build_deepseek_v4_target",
+    "build_dspark_target",
     "build_glm_5_2_backend",
     "build_glm_5_2_target",
     "build_kimi_k3_backend",
@@ -433,6 +575,7 @@ __all__ = [
     "distributed_section_dict",
     "gather_full_weight_module",
     "repair_glm_5_2_qk_rope_head_dim",
+    "resolve_dspark_target_layer_ids",
     "resolve_reduced_target_layers",
     "unsupported_parallel_axes",
     "validate_dspark_parallelism_axes",

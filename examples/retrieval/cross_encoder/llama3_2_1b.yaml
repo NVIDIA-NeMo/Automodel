@@ -138,6 +138,7 @@ distributed:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: oliverholworthy
   time: "01:30:00"
   nodes: 1

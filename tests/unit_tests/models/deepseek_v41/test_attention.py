@@ -303,6 +303,35 @@ def test_padding_and_incomplete_groups_do_not_change_real_token_outputs() -> Non
     assert torch.count_nonzero(hidden.grad[~mask.bool()]) == 0
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_apply_rope_assembly_is_bitwise_the_concatenation(dtype: torch.dtype, inverse: bool) -> None:
+    """clone + slice write must equal torch.cat of the untouched channels and the rotated ones, values and grads."""
+    torch.manual_seed(7)
+    angles = torch.rand(2, 5, 4) * 6.28
+    frequencies = torch.polar(torch.ones_like(angles), angles)
+    if inverse:
+        frequencies = frequencies.conj()
+    for values in (
+        torch.randn(2, 5, 16, dtype=dtype),
+        torch.randn(2, 5, 3, 16, dtype=dtype),
+        torch.randn(2, 3, 5, 16, dtype=dtype).transpose(1, 2),  # non-contiguous, as the attention output arrives
+    ):
+        values = values.detach().requires_grad_(True)
+        reference_input = values.detach().clone().requires_grad_(True)
+        pairs = torch.view_as_complex(reference_input[..., -8:].float().unflatten(-1, (-1, 2)).contiguous())
+        rotation = frequencies.unsqueeze(2) if values.ndim == 4 else frequencies
+        rotated = torch.view_as_real(pairs * rotation).flatten(-2).to(dtype)
+        reference = torch.cat((reference_input[..., :-8], rotated), dim=-1)
+        actual = _apply_rope(values, angles, inverse=inverse)
+        assert actual.is_contiguous() and actual.data_ptr() != values.data_ptr()
+        assert torch.equal(actual, reference)
+        upstream = torch.randn_like(actual)
+        (actual * upstream).sum().backward()
+        (reference * upstream).sum().backward()
+        assert torch.equal(values.grad, reference_input.grad)
+
+
 def test_rotary_recomputes_exact_fp32_frequencies_after_bfloat16_cast() -> None:
     config = _config()
     rotary = _RotaryEmbedding(config, compressed=True)
@@ -592,3 +621,41 @@ def test_indexer_uses_bf16_scores_and_returns_sorted_positions_with_empty_querie
     assert not actual.topk_indices[:, 0].ge(0).any()
     assert state.topk_indices is None
     assert all(not parameter.requires_grad for parameter in module.parameters())
+
+
+def test_validate_attention_inputs_runs_once_and_layers_skip_host_checks(monkeypatch) -> None:
+    """The host-synchronising checks live in validate_attention_inputs; a layer told inputs_validated=True does not
+    repeat them (no torch.equal / torch.all / torch.any on device tensors in its forward)."""
+    from nemo_automodel.components.models.deepseek_v41.attention import validate_attention_inputs
+
+    positions = torch.arange(4)[None]
+    validate_attention_inputs(positions, None, None, sequence=4)
+    validate_attention_inputs(positions, torch.tensor([[1, 1, 1, 0]]), None, sequence=4)
+    with pytest.raises(ValueError, match="zero-based"):
+        validate_attention_inputs(torch.tensor([[0, 1, 0, 1]]), None, None, sequence=4)
+    with pytest.raises(ValueError, match="right padding"):
+        validate_attention_inputs(positions, torch.tensor([[0, 1, 1, 1]]), None, sequence=4)
+    with pytest.raises(ValueError, match="zero and one"):
+        validate_attention_inputs(positions, torch.full((1, 4), 2), None, sequence=4)
+
+    hidden = torch.randn(1, 4, 16)
+    source = DeepseekV41Attention(_config(), 1, _backend())
+
+    def no_sync(*args, **kwargs):
+        raise AssertionError("host-synchronising comparison in the attention hot path")
+
+    monkeypatch.setattr(torch, "equal", no_sync)
+    monkeypatch.setattr(torch, "all", no_sync)
+    monkeypatch.setattr(torch, "any", no_sync)
+    out = source(hidden, position_ids=positions, state=DeepseekV41AttentionState(), inputs_validated=True)
+    assert out.hidden_states.shape == hidden.shape
+    out = source(
+        hidden,
+        position_ids=positions,
+        state=DeepseekV41AttentionState(),
+        attention_mask=torch.tensor([[1, 1, 1, 0]]),
+        inputs_validated=True,
+    )
+    assert out.hidden_states.shape == hidden.shape
+    with pytest.raises(AssertionError, match="host-synchronising"):
+        source(hidden, position_ids=positions, state=DeepseekV41AttentionState())

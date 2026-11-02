@@ -1,0 +1,141 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Frozen real text data: override --dataset.path_or_dataset_id.
+# These are execution targets; consult measured validation before choosing axes.
+# CE-only: original router auxiliary objective remains unspecified, so its
+# coefficient is explicitly zero. Tokenization uses the checkpoint template.
+# Keep the original49-layer source config for full-depth runs.
+# Four GB200 GPUs: TP1/PP1/CP1/EP2, inferred DP4, LBS1/GBS4.
+# BF16 frozen bulk base, protected FP32 sinks/head, FP32 trainable LoRA and AdamW moments.
+# Chunked CE preserves the model-owned FP32 head and bounds logits memory.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 1
+  max_steps: 100
+  num_epochs: null
+  ckpt_every_steps: 50
+  save_checkpoint_every_epoch: false
+  val_every_steps: 1000
+  gc_every_steps: 5
+  log_remote_every_steps: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: RecursiveSI/flint
+  dtype: bfloat16
+  config:
+    router_aux_loss_coef: 0.0
+    residual_dtype: fp32
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  trust_remote_code: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    gate_precision: null
+    enable_fsdp_optimizations: false
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 2
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+loss_fn:
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+  chunk_len: 256
+  compile: true
+  reduction: sum
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: data/frozen_tulu3.jsonl
+  seq_length: 4096
+  truncation: true
+  padding: max_length
+  shuffle_seed: null
+packed_sequence:
+  packed_sequence_size: 0
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 1
+  num_workers: 0
+  pin_memory: true
+  drop_last: true
+  shuffle: false
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+optimizer:
+  _target_: nemo_automodel.components.optim.optimizer.AdamWConfig
+  fused: true
+  lr: 0.0001
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  weight_decay: 0.0
+lr_scheduler:
+  lr_decay_style: constant
+  lr_warmup_steps: 10
+  lr_decay_steps: 100
+  wd_incr_steps: 100
+clip_grad_norm:
+  max_norm: 1.0
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/flint_tulu3_lora
+  model_save_format: safetensors
+  save_consolidated: final
+  is_async: false
+  cpu_offload: false
+  v4_compatible: false
+  restore_from: null
+compile:
+  enabled: false
+wandb:
+  enable: false
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+  - model.layers.*.self_attn.q_proj
+  - model.layers.*.self_attn.k_proj
+  - model.layers.*.self_attn.v_proj
+  - model.layers.*.self_attn.o_proj
+  - model.layers.*.mlp.experts
+  dim: 8
+  alpha: 32
+  dropout: 0.0
+  lora_dtype: float32
+  use_memory_efficient_lora: true
+  use_triton: false
+  moe_rank_scaling: false
+
+ci:
+  # Excluded from automatic GPU CI; requires user-provided training data.
+  deprecated: true
+  cluster_tag: gb200
+  recipe_owner: snowmanwwg
+  time: "01:00:00"
+  nodes: 1

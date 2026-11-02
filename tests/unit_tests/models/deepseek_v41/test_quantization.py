@@ -119,3 +119,33 @@ def test_cache_quantization_zero_partial_group_and_straight_through_gradient(for
     assert torch.isfinite(quantized).all()
     quantized.backward(upstream)
     torch.testing.assert_close(values.grad, upstream, rtol=0, atol=0)
+
+
+def test_compile_cache_quant_is_a_model_config_knob_that_defaults_off() -> None:
+    """Model-specific knobs live on the model's config class, not on the shared BackendConfig."""
+    from nemo_automodel.components.models.common import BackendConfig
+    from nemo_automodel.components.models.deepseek_v41 import quantization as q
+    from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
+
+    assert DeepseekV41TextConfig().compile_cache_quant is False
+    assert DeepseekV41TextConfig(compile_cache_quant=True).compile_cache_quant is True
+    assert DeepseekV41Config(text_config={"compile_cache_quant": True}).text_config.compile_cache_quant is True
+    assert not hasattr(BackendConfig(), "compile_cache_quant")
+    assert q._quantize is q._cache_quantization_core and not q._QUANT_COMPILED
+
+
+@pytest.mark.runtime_budget(30, reason="compiles the cache-quantization core with torch.compile for three formats")
+@pytest.mark.parametrize("fmt,block", [("fp8", 32), ("mxfp4", 32), ("nvfp4", 16)])
+def test_compiled_cache_quantization_matches_eager(monkeypatch, fmt: str, block: int) -> None:
+    from nemo_automodel.components.models.deepseek_v41 import quantization as q
+
+    monkeypatch.setattr(q, "_quantize", q._cache_quantization_core)
+    monkeypatch.setattr(q, "_QUANT_COMPILED", False)
+    values = torch.randn(3, 5, 80, dtype=torch.bfloat16) * 4
+    eager = q.quantize_cache(values, format=fmt, block_size=block)
+    q.compile_cache_quantization()
+    assert q._QUANT_COMPILED and q._quantize is not q._cache_quantization_core
+    q.compile_cache_quantization()  # idempotent
+    compiled = q.quantize_cache(values, format=fmt, block_size=block)
+    torch.testing.assert_close(compiled, eager, rtol=0, atol=0)
+    assert compiled.dtype == values.dtype and compiled.shape == values.shape

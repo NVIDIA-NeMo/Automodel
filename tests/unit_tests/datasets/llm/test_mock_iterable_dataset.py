@@ -249,3 +249,11 @@ class TestMockIterableDatasetExcludeTokenIds:
             MockIterableDataset(vocab_size=10, seq_len=4, exclude_token_ids=[10])
         with pytest.raises(ValueError):
             MockIterableDataset(vocab_size=2, seq_len=4, exclude_token_ids=[0, 1])
+
+    def test_position_ids_can_be_omitted(self):
+        from nemo_automodel.components.datasets.llm.mock_iterable_dataset import MockIterableDatasetConfig
+
+        with_positions = next(iter(MockIterableDataset(vocab_size=50, seq_len=8, batch_size=2)))
+        assert torch.equal(with_positions["position_ids"], torch.arange(8).expand(2, -1))
+        dataset = MockIterableDatasetConfig(vocab_size=50, seq_len=8, include_position_ids=False).build()
+        assert set(next(iter(dataset))) == {"input_ids", "labels"}

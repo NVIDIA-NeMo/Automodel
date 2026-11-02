@@ -28,6 +28,8 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Cfg:
     def __init__(self, **values):
@@ -723,7 +725,9 @@ def _packing_contract_worker(rank, rendezvous):
 
 
 @pytest.mark.runtime_budget(
-    20, hard_timeout=60, reason="Two spawned CPU ranks import both recipe stacks; measured 8.6s locally"
+    30,
+    hard_timeout=60,
+    reason="Two spawned CPU ranks import both recipe stacks; measured up to 21.48s in CI",
 )
 def test_kd_packing_contract_agreement_across_real_cpu_ranks(tmp_path):
     # Process startup imports both recipe stacks; leave room for cold CI workers.

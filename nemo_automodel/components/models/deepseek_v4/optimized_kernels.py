@@ -35,6 +35,7 @@ TileLang still import the model and use the existing torch path.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -42,7 +43,7 @@ import torch
 from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
 
-Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "auto"]
+Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "cudnn", "auto"]
 Dsv4IndexerBackend = Literal["torch", "tilelang", "auto"]
 Dsv4SinkhornBackend = Literal["torch", "tilelang", "auto"]
 
@@ -323,12 +324,14 @@ def sparse_attention_torch(
     batch_idx = torch.arange(batch, device=q.device).view(batch, 1, 1)
     kv_gathered = kv_float[batch_idx, safe_idxs]
 
-    scores = torch.einsum("bshd,bskd->bshk", q_float, kv_gathered) * sm_scale
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        scores = torch.einsum("bshd,bskd->bshk", q_float, kv_gathered) * sm_scale
     scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
     scores_max = scores.max(dim=-1).values.clamp(min=-1e30)
     exp_scores = torch.exp(scores - scores_max.unsqueeze(-1))
 
-    numerator = torch.einsum("bshk,bskd->bshd", exp_scores, kv_gathered)
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        numerator = torch.einsum("bshk,bskd->bshd", exp_scores, kv_gathered)
     denominator = exp_scores.sum(dim=-1) + torch.exp(sinks.float().view(1, 1, heads) - scores_max)
     return (numerator / denominator.unsqueeze(-1)).to(q.dtype)
 
@@ -340,7 +343,18 @@ def dense_attention_topk_torch(
     topk_idxs: torch.Tensor,
     sm_scale: float,
 ) -> torch.Tensor:
-    """Dense torch oracle for the Miles top-k sparse-attention contract."""
+    """Compute a dense FP32 oracle for top-k sparse attention.
+
+    Args:
+        q: Query tensor of shape [batch, sequence, heads, head_dim].
+        kv: Shared key/value tensor of shape [batch, keys, head_dim].
+        sinks: Attention-sink logits of shape [heads].
+        topk_idxs: Integer tensor [batch, sequence, topk]; -1 masks an entry.
+        sm_scale: Attention scaling factor.
+
+    Returns:
+        Tensor [batch, sequence, heads, head_dim] in q's dtype.
+    """
     batch, seq_len, heads, _ = q.shape
     key_len = kv.shape[1]
     topk_len = topk_idxs.shape[-1]
@@ -351,24 +365,89 @@ def dense_attention_topk_torch(
     seq_idx = torch.arange(seq_len, device=q.device).view(1, seq_len, 1).expand(batch, seq_len, topk_len)
     attn_mask[batch_idx[valid], seq_idx[valid], safe_topk[valid].long()] = True
 
-    scores = torch.einsum("bshd,bkd->bshk", q.float(), kv.float()) * sm_scale
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        scores = torch.einsum("bshd,bkd->bshk", q.float(), kv.float()) * sm_scale
     scores = scores.masked_fill(~attn_mask.unsqueeze(2), float("-inf"))
     scores_max = scores.max(dim=-1).values.clamp(min=-1e30)
     exp_scores = torch.exp(scores - scores_max.unsqueeze(-1))
-    numerator = torch.einsum("bshk,bkd->bshd", exp_scores, kv.float())
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        numerator = torch.einsum("bshk,bkd->bshd", exp_scores, kv.float())
     denominator = exp_scores.sum(dim=-1) + torch.exp(sinks.float().view(1, 1, heads) - scores_max)
     return (numerator / denominator.unsqueeze(-1)).to(q.dtype)
+
+
+@dataclass(frozen=True)
+class SparseIndexPlan:
+    """Sparse-attention indices prepared once for every layer that consumes the same selection.
+
+    Attributes:
+        backend: The sparse backend the layout is prepared for (``"cudnn"`` or ``"tilelang"``).
+        indices: ``"cudnn"``: contiguous int32 ``[batch * sequence, 1, padded_width]`` with global flat K/V
+            coordinates (per-batch offsets applied), an ascending valid prefix and a ``-1`` suffix.
+            ``"tilelang"``: contiguous int32 ``[batch, sequence, slots]`` with ``-1`` masked, the kernel layout.
+        topk_length: ``"cudnn"`` only: contiguous int32 ``[batch * sequence]`` valid-prefix lengths.
+        valid_rows: ``"cudnn"`` with padded inputs only: int64 indices of the nonempty query rows, so the
+            backward skips its empty-row scan; ``None`` when every row is nonempty.
+        kv_sequence: Number of K/V positions per batch row the coordinates refer to.
+    """
+
+    backend: Dsv4SparseAttentionBackend
+    indices: torch.Tensor
+    topk_length: torch.Tensor | None
+    valid_rows: torch.Tensor | None
+    kv_sequence: int
+
+
+def _flatten_sparse_indices(topk_idxs: torch.Tensor, kv_sequence: int) -> torch.Tensor:
+    """Turn per-batch ``[batch, sequence, slots]`` indices into int64 ``[batch * sequence, slots]`` global coordinates."""
+    batch, sequence, _ = topk_idxs.shape
+    offsets = (torch.arange(batch, device=topk_idxs.device, dtype=torch.int64) * kv_sequence).view(batch, 1, 1)
+    flat_idx = torch.where(
+        topk_idxs >= 0, topk_idxs.to(torch.int64) + offsets, torch.full_like(topk_idxs, -1, dtype=torch.int64)
+    )
+    return flat_idx.reshape(batch * sequence, -1)
+
+
+def plan_dsv4_sparse_indices(
+    topk_idxs: torch.Tensor,
+    kv_sequence: int,
+    *,
+    backend: Dsv4SparseAttentionBackend,
+    all_rows_nonempty: bool = False,
+) -> SparseIndexPlan:
+    """Prepare the per-call index work of :func:`dsv4_sparse_attention` once for a shared selection.
+
+    Args:
+        topk_idxs: Sparse indices ``[batch, sequence, slots]`` with ``-1`` masked.
+        kv_sequence: Number of K/V positions per batch row.
+        backend: Sparse execution backend the plan is for.
+        all_rows_nonempty: Whether every query has at least one valid slot (``"cudnn"``: when false the plan
+            also carries the nonempty rows, one host synchronisation per plan instead of one per layer backward).
+
+    Returns:
+        The plan to pass as ``plan=`` to :func:`dsv4_sparse_attention` together with the same ``kv``.
+    """
+    if backend == "cudnn":
+        from nemo_automodel.components.models.common.cudnn_sparse_attention import plan_sparse_indices
+
+        batch = topk_idxs.shape[0]
+        indices, topk_length = plan_sparse_indices(_flatten_sparse_indices(topk_idxs, kv_sequence), batch * kv_sequence)
+        valid_rows = None if all_rows_nonempty else torch.nonzero(topk_length > 0, as_tuple=False).flatten()
+        return SparseIndexPlan("cudnn", indices.unsqueeze(1), topk_length, valid_rows, kv_sequence)
+    return SparseIndexPlan(backend, topk_idxs.to(torch.int32).contiguous(), None, None, kv_sequence)
 
 
 def dsv4_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     sinks: torch.Tensor,
-    topk_idxs: torch.Tensor,
+    topk_idxs: torch.Tensor | None,
     sm_scale: float,
     *,
     backend: Dsv4SparseAttentionBackend,
     reference_rounding: bool = False,
+    all_rows_nonempty: bool = False,
+    plan: SparseIndexPlan | None = None,
 ) -> torch.Tensor:
     """Run sparse attention with an optional original-inference rounding mode.
 
@@ -376,15 +455,32 @@ def dsv4_sparse_attention(
         q: BF16 queries [batch, sequence, heads, head_dim].
         kv: Shared keys/values [batch, kv_sequence, head_dim].
         sinks: FP32 denominator biases [heads].
-        topk_idxs: Sparse indices [batch, sequence, slots], with -1 masked.
+        topk_idxs: Sparse indices [batch, sequence, slots], with -1 masked; ``None`` only together
+            with ``plan``, which then carries the prepared indices.
         sm_scale: Query/key score multiplier.
         backend: Sparse execution backend.
         reference_rounding: Scale logits before max reduction and use the
             original inference exponent arithmetic. Requires TileLang.
+        all_rows_nonempty: Whether every query has at least one valid slot (``"cudnn"``).
+        plan: Optional :class:`SparseIndexPlan` from :func:`plan_dsv4_sparse_indices` for this ``backend``
+            and ``kv``; it replaces the per-call index preparation of ``topk_idxs``.
 
     Returns:
         Attention output [batch, sequence, heads, head_dim], with q's dtype.
     """
+    if topk_idxs is None and plan is None:
+        raise ValueError("dsv4_sparse_attention needs topk_idxs or a prepared plan")
+    if plan is not None and (plan.backend != backend or plan.kv_sequence != kv.shape[1]):
+        raise ValueError(
+            f"The sparse-index plan was built for backend={plan.backend!r} and kv_sequence={plan.kv_sequence}, "
+            f"got backend={backend!r} and kv_sequence={kv.shape[1]}"
+        )
+    if backend == "cudnn":
+        # cuDNN Frontend DSA kernels (FlashMLA forward when installed): one flat token axis, global K/V coordinates.
+        # The kernels have their own rounding, so ``reference_rounding`` does not apply here.
+        return _dsv4_sparse_attention_cudnn(
+            q, kv, sinks, topk_idxs, sm_scale, all_rows_nonempty=all_rows_nonempty, plan=plan
+        )
     use_tilelang = _should_use_tilelang(
         backend,
         available=_HAS_MILES_SPARSE_ATTN,
@@ -396,7 +492,7 @@ def dsv4_sparse_attention(
         q = q.contiguous()
         kv = kv.contiguous()
         sinks = sinks.float().contiguous()
-        topk_idxs = topk_idxs.to(torch.int32).contiguous()
+        topk_idxs = plan.indices if plan is not None else topk_idxs.to(torch.int32).contiguous()
         original_heads = q.shape[2]
         if original_heads < 16:
             head_pad = 16 - original_heads
@@ -404,11 +500,13 @@ def dsv4_sparse_attention(
             sinks = torch.cat([sinks, sinks.new_zeros(head_pad)], dim=0).contiguous()
 
         # Miles runs this kernel under tensor parallelism, so the kernel sees a
-        # small local head count. AutoModel's DSV4 recipe currently uses TP=1,
-        # which would launch a single H=64, D=512 kernel with excessive shared
-        # memory/register pressure. Chunking heads preserves the same TileLang
-        # fwd/bwd kernels and lets autograd sum the per-chunk KV gradients.
-        max_heads_per_kernel = 16 if q.shape[-1] >= 256 else 64
+        # small local head count. AutoModel's DSV4 recipes use TP=1 (64 heads,
+        # D=512). One backward kernel over all 64 heads, with its thread count
+        # scaled to the head count (see sparse_mqa_bwd_interface), gathers the
+        # top-k KV rows and accumulates the fp32 KV gradient once per layer; the
+        # earlier 16-head chunks repeated both four times and ran the backward
+        # 7-8x slower than the forward. Chunking remains for more than 64 heads.
+        max_heads_per_kernel = 64
         if q.shape[2] > max_heads_per_kernel:
             if not _HAS_MILES_SPARSE_ATTN_CHUNKED:
                 raise RuntimeError("Chunked Miles DeepSeek V4 sparse attention is unavailable")
@@ -422,7 +520,64 @@ def dsv4_sparse_attention(
         return output[:, :, :original_heads, :]
     if reference_rounding:
         raise ValueError("Original-inference sparse attention rounding requires the TileLang backend")
+    if plan is not None:
+        topk_idxs = plan.indices
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
+
+
+def _dsv4_sparse_attention_cudnn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    sinks: torch.Tensor,
+    topk_idxs: torch.Tensor | None,
+    sm_scale: float,
+    all_rows_nonempty: bool = False,
+    plan: SparseIndexPlan | None = None,
+) -> torch.Tensor:
+    """Run the shared cuDNN sparse attention on batched DSV4 tensors.
+
+    Args:
+        q: BF16 queries ``[batch, sequence, heads, head_dim]``.
+        kv: BF16 shared keys/values ``[batch, kv_sequence, head_dim]``.
+        sinks: FP32 per-head sink logits ``[heads]``.
+        topk_idxs: Per-batch sparse indices ``[batch, sequence, slots]`` with ``-1`` masked; ``None`` with ``plan``.
+        sm_scale: Softmax scale.
+        all_rows_nonempty: Whether every query has at least one valid slot.
+        plan: Optional prepared ``"cudnn"`` plan for this ``kv``, replacing ``topk_idxs``.
+
+    Returns:
+        BF16 output ``[batch, sequence, heads, head_dim]``.
+    """
+    from nemo_automodel.components.models.common.cudnn_sparse_attention import (
+        cudnn_sparse_attention,
+        is_cudnn_sparse_attention_available,
+    )
+
+    if not is_cudnn_sparse_attention_available():
+        raise RuntimeError(
+            "backend.attn='cudnn' requires nvidia-cudnn-frontend[cutedsl] >= 1.29 (or FlashMLA for the forward)."
+        )
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        raise RuntimeError("dsv4 cuDNN sparse attention requires bfloat16 q and kv.")
+    batch, sequence, heads, head_dim = q.shape
+    kv_sequence = kv.shape[1]
+    if plan is None:
+        flat_idx = _flatten_sparse_indices(topk_idxs, kv_sequence).unsqueeze(1).to(torch.int32).contiguous()
+        topk_length = valid_rows = None
+    else:
+        flat_idx, topk_length = plan.indices, plan.topk_length
+        valid_rows = None if all_rows_nonempty else plan.valid_rows
+    output = cudnn_sparse_attention(
+        q.reshape(batch * sequence, heads, head_dim).contiguous(),
+        kv.reshape(batch * kv_sequence, 1, head_dim).contiguous(),
+        flat_idx,
+        softmax_scale=sm_scale,
+        topk_length=topk_length,
+        all_rows_nonempty=all_rows_nonempty,
+        valid_row_indices=valid_rows,
+        attn_sink=sinks.to(torch.float32).contiguous(),
+    )
+    return output.reshape(batch, sequence, heads, -1)
 
 
 def indexer_scores_torch(
@@ -431,8 +586,19 @@ def indexer_scores_torch(
     weights: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """Torch reference for the Miles DSV4 C4 indexer score kernel."""
-    scores = torch.matmul(q.float(), pooled_kv.transpose(-1, -2).float().unsqueeze(1))
+    """Compute FP32 indexer scores for compressed key selection.
+
+    Args:
+        q: Query tensor of shape [batch, sequence, heads, head_dim].
+        pooled_kv: Compressed keys of shape [batch, compressed, head_dim].
+        weights: Head weights of shape [batch, sequence, heads].
+        softmax_scale: Query/key scaling factor.
+
+    Returns:
+        FP32 scores of shape [batch, sequence, compressed].
+    """
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        scores = torch.matmul(q.float(), pooled_kv.transpose(-1, -2).float().unsqueeze(1))
     scores = torch.relu(scores) * softmax_scale
     return (scores * weights.float().unsqueeze(-1)).sum(dim=2)
 

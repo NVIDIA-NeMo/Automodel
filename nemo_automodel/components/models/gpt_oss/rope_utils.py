@@ -115,7 +115,7 @@ class RotaryEmbedding(torch.nn.Module):
     def _compute_cos_sin(self, num_tokens: int):
         concentration, inv_freq = self._compute_concentration_and_inv_freq()
         t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        freqs = torch.outer(t, inv_freq)
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
         return cos, sin
@@ -148,19 +148,29 @@ def apply_rotary_emb_qk(
     """Apply rotary embeddings to query and key tensors.
 
     Args:
-        q: Query tensor.
-        k: Key tensor.
-        freqs_cis: Frequency tensor. Format depends on rope_fusion:
-                   - If rope_fusion=True: [angles, angles] for TE fused rope
-                   - If rope_fusion=False: [cos, sin] with concentration applied
+        q: Query tensor of shape [batch, sequence, query_heads, head_dim] for
+            BSHD or [tokens, query_heads, head_dim] for packed THD. Leading
+            dimensions contain the local context-parallel shard, if used.
+        k: Key tensor with the same layout as ``q``, with ``key_heads`` in
+            place of ``query_heads``. Arbitrary strides are supported.
+        freqs_cis: For non-fused RoPE, tensor of shape [batch, sequence,
+            rotary_dim] or [tokens, rotary_dim], containing concatenated
+            cosine/sine tables with concentration applied. Leading dimensions
+            broadcast to the local tokens in ``q`` and ``k``. For TE fused
+            RoPE, tensor of shape [sequence, 1, 1, rotary_dim] containing
+            duplicated angles for the global sequence. ``rotary_dim`` is even
+            and at most ``head_dim``.
         format: QKV format ("bshd" or "thd").
         rope_fusion: If True, use TE fused rope. If False, use non-fused rope.
-        cu_seqlens: Cumulative sequence lengths for variable-length sequences.
+        cu_seqlens: Optional tensor of shape [num_sequences + 1] containing
+            cumulative sequence lengths for variable-length TE fused RoPE.
+        concentration: Optional scale applied after TE fused RoPE.
         cp_size: Context parallelism size.
         cp_rank: Context parallelism rank.
 
     Returns:
-        Tuple of (q, k) with rotary embeddings applied.
+        Tuple of rotated query and key tensors, preserving their respective
+        shapes and dtypes without mutating or aliasing the input tensors.
     """
     if rope_fusion:
         from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
@@ -176,10 +186,41 @@ def apply_rotary_emb_qk(
             k = k * concentration
         return q, k
     else:
-        cos, sin = freqs_cis.split(freqs_cis.shape[-1] // 2, dim=-1)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-        return q, k
+        if q.is_cuda and not torch.compiler.is_compiling():
+            return _compiled_apply_rotary_emb_qk(q, k, freqs_cis)
+        return _apply_rotary_emb_qk(q, k, freqs_cis)
+
+
+def _apply_rotary_emb_qk(
+    q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate query/key together, sharing their dtype-rounded tables.
+
+    Args:
+        q: Tensor of shape [..., query_heads, head_dim], with arbitrary leading
+            dimensions and strides.
+        k: Tensor of shape [..., key_heads, head_dim], sharing the leading
+            dimensions of ``q`` and accepting arbitrary strides.
+        freqs_cis: Tensor of shape [..., rotary_dim], with leading dimensions
+            broadcastable to ``q`` and ``k``. The last dimension concatenates
+            cosine and sine tables; ``rotary_dim`` is even and at most
+            ``head_dim``.
+
+    Returns:
+        Independently allocated rotated query and key tensors, preserving
+        their respective shapes and dtypes.
+    """
+    cos, sin = freqs_cis.split(freqs_cis.shape[-1] // 2, dim=-1)
+    return apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+
+
+# Preserve BF16/FP16 rounding between multiplies and adds, not only when casting
+# the tables. Computing Q/K together also shares table casts and compiler guards.
+# Symbolic token dimensions keep packed microbatches from exhausting Dynamo's
+# recompile limit and silently falling back to eager execution.
+_compiled_apply_rotary_emb_qk = torch.compile(
+    _apply_rotary_emb_qk, dynamic=True, options={"emulate_precision_casts": True}
+)
 
 
 @torch.no_grad()
@@ -190,6 +231,21 @@ def position_ids_to_freqs_cis(
     for_fused_rope: bool = True,
     cp_size: int = 1,
 ) -> torch.Tensor:
+    """Build FP32 rotary angles or coefficients without autocast rounding.
+
+    Args:
+        rotary_emb: Rotary configuration and inverse-frequency owner.
+        position_ids: Integer tensor [batch, sequence] for BSHD or [tokens]
+            for packed THD. Fused THD uses sequential positions across CP ranks.
+        qkv_format: BSHD or packed THD tensor layout.
+        for_fused_rope: Whether to return raw angles for the fused kernel.
+        cp_size: Context-parallel world size for fused THD positions.
+
+    Returns:
+        FP32 angles [sequence, 1, 1, rotary_dim] for fused RoPE; otherwise
+        FP32 coefficients [batch, sequence, rotary_dim] or [tokens, rotary_dim]
+        with cosine and sine concatenated along the final dimension.
+    """
     if qkv_format == "thd":
         if for_fused_rope:
             # shape[0] is T for 1D [T] or batch for 2D [B, T].
@@ -203,7 +259,7 @@ def position_ids_to_freqs_cis(
     concentration, inv_freq = rotary_emb._compute_concentration_and_inv_freq()
     inv_freq = inv_freq.to(device=position_ids.device, dtype=torch.float32)
     # angles: (B, T, D/2)
-    angles = torch.einsum("bt,d->btd", position_ids.to(dtype=torch.float32), inv_freq)
+    angles = position_ids.to(dtype=torch.float32).unsqueeze(-1) * inv_freq
 
     if for_fused_rope:
         # TE fused rope expects [angles, angles]

@@ -84,7 +84,7 @@ def test_reuses_packed_metadata_across_checkpointed_moe_layers(monkeypatch):
 
     chunk_gated_delta_rule = MagicMock(side_effect=lambda *args, **_kwargs: (args[2], None))
     for linear_attn in linear_attn_modules:
-        linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda **kwargs: kwargs["x"])
+        linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda x, **kwargs: x)
         linear_attn.chunk_gated_delta_rule = chunk_gated_delta_rule
         linear_attn.norm.forward = MagicMock(side_effect=torch.add)
 

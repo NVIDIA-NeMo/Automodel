@@ -142,11 +142,16 @@ def test_deepseek_v32_rejects_fa4_before_sparse_layers():
 @pytest.mark.parametrize("microbatch_size", [1, 2])
 def test_qwen35_hybrid_packed_fa4_matches_sdpa(microbatch_size):
     """Exercise collation, entry hook, recurrent/full attention, logits and gradients."""
+    import inspect
+
     from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule
 
     from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM
     from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
     from tests.unit_tests.models.qwen3_5.test_qwen3_5_dense_backbone import _backend, _tiny_config
+
+    # Keep the CPU oracle on HF's PyTorch implementation even when FLA is installed.
+    reference_recurrent = inspect.unwrap(torch_recurrent_gated_delta_rule)
 
     def conv(x, weight, bias, activation, seq_idx):
         """Run separate document convolutions.
@@ -193,7 +198,7 @@ def test_qwen35_hybrid_packed_fa4_matches_sdpa(microbatch_size):
         cuts = cu_seqlens.tolist()
         return torch.cat(
             [
-                torch_recurrent_gated_delta_rule(q[:, a:b], k[:, a:b], v[:, a:b], g[:, a:b], beta[:, a:b], **kwargs)[0]
+                reference_recurrent(q[:, a:b], k[:, a:b], v[:, a:b], g[:, a:b], beta[:, a:b], **kwargs)[0]
                 for a, b in zip(cuts, cuts[1:])
             ],
             dim=1,

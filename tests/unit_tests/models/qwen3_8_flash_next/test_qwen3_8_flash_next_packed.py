@@ -599,11 +599,16 @@ def test_model_advertises_packed_cp_for_sparse_backends(attn_backend: str) -> No
 def test_packed_gdn_parent_forward_backward_matches_separate_documents(document_id_offset: int | None) -> None:
     """Exercise the inherited forward with three documents, including zero-based ID 2."""
     import copy
+    import inspect
 
     import torch.nn.functional as F
     from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule
 
     from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
+
+    # HF 5.18 decorates the reference with automatic FLA dispatch. Keep this
+    # CPU parity oracle on the original differentiable PyTorch implementation.
+    reference_recurrent = inspect.unwrap(torch_recurrent_gated_delta_rule)
 
     def reference_conv(x, weight, bias, activation, seq_idx):
         """Apply independent causal convolutions at document boundaries.
@@ -654,7 +659,7 @@ def test_packed_gdn_parent_forward_backward_matches_separate_documents(document_
         """
         cuts = [0, q.shape[1]] if cu_seqlens is None else cu_seqlens.tolist()
         outputs = [
-            torch_recurrent_gated_delta_rule(
+            reference_recurrent(
                 q[:, start:end], k[:, start:end], v[:, start:end], g[:, start:end], beta[:, start:end], **kwargs
             )[0]
             for start, end in zip(cuts, cuts[1:])
@@ -675,6 +680,7 @@ def test_packed_gdn_parent_forward_backward_matches_separate_documents(document_
         layer._fp32_params.dt_bias.zero_()
     layer.causal_conv1d_fn = reference_conv
     layer.chunk_gated_delta_rule = reference_gdn
+    layer.recurrent_gated_delta_rule = reference_gdn
     reference = copy.deepcopy(layer)
     hidden = torch.randn(1, 10, config.hidden_size, requires_grad=True)
     ref_hidden = hidden.detach().clone().requires_grad_()
@@ -744,3 +750,22 @@ def test_packed_gdn_canonicalizes_reused_ids_and_inconsistent_indices(monkeypatc
     )
     assert captured["attention_mask"].tolist() == [[0, 0, 0, 1, 2, 2, 2, 3, 3, 3]]
     assert captured["indices"].tolist() == list(range(10))
+
+
+def test_decoder_layer_derives_ple_document_ids_only_for_packed_rows() -> None:
+    from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextDecoderLayer
+
+    derive = Qwen3_8_FlashNextDecoderLayer._ple_sequence_ids
+    input_ids = torch.zeros(1, 6, dtype=torch.long)
+    assert derive(input_ids, None, None) is None
+    torch.testing.assert_close(
+        derive(input_ids, None, torch.tensor([0, 2, 6])),
+        torch.tensor([[0, 0, 1, 1, 1, 1]]),
+    )
+    # Positions past the last boundary (pack or CP padding) form one more segment.
+    torch.testing.assert_close(
+        derive(input_ids, None, torch.tensor([0, 2, 4])),
+        torch.tensor([[0, 0, 1, 1, 2, 2]]),
+    )
+    with pytest.raises(ValueError, match="one physical row"):
+        derive(torch.zeros(2, 6, dtype=torch.long), None, torch.tensor([0, 2, 6]))

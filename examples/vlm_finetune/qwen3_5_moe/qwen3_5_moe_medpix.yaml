@@ -125,6 +125,7 @@ optimizer:
 
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 32
   time: "00:45:00"

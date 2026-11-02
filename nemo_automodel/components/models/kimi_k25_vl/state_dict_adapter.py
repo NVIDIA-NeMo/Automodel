@@ -201,7 +201,11 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         quantization = kwargs.get("quantization", False)
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
-        if fqn.startswith("model."):
+        # The outer "model." belongs to the native wrapper and is dropped on export.
+        # Adapter keys keep it: they are saved in native layout, and until now that was
+        # decided by them arriving under "base_model.", which the boundary is taking
+        # ownership of. ".lora_" asks the same question without depending on the prefix.
+        if ".lora_" not in fqn and fqn.startswith("model."):
             fqn = fqn[6:]
 
         if fqn.startswith("multi_modal_projector."):
@@ -370,11 +374,13 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         peft_keys = {}
 
         for key, value in effective_state_dict.items():
-            if key.startswith("base_model."):
-                # PEFT adapter namespace. These keys are saved with their native-format
-                # path preserved (including the "base_model.model." outer prefix), so no
-                # HF->native renaming applies — only the per-expert expert-LoRA keys need
-                # recombining into the grouped tensors the model actually holds.
+            if ".lora_" in key:
+                # PEFT adapter factors. These are saved with their native-format path
+                # preserved, so no HF->native renaming applies -- only the per-expert
+                # expert-LoRA keys need recombining into the grouped tensors the model
+                # actually holds. Recognised by ".lora_" rather than the "base_model."
+                # outer prefix, which ModelState owns and #3867 moves out of the adapters'
+                # sight; it is also what export uses for the same decision above.
                 peft_keys[key] = value
             elif key.startswith("language_model.model."):
                 llm_key = key.replace("language_model.model.", "model.")

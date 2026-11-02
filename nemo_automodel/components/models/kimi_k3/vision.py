@@ -234,8 +234,18 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
 
         self.reset_parameters()
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
+        """Restore learned positions and the configuration-derived temporal buffer.
+
+        The temporal buffer follows the learned positions' device and dtype, so a
+        BF16 tower keeps BF16 patch states after re-initialization.
+        """
         nn.init.normal_(self.weight)
+        self.time_weight = (
+            torch.from_numpy(get_1d_sincos_pos_embed(self.dim, self.num_frames))
+            .to(device=self.weight.device, dtype=self.weight.dtype)
+            .unsqueeze(1)
+        )
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         pos_embs = []
@@ -338,6 +348,10 @@ class Rope2DPosEmbRepeated(nn.Module):
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
+
+    def reset_parameters(self) -> None:
+        """Discard rotary caches invalidated by meta materialization."""
+        self._buffers.pop("freqs_cis", None)
 
     def extra_repr(self):
         return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
@@ -591,6 +605,7 @@ class MoonViT3dPretrainedModel(PreTrainedModel):
     model_type = "moonvit3d"
     _no_split_modules = ["MoonViTEncoderLayer"]
     _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
 
     def __init__(self, config, *inputs, **kwargs):

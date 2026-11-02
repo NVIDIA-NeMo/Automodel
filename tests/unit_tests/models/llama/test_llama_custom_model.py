@@ -72,18 +72,32 @@ ROPE_CONFIGS = {
 }
 
 
-def test_quack_rope_layout_matches_torch_for_batch_specific_tables():
-    batch, q_heads, kv_heads, seq_len, head_dim = 2, 4, 2, 8, 64
+@pytest.mark.parametrize("batch", [1, 2])
+def test_quack_rope_layout_matches_torch_for_batch_specific_tables(batch):
+    q_heads, kv_heads, seq_len, head_dim = 4, 2, 8, 64
     q = torch.randn(batch, q_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(batch, kv_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
     angles = torch.randn(batch, seq_len, head_dim // 2, device="cuda", dtype=torch.float32)
-    cos_half = angles.cos().to(torch.bfloat16)
-    sin_half = angles.sin().to(torch.bfloat16)
+    cos_half = angles.cos()
+    sin_half = angles.sin()
     cos = torch.cat((cos_half, cos_half), dim=-1)
     sin = torch.cat((sin_half, sin_half), dim=-1)
 
-    def fake_quack_apply(x, cos_table, sin_table, inplace=False):
-        x0, x1 = x.chunk(2, dim=-1)
+    def fake_quack_apply(
+        x: torch.Tensor, cos_table: torch.Tensor, sin_table: torch.Tensor, inplace: bool = False
+    ) -> torch.Tensor:
+        """Emulate QuACK's FP32 arithmetic and input-dtype output.
+
+        Args:
+            x: BSHD tensor [batch, sequence, heads, head_dim].
+            cos_table: FP32 coefficients [sequence, head_dim // 2].
+            sin_table: FP32 coefficients [sequence, head_dim // 2].
+            inplace: Whether to write the result into x.
+
+        Returns:
+            BSHD tensor with x's dtype, aliasing x only when inplace is true.
+        """
+        x0, x1 = x.float().chunk(2, dim=-1)
         out = torch.cat(
             (
                 x0 * cos_table[None, :, None, :] - x1 * sin_table[None, :, None, :],
@@ -91,6 +105,7 @@ def test_quack_rope_layout_matches_torch_for_batch_specific_tables():
             ),
             dim=-1,
         )
+        out = out.to(x.dtype)
         if inplace:
             x.copy_(out)
             return x
