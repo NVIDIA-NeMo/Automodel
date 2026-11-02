@@ -324,14 +324,18 @@ def test_to_yaml_dict_uses_live_callable_when_original_target_cannot_resolve():
 
 
 def test_to_yaml_dict_emits_tuples_as_safe_loadable_lists():
-    """A tuple CLI value must not dump as `!!python/tuple`, which yaml.safe_load rejects."""
-    cfg = ConfigNode({"optimizer": {"betas": [0.9, 0.999]}})
+    """CLI tuple literals must serialize as plain YAML sequences, not `!!python/tuple`."""
+    cfg = ConfigNode({"optimizer": {"lr": 1e-4}})
     cfg.set_by_dotted("optimizer.betas", translate_value("(0.9, 0.95)"))
+    cfg.set_by_dotted("shapes", translate_value("[(1, 2), (3, 4)]"))
 
     out = cfg.to_yaml_dict(use_orig_values=True)
 
     assert out["optimizer"]["betas"] == [0.9, 0.95]
+    assert out["shapes"] == [[1, 2], [3, 4]]
     assert yaml.safe_load(yaml.dump(out)) == out
+    # The live config keeps the tuple for the components that consume it.
+    assert cfg.optimizer.betas == (0.9, 0.95)
 
 
 def test_load_yaml_config(tmp_path):
