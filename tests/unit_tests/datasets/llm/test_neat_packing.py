@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,10 +23,9 @@ from nemo_automodel.components.datasets.llm.neat_packing import (
     greedy_knapsack,
     neat_pack_dataset,
 )
-from nemo_automodel.components.datasets.utils import (
-    indexed_mask_to_4d_block_causal,
-    neat_packed_collater,
-)
+from nemo_automodel.components.datasets.utils import neat_packed_collater
+from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
+from nemo_automodel.components.models.common.packing import PackingCapabilities, get_packing_capabilities
 
 
 class TestGreedyKnapsack:
@@ -384,7 +382,7 @@ class TestNeatPackedCollater:
                 "position_ids": torch.tensor([0, 1, 2, 3]),
             },
         ]
-        result = neat_packed_collater(batch)
+        result = neat_packed_collater(batch, packing=get_packing_capabilities("sdpa"))
 
         assert result["input_ids"].shape == (2, 4)
         assert result["labels"].shape == (2, 4)
@@ -404,7 +402,7 @@ class TestNeatPackedCollater:
         ]
         result = neat_packed_collater(
             batch,
-            packing=SimpleNamespace(
+            packing=PackingCapabilities(
                 packed_mask_type="block_causal",
                 return_packed_sequence_metadata=False,
             ),
@@ -430,7 +428,7 @@ class TestNeatPackedCollaterContracts:
 
     @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
     def test_flash_versions_emit_varlen_kwargs_and_no_mask(self, impl):
-        out = neat_packed_collater(self._batch(), attn_implementation=impl)
+        out = neat_packed_collater(self._batch(), attn_implementation=impl, packing=get_packing_capabilities(impl))
         # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
         assert "attention_mask" not in out
         # cu_seqlens spans the full flattened batch: doc1 (2) + doc2 (2) = 4 tokens.
@@ -441,7 +439,7 @@ class TestNeatPackedCollaterContracts:
         assert out["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
 
     def test_document_ids_contract_keeps_indexed_2d_mask(self):
-        packing = SimpleNamespace(
+        packing = PackingCapabilities(
             packed_mask_type="document_ids",
             return_packed_sequence_metadata=False,
         )
@@ -452,7 +450,7 @@ class TestNeatPackedCollaterContracts:
         assert out["attention_mask"].tolist() == [[1, 1, 2, 2]]
 
     def test_block_causal_contract_gets_4d_mask(self):
-        packing = SimpleNamespace(
+        packing = PackingCapabilities(
             packed_mask_type="block_causal",
             return_packed_sequence_metadata=False,
         )
@@ -462,7 +460,7 @@ class TestNeatPackedCollaterContracts:
         assert out["attention_mask"].dim() == 4
 
     def test_metadata_contract_emits_backend_neutral_varlen_metadata(self):
-        packing = SimpleNamespace(
+        packing = PackingCapabilities(
             packed_mask_type="document_ids",
             return_packed_sequence_metadata=True,
         )
@@ -475,7 +473,7 @@ class TestNeatPackedCollaterContracts:
         assert out["max_seqlen"] == 2
 
     def test_unknown_mask_type_is_rejected(self):
-        packing = SimpleNamespace(
+        packing = PackingCapabilities(
             packed_mask_type="unknown",
             return_packed_sequence_metadata=False,
         )
@@ -488,6 +486,7 @@ class TestNeatPackedCollaterContracts:
             out = neat_packed_collater(
                 self._batch(),
                 attn_implementation="flash_attention_2",
+                packing=get_packing_capabilities("flash_attention_2"),
             )
 
         assert "attention_mask" not in out

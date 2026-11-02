@@ -45,6 +45,7 @@ from nemo_automodel.components.datasets.vlm.loader import (
     VlmProcessorConfig,
     apply_vlm_chat_template,
 )
+from nemo_automodel.components.datasets.vlm.media import pad_image_tensors
 from nemo_automodel.components.datasets.vlm.pp_media import prepare_vlm_media_for_pp
 from nemo_automodel.components.datasets.vlm.preprocessing import (
     collate_position_ids,
@@ -57,7 +58,6 @@ from nemo_automodel.components.datasets.zephon.attention import (
     enable_xdoc_attention,
 )
 from nemo_automodel.shared.import_utils import safe_import_from
-from nemo_automodel.shared.vlm_media import pad_image_tensors
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin

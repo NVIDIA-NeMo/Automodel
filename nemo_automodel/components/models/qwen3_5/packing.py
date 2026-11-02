@@ -103,8 +103,8 @@ def prepare_gated_delta_packed_metadata(
         if is_indexed_packed_mask(candidate_cpu):
             document_ids = candidate
             break
-    if document_ids is None:
-        document_ids = metadata_candidate if has_metadata else None
+    if document_ids is None and has_metadata:
+        document_ids = metadata_candidate
     if document_ids is None:
         return None
 

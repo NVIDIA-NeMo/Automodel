@@ -27,12 +27,12 @@ from nemo_automodel.components.datasets.zephon.attention import (
     enable_xdoc_attention,
 )
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
+from nemo_automodel.components.models.common.packed_seq import (
+    indexed_mask_to_4d_block_causal as block_causal_attention_mask,
+)
 from nemo_automodel.components.models.common.packing import (
     PackingCapabilities,
     configure_packing,
-)
-from nemo_automodel.shared.packed_seq import (
-    indexed_mask_to_4d_block_causal as block_causal_attention_mask,
 )
 from tests.utils.zephon_distributed import (
     distributed_environment as distributed_environment,

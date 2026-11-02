@@ -18,7 +18,7 @@ from collections.abc import Mapping, Sequence
 
 import torch
 
-from nemo_automodel.shared.vlm_media import pad_image_tensors
+from nemo_automodel.components.datasets.vlm.media import pad_image_tensors
 
 
 def merge_vlm_documents(
