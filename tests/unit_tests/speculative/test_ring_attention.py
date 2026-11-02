@@ -20,9 +20,6 @@ mixed causal + diagonal softmax. This pins the forward and backward math (the ri
 comms are exercised separately by the 2-GPU checks).
 """
 
-import os
-import socket
-
 import pytest
 import torch
 import torch.multiprocessing as mp
@@ -63,25 +60,14 @@ def _eager_cached_reference(q, cache_k, cache_v, scale):
     return out
 
 
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def _ring_worker(rank: int, port: int) -> None:
+def _ring_worker(rank: int) -> None:
     # Run in a spawned child so the process group never collides with one another
     # test in the suite left initialized. NCCL (not gloo): the ring backward issues
     # a self send/recv even at world_size=1, which gloo rejects but NCCL handles.
     try:
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(port)
-        os.environ["RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
         torch.cuda.set_device(0)
-        torch.distributed.init_process_group("nccl", rank=0, world_size=1)
+        # One rank needs no TCP rendezvous; avoid racing to reuse a released port.
+        torch.distributed.init_process_group("nccl", store=torch.distributed.HashStore(), rank=rank, world_size=1)
 
         from nemo_automodel.components.speculative.eagle.ring_attention import cached_ring_attention
 
@@ -110,4 +96,4 @@ def _ring_worker(rank: int, port: int) -> None:
 
 
 def test_cached_ring_attention_world1_matches_eager():
-    mp.spawn(_ring_worker, args=(_free_port(),), nprocs=1, join=True)
+    mp.spawn(_ring_worker, nprocs=1, join=True)

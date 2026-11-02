@@ -544,6 +544,41 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     def get_output_embeddings(self):
         return self.lm_head
 
+    def get_dspark_target_feature_modules(self, layer_ids: list[int]) -> tuple[nn.Module, ...]:
+        """Return modules whose inputs are the DSpark target features of ``layer_ids``.
+
+        The feature of layer ``i`` is the residual stream entering layer ``i + 1``.
+        For the last layer that is the stream entering the final norm, so the
+        draft sees the same unnormalized last-layer state as at serving time
+        instead of the normalized hidden state that feeds ``lm_head``. Each
+        decoder block's input norm and the final norm take that stream as their
+        first positional argument.
+
+        Args:
+            layer_ids: Strictly increasing decoder-layer indices in
+                ``[-1, num_hidden_layers)``; ``-1`` selects the stream entering
+                layer 0.
+
+        Returns:
+            Modules ordered like ``layer_ids``. Each receives a tensor of shape
+            [batch, sequence, hidden] as its first forward argument.
+
+        Raises:
+            ValueError: If the indices are duplicated, unsorted, or outside the
+                decoder depth, or this rank does not hold the final norm.
+        """
+        num_layers = len(self.model.layers)
+        if layer_ids != sorted(set(layer_ids)):
+            raise ValueError(f"DSpark target layer IDs must be strictly increasing, got {layer_ids}")
+        if any(type(layer_id) is not int or not -1 <= layer_id < num_layers for layer_id in layer_ids):
+            raise ValueError(f"DSpark target layer IDs must be integers in [-1, {num_layers}), got {layer_ids}")
+        if self.model.norm is None:
+            raise ValueError("DSpark target features need the final norm, which this pipeline stage does not hold")
+        return tuple(
+            self.model.norm if layer_id == num_layers - 1 else self.model.layers[str(layer_id + 1)].input_layernorm
+            for layer_id in layer_ids
+        )
+
     def customize_pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],

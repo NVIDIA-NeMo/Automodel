@@ -1,0 +1,48 @@
+{
+  "verdict": {
+    "type": "choice",
+    "instructions": "What explains the observed security alert?",
+    "criteria": {
+      "malicious": "The evidence supports an unauthorized attack.",
+      "benign_authorized": "The activity is authorized and expected.",
+      "false_positive": "A sensor artifact explains the alert."
+    }
+  },
+  "action": {
+    "type": "choice",
+    "instructions": "Which response follows the tutorial policy?",
+    "criteria": {
+      "close": "Close the alert.",
+      "monitor": "Monitor the asset without containment.",
+      "escalate": "Ask an analyst to investigate.",
+      "contain": "Contain the affected asset."
+    }
+  },
+  "severity": {
+    "type": "score",
+    "instructions": "How severe is the event under the tutorial policy?",
+    "criteria": [
+      "Informational",
+      "Low",
+      "Medium",
+      "High",
+      "Critical"
+    ]
+  },
+  "attack_tactic": {
+    "type": "choice",
+    "instructions": "Which behavior generated this alert?",
+    "criteria": {
+      "credential_access": "An attempt to obtain or misuse credentials.",
+      "execution": "A process or script execution event."
+    }
+  },
+  "needs_human": {
+    "type": "noul",
+    "instructions": "Does the tutorial policy require analyst review?",
+    "criteria": {
+      "false": "No analyst review is required.",
+      "true": "An analyst must review the alert."
+    }
+  }
+}

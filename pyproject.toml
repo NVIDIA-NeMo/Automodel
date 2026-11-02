@@ -617,6 +617,7 @@ modules = [
     "nemo_automodel.components.config",
     "nemo_automodel.components.datasets",
     "nemo_automodel.components.distributed",
+    "nemo_automodel.components.eval.decision",
     "nemo_automodel.components.flow_matching",
     "nemo_automodel.components.launcher",
     "nemo_automodel.components.loggers",
