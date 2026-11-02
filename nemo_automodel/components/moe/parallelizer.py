@@ -871,6 +871,9 @@ def apply_fsdp(
     wrap_outer_model: bool = True,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     model_parallelizer: "ModelParallelizer | None" = None,
+    *,
+    fsdp2_forward_prefetch_depth: int = 0,
+    fsdp2_backward_prefetch_depth: int = 0,
 ) -> None:
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
@@ -1061,6 +1064,18 @@ def apply_fsdp(
             reshard_after_forward=reshard_after_forward,
             ignored_params=ignored_params or None,
             model_parallelizer=model_parallelizer,
+        )
+
+    parallelizer_utils.configure_fsdp_prefetch(
+        list(_iter_moe_blocks(model, _model)),
+        forward_depth=fsdp2_forward_prefetch_depth,
+        backward_depth=fsdp2_backward_prefetch_depth,
+    )
+    if fsdp2_forward_prefetch_depth or fsdp2_backward_prefetch_depth:
+        logger.info(
+            "MoE FSDP block prefetch: forward=%d, backward=%d",
+            fsdp2_forward_prefetch_depth,
+            fsdp2_backward_prefetch_depth,
         )
 
     # Re-establish weight tying before detecting it: a device/dtype move during
@@ -1266,6 +1281,8 @@ def parallelize_model(
     ignore_router_for_ac: bool = True,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
+    fsdp2_forward_prefetch_depth: int = 0,
+    fsdp2_backward_prefetch_depth: int = 0,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
@@ -1375,6 +1392,8 @@ def parallelize_model(
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             reshard_after_forward=reshard_after_forward,
+            fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
+            fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,

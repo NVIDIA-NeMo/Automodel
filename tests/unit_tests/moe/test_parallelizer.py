@@ -457,6 +457,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
     parallelizer_utils_stub.fully_shard_across_blocks = lambda blocks, module_names, **kwargs: set()
     parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
+    parallelizer_utils_stub.configure_fsdp_prefetch = MagicMock()
 
     monkeypatch.setitem(
         sys.modules,
@@ -1046,6 +1047,96 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     model_call = _find_call_by_first_arg(fully_shard_mock, model)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
+
+
+def _stub_apply_fsdp_sharding(P, monkeypatch):
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+    prefetch_mock = MagicMock()
+    monkeypatch.setattr(P.parallelizer_utils, "configure_fsdp_prefetch", prefetch_mock)
+    return prefetch_mock
+
+
+@pytest.mark.parametrize(
+    "depths, expected",
+    [({}, (0, 0)), ({"fsdp2_forward_prefetch_depth": 2, "fsdp2_backward_prefetch_depth": 3}, (2, 3))],
+)
+def test_apply_fsdp_prefetches_backbone_then_mtp_blocks(monkeypatch, depths, expected):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    prefetch_mock = _stub_apply_fsdp_sharding(P, monkeypatch)
+
+    backbone = [DummyBlock(mlp=DummyMoE()), DummyBlock(mlp=DummyMoE())]
+    mtp_block = DummyBlock(mlp=DummyMoE())
+    model = types.SimpleNamespace(
+        model=DummyModel(backbone),
+        mtp=types.SimpleNamespace(layers=LayerContainer([mtp_block])),
+    )
+
+    P.apply_fsdp(model=model, fsdp_mesh=object(), ep_enabled=False, ep_shard_enabled=False, **depths)
+
+    prefetch_mock.assert_called_once_with(
+        [backbone[0], backbone[1], mtp_block], forward_depth=expected[0], backward_depth=expected[1]
+    )
+
+
+class _ReplacingLayerContainer(LayerContainer):
+    """Layer container whose registration replaces the child, like ``nn.Module``."""
+
+    def register_module(self, name, module):
+        super().register_module(name, module)
+        self._blocks[int(name)] = module
+
+
+def test_apply_fsdp_prefetches_checkpoint_wrapped_blocks(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    prefetch_mock = _stub_apply_fsdp_sharding(P, monkeypatch)
+
+    class _Wrapper:
+        def __init__(self, block):
+            self.block = block
+
+        def __getattr__(self, name):
+            return getattr(self.block, name)
+
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **_kwargs: _Wrapper(block)))
+    blocks = [DummyBlock(mlp=DummyMoE()), DummyBlock(mlp=DummyMoE())]
+    model = DummyModel(blocks)
+    model.layers = _ReplacingLayerContainer(list(blocks))
+
+    P.apply_ac(model, ignore_router=True, hidden_size=8, num_experts=4)
+    wrappers = list(model.layers.children())
+    assert [wrapper.block for wrapper in wrappers] == blocks
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=object(),
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        fsdp2_forward_prefetch_depth=1,
+        fsdp2_backward_prefetch_depth=2,
+    )
+
+    targets = prefetch_mock.call_args.args[0]
+    assert len(targets) == 2 and all(t is w for t, w in zip(targets, wrappers))
+    assert prefetch_mock.call_args.kwargs == {"forward_depth": 1, "backward_depth": 2}
+
+
+def test_apply_fsdp_keeps_existing_positional_slots(monkeypatch):
+    """The prefetch depths are keyword-only, so older positional calls bind as before."""
+    import inspect
+
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    positional = ("model", "mesh", True, False, None, "mp", "offload", True, "float32", False, "per_layer", None)
+
+    bound = inspect.signature(P.apply_fsdp).bind(*positional)
+
+    assert bound.arguments["reshard_after_forward"] is True
+    assert bound.arguments["lm_head_precision"] == "float32"
+    assert bound.arguments["wrap_outer_model"] is False
+    assert bound.arguments["frozen_multimodal_sharding"] == "per_layer"
+    with pytest.raises(TypeError):
+        inspect.signature(P.apply_fsdp).bind(*positional, 2)
 
 
 def test_apply_fsdp_installs_accumulated_grad_guard(monkeypatch):
@@ -1712,6 +1803,8 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
         ep_axis_name="ep",
         ep_shard_axis_names=("es1", "es2"),
         activation_checkpointing=True,
+        fsdp2_forward_prefetch_depth=2,
+        fsdp2_backward_prefetch_depth=3,
     )
     apply_ep_mock.assert_called_once()
     # AC enabled
@@ -1733,6 +1826,8 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     assert ep_shard_enabled is True
     assert ep_shard_mesh_arg.size() == 2
     assert kwargs.get("frozen_multimodal_sharding") == "root"
+    assert kwargs["fsdp2_forward_prefetch_depth"] == 2
+    assert kwargs["fsdp2_backward_prefetch_depth"] == 3
 
 
 def test_parallelize_model_passes_frozen_multimodal_sharding_to_apply_fsdp(monkeypatch):
@@ -1756,6 +1851,8 @@ def test_parallelize_model_passes_frozen_multimodal_sharding_to_apply_fsdp(monke
     apply_fsdp_mock.assert_called_once()
     _, kwargs = apply_fsdp_mock.call_args
     assert kwargs["frozen_multimodal_sharding"] == "replicate"
+    assert kwargs["fsdp2_forward_prefetch_depth"] == 0
+    assert kwargs["fsdp2_backward_prefetch_depth"] == 0
 
 
 def test_parallelize_model_accepts_top_level_moe_config(monkeypatch):

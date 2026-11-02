@@ -25,7 +25,9 @@ from nemo_automodel.components.distributed.config import MoEParallelizerConfig
 def test_parallelize_moe_forwards_the_moe_checkpointing_mode() -> None:
     """The activation-checkpointing mode and the router knob must reach parallelize_model unchanged."""
     model = nn.Linear(2, 2)
-    moe = MoEParallelizerConfig(ignore_router_for_ac=True)
+    moe = MoEParallelizerConfig(
+        ignore_router_for_ac=True, fsdp2_forward_prefetch_depth=2, fsdp2_backward_prefetch_depth=3
+    )
     mesh_context = SimpleNamespace(
         device_mesh=object(),
         moe_mesh=object(),
@@ -43,4 +45,18 @@ def test_parallelize_moe_forwards_the_moe_checkpointing_mode() -> None:
     kwargs = parallelize.call_args.kwargs
     assert kwargs["activation_checkpointing"] == "moe"
     assert kwargs["ignore_router_for_ac"] is True
+    assert kwargs["fsdp2_forward_prefetch_depth"] == 2
+    assert kwargs["fsdp2_backward_prefetch_depth"] == 3
     assert "checkpoint_moe_only" not in kwargs
+
+
+def test_moe_parallelizer_config_keeps_positional_slots() -> None:
+    """The prefetch depths are keyword-only, so older positional calls bind as before."""
+    moe = MoEParallelizerConfig(True, False, "float32", False)
+
+    assert moe.ignore_router_for_ac is True
+    assert moe.reshard_after_forward is False
+    assert moe.lm_head_precision == "float32"
+    assert moe.wrap_outer_model is False
+    assert moe.fsdp2_forward_prefetch_depth == 0
+    assert moe.fsdp2_backward_prefetch_depth == 0
