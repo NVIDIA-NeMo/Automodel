@@ -34,8 +34,6 @@ from transformers.utils import logging
 from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
-
 if TYPE_CHECKING:
     from .reranker_export import Mistral3RerankerMetadataExporter
 
@@ -358,7 +356,6 @@ class Mistral3BidirectionalModel(Mistral3Model):
             config: Composite Mistral3 vision-language configuration.
         """
         super().__init__(config)
-        apply_pixtral_forward_backport(self.vision_tower)
         # AutoModel already resolves our registered text config to the retrieval tower.
         # Only callers supplying a stock text config object need a replacement.
         if not isinstance(self.language_model, Ministral3BidirectionalModel):

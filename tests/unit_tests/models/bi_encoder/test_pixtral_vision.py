@@ -12,28 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise the Pixtral backport through the retrieval owner.
-
-Run this file with real Transformers 5.18.0 in addition to the project pin;
-faking a version string alone cannot test its changed rotary-position contract.
-"""
+"""Verify retrieval uses stock Pixtral vision outputs and gradients."""
 
 import copy
-from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import Mistral3Config, PixtralVisionModel
+from transformers import PixtralVisionModel
 
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Mistral3BidirectionalConfig,
     Mistral3BidirectionalModel,
 )
-from nemo_automodel.components.models.pixtral import compat
 
 
-@pytest.fixture(params=["retrieval"])
-def vision_tower_factory(request):
+@pytest.fixture
+def vision_tower_factory():
     def make_tower(attention="eager"):
         text_config = dict(
             model_type="ministral3",
@@ -56,21 +50,20 @@ def vision_tower_factory(request):
             patch_size=8,
             attention_dropout=0.0,
         )
-        config_cls = Mistral3BidirectionalConfig if request.param == "retrieval" else Mistral3Config
-        config = config_cls(text_config=text_config, vision_config=vision_config, spatial_merge_size=1)
+        config = Mistral3BidirectionalConfig(text_config=text_config, vision_config=vision_config, spatial_merge_size=1)
         config._attn_implementation = attention
-        if request.param == "retrieval":
-            return Mistral3BidirectionalModel(config).vision_tower
+        return Mistral3BidirectionalModel(config).vision_tower
 
     return make_tower
 
 
 @pytest.mark.parametrize("attention", ["eager", "sdpa"])
 @pytest.mark.parametrize("infer_sizes", [False, True])
-def test_pixtral_backport_preserves_outputs_and_gradients(vision_tower_factory, attention, infer_sizes):
+def test_retrieval_pixtral_preserves_stock_outputs_and_gradients(vision_tower_factory, attention, infer_sizes):
     """Mixed rectangular images retain upstream outputs, captured states, and gradients."""
     torch.manual_seed(42)
     tower = vision_tower_factory(attention).eval()
+    assert tower.forward.__func__ is PixtralVisionModel.forward
     stock = PixtralVisionModel(copy.deepcopy(tower.config)).eval()
     stock.load_state_dict(tower.state_dict())
     pixels = torch.randn(2, 3, 24, 24)
@@ -89,14 +82,3 @@ def test_pixtral_backport_preserves_outputs_and_gradients(vision_tower_factory, 
         assert parameter.grad is not None, name
         assert stock_parameter.grad is not None, name
         torch.testing.assert_close(parameter.grad, stock_parameter.grad, atol=1e-6, rtol=1e-5, msg=name)
-
-
-# 5.19.1 is a future-version example, not a claim that it contains HF #49373.
-@pytest.mark.parametrize("version", ["5.15.1", "5.17.0", "5.18.0", "5.19.0", "5.19.1"])
-def test_pixtral_backport_is_instance_and_version_local(monkeypatch, vision_tower_factory, version):
-    """Retrieval models bind the fix only on affected releases; unrelated HF models stay native."""
-    monkeypatch.setattr(compat, "transformers", SimpleNamespace(__version__=version))
-    tower = vision_tower_factory()
-    assert (tower.forward.__func__ is PixtralVisionModel.forward) == (version not in {"5.17.0", "5.18.0", "5.19.0"})
-    stock = PixtralVisionModel(tower.config)
-    assert stock.forward.__func__ is PixtralVisionModel.forward
