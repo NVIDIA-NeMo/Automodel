@@ -146,6 +146,7 @@ class NativeFA4Consumer(Protocol):
 class PackedMetadataEntryOwner(Protocol):
     """Model whose attention policy needs metadata at a specific forward entry."""
 
+    @property
     def packed_metadata_entry_module(self) -> torch.nn.Module:
         """Return the called module that owns packed attention preparation."""
         ...
@@ -213,13 +214,12 @@ def get_packing_capabilities(
     requires_metadata = isinstance(model, PackingMetadataConsumer) and model.requires_packed_sequence_metadata
     model_mask_type = model.packed_mask_type if isinstance(model, PackedMaskConsumer) else None
     uses_native_fa4 = attn_implementation == "fa4" and isinstance(model, NativeFA4Consumer) and model._uses_native_fa4
-    mask_type: PackedMaskType = (
-        "document_ids"
-        if uses_native_fa4
-        else "flash_varlen"
-        if attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS
-        else model_mask_type or "block_causal"
-    )
+    if uses_native_fa4:
+        mask_type: PackedMaskType = "document_ids"
+    elif attn_implementation in _FLASH_ATTN_IMPLEMENTATIONS:
+        mask_type = "flash_varlen"
+    else:
+        mask_type = model_mask_type or "block_causal"
     return PackingCapabilities(
         packed_mask_type=mask_type,
         return_packed_sequence_metadata=requires_metadata or uses_native_fa4,
@@ -794,7 +794,7 @@ def configure_packing(
 
         uncompiled = getattr(model, "_orig_mod", model)
         if isinstance(uncompiled, PackedMetadataEntryOwner):
-            entry = uncompiled.packed_metadata_entry_module()
+            entry = uncompiled.packed_metadata_entry_module
         else:
             entry = uncompiled.get_decoder() if isinstance(uncompiled, PreTrainedModel) else uncompiled
         selection = (capabilities.packed_mask_type, attn_implementation)
