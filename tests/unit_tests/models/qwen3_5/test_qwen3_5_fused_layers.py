@@ -199,7 +199,6 @@ def test_backbone_uses_fused_layers_with_unchanged_parameter_names():
     } <= set(backbone.state_dict())
 
 
-@pytest.mark.cpu_only
 def test_backbone_forward_backward_is_finite():
     config = Qwen3_5TextConfig(
         vocab_size=64,
