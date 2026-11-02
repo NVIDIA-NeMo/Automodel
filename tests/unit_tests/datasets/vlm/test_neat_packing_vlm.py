@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import io
 import logging
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     _shift_sample,
     neat_pack_dataset_vlm,
 )
+from nemo_automodel.components.models.common.packing import get_packing_capabilities
 
 
 class _FakeDataset:
@@ -360,7 +362,7 @@ class TestNeatPackedVlmCollater:
                 "image_grid_thw": torch.tensor([[1, 224, 224], [1, 224, 224]]),
             },
         ]
-        result = neat_packed_vlm_collater(batch)
+        result = neat_packed_vlm_collater(batch, packing=get_packing_capabilities("sdpa"))
 
         assert result["input_ids"].shape == (2, 4)
         assert result["labels"].shape == (2, 4)
@@ -390,7 +392,9 @@ class TestNeatPackedVlmCollater:
                 "position_ids": torch.tensor([0, 1, 2, 3]),
             },
         ]
-        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+        result = neat_packed_vlm_collater(
+            batch, attn_implementation="flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
+        )
 
         # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
         assert "attention_mask" not in result
@@ -535,7 +539,7 @@ class TestMRoPESupport:
                 "n_videos": 0,
             },
         ]
-        result = neat_packed_vlm_collater(batch)
+        result = neat_packed_vlm_collater(batch, packing=get_packing_capabilities("sdpa"))
 
         # position_ids should be [3, B=2, S=4]
         assert result["position_ids"].shape == (3, 2, 4)
