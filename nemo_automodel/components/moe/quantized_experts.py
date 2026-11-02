@@ -37,6 +37,7 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     GroupedExpertsTE,
     _apply_bias,
+    _has_dispatched_rows,
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.components.quantization.mxfp4 import (
@@ -304,6 +305,7 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
                 dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
                 dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
             )
+        self.nccl_ep = orig_module.nccl_ep
         self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
         self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
@@ -314,6 +316,8 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
         self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
         self.dispatcher_equal_token_counts = orig_module.dispatcher_equal_token_counts
         self.dispatch_rows_never_empty = orig_module.dispatch_rows_never_empty
+        # This module builds its own default activation, which takes the bound when the original's did.
+        self.routed_rows_swiglu = self.expert_activation if orig_module.routed_rows_swiglu is not None else None
         # The combine cache (BackendConfig.dispatcher_recompute_cache) is read by the shared dispatcher's config as
         # well: a frozen layer next to a LoRA one must carry the same mode, or the shared-manager check rejects the
         # pair and an all-frozen conversion silently loses the request (review of #4395).
@@ -338,6 +342,15 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
 
         Preserves the tensor and EP contract of ``GroupedExpertsDeepEP.forward``, replacing the two base
         ``torch._grouped_mm`` calls with ``MXFP4GroupedMM`` over the packed weights.
+
+        Args:
+            x: Tensor of shape [local_tokens, hidden].
+            token_mask: Boolean tensor of shape [local_tokens], marking valid tokens.
+            weights: Routing probabilities of shape [local_tokens, top_k].
+            indices: Global expert IDs of shape [local_tokens, top_k].
+
+        Returns:
+            Combined expert output of shape [local_tokens, hidden].
         """
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0, (
@@ -348,24 +361,27 @@ class GroupedExpertsDeepEPMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepEP):
             x, token_mask, weights, indices
         )
 
-        # dispatch_rows_never_empty (static routing or capacity mode): skip the count_nonzero host read, as
-        # GroupedExpertsDeepEP.forward does.
-        if self.dispatch_rows_never_empty or torch.count_nonzero(tokens_per_expert) > 0:
+        if _has_dispatched_rows(
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            never_empty=self.dispatch_rows_never_empty,
+            dispatcher_backend=self.dispatcher_backend,
+        ):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
 
             output1 = self._mxfp4_base_mm(permuted_local_hidden_states, "gate_and_up_projs", offs)
             if self.expert_bias:
                 output1 = _apply_bias(output1, _to_local(self.gate_up_proj_bias), tokens_per_expert)
-            output1 = self.expert_activation(output1, permuted_probs)
+            output1 = self._routed_rows_activation(tokens_per_expert_gpu)(output1, permuted_probs)
             output2 = self._mxfp4_base_mm(output1, "down_projs", offs)
             if self.expert_bias:
                 output2 = _apply_bias(output2, _to_local(self.down_proj_bias), tokens_per_expert, permuted_probs)
         else:
-            # Dummy computation for gradient flow when no tokens routed locally.
+            # Preserve the dispatch backward edge on empty receiving ranks.
             gate_up_w0 = self._mxfp4_dequant_expert0("gate_and_up_projs", x.dtype)
             down_w0 = self._mxfp4_dequant_expert0("down_projs", x.dtype)
-            output1 = torch.matmul(x[0] * 0, gate_up_w0)
+            output1 = torch.matmul(permuted_local_hidden_states, gate_up_w0)
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, down_w0)
 

@@ -818,7 +818,7 @@ class MoE(nn.Module):
             if world_size % 4 != 0:
                 raise ValueError(f"dispatcher='mok' requires world size to be divisible by 4; got {world_size}")
             self.experts = GroupedExpertsMoK(config, backend)
-        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
+        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep", "nccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
                 "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",
@@ -826,7 +826,7 @@ class MoE(nn.Module):
                 stacklevel=2,
             )
             self.experts = GroupedExperts(config, backend=backend)
-        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep"):
+        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep", "nccl_ep"):
             if backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8"):
                 self.experts = GroupedExpertsDeepEP(
                     config,

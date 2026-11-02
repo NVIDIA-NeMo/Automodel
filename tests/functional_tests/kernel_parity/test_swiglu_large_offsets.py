@@ -45,12 +45,12 @@ def test_clamped_swiglu_large_offsets(rows: int, direction: str) -> None:
     gate, up = ref_x.chunk(2, dim=-1)
     ref_y = F.silu(gate.clamp(max=10.0)) * up.clamp(min=-10.0, max=10.0) * ref_probs
     if direction == "forward":
-        actual = swiglu_triton._forward(x, probs, 10.0)
+        actual = swiglu_triton._forward(x, probs, 10.0, routed_rows=None)
         torch.cuda.synchronize()
         torch.testing.assert_close(actual.index_select(0, indices).float(), ref_y.to(x.dtype).float(), rtol=0, atol=0)
     else:
         grad_y = torch.full((rows, inter), 0.125, dtype=x.dtype, device=x.device)
-        grad_x, grad_probs = swiglu_triton._backward(x, probs, grad_y, 10.0)
+        grad_x, grad_probs = swiglu_triton._backward(x, probs, grad_y, 10.0, routed_rows=None)
         torch.cuda.synchronize()
         ref_y.backward(torch.full_like(ref_y, 0.125))
         torch.testing.assert_close(

@@ -17,11 +17,14 @@ import logging
 import math
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Literal, Tuple
+from dataclasses import dataclass, field
+from typing import Literal, Tuple
 
 import torch
 from torch import nn
+
+from nemo_automodel.components.models.common.utils import NcclEpConfig
+from nemo_automodel.components.moe.nccl_ep import NcclEpManager
 
 from .fused_a2a import (
     fused_combine,
@@ -999,8 +1002,10 @@ class TokenDispatcherConfig:
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
 
-    moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep"] = "deepep"
-    """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
+    moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep", "nccl_ep"] = "deepep"
+    """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', 'uccl_ep', or 'nccl_ep'."""
+
+    nccl_ep: NcclEpConfig = field(default_factory=NcclEpConfig)
 
     moe_hybridep_capacity_factor: float | None = None
     """HybridEP capacity mode (mirrors BackendConfig.dispatcher_capacity_factor): after one blocking
@@ -1061,18 +1066,23 @@ class MoEFlexTokenDispatcher:
     def __init__(
         self,
         num_local_experts: int,
-        local_expert_indices: List[int],
+        local_expert_indices: list[int],
         config: TokenDispatcherConfig,
         ep_group: torch.distributed.ProcessGroup,
-    ):
+        hidden_dim: int | None = None,
+        expert_alignment: int = 1,
+    ) -> None:
         """
         Initialize the Flex token dispatcher.
 
         Args:
             num_local_experts (int): Number of local experts on the current device.
-            local_expert_indices (List[int]): Indices of local experts on the current device.
+            local_expert_indices (list[int]): Indices of local experts on the current device.
             config (TokenDispatcherConfig): Configuration for the transformer model.
             ep_group (torch.distributed.ProcessGroup): Process group for MoE operations.
+            hidden_dim: Dispatched token width; required for NCCL-EP initialization.
+            expert_alignment: Row multiple that NCCL-EP pads each local expert's dispatched
+                segment to; other backends require 1.
         """
         self.config = config
         self.shared_experts = None
@@ -1088,8 +1098,25 @@ class MoEFlexTokenDispatcher:
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
 
         backend = self.config.moe_flex_dispatcher_backend
+        if expert_alignment != 1 and backend != "nccl_ep":
+            raise ValueError(f"expert_alignment is only supported by the NCCL-EP backend, got {backend!r}")
 
-        if backend == "uccl_ep":
+        if backend == "nccl_ep":
+            if hidden_dim is None:
+                raise ValueError("NCCL-EP requires the dispatched hidden dimension at initialization")
+            if self.config.moe_expert_capacity_factor is not None or self.config.moe_router_expert_pad_multiple:
+                raise ValueError("NCCL-EP currently supports eager dropless dispatch without expert padding")
+            if self.config.moe_deepep_async_dispatch:
+                raise ValueError("NCCL-EP does not support dispatcher_async_dispatch")
+            self._comm_manager = NcclEpManager(
+                self.config.nccl_ep,
+                group=ep_group,
+                hidden_dim=hidden_dim,
+                num_experts=self.config.num_moe_experts,
+                top_k=self.config.moe_router_topk,
+                expert_alignment=expert_alignment,
+            )
+        elif backend == "uccl_ep":
             if set_uccl_num_sms is not None:
                 set_uccl_num_sms(self.config.moe_deepep_num_sms)
             dispatch_fn = uccl_fused_dispatch
@@ -1208,7 +1235,7 @@ class MoEFlexTokenDispatcher:
             )
         else:
             raise ValueError(
-                f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
+                f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', 'uccl_ep', or 'nccl_ep'"
             )
 
     def get_pipeline_runtime_initializers(
@@ -1324,6 +1351,18 @@ class MoEFlexTokenDispatcher:
             self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
             self._comm_manager.dispatched_probs,
         )
+
+    def expert_buffers(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return the symmetric buffers that zero-copy NCCL-EP experts write into.
+
+        Returns:
+            ``(expert_output, expert_input_grad)``, each BF16 of shape [recv_capacity, hidden],
+            when NCCL-EP runs with ``zero_copy``; otherwise None. See
+            :meth:`NcclEpManager.expert_buffers`.
+        """
+        if not isinstance(self._comm_manager, NcclEpManager):
+            return None
+        return self._comm_manager.expert_buffers()
 
     def dispatch_postprocess(self, hidden_states: torch.Tensor):
         """

@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -23,6 +24,7 @@ from torch import nn
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
+    _make_lazy_te_patcher,
     compute_lm_head_logits,
     generation_config_from_model_config,
     get_is_first_microbatch,
@@ -140,6 +142,39 @@ class TestIsFirstMicrobatch:
         # After first microbatch
         set_is_first_microbatch(False)
         assert get_is_first_microbatch() is False
+
+
+def test_te_patch_forwards_grouped_linear_buffers(monkeypatch):
+    """The microbatch-flag patch keeps GroupedLinear's output and input-gradient buffer arguments."""
+    calls = []
+
+    class GroupedLinear:
+        def forward(self, inp, m_splits, is_first_microbatch=None, out=None, dgrad_out=None):
+            calls.append((is_first_microbatch, out, dgrad_out))
+            return inp
+
+    class Unpatched:
+        def forward(self, x):
+            return x
+
+    modules = {
+        "transformer_engine.pytorch.module.grouped_linear": ModuleType("grouped_linear"),
+        "transformer_engine.pytorch.module.linear": ModuleType("linear"),
+        "transformer_engine.pytorch.module.rmsnorm": ModuleType("rmsnorm"),
+    }
+    modules["transformer_engine.pytorch.module.grouped_linear"].GroupedLinear = GroupedLinear
+    modules["transformer_engine.pytorch.module.linear"].Linear = type("Linear", (Unpatched,), {})
+    modules["transformer_engine.pytorch.module.rmsnorm"].RMSNorm = type("RMSNorm", (Unpatched,), {})
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(GroupedLinear, "forward", GroupedLinear.forward)
+    _make_lazy_te_patcher()()
+    set_is_first_microbatch(True)
+    try:
+        GroupedLinear().forward(torch.zeros(1), [1], out="out", dgrad_out="dgrad")
+    finally:
+        set_is_first_microbatch(None)
+    assert calls == [(True, "out", "dgrad")]
 
 
 class TestTEFp8Config:
