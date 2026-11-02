@@ -125,31 +125,44 @@ def _compiled_flex_attention(attention_module: torch.nn.Module):
     return compiled
 
 
-@contextlib.contextmanager
-def _duck_shape_disabled():
-    """Locally disable flex duck-shape specialization for the wrapped flex call.
+# Every layer shares one compiled ``flex_attention`` code object, whose guards split on the layer
+# type (window, K/V heads), the grad mode and whether the query and key chunks share their metadata
+# tensors. Dynamo's default of 8 recompiles runs out within the first step, after which flex silently
+# runs eagerly and materializes the full score matrix (several times slower, tens of GiB more). A
+# process-level raise does not help: dynamo config writes are thread-local, so autograd's backward
+# threads, where the ring recompiles flex, still see the default. Hence the limit is raised in the
+# call scope, on the thread that compiles.
+_FLEX_RECOMPILE_LIMIT = 64
 
-    Otherwise the compiled flex kernel guards on incidental dim-equalities and recompiles on
-    every new sequence length. Dynamo reads ``use_duck_shape`` at (re)trace time inside the
-    flex call, so scoping it to the call window avoids mutating the process-global fx config.
+
+@contextlib.contextmanager
+def _flex_compile_settings():
+    """Scope the compiled flex call: no duck-shape specialization, and room for its recompiles.
+
+    Without the first, the compiled flex kernel guards on incidental dim-equalities and recompiles
+    on every new sequence length; the second keeps the per-layer-type variants compiled (see
+    ``_FLEX_RECOMPILE_LIMIT``). Dynamo reads both at (re)trace time inside the flex call.
     """
     from torch.fx.experimental import _config as _fx_config
 
-    prev = _fx_config.use_duck_shape
-    _fx_config.use_duck_shape = False
-    try:
+    limit = max(torch._dynamo.config.recompile_limit, _FLEX_RECOMPILE_LIMIT)
+    with _fx_config.patch(use_duck_shape=False), torch._dynamo.config.patch(recompile_limit=limit):
         yield
-    finally:
-        _fx_config.use_duck_shape = prev
 
 
-def _base_gemma4_cp_mask(attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx, kv_global_start: int = 0):
+def _base_gemma4_cp_mask(
+    attention_module: torch.nn.Module, ctx: Any, q_idx, kv_idx, kv_global_start: int = 0, block_overlay=None
+):
     q_global_idx = q_idx + ctx.seq_global_start
     kv_global_idx = kv_idx + kv_global_start
     if not ctx.is_causal:
         allowed = torch.ones_like(q_global_idx >= kv_global_idx)
     else:
         allowed = kv_global_idx <= q_global_idx
+    if block_overlay is not None:
+        # Hugging Face's Gemma4 sliding masks are AND(window, OR(causal, vision block)): the window
+        # still cuts a vision block longer than itself.
+        allowed = allowed | block_overlay
 
     sliding_window = getattr(attention_module, "sliding_window", None)
     if sliding_window is not None:
@@ -319,12 +332,14 @@ def _run_gemma4_flex_chunk(
         ):
 
             def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
-                allowed = _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx, kv_global_start)
+                same_vision_group = None
                 if use_vision_bidirectional:
                     q_group = vision_group_ids_q[batch_idx, q_idx]
                     kv_group = vision_group_ids_kv[batch_idx, kv_idx]
                     same_vision_group = (q_group == kv_group) & (q_group >= 0)
-                    allowed = allowed | same_vision_group
+                allowed = _base_gemma4_cp_mask(
+                    attention_module, ctx, q_idx, kv_idx, kv_global_start, block_overlay=same_vision_group
+                )
                 if packed_seq_ids_q is not None and packed_seq_ids_kv is not None:
                     q_pack_id = packed_seq_ids_q[batch_idx, q_idx]
                     kv_pack_id = packed_seq_ids_kv[batch_idx, kv_idx]
@@ -409,7 +424,7 @@ def _run_gemma4_flex_chunk(
                 "num_warps": 4,
             }
 
-        with _duck_shape_disabled():
+        with _flex_compile_settings():
             try:
                 out, lse = _compiled_flex_attention(attention_module)(
                     query_for_flex.contiguous(), key_for_flex, value_for_flex, return_lse=True, **flex_kwargs
@@ -639,6 +654,8 @@ def _build_packed_ring_segments(q_ids: torch.Tensor, k_ids: torch.Tensor) -> dic
         "k_index": torch.tensor(k_index, dtype=torch.long, device=device),
         "cu_q": torch.tensor(cu_q, dtype=torch.int32, device=device),
         "cu_k": torch.tensor(cu_k, dtype=torch.int32, device=device),
+        "cu_q_host": cu_q,
+        "cu_k_host": cu_k,
         "max_q": max_q,
         "max_k": max_k,
         "dense_local": q_single_doc,
@@ -842,6 +859,8 @@ def _ffpa_varlen_backward_chunk(
         seg["max_k"],
         scale=scale,
         causal=causal,
+        cu_q_host=seg["cu_q_host"],
+        cu_k_host=seg["cu_k_host"],
     )
 
 
@@ -1329,6 +1348,41 @@ def _install_gemma4_cp_ring_sdpa(attention_module: torch.nn.Module, cp_mesh) -> 
     attention_module.register_forward_hook(_post_hook, always_call=True)
 
 
+def set_gemma4_cp_dense_metadata(
+    model: torch.nn.Module,
+    *,
+    mm_token_type_ids: torch.Tensor | None,
+    padding_mask: torch.Tensor | None,
+    packed_seq_ids: torch.Tensor | None,
+    vision_group_ids: torch.Tensor | None,
+    has_vision_tokens: bool,
+) -> None:
+    """Stash this rank's CP mask metadata on every ring-hooked attention module of ``model``.
+
+    Hugging Face's decoder layers do not hand the metadata to ``self_attn``, so the ring's pre-hook
+    falls back to this ``_cp_dense_metadata`` stash. Each CP forward overwrites it; it is not cleared,
+    so the activation-checkpoint recompute in backward sees the same metadata.
+
+    Args:
+        model: The Gemma4-family model.
+        mm_token_type_ids: This rank's modality ids ``[batch, local_sequence]``, or None.
+        padding_mask: This rank's padding mask ``[batch, local_sequence]`` (True = pad), or None.
+        packed_seq_ids: This rank's document ids ``[batch, local_sequence]`` (0 = pad), or None.
+        vision_group_ids: This rank's vision-block ids ``[batch, local_sequence]`` (-1 = none), or None.
+        has_vision_tokens: Rank-uniform flag that the batch carries vision-bidirectional blocks.
+    """
+    metadata = {
+        "mm_token_type_ids": mm_token_type_ids,
+        "padding_mask": padding_mask,
+        "_packed_seq_ids": packed_seq_ids,
+        "_gemma4_vision_group_ids": vision_group_ids,
+        "_gemma4_has_vision_tokens": has_vision_tokens,
+    }
+    for module in model.modules():
+        if getattr(module, "_cp_uses_attention_hook", False):
+            module._cp_dense_metadata = metadata
+
+
 def attach_gemma4_cp_ring_attention(
     attention_module: torch.nn.Module, *, use_ffpa: bool = False, sliding_backend: str = "flex"
 ) -> None:
@@ -1363,3 +1417,35 @@ def attach_gemma4_cp_ring_attention(
     }
     attention_module.run_cp_manual_attention = MethodType(_gemma4_cp_manual_attention, attention_module)
     attention_module.setup_cp_attention = MethodType(_install_gemma4_cp_ring_sdpa, attention_module)
+
+
+def apply_gemma4_cp_attention_backend_policy(model: torch.nn.Module, attention_cls: type) -> None:
+    """Attach the ring to every ``attention_cls`` module of ``model`` with the configured CP kernels.
+
+    The text config selects the kernels: ``cp_full_attn_backend`` (``flex`` | ``ffpa``) for full-attention
+    layers and ``cp_sliding_attn_backend`` (``flex`` | ``fa``) for sliding-window layers; both default to
+    ``flex``.
+
+    Args:
+        model: The Gemma4-family model whose self-attention modules get the ring.
+        attention_cls: The self-attention module class to attach to.
+
+    Raises:
+        ValueError: For an unsupported backend name.
+    """
+    text_config = getattr(model.config, "text_config", model.config)
+    full_backend = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower()
+    sliding_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
+    if full_backend not in {"flex", "ffpa"}:
+        raise ValueError(f"Unsupported cp_full_attn_backend: {full_backend!r}")
+    if sliding_backend not in {"flex", "fa"}:
+        raise ValueError(f"Unsupported cp_sliding_attn_backend: {sliding_backend!r}")
+    is_rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    if full_backend == "ffpa" and is_rank0 and not _ffpa_varlen_ring_available():
+        logger.warning(
+            "cp_full_attn_backend='ffpa' was requested, but the ffpa-attn CuTeDSL varlen ops are unavailable; "
+            "the full-attention CP ring chunks fall back to Flex. Install the `ffpa` extra to use FFPA."
+        )
+    for module in model.modules():
+        if isinstance(module, attention_cls):
+            attach_gemma4_cp_ring_attention(module, use_ffpa=full_backend == "ffpa", sliding_backend=sliding_backend)

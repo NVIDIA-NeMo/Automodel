@@ -1041,6 +1041,9 @@ navigation:
           - page: "Train a DSpark Drafter for Speculative Decoding"
             path: ../../guides/speculative/dspark.mdx
             slug: dspark-speculative-decoding
+          - page: "Finetune a Model's Native MTP Head for Speculative Decoding"
+            path: ../../guides/speculative/mtp.mdx
+            slug: mtp-speculative-decoding
   - section: "Data"
     slug: datasets
     contents:
