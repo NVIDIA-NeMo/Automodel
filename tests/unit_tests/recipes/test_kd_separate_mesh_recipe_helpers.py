@@ -644,7 +644,7 @@ def test_kd_packing_covers_teacher_metadata_and_hooks(teacher_backend, recipe_mo
     recipe.teacher_model = Model(teacher_backend)
     recipe.teacher_pp = None
     recipe.separate_meshes = False
-    contract = recipe._get_packing_contract()
+    contract = recipe._packing_contract
     assert contract.return_packed_sequence_metadata
     recipe._configure_teacher_packing()
     batch = neat_packed_collater(
@@ -778,7 +778,7 @@ def test_kd_only_delivers_neat_offsets_to_consumers_that_require_them(
     recipe.teacher_model = Model(teacher_requires)
     recipe.teacher_pp = None
     recipe.separate_meshes = False
-    contract = recipe._get_packing_contract()
+    contract = recipe._packing_contract
     configure_packing_for_models(recipe.model_parts)
     recipe._configure_teacher_packing()
     recipe.dist_env = SimpleNamespace(device="cpu")
