@@ -541,4 +541,12 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    # Running this file by path puts tools/, not the repository root, on sys.path. Add the root so the
+    # checkout's nemo_automodel is importable when the package is not installed.
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
     main()
