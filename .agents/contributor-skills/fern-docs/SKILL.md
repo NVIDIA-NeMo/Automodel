@@ -79,7 +79,7 @@ Run the commands in this guide from the repository root. They use `make -C docs/
 
 ### Add a Page
 
-1. Gather: title, target section, filename (kebab-case `.mdx` for ordinary pages), subdirectory under `docs/`. Preserve canonical Hub-ID-based paths and case for dataset cards.
+1. Gather: title, target section, filename (kebab-case `.mdx`), subdirectory under `docs/`. Dataset cards also use kebab-case filenames; their frontmatter `slug` preserves the canonical Hub ID (see the [dataset-card guide](../../../docs/templates/dataset-card-guide.md)).
 2. Create the MDX at `docs/<subdir>/<filename>.mdx` with frontmatter:
 
    ```mdx

@@ -109,7 +109,7 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/colum
 - Set `mask_generation_prompt: true` when fine-tuning a hybrid-reasoning model (Nemotron, Qwen3, GLM, ...) on non-thinking data.
   - Those chat templates insert an empty reasoning block (for example, `<think></think>`) into every assistant turn that has no `reasoning_content`.
   - At inference, the generation prompt supplies that block, so training on it only teaches the model to close the block immediately.
-  - The option masks the role header and that block for every assistant turn. It is detected by rendering the template's generation prompt, so no tag strings are hardcoded.
+  - The option masks the role header and that block for every assistant turn. It detects the block by rendering the template's generation prompt, so no tag strings are hardcoded.
   - Like `answer_only_loss_mask` without `{% generation %}` blocks, the option locates turns by rendering conversation prefixes. Multi-turn conversations need a template that renders earlier turns the same way as the conversation grows, or a `{% generation %}` template.
   - Stock Qwen3 rewrites earlier assistant turns (it drops their reasoning block after a later user turn follows). On that template, multi-turn answer-only masking raises, and the option applies to single-turn conversations only.
 - Set `skip_invalid_samples: true` for noisy local JSONL so lines that are not valid JSON are skipped instead of failing the load
@@ -374,7 +374,7 @@ When using streaming datasets, be aware of these limitations:
 
 1. **No random access**: You cannot use `dataset[index]` to access specific samples. Streaming datasets only support iteration.
 
-2. **No `len(dataset)`**: The iterable does not expose its length. Upstream metadata may provide a source row count, but filtering can change the number of usable samples.
+2. **No `len(dataset)`**: The iterable does not expose its length. Upstream metadata might provide a source row count, but filtering can change the number of usable samples.
 
 3. **Repeated streams need a stopping condition**: `ColumnMappedTextInstructionIterableDataset` automatically restarts when exhausted and currently requires `repeat_on_exhaustion: true`. Set a finite `step_scheduler.max_steps` in your training recipe.
 

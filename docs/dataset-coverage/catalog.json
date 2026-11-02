@@ -13,7 +13,7 @@
   },
   {
     "id": "Rowan/hellaswag",
-    "card": "docs/dataset-coverage/Rowan/hellaswag.mdx",
+    "card": "docs/dataset-coverage/rowan/hellaswag.mdx",
     "task": "Multiple-choice commonsense inference",
     "recipes": [
       "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml"
@@ -39,7 +39,7 @@
   },
   {
     "id": "Muennighoff/natural-instructions",
-    "card": "docs/dataset-coverage/Muennighoff/natural-instructions.mdx",
+    "card": "docs/dataset-coverage/muennighoff/natural-instructions.mdx",
     "task": "Instruction-conditioned text generation",
     "recipes": [
       "examples/llm_finetune/llama3_1/llama3_1_8b_columnmapped_lora.yaml"
@@ -50,7 +50,7 @@
   },
   {
     "id": "lm-provers/FineProofs-SFT",
-    "card": "docs/dataset-coverage/lm-provers/FineProofs-SFT.mdx",
+    "card": "docs/dataset-coverage/lm-provers/fineproofs-sft.mdx",
     "task": "Mathematical reasoning and proof generation",
     "recipes": [
       "examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml"
@@ -61,7 +61,7 @@
   },
   {
     "id": "llamafactory/glaive_toolcall_en",
-    "card": "docs/dataset-coverage/llamafactory/glaive_toolcall_en.mdx",
+    "card": "docs/dataset-coverage/llamafactory/glaive-toolcall-en.mdx",
     "task": "Function calling",
     "recipes": [
       "examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml",
@@ -84,7 +84,7 @@
   },
   {
     "id": "Salesforce/xlam-function-calling-60k",
-    "card": "docs/dataset-coverage/Salesforce/xlam-function-calling-60k.mdx",
+    "card": "docs/dataset-coverage/salesforce/xlam-function-calling-60k.mdx",
     "task": "Function calling",
     "recipes": [
       "examples/llm_finetune/gemma/functiongemma_xlam.yaml"
@@ -95,7 +95,7 @@
   },
   {
     "id": "nvidia/Nemotron-Post-Training-Dataset-v2",
-    "card": "docs/dataset-coverage/nvidia/Nemotron-Post-Training-Dataset-v2.mdx",
+    "card": "docs/dataset-coverage/nvidia/nemotron-post-training-dataset-v2.mdx",
     "task": "Instruction following and reasoning",
     "recipes": [
       "examples/dllm_sft/qwen3_8b_idlm.yaml",
@@ -143,7 +143,7 @@
   },
   {
     "id": "ise-uiuc/Magicoder-OSS-Instruct-75K",
-    "card": "docs/dataset-coverage/ise-uiuc/Magicoder-OSS-Instruct-75K.mdx",
+    "card": "docs/dataset-coverage/ise-uiuc/magicoder-oss-instruct-75k.mdx",
     "task": "Code generation",
     "recipes": [
       "examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml"
@@ -154,7 +154,7 @@
   },
   {
     "id": "mmoukouba/MedPix-VQA",
-    "card": "docs/dataset-coverage/mmoukouba/MedPix-VQA.mdx",
+    "card": "docs/dataset-coverage/mmoukouba/medpix-vqa.mdx",
     "task": "Visual question answering",
     "recipes": [
       "examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml",
@@ -189,7 +189,7 @@
   },
   {
     "id": "Shopify/product-catalogue",
-    "card": "docs/dataset-coverage/Shopify/product-catalogue.mdx",
+    "card": "docs/dataset-coverage/shopify/product-catalogue.mdx",
     "task": "Product taxonomy classification",
     "recipes": [
       "examples/vlm_finetune/cohere_micro_vision/north_micro_vision_shopify_full.yaml",
@@ -213,7 +213,7 @@
   },
   {
     "id": "ysdede/commonvoice_17_tr_fixed",
-    "card": "docs/dataset-coverage/ysdede/commonvoice_17_tr_fixed.mdx",
+    "card": "docs/dataset-coverage/ysdede/commonvoice-17-tr-fixed.mdx",
     "task": "Turkish speech recognition",
     "recipes": [
       "examples/vlm_finetune/phi4/phi4_mm_cv17.yaml"
@@ -236,7 +236,7 @@
   },
   {
     "id": "Tevatron/colpali",
-    "card": "docs/dataset-coverage/Tevatron/colpali.mdx",
+    "card": "docs/dataset-coverage/tevatron/colpali.mdx",
     "task": "Visual document retrieval",
     "recipes": [
       "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml"
@@ -249,7 +249,7 @@
   },
   {
     "id": "Tevatron/colpali-corpus",
-    "card": "docs/dataset-coverage/Tevatron/colpali-corpus.mdx",
+    "card": "docs/dataset-coverage/tevatron/colpali-corpus.mdx",
     "task": "Visual document retrieval corpus",
     "recipes": [
       "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml"
@@ -262,7 +262,7 @@
   },
   {
     "id": "sanchit-gandhi/earnings22_split",
-    "card": "docs/dataset-coverage/sanchit-gandhi/earnings22_split.mdx",
+    "card": "docs/dataset-coverage/sanchit-gandhi/earnings22-split.mdx",
     "task": "Earnings-call speech recognition",
     "recipes": [
       "examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml"
@@ -306,7 +306,7 @@
   },
   {
     "id": "openslr/librispeech_asr",
-    "card": "docs/dataset-coverage/openslr/librispeech_asr.mdx",
+    "card": "docs/dataset-coverage/openslr/librispeech-asr.mdx",
     "task": "Read-speech recognition",
     "recipes": [
       "examples/audio_finetune/qwen2_5_omni_asr/multi_en_sft_3b.yaml"
@@ -331,7 +331,7 @@
   },
   {
     "id": "HuggingFaceFW/fineweb",
-    "card": "docs/dataset-coverage/HuggingFaceFW/fineweb.mdx",
+    "card": "docs/dataset-coverage/huggingfacefw/fineweb.mdx",
     "task": "Causal language modeling",
     "recipes": [
       "examples/llm_pretrain/nanogpt_pretrain.yaml"
@@ -344,7 +344,7 @@
   },
   {
     "id": "HuggingFaceFW/fineweb-edu",
-    "card": "docs/dataset-coverage/HuggingFaceFW/fineweb-edu.mdx",
+    "card": "docs/dataset-coverage/huggingfacefw/fineweb-edu.mdx",
     "task": "Causal language modeling on educational text",
     "recipes": [
       "examples/llm_pretrain/megatron_pretrain_gpt2.yaml"
@@ -357,7 +357,7 @@
   },
   {
     "id": "togethercomputer/CoderForge-Preview",
-    "card": "docs/dataset-coverage/togethercomputer/CoderForge-Preview.mdx",
+    "card": "docs/dataset-coverage/togethercomputer/coderforge-preview.mdx",
     "task": "Coding-agent trajectory modeling",
     "recipes": [
       "examples/long_context_validation/qwen3_32b/qwen3_32b_coderforge_cp16_128k_lowerLR.yaml"
@@ -370,7 +370,7 @@
   },
   {
     "id": "frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct",
-    "card": "docs/dataset-coverage/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct.mdx",
+    "card": "docs/dataset-coverage/frankleeeee/perfectblend-regenerated-llama-3-1-8b-instruct.mdx",
     "task": "Conversation response generation",
     "recipes": [
       "examples/speculative/eagle3/llama_eagle3_perfectblend.yaml"
@@ -394,7 +394,7 @@
   },
   {
     "id": "liuhaotian/LLaVA-Pretrain",
-    "card": "docs/dataset-coverage/liuhaotian/LLaVA-Pretrain.mdx",
+    "card": "docs/dataset-coverage/liuhaotian/llava-pretrain.mdx",
     "task": "Image-caption alignment",
     "recipes": [
       "examples/speculative/vispec/qwen2_5_vl_vispec.yaml"

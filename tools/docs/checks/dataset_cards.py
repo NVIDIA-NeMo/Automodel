@@ -61,6 +61,20 @@ class _CatalogEntry(_RequiredCatalogEntry, total=False):
     evidence: list[str]
 
 
+def card_path(dataset_id: str) -> str:
+    """Return the kebab-case source path of a Hub dataset's card.
+
+    Args:
+        dataset_id: Canonical ``ORGANIZATION/DATASET`` Hub ID.
+
+    Returns:
+        Repository path with lowercased organization and dataset segments, in
+        which each run of other characters becomes one hyphen.
+    """
+    segments = (re.sub(r"[^a-z0-9]+", "-", segment.lower()).strip("-") for segment in dataset_id.split("/"))
+    return f"{CARD_DIRECTORY}/{'/'.join(segments)}.mdx"
+
+
 def hub_ids(value: object) -> set[str]:
     """Read explicit dataset IDs from parsed YAML, excluding local file paths.
 
@@ -246,9 +260,13 @@ def validate(root: Path) -> list[str]:
                 errors.append(f"duplicate dataset ID or alias: {name}")
             known_ids.add(name)
         card = entry["card"]
+        if card in registered:
+            errors.append(f"{card}: registered by more than one catalog entry")
+            continue
         registered.add(card)
-        if card not in {f"{CARD_DIRECTORY}/{dataset_id}.mdx", f"{CARD_DIRECTORY}/{dataset_id}.md"}:
-            errors.append(f"{card}: path must preserve the canonical Hub ID")
+        expected = card_path(dataset_id)
+        if card not in {expected, expected.removesuffix(".mdx") + ".md"}:
+            errors.append(f"{card}: path must be {expected}, the kebab-case form of the Hub ID")
             continue
         path = root / card
         if not path.is_file():

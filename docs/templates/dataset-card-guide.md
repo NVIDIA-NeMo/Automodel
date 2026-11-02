@@ -1,17 +1,21 @@
 # Dataset Cards
 
 Use [dataset-card.mdx](dataset-card.mdx) for datasets hosted on the Hugging Face
-Hub and used by checked-in AutoModel training examples. A card describes the
+Hub and used by checked-in NeMo AutoModel training examples. A card describes the
 source dataset first: task, example record, schema, and upstream splits. Recipes
 and adapters are supporting references in **Use with NeMo AutoModel**.
 
 ## Identity and Links
 
-Save the card at `docs/dataset-coverage/ORGANIZATION/DATASET-NAME.mdx`, preserving
-the canonical Hub ID's spelling and case. In the card's frontmatter, set `title`
-to that full ID and `slug` to `dataset-coverage/ORGANIZATION/DATASET-NAME`.
-Modality belongs in the navigation grouping, so reorganizing navigation does not
-change the card URL.
+Save the card at `docs/dataset-coverage/organization/dataset-name.mdx`, using the
+kebab-case form of the canonical Hub ID: lowercase both segments and replace each
+run of other characters, such as `.` or `_`, with one hyphen. For example,
+`frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct` is saved at
+`docs/dataset-coverage/frankleeeee/perfectblend-regenerated-llama-3-1-8b-instruct.mdx`.
+In the card's frontmatter, set `title` to the full Hub ID and `slug` to
+`dataset-coverage/ORGANIZATION/DATASET-NAME`, preserving the ID's spelling and case.
+The slug, not the filename, determines the card URL. Modality belongs in the
+navigation grouping, so reorganizing navigation does not change the card URL.
 
 A model card's recipe table can link a dataset by its stable route:
 
@@ -36,7 +40,7 @@ and update its AutoModel links together. The offline validator checks current
 path existence and registration; it does not compare the contents at historical
 link revisions with the current checkout.
 
-When adding a dataset or updating its pinned revision, the secret scanner may
+When adding a dataset or updating its pinned revision, the secret scanner might
 flag the public Git hash as a `Hex High Entropy String`. Verify the reported
 value against the linked upstream revision, then add only that verified false
 positive to `.github/workflows/config/.secrets.baseline` with `is_secret: false`.

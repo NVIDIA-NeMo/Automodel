@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.docs.checks.dataset_cards import card_errors, hub_ids, validate, validate_dataset_cards
+from tools.docs.checks.dataset_cards import card_errors, card_path, hub_ids, validate, validate_dataset_cards
 
 ENTRY = {
     "id": "example/toy",
@@ -175,6 +175,22 @@ def test_local_paths_are_not_hub_ids(path: str):
     assert hub_ids({"path_or_dataset_id": path}) == set()
 
 
+@pytest.mark.parametrize(
+    ("dataset_id", "expected"),
+    [
+        ("example/toy", "docs/dataset-coverage/example/toy.mdx"),
+        ("HuggingFaceFW/fineweb-edu", "docs/dataset-coverage/huggingfacefw/fineweb-edu.mdx"),
+        ("ysdede/commonvoice_17_tr_fixed", "docs/dataset-coverage/ysdede/commonvoice-17-tr-fixed.mdx"),
+        (
+            "frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct",
+            "docs/dataset-coverage/frankleeeee/perfectblend-regenerated-llama-3-1-8b-instruct.mdx",
+        ),
+    ],
+)
+def test_card_path_is_the_kebab_case_hub_id(dataset_id: str, expected: str):
+    assert card_path(dataset_id) == expected
+
+
 class _Catalog:
     """A minimal repository holding one valid registered dataset card."""
 
@@ -301,9 +317,27 @@ def test_duplicate_ids_and_aliases_are_rejected(catalog: _Catalog, entries: list
     assert any("duplicate dataset ID or alias" in error for error in catalog.errors())
 
 
-def test_card_path_must_preserve_hub_id(catalog: _Catalog):
-    catalog.write("docs/dataset-coverage/catalog.json", json.dumps([{**ENTRY, "card": "docs/toy.mdx"}]))
-    assert any("path must preserve the canonical Hub ID" in error for error in catalog.errors())
+def test_card_path_must_be_the_kebab_case_hub_id(catalog: _Catalog):
+    dataset_id = "Example/Toy_Set-1.5"
+    card = "docs/dataset-coverage/example/toy-set-1-5.mdx"
+    (catalog.root / ENTRY["card"]).unlink()
+    catalog.write(card, CARD.replace("example/toy", dataset_id))
+    catalog.write("docs/dataset-coverage/index.mdx", f"[Toy](/dataset-coverage/{dataset_id})")
+    catalog.write("docs/fern/versions/nightly.yml", f"path: ../../{card.removeprefix('docs/')}\n")
+    catalog.write("examples/toy.yaml", f"dataset:\n  path_or_dataset_id: {dataset_id}\n")
+    entry = {**ENTRY, "id": dataset_id, "card": card}
+    catalog.write("docs/dataset-coverage/catalog.json", json.dumps([entry]))
+    assert catalog.errors() == []
+
+    for wrong in (f"docs/dataset-coverage/{dataset_id}.mdx", "docs/toy.mdx"):
+        catalog.write("docs/dataset-coverage/catalog.json", json.dumps([{**entry, "card": wrong}]))
+        assert any(f"{wrong}: path must be {card}" in error for error in catalog.errors())
+
+
+def test_card_paths_must_be_unique(catalog: _Catalog):
+    twin = {**ENTRY, "id": "Example/Toy"}
+    catalog.write("docs/dataset-coverage/catalog.json", json.dumps([ENTRY, twin]))
+    assert any("registered by more than one catalog entry" in error for error in catalog.errors())
 
 
 def test_missing_index_link_is_rejected(catalog: _Catalog):

@@ -42,7 +42,7 @@ This **synthetic example** uses invented values in selected source fields; it is
 
 ## Schema and Splits
 
-The table describes the task-bearing fields in the example. The source may also include identifiers and other metadata.
+The table describes the task-bearing fields in the example. The source can also include identifiers and other metadata.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -76,9 +76,7 @@ The Hub marks this dataset as gated. Request access on the [dataset page](https:
 
 **Adapter:** [`ChatDataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/03429168a27bfffd10d109d2adf436b49f1c82a7/nemo_automodel/components/datasets/llm/chat_dataset.py).
 
-The Qwen example concatenates `math+code`, sets a 4,096-token length limit, and requests unshifted labels for the diffusion objective. The Nemotron example selects `chat+math+code`. Follow each recipe's target-model response regeneration guidance when reproducing its intended training setup.
-
-The table lists the domain splits selected by these examples. Neither listed recipe configures a separate validation dataset.
+The Qwen example concatenates `math+code`, sets a 4,096-token length limit, and requests unshifted labels for the diffusion objective. The Nemotron example selects `chat+math+code`. Neither recipe configures a separate validation dataset. Follow each recipe's target-model response regeneration guidance when reproducing its intended training setup.
 
 ## Related Resources
 
