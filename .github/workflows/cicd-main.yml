@@ -596,9 +596,10 @@ jobs:
             timeout: 60
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
+          # Leave room for cold compilation in the packed Qwen3.5 CP test.
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 30
+            timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           - test-name: L2_Retrieval
@@ -694,9 +695,10 @@ jobs:
             test-folder: hf_transformer_vlm
             timeout: 60
             is-optional: "true"
+          # Leave room for cold compilation in the packed Qwen3.5 CP test.
           - test-name: L2_Context_Parallel
             test-folder: context_parallel
-            timeout: 30
+            timeout: 40
           - test-name: L2_Retrieval
             test-folder: retrieval
             timeout: 20
