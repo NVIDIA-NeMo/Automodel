@@ -66,11 +66,12 @@ def create_source_pipeline(
     estimation = options.source.token_estimation
     if estimation is None:
         estimation = len(options.sources) > 1
-    token_estimation = (
-        work.TokenEstimation(measure=measure, **estimation)
-        if isinstance(estimation, dict)
-        else (work.TokenEstimation(measure=measure) if estimation else None)
-    )
+    if isinstance(estimation, dict):
+        token_estimation = work.TokenEstimation(measure=measure, **estimation)
+    elif estimation:
+        token_estimation = work.TokenEstimation(measure=measure)
+    else:
+        token_estimation = None
     source = work.StaticMixtureWorkSource(
         datasets=datasets,
         mixture=work.MixtureSpec({source.name: source.weight for source in options.sources}),
