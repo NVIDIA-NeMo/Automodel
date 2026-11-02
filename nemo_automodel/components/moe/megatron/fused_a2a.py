@@ -922,10 +922,13 @@ class HybridEPDispatch(torch.autograd.Function):
             # The backward combine is the last HybridEP kernel variant compiled in a training step.
             _jit_stored = True
             store_hybrid_ep_jit_cache()
+        # One entry per forward input (16, ``max_tokens_per_rank`` included): autograd rejects a
+        # shorter tuple whenever the wrapper passes every argument.
         return (
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
