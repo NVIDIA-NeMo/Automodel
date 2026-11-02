@@ -17,11 +17,13 @@ import logging
 import math
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Literal, Tuple
 
 import torch
 from torch import nn
+
+from nemo_automodel.shared.deepep_v25 import DeepEpV25Config, DeepEpV25Manager
 
 from .fused_a2a import (
     fused_combine,
@@ -999,8 +1001,10 @@ class TokenDispatcherConfig:
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
 
-    moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep"] = "deepep"
-    """Backend for the flex token dispatcher. Options: 'deepep', 'hybridep', or 'uccl_ep'."""
+    moe_flex_dispatcher_backend: Literal["deepep", "hybridep", "uccl_ep", "deepep_v25"] = "deepep"
+    """Backend for the flex token dispatcher. Options: 'deepep', 'deepep_v25', 'hybridep', or 'uccl_ep'."""
+
+    deepep_v25: DeepEpV25Config = field(default_factory=DeepEpV25Config)
 
     moe_hybridep_capacity_factor: float | None = None
     """HybridEP capacity mode (mirrors BackendConfig.dispatcher_capacity_factor): after one blocking
@@ -1089,7 +1093,16 @@ class MoEFlexTokenDispatcher:
 
         backend = self.config.moe_flex_dispatcher_backend
 
-        if backend == "uccl_ep":
+        if backend == "deepep_v25":
+            if self.config.moe_expert_capacity_factor is not None or self.config.moe_router_expert_pad_multiple:
+                raise ValueError("DeepEP v2.5 currently supports eager dropless dispatch without expert padding")
+            self._comm_manager = self.config.deepep_v25.build(
+                group=ep_group,
+                num_experts=self.config.num_moe_experts,
+                top_k=self.config.moe_router_topk,
+                num_sms=self.config.moe_deepep_num_sms,
+            )
+        elif backend == "uccl_ep":
             if set_uccl_num_sms is not None:
                 set_uccl_num_sms(self.config.moe_deepep_num_sms)
             dispatch_fn = uccl_fused_dispatch
@@ -1208,7 +1221,7 @@ class MoEFlexTokenDispatcher:
             )
         else:
             raise ValueError(
-                f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
+                f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'deepep_v25', 'hybridep', or 'uccl_ep'"
             )
 
     def get_pipeline_runtime_initializers(
@@ -1350,7 +1363,9 @@ class MoEFlexTokenDispatcher:
         hidden_states, _ = self.dispatch_preprocess(
             hidden_states=hidden_states, num_local_tokens=num_local_tokens, probs=probs
         )
-        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
+        async_dispatch = (
+            isinstance(self._comm_manager, (_DeepepManager, DeepEpV25Manager)) and self.config.moe_deepep_async_dispatch
+        )
         hidden_states, _ = self.dispatch_all_to_all(
             hidden_states,
             async_finish=async_dispatch,
@@ -1381,7 +1396,9 @@ class MoEFlexTokenDispatcher:
             token_probs=token_probs,
             token_indices=token_indices,
         )
-        async_dispatch = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
+        async_dispatch = (
+            isinstance(self._comm_manager, (_DeepepManager, DeepEpV25Manager)) and self.config.moe_deepep_async_dispatch
+        )
         hidden_states, _ = self.dispatch_all_to_all(
             hidden_states,
             async_finish=async_dispatch,
@@ -1430,7 +1447,9 @@ class MoEFlexTokenDispatcher:
         3. Post-process the combined tokens to match the original input shape
         """
         hidden_states = self.combine_preprocess(hidden_states)
-        async_combine = isinstance(self._comm_manager, _DeepepManager) and self.config.moe_deepep_async_dispatch
+        async_combine = (
+            isinstance(self._comm_manager, (_DeepepManager, DeepEpV25Manager)) and self.config.moe_deepep_async_dispatch
+        )
         hidden_states = self.combine_all_to_all(
             hidden_states,
             async_finish=async_combine,

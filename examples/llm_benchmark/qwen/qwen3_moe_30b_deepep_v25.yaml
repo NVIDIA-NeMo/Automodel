@@ -1,0 +1,100 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-depth random-init training with FP32 AdamW state and BF16 compute.
+# Requires DeepEP v2.5, CUDA >=13.1 and NCCL >=2.32.3.
+# Run: automodel examples/llm_benchmark/qwen/qwen3_moe_30b_deepep_v25.yaml --nproc-per-node 8
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+seed: 1234
+benchmark:
+  warmup_steps: 5
+  peak_tflops: 989
+  nsys_start: -1
+  nsys_end: -1
+  nsys_ranks: []
+  num_nodes: 1
+  json_output_path: training_logs/qwen3_moe_30b_deepep_v25.json
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  num_epochs: 1
+  max_steps: 20
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+    revision: ad44e777bcd18fa416d9da3bd8f70d33ebb85d39
+  dtype: float32
+  trust_remote_code: false
+  load_base_model: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    fake_balanced_gate: false
+    gate_precision: float32
+    enable_hf_state_dict_adapter: false
+    enable_fsdp_optimizations: true
+    dispatcher: deepep_v25
+    deepep_v25:
+      max_tokens_per_rank: 4096
+checkpoint:
+  enabled: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  seq_len: 4096
+  vocab_size: 151936
+  num_samples: 100000
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null
+  num_workers: 0
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-05
+  lr: 0.0001
+  weight_decay: 0.1
+  foreach: false
+lr_scheduler:
+  lr_decay_style: constant
+  lr_warmup_steps: 0
+  min_lr: 0.0
