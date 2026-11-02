@@ -23,6 +23,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils._python_dispatch import _disable_current_modes
 
 # Try to import fast_hadamard_transform, fall back to torch implementation
 try:
@@ -71,7 +72,11 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.deepseek_v3.rope_utils import apply_rotary_emb
-from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather, glm_dsa_cp_enabled
+from nemo_automodel.components.models.glm_moe_dsa.cp import (
+    glm_dsa_cp_all_gather,
+    glm_dsa_cp_enabled,
+    glm_dsa_gather_replay,
+)
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
     cudnn_indexer_topk,
     cudnn_sparse_attention,
@@ -82,7 +87,12 @@ from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
     tilelang_sparse_attention,
 )
 from nemo_automodel.components.models.glm_moe_dsa.rope_utils import mla_softmax_scale
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+# Record/replay channel for the frozen DSA selection across an activation-checkpoint recompute
+# (bound per checkpointed block call by ``Block.nemo_checkpoint_context_fn``).
+glm_dsa_indexer_replay: RecomputeReplay[torch.Tensor] = RecomputeReplay("GLM DSA frozen indexer selection")
 
 
 def _dsa_kernel_backend(backend: BackendConfig) -> str:
@@ -315,7 +325,7 @@ class GlmMoeDsaIndexer(nn.Module):
         if cp_enabled:
             if qkv_format != "thd":
                 raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
-            k = glm_dsa_cp_all_gather(k, dim=0, cp_group=cp_group)
+            k = glm_dsa_cp_all_gather(k, dim=0, cp_group=cp_group, order=attn_kwargs.get("_glm_dsa_cp_gather_order"))
 
         if dsa_backend == "cudnn":
             if qkv_format != "thd":
@@ -452,6 +462,75 @@ class GlmMoeDsaIndexer(nn.Module):
         self.k_norm.reset_parameters()
 
 
+class _AbsorbedSparseQuery(torch.autograd.Function):
+    """Build the absorbed sparse-attention query ``[tokens, heads, latent + rope]`` without a concat.
+
+    ``cat([einsum(q_nope, w_kc), q_pe])`` materializes the 1.2 GB (16k tokens) kernel input twice;
+    here the head-batched GEMM writes straight into the first ``latent`` columns of the kernel input
+    (cuBLAS accepts the strided output view) and the rotated rope slice is copied into the rest.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, q_nope: torch.Tensor, q_pe: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
+        """Absorb the key up-projection into the query.
+
+        Args:
+            ctx: Autograd context.
+            q_nope: Non-rope query of shape ``[tokens, heads, qk_nope_head_dim]``.
+            q_pe: Rotated rope query of shape ``[tokens, heads, qk_rope_head_dim]``, same dtype as ``q_nope``.
+            w_kc: Key up-projection of shape ``[heads, qk_nope_head_dim, latent]``, same dtype as ``q_nope``.
+
+        Returns:
+            Contiguous tensor of shape ``[tokens, heads, latent + qk_rope_head_dim]``.
+        """
+        tokens, heads, _ = q_nope.shape
+        latent = w_kc.shape[-1]
+        out = torch.empty(tokens, heads, latent + q_pe.shape[-1], dtype=q_nope.dtype, device=q_nope.device)
+        torch.bmm(q_nope.transpose(0, 1), w_kc, out=out[..., :latent].transpose(0, 1))
+        out[..., latent:].copy_(q_pe)
+        ctx.save_for_backward(q_nope, w_kc)
+        ctx.latent = latent
+        return out
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_out: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Route the latent columns' gradient through the GEMM and the rope columns' gradient straight to ``q_pe``.
+
+        Args:
+            ctx: Context holding ``q_nope`` and ``w_kc``.
+            grad_out: Gradient of shape ``[tokens, heads, latent + qk_rope_head_dim]``.
+
+        Returns:
+            Gradients for ``q_nope``, ``q_pe`` and ``w_kc`` (``None`` where not required).
+        """
+        q_nope, w_kc = ctx.saved_tensors
+        grad_latent = grad_out[..., : ctx.latent].transpose(0, 1)  # [heads, tokens, latent] view
+        grad_q_nope = grad_w_kc = grad_q_pe = None
+        if ctx.needs_input_grad[0]:
+            grad_q_nope = torch.bmm(grad_latent, w_kc.transpose(1, 2)).transpose(0, 1)
+        if ctx.needs_input_grad[1]:
+            grad_q_pe = grad_out[..., ctx.latent :]
+        if ctx.needs_input_grad[2]:
+            grad_w_kc = torch.bmm(q_nope.transpose(0, 1).transpose(1, 2), grad_latent)
+        return grad_q_nope, grad_q_pe, grad_w_kc
+
+
+def absorbed_sparse_query(q_nope: torch.Tensor, q_pe: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
+    """Return ``cat([q_nope @ w_kc (per head), q_pe], -1)`` as one contiguous tensor without the concat copy.
+
+    Args:
+        q_nope: Non-rope query of shape ``[tokens, heads, qk_nope_head_dim]``.
+        q_pe: Rotated rope query of shape ``[tokens, heads, qk_rope_head_dim]`` in ``q_nope``'s dtype.
+        w_kc: Key up-projection of shape ``[heads, qk_nope_head_dim, latent]`` in ``q_nope``'s dtype.
+
+    Returns:
+        Contiguous tensor of shape ``[tokens, heads, latent + qk_rope_head_dim]`` in ``q_nope``'s dtype.
+    """
+    return _AbsorbedSparseQuery.apply(q_nope, q_pe, w_kc)
+
+
 class GlmMoeDsaMLA(nn.Module):
     """Multi-head Latent Attention with Indexer for sparse attention.
 
@@ -567,6 +646,49 @@ class GlmMoeDsaMLA(nn.Module):
         # Initialize the Indexer. "shared" layers (GLM IndexShare) own no indexer and
         # reuse the previous full layer's top-k indices passed in via `prev_topk_indices`.
         self.indexer = None if skip_topk else GlmMoeDsaIndexer(config, backend)
+
+    def _select_topk(
+        self,
+        x: torch.Tensor,
+        q_resid: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        **attn_kwargs: Any,
+    ) -> torch.Tensor:
+        """Run the indexer, or replay its recorded selection during an activation-checkpoint recompute.
+
+        The selection is a deterministic function of the layer input and the indexer weights, and no
+        gradient reaches the indexer (its top-k indices are discrete and its scores feed nothing else),
+        so a checkpointed block records the indices in its forward and hands them back in the recompute
+        instead of re-running the score GEMM, the top-k and the index canonicalization. Outside a replay
+        scope (no activation checkpointing, or a block wrapped without ``Block.nemo_checkpoint_context_fn``)
+        the indexer runs as before.
+
+        Args:
+            x: Hidden states of shape ``[batch, sequence, hidden]`` or packed ``[tokens, hidden]``.
+            q_resid: Normalized query-LoRA residual with the token axes of ``x``.
+            freqs_cis: Rotary tensor for the indexer's rope slice.
+            attention_mask: Optional key mask forwarded to the indexer.
+            **attn_kwargs: Attention metadata forwarded to the indexer.
+
+        Returns:
+            Top-k index tensor in the layout documented by :meth:`GlmMoeDsaIndexer.forward`.
+        """
+        replay = glm_dsa_indexer_replay.current()
+        if replay is None:
+            return self.indexer(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
+        recorder, mode = replay
+        if mode == "replay":
+            recorded = recorder.take()
+            if recorded is not None:
+                return recorded
+        # Keep the recorded region out of selective-checkpointing op accounting: it has no
+        # differentiable output and the recompute deliberately skips it.
+        with _disable_current_modes(), torch.no_grad():
+            selected = self.indexer(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
+        if mode == "record":
+            recorder.record(selected)
+        return selected
 
     def _build_sparse_mask(
         self,
@@ -698,7 +820,7 @@ class GlmMoeDsaMLA(nn.Module):
         # Get top-k indices: run our own indexer ("full" layer), or reuse the previous
         # full layer's selection ("shared" layer, GLM IndexShare).
         if self.indexer is not None:
-            topk_indices = self.indexer(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
+            topk_indices = self._select_topk(x, q_resid, freqs_cis, attention_mask, **attn_kwargs)
         else:
             if prev_topk_indices is None:
                 raise ValueError(
@@ -734,11 +856,23 @@ class GlmMoeDsaMLA(nn.Module):
         cp_group = attn_kwargs.get("_glm_dsa_cp_group")
         cp_enabled = glm_dsa_cp_enabled(cp_group)
         dsa_backend = _dsa_kernel_backend(self.backend)
+        kv_latent_global = None
         if cp_enabled:
             if qkv_format != "thd":
                 raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
-            kv = glm_dsa_cp_all_gather(kv, dim=0, cp_group=cp_group)
-            k_pe = glm_dsa_cp_all_gather(k_pe, dim=0, cp_group=cp_group)
+            if dsa_backend not in ("tilelang", "cudnn"):
+                raise NotImplementedError(
+                    "GLM DSA context parallelism is implemented only for backend.attn in {'tilelang', 'cudnn'}."
+                )
+            # One all-gather of the concatenated latent (kv | k_pe) per layer; a checkpointed block
+            # replays the gathered tensor in its recompute instead of communicating again.
+            kv_latent_global = glm_dsa_cp_all_gather(
+                torch.cat([kv, k_pe], dim=-1),
+                dim=0,
+                cp_group=cp_group,
+                replay=glm_dsa_gather_replay,
+                order=attn_kwargs.get("_glm_dsa_cp_gather_order"),
+            )
 
         # Optimized sparse paths run on the absorbed latent representation. The k_nope
         # up-projection is folded into the query, and w_vc maps the latent output back.
@@ -755,9 +889,11 @@ class GlmMoeDsaMLA(nn.Module):
             w = kv_b_weight.view(self.n_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
             w_kc = w[:, : self.qk_nope_head_dim, :]
             w_vc = w[:, self.qk_nope_head_dim :, :]
-            q_absorbed = torch.einsum("thd,hdc->thc", q_nope, w_kc.to(q_nope.dtype))
-            q_sparse = torch.cat([q_absorbed, q_pe], dim=-1).to(torch.bfloat16)
-            kv_latent = torch.cat([kv, k_pe], dim=-1).unsqueeze(1).to(torch.bfloat16)
+            q_sparse = absorbed_sparse_query(q_nope, q_pe.to(q_nope.dtype), w_kc.to(q_nope.dtype))
+            if q_sparse.dtype != torch.bfloat16:
+                q_sparse = q_sparse.to(torch.bfloat16)
+            kv_latent = kv_latent_global if kv_latent_global is not None else torch.cat([kv, k_pe], dim=-1)
+            kv_latent = kv_latent.unsqueeze(1).to(torch.bfloat16)
             if dsa_backend == "tilelang":
                 if not should_use_tilelang(
                     "tilelang",

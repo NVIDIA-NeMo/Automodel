@@ -1995,6 +1995,12 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         from nemo_automodel.components.models.step5.flops import step5_flops
 
         return step5_flops
+    if config_class_name == "GlmMoeDsaConfig":
+        # GLM-5.x: sparse MLA with a causal-capped top-k, a forward-only indexer on "full"
+        # layers only, and no MTP module; the generic MLA+MoE formula overcounts all three.
+        from nemo_automodel.components.models.glm_moe_dsa.flops import model_flops
+
+        return model_flops
 
     # Map config class names to FLOPs formulas
     class_name_to_formula = {
@@ -2040,7 +2046,6 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "Glm4Config": qwen3_flops,  # Dense GQA + SwiGLU (e.g. GLM-4-9B-0414)
         "Glm4MoeConfig": glm4_moe_flops,  # GLM-4.7 (GQA + MoE)
         "Glm4MoeLiteConfig": mla_moe_flops,  # GLM-4.7-Flash (MLA + MoE)
-        "GlmMoeDsaConfig": mla_moe_flops,  # GLM-5 (MLA + MoE)
         # MiniMax-M2 / M2.5
         "MiniMaxM2Config": minimax_m2_flops,
         # MLA + MoE models (Mistral Small 4, Kimi K2.5)

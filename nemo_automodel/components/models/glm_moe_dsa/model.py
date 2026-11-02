@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from typing import Any, Union
 
@@ -35,8 +37,13 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.glm_moe_dsa.cp import shard_glm_dsa_packed_cp_batch
-from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
+from nemo_automodel.components.models.glm_moe_dsa.cp import (
+    gather_order,
+    glm_dsa_gather_replay,
+    shard_glm_dsa_packed_cp_batch,
+    validate_gather_order,
+)
+from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA, glm_dsa_indexer_replay
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -84,6 +91,28 @@ class Block(nn.Module):
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.layer_idx = layer_idx
+
+    def nemo_checkpoint_context_fn(
+        self,
+        context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Replay this block's DSA selection, and under context parallelism its gathered latent, in the recompute.
+
+        The parallelizer composes this hook into the block's checkpoint context. A full indexer
+        layer records its top-k indices in the checkpoint forward and returns them in the recompute
+        (``GlmMoeDsaMLA._select_topk``); an IndexShare "shared" layer takes its indices from the
+        previous full layer and needs no selection replay. Under context parallelism every layer
+        records its all-gathered latent K/V so the recompute does not communicate again.
+
+        Args:
+            context_fn: Existing forward/recompute context factory, or ``None``.
+
+        Returns:
+            The factory wrapped with the replays this layer uses.
+        """
+        if not self.skip_topk:
+            context_fn = glm_dsa_indexer_replay.checkpoint_context_fn(context_fn)
+        return glm_dsa_gather_replay.checkpoint_context_fn(context_fn)
 
     def forward(
         self,
@@ -251,6 +280,23 @@ class GlmMoeDsaModel(nn.Module):
         )
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
+
+        cp_size = int(attn_kwargs.get("cp_size", 1))
+        if cp_size > 1 and attn_kwargs.get("qkv_format") == "thd":
+            # The layers all-gather the indexer keys and the latent K/V in rank order. Every kernel then
+            # reads those rows by global token coordinate, so a layout whose rank order is not global
+            # order (head/tail) needs the gather permuted back; the order is derived once per forward
+            # from the configured layout and checked against the slice this rank actually received.
+            order = gather_order(self.backend.cp_query_layout, cp_size, h.shape[0] * cp_size, h.device)
+            if order is not None:
+                query_indices = attn_kwargs.get("glm_dsa_cp_query_indices")
+                if query_indices is None:
+                    raise ValueError(
+                        "cp_query_layout='head_tail' requires glm_dsa_cp_query_indices in the packed CP batch."
+                    )
+                validate_gather_order(order, int(attn_kwargs["cp_rank"]), h.shape[0], query_indices)
+            attn_kwargs = dict(attn_kwargs)
+            attn_kwargs["_glm_dsa_cp_gather_order"] = order
 
         if self.backend.attn == "cudnn" and attn_kwargs.get("qkv_format") == "thd":
             cu_seqlens = attn_kwargs.get("cu_seqlens")
@@ -430,6 +476,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ) -> dict[str, Any]:
         """Attach GLM DSA's packed THD context-parallel batch sharder.
 
+        ``BackendConfig.cp_query_layout`` picks the query shard each rank owns: contiguous
+        (rank r keeps tokens ``[r * T/cp, (r + 1) * T/cp)``) or head/tail (rank r keeps chunks r and
+        ``2 * cp - 1 - r`` of ``2 * cp``, which balances the indexer's causal work across ranks).
+
         Args:
             batch: The batch dict.
             num_chunks: Number of chunks for load-balanced CP sharding.
@@ -439,6 +489,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
             ContextParallelSharder,
             contiguous_local_indices,
+            round_robin_local_indices,
         )
 
         attn_backend = getattr(self.backend, "attn", None)
@@ -448,14 +499,16 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 f"got backend.attn={attn_backend!r}."
             )
 
+        query_layout = self.backend.cp_query_layout
         cp_sharder = ContextParallelSharder(
             shard_batch=partial(
                 shard_glm_dsa_packed_cp_batch,
                 num_chunks=int(num_chunks),
+                query_layout=query_layout,
             ),
-            # Contiguous over the packed THD token axis: rank r keeps
-            # tokens [r * T/cp, (r + 1) * T/cp).
-            local_token_global_indices=contiguous_local_indices,
+            local_token_global_indices=(
+                round_robin_local_indices if query_layout == "head_tail" else contiguous_local_indices
+            ),
         )
         return {"cp_sharder": cp_sharder}
 
