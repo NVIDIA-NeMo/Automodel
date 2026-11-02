@@ -22,7 +22,7 @@ import logging
 import os
 import pathlib
 from collections import deque
-from contextlib import nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
@@ -47,7 +47,7 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
 )
 from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.models.common import BackendConfig
@@ -79,7 +79,6 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     apply_draft_fp8,
     packing_kwargs,
     read_load_metadata_with_gloo,
-    should_sync_grads,
     submesh_or_none,
 )
 from nemo_automodel.recipes.speculative_decoding.peagle_recipe import PeagleRecipeMixin
@@ -182,6 +181,56 @@ def _window_tau_sim(step_prefix_hits: torch.Tensor | None, step_valid: torch.Ten
     if valid.sum().item() <= 0:
         return None
     return simulated_accept_length(hits, valid).item()
+
+
+@dataclass
+class _Eagle3TrainWindow:
+    """Per-rank training metrics summed over the micro-batches since the last log point.
+
+    Sums stay on the device so accumulating never forces a host sync.
+    """
+
+    loss: torch.Tensor  # scalar
+    accuracy: torch.Tensor  # scalar
+    # Per-TTT-step prefix-hit and supervised counts, each of shape [ttt_steps];
+    # allocated on the first micro-batch that reports them (P-EAGLE metrics do
+    # not), so ttt_steps never has to be threaded here.
+    step_prefix_hits: torch.Tensor | None = None
+    step_valid: torch.Tensor | None = None
+    steps: int = 0
+
+    @classmethod
+    def empty(cls, device: torch.device) -> _Eagle3TrainWindow:
+        """Return a zeroed window whose scalar sums live on ``device``."""
+        return cls(loss=torch.zeros((), device=device), accuracy=torch.zeros((), device=device))
+
+    def add(self, metrics) -> None:
+        """Add one micro-batch's metrics.
+
+        Args:
+            metrics: EAGLE-3 step metrics with scalar ``loss`` and ``accuracy``
+                tensors and, optionally, ``step_prefix_hits`` / ``step_valid``
+                tensors of shape [ttt_steps].
+        """
+        self.loss = self.loss + metrics.loss.detach()
+        self.accuracy = self.accuracy + metrics.accuracy.detach()
+        step_prefix_hits = getattr(metrics, "step_prefix_hits", None)
+        if step_prefix_hits is not None:
+            if self.step_prefix_hits is None:
+                self.step_prefix_hits = torch.zeros_like(step_prefix_hits, dtype=torch.float32)
+                self.step_valid = torch.zeros_like(self.step_prefix_hits)
+            self.step_prefix_hits += step_prefix_hits.float()
+            self.step_valid += metrics.step_valid.float()
+        self.steps += 1
+
+    def reset(self) -> None:
+        """Zero every sum in place."""
+        self.loss.zero_()
+        self.accuracy.zero_()
+        if self.step_prefix_hits is not None:
+            self.step_prefix_hits.zero_()
+            self.step_valid.zero_()
+        self.steps = 0
 
 
 def _validate_cp_gates(
@@ -1798,49 +1847,185 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
             tau_sim,
         )
 
-    def run_train_validation_loop(self):
-        """Run the minimal EAGLE-3 train loop."""
-        self.trainer_module.train()
+    # The run is step-budget driven: it stops when ``global_step`` reaches
+    # ``total_optim_steps`` (the horizon the LR schedule was calibrated on). With
+    # on-policy regen an epoch is split into several dataloader segments, so the
+    # epoch range alone is not the stop.
+    stop_at_step_budget = True
+
+    def _on_train_start(self, start_epoch: int) -> None:
+        """Log the resolved loop and schedule settings."""
+        if not self.dist_env.is_main:
+            return
         try:
             batches_per_epoch = len(self.train_dataloader)
         except TypeError:
             batches_per_epoch = None
-        is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
-        start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
-        if start_epoch >= self.num_epochs:
-            if self.dist_env.is_main:
-                logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
-            self._finalize_training()
-            return
+        logger.info(
+            "Training start: start_epoch=%s num_epochs=%s batches_per_epoch=%s grad_accum=%s log_every=%s "
+            "total_optim_steps=%s warmup_steps=%s peak_lr=%.3e min_lr_ratio=%s",
+            start_epoch,
+            self.num_epochs,
+            batches_per_epoch,
+            self.grad_accumulation_steps,
+            self.log_every_steps,
+            self.total_optim_steps,
+            self.warmup_steps,
+            self.peak_lr,
+            self.min_lr_ratio,
+        )
+
+    def _finish_checkpointing(self) -> None:
+        """Wait for the async checkpoint writes and publish them; closing happens in :meth:`_finalize_training`."""
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is not None:
+            checkpointer.async_wait()
+            checkpointer.lifecycle.complete_pending()
+        if self.dist_env.is_main:
+            logger.info("Training complete: global_step=%s", self.runtime.global_step)
+
+    def _on_train_end(self) -> None:
+        """Release the target backend, workers and loggers on every exit path."""
+        self._finalize_training()
+
+    def _iter_train_batches(self):
+        """Yield ``(batch, target_batch)`` pairs.
+
+        With prefetch the supervision is fetched asynchronously and paired with
+        its batch; otherwise the target runs inline and ``target_batch`` is None.
+        """
+        if self.target_prefetch_depth > 0:
+            return self._prefetched_batches(self.train_dataloader)
+        return ((batch, None) for batch in self.train_dataloader)
+
+    def _train_micro_batch(self, item, sync_ctx):
+        """Run forward and backward for one ``(batch, target_batch)`` item.
+
+        Args:
+            item: ``(batch, target_batch)`` from :meth:`_iter_train_batches`; see
+                :meth:`_forward_batch` for both layouts.
+            sync_ctx: Context that gates this micro-batch's gradient all-reduce.
+        """
+        batch, target_batch = item
+        if self._peagle_partitioned:
+            # P-EAGLE sequence partitioning owns its per-segment backward and its
+            # own no_sync (the all-reduce fires on the last segment), so it runs
+            # outside the grad-accum sync context.
+            return self._peagle_partitioned_step(batch)
+        with sync_ctx:
+            metrics = self._forward_batch(batch, target_batch)
+            (metrics.loss / float(self.grad_accumulation_steps)).backward()
+        return metrics
+
+    def _sync_grads_before_clip(self) -> None:
+        """Sum the draft gradients over context parallelism, then reduce TP replicas.
+
+        Without the CP sum each cp rank would apply its partial gradient and the
+        cp replicas of the draft would desync permanently.
+        """
+        if getattr(self, "cp_group", None) is not None:
+            self._all_reduce_draft_grads_over_cp()
+        super()._sync_grads_before_clip()
+
+    def _at_window_boundary(self) -> bool:
+        """Launch an on-policy regen cycle when due and swap in finished shards.
+
+        The regen cadence is checked at every window boundary (not at the log
+        cadence) so it honors ``regen.every_steps`` independently of
+        ``log_every_steps``; the base loop checks the step budget first so the
+        terminal step never spawns a cycle nothing will consume. No-op off rank 0.
+        """
+        self._maybe_run_regen()
+        return self._maybe_swap_regen_dataloader()
+
+    def _new_train_window(self) -> _Eagle3TrainWindow:
+        """Return an empty training-metric window on ``self.device``."""
+        return _Eagle3TrainWindow.empty(self.device)
+
+    def _accumulate_train_metrics(self, window: _Eagle3TrainWindow, metrics) -> None:
+        """Add one micro-batch's loss, accuracy and per-TTT-step prefix hits to ``window``."""
+        window.add(metrics)
+
+    def _log_window(self, window: _Eagle3TrainWindow, epoch_idx: int, grad_norm, pbar, *, suffix: str = "") -> None:
+        """All-reduce and log ``window``'s means, then reset it; every rank must call this."""
+        mean_loss = all_reduce_mean(window.loss / max(window.steps, 1))
+        mean_acc = all_reduce_mean(window.accuracy / max(window.steps, 1))
+        tau_sim = _window_tau_sim(window.step_prefix_hits, window.step_valid)
+        current_lr = self.lr_scheduler.get_last_lr()[0]
+        if self.dist_env.is_main:
+            if pbar is not None:
+                postfix = {
+                    "loss": f"{mean_loss.item():.4f}",
+                    "acc": f"{mean_acc.item():.4f}",
+                    "lr": f"{current_lr:.2e}",
+                }
+                if tau_sim is not None:
+                    postfix["tau"] = f"{tau_sim:.2f}"
+                pbar.set_postfix(**postfix)
+            logger.info(
+                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f%s lr=%.3e%s",
+                epoch_idx,
+                self.runtime.global_step,
+                mean_loss.item(),
+                mean_acc.item(),
+                "" if tau_sim is None else f" train_tau_sim={tau_sim:.4f}",
+                current_lr,
+                suffix,
+            )
+            wandb_data = {
+                "train/loss": mean_loss.item(),
+                "train/accuracy": mean_acc.item(),
+                "train/lr": current_lr,
+                "train/grad_norm": float(grad_norm),
+                "train/epoch": epoch_idx,
+            }
+            if tau_sim is not None:
+                wandb_data["train/tau_sim"] = tau_sim
+            self._wandb_log(wandb_data, step=self.runtime.global_step)
+        window.reset()
+
+    def _log_train_window(self, window: _Eagle3TrainWindow, epoch_idx: int, grad_norm, pbar) -> None:
+        """Log ``window`` and collect or launch the periodic decode evaluation."""
+        self._log_window(window, epoch_idx, grad_norm, pbar)
+        if self.dist_env.is_main:
+            self._maybe_run_decode_eval()
+
+    def _after_trailing_flush(self, window: _Eagle3TrainWindow, epoch_idx: int, grad_norm) -> None:
+        """Log the micro-batches of the trailing partial window, if any were accumulated."""
+        if window.steps > 0:
+            self._log_window(window, epoch_idx, grad_norm, None, suffix=" (trailing flush)")
+
+    def _on_epoch_end(self, epoch_idx: int, batches_seen: int) -> None:
+        """Log how many micro-batches the epoch consumed."""
         if self.dist_env.is_main:
             logger.info(
-                "Training start: start_epoch=%s num_epochs=%s batches_per_epoch=%s grad_accum=%s log_every=%s "
-                "total_optim_steps=%s warmup_steps=%s peak_lr=%.3e min_lr_ratio=%s",
-                start_epoch,
-                self.num_epochs,
-                batches_per_epoch,
-                self.grad_accumulation_steps,
-                self.log_every_steps,
-                self.total_optim_steps,
-                self.warmup_steps,
-                self.peak_lr,
-                self.min_lr_ratio,
+                "Epoch %s done: total_batches_seen=%s global_step=%s", epoch_idx, batches_seen, self.runtime.global_step
             )
 
-        pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
-        try:
-            self._train_epochs(start_epoch, is_ddp, pbar)
-            self._maybe_save_final_checkpoint(self.num_epochs)
-            checkpointer = getattr(self, "checkpointer", None)
-            if checkpointer is not None:
-                checkpointer.async_wait()
-                checkpointer.lifecycle.complete_pending()
-            if self.dist_env.is_main:
-                logger.info("Training complete: global_step=%s", self.runtime.global_step)
-        finally:
-            if pbar is not None:
-                pbar.close()
-            self._finalize_training()
+    def _report_epoch(self, epoch_idx: int, completed_steps: int, eval_metrics):
+        """Log the validation loss, accuracy and simulated acceptance length.
+
+        Returns:
+            ``{"val_loss", "val_accuracy"}`` floats for the epoch checkpoint, or None
+            without a validation set.
+        """
+        if eval_metrics is None:
+            return None
+        val_loss, val_acc, val_tau_sim = eval_metrics
+        val_metrics = {"val_loss": val_loss.item(), "val_accuracy": val_acc.item()}
+        if self.dist_env.is_main:
+            logger.info(
+                "epoch=%s val_loss=%.6f val_acc=%.6f%s",
+                epoch_idx,
+                val_metrics["val_loss"],
+                val_metrics["val_accuracy"],
+                "" if val_tau_sim is None else f" val_tau_sim={val_tau_sim:.4f}",
+            )
+            wandb_data = {"val/loss": val_metrics["val_loss"], "val/accuracy": val_metrics["val_accuracy"]}
+            if val_tau_sim is not None:
+                wandb_data["val/tau_sim"] = val_tau_sim
+            self._wandb_log(wandb_data, step=self.runtime.global_step)
+        return val_metrics
 
     def _finalize_training(self) -> None:
         """Release training resources on any exit path (normal, early-return, or
@@ -1869,289 +2054,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, SpecDecodeRecipeBase):
             _best_effort("finishing W&B run", self.wandb_run.finish)
         if getattr(self, "trackio_logger", None) is not None:
             _best_effort("finishing Trackio run", self.trackio_logger.finish)
-
-    def _train_epochs(self, start_epoch, is_ddp, pbar=None):
-        """Run the epoch loop (extracted so :meth:`run_train_validation_loop` can
-        wrap it in ``try/finally`` and guarantee teardown on any exit path).
-
-        The run is step-budget driven: it stops when ``global_step`` reaches
-        ``total_optim_steps`` (the horizon the LR schedule was calibrated on), not
-        when the epoch range is exhausted. With on-policy regen enabled an epoch is
-        split into *segments* -- one contiguous pass over each bound dataloader --
-        and a swap to freshly regenerated shards ends the current segment and rebinds
-        a new one. Swaps happen only at a grad-accum window boundary
-        (``pending_micro_batches == 0``), so there is never a partial window to flush
-        or an un-synced gradient at the swap point; the trailing flush below then
-        only ever runs for the single segment that ends by dataloader exhaustion.
-        """
-        reached_budget = False
-        for epoch in range(start_epoch, self.num_epochs):
-            running_loss = torch.zeros((), device=self.device)
-            running_acc = torch.zeros((), device=self.device)
-            # Per-TTT-step prefix-hit/valid counts for the simulated accept
-            # length; allocated lazily on the first batch that reports them
-            # (P-EAGLE metrics do not) so ttt_steps never has to be threaded
-            # here.
-            running_step_prefix: torch.Tensor | None = None
-            running_step_valid: torch.Tensor | None = None
-            running_steps = 0
-            self.optimizer.zero_grad(set_to_none=True)
-
-            batches_processed = 0
-            pending_micro_batches = 0
-
-            # Segment loop: one contiguous pass over the currently-bound dataloader.
-            # A mid-epoch swap to regenerated shards ends the segment and rebinds a
-            # new one (``segment_done`` stays False so the while re-enters); the
-            # epoch's pass is complete only when a dataloader is exhausted without a
-            # swap (the ``for ... else`` path).
-            segment_done = False
-            while not segment_done and not reached_budget:
-                if hasattr(self.train_dataloader.sampler, "set_epoch"):
-                    self.train_dataloader.sampler.set_epoch(epoch)
-                # Recompute the length every segment: after a swap the regen loader
-                # may differ, and should_sync_grads keys the segment's final (partial)
-                # window off it -- a stale value would run the trailing flush on
-                # un-all-reduced gradients and silently desync the DDP replicas.
-                try:
-                    seg_batches_per_epoch = len(self.train_dataloader)
-                except TypeError:
-                    seg_batches_per_epoch = None
-                # With prefetch the supervision is fetched asynchronously and paired
-                # with its batch; otherwise the target runs inline (target_batch=None).
-                if self.target_prefetch_depth > 0:
-                    batch_source = enumerate(self._prefetched_batches(self.train_dataloader))
-                else:
-                    batch_source = ((i, (b, None)) for i, b in enumerate(self.train_dataloader))
-                for batch_idx, (batch, target_batch) in batch_source:
-                    if self._peagle_partitioned:
-                        # P-EAGLE sequence partitioning owns its per-segment backward
-                        # and its own no_sync (the all-reduce fires on the last
-                        # segment), so it runs outside the grad-accum sync context.
-                        metrics = self._peagle_partitioned_step(batch)
-                    else:
-                        # Skip DDP's per-micro-batch all-reduce on every micro-batch
-                        # except the one an optimizer step immediately follows; that
-                        # step's all-reduce covers the whole locally-accumulated window.
-                        sync_grads = should_sync_grads(
-                            pending_micro_batches=pending_micro_batches,
-                            grad_accumulation_steps=self.grad_accumulation_steps,
-                            batch_idx=batch_idx,
-                            batches_per_epoch=seg_batches_per_epoch,
-                            is_ddp=is_ddp,
-                        )
-                        sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
-                        with sync_ctx:
-                            metrics = self._forward_batch(batch, target_batch)
-                            loss = metrics.loss / float(self.grad_accumulation_steps)
-                            loss.backward()
-
-                    running_loss = running_loss + metrics.loss.detach()
-                    running_acc = running_acc + metrics.accuracy.detach()
-                    step_prefix_hits = getattr(metrics, "step_prefix_hits", None)
-                    if step_prefix_hits is not None:
-                        if running_step_prefix is None:
-                            running_step_prefix = torch.zeros_like(step_prefix_hits, dtype=torch.float32)
-                            running_step_valid = torch.zeros_like(running_step_prefix)
-                        running_step_prefix += step_prefix_hits.float()
-                        running_step_valid += metrics.step_valid.float()
-                    running_steps += 1
-                    batches_processed += 1
-                    pending_micro_batches += 1
-
-                    if pending_micro_batches == self.grad_accumulation_steps:
-                        if getattr(self, "cp_group", None) is not None:
-                            self._all_reduce_draft_grads_over_cp()
-                        synchronize_tp_replica_gradients(
-                            [self.trainer_module],
-                            getattr(self, "device_mesh", None),
-                        )
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
-                        self.optimizer.step()
-                        self.lr_scheduler.step()
-                        self.optimizer.zero_grad(set_to_none=True)
-                        self.runtime.global_step += 1
-                        if pbar is not None:
-                            pbar.update(1)
-                        pending_micro_batches = 0
-                        self._maybe_save_step_checkpoint(epoch)
-
-                        if self.runtime.global_step % self.log_every_steps == 0:
-                            mean_loss = all_reduce_mean(running_loss / max(running_steps, 1))
-                            mean_acc = all_reduce_mean(running_acc / max(running_steps, 1))
-                            tau_sim = _window_tau_sim(running_step_prefix, running_step_valid)
-                            current_lr = self.lr_scheduler.get_last_lr()[0]
-                            if self.dist_env.is_main:
-                                if pbar is not None:
-                                    postfix = {
-                                        "loss": f"{mean_loss.item():.4f}",
-                                        "acc": f"{mean_acc.item():.4f}",
-                                        "lr": f"{current_lr:.2e}",
-                                    }
-                                    if tau_sim is not None:
-                                        postfix["tau"] = f"{tau_sim:.2f}"
-                                    pbar.set_postfix(**postfix)
-                                logger.info(
-                                    "epoch=%s step=%s train_loss=%.6f train_acc=%.6f%s lr=%.3e",
-                                    epoch,
-                                    self.runtime.global_step,
-                                    mean_loss.item(),
-                                    mean_acc.item(),
-                                    "" if tau_sim is None else f" train_tau_sim={tau_sim:.4f}",
-                                    current_lr,
-                                )
-                                wandb_data = {
-                                    "train/loss": mean_loss.item(),
-                                    "train/accuracy": mean_acc.item(),
-                                    "train/lr": current_lr,
-                                    "train/grad_norm": float(grad_norm),
-                                    "train/epoch": epoch,
-                                }
-                                if tau_sim is not None:
-                                    wandb_data["train/tau_sim"] = tau_sim
-                                self._wandb_log(wandb_data, step=self.runtime.global_step)
-                                self._maybe_run_decode_eval()
-                            running_loss.zero_()
-                            running_acc.zero_()
-                            if running_step_prefix is not None:
-                                running_step_prefix.zero_()
-                                running_step_valid.zero_()
-                            running_steps = 0
-
-                        # Grad-accum window boundary (pending==0, gradients clean):
-                        # the only safe point to stop on the step budget or swap in
-                        # freshly regenerated data. Both branch on ``global_step``,
-                        # which is identical on every rank, so the collective swap
-                        # broadcast stays lockstep.
-                        if self.runtime.global_step >= self.total_optim_steps:
-                            reached_budget = True
-                            break
-                        # The regen launch cadence is checked at every window
-                        # boundary (not inside the log gate above) so it honors
-                        # ``regen.every_steps`` independently of ``log_every_steps``;
-                        # after the budget break so the terminal step never spawns a
-                        # cycle nothing will consume. No-op off rank 0.
-                        self._maybe_run_regen()
-                        if self._maybe_swap_regen_dataloader():
-                            break
-                else:
-                    # Dataloader exhausted with no swap and no budget stop: this
-                    # epoch's pass is complete (its trailing partial window, if any,
-                    # is flushed below).
-                    segment_done = True
-
-            # Flush the trailing partial accumulation window. When
-            # ``batches_per_epoch`` is not a multiple of
-            # ``grad_accumulation_steps``, up to ``grad_accumulation_steps - 1``
-            # micro-batches have run ``backward()`` but never reached an
-            # ``optimizer.step()`` -- those gradients would otherwise be wiped
-            # by the next epoch's ``zero_grad`` and the samples wasted.
-            #
-            # Each micro-batch divided its loss by ``grad_accumulation_steps``
-            # in anticipation of a full window. With only ``pending_micro_batches``
-            # contributors, the accumulated gradient magnitude is
-            # ``pending_micro_batches / grad_accumulation_steps`` of a normal
-            # step; rescale by the inverse so the trailing step's gradient
-            # is on the same scale as every other step.
-            if pending_micro_batches > 0:
-                # Sum the draft grads over cp first (as in the full-window step above);
-                # otherwise the trailing step applies per-rank partial gradients and the
-                # cp replicas of the draft desync permanently from here on.
-                if getattr(self, "cp_group", None) is not None:
-                    self._all_reduce_draft_grads_over_cp()
-                synchronize_tp_replica_gradients(
-                    [self.trainer_module],
-                    getattr(self, "device_mesh", None),
-                )
-                scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
-                for p in self.trainer_module.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(scale)
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                self.optimizer.zero_grad(set_to_none=True)
-                self.runtime.global_step += 1
-                if pbar is not None:
-                    pbar.update(1)
-                pending_micro_batches = 0
-                self._maybe_save_step_checkpoint(epoch)
-
-                if running_steps > 0:
-                    mean_loss = all_reduce_mean(running_loss / max(running_steps, 1))
-                    mean_acc = all_reduce_mean(running_acc / max(running_steps, 1))
-                    tau_sim = _window_tau_sim(running_step_prefix, running_step_valid)
-                    current_lr = self.lr_scheduler.get_last_lr()[0]
-                    if self.dist_env.is_main:
-                        logger.info(
-                            "epoch=%s step=%s train_loss=%.6f train_acc=%.6f%s lr=%.3e (trailing flush)",
-                            epoch,
-                            self.runtime.global_step,
-                            mean_loss.item(),
-                            mean_acc.item(),
-                            "" if tau_sim is None else f" train_tau_sim={tau_sim:.4f}",
-                            current_lr,
-                        )
-                        wandb_data = {
-                            "train/loss": mean_loss.item(),
-                            "train/accuracy": mean_acc.item(),
-                            "train/lr": current_lr,
-                            "train/grad_norm": float(grad_norm),
-                            "train/epoch": epoch,
-                        }
-                        if tau_sim is not None:
-                            wandb_data["train/tau_sim"] = tau_sim
-                        self._wandb_log(wandb_data, step=self.runtime.global_step)
-                    running_loss.zero_()
-                    running_acc.zero_()
-                    if running_step_prefix is not None:
-                        running_step_prefix.zero_()
-                        running_step_valid.zero_()
-                    running_steps = 0
-
-            if self.dist_env.is_main:
-                logger.info(
-                    "Epoch %s done: total_batches_seen=%s global_step=%s",
-                    epoch,
-                    batches_processed,
-                    self.runtime.global_step,
-                )
-
-            eval_metrics = self._run_eval()
-            val_loss_dict: dict[str, float] | None = None
-            if eval_metrics is not None:
-                val_loss, val_acc, val_tau_sim = eval_metrics
-                val_loss_dict = {
-                    "val_loss": val_loss.item(),
-                    "val_accuracy": val_acc.item(),
-                }
-                if self.dist_env.is_main:
-                    logger.info(
-                        "epoch=%s val_loss=%.6f val_acc=%.6f%s",
-                        epoch,
-                        val_loss_dict["val_loss"],
-                        val_loss_dict["val_accuracy"],
-                        "" if val_tau_sim is None else f" val_tau_sim={val_tau_sim:.4f}",
-                    )
-                    wandb_data = {"val/loss": val_loss_dict["val_loss"], "val/accuracy": val_loss_dict["val_accuracy"]}
-                    if val_tau_sim is not None:
-                        wandb_data["val/tau_sim"] = val_tau_sim
-                    self._wandb_log(wandb_data, step=self.runtime.global_step)
-            if getattr(self, "save_checkpoint_every_epoch", False):
-                self.save_checkpoint(
-                    epoch=epoch + 1,
-                    step=self.runtime.global_step,
-                    train_loss=None,
-                    val_loss=val_loss_dict,
-                    best_metric_key="val_loss",
-                    is_final_checkpoint=epoch + 1 >= self.num_epochs,
-                )
-                self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
-
-            if reached_budget:
-                # Step budget reached (with regen, one epoch is split into many
-                # segments, so the budget -- not the epoch range -- is the stop).
-                break
 
 
 def main(config_path=None):

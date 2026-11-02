@@ -37,7 +37,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel.recipes.speculative_decoding import train_eagle1
+from nemo_automodel.recipes.speculative_decoding import _spec_recipe_base
 from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
 
 # ---------------------------------------------------------------------------
@@ -162,8 +162,9 @@ def test_trailing_flush_rescales_gradient_to_full_window_scale(
 
     captured: list[torch.Tensor] = []
     sync_calls = []
+    # The shared draft training loop (SpecDecodeRecipeBase) owns the TP sync call.
     monkeypatch.setattr(
-        train_eagle1,
+        _spec_recipe_base,
         "synchronize_tp_replica_gradients",
         lambda model_parts, device_mesh: sync_calls.append((model_parts, device_mesh)),
     )

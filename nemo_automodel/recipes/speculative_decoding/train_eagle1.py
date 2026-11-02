@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
+from dataclasses import dataclass, field
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
@@ -28,7 +28,7 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule, FeatureNoiseConfig
@@ -45,7 +45,6 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     packing_kwargs,
     raise_if_peft_configured,
     read_load_metadata_with_gloo,
-    should_sync_grads,
     submesh_or_none,
     validate_packing_gates,
 )
@@ -56,6 +55,23 @@ logger = logging.getLogger(__name__)
 def _build_feature_noise(half_width: float) -> FeatureNoiseConfig | None:
     """Build the EAGLE-1/2 augmentation from the recipe's fixed-width knob."""
     return FeatureNoiseConfig.fixed(half_width) if half_width > 0 else None
+
+
+@dataclass
+class _Eagle1TrainWindow:
+    """Per-rank training metrics summed over the micro-batches since the last log point."""
+
+    loss: float = 0.0
+    accuracy: float = 0.0
+    micro_batches: int = 0
+    # Loss-component name -> summed value from ``_loss_components``.
+    components: dict[str, float] = field(default_factory=dict)
+
+    def reset(self) -> None:
+        """Clear every sum."""
+        self.loss = self.accuracy = 0.0
+        self.micro_batches = 0
+        self.components = {}
 
 
 class TrainEagle1Recipe(SpecDecodeRecipeBase):
@@ -352,200 +368,82 @@ class TrainEagle1Recipe(SpecDecodeRecipeBase):
             "val_accuracy": (total_acc / total_batches.clamp_min(1)).item(),
         }
 
-    def run_train_validation_loop(self):
-        """Run the training loop."""
-        self.trainer_module.train()
-        start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
-        if start_epoch >= self.num_epochs:
-            if self.dist_env.is_main:
-                logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
-            return
-        try:
-            batches_per_epoch = len(self.train_dataloader)
-        except TypeError:
-            batches_per_epoch = None
-        is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
-        pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
-        try:
-            for epoch_idx in range(start_epoch, self.num_epochs):
-                if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
-                    self.train_dataloader.sampler.set_epoch(epoch_idx)
+    def _forward_micro_batch(self, batch: dict[str, torch.Tensor]):
+        """Move one micro-batch to the device and return its draft metrics.
 
-                running_loss = 0.0
-                running_acc = 0.0
-                running_components: dict[str, float] = {}
-                running_micro_batches = 0
-                epoch_loss = 0.0
-                micro_step = 0
-                pending_micro_batches = 0
-                completed_steps = 0
-                last_batch_idx = -1
-                for batch_idx, batch in enumerate(self.train_dataloader):
-                    last_batch_idx = batch_idx
-                    batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                    # Skip DDP's per-micro-batch all-reduce on every micro-batch
-                    # except the one an optimizer step immediately follows; that
-                    # step's all-reduce covers the whole locally-accumulated window.
-                    sync_grads = should_sync_grads(
-                        pending_micro_batches=pending_micro_batches,
-                        grad_accumulation_steps=self.grad_accumulation_steps,
-                        batch_idx=batch_idx,
-                        batches_per_epoch=batches_per_epoch,
-                        is_ddp=is_ddp,
-                    )
-                    sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
-                    with sync_ctx:
-                        metrics = self._compute_metrics(batch)
-                        loss = metrics.loss / self.grad_accumulation_steps
-                        loss.backward()
+        Args:
+            batch: Dataloader batch with ``input_ids`` / ``attention_mask`` /
+                ``loss_mask`` tensors of shape [batch, sequence], plus any packing
+                metadata; see :meth:`_compute_metrics`.
+        """
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        return self._compute_metrics(batch)
 
-                    running_loss += metrics.loss.detach().item()
-                    running_acc += metrics.accuracy.detach().item()
-                    running_micro_batches += 1
-                    for component_name, component_value in self._loss_components(metrics).items():
-                        running_components[component_name] = (
-                            running_components.get(component_name, 0.0) + component_value
-                        )
-                    epoch_loss += metrics.loss.detach().item()
-                    micro_step += 1
-                    pending_micro_batches += 1
+    def _new_train_window(self) -> _Eagle1TrainWindow:
+        """Return an empty training-metric window."""
+        return _Eagle1TrainWindow()
 
-                    if pending_micro_batches == self.grad_accumulation_steps:
-                        synchronize_tp_replica_gradients(
-                            [self.trainer_module],
-                            getattr(self, "device_mesh", None),
-                        )
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
-                        self.optimizer.step()
-                        self.optimizer.zero_grad(set_to_none=True)
-                        self.lr_scheduler.step()
-                        self.runtime.global_step += 1
-                        if pbar is not None:
-                            pbar.update(1)
-                        completed_steps += 1
-                        pending_micro_batches = 0
-                        self._maybe_save_step_checkpoint(epoch_idx)
+    def _accumulate_train_metrics(self, window: _Eagle1TrainWindow, metrics) -> None:
+        """Add one micro-batch's loss, accuracy and loss components to ``window``."""
+        window.loss += metrics.loss.detach().item()
+        window.accuracy += metrics.accuracy.detach().item()
+        window.micro_batches += 1
+        for name, value in self._loss_components(metrics).items():
+            window.components[name] = window.components.get(name, 0.0) + value
 
-                        if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
-                            n = max(1, running_micro_batches)
-                            avg_loss = running_loss / n
-                            avg_acc = running_acc / n
-                            current_lr = self.lr_scheduler.get_last_lr()[0]
-                            if pbar is not None:
-                                pbar.set_postfix(
-                                    loss=f"{avg_loss:.4f}",
-                                    acc=f"{avg_acc:.4f}",
-                                    lr=f"{current_lr:.2e}",
-                                )
-                            # grad_norm is the pre-clip norm, so a value far above
-                            # ``max_grad_norm`` means every step is being rescaled
-                            # and the effective LR is ``lr / grad_norm``; the
-                            # per-recipe components carry the loss breakdown that
-                            # otherwise only reaches W&B.
-                            component_text = " ".join(
-                                f"{name}={value / n:.4g}" for name, value in sorted(running_components.items())
-                            )
-                            logger.info(
-                                "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g grad_norm=%.4g%s",
-                                epoch_idx,
-                                self.runtime.global_step,
-                                avg_loss,
-                                avg_acc,
-                                current_lr,
-                                float(grad_norm),
-                                f" {component_text}" if component_text else "",
-                            )
-                            self._wandb_log(
-                                {
-                                    "train/loss": avg_loss,
-                                    "train/accuracy": avg_acc,
-                                    **{f"train/{name}": value / n for name, value in running_components.items()},
-                                    "train/lr": current_lr,
-                                    "train/grad_norm": float(grad_norm),
-                                    "train/epoch": epoch_idx,
-                                },
-                                step=self.runtime.global_step,
-                            )
-                            running_loss = 0.0
-                            running_acc = 0.0
-                            running_components = {}
-                            running_micro_batches = 0
-
-                # Flush the trailing partial accumulation window. When
-                # ``batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``,
-                # up to ``grad_accumulation_steps - 1`` micro-batches have run
-                # ``backward()`` but never reached an ``optimizer.step()`` -- those
-                # gradients would otherwise be wiped by the next epoch's
-                # ``zero_grad`` and the samples wasted.
-                #
-                # Each micro-batch divided its loss by ``grad_accumulation_steps``
-                # in anticipation of a full window. With only ``pending_micro_batches``
-                # contributors, the accumulated gradient magnitude is
-                # ``pending_micro_batches / grad_accumulation_steps`` of a normal
-                # step; rescale by the inverse so the trailing step's gradient is on
-                # the same scale as every other step.
-                #
-                # Assumption: every data-parallel rank reaches this flush with the
-                # same ``pending_micro_batches``. That holds here because the loader
-                # uses ``DistributedSampler`` with ``drop_last=False`` (and the
-                # DataLoader likewise), which pads every rank to an equal sample
-                # count -> equal batches per epoch -> equal trailing windows. If a
-                # non-padding / variable-length sampler is ever introduced, revisit
-                # this: a divergent per-rank ``scale`` would desync parameters, and
-                # a rank that lands on ``pending_micro_batches == 0`` would skip the
-                # flush (and the TP gradient synchronization inside it) while its
-                # peers step, hanging on the mismatched collective.
-                if pending_micro_batches > 0:
-                    synchronize_tp_replica_gradients(
-                        [self.trainer_module],
-                        getattr(self, "device_mesh", None),
-                    )
-                    scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
-                    for p in self.trainer_module.parameters():
-                        if p.grad is not None:
-                            p.grad.mul_(scale)
-                    torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.lr_scheduler.step()
-                    self.runtime.global_step += 1
-                    if pbar is not None:
-                        pbar.update(1)
-                    completed_steps += 1
-                    pending_micro_batches = 0
-                    self._maybe_save_step_checkpoint(epoch_idx)
-
-                eval_metrics = self._run_eval()
-                if self.dist_env.is_main:
-                    msg = f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps}"
-                    if eval_metrics is not None:
-                        msg += (
-                            f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
-                        )
-                    logger.info(msg)
-                if eval_metrics is not None:
-                    self._wandb_log(
-                        {"val/loss": eval_metrics["val_loss"], "val/accuracy": eval_metrics["val_accuracy"]},
-                        step=self.runtime.global_step,
-                    )
-
-                if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
-                    avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
-                    self.save_checkpoint(
-                        epoch=epoch_idx + 1,
-                        step=self.runtime.global_step,
-                        train_loss=avg_loss,
-                        val_loss=eval_metrics,
-                        best_metric_key="val_loss",
-                        is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
-                    )
-
-            self._maybe_save_final_checkpoint(self.num_epochs)
-            self._finalize_and_close_checkpointer()
-        finally:
+    def _log_train_window(self, window: _Eagle1TrainWindow, epoch_idx: int, grad_norm, pbar) -> None:
+        """Log rank 0's window means and the pre-clip gradient norm, then reset ``window``."""
+        if self.dist_env.is_main:
+            n = max(1, window.micro_batches)
+            avg_loss = window.loss / n
+            avg_acc = window.accuracy / n
+            current_lr = self.lr_scheduler.get_last_lr()[0]
             if pbar is not None:
-                pbar.close()
+                pbar.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{avg_acc:.4f}", lr=f"{current_lr:.2e}")
+            # grad_norm is the pre-clip norm, so a value far above ``max_grad_norm``
+            # means every step is being rescaled and the effective LR is
+            # ``lr / grad_norm``; the per-recipe components carry the loss breakdown
+            # that otherwise only reaches W&B.
+            component_text = " ".join(f"{name}={value / n:.4g}" for name, value in sorted(window.components.items()))
+            logger.info(
+                "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g grad_norm=%.4g%s",
+                epoch_idx,
+                self.runtime.global_step,
+                avg_loss,
+                avg_acc,
+                current_lr,
+                float(grad_norm),
+                f" {component_text}" if component_text else "",
+            )
+            self._wandb_log(
+                {
+                    "train/loss": avg_loss,
+                    "train/accuracy": avg_acc,
+                    **{f"train/{name}": value / n for name, value in window.components.items()},
+                    "train/lr": current_lr,
+                    "train/grad_norm": float(grad_norm),
+                    "train/epoch": epoch_idx,
+                },
+                step=self.runtime.global_step,
+            )
+        window.reset()
 
+    def _report_epoch(self, epoch_idx: int, completed_steps: int, eval_metrics):
+        """Log the epoch summary and the validation loss and accuracy."""
+        if self.dist_env.is_main:
+            msg = f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps}"
+            if eval_metrics is not None:
+                msg += f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
+            logger.info(msg)
+        if eval_metrics is not None:
+            self._wandb_log(
+                {"val/loss": eval_metrics["val_loss"], "val/accuracy": eval_metrics["val_accuracy"]},
+                step=self.runtime.global_step,
+            )
+        return eval_metrics
+
+    def _on_train_end(self) -> None:
+        """Finish the W&B and Trackio runs."""
         if getattr(self, "wandb_run", None) is not None:
             self.wandb_run.finish()
         if getattr(self, "trackio_logger", None) is not None:
