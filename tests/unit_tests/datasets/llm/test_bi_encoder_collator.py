@@ -343,11 +343,3 @@ def test_processor_method_collator_resolves_method_once():
 def test_make_vision_collator_from_processor_method_missing_method_raises():
     with pytest.deprecated_call(match="use ProcessorMethodCollator"), pytest.raises(AttributeError):
         rc.make_vision_collator_from_processor_method(object(), "missing_collator")
-
-
-def test_models_with_processor_includes_llama_nemotron_vl():
-    from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
-    from nemo_automodel.components.models.ministral_bidirectional import Mistral3BiEncoderProcessor
-
-    assert rc.MODELS_WITH_PROCESSOR["llama_nemotron_vl"] is LlamaNemotronVLProcessor
-    assert rc.MODELS_WITH_PROCESSOR["ministral3"] is Mistral3BiEncoderProcessor

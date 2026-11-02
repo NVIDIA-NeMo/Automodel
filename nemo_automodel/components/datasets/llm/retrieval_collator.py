@@ -20,18 +20,6 @@ import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.file_utils import PaddingStrategy
 
-from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
-from nemo_automodel.components.models.ministral_bidirectional import Mistral3BiEncoderProcessor
-
-MODELS_WITH_PROCESSOR = {
-    "llama_nemotron_vl": LlamaNemotronVLProcessor,
-    "mistral3": Mistral3BiEncoderProcessor,
-    "mistral3_bidirec": Mistral3BiEncoderProcessor,
-    "ministral3": Mistral3BiEncoderProcessor,
-    "ministral3_bidirec": Mistral3BiEncoderProcessor,
-}
-
-
 from nemo_automodel.shared.retrieval_ids import document_id_to_int64
 
 if TYPE_CHECKING:
