@@ -34,7 +34,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.shared.batch import move_batch_to_device
+from nemo_automodel.components.training.batch import move_batch_to_device
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_MLFLOW, mlflow = safe_import(
