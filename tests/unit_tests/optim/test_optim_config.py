@@ -355,6 +355,19 @@ class TestDionFamilyConfigs:
         assert type(opt).__name__ == "Muon"
         assert len(opt.param_groups) >= 2  # matrix group + scalar/embed group(s)
 
+    def test_muon_keeps_grouped_experts_on_the_scalar_optimizer(self):
+        # dion.Muon reads the last two dims as [out, in] for its spectral-norm LR scale, but grouped experts store
+        # [expert, in, out]; until Muon honors that layout, 3D expert weights stay on the scalar optimizer.
+        pytest.importorskip("dion")
+        from nemo_automodel.components.optim.optimizer import MuonConfig
+
+        model = torch.nn.Module()
+        model.experts = torch.nn.Parameter(torch.randn(4, 8, 16))
+        opt = MuonConfig(lr=1e-3).build(model)[0]
+
+        (group,) = [g for g in opt.param_groups if any(p is model.experts for p in g["params"])]
+        assert group["algorithm"] == "adamw"
+
     @pytest.mark.parametrize("cls_name", ["Muon", "NorMuon", "Dion2", "Dion"])
     def test_all_dion_configs_build(self, cls_name):
         pytest.importorskip("dion")
@@ -366,8 +379,12 @@ class TestDionFamilyConfigs:
             "Dion2": opt_mod.Dion2Config,
             "Dion": opt_mod.DionConfig,
         }[cls_name]
-        opt = cfg_cls(lr=5e-4).build(_dion_test_model())[0]
+        model = _dion_test_model()
+        opt = cfg_cls(lr=5e-4, scalar_lr=1e-4, adamw_param_patterns=[r"^1\.weight$"]).build(model)[0]
         assert type(opt).__name__ == cls_name
+        (group,) = [g for g in opt.param_groups if any(p is model[1].weight for p in g["params"])]
+        assert group["algorithm"] == "adamw"
+        assert group["lr"] == pytest.approx(1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +458,27 @@ class TestLRSchedulerConfig:
         ss = self._step_scheduler(epoch_len=100, num_epochs=10, max_steps=20)
         scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
         assert scheds[0].lr_decay_steps == 20  # min(num_epochs*epoch_len=1000, max_steps=20)
+
+    def test_build_keeps_caller_param_group_lr_and_weight_decay(self):
+        # The retrieval recipes build a no-decay group and a projection group with its own lr this way.
+        decay, no_decay, projection = (torch.nn.Parameter(torch.zeros(2)) for _ in range(3))
+        opt = AdamWConfig(lr=1e-5, weight_decay=0.01).build_from_param_groups(
+            [
+                {"params": [decay]},
+                {"params": [no_decay], "weight_decay": 0.0},
+                {"params": [projection], "weight_decay": 0.0, "lr": 1e-3},
+            ]
+        )
+        ss = self._step_scheduler(epoch_len=100, num_epochs=1, max_steps=None)
+        scheduler = LRSchedulerConfig(lr_warmup_steps=10).build(opt, ss)[0]
+        scheduler.step(10)  # end of warmup: group 0 is at the optimizer's lr
+        decay_group, no_decay_group, projection_group = opt.param_groups
+
+        assert decay_group["lr"] == pytest.approx(1e-5)
+        assert decay_group["weight_decay"] == pytest.approx(0.01)
+        assert no_decay_group["weight_decay"] == 0.0
+        assert projection_group["weight_decay"] == 0.0
+        assert projection_group["lr"] == pytest.approx(1e-3)
 
 
 # ---------------------------------------------------------------------------

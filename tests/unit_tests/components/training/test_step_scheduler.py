@@ -723,3 +723,62 @@ def test_step_scheduler_config_exposes_preemption_signal():
         assert scheduler.sig_handler.sigs == [_signal.SIGUSR2]
     finally:
         scheduler.sig_handler.release()
+
+
+class _RecordingCollator:
+    """Collate function that records the epochs forwarded to it."""
+
+    def __init__(self):
+        self.epochs = []
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epochs.append(epoch)
+
+    def __call__(self, batch):
+        return batch
+
+
+def _scheduler_with(dataloader):
+    return StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=1000,
+        dataloader=dataloader,
+        num_epochs=1,
+        max_steps=10,
+    )
+
+
+def test_set_epoch_forwards_to_collate_fn():
+    """A collator that derives per-epoch augmentation must be told the epoch."""
+    dataloader = SizedDataLoader(num_batches=10)
+    collator = _RecordingCollator()
+    dataloader.collate_fn = collator
+    scheduler = _scheduler_with(dataloader)
+
+    scheduler.set_epoch(0)
+    scheduler.set_epoch(1)
+    scheduler.set_epoch(2)
+
+    assert collator.epochs == [0, 1, 2]
+    assert scheduler.epoch == 2
+
+
+def test_set_epoch_tolerates_collate_fn_without_set_epoch():
+    """Most collators have no epoch hook; they must not break the epoch loop."""
+    dataloader = SizedDataLoader(num_batches=10)
+    dataloader.collate_fn = lambda batch: batch
+    scheduler = _scheduler_with(dataloader)
+
+    scheduler.set_epoch(3)
+
+    assert scheduler.epoch == 3
+
+
+def test_set_epoch_tolerates_dataloader_without_collate_fn():
+    scheduler = _scheduler_with(SizedDataLoader(num_batches=10))
+
+    scheduler.set_epoch(4)
+
+    assert scheduler.epoch == 4

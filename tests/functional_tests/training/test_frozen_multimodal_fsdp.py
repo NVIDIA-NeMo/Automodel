@@ -29,7 +29,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.fsdp._fully_shard import FSDPModule
 from torch.distributed.tensor import DTensor
 
-from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
 _RESULT_PREFIX = "FROZEN_MULTIMODAL_FSDP_RESULT "
 
@@ -112,7 +112,7 @@ def _run_training_case(
         reduce_dtype=torch.float32,
         output_dtype=torch.float32,
     )
-    model = DefaultParallelizationStrategy().parallelize(
+    model = ModelParallelizer()._apply(
         model,
         mesh,
         mp_policy=fp32_policy,

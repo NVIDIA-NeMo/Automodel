@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
+import torch.nn.functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
@@ -22,6 +24,7 @@ from nemo_automodel.components.models.kimi_k3.model import (
     _build_moe_config,
 )
 from nemo_automodel.components.moe.layers import FakeBalancedGate
+from nemo_automodel.components.moe.router_replay import RouterReplay
 
 
 def _tiny_config() -> KimiK3TextConfig:
@@ -69,10 +72,36 @@ def _torch_backend(**overrides) -> BackendConfig:
     )
 
 
-def _build_moe(backend: BackendConfig) -> KimiK3MoE:
+def _build_moe(backend: BackendConfig, moe_overrides: dict[str, bool] | None = None) -> KimiK3MoE:
     config = _tiny_config()
-    moe_config = _build_moe_config(config, torch.float32, None)
+    moe_config = _build_moe_config(config, torch.float32, moe_overrides)
     return KimiK3MoE(config, moe_config, backend)
+
+
+@pytest.fixture
+def clean_router_replay_registry():
+    """Isolate the process-global RouterReplay registry around a test.
+
+    Yields:
+        None.
+    """
+    RouterReplay.clear_registry()
+    yield
+    RouterReplay.clear_registry()
+
+
+def _build_replay_gate() -> KimiK3Gate:
+    """Build a K3 gate with a RouterReplay handle and distinct, non-trivial router state.
+
+    Returns:
+        A ``KimiK3Gate`` whose weight and correction bias are random.
+    """
+    torch.manual_seed(0)
+    gate = _build_moe(_torch_backend(), {"enable_routing_replay": True}).gate
+    with torch.no_grad():
+        gate.weight.normal_(0.0, 1.0)
+        gate.e_score_correction_bias.normal_(0.0, 0.1)
+    return gate
 
 
 def test_kimi_k3_moe_uses_learned_gate_by_default():
@@ -98,3 +127,49 @@ def test_kimi_k3_fake_balanced_gate_spreads_tokens_across_experts():
     # number of (token, slot) assignments instead of collapsing onto [0..topk).
     counts = torch.bincount(indices.flatten(), minlength=moe.n_routed_experts)
     assert (counts == counts[0]).all()
+
+
+def test_kimi_k3_gate_without_routing_replay_has_no_handle(clean_router_replay_registry):
+    moe = _build_moe(_torch_backend())
+    assert moe.gate.router_replay is None
+    assert RouterReplay.instances() == []
+
+
+def test_kimi_k3_gate_records_live_selection(clean_router_replay_registry):
+    gate = _build_replay_gate()
+    hidden_states = torch.randn(6, gate.dim)
+    token_mask = torch.ones(6, dtype=torch.bool)
+    _, live_indices, _ = gate(hidden_states, token_mask, None)
+
+    with RouterReplay.record():
+        gate(hidden_states, token_mask, None)
+
+    assert RouterReplay.instances() == [gate.router_replay]
+    assert torch.equal(RouterReplay.collect()[0], live_indices)
+
+
+def test_kimi_k3_gate_replays_selection_with_live_weights_and_grads(clean_router_replay_registry):
+    config = _tiny_config()
+    gate = _build_replay_gate()
+    hidden_states = torch.randn(6, gate.dim)
+    token_mask = torch.ones(6, dtype=torch.bool)
+    _, live_indices, _ = gate(hidden_states, token_mask, None)
+    # With 4 experts and top-2, replay the two experts the live router did not pick.
+    unpicked = torch.ones(6, config.num_experts, dtype=torch.bool).scatter_(1, live_indices, False)
+    target = unpicked.nonzero()[:, 1].view(6, config.num_experts_per_token)
+
+    with RouterReplay.replay([target]):
+        weights, indices, _ = gate(hidden_states, token_mask, None)
+
+    assert torch.equal(indices, target)
+    # Oracle: unbiased fp32 sigmoid scores of the live router, gathered at the replayed experts.
+    router_weight = gate.weight.detach().clone().requires_grad_(True)
+    scores = F.linear(hidden_states.float(), router_weight.float()).sigmoid()
+    expected = scores.gather(1, target)
+    expected = expected / expected.sum(dim=-1, keepdim=True) * config.routed_scaling_factor
+    torch.testing.assert_close(weights, expected)
+
+    upstream = torch.randn_like(weights)
+    (weights * upstream).sum().backward()
+    (expected * upstream).sum().backward()
+    torch.testing.assert_close(gate.weight.grad, router_weight.grad)

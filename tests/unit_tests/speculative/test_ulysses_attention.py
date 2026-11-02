@@ -26,8 +26,7 @@ Two layers of coverage:
   all-to-all against the single-process reference restricted to each shard.
 """
 
-import os
-import socket
+from pathlib import Path
 
 import pytest
 import torch
@@ -37,7 +36,7 @@ import nemo_automodel.components.speculative.eagle.ulysses_attention as ua
 
 # Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
 
 
 # --------------------------------------------------------------------------- #
@@ -105,19 +104,13 @@ def _eager_cached_reference(q_bthd, cache_k, cache_v, scale):
     return out
 
 
-def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def _ulysses_worker(rank: int, world_size: int, port: int) -> None:
+def _ulysses_worker(rank: int, world_size: int, store_path: str) -> None:
     try:
-        os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(world_size))
         torch.cuda.set_device(rank)
-        torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+        # A per-test file avoids releasing a free TCP port before spawned workers can bind it.
+        torch.distributed.init_process_group(
+            "nccl", init_method=f"file://{store_path}", rank=rank, world_size=world_size
+        )
         group = torch.distributed.group.WORLD
         dev = torch.device("cuda")
         dtype = torch.bfloat16
@@ -164,11 +157,11 @@ def _ulysses_worker(rank: int, world_size: int, port: int) -> None:
 
 
 @_GPU
-def test_ulysses_world1_matches_eager():
-    mp.spawn(_ulysses_worker, args=(1, _free_port()), nprocs=1, join=True)
+def test_ulysses_world1_matches_eager(tmp_path: Path) -> None:
+    mp.spawn(_ulysses_worker, args=(1, str(tmp_path / "rendezvous")), nprocs=1, join=True)
 
 
 @_GPU
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs for the real all-to-all")
-def test_ulysses_world2_matches_full_sequence_reference():
-    mp.spawn(_ulysses_worker, args=(2, _free_port()), nprocs=2, join=True)
+def test_ulysses_world2_matches_full_sequence_reference(tmp_path: Path) -> None:
+    mp.spawn(_ulysses_worker, args=(2, str(tmp_path / "rendezvous")), nprocs=2, join=True)

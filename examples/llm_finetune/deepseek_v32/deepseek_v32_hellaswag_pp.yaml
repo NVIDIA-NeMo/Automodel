@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Finetuning config for DeepSeek V3.2 on HellaSwag
-# Replace /path/to/deepseek-v32 with the path to the DeepSeek V3.2 model
+# Loads the published DeepSeek V3.2 checkpoint and matching tokenizer.
 
 # To run this recipe:
 #   automodel examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml --nproc-per-node 8
@@ -63,8 +63,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.deepseek_v32.config.DeepseekV32Config.from_pretrained
-    pretrained_model_name_or_path: /path/to/deepseek-v32
-    name_or_path: /path/to/deepseek-v32
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
+    name_or_path: deepseek-ai/DeepSeek-V3.2
   trust_remote_code: true
   load_base_model: true
   backend:
@@ -93,7 +93,7 @@ dataset:
   split: train
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /path/to/deepseek-v32
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
 
 packed_sequence:
   packed_sequence_size: 0
@@ -111,7 +111,7 @@ validation_dataset:
   split: train
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /path/to/deepseek-v32
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3.2
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -131,6 +131,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  cluster_tag: h100
   recipe_owner: hemildesai
   nodes: 32
   time: "00:30:00"

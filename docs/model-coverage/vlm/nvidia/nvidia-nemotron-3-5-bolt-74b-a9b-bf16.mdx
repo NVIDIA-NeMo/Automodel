@@ -1,0 +1,53 @@
+---
+title: "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16"
+description: "Use NeMo AutoModel to LoRA fine-tune NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16 on one GB300 GPU through its Hugging Face implementation."
+slug: model-coverage/vision-language-models/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16
+---
+
+[NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16)
+has a checked-in NeMo AutoModel recipe for image-text-to-text LoRA fine-tuning. The recipe uses the model's
+Hugging Face remote implementation and keeps every parallelism axis, including expert parallelism, at one.
+
+## Fine-Tune NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16
+
+Follow the [installation instructions](/get-started/installation), then run the recipe on one GB300 GPU from the
+repository root:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 automodel \
+  examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_cord_v2_lora.yaml \
+  --nproc-per-node 1
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| LoRA fine-tuning on CORD-v2 | Use the [single-GPU recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/nemotron_3_5_bolt/nemotron_3_5_bolt_cord_v2_lora.yaml). |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | 1 NVIDIA GB300 GPU |
+| Strategy | FSDP2; `dp_size=1`, `tp_size=1`, `pp_size=1`, `cp_size=1`, `ep_size=1` |
+| Sequence length | 4,096 tokens |
+| Features | BF16 LoRA, reshard after forward, frozen vision encoder and projector |
+| Advanced | Hugging Face remote implementation, eager attention |
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-text-to-text |
+| Architecture | `NemotronH_Omni_Reasoning_V3` |
+
+### Available Models
+
+- [`nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16)
+
+## Related Resources
+
+- [Vision-language model fine-tuning guide](/recipes-e2e-examples/gemma-3-3n)

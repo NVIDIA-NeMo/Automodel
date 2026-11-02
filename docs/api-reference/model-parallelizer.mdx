@@ -1,0 +1,153 @@
+---
+title: "Model Parallelizer API"
+description: "Implement model-owned parallelization policy without duplicating NeMo AutoModel's distributed runtime."
+---
+
+The model parallelizer is a lightweight, model-owned sidecar. It has one public
+operation: `parallelize(model, mesh_context)`. Shared distributed infrastructure
+selects and sequences DDP, FSDP2, TP, CP, EP, and MoE behavior from the resolved
+context; the model only supplies architecture-specific customization.
+
+Most models do not need a custom sidecar. If a model class has no `parallelizer`
+attribute, NeMo AutoModel uses `ModelParallelizer()`.
+
+## Contract
+
+| Symbol | Responsibility |
+|---|---|
+| `ModelParallelizer` | The sole model-facing parallelization contract and the shared default implementation. Import it from `nemo_automodel.components.distributed`. |
+| `MeshContext` | The sole runtime input, containing resolved meshes and axis names together with strategy, MoE, activation-checkpointing, and trainability policy. |
+
+`ModelParallelizer.parallelize(model, mesh_context)` dispatches by the resolved
+runtime configuration inside shared infrastructure:
+
+| Condition | Execution Path |
+|---|---|
+| `ep_size > 1` | Unified MoE TP + CP + EP + FSDP path |
+| FSDP2 without EP | Shared dense TP + activation checkpointing + FSDP2 path |
+| DDP without EP | Shared DDP path |
+| Megatron-FSDP without EP | Shared Megatron-FSDP path |
+
+Model code never branches among `parallelize_fsdp2`, `parallelize_moe`, or
+similar operations. It always calls or supplies the same `parallelize(model,
+mesh_context)` contract. A sidecar does not parse distributed configuration, build
+meshes, or reproduce TP/CP/EP sequencing.
+
+### Diffusion Pipeline Boundary
+
+`NeMoAutoDiffusionPipeline` follows the same topology-ownership rule. The
+caller supplies one resolved `MeshContext`; the loader returns the pipeline
+itself after replacing every selected component with its parallelized module.
+
+```python
+pipe = NeMoAutoDiffusionPipeline.from_pretrained(
+    model_id,
+    mesh_context=mesh_context,
+    components_to_load=["transformer"],
+)
+```
+
+When `mesh_context` is omitted, the pipeline is loaded without distributed
+parallelization. There is no second per-component policy map: the selected
+components all consume the same resolved context.
+
+### Architecture Guardrail
+
+Two checks run in CI. The standard `import-linter` contract prevents distributed
+infrastructure from directly importing model or adapter implementations. The focused
+`python tools/lint_model_parallelizer_contract.py` check rejects a second
+`ParallelizeContext` or `parallel_scheme` API, any additional public sidecar
+method, and sidecars that import distributed symbols not declared in `__all__`.
+The focused check also runs as the `model-parallelizer-contract` pre-commit hook,
+so the same failure is visible before a change reaches CI.
+
+## Add a Model Sidecar
+
+Create a small `parallelization.py` module next to the model. Subclass
+`ModelParallelizer` and override only the narrowest protected hook the model
+needs:
+
+```python
+from nemo_automodel.components.distributed import ModelParallelizer
+
+from .fsdp import fully_shard_my_model
+
+
+class MyModelParallelizer(ModelParallelizer):
+    def _fully_shard_module(self, module, **kwargs):
+        return fully_shard_my_model(module, **kwargs)
+
+
+PARALLELIZER = MyModelParallelizer()
+```
+
+Attach the sidecar to the model class in `model.py`:
+
+```python
+from .parallelization import PARALLELIZER
+
+
+class MyModelForCausalLM(nn.Module):
+    # Model implementation...
+    pass
+
+
+MyModelForCausalLM.parallelizer = PARALLELIZER
+```
+
+This direction keeps imports one-way: shared distributed infrastructure never
+imports model implementations, while a model may import exported distributed
+symbols.
+
+## Choose the Extension Point
+
+`ModelParallelizer` provides protected extension hooks. They are intentionally
+narrow so a sidecar can preserve the shared TP, activation-checkpointing,
+mixed-precision, prefetch, CP, EP, and root-wrapping behavior.
+
+- Override `_fully_shard_module(module, **kwargs)` when the model needs a
+  different FSDP2 primitive or must adjust a module immediately before it is
+  sharded. The shared traversal uses this hook for decoder layers, standalone
+  embeddings, the output head, and the root model. Set the protected
+  `_customizes_moe_fsdp = True` capability only when that primitive is also
+  required and safe after the unified MoE path establishes EP ownership.
+- Override `_apply_fsdp_sharding(...)` when the model needs different FSDP unit
+  boundaries, such as dtype-uniform groups. Continue to use
+  `self._fully_shard_module` (or helpers that accept the parallelizer) so custom
+  wrapping remains consistent at every level.
+- Override `_validate_tp_mesh(model, tp_mesh)` when the model exposes
+  heterogeneous per-layer attention shapes that cannot be validated through a
+  single global head count.
+- Override `_use_full_layer_activation_checkpointing(model)` only when the
+  model can safely replay a complete decoder layer, including any shared-K/V
+  state, during backward.
+- Override `_apply(...)` only when model-specific work must surround or replace
+  the complete dense FSDP2 flow. Call `super()._apply(...)` to retain the common
+  ordering and validations. The public `parallelize(model, context)` method
+  remains unchanged.
+
+<Note>
+The leading underscores mark model-author extension points, not general
+application APIs. Keep overrides local to the sidecar and match the base
+signature so shared infrastructure can evolve without model-name dispatch.
+
+</Note>
+
+## Ownership Rules
+
+Keep the boundary small:
+
+- Shared infrastructure owns mesh construction, strategy dispatch, TP plans,
+  CP/EP coordination, activation checkpointing, and DDP/Megatron-FSDP setup.
+- The model package owns only architecture-specific FSDP grouping, primitive
+  selection, and unavoidable model setup or post-processing.
+- Do not add model imports or model-name conditionals to
+  `components.distributed`.
+- Do not copy the shared parallelization flow merely to substitute
+  `fully_shard`; override `_fully_shard_module` instead.
+
+For working examples, see the
+[DeepSeek-V4 sidecar](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/deepseek_v4/parallelization.py),
+[Qwen3.5 dtype-aware sidecar](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/qwen3_5/parallelization.py),
+and
+[DiffusionGemma FSDP sidecar](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/models/diffusion_gemma/fsdp.py).

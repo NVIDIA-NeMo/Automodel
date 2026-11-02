@@ -775,7 +775,7 @@ class ImageEditDataloaderConfig:
             generator=torch.Generator().manual_seed(self.seed + dp_rank),
         )
         logger.info("Built image-edit dataset with %d samples and %d batches", len(dataset), len(sampler))
-        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler)
+        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler, drop_last=self.drop_last)
 
 
 __all__ = [

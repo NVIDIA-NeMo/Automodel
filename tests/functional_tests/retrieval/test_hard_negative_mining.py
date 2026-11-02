@@ -14,6 +14,8 @@
 
 """Real-CUDA functional coverage for hard-negative mining."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -26,6 +28,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 def test_mining_ranks_negatives_and_filters_false_negatives() -> None:
     """Mine by GPU similarity while preserving duplicate-positive score order."""
     recipe = MineHardNegativesRecipe.__new__(MineHardNegativesRecipe)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cuda"))
     queries = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
     documents = np.asarray(
         [

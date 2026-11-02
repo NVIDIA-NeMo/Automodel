@@ -12,24 +12,24 @@ slug: model-coverage/diffusion/qwen/Qwen-Image
 
 | Property | Value |
 |---|---|
-| **Tasks** | Text-to-Image, instruction-based image editing |
+| **Tasks** | Text-to-Image, Instruction-Based Image Editing |
 | **Architecture** | Diffusion Transformer (Flow Matching) |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
 
 ## Available Models
 
-| Model | HF ID | Training scope |
+| Model | HF ID | Training Scope |
 |---|---|---|
 | Qwen-Image | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) | Text-to-image training and fine-tuning |
 | Qwen-Image-Edit-2511 | [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Cached, full-parameter, single-node training |
 
-Qwen-Image-Edit-2511 training is intentionally limited to cached target/context latents and cached Qwen2.5-VL prompt conditioning. Raw-image online encoding, LoRA, older Qwen image-edit checkpoints, and multinode tuning are not supported by the training recipe. Image-edit inference is supported by the generic generation script.
+Qwen-Image-Edit-2511 training is intentionally limited to cached target latents, cached context latents, and cached Qwen2.5-VL prompt conditioning. Raw-image online encoding, LoRA, older Qwen image-edit checkpoints, and multi-node tuning are not supported by the training recipe. Image-edit inference is supported by the generic generation script.
 
 ## Recipes
 
 | Recipe | Description |
 |---|---|
-| [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) | Eight-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training |
+| [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) | 8-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training |
 | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune Qwen-Image with flow matching |
 | [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain Qwen-Image with flow matching |
 
@@ -108,7 +108,7 @@ uv run torchrun --nproc-per-node=8 \
 
 The baseline uses BF16 parameters and compute, whole Qwen transformer-block activation checkpointing, beta timestep sampling, and the distributed checkpoint manager. Consolidated model checkpoints are written in the Diffusers-compatible safetensors format (`checkpoint.diffusers_compatible: true`), matching the other diffusion recipes. Set `checkpoint.restore_from: LATEST` to resume the optimizer, scheduler, dataloader, sampler, and step state.
 
-### Checkpoint-resume smoke test
+### Checkpoint-Resume Smoke Test
 
 Use the 64-example correctness cache and a new checkpoint path. The first launch saves after 10 completed optimizer steps:
 

@@ -137,7 +137,9 @@ class BlendedDataset(torch.utils.data.Dataset):
             # Build the dataset and dataset sample indexes
             logger.info("\tBuild and save the dataset and dataset sample indexes")
             t_beg = time.time()
-            from nemo_automodel.components.datasets.llm.megatron import helpers_cpp
+            from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper
+
+            helpers_cpp = compile_helper()
 
             if self.size is not None:
                 dataset_index = numpy.zeros(self.size, dtype=numpy.int16)

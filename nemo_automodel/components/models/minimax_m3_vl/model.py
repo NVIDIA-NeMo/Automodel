@@ -153,7 +153,9 @@ class MiniMaxM3TextModel(nn.Module):
             )
 
         gemma = getattr(config, "use_gemma_norm", False)
-        self.norm = MiniMaxM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma=gemma)
+        self.norm = MiniMaxM3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, gemma=gemma, compile_norm=backend.compile_norm
+        )
 
         self.max_seq_len = config.max_position_embeddings
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -225,6 +227,10 @@ class MiniMaxM3TextModel(nn.Module):
                 attn_kwargs=attn_kwargs,
                 forced_blocks=self._msa_forced_blocks,
             )
+            # Plan block selection before the decoder blocks: built lazily inside an activation-checkpointed
+            # block, its one-time ops would be saved by the checkpoint forward and never replayed by the
+            # recompute, shifting every later saved op of that block.
+            msa.prepare_selection()
             # Canonical ids still own padding for the MoE router. Every attention layer packs, so
             # document isolation travels as cu_seqlens and no attention mask may survive: a non-None
             # mask makes the TE backend silently drop cu_seqlens (attention/utils.py:135-143).
@@ -309,10 +315,6 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
 
     _keep_in_fp32_modules_strict = ["mlp.gate.weight", "mlp.gate.e_score_correction_bias"]
     _pp_keep_self_forward: bool = True
-
-    # The state-dict adapter loads every tensor from the checkpoint, so skip HF
-    # random init on load (also avoids DTensor-collective hangs under sharding/PP).
-    _skip_init_weights_on_load = True
 
     @classmethod
     def from_config(
@@ -417,7 +419,9 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 
@@ -454,10 +458,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # The same attention shards the packed sequence in forward and carries the document
     # boundaries into every layer, so it owns the packed CP path end to end.
     _owns_cp_attention = True
-    # The state-dict adapter fully populates every tensor from the checkpoint
-    # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
-    # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
-    _skip_init_weights_on_load = True
     # CP submesh, installed by the MoE parallelizer's apply_cp when context
     # parallelism is active; None (default) means the forward embeds and shards
     # nothing for CP. See prepare_model_inputs_for_cp / forward.
@@ -543,6 +543,41 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
     def get_output_embeddings(self):
         return self.lm_head
+
+    def get_dspark_target_feature_modules(self, layer_ids: list[int]) -> tuple[nn.Module, ...]:
+        """Return modules whose inputs are the DSpark target features of ``layer_ids``.
+
+        The feature of layer ``i`` is the residual stream entering layer ``i + 1``.
+        For the last layer that is the stream entering the final norm, so the
+        draft sees the same unnormalized last-layer state as at serving time
+        instead of the normalized hidden state that feeds ``lm_head``. Each
+        decoder block's input norm and the final norm take that stream as their
+        first positional argument.
+
+        Args:
+            layer_ids: Strictly increasing decoder-layer indices in
+                ``[-1, num_hidden_layers)``; ``-1`` selects the stream entering
+                layer 0.
+
+        Returns:
+            Modules ordered like ``layer_ids``. Each receives a tensor of shape
+            [batch, sequence, hidden] as its first forward argument.
+
+        Raises:
+            ValueError: If the indices are duplicated, unsorted, or outside the
+                decoder depth, or this rank does not hold the final norm.
+        """
+        num_layers = len(self.model.layers)
+        if layer_ids != sorted(set(layer_ids)):
+            raise ValueError(f"DSpark target layer IDs must be strictly increasing, got {layer_ids}")
+        if any(type(layer_id) is not int or not -1 <= layer_id < num_layers for layer_id in layer_ids):
+            raise ValueError(f"DSpark target layer IDs must be integers in [-1, {num_layers}), got {layer_ids}")
+        if self.model.norm is None:
+            raise ValueError("DSpark target features need the final norm, which this pipeline stage does not hold")
+        return tuple(
+            self.model.norm if layer_id == num_layers - 1 else self.model.layers[str(layer_id + 1)].input_layernorm
+            for layer_id in layer_ids
+        )
 
     def customize_pipeline_stage_modules(
         self,
@@ -869,7 +904,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 nn.init.trunc_normal_(
                     self.lm_head.weight, mean=0.0, std=final_out_std, a=-3 * final_out_std, b=3 * final_out_std
                 )
-        cast_model_to_dtype(self, dtype)
+        # Preserve the declared FP32 gates. After FSDP wrapping, restoring
+        # DTensor .data after a cast cannot restore its local shard.
+        cast_model_to_dtype(self, dtype, skip_modules=("gate",))
         with buffer_device:
             self.model.rotary_emb.device = buffer_device
 

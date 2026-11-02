@@ -69,6 +69,10 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     is_gated_delta_net_fp32_param_key,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packing import (
+    AttentionBackendSelection,
+    get_model_attn_implementation,
+)
 from nemo_automodel.components.models.common.utils import (
     HUB_LOADING_KWARGS,
     BackendConfig,
@@ -133,12 +137,14 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
     Returns:
         A class that inherits from both HFCheckpointingMixin and model_class
     """
+    from nemo_automodel._transformers.model_parallelization import configure_parallelization_metadata
+
     # Custom models already inherit HFCheckpointingMixin
     if issubclass(model_class, HFCheckpointingMixin):
-        return model_class
+        return configure_parallelization_metadata(model_class)
 
     # Create wrapper class that looks identical to original
-    return type(
+    wrapped_class = type(
         model_class.__name__,
         (HFCheckpointingMixin, model_class),
         {
@@ -146,6 +152,7 @@ def _get_mixin_wrapped_class(model_class: type) -> type:
             "__qualname__": model_class.__qualname__,
         },
     )
+    return configure_parallelization_metadata(wrapped_class)
 
 
 @contextmanager
@@ -301,6 +308,15 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     Get the HF config for the model.
     """
     kwargs = kwargs.copy()
+    kwargs["revision"] = AutoConfig.resolve_revision(
+        pretrained_model_name_or_path,
+        kwargs.get("revision"),
+        cache_dir=kwargs.get("cache_dir"),
+        token=kwargs.get("token", kwargs.get("use_auth_token")),
+        local_files_only=kwargs.get("local_files_only", False),
+        subfolder=kwargs.get("subfolder", ""),
+        force_download=kwargs.get("force_download", False),
+    )
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
     # A plain-dict ``config`` (e.g. from CLI ``--model.config.num_hidden_layers 16``,
@@ -390,8 +406,6 @@ def _load_config_with_layer_types_fix(pretrained_model_name_or_path, attn_implem
             for key in ("revision", "code_revision", "cache_dir", "token", "local_files_only", "force_download")
             if key in kwargs
         }
-        if config_dict.get("_commit_hash") is not None:
-            code_kwargs["revision"] = config_dict["_commit_hash"]
         config_cls = get_class_from_dynamic_module(auto_map["AutoConfig"], pretrained_model_name_or_path, **code_kwargs)
     if config_cls is None:
         model_type = config_dict.get("model_type")
@@ -441,8 +455,6 @@ def _download_model_weights(
                 for key in ("cache_dir", "revision", "token", "local_files_only", "force_download")
                 if key in kwargs
             }
-            if hf_config._commit_hash is not None:
-                download_kwargs["revision"] = hf_config._commit_hash
             snapshot_download(pretrained_model_name_or_path, **download_kwargs)
 
 
@@ -1031,7 +1043,7 @@ def _init_model_bnb_streaming(
     # 2. Resolve to local directory & verify safetensors
     model_dir = _resolve_model_dir(
         pretrained_model_name_or_path,
-        revision=hf_config._commit_hash,
+        revision=kwargs.get("revision"),
         cache_dir=kwargs.get("cache_dir"),
         subfolder=kwargs.get("subfolder", ""),
     )
@@ -1209,6 +1221,16 @@ def __init_model(
     process_group = kwargs.pop("_process_group", None)
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
+    if is_pretrained_init:
+        kwargs["revision"] = AutoConfig.resolve_revision(
+            pretrained_model_name_or_path_or_config,
+            kwargs.get("revision"),
+            cache_dir=kwargs.get("cache_dir"),
+            token=kwargs.get("token", kwargs.get("use_auth_token")),
+            local_files_only=kwargs.get("local_files_only", False),
+            subfolder=kwargs.get("subfolder", ""),
+            force_download=kwargs.get("force_download", False),
+        )
     hf_config = (
         get_hf_config(pretrained_model_name_or_path_or_config, attn_implementation, **kwargs)
         if is_pretrained_init
@@ -1217,9 +1239,6 @@ def __init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
-    if is_pretrained_init and hf_config._commit_hash is not None:
-        kwargs["revision"] = hf_config._commit_hash
-        kwargs["_commit_hash"] = hf_config._commit_hash
     # A plain-dict ``config`` override (e.g. from ``--model.config.num_hidden_layers``)
     # has already been folded into ``hf_config`` by ``get_hf_config`` above. Drop it from
     # kwargs so it is not also forwarded into the model constructor / HF from_pretrained
@@ -1255,7 +1274,7 @@ def __init_model(
     ):
         try:
             logger.info("Using streaming BnB quantization for memory-efficient loading")
-            return _init_model_bnb_streaming(
+            _, model = _init_model_bnb_streaming(
                 cls,
                 pretrained_model_name_or_path,
                 hf_config,
@@ -1264,6 +1283,7 @@ def __init_model(
                 quantization_config,
                 **kwargs,
             )
+            return False, model, None
         except FileNotFoundError:
             logger.warning(
                 "Streaming BnB loading unavailable (no safetensors checkpoint); falling back to standard HF loading."
@@ -1307,6 +1327,7 @@ def __init_model(
                     requested_dtype=(torch_dtype if torch_dtype != "auto" else None),
                 )
         else:
+            kwargs.pop("revision", None)
             model = cls._from_config_parent_class(
                 hf_config,
                 *model_args,
@@ -1322,7 +1343,7 @@ def __init_model(
         except KeyError:
             pass  # fallback to use the model class from the model object
         model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
-        return False, model
+        return False, model, None
 
     # 2. If we have a custom model implementation available, we prioritize that over HF
     model_cls = _resolve_custom_model_cls_for_config(hf_config)
@@ -1342,29 +1363,39 @@ def __init_model(
             if pretrained_model_name_or_path:
                 _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=process_group, **kwargs)
             logger.info(f"Using custom model implementation for {architectures[0]}")
-            kwargs.pop("trust_remote_code", None)
+            init_param_names = _get_init_param_names(model_cls)
+            # Explicit constructor parameters let model-owned remote components
+            # retain the caller's consent; **kwargs alone does not opt in.
+            if "trust_remote_code" not in init_param_names:
+                kwargs.pop("trust_remote_code", None)
             # Keep the hub loading options before the constructor-argument filter drops
             # them: the generation-config restore below has to read from the same
             # subfolder/revision the weights came from.
             loading_kwargs = {key: kwargs[key] for key in HUB_LOADING_KWARGS if key in kwargs}
-            for key in (*HUB_LOADING_KWARGS, "_commit_hash", "code_revision", "use_auth_token"):
-                kwargs.pop(key, None)
+            for key in (*HUB_LOADING_KWARGS, "code_revision", "use_auth_token"):
+                # A model-owned tokenizer or adapter can explicitly request the
+                # resolved revision; **kwargs alone does not opt a model in.
+                if key != "revision" or key not in init_param_names:
+                    kwargs.pop(key, None)
             # Treat config-related kwargs as config overrides (HF behavior) and
             # avoid forwarding them into model __init__.
-            init_param_names = _get_init_param_names(model_cls)
             config_overrides = dict_config_overrides | _consume_config_overrides(
                 hf_config, kwargs, init_param_names=init_param_names
             )
-            kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
             if "backend" in kwargs and isinstance(kwargs["backend"], dict):
                 backend_config_resolver = getattr(model_cls, "backend_config_resolver", None)
                 if backend_config_resolver is not None:
                     kwargs["backend"] = backend_config_resolver(kwargs["backend"])
                 else:
-                    from nemo_automodel.components.models.common.utils import BackendConfig
-
                     kwargs["backend"] = BackendConfig(**kwargs["backend"])
+            uses_native_fa4 = getattr(model_cls, "_uses_native_fa4", False) is True
+            if kwargs.get("backend") is None and attn_implementation == "flash_attention_4" and uses_native_fa4:
+                # The HF alias supplies a default only. An explicit native
+                # backend remains authoritative, including model-specific configs.
+                kwargs["backend"] = BackendConfig(attn="fa4")
+            resolved_backend = kwargs.get("backend")
+            kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             with local_torch_dtype(torch_dtype, model_cls.__name__):
                 model = model_cls(hf_config, *model_args, **kwargs)
             if is_pretrained_init:
@@ -1376,7 +1407,7 @@ def __init_model(
                 restore_pretrained_generation_config(
                     model, pretrained_model_name_or_path, config_overrides=config_overrides, **loading_kwargs
                 )
-            return True, model
+            return True, model, resolved_backend
 
     # 3. fallback to HF model class wrapped with mixin
     model = None
@@ -1433,6 +1464,7 @@ def __init_model(
                 requested_dtype=(torch_dtype if torch_dtype != "auto" else None),
             )
     else:
+        kwargs.pop("revision", None)
         model = cls._from_config_parent_class(
             hf_config,
             *model_args,
@@ -1449,7 +1481,7 @@ def __init_model(
     except KeyError:
         pass  # fallback to use the model class from the model object
     model.__class__ = _get_mixin_wrapped_class(hf_model_cls)
-    return False, model
+    return False, model, None
 
 
 def _tie_weights_nemo(model):
@@ -1537,6 +1569,36 @@ def _apply_backend_module_overrides(model: torch.nn.Module, backend: BackendConf
                 pending.append(child)
 
 
+def _log_attention_selection(model: torch.nn.Module, *, requested_hf_attention: str, explicit_backend: bool) -> None:
+    """Report construction-time attention selection without claiming kernel coverage."""
+    attention = get_model_attn_implementation(model)
+    logger.info("Model construction attention: primary text/BSHD=%s", attention)
+    config = getattr(model, "config", None)
+    vision_config = getattr(config, "vision_config", None)
+    if vision_config is not None:
+        logger.info(
+            "Model construction attention: HF vision-config dispatch=%s (where HF vision attention is retained)",
+            getattr(vision_config, "_attn_implementation", None),
+        )
+    backend = getattr(model, "backend", None)
+    if (
+        explicit_backend
+        and isinstance(backend, AttentionBackendSelection)
+        and not getattr(model, "_uses_hf_attention", False)
+        and backend.attn == attention
+        and attention in ("sdpa", "eager")
+        and requested_hf_attention in ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+    ):
+        logger.warning(
+            "backend.attn=%r controls this model's primary text/BSHD attention; "
+            "attn_implementation=%r does not override it and applies only to HF-dispatched attention. "
+            "To use native FlashAttention-4 on a supported model, set backend.attn='fa4'. "
+            "Mixed native/HF attention selections can be intentional.",
+            attention,
+            requested_hf_attention,
+        )
+
+
 def _init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -1547,11 +1609,7 @@ def _init_model(
     *model_args,
     **kwargs,
 ):
-    requested_backend = kwargs.get("backend")
-    if isinstance(requested_backend, dict):
-        requested_backend = BackendConfig(**requested_backend)
-
-    is_custom_model, model = __init_model(
+    is_custom_model, model, resolved_backend = __init_model(
         cls,
         pretrained_model_name_or_path_or_config,
         attn_implementation,
@@ -1561,10 +1619,13 @@ def _init_model(
         *model_args,
         **kwargs,
     )
-    if is_custom_model and requested_backend is not None:
-        _apply_backend_module_overrides(model, requested_backend)
+    if is_custom_model and isinstance(resolved_backend, BackendConfig):
+        model_backend = getattr(model, "backend", None)
+        if isinstance(model_backend, BackendConfig):
+            resolved_backend = model_backend
+        _apply_backend_module_overrides(model, resolved_backend)
         if not hasattr(model, "backend"):
-            model.backend = requested_backend
+            model.backend = resolved_backend
 
     # https://github.com/NVIDIA-NeMo/Automodel/blob/a3a57176f68add7917faaa32f19228f49fcbb1ba/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml#L41
     # this happens in nemotron_flash, where we load using force_hf, and the model is pre 5.x
@@ -1578,6 +1639,11 @@ def _init_model(
 
     if hasattr(model, "_nemo_tied_weights_keys"):
         _tie_weights_nemo(model)
+    _log_attention_selection(
+        model,
+        requested_hf_attention=attn_implementation,
+        explicit_backend=kwargs.get("backend") is not None,
+    )
     return is_custom_model, model
 
 

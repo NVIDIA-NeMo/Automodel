@@ -22,6 +22,7 @@ the trainer-module swap, and the extra-metrics plumbing.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -154,14 +155,47 @@ def test_build_trainer_module_defaults_loss_decay_gamma_to_paper_value():
     assert module.sliding_window is None
 
 
-def test_build_trainer_module_rejects_loss_type():
-    """The DFlash loss_type knob must fail loudly here instead of being silently
-    ignored (DFlash 2 teacher-forces the selector from the fixed-anchor layout)."""
+def test_build_trainer_module_rejects_variable_prefix_loss_type():
+    """``variable_prefix`` must fail loudly instead of being silently ignored:
+    DFlash 2 teacher-forces the selector's predecessor from the fixed-anchor
+    block layout, which a variable visible prefix breaks."""
     recipe = _recipe()
     recipe.draft_model = _dflash2_draft()
     recipe.mask_token_id = MASK_ID
-    with pytest.raises(ValueError, match="loss_type"):
+    recipe.block_size = BLOCK_SIZE
+    recipe.target_model = _target_model()
+    recipe.draft_sliding_window = None
+    with pytest.raises(ValueError, match="variable_prefix"):
         recipe._build_trainer_module("sdpa", {"loss_type": "variable_prefix"})
+
+
+def test_build_trainer_module_threads_dpace_loss_type():
+    """``loss_type`` / ``dpace_alpha`` must reach the trainer, not silently stay
+    on the ``"dflash"`` default -- the gap the DFlash recipe already closed."""
+    recipe = _recipe()
+    recipe.draft_model = _dflash2_draft()
+    recipe.mask_token_id = MASK_ID
+    recipe.block_size = BLOCK_SIZE
+    recipe.target_model = _target_model()
+    recipe.draft_sliding_window = None
+    module = recipe._build_trainer_module("sdpa", {"loss_type": "dpace", "dpace_alpha": 0.3})
+    assert isinstance(module, DFlash2TrainerModule)
+    assert module.loss_type == "dpace"
+    assert module.dpace_alpha == 0.3
+
+
+def test_build_trainer_module_defaults_loss_type_to_dflash():
+    """An unset ``loss_type`` must keep the fixed-decay default, matching the
+    DFlash recipe's own null-folding convention."""
+    recipe = _recipe()
+    recipe.draft_model = _dflash2_draft()
+    recipe.mask_token_id = MASK_ID
+    recipe.block_size = BLOCK_SIZE
+    recipe.target_model = _target_model()
+    recipe.draft_sliding_window = None
+    module = recipe._build_trainer_module("sdpa", {"loss_type": None})
+    assert module.loss_type == "dflash"
+    assert module.dpace_alpha == 0.5
 
 
 def _metrics(**overrides):
@@ -176,6 +210,7 @@ def _metrics(**overrides):
         valid_blocks=torch.tensor(2.0),
         base_loss=torch.tensor(2.3),
         selector_loss=torch.tensor(0.7),
+        selector_loss_denominator=torch.tensor(4.0),
         base_accuracy=torch.tensor(0.4),
         base_correct_tokens=torch.tensor(4.0),
         base_accept_len=torch.tensor(4.0),
@@ -223,15 +258,48 @@ def test_train_sums_include_selector_diagnostics():
 def test_eval_sums_keep_additive_numerators():
     recipe = _recipe()
 
-    sums = recipe._extra_eval_metric_sums(_metrics())
+    sums = recipe._extra_eval_metric_sums(
+        _metrics(base_loss=torch.tensor(2.3, requires_grad=True), selector_loss=torch.tensor(0.7, requires_grad=True))
+    )
 
     assert sums["val_base_loss"][0].item() == pytest.approx(18.4)
     assert sums["val_base_loss"][1].item() == 8.0
-    assert sums["val_selector_loss"][0].item() == pytest.approx(5.6)
+    assert sums["val_selector_loss"][0].item() == pytest.approx(2.8)
+    assert sums["val_selector_loss"][1].item() == 4.0
+    assert all(not value.requires_grad for pair in sums.values() for value in pair)
     assert sums["val_base_accuracy"][0].item() == 4.0
     assert sums["val_base_accept_len"][0].item() == 8.0
     assert sums["val_base_accept_len"][1].item() == 2.0
     assert sums["val_candidate_recall"][0].item() == pytest.approx(9.0)
+
+
+@pytest.mark.parametrize("selector_weights,expected", [([1.0, 3.0, 0.0], 6.5), ([0.0, 0.0, 0.0], 0.0)])
+def test_run_eval_weights_selector_loss_by_candidate_hits(selector_weights, expected):
+    recipe = _recipe()
+    recipe.device = torch.device("cpu")
+    recipe.trainer_module = torch.nn.Identity()
+    recipe.target_wrapper = SimpleNamespace(generate_batch=lambda **kwargs: None)
+    recipe.val_dataloader = [
+        {"input_ids": torch.ones(1, 4, dtype=torch.long), "attention_mask": torch.ones(1, 4), "loss_mask": torch.ones(1, 4)}
+    ] * 3
+    recipe._run_trainer_step = Mock(
+        side_effect=[
+            _metrics(
+                loss_weight=torch.tensor(base_weight),
+                selector_loss=torch.tensor(loss if selector_weight else 0.0),
+                selector_loss_denominator=torch.tensor(selector_weight),
+            )
+            for loss, base_weight, selector_weight in zip([2.0, 8.0, 0.0], [8.0, 8.0, 100.0], selector_weights)
+        ]
+    )
+
+    result = recipe._run_eval()
+
+    # One eligible prediction at loss 2 and three at loss 8 yield (2 + 24) / 4.
+    # The batch with no candidate hits contributes no selector loss or weight.
+    assert result["val_selector_loss"] == pytest.approx(expected)
+    assert result["val_base_loss"] == pytest.approx(2.3)
+    assert recipe.trainer_module.training
 
 
 def test_empty_eval_sums_have_stable_collective_order():

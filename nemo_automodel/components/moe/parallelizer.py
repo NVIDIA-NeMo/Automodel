@@ -19,6 +19,7 @@ import logging
 import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -33,16 +34,13 @@ from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed import parallelizer_utils
-from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
-from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
-from nemo_automodel.components.moe.layers import (
-    Gate,
-    MoE,
+from nemo_automodel.components.distributed.fsdp_patches import (
+    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
 )
-from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
-from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
-from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
-from nemo_automodel.shared.multimodal_fsdp import (
+from nemo_automodel.components.distributed.fsdp_patches import (
+    patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
+)
+from nemo_automodel.components.distributed.multimodal_fsdp import (
     MULTIMODAL_TOWER_NAMES,
     FrozenMultimodalSharding,
     ignored_params_for_root,
@@ -52,14 +50,20 @@ from nemo_automodel.shared.multimodal_fsdp import (
     normalize_frozen_multimodal_sharding,
     shard_multimodal_module,
 )
+from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
+from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components.moe.layers import (
+    Gate,
+    MoE,
+)
+from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
+from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
-from nemo_automodel.shared.torch_patches import (
-    patch_fsdp_accumulated_grad_guard as _patch_fsdp_accumulated_grad_guard,
-)
-from nemo_automodel.shared.torch_patches import (
-    patch_fsdp_uniform_reduce_dtype as _patch_fsdp_uniform_reduce_dtype,
-)
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
 logger = logging.getLogger(__name__)
 _CP_STREAM = None
@@ -120,6 +124,11 @@ def _is_selective_ac(activation_checkpointing: object) -> bool:
     )
 
 
+def _is_moe_only_ac(activation_checkpointing: object) -> bool:
+    """Return True when the AC mode requests checkpointing of the MoE sub-blocks only."""
+    return isinstance(activation_checkpointing, str) and activation_checkpointing.lower() == "moe"
+
+
 def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) == "deepseek_v4":
@@ -138,8 +147,15 @@ def _get_cp_stream() -> torch.cuda.Stream:
 
 
 def _get_moe_module(block: nn.Module) -> MoE | None:
+    """Return the block's MoE sub-block, looking through a checkpoint wrapper around it.
+
+    With ``activation_checkpointing='moe'`` the MoE sub-block itself is the checkpoint unit, so the
+    FSDP wrapping that separates expert parameters from the block must still find it.
+    """
     for name in ("moe", "mlp"):
         module = getattr(block, name, None)
+        # A checkpoint wrapper forwards attribute access but not isinstance; look inside.
+        module = getattr(module, "_checkpoint_wrapped_module", module)
         if isinstance(module, MoE):
             return module
 
@@ -203,6 +219,23 @@ def _preserve_gate_load_during_recompute(
         return forward_context, recompute()
 
     return checkpoint_context_fn
+
+
+def _with_model_checkpoint_context(
+    block: nn.Module,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+    """Let a block extend its own activation-checkpoint contexts.
+
+    Models that own state which must stay consistent between the checkpoint forward and
+    its recompute (for example a frozen router whose selection is replayed instead of
+    recomputed) expose ``nemo_checkpoint_context_fn(context_fn)`` on the block. The
+    parallelizer stays model-agnostic: it only composes that hook when present.
+    """
+    hook = getattr(block, "nemo_checkpoint_context_fn", None)
+    if not callable(hook):
+        return context_fn
+    return hook(context_fn)
 
 
 def _get_model_moe_config(model: nn.Module):
@@ -303,8 +336,13 @@ class ExpertParallel(ParallelStyle):
         assert device_mesh.ndim == 1
 
         for name, param in module.named_parameters(recurse=False):
-            dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
-            dist_param.requires_grad = param.requires_grad
+            # Pass requires_grad at construction: nn.Parameter defaults to
+            # requires_grad=True, which raises for non-floating dtypes (e.g. the
+            # int8 / e8m0 packed tensors of mxfp4-resident experts) before a
+            # later assignment could fix it.
+            dist_param = nn.Parameter(
+                distribute_tensor(param, device_mesh, [Shard(0)]), requires_grad=param.requires_grad
+            )
             module.register_parameter(name, dist_param)
 
         if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsMoK)):
@@ -482,25 +520,9 @@ def _replay_deepep_dispatch_on_recompute(
     dispatches separate, and the recompute consumes them in the order the
     matching forward produced them.
     """
-    from nemo_automodel.components.moe.megatron.fused_a2a import (
-        DispatchReplayRecorder,
-        dispatch_replay_scope,
-    )
+    from nemo_automodel.components.moe.megatron.fused_a2a import deepep_dispatch_replay
 
-    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
-        forward_context, recompute_context = context_fn()
-        recorder = DispatchReplayRecorder()
-
-        @contextmanager
-        def scoped(mode: str, inner: AbstractContextManager):
-            if mode == "replay":
-                recorder.rewind()
-            with dispatch_replay_scope(recorder, mode), inner:
-                yield
-
-        return scoped("record", forward_context), scoped("replay", recompute_context)
-
-    return checkpoint_context_fn
+    return deepep_dispatch_replay.checkpoint_context_fn(context_fn)
 
 
 def _replay_hybridep_dispatch_on_recompute(
@@ -514,31 +536,33 @@ def _replay_hybridep_dispatch_on_recompute(
     still redispatching the recomputed activations, so activation memory remains
     checkpointed.
     """
-    from nemo_automodel.components.moe.megatron.fused_a2a import (
-        HybridEPDispatchReplayRecorder,
-        hybridep_dispatch_replay_scope,
-    )
+    from nemo_automodel.components.moe.megatron.fused_a2a import hybridep_dispatch_replay
 
-    def checkpoint_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
-        forward_context, recompute_context = context_fn()
-        recorder = HybridEPDispatchReplayRecorder()
+    return hybridep_dispatch_replay.checkpoint_context_fn(context_fn)
 
-        @contextmanager
-        def scoped(mode: str, inner: AbstractContextManager):
-            if mode == "replay":
-                recorder.rewind()
-            with hybridep_dispatch_replay_scope(recorder, mode):
-                with inner:
-                    yield
-                if mode == "record":
-                    # Cache the dispatch extents only after the selective-op
-                    # context exits. Recompute can then reuse them without an
-                    # extra aten.sum that would diverge from the forward trace.
-                    recorder.finalize()
 
-        return scoped("record", forward_context), scoped("replay", recompute_context)
+def _cache_moe_combine_on_recompute(
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]],
+) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]]:
+    """Serve each MoE layer's combine output of the checkpoint forward to its backward recompute.
 
-    return checkpoint_context_fn
+    ``BackendConfig.dispatcher_recompute_cache``: the block's forward keeps a clone of the HybridEP combine
+    output ([tokens, hidden]); the recompute returns it instead of re-running the unpermute, the EP-group
+    barrier and the combine all-to-all (and, with ``moe_tail``, the down projection's GEMM). One cache per
+    checkpointed call, bound for the forward in ``record`` mode and for the recompute in ``replay`` mode.
+    Independent of the dispatch layout replay, so it is installed whether or not the router is recomputed.
+    """
+    from nemo_automodel.components.moe.megatron.fused_a2a import moe_combine_replay
+
+    return moe_combine_replay.checkpoint_context_fn(context_fn)
+
+
+def _uses_moe_recompute_cache(model: nn.Module) -> bool:
+    """Return whether any expert module asked for the combine recompute cache."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    return any(getattr(module, "dispatcher_recompute_cache", "none") != "none" for module in modules())
 
 
 def _uses_hybridep_dispatch(model: nn.Module) -> bool:
@@ -553,6 +577,28 @@ def _uses_hybridep_dispatch(model: nn.Module) -> bool:
     )
 
 
+def _moe_child(block: nn.Module) -> tuple[str, MoE] | None:
+    """Return the attribute name and module of the block's MoE sub-block, if any."""
+    for name in ("moe", "mlp"):
+        module = getattr(block, name, None)
+        if isinstance(module, MoE):
+            return name, module
+    return None
+
+
+def _uses_hybridep_capacity_mode(model: nn.Module) -> bool:
+    """Return whether any HybridEP expert module runs capacity mode (``dispatcher_capacity_factor``)."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return False
+    return any(
+        isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsTE))
+        and getattr(module, "dispatcher_backend", None) == "hybridep"
+        and getattr(module, "dispatcher_capacity_factor", None) is not None
+        for module in modules()
+    )
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -560,6 +606,7 @@ def apply_ac(
     num_experts: int | None = None,
     selective: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
+    moe_only: bool = False,
 ):
     """Apply activation checkpointing to the model.
 
@@ -575,6 +622,9 @@ def apply_ac(
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy saves ``topk``, and HybridEP reuses the
             checkpoint-forward dispatch layout while redispatching recomputed activations.
+        moe_only: If True, checkpoint only each decoder block's MoE sub-block (``moe``/``mlp``)
+            and save every other activation of the block. Requires ``ignore_router=True`` and
+            ``selective=False``; blocks without an MoE sub-block are left uncheckpointed.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
             the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
@@ -595,7 +645,24 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
+    if moe_only and (selective or not ignore_router):
+        raise ValueError(
+            "activation_checkpointing='moe' requires ignore_router_for_ac=true and cannot be "
+            "combined with selective checkpointing; got "
+            f"selective={selective}, ignore_router={ignore_router}"
+        )
     uses_hybridep_dispatch = checkpoint_decoder and _uses_hybridep_dispatch(model)
+    uses_moe_recompute_cache = checkpoint_decoder and _uses_moe_recompute_cache(model)
+    if checkpoint_decoder and not ignore_router and not selective and _uses_hybridep_capacity_mode(model):
+        # Without a replay recorder the recompute dispatch runs in capacity mode (``capacity`` rows)
+        # while the first forward dispatch was the blocking calibration (``actual`` rows), and
+        # non-reentrant checkpointing fails on the shape mismatch on every run.
+        raise ValueError(
+            "dispatcher_capacity_factor needs the routing pinned across the activation-checkpoint recompute: "
+            "set distributed.moe.ignore_router_for_ac=true (the default) or use selective activation "
+            "checkpointing; with ignore_router_for_ac=false and full checkpointing the recompute dispatch "
+            "is sized to the capacity while the forward calibration dispatch was not"
+        )
     repeated_mtp_moe_block_ids = _repeated_mtp_moe_block_ids(model) if checkpoint_decoder else set()
     if repeated_mtp_moe_block_ids:
         logger.info(
@@ -635,10 +702,11 @@ def apply_ac(
                 if bool(getattr(block, "_nemo_disable_activation_checkpointing", False)):
                     logger.info("Skipping activation checkpointing for model-owned eager block %s", layer_id)
                     continue
+                block_context_fn = _preserve_gate_load_during_recompute(block, attention_context_fn)
                 block = ptd_checkpoint_wrapper(
                     block,
                     preserve_rng_state=True,
-                    context_fn=_preserve_gate_load_during_recompute(block, attention_context_fn),
+                    context_fn=_with_model_checkpoint_context(block, block_context_fn),
                 )
                 # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
                 # selective policy visible to the partitioner) instead of unwrapping and
@@ -707,12 +775,17 @@ def apply_ac(
 
     from nemo_automodel.components.distributed.activation_checkpointing import (
         ensure_fsdp_ops_sac_ignored,
+        ensure_moe_recompute_cache_ops_sac_ignored,
         ensure_profiler_ops_sac_ignored,
         transformer_engine_attention_backend_snapshot_context_fn,
     )
 
     ensure_profiler_ops_sac_ignored()
     ensure_fsdp_ops_sac_ignored()
+    if uses_moe_recompute_cache:
+        # moe_tail allocates the skipped down projection's output in the recompute only; the router-saving
+        # context below indexes every recompute op against the forward's stream (review of #4395).
+        ensure_moe_recompute_cache_ops_sac_ignored()
 
     def _with_attention_backend_snapshot(context_fn=None):
         return functools.partial(transformer_engine_attention_backend_snapshot_context_fn, context_fn)
@@ -739,17 +812,45 @@ def apply_ac(
             block_context_fn = _replay_deepep_dispatch_on_recompute(block_context_fn)
             if uses_hybridep_dispatch:
                 block_context_fn = _replay_hybridep_dispatch_on_recompute(block_context_fn)
+            if moe_only:
+                # Checkpoint the MoE sub-block alone: attention / linear-attention /
+                # residual mixing keep their activations, only the experts (and the
+                # dispatch around them) are recomputed. The block itself is not
+                # wrapped, so model-owned block hooks (e.g. route replay) are not needed.
+                moe_child = _moe_child(block)
+                if moe_child is None:
+                    logger.info(
+                        "Skipping MoE-only activation checkpointing for block %s without an MoE sub-block", layer_id
+                    )
+                    continue
+                child_name, moe_module = moe_child
+                wrapped_moe = ptd_checkpoint_wrapper(
+                    moe_module,
+                    preserve_rng_state=True,
+                    determinism_check=_register_moe_checkpoint_determinism_check(),
+                    context_fn=block_context_fn,
+                )
+                block.register_module(child_name, wrapped_moe)
+                continue
+            if uses_moe_recompute_cache:
+                # Full-block regions only: an MoE-only region ends at the combine, whose output is held by the
+                # consumer outside the region, so its recompute never re-runs the combine and the cache would
+                # only cost the clone.
+                block_context_fn = _cache_moe_combine_on_recompute(block_context_fn)
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
                 determinism_check=_register_moe_checkpoint_determinism_check(),
-                context_fn=block_context_fn,
+                context_fn=_with_model_checkpoint_context(block, block_context_fn),
             )
         else:
+            block_context_fn = _preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot())
+            if uses_moe_recompute_cache:
+                block_context_fn = _cache_moe_combine_on_recompute(block_context_fn)
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
-                context_fn=_preserve_gate_load_during_recompute(block, _with_attention_backend_snapshot()),
+                context_fn=_with_model_checkpoint_context(block, block_context_fn),
             )
 
         parent_layers.register_module(layer_id, block)
@@ -769,6 +870,7 @@ def apply_fsdp(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
+    model_parallelizer: "ModelParallelizer | None" = None,
 ) -> None:
     """Apply FSDP wrapping to MoE transformer blocks and model-level modules."""
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
@@ -788,16 +890,16 @@ def apply_fsdp(
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
-            output_dtype=torch.bfloat16,
-            cast_forward_inputs=True,
+            output_dtype=None,
+            cast_forward_inputs=False,
         )
     experts_mp_policy = parallelizer_utils.get_internal_fsdp_mp_policy(mp_policy)
     fp32_compute_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())
 
-    fully_shard_impl = getattr(model, "_nemo_fully_shard", fully_shard)
+    shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
 
     fully_shard_default = functools.partial(
-        fully_shard_impl,
+        shard_module,
         mesh=fsdp_mesh,
         reshard_after_forward=reshard_after_forward,
         mp_policy=mp_policy,
@@ -838,6 +940,21 @@ def apply_fsdp(
         logger.info(
             "Excluding %d model-owned sharded parameters from FSDP ownership",
             len(externally_sharded_params),
+        )
+
+    # fp32 parameter holders whose forward ignores its input (DeepSeek-V4 attention sinks) share one FSDP
+    # unit across all blocks instead of one per block: FSDP2 can only run their post-backward in the root
+    # callback after the whole backward, serially — see fully_shard_across_blocks.
+    cross_block_names = tuple(getattr(model, "_fsdp_shard_across_blocks", None) or ())
+    cross_block_params: set[nn.Parameter] = set()
+    if cross_block_names:
+        cross_block_params = parallelizer_utils.fully_shard_across_blocks(
+            list(_iter_moe_blocks(model, _model)),
+            cross_block_names,
+            mesh=fsdp_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            shard_module=shard_module,
         )
 
     multimodal_modules: list[tuple[str, nn.Module, set[nn.Parameter], bool]] = []
@@ -930,6 +1047,8 @@ def apply_fsdp(
             ignored_params.update(moe_module.experts.parameters())
         if externally_sharded_params:
             ignored_params.update(externally_sharded_params.intersection(block.parameters()))
+        if cross_block_params:
+            ignored_params.update(cross_block_params.intersection(block.parameters()))
 
         # Reuse the dense dtype-aware path for model-owned fp32 contracts while
         # leaving EP-owned experts out of the block's dtype and FSDP ownership.
@@ -941,7 +1060,7 @@ def apply_fsdp(
             fp32_compute_module_names=fp32_compute_module_names,
             reshard_after_forward=reshard_after_forward,
             ignored_params=ignored_params or None,
-            fully_shard_fn=fully_shard_impl,
+            model_parallelizer=model_parallelizer,
         )
 
     # Re-establish weight tying before detecting it: a device/dtype move during
@@ -1156,6 +1275,7 @@ def parallelize_model(
     enable_async_tensor_parallel: bool = False,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
     reapply_trainability: Callable[[nn.Module], None] | None = None,
+    model_parallelizer: "ModelParallelizer | None" = None,
 ) -> None:
     """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism.
 
@@ -1206,8 +1326,6 @@ def parallelize_model(
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
-        parallelizer_utils.reject_unsupported_mtp_cp_pp(model)
-        parallelizer_utils.reject_unsupported_mtp_cp(model)
         apply_cp(model, world_mesh[cp_axis_name])
 
     ep_enabled = ep_axis_name is not None and moe_mesh is not None and moe_mesh[ep_axis_name].size() > 1
@@ -1226,6 +1344,7 @@ def parallelize_model(
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
             activation_checkpointing_scope=activation_checkpointing_scope,
+            moe_only=_is_moe_only_ac(activation_checkpointing),
         )
 
     if reapply_trainability is not None:
@@ -1259,6 +1378,7 @@ def parallelize_model(
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,
             frozen_multimodal_sharding=frozen_multimodal_sharding,
+            model_parallelizer=model_parallelizer,
         )
         if cp_enabled:
             configured_units = parallelizer_utils.configure_fsdp_unused_param_reduction(model)
