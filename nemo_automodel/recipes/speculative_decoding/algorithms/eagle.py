@@ -434,13 +434,6 @@ class TrainEagle1Recipe(SpecDecodeRecipeBase):
             )
         return eval_metrics
 
-    def _on_train_end(self) -> None:
-        """Finish the W&B and Trackio runs."""
-        if getattr(self, "wandb_run", None) is not None:
-            self.wandb_run.finish()
-        if getattr(self, "trackio_logger", None) is not None:
-            self.trackio_logger.finish()
-
 
 class TrainEagle2Recipe(TrainEagle1Recipe):
     """EAGLE-2 draft training.

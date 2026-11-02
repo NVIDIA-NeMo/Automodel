@@ -1214,7 +1214,7 @@ def _eval_recipe(batches):
     obj.trainer_module = SimpleNamespace(eval=lambda: None, train=lambda: None)
     obj._dp_allreduce = lambda tensor: tensor
     remaining = list(batches)
-    obj._forward_batch = lambda batch: remaining.pop(0)
+    obj._forward_micro_batch = lambda batch: remaining.pop(0)
     return obj
 
 

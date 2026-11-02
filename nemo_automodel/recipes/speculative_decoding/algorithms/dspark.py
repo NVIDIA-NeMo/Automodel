@@ -1296,7 +1296,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         if meta is not None:
             check_resumed_mask_token_id(meta, self.mask_token_id, ckpt_dir)
 
-    def _forward_batch(self, batch):
+    def _forward_micro_batch(self, batch):
         """Run one batch through live target capture or the offline cache."""
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         if self.target_wrapper is None:
@@ -1353,7 +1353,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         accept_pos_den = torch.zeros(self.block_size, device=self.device)
         with torch.no_grad():
             for batch in self.val_dataloader:
-                metrics = self._forward_batch(batch)
+                metrics = self._forward_micro_batch(batch)
                 scalars += torch.stack(
                     [
                         metrics.loss.detach(),
@@ -1416,14 +1416,6 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             logger.warning("Failed to finish W&B run cleanly.", exc_info=True)
         finally:
             self.wandb_run = None
-
-    def _forward_micro_batch(self, batch):
-        """Return the DSpark step metrics of one micro-batch.
-
-        Args:
-            batch: Mapping of tensors from the training dataloader; see :meth:`_forward_batch`.
-        """
-        return self._forward_batch(batch)
 
     def _sync_grads_before_clip(self) -> None:
         """No-op: DDP and FSDP2 already reduced the draft gradients on the final backward."""

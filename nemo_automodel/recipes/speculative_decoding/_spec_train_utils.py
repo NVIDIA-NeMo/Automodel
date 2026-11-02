@@ -253,23 +253,22 @@ def should_sync_grads(
     grad_accumulation_steps: int,
     batch_idx: int,
     batches_per_epoch: int | None,
-    is_ddp: bool,
 ) -> bool:
-    """Return True when this micro-batch's backward should all-reduce gradients.
+    """Return True when this micro-batch's backward should reduce gradients.
 
-    Under DDP with gradient accumulation only the micro-batch immediately
-    followed by an ``optimizer.step()`` needs to synchronize: at that point the
+    With gradient accumulation only the micro-batch immediately followed by an
+    ``optimizer.step()`` needs to synchronize: at that point the
     locally-accumulated ``.grad`` already holds the whole window's contribution,
-    so a single all-reduce averages the complete window and the intervening
-    micro-batches can run under ``no_sync()`` -- saving ``grad_accumulation_steps - 1``
-    all-reduces per window. That step is either the window closer
+    so a single reduction covers the complete window and the intervening
+    micro-batches can skip it, saving ``grad_accumulation_steps - 1`` reductions
+    per window. That step is either the window closer
     (``pending_micro_batches + 1 == grad_accumulation_steps``) or the epoch's
     final batch (which the trailing-flush step consumes). When the dataloader
     length is unknown we cannot identify the final batch, so we sync every step
-    (correct, just no speedup). With a single process (no DDP) there is nothing
-    to synchronize, so this is always True.
+    (correct, just no speedup). ``get_sync_ctx`` turns the decision into DDP
+    ``no_sync()`` or FSDP2 deferral; a single-process draft ignores it.
     """
-    if not is_ddp or batches_per_epoch is None:
+    if batches_per_epoch is None:
         return True
     closes_window = pending_micro_batches + 1 == grad_accumulation_steps
     is_last_batch = batch_idx == batches_per_epoch - 1

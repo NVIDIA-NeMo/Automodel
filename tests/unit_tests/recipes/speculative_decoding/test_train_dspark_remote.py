@@ -214,7 +214,7 @@ def test_remote_setup_seeds_draft_from_server_and_feeds_colocated_features(monke
     recorded = {}
     recipe.trainer_module = lambda **kwargs: recorded.update(kwargs)
     batch = _batches()[0]
-    recipe._forward_batch(batch)
+    recipe._forward_micro_batch(batch)
 
     reference = HFDSparkTargetModel(model, target_layer_ids=LAYER_IDS).generate_batch(
         input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], loss_mask=batch["loss_mask"]

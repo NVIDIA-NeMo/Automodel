@@ -568,7 +568,7 @@ class SpecDecodeRecipeBase(BaseRecipe):
         self._on_epoch_end(epoch_idx, batches_seen)
         eval_metrics = self._run_eval()
         val_metrics = self._report_epoch(epoch_idx, self.runtime.global_step - start_step, eval_metrics)
-        if getattr(self, "save_checkpoint_every_epoch", False) and batches_seen > 0:
+        if getattr(self, "save_checkpoint_every_epoch", False):
             self.save_checkpoint(
                 epoch=epoch_idx + 1,
                 step=self.runtime.global_step,
@@ -620,7 +620,19 @@ class SpecDecodeRecipeBase(BaseRecipe):
         """Called once before the first epoch that trains."""
 
     def _on_train_end(self) -> None:
-        """Release loggers and other run resources; runs on every exit path."""
+        """Finish the W&B and Trackio runs; runs on every exit path.
+
+        Best-effort, so a teardown failure never masks the exception that ended
+        training.
+        """
+        for name in ("wandb_run", "trackio_logger"):
+            run = getattr(self, name, None)
+            if run is None:
+                continue
+            try:
+                run.finish()
+            except Exception:
+                logger.exception("Failed to finish %s", name)
 
     def _finish_checkpointing(self) -> None:
         """Wait for and publish pending checkpoints after the last epoch."""
@@ -642,7 +654,6 @@ class SpecDecodeRecipeBase(BaseRecipe):
             grad_accumulation_steps=self.grad_accumulation_steps,
             batch_idx=batch_idx,
             batches_per_epoch=num_batches,
-            is_ddp=True,
         )
         return get_sync_ctx(self.trainer_module, is_optim_step, self.defer_fsdp_grad_sync)
 
