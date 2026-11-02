@@ -615,9 +615,9 @@ jobs:
           # moe + parallelism merged (2.8 + 5.8 = 8.6 min median) to fit `max-parallel: 10`.
           # Each parity test in `parallelism` runs the proxy twice (1-rank baseline +
           # 2-rank parallel), so the budget is roughly double a single smoke test.
-          # The merged pytest run took 32-33 minutes before `distributed` was added
-          # (about 4 more minutes), so a 50-minute timeout leaves room for slow runners
-          # without letting a hung test retry for long.
+          # The merged pytest run took 32-33 minutes before `distributed` was added, and
+          # that folder adds a few minutes, so a 50-minute timeout leaves room for slow
+          # runners without letting a hung test retry for long.
           # Include the two-GPU CLEF optimizer/reload and native YAML-setup coverage, plus
           # every test under tests/functional_tests/distributed.
           - test-name: L2_Distributed
