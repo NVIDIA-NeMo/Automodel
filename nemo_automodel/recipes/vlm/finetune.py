@@ -492,7 +492,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         """Whether this rank owns the trainable model and its components."""
         return True
 
-    def _get_packing_contract(self) -> PackingCapabilities:
+    @property
+    def _packing_contract(self) -> PackingCapabilities:
         """Query loader requests; KD can include a teacher constructed later."""
         from nemo_automodel.components.models.common.packing import get_packing_capabilities_for_models
 
@@ -703,7 +704,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         # Every loader receives model return requests; only packed batched input
         # configures mask/Flash/gather adapters. THD owns its length-based route.
-        packing_contract = self._get_packing_contract()
+        packing_contract = self._packing_contract
         if dataloader_config.output_format == "thd":
             validate_thd_packing_support(self.model_parts)
         elif dataloader_config.is_packed:
