@@ -2482,6 +2482,46 @@ def test_te_honors_compile_router_weight(moe_config, fake_native_te, monkeypatch
     assert called == [1]
 
 
+@pytest.mark.parametrize("equal_token_counts", [None, False, True], ids=["omitted", "false", "true"])
+def test_te_passes_equal_token_counts_to_the_hybridep_manager(
+    moe_config, fake_native_te, monkeypatch, equal_token_counts
+):
+    """dispatcher_equal_token_counts reaches the HybridEP manager on the TE path as on the native one; dropped, every
+    dispatch keeps the EP-group max all-reduce and host sync that the setting exists to skip."""
+    import nemo_automodel.components.moe.megatron.token_dispatcher as token_dispatcher
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    # The real dispatcher builds the manager; only the HybridEP kernel entry point is missing on CPU.
+    monkeypatch.setattr(
+        "nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher", token_dispatcher.MoEFlexTokenDispatcher
+    )
+    monkeypatch.setattr(token_dispatcher.MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", Mock())
+    knobs = {} if equal_token_counts is None else {"dispatcher_equal_token_counts": equal_token_counts}
+    backend = BackendConfig(experts="te", dispatcher="hybridep", **knobs)
+    experts = GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="hybridep")
+    group = Mock()
+    group.size.return_value = 2
+    mesh = Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    mesh.get_group.return_value = group
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+
+    assert experts.token_dispatcher._comm_manager.equal_token_counts is bool(equal_token_counts)
+
+
+def test_te_rejects_the_hybridep_capacity_factor(moe_config, fake_native_te):
+    """Capacity mode pads the dispatched buffer past the routed rows, which TE's per-expert split sizes cannot
+    describe, so the TE experts refuse the factor instead of silently keeping the blocking dispatch."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    backend = BackendConfig(experts="te", dispatcher="hybridep", dispatcher_capacity_factor=1.5)
+    with pytest.raises(ValueError, match="dispatcher_capacity_factor is not supported by the TE grouped experts"):
+        GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="hybridep")
+
+
 def test_te_native_recipe_validation_and_padding(moe_config, fake_native_te):
     from nemo_automodel.components.moe.experts import GroupedExpertsTE
 

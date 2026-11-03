@@ -1903,12 +1903,17 @@ class GroupedExpertsTE(nn.Module):
         Args:
             config: MoE configuration containing expert parameters.
             backend: Backend configuration; reads ``benchmark_static_routing``
-                (cache the per-microbatch split list under forced-balanced routing) and
-                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs).
+                (cache the per-microbatch split list under forced-balanced routing),
+                ``te_grouped_tensor`` (prefer TE native grouped-tensor GEMMs) and
+                ``dispatcher_equal_token_counts`` (passed to the HybridEP dispatcher).
             dispatcher_backend: Backend for the flex token dispatcher ("deepep" or "hybridep").
             dispatcher_num_sms: Number of SMs to use for the dispatcher backend.
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
+
+        Raises:
+            ValueError: If ``te_grouped_tensor`` is requested with Transformer Engine older than 2.19.0, or if
+                ``dispatcher_capacity_factor`` is set, which these experts cannot use.
         """
         from nemo_automodel.components.models.common.utils import _patch_te_modules
 
@@ -1957,6 +1962,18 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
         )
+        # BackendConfig.dispatcher_equal_token_counts (HybridEP only): every EP rank dispatches the same row
+        # count, so the dispatcher derives its pad size locally instead of all-reducing it on every dispatch.
+        self.dispatcher_equal_token_counts = backend.dispatcher_equal_token_counts if backend is not None else False
+        if backend is not None and backend.dispatcher_capacity_factor is not None:
+            # Capacity mode pads the dispatched buffer past the routed rows while tokens_per_expert counts only
+            # those rows. TE's GroupedLinear needs split sizes that cover every input row and reads them on the
+            # host, so the factor would neither run nor remove a sync here.
+            raise ValueError(
+                "dispatcher_capacity_factor is not supported by the TE grouped experts "
+                f"(experts={backend.experts!r} with dispatcher={backend.dispatcher!r}); use experts='torch_mm' "
+                "or leave it at None."
+            )
 
         # BackendConfig.dispatcher_recompute_cache: the HybridEP combine output of a checkpoint forward is served
         # in the recompute ("combine"); "moe_tail" is refused by BackendConfig for this backend (no deferred GEMM
@@ -2266,6 +2283,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
             moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
             moe_benchmark_static_routing=self.static_routing,
         )
