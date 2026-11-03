@@ -42,7 +42,11 @@ logger = logging.getLogger(__name__)
 _DEVICE_FLOPS: dict[str, float] = {
     "CPU": 448e9,
     "GB200": 2.5e15,
+    # Blackwell Ultra keeps Blackwell's dense BF16 peak: NVIDIA lists 360 PFLOPS sparse per
+    # GB300 NVL72 rack and 36 PFLOPS sparse per HGX B300, the same as GB200 NVL72 and HGX B200.
+    "GB300": 2.5e15,
     "B200": 2.25e15,
+    "B300": 2.25e15,
     "MI300X": 1336e12,
     "H100": 989e12,
     "H800": 989e12,
