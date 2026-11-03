@@ -118,16 +118,19 @@ def test_closed_loader_reports_error_instead_of_source_exhaustion():
     pipeline.checkpoint.assert_not_called()
 
 
-def test_iterator_cleanup_without_public_pipeline_close():
-    pipeline = Mock(spec=[])
-    iterator = Mock(spec=["close"])
+def test_close_delegates_iterator_cleanup_to_pipeline():
+    pipeline = Mock(spec=["close"])
+    iterator = iter(())
     loader = ZephonDataLoader(
         pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
     )
     loader._iterator = iterator
+    active_iterators = []
+    pipeline.close.side_effect = lambda: active_iterators.append(loader._iterator)
     loader.close()
     loader.close()
-    iterator.close.assert_called_once()
+    assert active_iterators == [iterator, None]
+    assert loader._iterator is None
     with pytest.raises(RuntimeError, match="ZephonDataLoader is closed"):
         next(loader)
 
@@ -138,8 +141,12 @@ def test_public_pipeline_cleanup_errors_are_not_swallowed():
     loader = ZephonDataLoader(
         pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
     )
+    loader._iterator = iter(())
     with pytest.raises(RuntimeError, match="pipeline cleanup failed"):
         loader.close()
+    assert loader._iterator is None
+    with pytest.raises(RuntimeError, match="ZephonDataLoader is closed"):
+        next(loader)
 
 
 @pytest.mark.parametrize("attention_kind", ["block_causal", "flash_varlen"])
