@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -42,6 +43,7 @@ from nemo_automodel.components.datasets.vlm.loader import (
 from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -764,9 +766,9 @@ def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
         shuffle=False,
     )
 
-    packing = SimpleNamespace(
+    packing = PackingCapabilities(
         packed_mask_type="block_causal",
-        requires_packed_sequence_metadata=False,
+        return_packed_sequence_metadata=False,
     )
     result = config.build(
         pretrained_model_name_or_path="unused",
