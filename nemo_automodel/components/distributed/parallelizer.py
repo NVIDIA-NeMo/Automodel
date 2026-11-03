@@ -16,7 +16,6 @@ import importlib
 import inspect
 import logging
 import warnings
-from collections.abc import Callable
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
@@ -40,7 +39,6 @@ from torch.distributed.tensor.parallel import (
     ParallelStyle,
     RowwiseParallel,
     SequenceParallel,
-    parallelize_module,
 )
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
@@ -79,7 +77,15 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     is_nemotron_flash_config,
     validate_optimized_tp_mesh,
 )
-from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce, translate_to_lora
+from nemo_automodel.components.distributed.parallel_styles import (
+    ReplicatedWithGradAllReduce,
+    parallelize_module_preserving_trainability,
+    translate_to_lora,
+)
+from nemo_automodel.components.distributed.parallelizer_utils import (
+    assert_trainability_unchanged,
+    trainability_by_name,
+)
 from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
@@ -295,9 +301,9 @@ class ModelParallelizer:
         reshard_after_forward: bool | None = None,
         activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
         frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
-        reapply_trainability: Callable[[nn.Module], None] | None = None,
     ) -> nn.Module:
         """Apply the shared dense FSDP2 implementation."""
+        trainability = trainability_by_name(model)
         frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
         tp_mesh = device_mesh[tp_mesh_name]
         # Set FSDP sharding mesh to context parallel mesh if CP > 1, else default to the data parallel mesh.
@@ -343,7 +349,7 @@ class ModelParallelizer:
                         message=".*could not be resolved.*",
                         category=UserWarning,
                     )
-                    parallelize_module(model, tp_mesh, model_parallel_plan)
+                    parallelize_module_preserving_trainability(model, tp_mesh, model_parallel_plan)
                 # TP styles replace module weights with DTensors independently.
                 # Restore an architectural embedding/head alias before FSDP
                 # records ownership; re-tying after FSDP can leave two roots
@@ -410,11 +416,10 @@ class ModelParallelizer:
                 else:
                     apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
 
-        if reapply_trainability is not None:
-            reapply_trainability(model)
+        assert_trainability_unchanged(model, trainability)
 
-        # Evaluate frozen-module ownership only after TP/AC transformations and
-        # trainability rebinding so FSDP sees the final module hierarchy.
+        # Evaluate frozen-module ownership only after TP/AC transformations so
+        # FSDP sees the final module hierarchy.
         frozen_multimodal_modules = [
             name for name, module in iter_multimodal_modules(model) if module_is_fully_frozen(module)
         ]
@@ -1540,7 +1545,6 @@ def fsdp2_strategy_parallelize(
     reshard_after_forward: bool | None = None,
     activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
-    reapply_trainability: Callable[[nn.Module], None] | None = None,
 ) -> nn.Module:
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -1576,9 +1580,6 @@ def fsdp2_strategy_parallelize(
             owned by the root FSDP unit (``"root"``), sharded normally
             (``"per_layer"``), or excluded from FSDP and copied on every rank
             (``"replicate"``).
-        reapply_trainability: Optional callback that re-resolves parameter
-            trainability after strategy-specific model surgery and immediately
-            before FSDP construction.
 
     Returns:
         The parallelized model.
@@ -1619,7 +1620,6 @@ def fsdp2_strategy_parallelize(
         device_mesh,
         strategy_config=config,
         activation_checkpointing=activation_checkpointing,
-        reapply_trainability=reapply_trainability,
     )
     return parallelize_model(model, mesh_context)
 
@@ -1751,7 +1751,6 @@ def megatron_fsdp_strategy_parallelize(
     fsdp_double_buffer: bool = False,
     dp_shard_dim: str = "dp",
     tp_dim: str = "tp",
-    reapply_trainability: Callable[[nn.Module], None] | None = None,
 ):
     """
     Apply tensor/data parallelism (MegatronFSDP) and optional activation-checkpointing to the model.
@@ -1807,9 +1806,6 @@ def megatron_fsdp_strategy_parallelize(
             Defaults to "dp".
         tp_dim (str): Key name for the tensor parallel mesh in device_mesh.
             Defaults to "tp".
-        reapply_trainability: Optional callback that re-resolves parameter
-            trainability after tensor-parallel surgery and immediately before
-            Megatron-FSDP construction.
 
     NOTE: The passed-in model should preferably reside on the meta device.
     Otherwise, ensure the model fits into available GPU or CPU memory.
@@ -1833,10 +1829,7 @@ def megatron_fsdp_strategy_parallelize(
 
     # TP sharding.
     if tp_mesh.size() > 1:
-        parallelize_module(model, tp_mesh, tp_shard_plan)
-
-    if reapply_trainability is not None:
-        reapply_trainability(model)
+        parallelize_module_preserving_trainability(model, tp_mesh, tp_shard_plan)
 
     # MegatronFSDP requires a sharded DP dimension to create its param/grad buffers.
     # In practice, configurations like world_size=2,tp=2 -> dp=1 frequently hit

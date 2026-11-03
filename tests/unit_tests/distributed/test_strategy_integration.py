@@ -155,7 +155,7 @@ def test_backward_compatibility_standard_model(
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
 @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
 @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
-@patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
+@patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module_preserving_trainability")
 def test_backward_compatibility_nemotron_model(
     mock_parallelize_module, mock_fully_shard, mock_fully_shard_by_dtype, mock_gpgr, mock_device_mesh
 ):
@@ -231,7 +231,9 @@ def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
             "nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype",
             side_effect=lambda model, **kwargs: model,
         ),
-        patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module"),
+        patch(
+            "nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module_preserving_trainability"
+        ),
     ):
         with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
             with patch(

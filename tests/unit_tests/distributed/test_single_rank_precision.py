@@ -93,7 +93,6 @@ def _parallelize(model, *, dtype=torch.bfloat16, autocast_dtype=None, checkpoint
             autocast_dtype=autocast_dtype,
         ),
         activation_checkpointing=checkpointing,
-        reapply_trainability=None,
     )
     return parallelize_model(model, context)
 

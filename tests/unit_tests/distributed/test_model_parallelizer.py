@@ -58,7 +58,6 @@ def test_contract_is_runtime_lightweight():
         "strategy_config",
         "moe_parallel_config",
         "activation_checkpointing",
-        "reapply_trainability",
     } <= MeshContext.__dataclass_fields__.keys()
 
 
@@ -144,7 +143,6 @@ def test_moe_executor_uses_generic_sharding_by_default(monkeypatch):
         strategy_config=FSDP2Config(),
         moe_parallel_config=None,
         activation_checkpointing=False,
-        reapply_trainability=None,
         parallelize_axis_kwargs=lambda: {},
     )
     executor = Mock()
@@ -167,7 +165,6 @@ def test_moe_executor_receives_opted_in_model_parallelizer(monkeypatch):
         strategy_config=FSDP2Config(),
         moe_parallel_config=None,
         activation_checkpointing=False,
-        reapply_trainability=None,
         parallelize_axis_kwargs=lambda: {},
     )
     executor = Mock()

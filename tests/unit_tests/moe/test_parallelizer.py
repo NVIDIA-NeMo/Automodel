@@ -457,6 +457,9 @@ def _import_parallelizer_with_stubs(monkeypatch):
     parallelizer_utils_stub.fully_shard_across_blocks = lambda blocks, module_names, **kwargs: set()
     parallelizer_utils_stub.get_internal_fsdp_mp_policy = lambda mp_policy: ("INTERNAL_MP_POLICY", mp_policy)
     parallelizer_utils_stub.configure_fsdp_unused_param_reduction = lambda module: 0
+    # The stubbed torch has no real parameters, so the trainability check is a no-op here.
+    parallelizer_utils_stub.trainability_by_name = lambda module: {}
+    parallelizer_utils_stub.assert_trainability_unchanged = lambda module, before: None
 
     monkeypatch.setitem(
         sys.modules,
@@ -515,6 +518,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     parallel_styles_stub = types.ModuleType("nemo_automodel.components.distributed.parallel_styles")
     parallel_styles_stub.translate_to_lora = lambda style: style
+    parallel_styles_stub.parallelize_module_preserving_trainability = lambda module, device_mesh, plan: None
     monkeypatch.setitem(
         sys.modules,
         "nemo_automodel.components.distributed.parallel_styles",
@@ -668,7 +672,7 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     # Patch MoE symbol for isinstance
     monkeypatch.setattr(P, "MoE", DummyMoE)
     parallelize_module_mock = MagicMock()
-    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+    monkeypatch.setattr(P, "parallelize_module_preserving_trainability", parallelize_module_mock)
 
     block = DummyBlock(mlp=DummyMoE())
     model = DummyModel([block])
@@ -717,7 +721,7 @@ def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
     parallelize_module_mock = MagicMock()
-    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+    monkeypatch.setattr(P, "parallelize_module_preserving_trainability", parallelize_module_mock)
 
     class DiffusionBlock:
         def __init__(self):
@@ -1946,7 +1950,9 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
     calls = []
     safe_plan = {"model.layers.*.mlp.shared_experts.up_proj": object()}
     monkeypatch.setattr(P, "_resolve_moe_tp_plan", MagicMock(return_value=safe_plan))
-    monkeypatch.setattr(P, "parallelize_module", MagicMock(side_effect=lambda *args: calls.append("tp")))
+    monkeypatch.setattr(
+        P, "parallelize_module_preserving_trainability", MagicMock(side_effect=lambda *args: calls.append("tp"))
+    )
     monkeypatch.setattr(P, "apply_cp", MagicMock(side_effect=lambda *args: calls.append("cp")))
     monkeypatch.setattr(P, "apply_ep", MagicMock(side_effect=lambda *args, **kwargs: calls.append("ep")))
     monkeypatch.setattr(P, "apply_ac", MagicMock(side_effect=lambda *args, **kwargs: calls.append("ac")))
@@ -1980,10 +1986,9 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
         tp_axis_name="tp",
         ep_axis_name="ep",
         activation_checkpointing=True,
-        reapply_trainability=lambda _model: calls.append("trainability"),
     )
 
-    assert calls == ["tp", "tie", "cp", "ep", "ac", "trainability", "fsdp"]
+    assert calls == ["tp", "tie", "cp", "ep", "ac", "fsdp"]
     assert model._nemo_moe_tp_requires_replica_sync is True
     assert model._nemo_moe_tp_requires_pretrained_weights is True
     P._resolve_moe_tp_plan.assert_called_once_with(
@@ -3000,7 +3005,7 @@ def test_apply_ep_handles_block_with_moe_attribute(monkeypatch):
     # Patch MoE symbol for isinstance
     monkeypatch.setattr(P, "MoE", DummyMoE)
     parallelize_module_mock = MagicMock()
-    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+    monkeypatch.setattr(P, "parallelize_module_preserving_trainability", parallelize_module_mock)
 
     moe = DummyMoE()
     # Block has moe attribute instead of mlp
@@ -3023,7 +3028,7 @@ def test_apply_ep_prefers_moe_over_mlp(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
     parallelize_module_mock = MagicMock()
-    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+    monkeypatch.setattr(P, "parallelize_module_preserving_trainability", parallelize_module_mock)
 
     moe = DummyMoE()
     mlp = DummyMoE()  # A different MoE object
@@ -3044,7 +3049,7 @@ def test_apply_ep_falls_back_to_mlp(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     monkeypatch.setattr(P, "MoE", DummyMoE)
     parallelize_module_mock = MagicMock()
-    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+    monkeypatch.setattr(P, "parallelize_module_preserving_trainability", parallelize_module_mock)
 
     mlp = DummyMoE()
     # Block with mlp but no moe attribute

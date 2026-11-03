@@ -18,10 +18,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.tensor import DeviceMesh, Replicate, Shard
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
+    ParallelStyle,
     RowwiseParallel,
     SequenceParallel,
 )
@@ -31,6 +34,7 @@ from nemo_automodel.components.distributed.parallel_styles import (
     RowwiseParallelLora,
     SequenceParallelLora,
     _distribute_param,
+    parallelize_module_preserving_trainability,
     translate_to_lora,
 )
 
@@ -104,8 +108,9 @@ class TestDistributeParam:
             assert call_args[0][1] == mock_device_mesh
             assert call_args[1]["src_data_rank"] == 0
 
-            # Verify the parameter was updated
+            # Verify the parameter was updated and kept its trainability
             assert isinstance(module.weight, nn.Parameter)
+            assert module.weight.requires_grad == original_requires_grad
 
     def test_distribute_param_preserves_requires_grad_true(self, mock_device_mesh):
         """Test that requires_grad=True is preserved."""
@@ -484,3 +489,62 @@ class TestIntegration:
         # Should not raise an error
         with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param"):
             colwise._partition_linear_fn("test", mock_linear_module, mock_device_mesh)
+
+
+# ==================== parallelize_module_preserving_trainability ====================
+
+
+@pytest.fixture
+def single_rank_tp_mesh():
+    """Provide a one-rank gloo process group and its CPU tensor-parallel mesh."""
+    if not dist.is_available():
+        pytest.skip("torch.distributed is not available")
+    already = dist.is_initialized()
+    if not already:
+        dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.HashStore())
+    try:
+        yield init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+    finally:
+        if not already:
+            dist.destroy_process_group()
+
+
+class _UpDown(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up = nn.Linear(4, 8)
+        self.down = nn.Linear(8, 4)
+
+
+class TestParallelizeModulePreservingTrainability:
+    """Tensor parallelism must not change which parameters train."""
+
+    def test_stock_styles_keep_frozen_parameters_frozen(self, single_rank_tp_mesh):
+        model = _UpDown()
+        model.up.requires_grad_(False)
+
+        parallelize_module_preserving_trainability(
+            model, single_rank_tp_mesh, {"up": ColwiseParallel(), "down": RowwiseParallel()}
+        )
+
+        # The stock styles re-register every parameter as a DTensor.
+        assert all(isinstance(parameter, DTensor) for parameter in model.parameters())
+        assert not model.up.weight.requires_grad
+        assert not model.up.bias.requires_grad
+        assert model.down.weight.requires_grad
+        assert model.down.bias.requires_grad
+
+    def test_restores_frozen_flags_when_a_style_fails_part_way(self, single_rank_tp_mesh):
+        class _ReplaceThenFail(ParallelStyle):
+            def _apply(self, module, device_mesh):
+                module.weight = nn.Parameter(module.weight.detach().clone())  # requires_grad=True by default
+                raise RuntimeError("style failed")
+
+        model = _UpDown()
+        model.up.requires_grad_(False)
+
+        with pytest.raises(RuntimeError, match="style failed"):
+            parallelize_module_preserving_trainability(model, single_rank_tp_mesh, {"up": _ReplaceThenFail()})
+
+        assert not model.up.weight.requires_grad
+        assert not model.up.bias.requires_grad

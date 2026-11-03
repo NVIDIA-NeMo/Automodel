@@ -44,9 +44,11 @@ if TYPE_CHECKING:
 UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
 
 __all__ = [
+    "assert_trainability_unchanged",
     "fully_shard_by_dtype",
     "reject_unsupported_mtp_cp",
     "reject_unsupported_mtp_cp_pp",
+    "trainability_by_name",
 ]
 
 
@@ -75,6 +77,50 @@ def reject_unsupported_mtp_cp_pp(model: nn.Module, *, pp_size: int | None = None
     if (pp_size is not None and pp_size > 1) or (callable(is_pp_stage_fn) and is_pp_stage_fn()):
         raise NotImplementedError(
             "MTP with context and pipeline parallelism is not supported; use PP size 1 or CP size 1"
+        )
+
+
+def trainability_by_name(module: nn.Module) -> dict[str, bool]:
+    """Return each parameter's ``requires_grad`` flag, keyed by canonical FQN.
+
+    Args:
+        module: Module whose parameters are inspected, including tied aliases.
+
+    Returns:
+        Map from parameter FQN, without activation-checkpoint wrapper components,
+        to ``requires_grad``.
+    """
+    return {
+        canonical_parameter_fqn(name): parameter.requires_grad
+        for name, parameter in module.named_parameters(remove_duplicate=False)
+    }
+
+
+def assert_trainability_unchanged(module: nn.Module, before: dict[str, bool]) -> None:
+    """Fail if model surgery changed which parameters train before FSDP/DDP capture.
+
+    Trainability is resolved once, before parallelization. Surgery that replaces
+    parameters (tensor-parallel styles, expert regrouping) must keep their
+    ``requires_grad`` flags, because the distributed wrapper captures the flags it
+    sees. Parameters whose canonical name did not exist in ``before`` are not
+    compared.
+
+    Args:
+        module: Module after surgery and before distributed wrapping.
+        before: ``trainability_by_name(module)`` taken before surgery.
+
+    Raises:
+        RuntimeError: If a parameter that kept its name changed ``requires_grad``.
+    """
+    changed = sorted(
+        name
+        for name, requires_grad in trainability_by_name(module).items()
+        if name in before and before[name] != requires_grad
+    )
+    if changed:
+        raise RuntimeError(
+            f"Parallelization changed requires_grad for {len(changed)} parameter(s) before distributed wrapping, "
+            f"e.g. {changed[:5]}. Surgery that replaces parameters must keep their requires_grad flags."
         )
 
 
