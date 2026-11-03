@@ -377,7 +377,9 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
                 of shape ``[kept_sequence]``.
             **kwargs: Additional Hugging Face language-model options. Packed
                 FlashAttention metadata contains cumulative sequence lengths of
-                shape ``[num_documents + 1]`` and scalar maximum lengths.
+                shape ``[num_documents + 1]`` and scalar maximum lengths, or an
+                unresolved ``_packed_seq_ids`` map ``[batch, sequence]``
+                converted at decoder entry. Neither belongs to the vision tower.
 
         Returns:
             Qwen3-VL output whose logits have shape ``[batch, kept_sequence,
@@ -387,7 +389,9 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         cp_mesh = getattr(self, "cp_mesh", None)
         cp_size = cp_mesh.size() if cp_mesh is not None else 1
         has_media = pixel_values is not None or pixel_values_videos is not None
-        has_packed_flash_metadata = any(key in kwargs for key in _PACKED_FLASH_ATTENTION_KWARGS)
+        has_packed_flash_metadata = any(key in kwargs for key in _PACKED_FLASH_ATTENTION_KWARGS) or (
+            kwargs.get("_packed_seq_ids") is not None and attention_mask is None and kwargs.get("qkv_format") != "thd"
+        )
         use_packed_media_path = cp_size <= 1 and has_media and has_packed_flash_metadata
         if cp_size <= 1 and not use_packed_media_path:
             return super().forward(

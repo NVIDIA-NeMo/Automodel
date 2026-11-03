@@ -150,6 +150,17 @@ def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
         return dict(kwargs)
 
     allowed = set(params.keys())
+    if (
+        "_packed_seq_ids" in kwargs
+        and "_packed_seq_ids" not in allowed
+        and kwargs.get("attention_mask") is None
+        and not any(kwargs.get(key) is not None for key in ("cu_seq_lens_q", "cu_seq_lens_k"))
+        and kwargs.get("qkv_format") != "thd"
+    ):
+        raise ValueError(
+            f"{type(model).__name__}.forward cannot receive _packed_seq_ids; "
+            "packed attention requires a forward accepting **kwargs or that explicit input"
+        )
     filtered = {key: value for key, value in kwargs.items() if key in allowed}
     dropped = sorted(set(kwargs) - set(filtered))
     if dropped:
