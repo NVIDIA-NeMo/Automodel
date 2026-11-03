@@ -107,6 +107,7 @@ class _Transport:
         self.finalized = 0
         self.ordered = False
         self.dispatches = 0
+        self.domain_queries = []
 
     def is_ep_bootstrapped(self):
         return False
@@ -179,6 +180,8 @@ def transport(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(nccl_ep.dist, "get_backend", lambda group: "nccl")
+    # NCCL reports each group as one NVLink domain unless a test says otherwise.
+    monkeypatch.setattr(nccl_ep, "_nvlink_domain_size", lambda group: api.domain_queries.append(group) or group.size())
     yield api
     nccl_ep.finalize_nccl_ep()
 
@@ -386,6 +389,8 @@ def test_groups_without_a_lendable_communicator_use_a_legacy_group(transport, mo
     _manager(group)
     # NCCL-EP runs on the legacy group, while layers keep matching the caller's group.
     assert [bootstrap[0] for bootstrap in transport.bootstraps] == [legacy]
+    # The NVLink domain check queries the communicator that NCCL-EP borrows.
+    assert transport.domain_queries == [legacy]
     nccl_ep.finalize_nccl_ep()
     # The legacy group outlives finalize, like the EP group it mirrors, and a new bootstrap reuses it.
     _manager(group)
@@ -408,6 +413,20 @@ def test_group_uses_ordered_layout_and_automatic_sms(transport, group, monkeypat
     assert transport.ordered
     assert transport.bootstraps[0][1]["max_num_sms"] == 0
     assert os.environ.get(_ORDERED_LAYOUT_ENV) == previous
+
+
+@pytest.mark.parametrize("domain", [1, 2])
+def test_groups_spanning_nvlink_domains_are_rejected_before_bootstrap(transport, group, monkeypatch, domain):
+    # A rank that receives no tokens crashes NCCL-EP's cross-domain combine, so such groups never bootstrap.
+    monkeypatch.setattr(nccl_ep, "_nvlink_domain_size", lambda pg: transport.domain_queries.append(pg) or domain)
+    if domain == group.size():
+        _manager(group)
+        assert len(transport.bootstraps) == 1
+    else:
+        with pytest.raises(RuntimeError, match=r"spans 2 NVLink domains of 1 rank"):
+            _manager(group)
+        assert not transport.bootstraps
+    assert transport.domain_queries == [group]
 
 
 @pytest.mark.parametrize("rows", [0, 3])

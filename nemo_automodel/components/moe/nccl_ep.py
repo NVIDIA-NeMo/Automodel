@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -96,6 +97,41 @@ def _legacy_group_for(group: dist.ProcessGroup) -> dist.ProcessGroup | None:
     return legacy
 
 
+class _NcclTeam(ctypes.Structure):
+    """NCCL's ``ncclTeam_t``: the team's rank count, this rank's index in it, and its rank stride."""
+
+    _fields_ = [("n_ranks", ctypes.c_int), ("rank", ctypes.c_int), ("stride", ctypes.c_int)]
+
+
+def _nvlink_domain_size(group: dist.ProcessGroup) -> int:
+    """Return how many ranks of ``group`` share this rank's NVLink domain, as NCCL-EP sees it.
+
+    NCCL-EP partitions its group into NCCL's load/store-accessible (LSA) teams, the ranks that
+    reach each other's memory over NVLink, and runs cross-domain kernels when there are several.
+    ``ncclTeamLsa`` reports this rank's team for the communicator that NCCL-EP borrows. The query
+    is local; NCCL-EP repeats it when it creates its group.
+
+    Args:
+        group: Classic NCCL group whose communicator NCCL-EP borrows.
+
+    Returns:
+        The LSA team size, a divisor of ``group.size()``.
+    """
+    # The group creates its communicator on first use.
+    dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    comm = group._get_backend(torch.device("cuda"))._comm_ptr()
+    try:
+        team_lsa = ctypes.CDLL("libnccl.so.2").ncclTeamLsa
+    except (OSError, AttributeError) as exc:
+        raise RuntimeError("NCCL-EP requires NCCL 2.30.4 or newer") from exc
+    team_lsa.argtypes = [ctypes.c_void_p]
+    team_lsa.restype = _NcclTeam
+    size = team_lsa(comm).n_ranks
+    if size <= 0:
+        raise RuntimeError("NCCL could not report the NVLink domain of the NCCL-EP group")
+    return size
+
+
 @contextmanager
 def _ordered_layout_environment() -> Iterator[None]:
     """Select NCCL-EP's ordered expert layout for groups created inside the block."""
@@ -144,9 +180,22 @@ def _join_transport(
             raise RuntimeError("NCCL-EP is already initialized outside AutoModel; finalize that context first")
         if _runtime.legacy_source is not group:
             _runtime.legacy_source, _runtime.legacy_group = group, _legacy_group_for(group)
+        transport_group = group if _runtime.legacy_group is None else _runtime.legacy_group
+        domain = _nvlink_domain_size(transport_group)
+        if domain != group.size():
+            # A rank that receives no tokens leaves NCCL-EP's cross-domain combine without its
+            # communication window, and the kernel then faults. Skipping that rank's combine would
+            # drop results it relays for other ranks, so refuse such groups until NCCL-EP fixes it.
+            raise RuntimeError(
+                f"dispatcher='nccl_ep' requires all EP ranks in one NVLink domain, such as one node or one "
+                f"GB200 NVL72 rack; this EP group of {group.size()} ranks spans {group.size() // domain} "
+                f"NVLink domains of {domain} rank(s). NCCL-EP's cross-domain combine fails with an illegal "
+                "memory access on a rank that receives no tokens. Keep the EP group within one NVLink "
+                "domain or choose another dispatcher."
+            )
         with _ordered_layout_environment():
             api.ep_bootstrap(
-                group if _runtime.legacy_group is None else _runtime.legacy_group,
+                transport_group,
                 num_experts=num_experts,
                 max_tokens_per_rank=capacity,
                 hidden_dim=hidden_dim,
