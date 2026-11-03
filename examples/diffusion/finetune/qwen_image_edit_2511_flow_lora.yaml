@@ -102,7 +102,8 @@ performance:
   check_loss: true
   grad_clip_foreach: false
 
-wandb: null
+wandb:
+  enable: false
 
 dist_env:
   backend: "nccl"
