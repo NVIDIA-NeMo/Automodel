@@ -1043,20 +1043,40 @@ def test_dpace_pre_step_routes_batch_block_denominator_to_recipe():
 
 
 @pytest.mark.parametrize("use_fused_linear_ce", [False, True])
-def test_dflash_forward_backward_uses_precomputed_multiblock_tensors(use_fused_linear_ce):
-    draft = _RecordingDraft()
+@pytest.mark.parametrize("head_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_dflash_forward_backward_uses_precomputed_multiblock_tensors(use_fused_linear_ce, head_dtype):
+    class Draft(_RecordingDraft):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(0.75))
+
+        def forward(self, **kwargs):
+            """Produce FP32 draft outputs with a trainable scale.
+
+            Args:
+                **kwargs: Draft inputs, including noise_embedding of shape
+                    [batch, tokens, hidden]; other inputs are recorded only.
+
+            Returns:
+                FP32 hidden states of shape [batch, tokens, hidden].
+            """
+            return super().forward(**kwargs).float() * self.scale
+
+    torch.manual_seed(4494)
+    draft = Draft()
     strategy = _make_strategy(block_size=3, overlap_anchors=False)
     strategy.num_blocks_per_sample = 2
     strategy.fixed_ctx_len = 6
     strategy.attention_backend = "sdpa"
     strategy.use_fused_linear_ce = use_fused_linear_ce
-    strategy.target_embed = torch.nn.Embedding(16, 5)
-    strategy.target_head = torch.nn.Linear(5, 11)
+    strategy.target_embed = torch.nn.Embedding(16, 5, dtype=head_dtype).requires_grad_(False)
+    strategy.target_head = torch.nn.Linear(5, 11, dtype=head_dtype).requires_grad_(False)
     strategy.dflash_loss_fn = DFlashDecayLoss(loss_gamma=2.0, use_fused_linear_ce=use_fused_linear_ce, chunk_size=2)
     recipe = types.SimpleNamespace(
         dist_env=types.SimpleNamespace(device=torch.device("cpu")),
         model_parts=[draft],
         distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True),
+        _get_dp_group_size=lambda include_cp: 1,
         te_fp8=None,
         device_mesh=None,
         _dllm_loss_buffer=[],
@@ -1080,7 +1100,7 @@ def test_dflash_forward_backward_uses_precomputed_multiblock_tensors(use_fused_l
         loss_buffer=loss_buffer,
         num_diffusion_tokens=4,
         num_batches=1,
-        is_train=False,
+        is_train=True,
     )
 
     assert len(loss_buffer) == 1
@@ -1093,6 +1113,26 @@ def test_dflash_forward_backward_uses_precomputed_multiblock_tensors(use_fused_l
     assert draft.last_kwargs["noise_embedding"].shape == (1, 6, 5)
     assert draft.last_kwargs["position_ids"].tolist() == [[0, 1, 2, 3, 4, 5, 1, 2, 3, 3, 4, 5]]
     assert draft.last_kwargs["attention_mask"].shape == (1, 1, 6, 12)
+
+    # The old enclosing autocast is an oracle for the projection boundary.
+    # Keep the draft output FP32, as requested by the shipped FSDP output policy.
+    reference_scale = draft.scale.detach().clone().requires_grad_()
+    hidden = strategy.target_embed(batch["_dflash_block_output_ids"]).float() * reference_scale
+    pred = hidden.view(1, 2, 3, 5)[:, :, 1:, :]
+    with torch.autocast("cpu", dtype=head_dtype, enabled=head_dtype != torch.float32):
+        logits = strategy.target_head(pred)
+    reference = strategy.dflash_loss_fn(
+        logits=logits,
+        target_ids=batch["_dflash_block_targets"].view(1, 2, 2),
+        block_mask=batch["_dflash_block_mask"].view(1, 2, 2),
+        num_tokens=4,
+        total_blocks=2,
+    ).total_loss
+    reference.backward()
+    torch.testing.assert_close(loss_buffer[0], reference.detach(), rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(draft.scale.grad, reference_scale.grad, rtol=1e-6, atol=1e-6)
+    assert torch.isfinite(draft.scale.grad)
+    assert strategy.target_head.weight.grad is None
 
 
 def test_dflash_forward_backward_fallback_skips_mask_for_single_sdpa_block():

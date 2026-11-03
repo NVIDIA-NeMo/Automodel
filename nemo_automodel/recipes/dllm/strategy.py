@@ -1278,6 +1278,9 @@ class DFlashStrategy(DLLMStrategy):
             # per-block confidence reset is structural.
             k = self.block_size - 1
             pred = draft_hidden.view(B, N, self.block_size, -1)[:, :, 1:, :]  # [B, N, k, dim]
+            # The draft output policy may return FP32; the frozen target head
+            # runs outside draft autocast and requires its own weight dtype.
+            pred = pred.to(self.target_head.weight.dtype)
             block_targets = block_targets.view(B, N, k)
             block_mask = block_mask.view(B, N, k)
             if self.use_fused_linear_ce:
