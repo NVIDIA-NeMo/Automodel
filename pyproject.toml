@@ -744,7 +744,7 @@ include = [
     "nemo_automodel/components/launcher/**",
     "nemo_automodel/components/loggers/**",
     "nemo_automodel/components/optim/**",
-    "nemo_automodel/components/utils/**",
+    "nemo_automodel/components/utils/yaml_utils.py",
 ]
 
 [tool.ty.overrides.rules]
@@ -768,6 +768,7 @@ unresolved-import = "error"
 # include = [
 #     "nemo_automodel/components/training/**",
 #     "nemo_automodel/components/distributed/**",
+#     "nemo_automodel/components/utils/**",
 # ]
 #
 # [tool.ty.overrides.rules]
