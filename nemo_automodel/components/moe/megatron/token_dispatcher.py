@@ -23,7 +23,7 @@ from typing import Literal, Tuple
 import torch
 from torch import nn
 
-from nemo_automodel.components.models.common.utils import NcclEpConfig
+from nemo_automodel.components.moe.config import NcclEpConfig
 from nemo_automodel.components.moe.nccl_ep import NcclEpManager
 
 from .fused_a2a import (

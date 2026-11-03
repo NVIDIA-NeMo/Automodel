@@ -24,9 +24,9 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils.checkpoint import checkpoint
 
 import nemo_automodel.components.moe.nccl_ep as nccl_ep
-from nemo_automodel.components.models.common.utils import BackendConfig, NcclEpConfig
-from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, _has_dispatched_rows
+from nemo_automodel.components.models.common.utils import BackendConfig
+from nemo_automodel.components.moe.config import MoEConfig, NcclEpConfig
+from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
 
 _ORDERED_LAYOUT_ENV = "NCCL_EP_HT_EM_AG_SCAN_MODE"
@@ -191,6 +191,28 @@ def _lending_group():
 @pytest.fixture
 def group():
     return _lending_group()
+
+
+def _moe_config(**overrides) -> MoEConfig:
+    """Return a four-expert top-2 MoE config with hidden size 4."""
+    values = dict(
+        n_routed_experts=4,
+        n_shared_experts=0,
+        n_activated_experts=2,
+        n_expert_groups=1,
+        n_limited_groups=1,
+        train_gate=True,
+        gate_bias_update_factor=0.0,
+        aux_loss_coeff=0.0,
+        score_func="softmax",
+        route_scale=1.0,
+        dim=4,
+        inter_dim=8,
+        moe_inter_dim=8,
+        norm_topk_prob=False,
+    )
+    values.update(overrides)
+    return MoEConfig(**values)
 
 
 def _manager(group, *, max_tokens=5, hidden_dim=4):
@@ -393,10 +415,21 @@ def test_nccl_ep_row_check_reads_the_host_extent(rows):
     # A meta tensor cannot be read on the host: the NCCL-EP check must not touch the counts.
     counts = torch.empty(2, dtype=torch.int64, device="meta")
     received = torch.empty(rows, 4)
-    assert _has_dispatched_rows(received, counts, never_empty=False, dispatcher_backend="nccl_ep") == (rows > 0)
-    assert _has_dispatched_rows(received, counts, never_empty=True, dispatcher_backend="deepep")
+    backend = BackendConfig(dispatcher="nccl_ep", experts="torch_mm", nccl_ep={"max_tokens_per_rank": 5})
+    nccl_experts = GroupedExpertsDeepEP(_moe_config(), backend=backend, dispatcher_backend="nccl_ep")
+    assert nccl_experts._has_dispatched_rows(received, counts) == (rows > 0)
+    # Static routing always dispatches rows, so it must not read the counts either.
+    static = BackendConfig(
+        dispatcher="deepep",
+        experts="torch_mm",
+        benchmark_static_routing=True,
+        fake_balanced_gate=True,
+        fake_gate_noise=0.0,
+    )
+    assert GroupedExpertsDeepEP(_moe_config(), backend=static)._has_dispatched_rows(received, counts)
+    # DeepEP's receive extent need not equal the routed rows, so it must read the counts.
     with pytest.raises(RuntimeError):
-        _has_dispatched_rows(received, counts, never_empty=False, dispatcher_backend="deepep")
+        GroupedExpertsDeepEP(_moe_config())._has_dispatched_rows(received, counts)
 
 
 @pytest.mark.parametrize(
@@ -441,22 +474,7 @@ def test_production_expert_selection_and_dispatch(transport, group, monkeypatch)
     backend = BackendConfig(
         dispatcher="nccl_ep", experts="torch_mm", nccl_ep={"max_tokens_per_rank": 5}, attn="sdpa", linear="torch"
     )
-    config = MoEConfig(
-        n_routed_experts=4,
-        n_shared_experts=0,
-        n_activated_experts=2,
-        n_expert_groups=1,
-        n_limited_groups=1,
-        train_gate=True,
-        gate_bias_update_factor=0.0,
-        aux_loss_coeff=0.0,
-        score_func="softmax",
-        route_scale=1.0,
-        dim=4,
-        inter_dim=8,
-        moe_inter_dim=8,
-        norm_topk_prob=False,
-    )
+    config = _moe_config()
     monkeypatch.setenv("WORLD_SIZE", "2")
     moe = MoE(config, backend)
     assert isinstance(moe.experts, GroupedExpertsDeepEP)
@@ -481,23 +499,7 @@ def test_production_expert_selection_and_dispatch(transport, group, monkeypatch)
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("expert_bias", [False, True])
 def test_empty_experts_keep_dispatch_backward_edge(tokens, lora, packed, expert_bias):
-    config = MoEConfig(
-        n_routed_experts=4,
-        n_shared_experts=0,
-        n_activated_experts=2,
-        n_expert_groups=1,
-        n_limited_groups=1,
-        train_gate=True,
-        gate_bias_update_factor=0.0,
-        aux_loss_coeff=0.0,
-        score_func="softmax",
-        route_scale=1.0,
-        dim=64,
-        inter_dim=64,
-        moe_inter_dim=64,
-        norm_topk_prob=False,
-        expert_bias=expert_bias,
-    )
+    config = _moe_config(dim=64, inter_dim=64, moe_inter_dim=64, expert_bias=expert_bias)
     experts = GroupedExpertsDeepEP(config)
     with torch.no_grad():
         for parameter in experts.parameters():
@@ -527,8 +529,25 @@ def test_empty_experts_keep_dispatch_backward_edge(tokens, lora, packed, expert_
     received = torch.empty(0, config.dim, dtype=torch.float32, requires_grad=True)
     probs = torch.empty(0, dtype=torch.float32, requires_grad=True)
 
-    def permutation(**kwargs):
-        """Return empty per-rank activations [0, hidden] and probabilities [0]."""
+    def permutation(
+        *,
+        hidden_states: torch.Tensor,
+        num_local_tokens: int,
+        token_probs: torch.Tensor,
+        token_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Emulate a rank that receives no routed rows.
+
+        Args:
+            hidden_states: Local source activations of shape [tokens, hidden].
+            num_local_tokens: Number of local source tokens.
+            token_probs: Routing probabilities of shape [tokens, top_k].
+            token_indices: Global expert IDs of shape [tokens, top_k], with -1 marking masked routes.
+
+        Returns:
+            Received activations of shape [0, hidden], integer counts of shape [local_experts],
+            and received probabilities of shape [0].
+        """
         return received, torch.zeros(2, dtype=torch.int64), probs
 
     def combine(output):
@@ -576,22 +595,7 @@ def test_backend_preserves_explicit_selection(experts):
 def test_lora_preserves_nccl_ep_capacity():
     from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA
 
-    config = MoEConfig(
-        n_routed_experts=4,
-        n_shared_experts=0,
-        n_activated_experts=2,
-        n_expert_groups=1,
-        n_limited_groups=1,
-        train_gate=True,
-        gate_bias_update_factor=0.0,
-        aux_loss_coeff=0.0,
-        score_func="softmax",
-        route_scale=1.0,
-        dim=4,
-        inter_dim=8,
-        moe_inter_dim=8,
-        norm_topk_prob=False,
-    )
+    config = _moe_config()
     backend = BackendConfig(dispatcher="nccl_ep", experts="torch_mm", nccl_ep={"max_tokens_per_rank": 17})
     original = GroupedExpertsDeepEP(config, backend=backend, dispatcher_backend=backend.dispatcher)
     wrapped = GroupedExpertsDeepEPLoRA(original, lora_dim=2)

@@ -32,7 +32,6 @@ from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
     _apply_bias,
-    _has_dispatched_rows,
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.components.moe.quantized_experts import MXFP4ExpertStorageMixin
@@ -300,12 +299,7 @@ class GroupedExpertsDeepEPLoRAMXFP4(MXFP4ExpertStorageMixin, GroupedExpertsDeepE
             _to_grouped_mm_operand(self.lora_down_B, x.dtype),
         )
 
-        if _has_dispatched_rows(
-            permuted_local_hidden_states,
-            tokens_per_expert,
-            never_empty=self.dispatch_rows_never_empty,
-            dispatcher_backend=self.dispatcher_backend,
-        ):
+        if self._has_dispatched_rows(permuted_local_hidden_states, tokens_per_expert):
             tokens_per_expert_gpu = tokens_per_expert.to(device=permuted_local_hidden_states.device, non_blocking=True)
             offs = tokens_per_expert_gpu.cumsum(dim=0).to(torch.int32)
 

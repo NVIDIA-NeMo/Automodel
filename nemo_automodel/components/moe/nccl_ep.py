@@ -25,7 +25,7 @@ from types import ModuleType
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.models.common.utils import NcclEpConfig
+from nemo_automodel.components.moe.config import NcclEpConfig
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
 # NCCL-EP reads group options from the environment once, when the group is created.
