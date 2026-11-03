@@ -55,7 +55,7 @@ wandb:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: inclusionAI/LLaDA2.1-mini
-  torch_dtype: bfloat16
+  torch_dtype: float32  # FP32 resident weights and AdamW moments; BF16 compute via mp_policy
   trust_remote_code: true
 
 checkpoint:
@@ -73,6 +73,7 @@ distributed:
   activation_checkpointing: false
   mp_policy:
     param_dtype: bfloat16
+    cast_forward_inputs: true  # Cast FP32 activations at FSDP compute boundaries.
     reduce_dtype: float32
     output_dtype: float32
   offload_policy: null
