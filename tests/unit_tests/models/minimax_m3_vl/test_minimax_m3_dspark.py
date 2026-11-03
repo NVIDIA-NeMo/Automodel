@@ -317,6 +317,16 @@ def test_released_config_rejects_a_different_backbone(tmp_path, override):
         target_config.build_dspark_draft(_options())
 
 
+def test_released_config_names_a_missing_field(tmp_path):
+    target_dir = Path(_write_released_target(tmp_path))
+    released_path = target_dir / "dspark" / "config.json"
+    released = json.loads(released_path.read_text())
+    del released["text_config"]["partial_rotary_factor"]
+    released_path.write_text(json.dumps(released))
+    with pytest.raises(ValueError, match="partial_rotary_factor"):
+        _target_config(str(target_dir)).build_dspark_draft(_options())
+
+
 def test_missing_released_config_warns(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         _target_config(str(tmp_path)).build_dspark_draft(_options())

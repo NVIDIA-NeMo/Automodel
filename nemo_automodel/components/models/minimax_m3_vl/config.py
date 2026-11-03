@@ -60,6 +60,18 @@ _DSPARK_RELEASED_BACKBONE_FIELDS = (
     "swiglu_alpha",
     "swiglu_limit",
 )
+_DSPARK_RELEASED_REQUIRED_FIELDS = (
+    *_DSPARK_RELEASED_BACKBONE_FIELDS,
+    "dspark_block_size",
+    "dspark_ffn_hidden_size",
+    "dspark_markov_head_type",
+    "dspark_markov_rank",
+    "dspark_noise_token_id",
+    "dspark_target_layer_ids",
+    "dspark_use_dense_ffn",
+    "layer_types",
+    "sliding_window",
+)
 
 
 class _DSparkDraftOptions(Protocol):
@@ -386,6 +398,9 @@ class MiniMaxM3DSparkReleasedConfig:
             released = json.load(f)
 
         text_config = released["text_config"]
+        missing = sorted(set(_DSPARK_RELEASED_REQUIRED_FIELDS) - set(text_config))
+        if missing:
+            raise ValueError(f"{path} is missing text_config fields {missing}.")
         layer_types = text_config["layer_types"]
         if (
             released["architectures"] != [_DSPARK_RELEASED_ARCHITECTURE]
