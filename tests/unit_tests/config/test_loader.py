@@ -145,6 +145,35 @@ def test_dotted_get_set_contains():
     assert cfg.get("non.existent", default="sentinel") == "sentinel"
 
 
+def test_set_by_dotted_indexes_into_lists():
+    cfg = ConfigNode({"optimizer": {"betas": [0.9, 0.95]}, "ds": [{"path": "a"}, {"path": "b"}]})
+
+    cfg.set_by_dotted("optimizer.betas.1", "0.98")
+    cfg.set_by_dotted("ds.1.path", "z")
+    cfg.set_by_dotted("ds.0", {"path": "y", "split": "train"})
+
+    assert cfg.optimizer.betas == [0.9, 0.98]
+    assert isinstance(cfg.ds, list) and len(cfg.ds) == 2
+    assert cfg.get("ds.1.path") == "z"
+    assert isinstance(cfg.ds[0], ConfigNode) and cfg.ds[0].to_dict() == {"path": "y", "split": "train"}
+    with pytest.raises(IndexError):
+        cfg.set_by_dotted("ds.2.path", "w")
+    with pytest.raises(IndexError):
+        cfg.set_by_dotted("optimizer.betas.x", 0.5)
+    assert cfg.optimizer.betas == [0.9, 0.98]
+
+
+def test_cli_override_of_list_element_keeps_the_list(tmp_path: Path):
+    from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text("optimizer:\n  lr: 1.0e-5\n  betas: [0.9, 0.95]\n")
+
+    cfg = parse_args_and_load_config(argv=["--config", str(cfg_path), "--optimizer.betas.1", "0.98"])
+
+    assert cfg.optimizer.betas == [0.9, 0.98]
+
+
 def test_instantiate_simple(tmp_module):
     """
     Instantiate a simple object with scalar arguments supplied as strings
