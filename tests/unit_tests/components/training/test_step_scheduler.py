@@ -782,3 +782,46 @@ def test_set_epoch_tolerates_dataloader_without_collate_fn():
     scheduler.set_epoch(4)
 
     assert scheduler.epoch == 4
+
+
+# ---------------------------------------------------------------------------
+# Telemetry: the data-wait span
+# ---------------------------------------------------------------------------
+
+from tests.utils.telemetry import lens_capture  # noqa: E402, F401
+
+
+def _scheduler(num_batches):
+    # grad_acc_steps = 8 // (2 * 2) = 2
+    return StepScheduler(
+        global_batch_size=8,
+        local_batch_size=2,
+        dp_size=2,
+        ckpt_every_steps=1000,
+        dataloader=SizedDataLoader(num_batches=num_batches),
+        num_epochs=1,
+        max_steps=1000,
+    )
+
+
+@pytest.mark.parametrize("num_batches, expected", [(5, [(0, 2), (1, 2), (2, 1)]), (4, [(0, 2), (1, 2), (2, 0)])])
+def test_data_wait_span_covers_each_window_and_closes_before_the_yield(lens_capture, num_batches, expected):
+    from opentelemetry import trace
+
+    capture = lens_capture("per_step")
+    scheduler = _scheduler(num_batches)
+
+    span_open_in_loop_body = [trace.get_current_span().is_recording() for _ in scheduler]
+
+    spans = capture.span_named("automodel.data.wait")
+    assert [(s.attributes["dl.iteration"], s.attributes["automodel.data.batches"]) for s in spans] == expected
+    # The caller's work on a window must not be timed or parented by the data-wait span.
+    assert span_open_in_loop_body == [False] * len(span_open_in_loop_body)
+    assert (scheduler.step, scheduler.epoch) == (3 if num_batches == 5 else 2, 1)
+
+
+def test_data_wait_span_is_off_in_the_default_preset(lens_capture):
+    capture = lens_capture("default")
+    groups = [len(group) for group in _scheduler(5)]
+    assert groups == [2, 2, 1]
+    assert capture.span_named("automodel.data.wait") == []
