@@ -41,15 +41,24 @@ _SUPPORTED_ATTENTION_HEAD_DIMS = (512, 576)
 _VALUE_HEAD_DIM = 512
 _FLASH_MLA_TOPK_ALIGNMENT = 512
 # cuDNN Frontend >= 1.29 ships its own SM100 sparse-prefill forward (``sparse_attention_forward_wrapper``); it stands
-# in for FlashMLA when that package is absent. Resolved lazily so tests can patch ``_CUDNN_DSA``.
+# in for FlashMLA when that package is absent. Resolved lazily so tests can patch ``_CUDNN_DSA``. The kernel rejects
+# other architectures, so SM90 still needs FlashMLA for the forward.
+
+
+def _on_sm100_family() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 
 def _cudnn_forward_available() -> bool:
-    return bool(_HAS_CUDNN_DSA) and callable(getattr(_CUDNN_DSA, "sparse_attention_forward_wrapper", None))
+    return (
+        bool(_HAS_CUDNN_DSA)
+        and callable(getattr(_CUDNN_DSA, "sparse_attention_forward_wrapper", None))
+        and _on_sm100_family()
+    )
 
 
 def is_cudnn_sparse_attention_available() -> bool:
-    """Return whether the cuDNN backward and a sparse forward (FlashMLA or cuDNN >= 1.29) import."""
+    """Return whether the cuDNN backward and a sparse forward (FlashMLA, or cuDNN >= 1.29 on SM100) are usable."""
     return bool(_HAS_CUDNN_DSA) and (bool(_HAS_FLASH_MLA) or _cudnn_forward_available())
 
 
@@ -58,7 +67,8 @@ def _require_available() -> None:
     if not is_cudnn_sparse_attention_available():
         raise RuntimeError(
             "cuDNN sparse attention requires nvidia-cudnn-frontend[cutedsl] (>= 1.29 for its forward kernel, "
-            "or any version with the backward kernel plus FlashMLA's flash_mla_sparse_fwd)."
+            "which runs only on SM100-family GPUs, or any version with the backward kernel plus FlashMLA's "
+            "flash_mla_sparse_fwd, which also covers SM90)."
         )
 
 
