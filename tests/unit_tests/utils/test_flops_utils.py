@@ -329,6 +329,19 @@ def test_get_device_flops_distinguishes_rtx_pro_6000_variants(device_name, expec
     assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
 
 
+@pytest.mark.parametrize(
+    "device_name, expected_tflops",
+    [
+        ("NVIDIA B200", 2250.0),
+        ("NVIDIA B300 SXM6 AC", 2250.0),
+        ("NVIDIA GB200", 2500.0),
+        ("NVIDIA GB300", 2500.0),
+    ],
+)
+def test_get_device_flops_recognizes_blackwell_datacenter_gpus(device_name, expected_tflops):
+    assert get_device_flops(unit="T", device_name=device_name) == expected_tflops
+
+
 def test_get_device_flops_detects_current_cuda_device(monkeypatch):
     monkeypatch.setattr(mfu_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(mfu_module.torch.cuda, "current_device", lambda: 3)
