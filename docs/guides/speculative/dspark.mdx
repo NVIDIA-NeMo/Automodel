@@ -167,7 +167,9 @@ The consolidated checkpoint uses the released key names under
 `language_model.model.dspark.` and a copy of the released `config.json` without
 `quantization_config`. It stores unquantized weights and no shared embedding or
 LM head, so the draft relies on the target's. MiniMax M3 has no `dspark/` folder,
-so its drafts keep native keys and take the FFN width from `intermediate_size`.
+so its drafts keep native keys and take the FFN width from `intermediate_size`. A
+local M3.1 snapshot needs its `dspark/` folder too; without it the recipe logs a
+warning and builds that same draft.
 
 Supported targets include Qwen3 (dense and MoE), Gemma4, DeepSeek V4 and V4.1,
 GLM-5.2, Kimi K3, MiniMax M3, and MiniMax M3.1 Flash.

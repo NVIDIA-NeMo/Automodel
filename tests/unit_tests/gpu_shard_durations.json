@@ -776,7 +776,7 @@
     "speculative/test_dspark_glm_5_2.py": 4.0,
     "speculative/test_dspark_kimi_k3.py": 0.4,
     "speculative/test_dspark_methodology.py": 0.0,
-    "speculative/test_dspark_minimax_m3.py": 0.0,
+    "models/minimax_m3_vl/test_minimax_m3_dspark.py": 0.0,
     "speculative/test_dspark_offline_cache.py": 0.3,
     "speculative/test_dspark_packing.py": 0.2,
     "speculative/test_dspark_registry.py": 0.0,

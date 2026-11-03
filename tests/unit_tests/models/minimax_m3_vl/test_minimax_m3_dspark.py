@@ -114,7 +114,24 @@ def _target_config(name_or_path: str = "") -> MiniMaxM3VLConfig:
 
 def _write_released_target(root: Path, **overrides) -> str:
     """Write the part of MiniMax-M3.1-Flash ``dspark/config.json`` the draft reads."""
+    target_text_config = _target_config().text_config
     text_config = {
+        **{
+            name: getattr(target_text_config, name)
+            for name in (
+                "hidden_size",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "head_dim",
+                "rms_norm_eps",
+                "use_gemma_norm",
+                "rope_theta",
+                "rotary_dim",
+                "partial_rotary_factor",
+                "swiglu_alpha",
+                "swiglu_limit",
+            )
+        },
         "dspark_block_size": RELEASED_BLOCK,
         "dspark_markov_rank": RELEASED_MARKOV,
         "dspark_markov_head_type": "vanilla",
@@ -281,6 +298,29 @@ def test_released_config_rejects_other_draft_shapes(tmp_path, override):
     target_config = _target_config(_write_released_target(tmp_path, **override))
     with pytest.raises(ValueError, match="dense, sliding-window"):
         target_config.build_dspark_draft(_options())
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"hidden_size": 2 * HIDDEN},
+        {"head_dim": 2 * HEAD_DIM},
+        {"rms_norm_eps": 1e-3},
+        {"rope_theta": 1.0},
+        {"rotary_dim": HEAD_DIM},
+        {"swiglu_limit": 1.0},
+    ],
+)
+def test_released_config_rejects_a_different_backbone(tmp_path, override):
+    target_config = _target_config(_write_released_target(tmp_path, **override))
+    with pytest.raises(ValueError, match=next(iter(override))):
+        target_config.build_dspark_draft(_options())
+
+
+def test_missing_released_config_warns(tmp_path, caplog):
+    with caplog.at_level("WARNING"):
+        _target_config(str(tmp_path)).build_dspark_draft(_options())
+    assert "has no dspark/config.json" in caplog.text
 
 
 def test_released_layout_requires_frozen_shared_weights(tmp_path):

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, Required, TypedDict, Union
@@ -40,8 +41,25 @@ if TYPE_CHECKING:
     from nemo_automodel.components.models.minimax_m3_vl.dspark import MiniMaxM3DSparkModel
 
 
+logger = logging.getLogger(__name__)
+
 _DSPARK_DRAFT_ATTN_IMPLEMENTATION = "flex_attention"
 _DSPARK_RELEASED_ARCHITECTURE = "DSparkMiniMaxDraftModel"
+# Draft fields inherited from the target. The released draft must agree on them, because the
+# config it exports is what inference engines build the draft from.
+_DSPARK_RELEASED_BACKBONE_FIELDS = (
+    "hidden_size",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "rms_norm_eps",
+    "use_gemma_norm",
+    "rope_theta",
+    "rotary_dim",
+    "partial_rotary_factor",
+    "swiglu_alpha",
+    "swiglu_limit",
+)
 
 
 class _DSparkDraftOptions(Protocol):
@@ -358,6 +376,11 @@ class MiniMaxM3DSparkReleasedConfig:
             _raise_exceptions_for_missing_entries=False,
         )
         if path is None:
+            logger.warning(
+                "%s has no dspark/config.json, so the MiniMax M3 DSpark draft takes its FFN width from "
+                "intermediate_size, has no sliding window, and exports native keys.",
+                target_name_or_path,
+            )
             return None
         with open(path, encoding="utf-8") as f:
             released = json.load(f)
@@ -434,6 +457,13 @@ class MiniMaxM3DSparkConfig:
             expected, actual = getattr(released, name), getattr(self, name)
             if actual != expected:
                 raise ValueError(f"MiniMax M3 DSpark requires {name}={expected} from the target, got {actual}.")
+        released_text_config = released.exported_config["text_config"]
+        for name in _DSPARK_RELEASED_BACKBONE_FIELDS:
+            expected, actual = released_text_config[name], getattr(self.text_config, name)
+            if actual != expected:
+                raise ValueError(
+                    f"The target's {name}={actual} disagrees with its released MiniMax M3 DSpark draft ({expected})."
+                )
         if self.confidence_head_alpha <= 0 or not self.confidence_head_with_markov:
             raise ValueError(
                 "The released MiniMax M3 DSpark draft requires a Markov-conditioned confidence head, got "

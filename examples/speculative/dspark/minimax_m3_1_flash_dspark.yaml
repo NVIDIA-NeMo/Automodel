@@ -5,6 +5,8 @@
 # block size 7, a rank-256 Markov head, and noise token 200058. The recipe rejects
 # settings that disagree with it. The trainable weights start from a fresh
 # initialization; only the frozen embedding and LM head are copied from the target.
+# A local target_model_name_or_path must include the dspark/ folder, or the recipe
+# logs a warning and builds the MiniMax M3 draft instead.
 #
 # The final consolidated checkpoint uses the layout of the released dspark/ folder,
 # with unquantized weights and without the shared embedding and LM head.
