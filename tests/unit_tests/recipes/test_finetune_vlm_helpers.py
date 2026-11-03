@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import sys
 import types
 from contextlib import nullcontext
@@ -32,6 +33,8 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.models.common.packing import PackingCapabilities
+from nemo_automodel.components.models.qwen3_5.packing import HostTensor
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
@@ -2570,6 +2573,49 @@ class _CPPreEmbedStop(RuntimeError):
 class TestForwardBackwardStepNonPP:
     """Tests for _forward_backward_step without pipeline parallelism."""
 
+    @pytest.mark.parametrize("cp_size, expect_host_mirror", [(1, True), (2, False)])
+    def test_model_host_metadata_is_added_only_without_cp(self, monkeypatch, cp_size, expect_host_mirror):
+        model = _CPPreEmbedModel()
+        model.prepare_host_batch_metadata = lambda batch: {
+            "_host_image_grid_thw": HostTensor(batch["image_grid_thw"]),
+            "_host_packed_seq_ids": HostTensor(batch["_packed_seq_ids"]),
+        }
+        recipe = _create_non_pp_recipe(model)
+        recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=cp_size)
+        packed_ids = torch.tensor([[1, 1, 2, 2]])
+        grid = torch.tensor([[1, 2, 2]])
+        moved = []
+
+        def record_move(batch, device):
+            moved.extend(batch.values())
+            return batch
+
+        def check_batch(sharder, batch):
+            assert batch["_packed_seq_ids"] is packed_ids
+            assert any(value is packed_ids for value in moved)
+            assert any(value is grid for value in moved)
+            assert ("_host_packed_seq_ids" in batch) is expect_host_mirror
+            if expect_host_mirror:
+                assert batch["_host_packed_seq_ids"].tensor is packed_ids
+                assert batch["_host_image_grid_thw"].tensor is grid
+            raise _CPPreEmbedStop
+
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.move_batch_to_device", record_move)
+        monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder.shard", check_batch)
+        with pytest.raises(_CPPreEmbedStop):
+            recipe._forward_backward_step(
+                idx=0,
+                batch={
+                    "input_ids": torch.ones(1, 4, dtype=torch.long),
+                    "_packed_seq_ids": packed_ids,
+                    "image_grid_thw": grid,
+                },
+                loss_buffer=[],
+                num_label_tokens=4,
+                num_batches=1,
+                is_train=False,
+            )
+
     def test_non_pp_cp_invokes_sharder_only_hook_and_keeps_inputs(self, monkeypatch):
         # Sunk contract: the non-PP CP path invokes the sharder-only hook, which
         # consumes nothing, so input_ids / pixel_values / mm_token_type_ids all
@@ -3099,6 +3145,8 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     )
     loader_config = SimpleNamespace(
         packing=None,
+        is_packed=False,
+        output_format="batched",
         build=lambda **kwargs: SimpleNamespace(dataloader="dl", processor="proc"),
     )
     monkeypatch.setattr(
@@ -3670,9 +3718,9 @@ def _patches_for_packing(neat_pack_side_effect):
     processor = MagicMock()
     processor.tokenizer.pad_token_id = 0
     processor.chat_template = "{{ x }}"
-    packing_contract = SimpleNamespace(
+    packing_contract = PackingCapabilities(
         packed_mask_type="document_ids",
-        requires_packed_sequence_metadata=True,
+        return_packed_sequence_metadata=True,
     )
     stateful_dataloader = MagicMock(return_value=MagicMock())
     return (
@@ -3690,9 +3738,13 @@ def _patches_for_packing(neat_pack_side_effect):
                 "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
                 side_effect=neat_pack_side_effect,
             ),
-            patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", stateful_dataloader),
+            patch("nemo_automodel.components.datasets.vlm.loader._VlmStatefulDataloader", stateful_dataloader),
             patch(
                 "nemo_automodel.components.models.common.packing.configure_packing",
+                return_value=packing_contract,
+            ),
+            patch(
+                "nemo_automodel.components.models.common.packing.get_packing_capabilities",
                 return_value=packing_contract,
             ),
             patch(
@@ -3867,3 +3919,15 @@ def test_build_dataloader_forwards_inject_fake_images_false():
 
     wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
+
+
+@pytest.mark.parametrize("pixel_shape", [(2, 4, 6), (2, 3, 4, 4)])
+def test_pipeline_image_counts_override_accidental_batch_size_match(pixel_shape):
+    pixels = torch.arange(torch.tensor(pixel_shape).prod()).reshape(pixel_shape)
+    grids = torch.tensor([[1, 2, 2], [1, 2, 2]])
+    pixel_chunks, grid_chunks = chunk_vlm_media(
+        pixels, grids, batch_size=2, n_microbatches=2, n_images_per_sample=torch.tensor([2, 0])
+    )
+    torch.testing.assert_close(pixel_chunks[0], pixels)
+    torch.testing.assert_close(grid_chunks[0], grids)
+    assert pixel_chunks[1].shape[0] == grid_chunks[1].shape[0] == 0

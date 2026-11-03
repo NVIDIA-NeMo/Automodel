@@ -14,16 +14,19 @@
 
 import logging
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, TypedDict, overload
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.autograd.function import BackwardCFunction
 from torch.distributed.tensor import DTensor
+from transformers import BitsAndBytesConfig
 
+from nemo_automodel.components._peft.config import PeftConfig as PeftConfig
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
     GroupedExpertsLoRA,
@@ -47,54 +50,24 @@ from nemo_automodel.shared.utils import dtype_from_str
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 HAS_TE, transformer_engine = safe_import_te()
 
+if TYPE_CHECKING:
+    from transformer_engine.pytorch import Linear as _TELinear
+else:
+    _TELinear = transformer_engine.pytorch.Linear if HAS_TE else nn.Linear
+
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class PeftConfig:
-    target_modules: list = field(default_factory=list)
-    exclude_modules: list = field(default_factory=list)
-    match_all_linear: bool = False
-    dim: int = 8
-    alpha: int = 32
-    # Note: we currently support DoRA for nn.Linear only.
-    use_dora: bool = False
-    dropout: float = 0.0
-    dropout_position: Literal["pre", "post"] = "post"
-    lora_A_init: str = "xavier"
-    lora_dtype: torch.dtype | None = None
-    use_memory_efficient_lora: bool = True
-    use_triton: bool = False
-    moe_rank_scaling: bool = False
-    # Storage mode, not a torch dtype: "unquantized" uses the ordinary floating-point
-    # experts with the model's configured precision (including FP32). "mxfp4"
-    # stores frozen expert bases as fp4-e2m1 + e8m0 scales and requires torch_mm.
-    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized"
-
-    def to_dict(self):
-        return self.__dict__.copy()
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]):
-        return cls(
-            target_modules=d.get("target_modules", []),
-            exclude_modules=d.get("exclude_modules", []),
-            match_all_linear=d.get("match_all_linear", False),
-            dim=d.get("dim", 8),
-            alpha=d.get("alpha", 32),
-            use_dora=d.get("use_dora", False),
-            dropout=d.get("dropout", 0.0),
-            dropout_position=d.get("dropout_position", "post"),
-            lora_A_init=d.get("lora_A_init", "xavier"),
-            lora_dtype=d.get("lora_dtype", None),
-            use_memory_efficient_lora=d.get("use_memory_efficient_lora", True),
-            use_triton=d.get("use_triton", False),
-            moe_rank_scaling=d.get("moe_rank_scaling", False),
-            expert_weight_format=d.get("expert_weight_format", "unquantized"),
-        )
+class _ExpertAdapterArgs(TypedDict):
+    lora_dim: int
+    alpha: int
+    lora_A_init_method: str
+    lora_dtype: torch.dtype | str | None
 
 
-def _extract_base_dtype(quantization_config, default_dtype=torch.bfloat16) -> torch.dtype:
+def _extract_base_dtype(
+    quantization_config: BitsAndBytesConfig, default_dtype: torch.dtype = torch.bfloat16
+) -> torch.dtype:
     if hasattr(quantization_config, "bnb_4bit_compute_dtype"):
         return quantization_config.bnb_4bit_compute_dtype
     return default_dtype
@@ -109,6 +82,17 @@ class LinearLoRA(nn.Linear):
     same code -> therefore those are decorated with @staticmethod.
     """
 
+    dim: int
+    scale: float
+    use_dora: bool
+    use_memory_efficient_lora: bool
+    super_fwd: Callable[[torch.Tensor], torch.Tensor]
+    lora_A: nn.Linear | _TELinear
+    lora_B: nn.Linear | _TELinear
+    dropout_p: float
+    dropout_position: Literal["pre", "post"]
+    lora_magnitude: nn.Parameter
+
     # Per-token adapter gate installed by :func:`lora_token_gate`; ``None`` applies LoRA to every token.
     _lora_token_gate: torch.Tensor | None = None
     # Module path set by ``patch_linear_module`` when a ``layer_name`` is given; used in error messages.
@@ -116,16 +100,16 @@ class LinearLoRA(nn.Linear):
 
     def __init__(
         self,
-        orig_linear,
-        dim=8,
-        alpha=32,
+        orig_linear: nn.Linear,
+        dim: int = 8,
+        alpha: int = 32,
         use_dora: bool = False,
-        dropout=0.0,
-        dropout_position="post",
-        lora_A_init_method="xavier",
-        lora_dtype=None,
-        use_memory_efficient_lora=True,
-    ):
+        dropout: float = 0.0,
+        dropout_position: Literal["pre", "post"] = "post",
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = None,
+        use_memory_efficient_lora: bool = True,
+    ) -> None:
         """
         LinearLora constructor.
 
@@ -164,33 +148,41 @@ class LinearLoRA(nn.Linear):
             use_memory_efficient_lora=use_memory_efficient_lora,
         )
 
+    def _adapter_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve tensor weights at the optional Transformer Engine boundary."""
+        a, b = self.lora_A.weight, self.lora_B.weight
+        if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+            raise TypeError("LoRA projections must expose tensor weights")
+        return a, b
+
     @torch.no_grad
-    def init_lora_weights(self, init_method: str):
+    def init_lora_weights(self, init_method: str) -> None:
         """
         Initialize the LoRA weights.
 
         Args:
             init_method (str): Method to initialize the LoRA weights.
         """
+        a, b = self._adapter_weights()
         if init_method == "xavier":
-            nn.init.xavier_normal_(self.lora_A.weight.data)
+            nn.init.xavier_normal_(a.data)
         else:
-            nn.init.kaiming_uniform_(self.lora_A.weight.data, a=math.sqrt(5))
-        self.lora_B.weight.data.fill_(0)
+            nn.init.kaiming_uniform_(a.data, a=math.sqrt(5))
+        b.data.fill_(0)
 
     @torch.no_grad
     @staticmethod
     def _init_adapter(
-        obj,
-        dim=8,
-        alpha=32,
+        obj: "LinearLoRA",
+        dim: int = 8,
+        alpha: int = 32,
         use_dora: bool = False,
-        dropout=0.0,
-        dropout_position="post",
-        lora_A_init_method="xavier",
-        lora_dtype=None,
-        use_memory_efficient_lora=True,
-    ):
+        dropout: float = 0.0,
+        dropout_position: Literal["pre", "post"] = "post",
+        lora_A_init_method: str = "xavier",
+        lora_dtype: torch.dtype | str | None = None,
+        use_memory_efficient_lora: bool = True,
+    ) -> None:
         """
         Adds LoRA weights to obj. Obj is either a LinearLoRA or an nn.Module (when monkey-patching).
 
@@ -248,7 +240,8 @@ class LinearLoRA(nn.Linear):
         Compute the detached weight norm used by DoRA.
         """
         # ΔW = B @ A, shapes: [out, dim] @ [dim, in] => [out, in]
-        delta_w = (self.lora_B.weight @ self.lora_A.weight).detach().to(self.weight.dtype)
+        a, b = self._adapter_weights()
+        delta_w = (b @ a).detach().to(self.weight.dtype)
         weight = self.weight.to(self.weight.dtype)
         weight_norm = torch.linalg.norm(weight + self.scale * delta_w, dim=1).to(weight.dtype)
         return weight_norm.detach()
@@ -279,25 +272,32 @@ class LinearLoRA(nn.Linear):
             raise NotImplementedError(
                 "materialize_effective_weight supports only dense, strided, non-quantized linear weights"
             )
-        return self.weight + self.scale * (self.lora_B.weight @ self.lora_A.weight)
+        a, b = self._adapter_weights()
+        return self.weight + self.scale * (b @ a)
 
     def _should_use_memory_efficient_lora(self, x: torch.Tensor) -> bool:
         """Return whether this LoRA branch can use the custom autograd path."""
-        if not getattr(self, "use_memory_efficient_lora", False):
+        if not self.use_memory_efficient_lora:
             return False
         if isinstance(x, DTensor):
             return False
-        if isinstance(getattr(self.lora_A, "weight", None), DTensor):
+        if isinstance(self.lora_A.weight, DTensor):
             return False
-        if isinstance(getattr(self.lora_B, "weight", None), DTensor):
+        if isinstance(self.lora_B.weight, DTensor):
             return False
         if torch.compiler.is_compiling():
             return False
-        if HAS_TE and isinstance(getattr(self, "lora_A", None), transformer_engine.pytorch.Linear):
+        if HAS_TE and isinstance(self.lora_A, transformer_engine.pytorch.Linear):
             return False
         return True
 
-    def forward(self, x):
+    @overload
+    def forward(self, input: torch.Tensor) -> torch.Tensor: ...
+
+    @overload
+    def forward(self, *, x: torch.Tensor) -> torch.Tensor: ...
+
+    def forward(self, input: torch.Tensor | None = None, *, x: torch.Tensor | None = None) -> torch.Tensor:
         """
         Forward pass through the original linear layer augmented with the LoRA pathway.
 
@@ -305,6 +305,8 @@ class LinearLoRA(nn.Linear):
         The result of the original linear transformation is combined with the LoRA output.
 
         Args:
+            input: Input activations, with the same layout and DTensor contract as ``x``.
+                Accepts the standard ``nn.Linear`` keyword; supply either ``input`` or ``x``.
             x (Tensor): Input activations of shape ``[B, S, in_features]``
                 (``B`` = batch, ``S`` = sequence) or ``[N, in_features]``
                 (``N`` = flattened tokens).  May be a DTensor: a 3-D DTensor
@@ -319,6 +321,12 @@ class LinearLoRA(nn.Linear):
             leading dimensions as ``x``; a DTensor if ``x`` and the weights
             are DTensors.
         """
+        if input is not None:
+            if x is not None:
+                raise TypeError("Pass either x or input to LoRA forward, not both")
+            x = input
+        if x is None:
+            raise TypeError("LoRA forward requires an input tensor")
         # pylint: disable=C0115,C0116
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
@@ -345,11 +353,10 @@ class LinearLoRA(nn.Linear):
             # Multiplying after lora_B would convert Partial to Replicate, causing an extra reduce-scatter operation.
             use_memory_efficient_lora = self._should_use_memory_efficient_lora(x)
             if use_memory_efficient_lora:
+                a, b = self._adapter_weights()
                 if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
-                    return apply_memory_efficient_lora(
-                        x, self.lora_A.weight, self.lora_B.weight, self.scale, False, res
-                    )
-                lora_res = apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, False)
+                    return apply_memory_efficient_lora(x, a, b, self.scale, False, res)
+                lora_res = apply_memory_efficient_lora(x, a, b, self.scale, False)
             else:
                 lora_res = self.lora_B(self.lora_A(x) * self.scale)
             if self.dropout_position == "post":
@@ -418,6 +425,8 @@ class LinearLoRA(nn.Linear):
         if isinstance(x, DTensor):
             raise NotImplementedError("lora_token_gate does not support DTensor activations (tensor parallelism).")
         gate = self._lora_token_gate
+        if gate is None:
+            raise RuntimeError("A token gate must be installed before gated LoRA execution.")
         # Only the exact leading shape or the flattened 2-D form: a permuted layout (e.g. a [batch, sequence]
         # gate on a sequence-first input) has the same token count but would route the wrong tokens.
         if gate.shape != x.shape[:-1] and not (x.dim() == 2 and gate.numel() == x.shape[0]):
@@ -451,16 +460,31 @@ class TritonLinearLoRA(LinearLoRA):
         are quantized weights (e.g. 4bit) needs to be specified explicitly.
     """
 
-    def forward(self, x):
+    @overload
+    def forward(self, input: torch.Tensor) -> torch.Tensor: ...
+
+    @overload
+    def forward(self, *, x: torch.Tensor) -> torch.Tensor: ...
+
+    def forward(self, input: torch.Tensor | None = None, *, x: torch.Tensor | None = None) -> torch.Tensor:
         """
         Forward function for LoRA with triton kernels.
 
         Args:
-            x (torch.Tensor): the input tensor.
+            input: Tensor of shape [batch, sequence, input_features] or [tokens, input_features].
+                Accepts the standard ``nn.Linear`` keyword; supply either ``input`` or ``x``.
+            x: Alias for ``input`` with the same layout, retained for existing callers.
 
         Returns:
-            torch.Tensor: the output tensor.
+            Tensor of shape [batch, sequence, output_features] or [tokens, output_features],
+            matching the input's leading dimensions.
         """
+        if input is not None:
+            if x is not None:
+                raise TypeError("Pass either x or input to LoRA forward, not both")
+            x = input
+        if x is None:
+            raise TypeError("LoRA forward requires an input tensor")
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
         # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.
@@ -476,9 +500,10 @@ class TritonLinearLoRA(LinearLoRA):
         if self.dropout_position == "pre":
             x = F.dropout(x, p=self.dropout_p, training=self.training)
         if self.use_memory_efficient_lora:
+            a, b = self._adapter_weights()
             if self.dropout_position == "pre" or not self.training or self.dropout_p == 0.0:
-                return apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True, res)
-            lora_res = apply_memory_efficient_lora(x, self.lora_A.weight, self.lora_B.weight, self.scale, True)
+                return apply_memory_efficient_lora(x, a, b, self.scale, True, res)
+            lora_res = apply_memory_efficient_lora(x, a, b, self.scale, True)
         else:
             lora_res = self.lora_B(self.lora_A(x) * self.scale)
         if self.dropout_position == "post":
@@ -490,18 +515,18 @@ class TritonLinearLoRA(LinearLoRA):
 
 
 def patch_linear_module(
-    orig_linear,
-    dim=8,
-    alpha=32,
+    orig_linear: nn.Linear | _TELinear,
+    dim: int = 8,
+    alpha: int = 32,
     use_dora: bool = False,
-    dropout=0.0,
-    dropout_position="post",
-    lora_A_init_method="xavier",
-    lora_dtype=None,
-    use_memory_efficient_lora=True,
-    use_triton=True,
-    layer_name=None,
-):
+    dropout: float = 0.0,
+    dropout_position: Literal["pre", "post"] = "post",
+    lora_A_init_method: str = "xavier",
+    lora_dtype: torch.dtype | str | None = None,
+    use_memory_efficient_lora: bool = True,
+    use_triton: bool = True,
+    layer_name: str | None = None,
+) -> nn.Linear:
     """
     Monkey-patches a nn.Linear (orig_linear param) to be a LinearLoRA.
 
@@ -547,19 +572,28 @@ def patch_linear_module(
         use_triton = False
 
     linear_lora_cls = TritonLinearLoRA if use_triton else LinearLoRA
-    linear_lora_cls._init_adapter(
-        orig_linear,
-        dim=dim,
-        alpha=alpha,
-        use_dora=use_dora,
-        dropout=dropout,
-        dropout_position=dropout_position,
-        lora_A_init_method=lora_A_init_method,
-        lora_dtype=lora_dtype,
-        use_memory_efficient_lora=use_memory_efficient_lora,
-    )
     cls = orig_linear.__class__
+    original_forward = orig_linear.forward
     new_cls = type("PatchedLinearLoRA", (linear_lora_cls, cls), {})
+    # Establish the actual adapter type before initializing its typed state.
+    orig_linear.__class__ = new_cls
+    if not isinstance(orig_linear, LinearLoRA):
+        raise TypeError("Patched linear must implement LinearLoRA")
+    try:
+        linear_lora_cls._init_adapter(
+            orig_linear,
+            dim=dim,
+            alpha=alpha,
+            use_dora=use_dora,
+            dropout=dropout,
+            dropout_position=dropout_position,
+            lora_A_init_method=lora_A_init_method,
+            lora_dtype=lora_dtype,
+            use_memory_efficient_lora=use_memory_efficient_lora,
+        )
+    except Exception:
+        orig_linear.__class__ = cls
+        raise
 
     # If the model uses quantized weights, we want to use orig_linear's forward
     if (
@@ -570,13 +604,12 @@ def patch_linear_module(
             assert not isinstance(orig_linear, transformer_engine.pytorch.Linear), (
                 "quant_state is not supported with transformer_engine.pytorch.Linear"
             )
-        orig_linear.super_fwd = orig_linear.forward
+        orig_linear.super_fwd = original_forward
     elif HAS_TE and isinstance(orig_linear, transformer_engine.pytorch.Linear):
         # Delegate base computation to TE's forward so TE kernels (including FP8)
         # are used instead of falling back to F.linear().
-        orig_linear.super_fwd = orig_linear.forward
+        orig_linear.super_fwd = original_forward
 
-    orig_linear.__class__ = new_cls
     if layer_name is not None:
         orig_linear._layer_name = layer_name
     return orig_linear
@@ -614,7 +647,9 @@ def patch_moe_module(
             f"Unsupported expert_weight_format: {expert_weight_format!r}. Expected 'unquantized' or 'mxfp4' "
             "as the storage mode; floating-point dtype is controlled by the model's precision configuration."
         )
-    common = dict(lora_dim=dim, alpha=alpha, lora_A_init_method=lora_A_init_method, lora_dtype=lora_dtype)
+    common: _ExpertAdapterArgs = dict(
+        lora_dim=dim, alpha=alpha, lora_A_init_method=lora_A_init_method, lora_dtype=lora_dtype
+    )
     mxfp4 = expert_weight_format == "mxfp4"
     if isinstance(orig_module, GroupedExpertsMoK):
         raise NotImplementedError("LoRA is not supported for Mixture-of-Kittens expert modules.")
@@ -640,7 +675,7 @@ def patch_moe_module(
 def apply_lora_to_linear_modules(
     model: nn.Module,
     peft_config: PeftConfig,
-    quantization_config=None,
+    quantization_config: BitsAndBytesConfig | None = None,
     skip_freeze: bool = False,
 ) -> int:
     """
@@ -670,18 +705,13 @@ def apply_lora_to_linear_modules(
         for w in model.parameters():
             w.requires_grad_(False)
 
-    is_causal_lm = False
-    try:
-        if (
-            hasattr(model, "config")
-            and model.config.architectures is not None
-            and len(model.config.architectures) > 0
-            and "CausalLM" in model.config.architectures[0]
-        ):
-            # for example, LlamaForCausalLM
-            is_causal_lm = True
-    except (AttributeError, TypeError):
-        is_causal_lm = False
+    architectures = getattr(getattr(model, "config", None), "architectures", None)
+    is_causal_lm = (
+        isinstance(architectures, (list, tuple))
+        and bool(architectures)
+        and isinstance(architectures[0], str)
+        and "CausalLM" in architectures[0]
+    )
 
     matcher = ModuleMatcher(
         peft_config.target_modules, peft_config.exclude_modules, peft_config.match_all_linear, is_causal_lm
@@ -726,13 +756,7 @@ def apply_lora_to_linear_modules(
                     expert_weight_format=peft_config.expert_weight_format,
                 )
 
-                # Find parent and replace
-                if "." not in name:
-                    setattr(model, name, new_module)
-                else:
-                    parent_name, child_name = name.rsplit(".", 1)
-                    parent = model.get_submodule(parent_name)
-                    setattr(parent, child_name, new_module)
+                model.set_submodule(name, new_module)
         else:
             # Standard Linear patching
             linear_types = [nn.Linear] + ([transformer_engine.pytorch.Linear] if HAS_TE else [])
@@ -752,12 +776,12 @@ def apply_lora_to_linear_modules(
                     dropout_position=peft_config.dropout_position,
                     lora_A_init_method=peft_config.lora_A_init,
                     lora_dtype=lora_dtype,
-                    use_memory_efficient_lora=getattr(peft_config, "use_memory_efficient_lora", True),
+                    use_memory_efficient_lora=peft_config.use_memory_efficient_lora,
                     use_triton=peft_config.use_triton,
                     layer_name=name,
                 )
 
-    if getattr(peft_config, "use_memory_efficient_lora", True):
+    if peft_config.use_memory_efficient_lora:
         # Fuse SwiGLU/ReLU² MLPs whose projections were just LoRA-patched into one memory-efficient
         # autograd op (recompute the activation in backward); falls back per-MLP under
         # sharding (DTensor) / DoRA / active dropout.
@@ -771,7 +795,7 @@ def apply_lora_to_linear_modules(
 
 
 @contextmanager
-def lora_token_gate(model: nn.Module, gate: torch.Tensor) -> Iterator[None]:
+def lora_token_gate(model: nn.Module, gate: torch.Tensor) -> Generator[None, None, None]:
     """Apply every LoRA linear adapter in ``model`` only to the tokens selected by ``gate``.
 
     Inside the context, each :class:`LinearLoRA` computes ``base(x) + lora_B(gate * scale * lora_A(x))``;
@@ -817,6 +841,22 @@ def lora_token_gate(model: nn.Module, gate: torch.Tensor) -> Iterator[None]:
             module._lora_token_gate = None
 
 
+@dataclass(frozen=True)
+class _LoRAState:
+    scale: float
+    dtype: torch.dtype
+    use_triton_kernel: bool
+    has_residual: bool
+    num_inputs: int
+
+
+_LoRAInputs = (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, torch.dtype]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, torch.dtype, bool]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, torch.dtype, bool, torch.Tensor | None]
+)
+
+
 class LoRATritonFunction(torch.autograd.Function):
     """
     Autograd function that avoids saving the LoRA A activation.
@@ -827,20 +867,34 @@ class LoRATritonFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def setup_context(ctx, inputs, output):
+    def setup_context(ctx: BackwardCFunction, inputs: _LoRAInputs, output: torch.Tensor) -> None:
         """
         Stores context for LoRA backward pass.
         """
         x, lora_A, lora_B, scale, dtype, *rest = inputs
         ctx.save_for_backward(x, lora_A, lora_B)
-        ctx.scale = scale
-        ctx.dtype = dtype
-        ctx.use_triton_kernel = bool(rest[0]) if rest else True
-        ctx.has_residual = len(rest) > 1 and rest[1] is not None
-        ctx.num_inputs = len(inputs)
+        setattr(
+            ctx,
+            "_lora_state",
+            _LoRAState(
+                scale=scale,
+                dtype=dtype,
+                use_triton_kernel=bool(rest[0]) if rest else True,
+                has_residual=len(rest) > 1 and rest[1] is not None,
+                num_inputs=len(inputs),
+            ),
+        )
 
     @staticmethod
-    def forward(x, lora_A, lora_B, scale, dtype, use_triton_kernel=True, res=None):
+    def forward(
+        x: torch.Tensor,
+        lora_A: torch.Tensor,
+        lora_B: torch.Tensor,
+        scale: float,
+        dtype: torch.dtype,
+        use_triton_kernel: bool = True,
+        res: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Forward method for memory-efficient LoRA.
 
@@ -868,7 +922,7 @@ class LoRATritonFunction(torch.autograd.Function):
         return lora_res
 
     @staticmethod
-    def backward(ctx, d_y):
+    def backward(ctx: BackwardCFunction, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         """Compute gradients for memory-efficient LoRA.
 
         Reshapes 3D tensors into 2D and then updates d_lora_a, d_lora_b, and dx. The PyTorch matmul
@@ -876,37 +930,48 @@ class LoRATritonFunction(torch.autograd.Function):
 
         Args:
             ctx: Autograd context containing the saved input and LoRA weights.
-            d_y: Tensor of shape ``[tokens, out_features]`` containing the output gradient in the forward compute
-                dtype.
+            grad_outputs: Exactly one Tensor of shape [tokens, out_features] in the forward compute dtype,
+                where tokens flattens the original batch and sequence axes for a 3D input.
 
         Returns:
-            Gradients for the custom autograd inputs. The input gradient has shape ``[tokens, in_features]`` or
-            ``[batch, sequence, in_features]`` and matches the original input dtype. LoRA weight gradients have
-            shapes ``[rank, in_features]`` and ``[out_features, rank]`` and match their weight dtypes. When a
-            residual input is present, its gradient matches the original residual shape.
+            Five gradients (dx, dA, dB, None, None) in forward-input order, with a sixth None when the
+            optional use_triton_kernel argument was supplied, and a seventh residual gradient when res
+            was supplied. dx is None or Tensor of shape [tokens, in_features] or
+            [batch, sequence, in_features], matching the original input. dA and dB are None or Tensors
+            of shape [rank, in_features] and [out_features, rank]. These gradients match their
+            corresponding input's dtype and device. The residual gradient is None when unrequested;
+            otherwise it has shape [tokens, out_features] or [batch, sequence, out_features], matching
+            the original residual, and retains the incoming gradient's dtype and device.
         """
-        x, lora_A, lora_B = ctx.saved_tensors
-        scale = ctx.scale
+        if len(grad_outputs) != 1:
+            raise TypeError("LoRA backward requires exactly one output gradient")
+        (d_y,) = grad_outputs
+        state = getattr(ctx, "_lora_state", None)
+        if not isinstance(state, _LoRAState):
+            raise TypeError("LoRA backward requires state saved by setup_context")
+        # The installed PyTorch stub types this variable-length property as tuple[Tensor].
+        x, lora_A, lora_B = tuple(iter(ctx.saved_tensors))
+        scale = state.scale
 
         reshape = x.dim() == 3
-        if reshape:
-            bs, seq_len, d = x.shape
+        original_shape = x.shape
         # forward now returns a 2D output, so d_y arrives 2D; the residual input kept its original
         # (possibly 3D) shape, so its gradient must be reshaped back to match that input.
         d_res = None
-        if ctx.has_residual and ctx.needs_input_grad[6]:
-            d_res = d_y.reshape(bs, seq_len, -1) if reshape else d_y
+        needs_input_grad = tuple(iter(ctx.needs_input_grad))
+        if state.has_residual and needs_input_grad[6]:
+            d_res = d_y.reshape(*original_shape[:-1], -1) if reshape else d_y
         if reshape:
             d_y = d_y.reshape(-1, d_y.shape[-1])
-            x = x.reshape(-1, d)
+            x = x.reshape(-1, original_shape[-1])
 
-        if ctx.use_triton_kernel:
-            d_lora_A, d_x = lora_da_dx_update_wrapper(x.t(), d_y, lora_B, lora_A, scale, dtype=ctx.dtype)
-            d_lora_B = lora_db_update_wrapper(lora_A, x.t(), d_y, scale, ctx.dtype)
+        if state.use_triton_kernel:
+            d_lora_A, d_x = lora_da_dx_update_wrapper(x.t(), d_y, lora_B, lora_A, scale, dtype=state.dtype)
+            d_lora_B = lora_db_update_wrapper(lora_A, x.t(), d_y, scale, state.dtype)
             d_lora_A = d_lora_A.t()
         else:
             d_x = d_lora_A = d_lora_B = None
-            needs_x, needs_lora_A, needs_lora_B = ctx.needs_input_grad[:3]
+            needs_x, needs_lora_A, needs_lora_B = needs_input_grad[:3]
             # Custom backward executes outside autocast. Reuse d_y's forward compute dtype for the recomputed
             # matmuls, then cast each returned gradient to the dtype of its corresponding input.
             x_compute = x.to(d_y.dtype) if needs_lora_A or needs_lora_B else x
@@ -926,17 +991,24 @@ class LoRATritonFunction(torch.autograd.Function):
                 d_lora_B = torch.matmul(d_y.t(), x_lora_A).to(lora_B.dtype)
 
         if reshape and d_x is not None:
-            d_x = d_x.view(bs, seq_len, d)
+            d_x = d_x.view(original_shape)
 
         gradients = (d_x, d_lora_A, d_lora_B, None, None)
-        if ctx.num_inputs == 7:
+        if state.num_inputs == 7:
             return gradients + (None, d_res)
-        if ctx.num_inputs == 6:
+        if state.num_inputs == 6:
             return gradients + (None,)
         return gradients
 
 
-def apply_memory_efficient_lora(x, lora_A, lora_B, scale, use_triton_kernel, res=None):
+def apply_memory_efficient_lora(
+    x: torch.Tensor,
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    scale: float,
+    use_triton_kernel: bool,
+    res: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Run :class:`LoRATritonFunction` and restore the input's leading dimensions.
 
     ``LoRATritonFunction.forward`` returns a 2D tensor (its reshape is intentionally kept outside the

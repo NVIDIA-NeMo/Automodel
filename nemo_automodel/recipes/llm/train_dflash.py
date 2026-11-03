@@ -166,6 +166,16 @@ def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
     return bool(flag.item())
 
 
+def _average_unsynced_ddp_grads(ddp_module: DistributedDataParallel) -> None:
+    """Average locally accumulated grads over the DDP group, as DDP's synced backward would (sum / size)."""
+    group = ddp_module.process_group
+    world_size = dist.get_world_size(group)
+    for param in ddp_module.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad, group=group)
+            param.grad.div_(world_size)
+
+
 def _submesh_or_none(device_mesh, name: str):
     """Return the named (flattened) submesh, or None if absent / no mesh.
 
@@ -653,6 +663,7 @@ class TrainDFlashRecipe(BaseRecipe):
             # ``or`` folds an explicit ``loss_type: null`` back to the default,
             # matching the null convention of loss_decay_gamma above.
             loss_type=str(recipe_cfg.get("loss_type", None) or "dflash"),
+            dpace_alpha=float(recipe_cfg.get("dpace_alpha", 0.5)),
             prefix_weight_base=float(recipe_cfg.get("prefix_weight_base", 0.9)),
             sliding_window=self.draft_sliding_window,
         )
@@ -1057,12 +1068,16 @@ class TrainDFlashRecipe(BaseRecipe):
                     self.train_dataloader.sampler.set_epoch(epoch_idx)
 
                 running_loss = 0.0
-                running_acc = 0.0
+                running_correct = 0.0
+                running_valid = 0.0
                 running_micro = 0
                 running_extra: dict[str, list[float]] = {}
                 epoch_loss = 0.0
                 micro_step = 0
                 pending_micro_batches = 0
+                # Whether the accumulated gradients were all-reduced by DDP, i.e.
+                # the window's latest backward ran outside ``no_sync()``.
+                window_grads_synced = True
                 completed_steps = 0
                 last_batch_idx = -1
                 num_batches = len(self.train_dataloader)
@@ -1100,12 +1115,14 @@ class TrainDFlashRecipe(BaseRecipe):
                         all_have_valid = _all_ranks_have_valid(local_has_valid, is_ddp, self.device)
                         if all_have_valid:
                             loss.backward()
+                            window_grads_synced = sync_grads
                     if not all_have_valid:
                         self._skipped_micro_batches += 1
                         continue
 
                     running_loss += metrics.loss.detach().item()
-                    running_acc += metrics.accuracy.detach().item()
+                    running_correct += metrics.correct_tokens.detach().item()
+                    running_valid += metrics.valid_tokens.detach().item()
                     running_micro += 1
                     # Accumulated here, past the skip ``continue`` above, so a
                     # micro-batch excluded from loss/accuracy is excluded from
@@ -1134,52 +1151,68 @@ class TrainDFlashRecipe(BaseRecipe):
                         pending_micro_batches = 0
                         self._maybe_save_step_checkpoint(epoch_idx)
 
-                        if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
-                            # Average over the micro-batches accumulated since the last
-                            # log, not over optimizer steps: with grad_accumulation_steps>1
-                            # (or skipped short micro-batches) the two differ, and dividing
-                            # by log_every_steps would inflate the reported loss/acc.
-                            avg_loss = running_loss / max(1, running_micro)
-                            avg_acc = running_acc / max(1, running_micro)
-                            current_lr = self.lr_scheduler.get_last_lr()[0]
-                            if pbar is not None:
-                                pbar.set_postfix(
-                                    loss=f"{avg_loss:.4f}",
-                                    acc=f"{avg_acc:.4f}",
-                                    lr=f"{current_lr:.2e}",
+                        if self.runtime.global_step % self.log_every_steps == 0:
+                            # One collective, entered by every rank, so it cannot sit
+                            # inside the rank-0 logging guard below. Loss averages over
+                            # the micro-batches accumulated since the last log, not over
+                            # optimizer steps: with grad_accumulation_steps>1 (or skipped
+                            # short micro-batches) the two differ. Accuracy is a ratio, so
+                            # it divides the summed counts once instead of averaging the
+                            # per-rank ratios, which would be biased because valid_tokens
+                            # differs across ranks.
+                            window = self._dp_allreduce(
+                                torch.tensor(
+                                    [running_loss, running_correct, running_valid, float(running_micro)],
+                                    device=self.device,
+                                    dtype=torch.float32,
                                 )
-                            logger.info(
-                                "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
-                                epoch_idx,
-                                self.runtime.global_step,
-                                avg_loss,
-                                avg_acc,
-                                current_lr,
-                            )
-                            self._log_extra_train_metrics(epoch_idx)
-                            if getattr(self, "wandb_run", None) is not None:
-                                wandb_data = {
-                                    "train/loss": avg_loss,
-                                    "train/accuracy": avg_acc,
-                                    "train/lr": current_lr,
-                                    "train/epoch": epoch_idx,
-                                }
-                                wandb_data.update(
-                                    {
-                                        name: numerator / denominator
-                                        for name, (numerator, denominator) in running_extra.items()
-                                        if denominator > 0
-                                    }
-                                )
-                                self._wandb_log(wandb_data, step=self.runtime.global_step)
-                            running_loss = 0.0
-                            running_acc = 0.0
+                            ).tolist()
+                            avg_loss = window[0] / max(1.0, window[3])
+                            avg_acc = window[1] / max(1.0, window[2])
+                            running_loss = running_correct = running_valid = 0.0
                             running_micro = 0
+                            if self.dist_env.is_main:
+                                current_lr = self.lr_scheduler.get_last_lr()[0]
+                                if pbar is not None:
+                                    pbar.set_postfix(
+                                        loss=f"{avg_loss:.4f}",
+                                        acc=f"{avg_acc:.4f}",
+                                        lr=f"{current_lr:.2e}",
+                                    )
+                                logger.info(
+                                    "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
+                                    epoch_idx,
+                                    self.runtime.global_step,
+                                    avg_loss,
+                                    avg_acc,
+                                    current_lr,
+                                )
+                                self._log_extra_train_metrics(epoch_idx)
+                                if getattr(self, "wandb_run", None) is not None:
+                                    wandb_data = {
+                                        "train/loss": avg_loss,
+                                        "train/accuracy": avg_acc,
+                                        "train/lr": current_lr,
+                                        "train/epoch": epoch_idx,
+                                    }
+                                    wandb_data.update(
+                                        {
+                                            name: numerator / denominator
+                                            for name, (numerator, denominator) in running_extra.items()
+                                            if denominator > 0
+                                        }
+                                    )
+                                    self._wandb_log(wandb_data, step=self.runtime.global_step)
                             running_extra.clear()
 
                 # Flush the trailing partial accumulation window (see EAGLE recipes
                 # for the rescale rationale).
                 if pending_micro_batches > 0:
+                    if is_ddp and not window_grads_synced:
+                        # The epoch's last micro-batch, which would have carried DDP's
+                        # all-reduce, was skipped on every rank (no valid anchors), so
+                        # each rank still holds only its own grads for this window.
+                        _average_unsynced_ddp_grads(self.trainer_module)
                     synchronize_tp_replica_gradients(
                         [self.trainer_module],
                         getattr(self, "device_mesh", None),

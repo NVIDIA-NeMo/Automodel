@@ -103,6 +103,47 @@ def test_fp32_router_selection_weights_and_gradients_survive_autocast(router, de
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("storage_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("autocast_dtype", [torch.bfloat16, torch.float16])
+def test_inkling_fp32_router_selection_weights_and_gradients_survive_autocast(device, storage_dtype, autocast_dtype):
+    from nemo_automodel.components.models.inkling.layers import InklingGate
+
+    torch.manual_seed(2714489)
+    router = InklingGate(
+        SimpleNamespace(
+            hidden_size=64,
+            n_routed_experts=8,
+            n_shared_experts=2,
+            num_experts_per_tok=2,
+            route_scale=1.0,
+            torch_dtype=storage_dtype,
+        )
+    ).to(device)
+    with torch.no_grad():
+        router.weight.normal_(0, 0.1)
+        router.e_score_correction_bias.uniform_(-0.01, 0.01)
+    correction_bias = router.e_score_correction_bias.detach().clone()
+    x = torch.randn(4096, 64, device=device, dtype=storage_dtype, requires_grad=True)
+    with torch.autocast(device.type, enabled=False):
+        expected, indices, shared = router(x)
+    upstream = torch.randn_like(expected)
+    shared_upstream = torch.randn_like(shared)
+    parameters = (x, router.weight, router.global_scale)
+    gradients = torch.autograd.grad((expected * upstream).sum() + (shared * shared_upstream).sum(), parameters)
+    with torch.autocast(device.type, dtype=autocast_dtype):
+        actual, actual_indices, actual_shared = router(x)
+    actual_gradients = torch.autograd.grad(
+        (actual * upstream).sum() + (actual_shared * shared_upstream).sum(), parameters
+    )
+    torch.testing.assert_close(actual_indices, indices, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_shared, shared, rtol=0, atol=0)
+    for actual_grad, expected_grad in zip(actual_gradients, gradients):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+    assert router.e_score_correction_bias.dtype == torch.float32
+    torch.testing.assert_close(router.e_score_correction_bias, correction_bias, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("family", ["deepseek", "gpt_oss", "ernie", "llama"])
 @pytest.mark.parametrize("fused", [False, True])
 def test_long_position_rope_matches_fp32_under_autocast(device, family, fused):

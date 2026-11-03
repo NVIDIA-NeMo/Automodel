@@ -25,7 +25,43 @@ from nemo_automodel.components.datasets.packing import (
 
 def test_default_packed_sequence_contract_preserves_block_causal_behavior() -> None:
     assert DEFAULT_PACKED_SEQUENCE_CONTRACT.packed_mask_type == "block_causal"
-    assert DEFAULT_PACKED_SEQUENCE_CONTRACT.requires_packed_sequence_metadata is False
+    assert DEFAULT_PACKED_SEQUENCE_CONTRACT.return_packed_sequence_metadata is False
+
+
+def test_native_collation_requires_an_explicit_model_conversion() -> None:
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+
+    document = {"input_ids": [1, 2], "labels": [2, 3], "position_ids": [0, 1], "attention_mask": [1, 1]}
+    with pytest.raises(ValueError, match="model-derived packing contract"):
+        neat_packed_collater([document], packing=DEFAULT_PACKED_SEQUENCE_CONTRACT)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["sdpa", "flash_attention_2"])
+def test_model_conversion_runs_in_a_spawned_collator_worker(backend: str) -> None:
+    from functools import partial
+
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common.packing import get_packing_capabilities
+
+    document = {
+        "input_ids": [1, 2, 3, 0],
+        "labels": [2, 3, 4, -100],
+        "position_ids": [0, 0, 1, 0],
+        "attention_mask": [1, 2, 2, 0],
+    }
+    contract = get_packing_capabilities(backend)
+    collate = partial(neat_packed_collater, packing=contract)
+    expected = collate([document])
+    loader = torch.utils.data.DataLoader([document], collate_fn=collate, num_workers=1, multiprocessing_context="spawn")
+    actual = next(iter(loader))
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        if isinstance(value, torch.Tensor):
+            torch.testing.assert_close(actual[key], value)
+            assert actual[key].device.type == "cpu"
+        else:
+            assert actual[key] == value
 
 
 def test_get_seqlens_in_batch_preserves_batch_document_order() -> None:

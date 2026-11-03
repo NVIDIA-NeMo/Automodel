@@ -1632,6 +1632,11 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         return_assistant_tokens_mask=True,
                         processor_kwargs=processor_kwargs,
                     )
+                elif type(self.processor).__name__ == "MistralCommonBackend":
+                    # MistralCommonBackend owns the HF token API and takes no media kwargs.
+                    result = self.processor.apply_chat_template(
+                        [conversation], tokenize=True, return_dict=True, return_tensors="pt"
+                    )
                 else:
                     text = self.processor.apply_chat_template([conversation], tokenize=False)
                     if isinstance(text, list):
@@ -1706,6 +1711,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     "video_grid_thw",
                     "second_per_grid_ts",
                     "image_position_ids",
+                    "image_sizes",
                     "mm_token_type_ids",
                 ):
                     if key in result and result[key] is not None:

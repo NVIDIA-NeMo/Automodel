@@ -16,6 +16,7 @@ import importlib.util
 import logging
 import math
 import os
+import types
 import warnings
 from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
@@ -226,6 +227,27 @@ def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
         return True
 
 
+_EXCLUDED_FORWARD_ATTR = "_te_fp8_excluded_forward"
+"""Instance attribute holding the forward a module had before :meth:`TEFp8Config.exclude_modules` wrapped it."""
+
+
+def _forward_outside_fp8(module: nn.Module, *args, **kwargs):
+    """Run ``module``'s forward with the Transformer Engine FP8 autocast disabled.
+
+    Bound per instance by :meth:`TEFp8Config.exclude_modules`. The forward the module had before the
+    exclusion (an instance-level one installed earlier by a tensor-parallel style, a pipeline wrapper or
+    CUDA-graph capture, else the class ``forward``) is looked up on the instance at call time, so the
+    binding stays valid after ``copy.deepcopy``.
+    """
+    from transformer_engine.pytorch.quantization import autocast as te_autocast
+
+    installed = vars(module).get(_EXCLUDED_FORWARD_ATTR)
+    with te_autocast(enabled=False):
+        if installed is not None:
+            return installed(*args, **kwargs)
+        return type(module).forward(module, *args, **kwargs)
+
+
 @dataclass(kw_only=True)
 class TEFp8Config:
     """Configuration for Transformer Engine FP8 quantization.
@@ -241,6 +263,59 @@ class TEFp8Config:
     """
 
     recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    exclude_fqns: tuple[str, ...] = ("lm_head",)
+    """Module names kept out of the FP8 autocast (their GEMMs run in the model dtype).
+
+    Same matching as the torchao ``fp8.filter_fqns`` block: a module is excluded when any entry is a
+    substring of its qualified name, so ``"lm_head"`` covers ``lm_head`` and
+    ``model.language_model.lm_head``. The default keeps the output head in high precision, as the
+    FP8 checkpoints' ``modules_to_not_convert`` lists do. The train recipe applies the exclusions to
+    every model part once the parts exist (:meth:`exclude_modules`).
+    """
+
+    def __post_init__(self) -> None:
+        """Normalize ``exclude_fqns`` from YAML lists or a single string into a tuple of names."""
+        if isinstance(self.exclude_fqns, str):
+            self.exclude_fqns = (self.exclude_fqns,)
+        self.exclude_fqns = tuple(self.exclude_fqns)
+        if any(not isinstance(fqn, str) or not fqn for fqn in self.exclude_fqns):
+            raise ValueError(f"te_fp8.exclude_fqns must be non-empty module-name strings, got {self.exclude_fqns!r}")
+
+    def module_excluded(self, name: str) -> bool:
+        """Whether the module with qualified name ``name`` stays out of the FP8 autocast."""
+        return any(fqn in name for fqn in self.exclude_fqns)
+
+    def exclude_modules(self, model: nn.Module) -> list[str]:
+        """Keep the modules matching :attr:`exclude_fqns` out of the FP8 autocast.
+
+        Each matching module gets an instance ``forward`` that runs the forward it had so far (an
+        instance-level forward installed earlier, e.g. by a tensor-parallel style, else the class
+        ``forward``) under ``te_autocast(enabled=False)``. Parameters, state-dict keys and FSDP/pipeline
+        wrapping are untouched; idempotent; the binding follows the instance through ``copy.deepcopy``.
+        Logs the excluded names.
+
+        Args:
+            model: Model (or pipeline stage) whose modules are inspected by qualified name.
+
+        Returns:
+            Qualified names of the modules now kept out of FP8, in ``named_modules`` order; empty
+            without Transformer Engine or without exclusions.
+        """
+        if not HAVE_TE or not self.exclude_fqns:
+            return []
+        excluded: list[str] = []
+        for name, module in model.named_modules():
+            if not name or not self.module_excluded(name):
+                continue
+            installed = vars(module).get("forward")
+            if not (isinstance(installed, types.MethodType) and installed.__func__ is _forward_outside_fp8):
+                if installed is not None:
+                    setattr(module, _EXCLUDED_FORWARD_ATTR, installed)
+                module.forward = types.MethodType(_forward_outside_fp8, module)
+            excluded.append(name)
+        if excluded:
+            logger.info("te_fp8: %d module(s) kept out of the FP8 autocast: %s", len(excluded), ", ".join(excluded))
+        return excluded
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
@@ -425,7 +500,9 @@ class BackendConfig:
             Inputs must use BSHD layout; pre-packed THD is unsupported. Packed
             Qwen3Next and DeepSeek V3.2 sparse attention do not support FA4.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
-            indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
+            indexer, and Sinkhorn kernels together; "cudnn" keeps the TileLang
+            indexer/Sinkhorn and selects FlashMLA forward with cuDNN backward.
+            For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
             CUDA BF16; CPU execution retains the PyTorch numerical oracle.
@@ -436,7 +513,7 @@ class BackendConfig:
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch", "quack" or "triton"). QuACK is currently
             integrated for Llama-family rotary embeddings; "triton" selects the fused
-            Triton rotation of DeepSeek-V4.1 (other models keep the torch path).
+            Triton rotation of DeepSeek V4 / V4.1 (other models keep the torch path).
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "torch_mm" uses torch._grouped_mm,
@@ -481,6 +558,16 @@ class BackendConfig:
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
             keep it False for variable-length or in-batch-packed inputs.
+        dispatcher_recompute_cache: HybridEP only; effective under full-block activation checkpointing (not
+            installed for ``checkpoint_moe_only`` regions, which end at the combine the recompute never re-runs).
+            ``"none"`` (default) recomputes the whole MoE layer in the backward. ``"combine"`` keeps
+            a clone of every MoE layer's combine output ([tokens, hidden] in the activation dtype)
+            from the checkpoint forward and returns it in the recompute instead of re-running the
+            unpermute, the EP-group barrier and the combine all-to-all. ``"moe_tail"`` additionally
+            builds the down projection's autograd node in the recompute without running its GEMM
+            (its output only fed the skipped combine; torch_mm experts without expert bias and with
+            the router weight applied inside the activation) (a post-expert callback that reads the output keeps the GEMM). Costs one [tokens, hidden] activation
+            per MoE layer per in-flight microbatch; gradients are unchanged.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -508,7 +595,7 @@ class BackendConfig:
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
         compile_hc: torch.compile the mHC (hyper-connection) cores of models that opt in
-            (currently DeepSeek V4.1): coefficient projection, stream collapse and stream expand,
+            (currently DeepSeek V4 / V4.1): coefficient projection, stream collapse and stream expand,
             one fused kernel each, static shapes (a new sequence length compiles them again; past
             dynamo's recompile limit a core runs eager). Same lazy once-per-process pattern as
             ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
@@ -516,7 +603,7 @@ class BackendConfig:
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
         compile_router_weight: torch.compile the fp32 router-weight multiply applied to
-            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP``, all MoE models),
+            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP`` / ``GroupedExpertsTE``, all MoE models),
             so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
             cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
             numerics are allclose to eager but not bitwise-identical.
@@ -565,6 +652,10 @@ class BackendConfig:
     # aligned. Leave False for variable-length inputs: with genuinely unequal aligned counts the
     # HybridEP collective hangs silently (no exception; the job sits until its time limit).
     dispatcher_equal_token_counts: bool = False
+    # HybridEP only, under block activation checkpointing: "none" | "combine" (serve each MoE layer's combine
+    # output from the checkpoint forward in the recompute) | "moe_tail" (also skip the down projection's GEMM
+    # in the recompute). One [tokens, hidden] activation per MoE layer per in-flight microbatch.
+    dispatcher_recompute_cache: str = "none"
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     dispatcher_hybridep_permute_fusion: bool = False
     dispatcher_hybridep_compact_routing: bool = False
@@ -596,7 +687,7 @@ class BackendConfig:
     # not bitwise-identical. Default False.
     compile_norm: bool = False
     # When True, torch.compile the mHC projection / collapse / expand cores of opted-in models
-    # (currently DeepSeek V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
+    # (currently DeepSeek V4 / V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
     # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_hc: bool = False
     # When True, torch.compile DeepSeek V4.1's cache quantize/dequantize core (fp8 SWA KV, mxfp4 index
@@ -746,6 +837,21 @@ class BackendConfig:
             raise ValueError(
                 f"dispatcher_capacity_factor must be >= 1.0 (a smaller buffer overflows on the first skewed batch), "
                 f"got {self.dispatcher_capacity_factor!r}"
+            )
+        if self.dispatcher_recompute_cache not in ("none", "combine", "moe_tail"):
+            raise ValueError(
+                "dispatcher_recompute_cache must be one of 'none', 'combine', 'moe_tail', "
+                f"got {self.dispatcher_recompute_cache!r}"
+            )
+        if self.dispatcher_recompute_cache != "none" and self.dispatcher != "hybridep":
+            raise ValueError(
+                "dispatcher_recompute_cache requires dispatcher='hybridep' (the cache is served by the HybridEP "
+                f"combine), got dispatcher='{self.dispatcher}'"
+            )
+        if self.dispatcher_recompute_cache == "moe_tail" and self.experts not in ("torch_mm", "gmm"):
+            raise ValueError(
+                "dispatcher_recompute_cache='moe_tail' requires experts='torch_mm' (the deferred down projection "
+                f"is the torch grouped-GEMM path), got experts='{self.experts}'"
             )
         if self.dispatcher_capacity_factor is not None and self.benchmark_static_routing:
             # Static routing already pins the dispatched count after the first dispatch, so the capacity

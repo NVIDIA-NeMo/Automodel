@@ -125,6 +125,7 @@ class DeepseekV41TextConfig(PretrainedConfig):
         engram_strict_validation: bool = False,
         engram_capacity_mode: bool = False,
         compile_engram: bool = False,
+        reuse_sparse_selection_on_recompute: bool = True,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
@@ -231,6 +232,10 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # gate and the gated residual add) once per process (engram.compile_engram_gate): allclose to eager, not
         # bitwise. A DeepSeek-V4.1 knob like compile_cache_quant, so it lives here rather than on the shared BackendConfig.
         self.compile_engram = compile_engram
+        # Under activation checkpointing, serve the frozen CSA2 indexer's selection and the sparse-index plan of
+        # the checkpoint forward to the recompute instead of recomputing them (attention.csa2_selection_replay);
+        # a DeepSeek-V4.1 knob like compile_cache_quant. Numerics are unchanged; False recomputes them.
+        self.reuse_sparse_selection_on_recompute = bool(reuse_sparse_selection_on_recompute)
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,

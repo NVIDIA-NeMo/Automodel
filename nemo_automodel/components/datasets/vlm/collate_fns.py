@@ -105,12 +105,49 @@ def make_robust_collate(dataset, collate_fn, max_retries=10):
 
 
 def _find_pattern_indices(template, pattern, search_start_index=0, allow_first_token_mismatch=False):
+    """Find the first token-pattern match in a one-dimensional sequence.
+
+    Args:
+        template: Token IDs with shape ``[sequence]``.
+        pattern: Token IDs with shape ``[pattern_tokens]`` on the same device.
+        search_start_index: Nonnegative first start offset to consider.
+        allow_first_token_mismatch: Match only ``pattern[1:]`` at each start.
+
+    Returns:
+        The first half-open ``(start, end)`` span, or ``(-1, -1)``. An empty
+        pattern matches at ``search_start_index`` when it is in range.
+    """
     template_len = len(template)
     pattern_len = len(pattern)
-    for i in range(search_start_index, template_len - pattern_len + 1):
-        match = template[i : i + pattern_len] == pattern
-        if torch.all(match) or (allow_first_token_mismatch and torch.all(match[1:])):
-            return i, i + pattern_len
+    search_stop_index = template_len - pattern_len + 1
+    if search_start_index >= search_stop_index:
+        return -1, -1
+    if pattern_len == 0:
+        return search_start_index, search_start_index
+
+    # Filter candidate starts with one token before comparing full slices.  The
+    # previous loop evaluated a tensor in a Python condition at every possible
+    # offset, producing one aten::is_nonzero/aten::item pair per comparison.
+    # On a 16K packed sample that can mean tens of thousands of scalarizations
+    # for each assistant span.
+    if allow_first_token_mismatch:
+        if pattern_len == 1:
+            return search_start_index, search_start_index + 1
+        anchor_offset = 1
+    else:
+        anchor_offset = 0
+    anchor = pattern[anchor_offset]
+    candidate_positions = torch.nonzero(
+        template[search_start_index + anchor_offset : search_stop_index + anchor_offset] == anchor,
+        as_tuple=True,
+    )[0]
+    compare_start = anchor_offset if allow_first_token_mismatch else 0
+    pattern_values = pattern[compare_start:].tolist()
+    for candidate_offset in candidate_positions.tolist():
+        start = search_start_index + candidate_offset
+        candidate_values = template[start + compare_start : start + pattern_len].tolist()
+        if candidate_values == pattern_values:
+            return start, start + pattern_len
     return -1, -1
 
 
@@ -364,6 +401,10 @@ def _build_labels_from_markers(
     stop_id:
         Single token id that closes a turn (e.g. ``<|im_end|>`` or
         ``<end_of_turn>``).
+
+    Returns:
+        Labels with shape ``(B, L)`` on the same device and with the same dtype
+        as ``input_ids_batch``.
     """
     marker_len = len(assistant_marker)
     marker_tensor = torch.tensor(assistant_marker, dtype=input_ids_batch.dtype, device=input_ids_batch.device)
@@ -376,22 +417,18 @@ def _build_labels_from_markers(
         i = 0
 
         while i <= seq_len - marker_len:
-            if torch.equal(encoded[i : i + marker_len], marker_tensor):
-                content_start = i + marker_len  # first token of assistant content
+            marker_start, content_start = _find_pattern_indices(encoded, marker_tensor, i)
+            if marker_start < 0:
+                break
 
-                # Scan forward to find the closing stop token.
-                content_end = content_start
-                while content_end < seq_len and encoded[content_end].item() != stop_id:
-                    content_end += 1
+            # Locate every possible closing token with one tensor comparison,
+            # then use the first host index.  The previous token-by-token loop
+            # called ``item()`` for every assistant token in the packed stream.
+            stop_offsets = torch.nonzero(encoded[content_start:] == stop_id, as_tuple=True)[0].tolist()
+            content_end = content_start + stop_offsets[0] + 1 if stop_offsets else seq_len
 
-                # Include the stop token in labels so the model learns to emit it.
-                if content_end < seq_len:
-                    content_end += 1
-
-                labels[content_start:content_end] = encoded[content_start:content_end]
-                i = content_end
-            else:
-                i += 1
+            labels[content_start:content_end] = encoded[content_start:content_end]
+            i = content_end
 
         labels_list.append(labels)
 
@@ -430,6 +467,12 @@ def build_labels_from_template(
     """
     processor_type = type(processor).__name__
     tokenizer = getattr(processor, "tokenizer", processor)
+
+    # MistralCommonBackend owns the HF token API; its .tokenizer is the vendor
+    # encoder, not another HF tokenizer. [/INST] delimits each assistant turn.
+    if processor_type == "MistralCommonBackend":
+        assistant_marker = [processor.convert_tokens_to_ids("[/INST]")]
+        return _build_labels_from_markers(input_ids_batch, assistant_marker, processor.eos_token_id)
 
     # Inkling closes an assistant message before emitting a separate sampling
     # terminator. Label through the first sampling terminator, which also keeps
@@ -1574,7 +1617,8 @@ def neat_packed_vlm_collater(
         attn_implementation: Deprecated attention-backend name retained in its
             original positional slot for Python-call compatibility.
         packing: Structural model contract selecting the packed mask representation.
-            Defaults to block-causal masking without packed-sequence metadata.
+            Native mask/Flash collation requires a model-derived contract supplying
+            the attention conversion; recipes provide it automatically.
         materialize_4d_mask: Whether SDPA/eager packing should expand the
             indexed ``[B, S]`` document map into a dense
             ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
@@ -1639,15 +1683,6 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
-    if packed_mask_type != "block_causal" or not materialize_4d_mask:
-        # Keep the compact indexed [B, S] map for native attention or CP.
-        # The HF varlen path replaces it with explicit cumulative lengths below.
-        attention_mask_out = attention_mask
-    else:
-        from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
-
-        attention_mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
-
     # Handle position_ids: 1D [seq_len] or 3D mRoPE [3, seq_len]
     pos_sample = torch.as_tensor(batch[0]["position_ids"])
     if pos_sample.ndim == 2:
@@ -1668,28 +1703,25 @@ def neat_packed_vlm_collater(
         "input_ids": input_ids,
         "labels": labels,
         "position_ids": position_ids,
-        "attention_mask": attention_mask_out,
         "mm_token_type_ids": mm_token_type_ids,
     }
-    if packed_mask_type == "flash_varlen":
-        from nemo_automodel.components.datasets.packed_seq import (
-            packed_seq_params_from_doc_ids,
-            to_flash_attention_kwargs,
-        )
-
-        # HF consumes physical offsets, including padding, without an attention
-        # mask. Native FA4's unpadded offsets below have a different contract.
-        result.pop("attention_mask")
-        result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
-    if packing.requires_packed_sequence_metadata:
+    if packed_mask_type == "block_causal" and not materialize_4d_mask:
+        # Native CP consumes compact IDs and constructs its local attention policy.
+        result["attention_mask"] = attention_mask
+    else:
+        prepare_attention = packing.prepare_attention_inputs
+        if prepare_attention is None:
+            raise ValueError("Native packed collation requires a model-derived packing contract")
+        result.update(prepare_attention(attention_mask))
+    if packing.return_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
 
     # Store indexed attention mask for loss functions that need per-sample
     # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
-    # ``attention_mask_out`` is already converted to 4D, so keep a copy.
+    # ``attention_mask`` is already converted to 4D, so keep a copy.
     has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
-    if has_multiple_docs or not materialize_4d_mask or packing.requires_packed_sequence_metadata:
+    if has_multiple_docs or not materialize_4d_mask or packing.return_packed_sequence_metadata:
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
@@ -2008,8 +2040,26 @@ def nemotron_omni_collate_fn(
 
     padded_input_ids = []
     padded_attention_masks = []
-    for input_ids, attn_mask in zip(all_input_ids, all_attention_masks):
+    for i, (input_ids, attn_mask) in enumerate(zip(all_input_ids, all_attention_masks)):
         seq_len = input_ids.shape[0]
+        # The final position is dropped by the label shift below, so any image
+        # token at or after ``target_len - 1`` loses its placeholder.
+        if seq_len >= target_len and (i in sample_pixel_values or i in sample_pixel_values_videos):
+            image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+            if bool((input_ids[target_len - 1 :] == image_token_id).any()):
+                # The model scatters the batch's concatenated image features into
+                # the image tokens in order, so a partially kept image would shift
+                # this row's leftover features into the next row. Drop this row's
+                # media and its remaining image tokens instead.
+                logger.warning(
+                    "max_length=%d cuts into the image tokens of sample %d (%d tokens); dropping its images.",
+                    target_len,
+                    i,
+                    seq_len,
+                )
+                sample_pixel_values.pop(i, None)
+                sample_pixel_values_videos.pop(i, None)
+                input_ids = input_ids.masked_fill(input_ids == image_token_id, pad_token_id)
         if seq_len < target_len:
             pad_len = target_len - seq_len
             input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id, dtype=input_ids.dtype)])

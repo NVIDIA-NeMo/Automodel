@@ -35,6 +35,7 @@ TileLang still import the model and use the existing torch path.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -375,16 +376,78 @@ def dense_attention_topk_torch(
     return (numerator / denominator.unsqueeze(-1)).to(q.dtype)
 
 
+@dataclass(frozen=True)
+class SparseIndexPlan:
+    """Sparse-attention indices prepared once for every layer that consumes the same selection.
+
+    Attributes:
+        backend: The sparse backend the layout is prepared for (``"cudnn"`` or ``"tilelang"``).
+        indices: ``"cudnn"``: contiguous int32 ``[batch * sequence, 1, padded_width]`` with global flat K/V
+            coordinates (per-batch offsets applied), an ascending valid prefix and a ``-1`` suffix.
+            ``"tilelang"``: contiguous int32 ``[batch, sequence, slots]`` with ``-1`` masked, the kernel layout.
+        topk_length: ``"cudnn"`` only: contiguous int32 ``[batch * sequence]`` valid-prefix lengths.
+        valid_rows: ``"cudnn"`` with padded inputs only: int64 indices of the nonempty query rows, so the
+            backward skips its empty-row scan; ``None`` when every row is nonempty.
+        kv_sequence: Number of K/V positions per batch row the coordinates refer to.
+    """
+
+    backend: Dsv4SparseAttentionBackend
+    indices: torch.Tensor
+    topk_length: torch.Tensor | None
+    valid_rows: torch.Tensor | None
+    kv_sequence: int
+
+
+def _flatten_sparse_indices(topk_idxs: torch.Tensor, kv_sequence: int) -> torch.Tensor:
+    """Turn per-batch ``[batch, sequence, slots]`` indices into int64 ``[batch * sequence, slots]`` global coordinates."""
+    batch, sequence, _ = topk_idxs.shape
+    offsets = (torch.arange(batch, device=topk_idxs.device, dtype=torch.int64) * kv_sequence).view(batch, 1, 1)
+    flat_idx = torch.where(
+        topk_idxs >= 0, topk_idxs.to(torch.int64) + offsets, torch.full_like(topk_idxs, -1, dtype=torch.int64)
+    )
+    return flat_idx.reshape(batch * sequence, -1)
+
+
+def plan_dsv4_sparse_indices(
+    topk_idxs: torch.Tensor,
+    kv_sequence: int,
+    *,
+    backend: Dsv4SparseAttentionBackend,
+    all_rows_nonempty: bool = False,
+) -> SparseIndexPlan:
+    """Prepare the per-call index work of :func:`dsv4_sparse_attention` once for a shared selection.
+
+    Args:
+        topk_idxs: Sparse indices ``[batch, sequence, slots]`` with ``-1`` masked.
+        kv_sequence: Number of K/V positions per batch row.
+        backend: Sparse execution backend the plan is for.
+        all_rows_nonempty: Whether every query has at least one valid slot (``"cudnn"``: when false the plan
+            also carries the nonempty rows, one host synchronisation per plan instead of one per layer backward).
+
+    Returns:
+        The plan to pass as ``plan=`` to :func:`dsv4_sparse_attention` together with the same ``kv``.
+    """
+    if backend == "cudnn":
+        from nemo_automodel.components.models.common.cudnn_sparse_attention import plan_sparse_indices
+
+        batch = topk_idxs.shape[0]
+        indices, topk_length = plan_sparse_indices(_flatten_sparse_indices(topk_idxs, kv_sequence), batch * kv_sequence)
+        valid_rows = None if all_rows_nonempty else torch.nonzero(topk_length > 0, as_tuple=False).flatten()
+        return SparseIndexPlan("cudnn", indices.unsqueeze(1), topk_length, valid_rows, kv_sequence)
+    return SparseIndexPlan(backend, topk_idxs.to(torch.int32).contiguous(), None, None, kv_sequence)
+
+
 def dsv4_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     sinks: torch.Tensor,
-    topk_idxs: torch.Tensor,
+    topk_idxs: torch.Tensor | None,
     sm_scale: float,
     *,
     backend: Dsv4SparseAttentionBackend,
     reference_rounding: bool = False,
     all_rows_nonempty: bool = False,
+    plan: SparseIndexPlan | None = None,
 ) -> torch.Tensor:
     """Run sparse attention with an optional original-inference rounding mode.
 
@@ -392,19 +455,32 @@ def dsv4_sparse_attention(
         q: BF16 queries [batch, sequence, heads, head_dim].
         kv: Shared keys/values [batch, kv_sequence, head_dim].
         sinks: FP32 denominator biases [heads].
-        topk_idxs: Sparse indices [batch, sequence, slots], with -1 masked.
+        topk_idxs: Sparse indices [batch, sequence, slots], with -1 masked; ``None`` only together
+            with ``plan``, which then carries the prepared indices.
         sm_scale: Query/key score multiplier.
         backend: Sparse execution backend.
         reference_rounding: Scale logits before max reduction and use the
             original inference exponent arithmetic. Requires TileLang.
+        all_rows_nonempty: Whether every query has at least one valid slot (``"cudnn"``).
+        plan: Optional :class:`SparseIndexPlan` from :func:`plan_dsv4_sparse_indices` for this ``backend``
+            and ``kv``; it replaces the per-call index preparation of ``topk_idxs``.
 
     Returns:
         Attention output [batch, sequence, heads, head_dim], with q's dtype.
     """
+    if topk_idxs is None and plan is None:
+        raise ValueError("dsv4_sparse_attention needs topk_idxs or a prepared plan")
+    if plan is not None and (plan.backend != backend or plan.kv_sequence != kv.shape[1]):
+        raise ValueError(
+            f"The sparse-index plan was built for backend={plan.backend!r} and kv_sequence={plan.kv_sequence}, "
+            f"got backend={backend!r} and kv_sequence={kv.shape[1]}"
+        )
     if backend == "cudnn":
         # cuDNN Frontend DSA kernels (FlashMLA forward when installed): one flat token axis, global K/V coordinates.
         # The kernels have their own rounding, so ``reference_rounding`` does not apply here.
-        return _dsv4_sparse_attention_cudnn(q, kv, sinks, topk_idxs, sm_scale, all_rows_nonempty=all_rows_nonempty)
+        return _dsv4_sparse_attention_cudnn(
+            q, kv, sinks, topk_idxs, sm_scale, all_rows_nonempty=all_rows_nonempty, plan=plan
+        )
     use_tilelang = _should_use_tilelang(
         backend,
         available=_HAS_MILES_SPARSE_ATTN,
@@ -416,7 +492,7 @@ def dsv4_sparse_attention(
         q = q.contiguous()
         kv = kv.contiguous()
         sinks = sinks.float().contiguous()
-        topk_idxs = topk_idxs.to(torch.int32).contiguous()
+        topk_idxs = plan.indices if plan is not None else topk_idxs.to(torch.int32).contiguous()
         original_heads = q.shape[2]
         if original_heads < 16:
             head_pad = 16 - original_heads
@@ -444,6 +520,8 @@ def dsv4_sparse_attention(
         return output[:, :, :original_heads, :]
     if reference_rounding:
         raise ValueError("Original-inference sparse attention rounding requires the TileLang backend")
+    if plan is not None:
+        topk_idxs = plan.indices
     return sparse_attention_torch(q, kv, sinks, topk_idxs.long(), sm_scale)
 
 
@@ -451,9 +529,10 @@ def _dsv4_sparse_attention_cudnn(
     q: torch.Tensor,
     kv: torch.Tensor,
     sinks: torch.Tensor,
-    topk_idxs: torch.Tensor,
+    topk_idxs: torch.Tensor | None,
     sm_scale: float,
     all_rows_nonempty: bool = False,
+    plan: SparseIndexPlan | None = None,
 ) -> torch.Tensor:
     """Run the shared cuDNN sparse attention on batched DSV4 tensors.
 
@@ -461,8 +540,10 @@ def _dsv4_sparse_attention_cudnn(
         q: BF16 queries ``[batch, sequence, heads, head_dim]``.
         kv: BF16 shared keys/values ``[batch, kv_sequence, head_dim]``.
         sinks: FP32 per-head sink logits ``[heads]``.
-        topk_idxs: Per-batch sparse indices ``[batch, sequence, slots]`` with ``-1`` masked.
+        topk_idxs: Per-batch sparse indices ``[batch, sequence, slots]`` with ``-1`` masked; ``None`` with ``plan``.
         sm_scale: Softmax scale.
+        all_rows_nonempty: Whether every query has at least one valid slot.
+        plan: Optional prepared ``"cudnn"`` plan for this ``kv``, replacing ``topk_idxs``.
 
     Returns:
         BF16 output ``[batch, sequence, heads, head_dim]``.
@@ -480,17 +561,20 @@ def _dsv4_sparse_attention_cudnn(
         raise RuntimeError("dsv4 cuDNN sparse attention requires bfloat16 q and kv.")
     batch, sequence, heads, head_dim = q.shape
     kv_sequence = kv.shape[1]
-    offsets = (torch.arange(batch, device=topk_idxs.device, dtype=torch.int64) * kv_sequence).view(batch, 1, 1)
-    flat_idx = torch.where(
-        topk_idxs >= 0, topk_idxs.to(torch.int64) + offsets, torch.full_like(topk_idxs, -1, dtype=torch.int64)
-    )
-    flat_idx = flat_idx.reshape(batch * sequence, 1, -1).to(torch.int32).contiguous()
+    if plan is None:
+        flat_idx = _flatten_sparse_indices(topk_idxs, kv_sequence).unsqueeze(1).to(torch.int32).contiguous()
+        topk_length = valid_rows = None
+    else:
+        flat_idx, topk_length = plan.indices, plan.topk_length
+        valid_rows = None if all_rows_nonempty else plan.valid_rows
     output = cudnn_sparse_attention(
         q.reshape(batch * sequence, heads, head_dim).contiguous(),
         kv.reshape(batch * kv_sequence, 1, head_dim).contiguous(),
         flat_idx,
         softmax_scale=sm_scale,
+        topk_length=topk_length,
         all_rows_nonempty=all_rows_nonempty,
+        valid_row_indices=valid_rows,
         attn_sink=sinks.to(torch.float32).contiguous(),
     )
     return output.reshape(batch, sequence, heads, -1)

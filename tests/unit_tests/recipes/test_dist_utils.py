@@ -40,6 +40,8 @@ from nemo_automodel.recipes._dist_utils import (
     parse_distributed_section,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeAxis:
     def __init__(self, size: int):

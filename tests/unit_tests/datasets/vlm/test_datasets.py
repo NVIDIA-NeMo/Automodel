@@ -2009,6 +2009,24 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
 
         assert wrapper.inject_fake_images is False
 
+    def test_native_preprocessing_preserves_original_image_sizes(self, monkeypatch):
+        import torch
+
+        self._patch_pipeline(monkeypatch)
+        sizes = torch.tensor([[8, 12], [12, 8]])
+        pixels = torch.ones(2, 3, 12, 12)
+
+        class SizedImageProcessor(_FakeProcessor):
+            def __call__(self, **kwargs):
+                return {**super().__call__(**kwargs), "image_sizes": sizes, "pixel_values": pixels}
+
+        wrapper = ds.PreTokenizedDatasetWrapper(
+            self._make_dataset(), SizedImageProcessor(), inject_fake_images=False, max_retries=1
+        )
+        encoded = wrapper[0]
+        assert encoded["image_sizes"] is sizes
+        assert encoded["pixel_values"] is pixels
+
 
 def _shopify_hf_dataset(n=3):
     """A real in-memory HF dataset so ``with_transform`` is actually exercised."""
