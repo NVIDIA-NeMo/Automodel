@@ -783,6 +783,43 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         logits_to_keep: int | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | MiniMaxM3CausalLMOutput | dict[str, torch.Tensor]:
+        """Run one MiniMax-M3 VL microbatch, consuming staged PP media when present.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] on the first stage,
+                with one placeholder per merged vision token, or float hidden
+                states of shape [batch, sequence, hidden] from the previous
+                pipeline stage. Under CP they stay full-length until the
+                embeddings are sharded here.
+            pixel_values: Optional image patch rows of shape
+                [patches, patch_features], where patch_features is
+                channels * temporal_patch_size * patch_size**2 and each image's
+                time * height * width patches are concatenated in image order.
+                When both media inputs are None, the next staged PP media chunk
+                is used.
+            image_grid_thw: Optional tensor of shape [images, 3], or a list of
+                [time, height, width] triples, storing each image's patch grid.
+            pixel_values_videos: Optional video patch rows of shape
+                [patches, patch_features], laid out like pixel_values.
+            video_grid_thw: Optional tensor of shape [videos, 3], or a list of
+                [time, height, width] triples, storing each video's patch grid.
+            position_ids: Optional tensor of shape [batch, sequence]; under CP,
+                sequence is the local shard.
+            attention_mask: Optional mask of shape [batch, sequence] or
+                [batch, 1, sequence, sequence].
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
+            logits_to_keep: When set outside pipeline parallelism, skip the LM
+                head and return hidden states for the fused loss.
+            **kwargs: Attention metadata forwarded to the text model.
+
+        Returns:
+            Logits of shape [batch, sequence, vocab], or hidden states of shape
+            [batch, sequence, hidden] on a pipeline stage without the LM head;
+            under CP, sequence is the local shard. When logits_to_keep is set outside pipeline parallelism,
+            a dict whose "hidden_states" has shape [batch, sequence, hidden].
+            During MTP training, a MiniMaxM3CausalLMOutput that also carries the
+            per-depth MTP logits.
+        """
         is_pp_stage = self._is_pipeline_parallel_stage()
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the

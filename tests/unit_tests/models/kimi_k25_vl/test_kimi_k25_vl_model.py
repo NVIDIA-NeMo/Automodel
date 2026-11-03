@@ -1475,6 +1475,119 @@ class TestKimiK25VLForConditionalGenerationForward:
         assert (grid_thws[:, 0] == 1).all()  # T dimension is 1
         assert (grid_thws[:, 1:] == image_grid_hws).all()
 
+    @pytest.mark.parametrize("image_counts", [[1, 1], [0, 2]])
+    def test_collated_patch_media_reaches_the_correct_pipeline_microbatch(self, image_counts, monkeypatch):
+        from types import SimpleNamespace
+
+        from nemo_automodel.components.datasets.vlm import collate_fns
+        from nemo_automodel.components.datasets.vlm.pp_media import prepare_vlm_media_for_pp, stage_vlm_media_for_pp
+        from nemo_automodel.components.models.common import BackendConfig
+
+        class Processor:
+            media_placeholder_token_id = 60
+            tokenizer = SimpleNamespace(pad_token_id=0)
+
+            def apply_chat_template(self, conversation, **kwargs):
+                return "test conversation"
+
+            def __call__(self, *, medias=(), **kwargs):
+                ids = torch.tensor([[1, *([60] * len(medias)), 2, 3]])
+                result = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+                if medias:
+                    result["pixel_values"] = torch.cat([media["image"][0] for media in medias])
+                    result["grid_thws"] = torch.tensor([media["image"][1] for media in medias])
+                return result
+
+        # Label construction is independent of media ownership; no tokenizer download.
+        monkeypatch.setattr(collate_fns, "build_labels_from_template", lambda ids, *args: ids.clone())
+        torch.manual_seed(12)
+        images = [(torch.randn(8, 3, 14, 14), [1, 2, 4]), (torch.randn(4, 3, 14, 14), [1, 2, 2])]
+        examples = []
+        offset = 0
+        for count in image_counts:
+            content = [{"type": "image", "image": image} for image in images[offset : offset + count]]
+            examples.append({"conversation": [{"role": "user", "content": content}]})
+            offset += count
+        batch = collate_fns.kimi_k25_vl_collate_fn(examples, Processor(), max_length=8)
+        torch.testing.assert_close(batch["n_images_per_sample"], torch.tensor(image_counts))
+
+        config = KimiK25VLConfig(
+            media_placeholder_token_id=60,
+            vision_config=dict(
+                hidden_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                intermediate_size=32,
+                init_pos_emb_height=4,
+                init_pos_emb_width=4,
+                init_pos_emb_time=1,
+            ),
+            text_config=dict(
+                vocab_size=64,
+                hidden_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                intermediate_size=32,
+                moe_intermediate_size=16,
+                q_lora_rank=None,
+                kv_lora_rank=8,
+                qk_nope_head_dim=4,
+                qk_rope_head_dim=4,
+                v_head_dim=8,
+                n_routed_experts=2,
+                num_experts_per_tok=1,
+                first_k_dense_replace=1,
+                max_position_embeddings=32,
+            ),
+        )
+        backend = BackendConfig(
+            linear="torch",
+            attn="sdpa",
+            rms_norm="torch",
+            rope_fusion=False,
+            dispatcher="torch",
+            enable_hf_state_dict_adapter=False,
+        )
+        model = KimiK25VLForConditionalGeneration(config, backend=backend).eval()
+        model.initialize_weights(buffer_device=torch.device("cpu"))
+        model.float()
+        pixels, grids = batch["pixel_values"], batch["grid_thws"]
+        direct = []
+        image_offset = patch_offset = 0
+        for index, count in enumerate(image_counts):
+            patch_count = int(grids[image_offset : image_offset + count].prod(1).sum())
+            output = model(
+                batch["input_ids"][index : index + 1],
+                attention_mask=batch["attention_mask"][index : index + 1],
+                pixel_values=pixels[patch_offset : patch_offset + patch_count] if count else None,
+                grid_thws=grids[image_offset : image_offset + count] if count else None,
+            )
+            direct.append(output)
+            image_offset += count
+            patch_offset += patch_count
+        sum(output.square().mean() for output in direct).backward()
+        expected_gradients = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+        model.zero_grad(set_to_none=True)
+
+        prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
+        pp = SimpleNamespace(info=SimpleNamespace(has_first_stage=True))
+        staged = []
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            for index in range(2):
+                output = model(
+                    batch["input_ids"][index : index + 1],
+                    attention_mask=batch["attention_mask"][index : index + 1],
+                )
+                staged.append(output)
+                assert model._vlm_chunk_idx == index + 1
+                torch.testing.assert_close(output, direct[index])
+            sum(output.square().mean() for output in staged).backward()
+        for name, parameter in model.named_parameters():
+            if name in expected_gradients:
+                torch.testing.assert_close(parameter.grad, expected_gradients[name])
+        assert model._vlm_pixel_values_chunks is None
+
     def test_forward_loss_computation_with_attention_mask(self):
         """Test loss computation with attention mask masking."""
         logits = torch.randn(2, 10, 1000)

@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.mistral4.model import Mistral3ForConditionalGeneration
+from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForConditionalGeneration
 from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
 from nemo_automodel.components.models.qwen3_vl_moe.model import Qwen3VLMoeForConditionalGeneration
 from nemo_automodel.components.models.step3p7.model import Step3p7ForConditionalGeneration
@@ -50,13 +51,14 @@ class _MediaBackbone(torch.nn.Module):
         for key in ("pixel_values", "pixel_values_videos", "patch_pixel_values"):
             if kwargs.get(key) is not None:
                 hidden = hidden + kwargs[key].mean()
-        return hidden if self.tensor_output else SimpleNamespace(last_hidden_state=hidden)
+        return hidden if self.tensor_output else SimpleNamespace(last_hidden_state=hidden, past_key_values=None)
 
 
 @pytest.mark.parametrize(
     "model_class",
     [
         Mistral3ForConditionalGeneration,
+        Qwen3_5ForConditionalGeneration,
         Qwen3_5MoeForConditionalGeneration,
         Qwen3VLMoeForConditionalGeneration,
         Step3p7ForConditionalGeneration,
@@ -66,7 +68,12 @@ def test_text_then_image_microbatch_matches_explicit_media_and_gradients(model_c
     torch.manual_seed(9)
     model = model_class.__new__(model_class)
     torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(text_config=SimpleNamespace(output_hidden_states=False))
+    model.config = SimpleNamespace(
+        text_config=SimpleNamespace(output_hidden_states=False),
+        image_token_id=4,
+        video_token_id=5,
+        vision_start_token_id=6,
+    )
     model.model = _MediaBackbone(tensor_output=model_class is Step3p7ForConditionalGeneration)
     if model_class is not Mistral3ForConditionalGeneration:
         model.lm_head = model.model.language_model.lm_head
@@ -76,12 +83,19 @@ def test_text_then_image_microbatch_matches_explicit_media_and_gradients(model_c
     model.backend = SimpleNamespace(attn="sdpa")
     model.eval()
     ids = torch.tensor([[1, 2, 3]])  # No hardcoded architecture image-token IDs.
+    image_ids = (
+        torch.tensor([[1, model.config.image_token_id, 3]]) if model_class is Qwen3_5ForConditionalGeneration else ids
+    )
     pixels = torch.randn(2, 3, 4, 4)
     grid = torch.tensor([[2, 3], [3, 2]])
     direct_kwargs = {"pixel_values": pixels}
     if model_class is Mistral3ForConditionalGeneration:
         direct_kwargs["image_sizes"] = grid
-    elif model_class in (Qwen3_5MoeForConditionalGeneration, Qwen3VLMoeForConditionalGeneration):
+    elif model_class in (
+        Qwen3_5ForConditionalGeneration,
+        Qwen3_5MoeForConditionalGeneration,
+        Qwen3VLMoeForConditionalGeneration,
+    ):
         direct_kwargs["image_grid_thw"] = torch.nn.functional.pad(grid, (1, 0), value=1)
     else:
         direct_kwargs["patch_pixel_values"] = pixels[:1]
@@ -89,7 +103,7 @@ def test_text_then_image_microbatch_matches_explicit_media_and_gradients(model_c
         direct_kwargs["patch_newline_mask"] = torch.tensor([False])
 
     direct_text = model(ids)
-    direct_image = model(ids, **direct_kwargs)
+    direct_image = model(image_ids, **direct_kwargs)
     direct_logits = direct_image.logits if hasattr(direct_image, "logits") else direct_image
     direct_logits.square().mean().backward()
     expected_gradients = {name: parameter.grad.clone() for name, parameter in model.named_parameters()}
@@ -106,7 +120,7 @@ def test_text_then_image_microbatch_matches_explicit_media_and_gradients(model_c
     staged_text = model(ids)
     assert model._vlm_chunk_idx == 1
     assert model.model.calls[-1].get("pixel_values") is None
-    staged_image = model(ids)
+    staged_image = model(image_ids)
     assert model._vlm_chunk_idx == 2
     actual_kwargs = model.model.calls[-1]
     for key, expected in direct_kwargs.items():
@@ -123,3 +137,29 @@ def test_text_then_image_microbatch_matches_explicit_media_and_gradients(model_c
     with pytest.raises(ValueError, match="chunks exhausted at microbatch 2"):
         model(ids)
     assert model._vlm_chunk_idx == 2
+
+
+def test_dense_qwen_explicit_media_uses_cached_token_presence_without_consuming_staged_media():
+    model = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(image_token_id=4, video_token_id=5, vision_start_token_id=6)
+    pixels = torch.randn(2, 12)
+    image_grid = torch.tensor([[1, 1, 2]])
+    video_grid = torch.tensor([[2, 1, 1]])
+    model._vlm_pixel_values_chunks = [pixels]
+    model._vlm_image_grid_hws_chunks = [image_grid]
+    model._vlm_chunk_idx = 0
+    kwargs = dict(
+        pixel_values=pixels,
+        image_grid_thw=image_grid,
+        pixel_values_videos=pixels,
+        video_grid_thw=video_grid,
+        _vlm_token_presence=(True, False, True),
+    )
+
+    image, video, grid, video_grid = model._pop_staged_vlm_media(torch.tensor([[1, 2, 3]]), kwargs)
+
+    assert image is pixels and grid is image_grid
+    assert video is None and video_grid is None
+    assert model._vlm_chunk_idx == 0
+    assert "_vlm_token_presence" not in kwargs
