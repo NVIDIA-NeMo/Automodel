@@ -500,8 +500,104 @@ class TestMain:
 
 
 # ---------------------------------------------------------------------------
-# merge_lora (mocked)
+# merge_lora
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tied,target_modules,multimodal",
+    [
+        (True, ["lm_head"], False),
+        (False, ["lm_head"], False),
+        (True, ["q_proj"], False),
+        (True, ["embed_tokens"], False),
+        (True, ["embed_tokens", "lm_head"], False),
+        (True, ["lm_head"], True),
+    ],
+    ids=["tied-head", "untied-head", "tied-projection", "tied-input", "tied-input-and-head", "tied-vlm-head"],
+)
+def test_merge_lora_preserves_tied_embedding_outputs(
+    tmp_path: Path, tied: bool, target_modules: list[str], multimodal: bool
+) -> None:
+    from peft import LoraConfig, get_peft_model
+    from safetensors.torch import load_file
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoModelForImageTextToText,
+        LlamaConfig,
+        LlamaForCausalLM,
+        SmolVLMConfig,
+        SmolVLMForConditionalGeneration,
+    )
+
+    from tools.merge_lora import merge_lora
+
+    torch.manual_seed(0)
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        tie_word_embeddings=tied,
+        pad_token_id=0,
+    )
+    auto_cls = AutoModelForCausalLM
+    if multimodal:
+        config = SmolVLMConfig(
+            text_config=config.to_dict(),
+            vision_config={
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "image_size": 16,
+                "patch_size": 4,
+            },
+            tie_word_embeddings=tied,
+            pad_token_id=0,
+            image_token_id=31,
+        )
+        base = SmolVLMForConditionalGeneration(config).eval()
+        auto_cls = AutoModelForImageTextToText
+    else:
+        base = LlamaForCausalLM(config).eval()
+    original_embeddings = base.get_input_embeddings().weight.detach().clone()
+    base_dir, adapter_dir, output_dir = (tmp_path / name for name in ("base", "adapter", "merged"))
+    base.save_pretrained(base_dir)
+    model = get_peft_model(
+        base, LoraConfig(r=2, lora_alpha=4, target_modules=target_modules, task_type="CAUSAL_LM")
+    ).eval()
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "lora_" in name:
+                parameter.normal_(0, 0.1)
+        input_ids = torch.tensor([[1, 4, 5, 6]])
+        expected_embeddings = model.get_input_embeddings()(input_ids)
+        expected_logits = model(input_ids).logits
+    model.save_pretrained(adapter_dir, save_embedding_layers=False)
+
+    merge_lora(
+        str(base_dir),
+        str(adapter_dir),
+        str(output_dir),
+        dtype="float32",
+        device="cpu",
+        save_tokenizer=False,
+        model_class=auto_cls.__name__ if multimodal else None,
+    )
+
+    merged = auto_cls.from_pretrained(output_dir).eval()
+    torch.testing.assert_close(merged.get_input_embeddings()(input_ids), expected_embeddings, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(merged(input_ids).logits, expected_logits, rtol=1e-5, atol=1e-6)
+    if "embed_tokens" not in target_modules:
+        torch.testing.assert_close(merged.get_input_embeddings().weight, original_embeddings, rtol=0, atol=0)
+    expected_tied = tied and target_modules == ["q_proj"]
+    assert merged.config.tie_word_embeddings is expected_tied
+    assert merged.config.get_text_config().tie_word_embeddings is expected_tied
+    assert (merged.get_input_embeddings().weight is merged.get_output_embeddings().weight) is expected_tied
+    assert ("lm_head.weight" in load_file(output_dir / "model.safetensors")) is not expected_tied
 
 
 class TestMergeLoraFunction:
