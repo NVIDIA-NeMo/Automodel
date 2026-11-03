@@ -437,6 +437,29 @@ def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, sett
         MoEFlexTokenDispatcher(2, [0, 1], config, group)
 
 
+@pytest.mark.parametrize("share_token_dispatcher", [True, False])
+def test_flex_dispatcher_forwards_max_tokens_per_rank_for_both_sharing_modes(monkeypatch, share_token_dispatcher):
+    """The capacity hint must reach the HybridEP manager whether or not dispatchers are shared."""
+    monkeypatch.setattr(MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", Mock())
+    config = TokenDispatcherConfig(
+        moe_flex_dispatcher_backend="hybridep",
+        num_moe_experts=8,
+        moe_share_token_dispatcher=share_token_dispatcher,
+        moe_hybridep_max_tokens_per_rank=3072,
+    )
+    group = Mock()
+    group.size.return_value = 4
+
+    dispatcher = MoEFlexTokenDispatcher(2, [0, 1], config, group)
+
+    assert dispatcher._comm_manager.moe_hybridep_max_tokens_per_rank == 3072
+    if share_token_dispatcher:
+        assert dispatcher._comm_manager is MoEFlexTokenDispatcher.shared_hybridep_manager
+    else:
+        assert MoEFlexTokenDispatcher.shared_hybridep_manager is None
+
+
 class TestIndicesToMultihot:
     """Tests for _HybridEPManager._indices_to_multihot."""
 

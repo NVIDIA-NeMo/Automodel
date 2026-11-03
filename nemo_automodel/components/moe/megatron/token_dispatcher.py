@@ -1210,6 +1210,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                     moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                    moe_hybridep_max_tokens_per_rank=self.config.moe_hybridep_max_tokens_per_rank,
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                     moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
