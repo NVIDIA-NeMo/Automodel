@@ -12,29 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Benchmarking config for Qwen3 MoE 30B (A3B) in BF16 on GB200: TE attention, Linear and RMSNorm,
-# TE GroupedLinear experts without FP8, and the HybridEP dispatcher. BF16 counterpart of the H100
-# recipe qwen3_moe_30b_te_deepep.yaml and of qwen3_moe_30b_te_mxfp8_gb200.yaml at the same
-# GBS 512 / seq 4096 / EP8 operating point, so the three performance-summary rows compare directly.
+# Benchmarking config for Qwen3 MoE 30B (A3B) bf16, experts=te (TE GroupedLinear, NO fp8), GB200 (WAVE 11 bake-off).
 #
-# Parallelism: 2 nodes x 4 GB200, ep_size=8 == world, tp=pp=cp=1, dp_size=8; lbs=16 gives
-# 512 / (8 * 16) = 4 gradient-accumulation micro-batches. peak_tflops=2500 is the GB200 BF16
-# dense peak (the H100 recipe uses 989).
+# Single-variable delta vs qwen3_moe_30b_te_deepep_gb200.yaml: experts torch_mm -> te.
+# No te_fp8 block => TE GroupedLinear runs in BF16 (not fp8). Same lbs16/GBS512/ep8/2N op point.
+# ep_size=8 == world (2N x 4) => experts:te params are NOT FSDP-wrapped (plain tensors) while the
+# rest are DTensor; optimizer.foreach=false avoids aten._foreach_lerp_ batching a plain-Tensor +
+# DTensor together (same fix as the TE-mxfp8 ep==world configs). Native torch_mm comparison = 25.45% MFU@2500.
 #
-# Routing knobs that only hold for the benchmark's deterministic balanced gate (fake_balanced_gate
-# with fake_gate_noise 0 and fixed-shape mock batches): benchmark_static_routing caches the
-# per-microbatch routing metadata, dispatcher_equal_token_counts skips HybridEP's per-dispatch
-# EP-group max all-reduce and host sync, and compile_router_weight fuses the fp32 router-weight
-# multiply. Do not copy them into a recipe with a learned gate or variable-length inputs.
+# GB200 deltas vs the generic qwen3_moe_30b_te_deepep.yaml:
+#   - peak_tflops: 2500  (GB200 BF16 dense peak; generic recipe uses H100 989)
+#   - num_nodes/ci.nodes: 1 -> 2  (2 nodes x 4 GB200 = 8 GPUs)
+#   - local_batch_size: 4 -> 16
 #
-# ep_size == world leaves the TE expert parameters as plain tensors next to DTensor parameters,
-# so optimizer.foreach=false keeps Adam from batching both kinds in one _foreach_lerp_ call.
-#
-# Measured on 8 GB200 with the 26.10 container: 9.505 s/step, 25.38% MFU at peak 2500
-# (634 TFLOPs/GPU), 107 GB peak memory, 10 warmup and 20 measured steps.
-# Measured without gain at this shape and left off: dispatcher_recompute_cache=combine (same step
-# time, +12 GB), HybridEP permute fusion and compact routing (+3% step time), te_grouped_tensor
-# (+0.5%), and FusedLinearCrossEntropy (+27% step time, -44 GB).
+# Parallelism: ep_size=8, tp=pp=cp=1. With dp_size=8 (world=8) and
+# global_batch_size=512, lbs=16 gives 512 / (8 * 16) = 4 gradient-accumulation
+# micro-batches. seq_len=4096. lbs=16 matches the qwen3_moe_30b_te_mxfp8_gb200
+# operating point so the bf16 vs mxfp8 comparison is a precision-only delta.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 
@@ -92,14 +86,11 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: te  # TE GroupedLinear in BF16 (no te_fp8 block)
+    experts: te  # WAVE 11: TE GroupedLinear bf16 (no fp8); vs torch_mm
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
-    compile_router_weight: true
-    dispatcher_equal_token_counts: true  # benchmark only: balanced gate, fixed-shape batches
-    benchmark_static_routing: true  # benchmark only: requires fake_balanced_gate, noise 0
 
 checkpoint:
   enabled: false
@@ -126,7 +117,7 @@ optimizer:
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
-  foreach: false  # ep==world: TE expert params are plain tensors, the rest DTensor; per-param Adam
+  foreach: false  # ep==world: TE experts plain-tensor vs DTensor; per-param Adam avoids _foreach_lerp_ mix
 
 
 ci:
