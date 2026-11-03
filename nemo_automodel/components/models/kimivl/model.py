@@ -728,6 +728,46 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         **kwargs,
     ):
         # Resolve from the text/decoder sub-config (the language model produces text logits).
+        """Run one Kimi-VL microbatch, consuming staged PP media when present.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] on the first stage,
+                with one media placeholder per merged image feature, or float
+                hidden states of shape [batch, sequence, hidden] from the
+                previous pipeline stage.
+            attention_mask: Optional tensor of shape [batch, sequence]; nonzero
+                marks a real token. It also masks the internal shifted loss.
+            position_ids: Optional tensor of shape [batch, sequence].
+            past_key_values: Unused; kept for HF API compatibility.
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
+            labels: Optional tensor of shape [batch, sequence] aligned with
+                input_ids; the loss shifts them by one internally. Image and padding
+                targets must already be masked with -100.
+            use_cache: Unused; kept for HF API compatibility.
+            output_attentions: Unused; kept for HF API compatibility.
+            output_hidden_states: Include final hidden states when return_dict
+                is set.
+            return_dict: Return a LlavaCausalLMOutputWithPast instead of logits.
+            pixel_values: Optional tensor of shape [patches, channels,
+                patch_height, patch_width], where each image's height * width
+                patches are concatenated along axis 0 in image order. When None,
+                the next staged PP media chunk is used.
+            image_grid_hws: Optional tensor of shape [images, 2] storing each
+                image's (height, width) patch grid.
+            padding_mask: Optional tensor of shape [batch, sequence] where True
+                marks padding.
+            logits_to_keep: Number of trailing positions to project, or indices
+                of shape [kept_sequence].
+            **kwargs: Attention metadata forwarded to the language model.
+
+        Returns:
+            Logits of shape [batch, kept_sequence, vocab], or hidden states of
+            shape [batch, sequence, hidden] on a stage without the LM head.
+            kept_sequence is restricted by logits_to_keep (0 keeps all). With
+            return_dict, a LlavaCausalLMOutputWithPast that also carries the
+            scalar loss and, when requested, hidden states
+            [batch, sequence, hidden].
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None

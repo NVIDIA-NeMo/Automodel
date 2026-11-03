@@ -23,9 +23,30 @@ import torch
 class VlmMediaChunk:
     """One microbatch's views of staged image and video tensors.
 
-    Image/video pixels retain their processor layout, with images or patches on
-    axis zero. Grids have shape [images or videos, coordinates]. Empty media
-    chunks become None; nonempty tensors alias the staged inputs unchanged.
+    Absent or empty staged tensors become None; every nonempty field aliases
+    its staged tensor unchanged.
+
+    Attributes:
+        pixel_values: Image pixels in processor layout with images or patches
+            on axis 0: complete images [images, channels, height, width],
+            padded patches [images, max_patches, features], flat patch rows
+            [patches, patch_features], or patch-major
+            [patches, channels, patch_height, patch_width].
+        image_grid: Per-image metadata with images on axis 0: patch grids
+            [images, 2] (height, width) or [images, 3] (time, height, width),
+            original sizes [images, 2], or per-patch positions
+            [images, max_patches, 2].
+        pixel_values_videos: Video pixels with patches on axis 0, e.g. flat
+            patch rows [patches, patch_features] in video order.
+        video_grid: Tensor of shape [videos, 3] storing each video's
+            (time, height, width) patch grid.
+        patch_pixel_values: Crop patches of shape [patches, channels, height,
+            width], concatenated in image order.
+        num_patches: Tensor of shape [batch] with each sample's crop-patch
+            count (Step3 stages one image per sample); it indexes
+            patch_pixel_values and patch_newline_mask.
+        patch_newline_mask: Tensor of shape [patches] marking patch-row
+            newline positions.
     """
 
     pixel_values: torch.Tensor | None
