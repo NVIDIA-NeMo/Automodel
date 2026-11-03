@@ -112,3 +112,5 @@ ci:
   env_vars:
     RDZV_TIMEOUT: "900"
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  perf_testing:
+    schedule: weekly

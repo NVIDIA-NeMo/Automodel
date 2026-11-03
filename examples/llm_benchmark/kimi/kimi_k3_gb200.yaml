@@ -162,3 +162,5 @@ ci:
     # Keep each EP32 group within one NVLink block: 8 nodes x 4 GPUs.
     SBATCH_SEGMENT_SIZE: "8"
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  perf_testing:
+    schedule: weekly

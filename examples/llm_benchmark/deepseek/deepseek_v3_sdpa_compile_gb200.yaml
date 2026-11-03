@@ -123,3 +123,5 @@ ci:
   ep_size: 64
   env_vars:
     RDZV_TIMEOUT: "900"
+  perf_testing:
+    schedule: weekly

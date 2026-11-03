@@ -113,3 +113,5 @@ ci:
   nproc_per_node: 4
   env_vars:
     PYTORCH_ALLOC_CONF: expandable_segments:True
+  perf_testing:
+    schedule: nightly
