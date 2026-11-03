@@ -69,6 +69,11 @@ def test_dense_indexer_preserves_hf_selection_on_cuda(dtype, seq_len, packed, co
     indexer = GlmMoeDsaIndexer(config, backend).cuda().to(dtype)
     reference = HFIndexer(config, layer_idx=0).cuda().to(dtype)
     reference.load_state_dict(indexer.state_dict())
+    # The reference head is held in fp32: HF lists ``indexer.weights_proj`` in ``_keep_in_fp32_modules``
+    # but enforces it only for fp16 loads, while this implementation follows the RL trainer / SGLang fp32
+    # projection in every dtype (``GlmMoeDsaIndexer._head_weights``). HF casts the input to the weight
+    # dtype, so an fp32 weight gives the fp32 projection.
+    reference.weights_proj.float()
     batch = 1 if packed or seq_len == 4096 else 2
     x = torch.randn(batch, seq_len, config.hidden_size * 2, device="cuda", dtype=dtype)[..., ::2]
     q_resid = torch.randn(batch, seq_len, config.q_lora_rank * 2, device="cuda", dtype=dtype)[..., ::2]
