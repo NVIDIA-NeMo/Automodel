@@ -1,659 +1,102 @@
 ---
 title: "Dataset Overview: LLM, VLM, and Retrieval Datasets in NeMo AutoModel"
-description: "Choose datasets and loaders for language, multimodal, retrieval, and diffusion training, and integrate custom data with NeMo AutoModel."
+description: "Find the NeMo AutoModel dataset guide for language, multimodal, retrieval, and diffusion training, and browse the Hugging Face datasets used by its examples."
 position: 1
 ---
-This page summarizes dataset loaders for large language models (LLMs), vision-language models (VLMs), retrieval, and diffusion in NeMo AutoModel. It also shows how to integrate your own datasets using Python functions or the YAML `_target_` mechanism.
+Use this page to find where to start with your data. Every NeMo AutoModel training recipe loads its data through a dataset loader named in the recipe configuration. Built-in loaders cover common file formats and Hugging Face Hub datasets, and a recipe can also load data with your own Python code, without changes to NeMo AutoModel.
 
-The YAML examples are fragments to merge into a training recipe. LLM recipes supply the model tokenizer when building the dataset. Replace local paths with your own files.
+The guides linked below explain each data format and loader and include configuration examples. To see which Hugging Face datasets the checked-in examples train on, browse the [dataset catalog](#dataset-catalog).
 
-- Refer to [LLM datasets](/datasets/text-dataset), [VLM datasets](/datasets/multi-modal-dataset), [Retrieval dataset](/datasets/retrieval-dataset), and [Retrieval fine-tuning](/recipes-e2e-examples/retrieval-finetune) for deeper, task-specific guides.
+## Find a Data Guide
 
-- If a dataset you need is missing, open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and an example schema so the team can prioritize support.
+| Task | Your Data | Start Here |
+| --- | --- | --- |
+| Language model fine-tuning | Instruction or question-answer records with your own column names, in local JSON or JSONL files or on the Hugging Face Hub | [Column-mapped dataset](/datasets/columnmapped-dataset) |
+| Language model fine-tuning | Instruction data that is too large to download first, or that is stored in Delta Lake or Databricks | [Streaming column-mapped dataset](/datasets/columnmapped-iterable) |
+| Language model fine-tuning | Multi-turn conversations, tool calls, or reasoning traces | [Chat dataset](/datasets/chat-dataset) |
+| Language model fine-tuning | Completion or question-answer data that needs custom preprocessing, modeled on HellaSwag or SQuAD | [Text dataset](/datasets/text-dataset) |
+| Language model pretraining | Corpora already tokenized for Megatron-LM | [Pretraining](/recipes-e2e-examples/pretraining) |
+| Language model pretraining | Token shards from NanoGPT-style preprocessing | [NanoGPT pretraining](/recipes-e2e-examples/nanogpt-pretraining) |
+| Retrieval | Query and passage data for embedding or reranking models | [Retrieval dataset](/datasets/retrieval-dataset) |
+| Vision, audio, and language | Conversations that pair text with images, documents, or audio | [Multi-modal dataset](/datasets/multi-modal-dataset) |
+| Diffusion | Images or videos with captions, encoded into cached latents before training | [Diffusion dataset preparation](/datasets/diffusion-dataset) |
+
+For complete workflows that start from data, see [function calling](/recipes-e2e-examples/function-calling), [multi-turn agent fine-tuning](/recipes-e2e-examples/agent-sft), and [retrieval fine-tuning](/recipes-e2e-examples/retrieval-finetune). Ready-to-run recipes are in the [LLM fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune), [LLM pretraining](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_pretrain), and [VLM fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_finetune) example directories.
+
+## Bring Your Own Data
+
+- **Map your columns.** If your instruction data uses its own field names, the [column-mapped dataset](/datasets/columnmapped-dataset) reads it without new code.
+- **Load data with your own code.** A recipe can call a dataset function or class from your own Python file. See custom dataset configuration for [text](/datasets/text-dataset#yaml-based-custom-dataset-configuration) and [multi-modal](/datasets/multi-modal-dataset#yaml-based-custom-dataset-configuration) data.
+- **Request a loader.** If a dataset you need is missing, open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with a short description and an example schema so the team can prioritize support.
+
+## Training Options for Any Dataset
+
+- **Packed sequences** combine variable-length samples to reduce padding and improve throughput. See [packed sequence support](/datasets/text-dataset#packed-sequence-support-in-nemo-automodel), which also covers padding sequence lengths for FP8 training.
+- **Validation data** uses a separate dataset and data loader that mirror the training settings.
+- **Data loader workers** for vision-language training are selected automatically. See [data loader workers](/datasets/multi-modal-dataset#dataloader-workers) to tune them.
+- **Chat templates** format conversations and determine which tokens count toward the loss for chat-formatted data. See the [chat dataset](/datasets/chat-dataset#chat-template-requirements) and [multi-modal dataset](/datasets/multi-modal-dataset#custom-chat-template) guides for template requirements and overrides.
 
 ## Dataset Catalog
 
-Browse the [dataset catalog](/dataset-coverage/overview) for Hugging Face Hub datasets, their tasks, synthetic example records, source schemas, splits, and related AutoModel recipes.
-
-## LLM Datasets
-
-NeMo AutoModel supports several common patterns for language modeling and supervised fine-tuning (SFT).
-
-### HellaSwag (Completion SFT)
-- Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
-- Use case: single-turn completion-style SFT where a prompt (ctx) is followed by a gold continuation (ending)
-- Key args: `path_or_dataset`, `split`, `num_samples_limit`
-- Example YAML:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
-  split: train
-```
-
-### SQuAD-Style Question Answering (QA) (Instruction SFT)
-- Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
-- Use case: instruction or QA tuning with either prompt-and-answer formatting or chat-template formatting
-
-<Note>
-
-- If the tokenizer has a usable chat template, `make_squad_dataset` uses it automatically and masks non-answer tokens. Otherwise it uses prompt-and-answer formatting.
-- You can use the optional `seq_length` parameter for padding or truncation.
-
-</Note>
-
-- Example YAML:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  split: train
-  dataset_name: rajpurkar/squad
-```
-
-### ColumnMappedTextInstructionDataset (Generic Instruction SFT)
-
-- Class: `nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset`
-- Use case: quickly adapt instruction datasets by mapping your schema's columns to `context`, `question`, `answer`
-- Sources: local JSON/JSONL or Hugging Face Hub dataset ID
-- Notes:
-  - Set `use_hf_chat_template: true` to opt into a usable tokenizer chat template. With `answer_only_loss_mask: true`, the dataset masks non-answer tokens; without a usable template it falls back to prompt-and-answer formatting.
-  - Map-style, non-streaming dataset (supports `len(ds)` and `ds[i]`)
-  - For streaming (including Delta Lake / Databricks), use `ColumnMappedTextInstructionIterableDataset` (see [Streaming Datasets](#streaming-datasets)).
-- Example YAML:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-  path_or_dataset_id: Muennighoff/natural-instructions
-  split: train
-  column_mapping:
-    context: definition
-    question: inputs
-    answer: targets
-  answer_only_loss_mask: true
-  use_hf_chat_template: true
-```
-See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/columnmapped-dataset), for more information.
-
-### ChatDataset (Multi-Turn Conversations and Tool Calling)
-- Class: `nemo_automodel.components.datasets.llm.ChatDataset`
-- Use case: multi-turn conversations and tool calling in OpenAI chat format
-- Sources: local JSON/JSONL or Hugging Face Hub dataset ID
-- Key args:
-  - `path_or_dataset_id`: path to local file(s) or Hugging Face dataset ID
-  - `tokenizer`: tokenizer instance (required; must have chat template support)
-  - `split`: dataset split (for example, "train", "validation")
-  - `name`: dataset configuration/subset name
-  - `seq_length`: maximum sequence length for padding/truncation
-  - `padding`: padding strategy ("do_not_pad", "max_length", and so on)
-  - `truncation`: truncation strategy ("do_not_truncate", "longest_first", and so on)
-  - `chat_template`: optional override for tokenizer's chat template
-  - `chat_template_kwargs`: optional extra chat template variables passed to every render, for example `{enable_thinking: false}` for Qwen3 or `{thinking_mode: thinking}` for DeepSeek-V4.1; names the dataset sets itself (such as `tools` or `add_generation_prompt`) are rejected
-  - `mask_reasoning_content`: optionally exclude rendered `reasoning_content` tokens from loss
-  - `mask_generation_prompt`: optionally exclude the template-supplied prefix of each assistant turn (the role header and any empty reasoning block such as `<think></think>`) from loss
-  - `skip_invalid_samples`: if `true`, skip malformed JSONL lines when reading local files (warnings log skip counts); default `false` fails fast on a bad line
-
-<Note>
-
-- Requires a tokenizer with chat template support
-- Supports both single-turn and multi-turn tool calling
-- Assistant messages can also include `reasoning_content` for structured reasoning traces
-- Tool definitions are provided in a `tools` field at the conversation level
-- Tool calls appear in assistant messages through the `tool_calls` field
-- Tool responses use the `tool` role and must include `tool_call_id`
-- If your dataset contains `reasoning_content`, your chat template must render it explicitly or it will be dropped
-- For multi-turn tool-calling datasets, prefer chat templates that use `{% generation %}` blocks so assistant-turn loss masking is exact
-- Set `mask_reasoning_content: true` if you want to train on the final assistant answer while excluding rendered reasoning traces from loss
-- Set `mask_generation_prompt: true` when fine-tuning a hybrid-reasoning model (Nemotron, Qwen3, GLM, ...) on non-thinking data.
-  - Those chat templates insert an empty reasoning block (for example, `<think></think>`) into every assistant turn that has no `reasoning_content`.
-  - At inference, the generation prompt supplies that block, so training on it only teaches the model to close the block immediately.
-  - The option masks the role header and that block for every assistant turn. It detects the block by rendering the template's generation prompt, so no tag strings are hardcoded.
-  - Like `answer_only_loss_mask` without `{% generation %}` blocks, the option locates turns by rendering conversation prefixes. Multi-turn conversations need a template that renders earlier turns the same way as the conversation grows, or a `{% generation %}` template.
-  - Stock Qwen3 rewrites earlier assistant turns (it drops their reasoning block after a later user turn follows). On that template, multi-turn answer-only masking raises, and the option applies to single-turn conversations only.
-- Set `skip_invalid_samples: true` for noisy local JSONL so lines that are not valid JSON are skipped instead of failing the load
-
-</Note>
-
-- Example YAML:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.ChatDataset
-  path_or_dataset_id: /abs/path/to/chat.jsonl
-  split: train
-  seq_length: 2048
-  mask_reasoning_content: false
-  mask_generation_prompt: false
-  skip_invalid_samples: false
-```
-Save each conversation as one JSON object per line in `chat.jsonl`. The following synthetic record is expanded for readability. Use a tokenizer whose chat template supports the fields in your data, including tool calls and any reasoning content.
-
-Expected data format (OpenAI messages format):
-
-```json
-{
-  "messages": [
-    {
-      "role": "system",
-      "content": "You are a helpful assistant."
-    },
-    {
-      "role": "user",
-      "content": "What's the weather in Seattle and should I bring an umbrella?"
-    },
-    {
-      "role": "assistant",
-      "reasoning_content": "The user wants weather info and advice. I should call get_weather first, then decide whether an umbrella is needed.",
-      "content": "",
-      "tool_calls": [
-        {
-          "id": "call_1",
-          "type": "function",
-          "function": {
-            "name": "get_weather",
-            "arguments": "{\"city\": \"Seattle\"}"
-          }
-        }
-      ]
-    },
-    {
-      "role": "tool",
-      "tool_call_id": "call_1",
-      "content": "{\"temperature\": 55, \"condition\": \"rain\", \"precipitation_chance\": 0.85}"
-    },
-    {
-      "role": "assistant",
-      "reasoning_content": "It is raining with a high precipitation chance, so I should recommend bringing an umbrella.",
-      "content": "It's currently 55 degrees F and raining in Seattle with an 85% chance of continued precipitation. Yes, definitely bring an umbrella."
-    }
-  ],
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get current weather for a city",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "city": {"type": "string"}
-          },
-          "required": ["city"]
-        }
-      }
-    }
-  ]
-}
-```
-Template requirement example for `reasoning_content`:
-
-```jinja
-{%- if message.reasoning_content %}
-{% generation %}
-{{ "<think>\n" + message.reasoning_content + "\n</think>\n" }}
-{% endgeneration %}
-{%- endif %}
-{% generation %}
-{{ message.content }}
-{% endgeneration %}
-```
-For single-turn tool calling (one tool call per conversation), omit the tool response and final assistant message:
-
-```json
-{
-  "messages": [
-    {
-      "role": "user",
-      "content": "Book a table for two at 7pm in Seattle."
-    },
-    {
-      "role": "assistant",
-      "content": "",
-      "tool_calls": [
-        {
-          "id": "call_1",
-          "type": "function",
-          "function": {
-            "name": "book_table",
-            "arguments": "{\"party_size\": 2, \"time\": \"19:00\", \"city\": \"Seattle\"}"
-          }
-        }
-      ]
-    }
-  ],
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "book_table",
-        "description": "Book a restaurant table",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "party_size": {"type": "integer"},
-            "time": {"type": "string"},
-            "city": {"type": "string"}
-          }
-        }
-      }
-    }
-  ]
-}
-```
-The raw `Salesforce/xlam-function-calling-60k` dataset uses `query`, `tools`, and `answers` fields. Use `nemo_automodel.components.datasets.llm.xlam.make_xlam_dataset` for that source instead of passing it directly to `ChatDataset`. See the [Function Calling guide](/recipes-e2e-examples/function-calling) for an end-to-end example with FunctionGemma.
-For a small reasoning-style chat SFT starting point, see [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml).
-
-### Retrieval Fine-Tuning
-- Dataset config for corpus ID JSON, `hf://` AutoModel-schema sources, and inline JSONL:
-  `nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig`
-- Collators: `nemo_automodel.components.datasets.llm.BiEncoderCollator` or
-  `nemo_automodel.components.datasets.llm.CrossEncoderCollator`
-- Use case: bi-encoder embedding fine-tuning with contrastive query and passage groups, or cross-encoder reranking over
-  query and passage pairs
-- Supported retrieval sources:
-  - Corpus ID JSON (Merlin/NeMo Retriever style)
-  - `hf://` sources that already follow the AutoModel retrieval schema
-  - Inline-text JSONL, such as `{"query": "...", "pos_doc": "...", "neg_doc": ["...", "..."]}`
-
-The following example configures an inline JSONL bi-encoder dataset:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
-  model_type: bi_encoder
-  data_dir_list:
-    - /abs/path/to/train.jsonl
-  data_type: train
-  n_passages: 5
-
-dataloader:
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
-    q_max_len: 512
-    p_max_len: 512
-  shuffle: true
-```
-Refer to [Retrieval dataset](/datasets/retrieval-dataset) for more information. For the end-to-end
-workflow, refer to [Retrieval fine-tuning](/recipes-e2e-examples/retrieval-finetune).
-
-### NanoGPT Binary Shards (Pretraining)
-- Class: `nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset`
-- Use case: token-level LM pretraining over `.bin` shards produced by NanoGPT-style preprocessors (supports legacy and current formats)
-
-<Note>
-
-- Streams contiguous `seq_len` slices and supports optional BOS alignment and `.bos.idx` sidecar files
-- Related tool: `tools/nanogpt_data_processor.py`
-
-</Note>
-
-### Megatron (Pretraining; Interoperable With Pre-Tokenized Megatron Data)
-- Class: `nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining`
-- Use case: large-scale LM pretraining over Megatron-LM formatted tokenized corpora
-- Interoperability: If your corpus has already been tokenized/indexed for Megatron (that is, `.bin`/`.idx` pairs), you can point AutoModel to those assets directly. No re-tokenization required.
-- Key args: `paths` (single path, glob, weighted list, or per-split dict), `seq_length`, `tokenizer`, `split`, `index_mapping_dir`, `splits_to_build`
-- Example YAML:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: /abs/path/to/processed_data_*_text_document*  # glob or explicit list
-  index_mapping_dir: /abs/path/to/mapping_dir
-  tokenizer:
-    _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: openai-community/gpt2
-  seq_length: 1024
-  split: "0.99, 0.01, 0.00"  # train, validation, test
-  splits_to_build: "train"
-```
-See the detailed [pretraining guide](/recipes-e2e-examples/pretraining), which uses MegatronPretraining data.
-
-## Streaming Datasets
-
-Streaming datasets read examples incrementally, which lets training start before the full dataset downloads. Regular Hugging Face `Dataset` objects also support data larger than RAM through memory-mapped local files; streaming primarily changes when data is downloaded and processed. See the [Hugging Face dataset comparison](https://huggingface.co/docs/datasets/about_mapstyle_vs_iterable).
-
-### What Are Streaming Datasets?
-
-Streaming datasets load and process examples as you iterate. This approach:
-
-- **Bounds working memory**: Memory use depends on active batches, shuffle buffers, and prefetching
-- **Enables training on massive datasets**: Process terabyte-scale datasets on machines with limited RAM
-- **Reduces startup downloads**: Begin processing before downloading the full dataset
-- **Reduces local storage requirements**: Stream from the Hugging Face Hub without storing the full dataset
-
-### When to Use Streaming
-
-Use streaming mode when:
-
-- Your dataset is very large (hundreds of GB or TB)
-- Available memory is limited compared to dataset size
-- You want to start training quickly without downloading the full dataset
-- You are experimenting with a subset of a large dataset
-
-Avoid streaming when:
-
-- Your dataset is small enough to fit comfortably in memory
-- You need random access to samples (for example, for certain sampling strategies)
-- You need to know the exact dataset length upfront
-- You require a full-dataset shuffle rather than buffer-based shuffling
-
-### Enable Streaming
-
-For `ColumnMappedTextInstructionDataset`, use the streaming variant by changing the class to `ColumnMappedTextInstructionIterableDataset`:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
-  path_or_dataset_id: Muennighoff/natural-instructions
-  split: train
-  column_mapping:
-    context: definition
-    question: inputs
-    answer: targets
-  answer_only_loss_mask: true
-  use_hf_chat_template: true
-```
-
-For Hugging Face datasets loaded directly, set `streaming=True`:
-
-```python
-from datasets import load_dataset
-
-# Non-streaming (downloads and prepares a memory-mapped local dataset)
-dataset = load_dataset("Muennighoff/natural-instructions", split="train", streaming=False)
-
-# Streaming (loads data incrementally)
-dataset = load_dataset("Muennighoff/natural-instructions", split="train", streaming=True)
-```
-
-### Streaming Limitations
-
-When using streaming datasets, be aware of these limitations:
-
-1. **No random access**: You cannot use `dataset[index]` to access specific samples. Streaming datasets only support iteration.
-
-2. **No `len(dataset)`**: The iterable does not expose its length. Upstream metadata might provide a source row count, but filtering can change the number of usable samples.
-
-3. **Repeated streams need a stopping condition**: `ColumnMappedTextInstructionIterableDataset` automatically restarts when exhausted and currently requires `repeat_on_exhaustion: true`. Set a finite `step_scheduler.max_steps` in your training recipe.
-
-4. **Limited shuffling**: Shuffling is done with a buffer (not the entire dataset), which might not provide perfect randomization.
-
-### Shard Streaming Data for Distributed Training
-
-AutoModel training recipes shard iterable datasets across data-parallel ranks and apply buffer shuffling. For direct Python use, the following example starts with one rank. Set `dp_rank` and `dp_world_size` to your data-parallel group values before sharding:
-
-```python
-from transformers import AutoTokenizer
-from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
-    ColumnMappedTextInstructionIterableDataset
-)
-
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-dp_rank, dp_world_size, epoch_num = 0, 1, 0
-
-dataset = ColumnMappedTextInstructionIterableDataset(
-    path_or_dataset_id="Muennighoff/natural-instructions",
-    split="train",
-    column_mapping={"context": "definition", "question": "inputs", "answer": "targets"},
-    tokenizer=tokenizer,
-)
-
-# Shard the dataset across data-parallel ranks
-dataset = dataset.shard(num_shards=dp_world_size, index=dp_rank)
-
-# Enable shuffling with a buffer
-dataset = dataset.shuffle(buffer_size=10000, seed=42)
-
-# Set epoch for deterministic shuffling across epochs
-dataset.set_epoch(epoch_num)
-```
-
-### Performance Considerations
-
-**Memory and Speed Trade-Offs**:
-- Streaming reduces memory usage but might be slower than in-memory datasets
-- Network latency can impact streaming performance for remote datasets
-- Use local caching when repeatedly accessing the same remote dataset
-
-**Buffer Size for Shuffling**:
-- Larger buffers provide better randomization but use more memory
-- Choose the buffer size based on sample size and available host memory
-- For perfect shuffling, you need a buffer size equal to the dataset size (defeating the purpose of streaming)
-
-**Prefetching**:
-- With data-loader workers enabled, prefetching can overlap data loading and training
-- Tune worker and prefetch settings based on network speed, batch size, and host memory
-
-### Configure a Streaming Dataset
-
-Add these dataset, dataloader, and stopping-condition settings to your instruction-tuning recipe:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
-  path_or_dataset_id: Muennighoff/natural-instructions
-  split: train
-  column_mapping:
-    context: definition
-    question: inputs
-    answer: targets
-  answer_only_loss_mask: true
-  use_hf_chat_template: true
-  repeat_on_exhaustion: true  # Automatically restart when stream ends
-
-dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 4
-  num_workers: 4
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-
-step_scheduler:
-  max_steps: 1000
-```
-
-This configuration:
-- Streams the dataset without loading it fully into memory
-- Automatically repeats when the stream is exhausted
-- Uses multiple workers for efficient data loading
-- Applies answer-only loss masking during tokenization
-
-## Packed Sequence Support
-To reduce padding and improve throughput with variable-length sequences:
-
-```yaml
-packed_sequence:
-  packed_sequence_size: 8192   # > 0 enables packing; 0 disables it
-  packing_strategy: thd        # Optional; defaults to THD packing
-```
-The fine-tuning recipe passes these settings to its packed-dataset path. For THD packing, it disables packing when the model does not support `seq_lens`.
-
-Use a collator that pads to an FP8-friendly multiple when training with FP8:
-
-```yaml
-dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 16
-```
-
-## VLM Datasets (Vision, Audio, and Language)
-VLM datasets are represented as conversations (message lists) that combine text with images or audio and are processed with the model's `AutoProcessor.apply_chat_template` and a suitable collate function.
-
-Built-in dataset makers return a Python list or a Hugging Face `Dataset`; each yielded sample includes a `conversation` field:
-- **RDR items**: `nemo_automodel.components.datasets.vlm.datasets.make_rdr_dataset` (HF: `quintend/rdr-items`)
-- **CORD-V2 receipts (Consolidated Receipt Dataset for Post-OCR Parsing)**: `nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset` (HF: `naver-clova-ix/cord-v2`)
-- **MedPix-VQA (Medical Pixel Question Answering)**: `nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset`
-- **Shopify product catalogue (product image to taxonomy category)**: `nemo_automodel.components.datasets.vlm.datasets.make_shopify_product_catalogue_dataset` (HF: `Shopify/product-catalogue`)
-- **CommonVoice 17 (CV17) (audio)**: `nemo_automodel.components.datasets.audio.datasets.make_cv17_dataset`
-
-RDR and CORD-V2 return lists. MedPix, Shopify product catalogue, and CommonVoice 17 return Hugging Face `Dataset` objects with lazy transforms. Each sample follows the conversation schema expected by `apply_chat_template`, for example:
-```python
-{
-  "conversation": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "image", "image": example_image},
-        {"type": "text",  "text":  "Describe this image."}
-      ]
-    },
-    {
-      "role": "assistant",
-      "content": [{"type": "text", "text": ground_truth_text}]
-    }
-  ]
-}
-```
-
-### Override the Chat Template
-By default, VLM fine-tuning uses the chat template built into the model's `AutoProcessor`. To override it, add `chat_template` under `dataset:` in your YAML config:
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  split: train
-  chat_template: /abs/path/to/model_chat_template.jinja
-```
-
-Use a template compatible with the model, including its image or audio placeholder tokens and role delimiters. `chat_template` accepts a Jinja template string, a path to a `.jinja` file, or a path to a JSON file containing a `chat_template` key. The override is applied to both the processor and its tokenizer before dataset instantiation.
-
-### Collate Functions
-- `nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn`
-- `nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn` (Qwen2.5 VL)
-- `nemo_automodel.components.datasets.vlm.collate_fns.phi4_mm_collate_fn` (audio)
-
-Select in your YAML:
-
-```yaml
-dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  batch_size: 1
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn
-```
-Answer-only loss masking is built into the supported VLM collators. They derive assistant regions from the processor's chat template with `build_labels_from_template`; `start_of_response_token` is not a collate argument.
-
-See [Gemma-3n](/recipes-e2e-examples/gemma-3-3n) and [VLM dataset](/datasets/multi-modal-dataset) for end-to-end examples.
-
-## Diffusion Datasets
-
-The diffusion recipes described here train on cached latent representations of images or videos. Preprocessing encodes the visual data into latents and converts text captions into conditioning embeddings.
-
-This encoding is done once during preprocessing, and the results are saved as cache files (`.meta`). Training then reads these cache files directly, which is significantly faster than re-encoding on every step.
-
-The built-in preprocessing tool ([`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py)) handles this conversion. It uses a variational autoencoder (VAE) to encode visual data and a text encoder for captions, grouping outputs into resolution-bucketed directories compatible with the multiresolution dataloader.
-
-### Dataloader Builders
-
-- **Video (T2V)**: `nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader`, for Wan 2.1 and HunyuanVideo
-- **Image (T2I)**: `nemo_automodel.components.datasets.diffusion.build_text_to_image_multiresolution_dataloader`, for FLUX.1-dev
-
-### Example YAML (Video Dataloader)
-
-```yaml
-data:
-  dataloader:
-    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
-    cache_dir: /path/to/processed_meta
-    model_type: wan
-    base_resolution: [512, 512]
-    dynamic_batch_size: false
-    shuffle: true
-    drop_last: false
-    num_workers: 0
-```
-
-See the [Diffusion Dataset Preparation](/datasets/diffusion-dataset) guide for full preprocessing instructions and configuration details.
-
-## Bring Your Own Dataset
-You can integrate custom datasets with zero code changes to NeMo AutoModel by using `_target_` in YAML. Choose one of the following approaches:
-
-### Point to an Existing Class or Function (Dotted Path)
-- LLM example (class):
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
-  split: train
-```
-- LLM example (factory function):
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  split: train
-  dataset_name: rajpurkar/squad
-```
-- VLM example (factory function):
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset
-  split: train
-```
-
-### Point to a Local Python File and Function
-
-```yaml
-dataset:
-  _target_: /abs/path/to/my_custom_dataset.py:build_my_dataset
-  some_arg: 123
-  split: train
-```
-`build_my_dataset` must return a dataset compatible with the recipe. For VLM recipes, return a `datasets.Dataset` or a list of dictionaries containing `conversation` records.
-
-### Use ColumnMappedTextInstructionDataset for Most Instruction Datasets (LLM)
-- Ideal when your data has columns like `instruction`, `input`, or `output` but with arbitrary names
-- Supports local JSON/JSONL and HF Hub
-
-```yaml
-dataset:
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
-  path_or_dataset_id: /abs/path/to/*.jsonl  # or org/repo on HF
-  column_mapping:
-    context: definition
-    question: inputs
-    answer: targets
-  answer_only_loss_mask: true
-  use_hf_chat_template: true
-```
-
-### Implement a Minimal Custom Class Pattern (LLM Completion)
-If you prefer Python, implement `get_context` and `get_target` and reuse the built-in preprocessor:
-
-```python
-from datasets import load_dataset
-from nemo_automodel.components.datasets.utils import SFTSingleTurnPreprocessor
-
-class MyCompletionDataset:
-    def __init__(self, path_or_dataset, tokenizer, split="train"):
-        raw_ds = load_dataset(path_or_dataset, split=split)
-        self.dataset = SFTSingleTurnPreprocessor(tokenizer).process(raw_ds, self)
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, index: int) -> dict[str, list[int]]:
-        return self.dataset[index]
-
-    def get_context(self, examples):
-        return examples["my_context_field"]
-
-    def get_target(self, examples):
-        return examples["my_target_field"]
-```
-
-Then reference your class with `_target_` in YAML.
-
-### Configuration Considerations
-- **Chat templates**: SQuAD uses a tokenizer chat template automatically when available. Column-mapped datasets opt in with `use_hf_chat_template: true`. `ChatDataset` derives assistant masking from the tokenizer's chat template. VLM collators derive assistant labels from the processor template and do not accept `start_of_response_token`.
-- **Padding for FP8**: If training with FP8, set `pad_seq_len_divisible: 16` in your collate function to align sequence lengths.
-- **Packed sequences**: Prefer packed sequences for throughput when fine-tuning LLMs on variable-length corpora.
-- **Validation**: You can define a separate `validation_dataset` and `validation_dataloader` block mirroring your training config.
-
-For detailed, end-to-end recipes, browse the example configs under [examples/llm_finetune/](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune), [examples/llm_pretrain/](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_pretrain), and [examples/vlm_finetune/](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/vlm_finetune).
+The dataset catalog lists the Hugging Face Hub datasets that NeMo AutoModel examples train on. Each card explains the dataset's task, shows a synthetic record, and describes its source schema and splits before linking to the recipes that use it. Cards also cover companion corpora and named sources within mixtures. Synthetic examples are invented illustrations, not copied training rows.
+
+### Text and Code
+
+| Hub Dataset | Task |
+| --- | --- |
+| [allenai/tulu-3-sft-mixture](/dataset-coverage/allenai/tulu-3-sft-mixture) | Instruction following and conversation |
+| [frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct](/dataset-coverage/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct) | Conversation response generation |
+| [HuggingFaceFW/fineweb](/dataset-coverage/HuggingFaceFW/fineweb) | Causal language modeling |
+| [HuggingFaceFW/fineweb-edu](/dataset-coverage/HuggingFaceFW/fineweb-edu) | Causal language modeling on educational text |
+| [ise-uiuc/Magicoder-OSS-Instruct-75K](/dataset-coverage/ise-uiuc/Magicoder-OSS-Instruct-75K) | Code generation |
+| [jihwan1205/perfectblend-qwen3-8b-regen](/dataset-coverage/jihwan1205/perfectblend-qwen3-8b-regen) | Speculative decoding draft training |
+| [julien-c/synthtraces](/dataset-coverage/julien-c/synthtraces) | Coding-agent interaction |
+| [llamafactory/glaive_toolcall_en](/dataset-coverage/llamafactory/glaive_toolcall_en) | Function calling |
+| [lm-provers/FineProofs-SFT](/dataset-coverage/lm-provers/FineProofs-SFT) | Mathematical reasoning and proof generation |
+| [Muennighoff/natural-instructions](/dataset-coverage/Muennighoff/natural-instructions) | Instruction-conditioned text generation |
+| [nvidia/Nemotron-Post-Training-Dataset-v2](/dataset-coverage/nvidia/Nemotron-Post-Training-Dataset-v2) | Instruction following and reasoning |
+| [nyu-mll/glue](/dataset-coverage/nyu-mll/glue) | Natural language understanding |
+| [open-thoughts/OpenThoughts3-1.2M](/dataset-coverage/open-thoughts/OpenThoughts3-1.2M) | Reasoning response generation |
+| [openai/gsm8k](/dataset-coverage/openai/gsm8k) | Multi-step mathematical question answering |
+| [rajpurkar/squad](/dataset-coverage/rajpurkar/squad) | Extractive question answering |
+| [richardr1126/spider-schema](/dataset-coverage/richardr1126/spider-schema) | Database-schema lookup for text-to-SQL |
+| [Rowan/hellaswag](/dataset-coverage/Rowan/hellaswag) | Multiple-choice commonsense inference |
+| [Salesforce/xlam-function-calling-60k](/dataset-coverage/Salesforce/xlam-function-calling-60k) | Function calling |
+| [togethercomputer/CoderForge-Preview](/dataset-coverage/togethercomputer/CoderForge-Preview) | Coding-agent trajectory modeling |
+| [xlangai/spider](/dataset-coverage/xlangai/spider) | Text-to-SQL generation |
+
+### Vision and Language
+
+| Hub Dataset | Task |
+| --- | --- |
+| [liuhaotian/LLaVA-Pretrain](/dataset-coverage/liuhaotian/LLaVA-Pretrain) | Image-caption alignment |
+| [mmoukouba/MedPix-VQA](/dataset-coverage/mmoukouba/MedPix-VQA) | Visual question answering |
+| [naver-clova-ix/cord-v2](/dataset-coverage/naver-clova-ix/cord-v2) | Receipt information extraction |
+| [quintend/rdr-items](/dataset-coverage/quintend/rdr-items) | Image-to-text generation |
+| [Shopify/product-catalogue](/dataset-coverage/Shopify/product-catalogue) | Product taxonomy classification |
+
+### Speech
+
+| Hub Dataset | Task |
+| --- | --- |
+| [edinburghcstr/ami](/dataset-coverage/edinburghcstr/ami) | Meeting speech recognition |
+| [facebook/voxpopuli](/dataset-coverage/facebook/voxpopuli) | Parliamentary speech recognition |
+| [kensho/spgispeech](/dataset-coverage/kensho/spgispeech) | English speech recognition |
+| [openslr/librispeech_asr](/dataset-coverage/openslr/librispeech_asr) | Read-speech recognition |
+| [sanchit-gandhi/earnings22_split](/dataset-coverage/sanchit-gandhi/earnings22_split) | Earnings-call speech recognition |
+| [speechcolab/gigaspeech](/dataset-coverage/speechcolab/gigaspeech) | English speech recognition |
+| [ysdede/commonvoice_17_tr_fixed](/dataset-coverage/ysdede/commonvoice_17_tr_fixed) | Turkish speech recognition |
+
+### Retrieval
+
+| Hub Dataset | Task |
+| --- | --- |
+| [nvidia/embed-nemotron-dataset-v1](/dataset-coverage/nvidia/embed-nemotron-dataset-v1) | Text retrieval and representation learning |
+| [Tevatron/colpali](/dataset-coverage/Tevatron/colpali) | Visual document retrieval |
+| [Tevatron/colpali-corpus](/dataset-coverage/Tevatron/colpali-corpus) | Visual document retrieval corpus |
+
+### Image Generation
+
+| Hub Dataset | Task |
+| --- | --- |
+| [lambda/naruto-blip-captions](/dataset-coverage/lambda/naruto-blip-captions) | Text-conditioned image generation |

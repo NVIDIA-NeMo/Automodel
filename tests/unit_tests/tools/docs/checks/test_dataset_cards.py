@@ -18,7 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from tools.docs.checks.dataset_cards import card_errors, card_path, hub_ids, validate, validate_dataset_cards
+from tools.docs.checks.dataset_cards import (
+    OVERVIEW_PAGE,
+    card_errors,
+    card_path,
+    hub_ids,
+    validate,
+    validate_dataset_cards,
+)
 
 ENTRY = {
     "id": "example/toy",
@@ -198,7 +205,7 @@ class _Catalog:
         self.root = root
         self.write(ENTRY["card"], CARD)
         self.write("docs/dataset-coverage/catalog.json", json.dumps([ENTRY]))
-        self.write("docs/dataset-coverage/index.mdx", "[Toy](/dataset-coverage/example/toy)")
+        self.write(OVERVIEW_PAGE, "[Toy](/dataset-coverage/example/toy)")
         self.write("docs/fern/versions/nightly.yml", "path: ../../dataset-coverage/example/toy.mdx\n")
         self.write("examples/toy.yaml", "dataset:\n  path_or_dataset_id: example/toy\n")
         self.write("loader.py", "")
@@ -322,7 +329,7 @@ def test_card_path_must_be_the_kebab_case_hub_id(catalog: _Catalog):
     card = "docs/dataset-coverage/example/toy-set-1-5.mdx"
     (catalog.root / ENTRY["card"]).unlink()
     catalog.write(card, CARD.replace("example/toy", dataset_id))
-    catalog.write("docs/dataset-coverage/index.mdx", f"[Toy](/dataset-coverage/{dataset_id})")
+    catalog.write(OVERVIEW_PAGE, f"[Toy](/dataset-coverage/{dataset_id})")
     catalog.write("docs/fern/versions/nightly.yml", f"path: ../../{card.removeprefix('docs/')}\n")
     catalog.write("examples/toy.yaml", f"dataset:\n  path_or_dataset_id: {dataset_id}\n")
     entry = {**ENTRY, "id": dataset_id, "card": card}
@@ -340,9 +347,14 @@ def test_card_paths_must_be_unique(catalog: _Catalog):
     assert any("registered by more than one catalog entry" in error for error in catalog.errors())
 
 
-def test_missing_index_link_is_rejected(catalog: _Catalog):
-    catalog.write("docs/dataset-coverage/index.mdx", "No cards linked")
-    assert any("missing catalog index link" in error for error in catalog.errors())
+def test_missing_overview_link_is_rejected(catalog: _Catalog):
+    catalog.write(OVERVIEW_PAGE, "No cards linked")
+    assert any("missing dataset catalog link" in error for error in catalog.errors())
+
+
+def test_catalog_directory_index_page_must_be_registered(catalog: _Catalog):
+    catalog.write("docs/dataset-coverage/index.mdx", "A separate catalog landing page")
+    assert any("unregistered dataset card: docs/dataset-coverage/index.mdx" in error for error in catalog.errors())
 
 
 def test_invalid_example_yaml_identifies_file(catalog: _Catalog):

@@ -1053,9 +1053,6 @@ navigation:
       - section: "Dataset Catalog"
         slug: cards
         contents:
-          - page: "Overview"
-            path: ../../dataset-coverage/index.mdx
-            slug: overview
           - section: "Text and Code"
             slug: text
             contents:
@@ -1191,6 +1188,9 @@ navigation:
       - page: "ColumnMapped Iterable"
         path: ../../guides/llm/column-mapped-text-instruction-iterable-dataset.mdx
         slug: columnmapped-iterable
+      - page: "Chat Dataset"
+        path: ../../guides/llm/chat-dataset.mdx
+        slug: chat-dataset
       - page: "Multi-Modal Dataset"
         path: ../../guides/vlm/dataset.mdx
         slug: multi-modal-dataset

@@ -29,6 +29,7 @@ import yaml
 
 LOGGER = logging.getLogger(__name__)
 CARD_DIRECTORY = "docs/dataset-coverage"
+OVERVIEW_PAGE = "docs/guides/dataset-overview.mdx"
 SECTIONS = ("Task", "Example Record", "Schema and Splits", "Use with NeMo AutoModel", "Related Resources")
 DATASET_KEYS = {
     "dataset_name",
@@ -207,7 +208,7 @@ def _navigation_paths(value: object) -> set[str]:
 
 
 def validate(root: Path) -> list[str]:
-    """Return errors across the catalog, cards, navigation, and example YAMLs.
+    """Return errors across the catalog, cards, overview links, navigation, and example YAMLs.
 
     Args:
         root: Repository root containing the documentation and example recipes.
@@ -226,7 +227,7 @@ def validate(root: Path) -> list[str]:
         navigation = _navigation_paths(yaml.safe_load((root / "docs/fern/versions/nightly.yml").read_text()))
     except yaml.YAMLError as exc:
         return [f"invalid nightly navigation YAML: {exc}"]
-    index = (directory / "index.mdx").read_text()
+    overview = (root / OVERVIEW_PAGE).read_text()
     for number, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             errors.append(f"catalog entry {number}: expected an object")
@@ -284,13 +285,9 @@ def validate(root: Path) -> list[str]:
         nav_path = "../../" + card.removeprefix("docs/")
         if nav_path not in navigation:
             errors.append(f"{card}: missing nightly navigation entry")
-        if f"](/dataset-coverage/{dataset_id})" not in index:
-            errors.append(f"{card}: missing catalog index link")
-    actual = {
-        str(p.relative_to(root))
-        for p in directory.rglob("*")
-        if p.suffix in {".md", ".mdx"} and p != directory / "index.mdx"
-    }
+        if f"](/dataset-coverage/{dataset_id})" not in overview:
+            errors.append(f"{card}: missing dataset catalog link in {OVERVIEW_PAGE}")
+    actual = {str(p.relative_to(root)) for p in directory.rglob("*") if p.suffix in {".md", ".mdx"}}
     errors.extend(f"unregistered dataset card: {p}" for p in sorted(actual - registered))
     for recipe in sorted((root / "examples").rglob("*")):
         if recipe.suffix not in {".yaml", ".yml"}:

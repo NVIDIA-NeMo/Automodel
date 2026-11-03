@@ -18,6 +18,39 @@ Multi-modal datasets combine text with other input types (e.g., images, audio, o
 
 NeMo Automodel supports multi-modal dataset integration through flexible preprocessing, custom formatting, and YAML-based configuration.
 
+### Built-In Dataset Makers
+
+VLM datasets are represented as conversations (message lists) that combine text with images or audio and are processed with the model's `AutoProcessor.apply_chat_template` and a suitable collate function.
+
+The built-in dataset makers in [`datasets.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/datasets.py) return a Python list or a Hugging Face `Dataset`; each yielded sample includes a `conversation` field. Examples include:
+- **RDR items**: `nemo_automodel.components.datasets.vlm.datasets.make_rdr_dataset` (HF: `quintend/rdr-items`)
+- **CORD-V2 receipts (Consolidated Receipt Dataset for Post-OCR Parsing)**: `nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset` (HF: `naver-clova-ix/cord-v2`)
+- **MedPix-VQA (Medical Pixel Question Answering)**: `nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset`
+- **Shopify product catalogue (product image to taxonomy category)**: `nemo_automodel.components.datasets.vlm.datasets.make_shopify_product_catalogue_dataset` (HF: `Shopify/product-catalogue`)
+- **CommonVoice 17 (CV17) (audio)**: `nemo_automodel.components.datasets.audio.datasets.make_cv17_dataset`
+
+RDR and CORD-V2 return lists. MedPix, Shopify product catalogue, and CommonVoice 17 return Hugging Face `Dataset` objects with lazy transforms. Each sample follows the conversation schema expected by `apply_chat_template`, for example:
+
+```python
+{
+  "conversation": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "image", "image": example_image},
+        {"type": "text",  "text":  "Describe this image."}
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [{"type": "text", "text": ground_truth_text}]
+    }
+  ]
+}
+```
+
+The [dataset catalog](/datasets/overview#dataset-catalog) describes the Hugging Face sources that these examples train on.
+
 ### Typical Types in Multi-modal Datasets
 A multi-modal dataset typically contains:
 - **Images, videos, audios** or other non-text modalities.
@@ -105,6 +138,23 @@ NeMo Automodel provides specialized collate functions for different VLM processo
 
 Multi-modal models require custom collate functions to batch and process each sample correctly. If your model uses a Hugging Face `AutoProcessor`, you can use it directly. Otherwise, you can define your own collate logic and point to it in your YAML config. We provide [example custom collate functions](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/vlm/collate_fns.py) that you can use as references for your implementation. After you implement your own collate function, you can specify it in your YAML config.
 
+Built-in collate functions include:
+- `nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn`
+- `nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn` (Qwen2.5 VL)
+- `nemo_automodel.components.datasets.vlm.collate_fns.phi4_mm_collate_fn` (audio)
+
+Select one in your YAML:
+
+```yaml
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn
+```
+
+Answer-only loss masking is built into the supported VLM collators. They derive assistant regions from the processor's chat template with `build_labels_from_template`; `start_of_response_token` is not a collate argument.
+
 ## YAML-based Custom Dataset Configuration
 
 NeMo Automodel supports YAML-based dataset specification using the _target_ key. This lets you reference dataset-building classes or functions using either:
@@ -134,6 +184,8 @@ dataset:
   num_blocks: 111
 ```
 This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
+
+`build_my_dataset` must return a dataset compatible with the recipe. For VLM recipes, return a `datasets.Dataset` or a list of dictionaries containing `conversation` records.
 
 ## DataLoader Workers
 
@@ -187,7 +239,7 @@ Accepted values:
 - A path to a `.jinja` template file
 - A path to a JSON file containing a `chat_template` key (e.g., `tokenizer_config.json`)
 
-The override is applied to both `processor.chat_template` and `processor.tokenizer.chat_template` before dataset loading.
+The override is applied to both `processor.chat_template` and `processor.tokenizer.chat_template` before dataset loading. Use a template compatible with the model, including its image or audio placeholder tokens and role delimiters.
 
 ## Troubleshooting Tips
 

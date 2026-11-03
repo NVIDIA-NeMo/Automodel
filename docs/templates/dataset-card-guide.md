@@ -25,8 +25,9 @@ A model card's recipe table can link a dataset by its stable route:
 | Fine-Tuning | [SQuAD](/dataset-coverage/rajpurkar/squad) | Link the model's YAML. |
 ```
 
-Add the card to `docs/dataset-coverage/catalog.json`, the catalog landing page,
-and the nightly **Data > Dataset Catalog** navigation. The catalog records canonical
+Add the card to `docs/dataset-coverage/catalog.json`, the matching table in the
+[dataset overview](../guides/dataset-overview.mdx#dataset-catalog), and the nightly
+**Data > Dataset Catalog** navigation. The catalog records canonical
 IDs, aliases used by examples, tasks, recipe paths, evidence from adapters and
 preparation scripts, and the upstream metadata revision. Keep preparation-only
 sources and mixture components tied to an actual example; a generic local-file
@@ -93,7 +94,7 @@ uv run --script tools/docs/check_docs.py
 Its source validation includes `tools/docs/checks/dataset_cards.py`, which
 validates all registered cards, detects unregistered Markdown and MDX cards,
 parses the synthetic JSON examples, and checks card paths, repository links,
-navigation entries, and catalog index links. For a faster offline check of only
+navigation entries, and dataset overview links. For a faster offline check of only
 the dataset catalog, run
 `uv run --no-project --with pyyaml==6.0.3 python -m tools.docs.checks.dataset_cards`.
 The validator detects uncovered Hub IDs in example YAMLs under `dataset_name`, `path_or_dataset`,

@@ -1,0 +1,193 @@
+---
+title: "Use the ChatDataset for Conversations and Tool Calling"
+description: "Fine-tune language models on multi-turn conversations, tool calls, and reasoning traces in OpenAI chat format with the NeMo AutoModel ChatDataset."
+---
+`ChatDataset` formats conversations with the model's chat template for supervised fine-tuning (SFT). Use it for multi-turn conversations, single-turn or multi-turn tool calling, and assistant reasoning traces in OpenAI chat format.
+
+`ChatDataset` reads local JSON or JSONL files, Parquet files or directories, or a Hugging Face Hub dataset ID. It produces `input_ids`, `labels`, and `attention_mask`, and masks non-assistant tokens from the loss.
+
+## Data Format
+
+Each record holds one conversation; in a JSONL file, write one JSON object per line. The record contains a `messages` list in OpenAI chat format:
+
+- Tool definitions are provided in a `tools` field at the conversation level.
+- Tool calls appear in assistant messages through the `tool_calls` field.
+- Tool responses use the `tool` role and must include `tool_call_id`.
+- Assistant messages can also include `reasoning_content` for structured reasoning traces.
+
+The following synthetic record is expanded for readability:
+
+```json
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "What's the weather in Seattle and should I bring an umbrella?"
+    },
+    {
+      "role": "assistant",
+      "reasoning_content": "The user wants weather info and advice. I should call get_weather first, then decide whether an umbrella is needed.",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Seattle\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temperature\": 55, \"condition\": \"rain\", \"precipitation_chance\": 0.85}"
+    },
+    {
+      "role": "assistant",
+      "reasoning_content": "It is raining with a high precipitation chance, so I should recommend bringing an umbrella.",
+      "content": "It's currently 55 degrees F and raining in Seattle with an 85% chance of continued precipitation. Yes, definitely bring an umbrella."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"}
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ]
+}
+```
+
+For single-turn tool calling (one tool call per conversation), omit the tool response and final assistant message:
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Book a table for two at 7pm in Seattle."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "book_table",
+            "arguments": "{\"party_size\": 2, \"time\": \"19:00\", \"city\": \"Seattle\"}"
+          }
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "book_table",
+        "description": "Book a restaurant table",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "party_size": {"type": "integer"},
+            "time": {"type": "string"},
+            "city": {"type": "string"}
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+Records that instead store turns in a ShareGPT `conversations` list, with `from` and `value` fields, are converted to `messages` automatically. The converter maps `system` to the system role; `human` and `user` to the user role; and `gpt`, `assistant`, `chatgpt`, `model`, and `bot` to the assistant role.
+
+The raw `Salesforce/xlam-function-calling-60k` dataset uses `query`, `tools`, and `answers` fields. Use `nemo_automodel.components.datasets.llm.xlam.make_xlam_dataset` for that source instead of passing it directly to `ChatDataset`. See the [Function Calling guide](/recipes-e2e-examples/function-calling) for an end-to-end example with FunctionGemma.
+
+## Configure the Dataset
+
+Add a `dataset` section to your fine-tuning recipe. LLM recipes supply the model tokenizer when building the dataset. Replace the local path with your own file:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.ChatDataset
+  path_or_dataset_id: /abs/path/to/chat.jsonl
+  split: train
+  seq_length: 2048
+  mask_reasoning_content: false
+  mask_generation_prompt: false
+  skip_invalid_samples: false
+```
+
+Key arguments:
+
+- `path_or_dataset_id`: path to local file(s) or Hugging Face dataset ID
+- `tokenizer`: tokenizer instance (required; must have chat template support)
+- `split`: dataset split or slice (for example, "train", "validation", or "train[1024:]")
+- `name`: dataset configuration/subset name
+- `seq_length`: maximum sequence length for padding/truncation
+- `padding`: padding strategy ("do_not_pad", "max_length", and so on)
+- `truncation`: truncation strategy ("do_not_truncate", "longest_first", and so on)
+- `shuffle_seed`: if set, shuffles Hub or Parquet data before applying a split slice
+- `chat_template`: optional override for tokenizer's chat template
+- `chat_template_kwargs`: optional extra chat template variables passed to every render, for example `{enable_thinking: false}` for Qwen3 or `{thinking_mode: thinking}` for DeepSeek-V4.1; names the dataset sets itself (such as `tools` or `add_generation_prompt`) are rejected
+- `mask_reasoning_content`: optionally exclude rendered `reasoning_content` tokens from loss
+- `mask_generation_prompt`: optionally exclude the template-supplied prefix of each assistant turn (the role header and any empty reasoning block such as `<think></think>`) from loss
+- `mask_history`: if `true`, supervise only the final assistant turn and treat earlier turns as prompt context
+- `skip_invalid_samples`: if `true`, skip malformed JSONL lines when reading local files (warnings log skip counts); default `false` fails fast on a bad line
+
+## Chat Template Requirements
+
+`ChatDataset` requires a tokenizer with chat template support, and it derives assistant loss masking from that template. Use a template that supports the fields in your data, including tool calls and any reasoning content:
+
+- If your dataset contains `reasoning_content`, your chat template must render it explicitly or it will be dropped.
+- For multi-turn tool-calling datasets, prefer chat templates that use `{% generation %}` blocks so assistant-turn loss masking is exact.
+
+Template requirement example for `reasoning_content`:
+
+```jinja
+{%- if message.reasoning_content %}
+{% generation %}
+{{ "<think>\n" + message.reasoning_content + "\n</think>\n" }}
+{% endgeneration %}
+{%- endif %}
+{% generation %}
+{{ message.content }}
+{% endgeneration %}
+```
+
+## Control the Loss Mask
+
+- Set `mask_reasoning_content: true` if you want to train on the final assistant answer while excluding rendered reasoning traces from loss.
+- Set `mask_generation_prompt: true` when fine-tuning a hybrid-reasoning model (Nemotron, Qwen3, GLM, ...) on non-thinking data.
+  - Those chat templates insert an empty reasoning block (for example, `<think></think>`) into every assistant turn that has no `reasoning_content`.
+  - At inference, the generation prompt supplies that block, so training on it only teaches the model to close the block immediately.
+  - The option masks the role header and that block for every assistant turn. It detects the block by rendering the template's generation prompt, so no tag strings are hardcoded.
+  - Like `answer_only_loss_mask` without `{% generation %}` blocks, the option locates turns by rendering conversation prefixes. Multi-turn conversations need a template that renders earlier turns the same way as the conversation grows, or a `{% generation %}` template.
+  - Stock Qwen3 rewrites earlier assistant turns (it drops their reasoning block after a later user turn follows). On that template, multi-turn answer-only masking raises, and the option applies to single-turn conversations only.
+- Set `mask_history: true` to supervise only the final assistant turn of each conversation.
+- Set `skip_invalid_samples: true` for noisy local JSONL so lines that are not valid JSON are skipped instead of failing the load.
+
+## Related Resources
+
+- [Function Calling guide](/recipes-e2e-examples/function-calling) for single-turn tool calling with FunctionGemma.
+- [Multi-turn agent fine-tuning](/recipes-e2e-examples/agent-sft) for multi-turn tool-calling SFT.
+- [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml) for a small reasoning-style chat SFT starting point.
+- [Dataset catalog](/datasets/overview#dataset-catalog) for Hugging Face conversation datasets used by NeMo AutoModel examples.
