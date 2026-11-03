@@ -150,6 +150,19 @@ class TestStep3p5RotaryEmbedding:
         assert rotary0.partial_rotary_factor == 0.5
         assert rotary1.partial_rotary_factor == 0.75
 
+    def test_forward_accepts_flat_thd_position_ids(self, config):
+        rotary = Step3p5RotaryEmbedding(config, layer_idx=0)
+        seq = 10
+        x = torch.randn(seq, config.hidden_size)
+        position_ids = torch.tensor([0, 1, 2, 0, 1, 2, 3, 4, 0, 1])
+
+        cos, sin = rotary(x, position_ids)
+
+        assert cos.shape == (seq, rotary.rotary_dim)
+        assert sin.shape == (seq, rotary.rotary_dim)
+        torch.testing.assert_close(cos[0], cos[3])
+        torch.testing.assert_close(sin[0], sin[3])
+
     def test_forward_returns_cos_sin(self, config):
         rotary = Step3p5RotaryEmbedding(config, layer_idx=0)
         batch, seq = 2, 10

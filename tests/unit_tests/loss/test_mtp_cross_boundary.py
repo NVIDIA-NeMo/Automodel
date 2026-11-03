@@ -420,3 +420,92 @@ def test_pipeline_mtp_rejects_unusable_shared_boundaries(boundaries):
     with pytest.raises(ValueError, match="Packed MTP requires"):
         loss_fn(tuple(logits.unbind()), torch.ones(1, 8, dtype=torch.long))
     assert logits.grad is None
+
+
+class TestVlmPipelineLossBinding:
+    """The VLM recipe must bind each packed microbatch's physical document
+    boundaries to the PP MTP loss before ``pp.step`` (review finding: metadata
+    was collected but never forwarded, so the loss treated packed sequences as
+    one document and shifted labels across real document ends).
+
+    These tests mirror the binding block in
+    ``recipes/vlm/finetune.py::_forward_backward_step``: with NEAT
+    ``_packed_seq_ids`` the shared ``cu_seqlens`` stays unset (the model's
+    per-microbatch seq_idx tail owns the layout); otherwise the microbatch's
+    ``cu_seqlens_padded`` is normalized (squeezed, sentinel-stripped) and
+    bound with ``is_packed``.
+    """
+
+    def _make_loss(self):
+        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+        from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+        model = torch.nn.Module()
+        model.mtp_outputs_are_logits = True
+        return PipelineCausalLMLoss(MaskedCrossEntropy(), model, scaling_factor=0.3)
+
+    def _bind(self, loss_fn, batch, mtp_seq_idx, mtp_is_packed):
+        """Copy of the recipe's per-microbatch binding block."""
+        if mtp_seq_idx is not None:
+            loss_fn.cu_seqlens = None
+            loss_fn.is_packed = True
+        else:
+            cu_seqlens_mb = batch.get("cu_seqlens_padded")
+            if isinstance(cu_seqlens_mb, torch.Tensor) and cu_seqlens_mb.dim() == 2:
+                cu_seqlens_mb = cu_seqlens_mb.squeeze(0)
+            if isinstance(cu_seqlens_mb, torch.Tensor) and cu_seqlens_mb.dim() == 1:
+                cu_seqlens_mb = cu_seqlens_mb[cu_seqlens_mb != -1000]
+            loss_fn.cu_seqlens = cu_seqlens_mb
+            loss_fn.is_packed = mtp_is_packed
+
+    def test_neat_seq_idx_owns_layout_shared_boundaries_unset(self):
+        loss_fn = self._make_loss()
+        batch = {"cu_seqlens_padded": torch.tensor([[0, 8, 16]], dtype=torch.int32)}
+        mtp_seq_idx = torch.tensor([[1] * 8 + [2] * 8], dtype=torch.int32)
+
+        self._bind(loss_fn, batch, mtp_seq_idx, mtp_is_packed=True)
+
+        assert loss_fn.cu_seqlens is None, "shared cu_seqlens must not shadow the per-microbatch tail"
+        assert loss_fn.is_packed is True
+
+    def test_thd_cu_seqlens_normalized_and_bound(self):
+        loss_fn = self._make_loss()
+        batch = {"cu_seqlens_padded": torch.tensor([[0, 8, 16, -1000, -1000]], dtype=torch.int32)}
+
+        self._bind(loss_fn, batch, mtp_seq_idx=None, mtp_is_packed=True)
+
+        assert loss_fn.cu_seqlens.tolist() == [0, 8, 16], "sentinels must be stripped and [1,T] squeezed"
+        assert loss_fn.is_packed is True
+
+    def test_unpacked_batch_leaves_loss_unpacked(self):
+        loss_fn = self._make_loss()
+        batch = {"qkv_format": "bshd"}
+
+        self._bind(loss_fn, batch, mtp_seq_idx=None, mtp_is_packed=False)
+
+        assert loss_fn.cu_seqlens is None
+        assert loss_fn.is_packed is False
+
+    def test_bound_cu_seqlens_mask_document_ends_to_zero_gradient(self):
+        """End-to-end through the bound loss: document-end positions receive
+        zero MTP-logit gradient and cross-document targets are ignored."""
+        torch.manual_seed(9264)
+        loss_fn = self._make_loss()
+        # Two documents [0,8) and [8,16) in one packed microbatch.
+        batch = {"cu_seqlens_padded": torch.tensor([[0, 8, 16]], dtype=torch.int32)}
+        self._bind(loss_fn, batch, mtp_seq_idx=None, mtp_is_packed=True)
+
+        labels = torch.tensor([[2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18]])
+        main_logits = torch.randn(1, 16, 20, requires_grad=True)
+        mtp_logits = torch.randn(1, 16, 20, requires_grad=True)
+        actual = loss_fn((main_logits, mtp_logits), labels)
+        # Isolate the MTP depth's gradient (main CE also backprops into
+        # main_logits; only the depth-1 term touches mtp_logits).
+        (mtp_grad,) = torch.autograd.grad(actual, mtp_logits, retain_graph=True)
+
+        # Position 7 (last of doc 0) predicts doc-1's first token at depth 1:
+        # cross-document, must be fully masked -> zero gradient rows.
+        assert torch.count_nonzero(mtp_grad[0, 7]) == 0, "document-end position must get zero MTP gradient"
+        # Interior positions of each document keep nonzero gradients.
+        assert torch.count_nonzero(mtp_grad[0, 3]) > 0
+        assert torch.count_nonzero(mtp_grad[0, 11]) > 0

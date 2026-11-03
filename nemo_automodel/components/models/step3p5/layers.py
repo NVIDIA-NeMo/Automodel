@@ -125,6 +125,16 @@ class Step3p5RotaryEmbedding(nn.Module):
         Returns:
             Tuple of (cos, sin) tensors.
         """
+        # THD/packed execution carries position_ids as a flat [T] stream.
+        # RoPE math still uses a batch-like leading dimension, so restore the
+        # singleton dimension locally while preserving reset positions at each
+        # packed-document boundary.
+        is_thd = position_ids.ndim == 1
+        if is_thd:
+            position_ids = position_ids.unsqueeze(0)
+        elif position_ids.ndim != 2:
+            raise ValueError(f"position_ids must have shape [T] or [B, S], got {tuple(position_ids.shape)}")
+
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float().to(x.device)
 
@@ -135,7 +145,12 @@ class Step3p5RotaryEmbedding(nn.Module):
             cos = emb.cos()
             sin = emb.sin()
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        cos = cos.to(dtype=x.dtype)
+        sin = sin.to(dtype=x.dtype)
+        if is_thd:
+            cos = cos.squeeze(0)
+            sin = sin.squeeze(0)
+        return cos, sin
 
 
 class Step3p5MLP(nn.Module):
