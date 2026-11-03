@@ -27,6 +27,7 @@ import logging
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -96,6 +97,24 @@ def test_model_config():
     logger.info(f"  ✓ Model instantiated with {param_count:,} parameters")
 
     return config, model
+
+
+@pytest.fixture(scope="module")
+def _tiny_config_and_model():
+    """Build the tiny config/model pair once, as ``main()`` does for script runs."""
+    return test_model_config()
+
+
+@pytest.fixture
+def config(_tiny_config_and_model):
+    """Tiny ``Llavaonevision1_5Config`` shared by the forward-pass tests."""
+    return _tiny_config_and_model[0]
+
+
+@pytest.fixture
+def model(_tiny_config_and_model):
+    """Eval-mode LLaVA-OneVision-1.5 model built from the tiny config."""
+    return _tiny_config_and_model[1]
 
 
 def test_forward_pass_shape(config, model):
