@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU native preprocessing/NEAT/model parity; no external dataset or GPU kernels."""
+"""Native preprocessing/NEAT/model parity with an offline image processor."""
 
 import copy
 from types import MethodType
@@ -37,12 +37,18 @@ from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForCondition
 from tests.utils.gemma4_vlm_fixtures import gemma4_processor, tiny_gemma4_config
 
 
-def _model(attention):
+@pytest.fixture
+def device() -> torch.device:
+    """Keep these integration tests on CPU unless the CUDA suite overrides it."""
+    return torch.device("cpu")
+
+
+def _model(attention: str, device: torch.device = torch.device("cpu")) -> Gemma4ForConditionalGeneration:
     torch.manual_seed(42)
     config = tiny_gemma4_config()
     config._attn_implementation = attention
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
-    return Gemma4ForConditionalGeneration(config, backend=backend).float().train()
+    return Gemma4ForConditionalGeneration(config, backend=backend).to(device=device, dtype=torch.float32).train()
 
 
 def _conversation(size, color):
@@ -61,16 +67,18 @@ def _conversation(size, color):
 
 
 def _forward(model, batch):
+    device = next(model.parameters()).device
     inputs = {
-        key: value
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
         for key, value in batch.items()
         if key not in ("labels", "n_images_per_sample", "n_videos_per_sample")
     }
-    return model(**inputs, use_cache=False).logits
+    output = model(**inputs, use_cache=False)
+    return output if isinstance(output, torch.Tensor) else output.logits
 
 
 @pytest.mark.parametrize("attention", ["sdpa", "eager"])
-def test_native_image_packing_matches_separate_logits_loss_and_gradients(attention):
+def test_native_image_packing_matches_separate_logits_loss_and_gradients(attention: str, device: torch.device) -> None:
     processor = gemma4_processor()
     dataset = PreTokenizedDatasetWrapper(
         [_conversation((8, 12), "red"), _conversation((12, 8), "blue")],
@@ -88,7 +96,7 @@ def test_native_image_packing_matches_separate_logits_loss_and_gradients(attenti
     assert packed["pixel_values"].shape[0] == 2
     assert packed["image_position_ids"].shape[0] == 2
     assert packed["_packed_seq_ids"].max() == 2
-    model = _model(attention)
+    model = _model(attention, device)
     reference = copy.deepcopy(model)
     actual = _forward(model, packed)
     expected_parts = []
@@ -106,6 +114,7 @@ def test_native_image_packing_matches_separate_logits_loss_and_gradients(attenti
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
     targets = torch.cat([sample["labels"][1:] for sample in encoded])[None]
     torch.testing.assert_close(packed["labels"], targets)
+    targets = targets.to(device)
     actual_loss = F.cross_entropy(actual.flatten(0, 1), targets.flatten(), reduction="sum")
     expected_loss = F.cross_entropy(expected.flatten(0, 1), targets.flatten(), reduction="sum")
     torch.testing.assert_close(actual_loss, expected_loss)
@@ -118,8 +127,8 @@ def test_native_image_packing_matches_separate_logits_loss_and_gradients(attenti
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.model.vision_tower.parameters())
 
 
-def test_single_document_native_neat_retains_sliding_policy():
-    model = _model("sdpa")
+def test_single_document_native_neat_retains_sliding_policy(device: torch.device) -> None:
+    model = _model("sdpa", device)
     tokens = torch.arange(2, 26)
     sample = {
         "input_ids": tokens,
@@ -131,7 +140,9 @@ def test_single_document_native_neat_retains_sliding_policy():
     assert batch["_packed_seq_ids"].tolist() == [[1] * 24]
     with torch.no_grad():
         actual = _forward(model, batch)
-        expected = model(input_ids=tokens[None], attention_mask=torch.ones((1, 24)), use_cache=False).logits
+        expected = model(
+            input_ids=tokens[None].to(device), attention_mask=torch.ones((1, 24), device=device), use_cache=False
+        ).logits
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
 
 
@@ -172,17 +183,17 @@ def test_native_tie_policy_rejects_scratch_untied_and_pipeline_aliases():
         validate_hf_model_for_pipeline_support(model)
 
 
-def test_pipeline_text_wrapper_preserves_model_prepared_masks_and_gradients():
+def test_pipeline_text_wrapper_preserves_model_prepared_masks_and_gradients(device: torch.device) -> None:
     """Compare the actual decoder wrapper locally; this does not certify Gemma PP."""
-    model = _model("sdpa")
+    model = _model("sdpa", device)
     reference = model.model.language_model
     wrapped = copy.deepcopy(reference)
     wrapped.forward = MethodType(create_pipeline_forward_gemma4_text(), wrapped)
-    tokens = torch.tensor([[2, 5, 6, 7, 3, 5, 8, 4]])
-    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
-    documents = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2]])
+    tokens = torch.tensor([[2, 5, 6, 7, 3, 5, 8, 4]], device=device)
+    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], device=device)
+    documents = torch.tensor([[1, 1, 1, 1, 2, 2, 2, 2]], device=device)
     allowed = (documents[:, None, :, None] == documents[:, None, None, :]).tril()
-    modalities = torch.tensor([[0, 1, 1, 0, 0, 1, 1, 0]])
+    modalities = torch.tensor([[0, 1, 1, 0, 0, 1, 1, 0]], device=device)
     masks = model.prepare_document_attention_mask(allowed, modalities, documents)
     originals = {name: value.clone() for name, value in masks.items()}
     expected = reference(
@@ -222,7 +233,7 @@ def test_flash_public_and_compact_metadata_are_rejected_before_forward(pipeline_
             model(input_ids=torch.tensor([[2, 3]]), **metadata)
 
 
-def test_pipeline_vlm_wrapper_composes_native_image_policy_before_decoder():
+def test_pipeline_vlm_wrapper_composes_native_image_policy_before_decoder(device: torch.device) -> None:
     """Compare full-model wrappers locally; no partitioned PP support is claimed."""
     processor = gemma4_processor()
     dataset = PreTokenizedDatasetWrapper(
@@ -236,7 +247,7 @@ def test_pipeline_vlm_wrapper_composes_native_image_policy_before_decoder():
         bins=[[0, 1]],
         padding_idx=processor.tokenizer.pad_token_id,
     )
-    reference = _model("sdpa")
+    reference = _model("sdpa", device)
     wrapped = copy.deepcopy(reference)
     wrapped.forward = MethodType(create_pipeline_forward_gemma4_vlm(), wrapped)
     wrapped.model.language_model.forward = MethodType(
@@ -246,20 +257,13 @@ def test_pipeline_vlm_wrapper_composes_native_image_policy_before_decoder():
     configure_packing("sdpa", model=wrapped)
     batch = neat_packed_vlm_collater([packed[0]], packing=contract)
     # The same compact hook must run before either outer forward composes masks.
-    batch["_packed_seq_ids"] = batch["_packed_seq_ids"]
     del batch["attention_mask"]
     expected = _forward(reference, batch)
-    actual = wrapped(
-        **{
-            key: value
-            for key, value in batch.items()
-            if key not in ("labels", "n_images_per_sample", "n_videos_per_sample")
-        },
-        use_cache=False,
-    )
+    actual = _forward(wrapped, batch)
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
-    expected_loss = F.cross_entropy(expected.flatten(0, 1), batch["labels"].flatten(), reduction="sum")
-    actual_loss = F.cross_entropy(actual.flatten(0, 1), batch["labels"].flatten(), reduction="sum")
+    targets = batch["labels"].to(device).flatten()
+    expected_loss = F.cross_entropy(expected.flatten(0, 1), targets, reduction="sum")
+    actual_loss = F.cross_entropy(actual.flatten(0, 1), targets, reduction="sum")
     torch.testing.assert_close(actual_loss, expected_loss)
     expected_loss.backward()
     actual_loss.backward()
