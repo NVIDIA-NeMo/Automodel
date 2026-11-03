@@ -139,7 +139,10 @@ class StepScheduler(Stateful):
         self.dataloader = dataloader
         self._synchronized_stream = synchronized_stream
         self._completion_group = process_group
-        self._stream_exhausted = False
+        # Whether synchronized source exhaustion ended training before its step cap.
+        # Recipes can use this after iteration to write a final checkpoint without
+        # reading ahead into the next optimizer step.
+        self.stream_exhausted: bool = False
         self._step_in_progress = False
         self.step = start_step
         if start_step < 0:
@@ -244,7 +247,7 @@ class StepScheduler(Stateful):
         The only buffered data is the current optimizer step, as in the native iterator.
         There is no next-step lookahead that could advance checkpointed data progress.
         """
-        if self._stream_exhausted:
+        if self.stream_exhausted:
             return
         iterator = None
         while self.step < self.max_steps and not self.sigterm_flag:
@@ -269,7 +272,7 @@ class StepScheduler(Stateful):
                     raise RuntimeError("Reading the synchronized training stream failed") from error
                 raise RuntimeError("Reading the synchronized training stream failed on another rank")
             if status == 1:
-                self._stream_exhausted = True
+                self.stream_exhausted = True
                 self.epoch += 1
                 if batches:
                     logger.warning(
@@ -287,15 +290,6 @@ class StepScheduler(Stateful):
             yield batches
             self.step += 1
             self._step_in_progress = False
-
-    @property
-    def stream_exhausted(self) -> bool:
-        """Whether synchronized source exhaustion ended training before its step cap.
-
-        Recipes can use this after iteration to write a final checkpoint without
-        reading ahead into the next optimizer step.
-        """
-        return self._stream_exhausted
 
     def set_epoch(self, epoch: int):
         """
@@ -368,7 +362,7 @@ class StepScheduler(Stateful):
         """
         # we +1 here because the step is incremented after
         # the batch is yielded in the tail handling of __iter__
-        if self._stream_exhausted or self.step + 1 >= self.max_steps:
+        if self.stream_exhausted or self.step + 1 >= self.max_steps:
             return True
         # Last batch of the last epoch when epochs are exhausted before max_steps.
         if self.num_epochs is not None and self.epoch + 1 >= self.num_epochs:
@@ -409,7 +403,7 @@ class StepScheduler(Stateful):
         """
         epoch = self.epoch
         for e in range(epoch, self.num_epochs):
-            if self._stream_exhausted or self.step >= self.max_steps or self.sigterm_received:
+            if self.stream_exhausted or self.step >= self.max_steps or self.sigterm_received:
                 return
             yield e
 
@@ -428,7 +422,7 @@ class StepScheduler(Stateful):
             return {
                 "step": min(self.max_steps, self.step + int(self._step_in_progress)),
                 "epoch": self.epoch,
-                "stream_exhausted": self._stream_exhausted,
+                "stream_exhausted": self.stream_exhausted,
             }
         return {"step": min(self.max_steps, self.step + 1), "epoch": self.epoch}
 
@@ -440,7 +434,7 @@ class StepScheduler(Stateful):
             s (dict): Dictionary containing 'step' and 'epoch'.
         """
         self.step, self.epoch = s["step"], s["epoch"]
-        self._stream_exhausted = bool(s.get("stream_exhausted", False))
+        self.stream_exhausted = bool(s.get("stream_exhausted", False))
         self._step_in_progress = False
 
 
