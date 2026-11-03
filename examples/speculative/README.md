@@ -87,7 +87,9 @@ The shipped example configs only cover a subset.
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
   (`Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration`),
   and MiniMax M3 VL (`MiniMaxM3SparseForConditionalGeneration`, including a
-  multimodal data path through `recipe_args.multimodal: true`).
+  multimodal data path through `recipe_args.multimodal: true`). MiniMax-M3.1-Flash
+  ships `dspark/config.json`, so its draft follows that contract and exports the
+  released layout (`dspark/minimax_m3_1_flash_dspark.yaml`).
 
 Qwen3-MoE is handled exactly like a dense target: the draft only consumes
 post-block hidden states, never per-expert routing. gpt-oss uses a dedicated
@@ -695,7 +697,7 @@ nemo_automodel/components/speculative/
   dflash/       core, dflash2_core, domino_core, jetspec_core, draft_qwen3,
                 draft_qwen3_dflash2, registry, target
   dspark/       core, draft_qwen3, draft_deepseek_v4, draft_glm_5_2,
-                draft_gemma4, draft_minimax_m3, markov_head, registry, target,
+                draft_gemma4, markov_head, registry, target,
                 remote                      # remote target server logic + client
   regenerate.py            # dataset regeneration with the target model
   regen_loop.py            # on-policy regeneration during training (regen block)
