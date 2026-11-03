@@ -222,8 +222,8 @@ def test_backbone_forward_backward_is_finite():
     backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", rope_fusion=False, dispatcher="torch")
     backbone = Qwen3_5DenseTextBackbone(config, backend).float().train()
     linear_attn = backbone.layers["0"].linear_attn
-    # Run the real CPU GatedDeltaNet math even when FLA is installed.
-    linear_attn.causal_conv1d_fn = None
+    # Unwrap HF dispatchers so installed CUDA kernels cannot replace this CPU math.
+    linear_attn.causal_conv1d_fn = inspect.unwrap(hf_modeling.causal_conv1d_fn)
     linear_attn.chunk_gated_delta_rule = inspect.unwrap(hf_modeling.torch_chunk_gated_delta_rule)
 
     hidden = backbone(input_ids=torch.tensor([[1, 2, 3, 4, 5]])).last_hidden_state
