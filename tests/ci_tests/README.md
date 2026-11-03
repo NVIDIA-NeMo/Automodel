@@ -80,6 +80,12 @@ ci:
     hf_device_map_auto: true      # Optional. Use for large HF reference loads that do not fit on one GPU
     # skip_resume: true           # Exceptional: skip native-checkpoint resume (Phase 4)
     # See checkpoint robustness section for all options
+  perf_testing:                   # Optional. Performance measurements run automatically from this section
+                                  # Without it, none run. ci.deprecated: true also disables them. Other ci settings (e.g. ep_size) apply
+    schedule: weekly              # Required. nightly, weekly, or disabled (keeps the settings, pauses the runs)
+    time: "00:40:00"              # Optional. Wall time of the performance run (HH:MM:SS, same format as ci.time)
+    config_overrides:             # Optional. Dotted config keys with non-null scalar values, passed as --key value
+      step_scheduler.max_steps: 10
 ```
 
 ## Checkpoint Robustness
