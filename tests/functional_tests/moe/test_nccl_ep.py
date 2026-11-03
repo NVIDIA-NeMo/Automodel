@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-GPU NCCL-EP forward, backward, and checkpoint parity."""
+"""Two-GPU NCCL-EP parity: the transport alone, and composed with FSDP2 by the MoE parallelizer."""
 
 import pytest
 
@@ -22,3 +22,8 @@ from tests.utils.test_utils import run_test_script
 @pytest.mark.timeout(600)
 def test_nccl_ep_parity() -> None:
     run_test_script("moe", "L2_MoE_NCCLEP_Parity.sh")
+
+
+@pytest.mark.timeout(600)
+def test_nccl_ep_fsdp_parity() -> None:
+    run_test_script("moe", "L2_MoE_NCCLEP_FSDP_Parity.sh")

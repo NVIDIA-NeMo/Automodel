@@ -190,11 +190,15 @@ Transformer Engine 2.20 borrows the EP group's NCCL communicator, which the
 not expose. In that case NCCL-EP creates a classic `nccl-legacy` group over the
 same ranks, which adds one NCCL communicator per EP group.
 
-Run the focused two-GPU validation in an enabled container:
+Run the focused two-GPU validation in an enabled container. The first script
+checks the transport on its own; the second checks a training step of a small
+model that composes NCCL-EP with FSDP2:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   tests/functional_tests/moe/run_nccl_ep_parity.py
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  tests/functional_tests/moe/run_nccl_ep_fsdp_parity.py
 ```
 
 ## Launch Training
