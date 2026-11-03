@@ -117,3 +117,5 @@ ci:
   nodes: 32
   env_vars:
     RDZV_TIMEOUT: "900"
+  perf_testing:
+    schedule: weekly

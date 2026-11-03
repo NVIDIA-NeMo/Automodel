@@ -96,3 +96,5 @@ ci:
   recipe_owner: ZhiyuLi-Nvidia
   time: "00:15:00"
   nodes: 2
+  perf_testing:
+    schedule: nightly

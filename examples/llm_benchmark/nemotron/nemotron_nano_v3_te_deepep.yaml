@@ -98,3 +98,5 @@ ci:
   cluster_tag: h100
   time: "00:15:00"
   nodes: 1
+  perf_testing:
+    schedule: nightly
