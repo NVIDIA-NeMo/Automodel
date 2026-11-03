@@ -2,7 +2,7 @@
 # Runs from this directory (docs/fern/). Invoke as:
 #
 #     cd docs/fern && make docs
-#     # or from anywhere in the repo:
+#     # or from the repository root:
 #     make -C docs/fern docs
 #
 # CI workflows under `.github/workflows/fern-docs-*.yml` are the source of
@@ -32,7 +32,7 @@ help:
 	@echo "========================================"
 	@echo ""
 	@echo "Run from this directory ('cd docs/fern && make <target>')"
-	@echo "or from anywhere in the repo ('make -C docs/fern <target>')."
+	@echo "or from the repository root ('make -C docs/fern <target>')."
 	@echo ""
 	@echo "  make docs-login             FIRST-TIME SETUP — provision Fern account + CLI auth"
 	@echo "  make docs                   Generate library reference and start Fern dev server"

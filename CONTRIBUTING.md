@@ -369,6 +369,13 @@ per-file alias registration in `tools/docs/catalog.py` is needed.
 
 If your contribution involves documentation changes, please refer to the [Fern docs maintenance guide](.agents/contributor-skills/fern-docs/SKILL.md) guide for detailed instructions on building and serving the documentation.
 
+Training examples that introduce a Hugging Face dataset must include its dataset
+card and catalog registration. Follow the [dataset-card guide](docs/templates/dataset-card-guide.md)
+and run `uv run --script tools/docs/check_docs.py`; Fern CI checks Hub IDs referenced
+directly in example YAML. Check indirect sources in loaders and preparation
+scripts by hand as described in the guide. Write relative local dataset directories with a `./` prefix
+so they can be distinguished from Hub IDs.
+
 ## Signing Your Work
 
 * We require that all contributors "sign-off" on their commits. This certifies that the contribution is your original work, or you have rights to submit it under the same license, or a compatible license.

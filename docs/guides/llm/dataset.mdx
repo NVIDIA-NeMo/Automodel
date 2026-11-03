@@ -91,6 +91,22 @@ The [SQuAD (Stanford Question Answering Dataset)](https://huggingface.co/dataset
 - **Question**: A question about the context
 - **Answers**: The correct answer with its position in the context
 
+To train on SQuAD, reference the built-in factory in your recipe:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  split: train
+  dataset_name: rajpurkar/squad
+```
+
+<Note>
+
+- If the tokenizer has a usable chat template, `make_squad_dataset` uses it automatically and masks non-answer tokens. Otherwise it uses prompt-and-answer formatting.
+- You can use the optional `seq_length` parameter for padding or truncation.
+
+</Note>
+
 #### Create Your Own Instruction Dataset
 
 The [`squad.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py) file contains the implementation for processing the SQuAD dataset into a format suitable for instruction tuning. It defines a dataset class and preprocessing functions that extract the context, question, and answer fields, concatenate them into a prompt-completion format, and apply tokenization, padding, and loss masking. This serves as a template for building custom instruction datasets by following a similar structure and adapting the extraction logic to your dataset's schema.
@@ -149,6 +165,8 @@ dataset:
 ```
 This calls `build_my_dataset()` from the specified file with the other keys (such as `num_blocks`) as arguments. This approach allows you to integrate custom datasets using configuration alone, with no need to alter the codebase or package structure.
 
+To evaluate during training, define a separate `validation_dataset` and `validation_dataloader` block that mirrors your training configuration.
+
 ## Packed Sequence Support in NeMo AutoModel
 NeMo AutoModel supports **packed sequences**, which is a technique to optimize training with variable-length sequences (such as text) by minimizing padding.
 
@@ -183,6 +201,16 @@ The `packed_sequence` block accepts the following settings:
 - **max_packs**: Optionally caps the number of packed samples created.
 - **drop_long_samples**: For `neat`, drops samples longer than `packed_sequence_size` when `true`. Otherwise, the packer raises an error.
 - **num_proc**: Specifies the number of worker processes used to tokenize the dataset before packing. Packing first runs one full pass over the dataset, which tokenizes every sample serially. Setting `num_proc > 1` front-loads that tokenization across processes, producing identical, order-preserving output. This defaults to `1` (serial). The speedup grows with the per-sample tokenization cost (such as long multi-turn chats and heavy chat templates) and available CPU cores. This runs independently on each data-parallel rank, so configure it so that `local_ranks * num_proc` does not oversubscribe the node's CPUs.
+
+When training with FP8, use a collator that pads sequence lengths to an FP8-friendly multiple:
+
+```yaml
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 16
+```
 
 ## Troubleshooting Tips
 

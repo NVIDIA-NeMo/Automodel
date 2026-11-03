@@ -35,6 +35,7 @@ from tools.docs.checks.architecture import (
     validate_architecture_reference_tables,
     validate_registered_architectures,
 )
+from tools.docs.checks.dataset_cards import validate_dataset_cards
 from tools.docs.checks.model_cards import (
     _validate_card_aliases,
     _validate_changed_card_identity,
@@ -115,6 +116,7 @@ def validate_sources(repo_root: Path) -> None:
         validate_architecture_aliases,
         validate_recipe_publishers,
         validate_recipe_publisher_aliases,
+        validate_dataset_cards,
     ):
         try:
             check(repo_root)

@@ -18,12 +18,14 @@ NVIDIA branding (logos, favicon, footer, fonts, NVIDIA-green CSS, OneTrust JS) c
 
 ## Quickstart
 
+Install Git, Make, Node.js 20 with npm, Python 3 with PyYAML, and `uv` before running the targets below. `make docs-check` forwards to `uv run --script tools/docs/check_docs.py`, which provisions an isolated Python 3.12 environment with PyYAML, separately from the training environment.
+
 First time on this machine:
 
 ```bash
 # All Make targets live in docs/fern/Makefile — run them from this directory
-# (`cd docs/fern && make <target>`), from the docs/ folder via the forwarder
-# (`cd docs && make <target>`), or from anywhere with `make -C docs/fern <target>`.
+# (`cd docs/fern && make <target>`), or from the repository root with
+# `make -C docs/fern <target>`.
 
 # 1. Install the Fern CLI globally (one-time)
 npm install -g fern-api
@@ -36,7 +38,7 @@ cd docs/fern && make docs-login
 # 3. Build the API library reference and start the local dev server
 make docs           # http://localhost:3002
 
-# 4. (Optional) validate config + MDX without booting the server
+# 4. Run the shared docs check: source contracts (including dataset cards), MDX syntax, and Fern configuration
 make docs-check
 ```
 
@@ -63,7 +65,7 @@ docs/                            ← nightly MDX lives here (sibling of fern/)
 ├── about/, guides/, model-coverage/, launcher/, api-reference/
 ├── *.png / *.jpg                ← page-scoped images
 └── fern/                        ← THIS DIRECTORY
-    ├── fern.config.json         # Fern CLI pin (5.29.0+) and org slug
+    ├── fern.config.json         # Fern CLI pin (5.139.0) and org slug
     ├── docs.yml                 # Site config: instances, versions, redirects, libraries, global-theme: nvidia
     ├── components/              # BadgeLinks.tsx, Tag.tsx (repo-specific only;
     │                            #   NVIDIA-branded footer/logo/CSS ship via global-theme)
@@ -72,7 +74,11 @@ docs/                            ← nightly MDX lives here (sibling of fern/)
     │   ├── v0.4.yml             # Nav for the frozen 0.4.0 GA snapshot — paths at ./v0.4/pages/
     │   ├── v0.4/pages/          # Frozen 0.4.0 content — lives on the `docs-archive` branch, NOT main;
     │   │                        #   restored here by `make docs-stitch` / CI (gitignored on main)
-    │   └── latest.yml           # GA alias — paths at ./v0.4/pages/ today; repointed at next GA cut
+    │   ├── v0.5.yml             # Nav for the frozen 0.5.0 GA snapshot — paths at ./v0.5/pages/
+    │   ├── v0.5/pages/          # Frozen 0.5.0 content — also restored from docs-archive
+    │   ├── v0.7.yml             # Nav for the frozen 0.7.0 GA snapshot — paths at ./v0.7/pages/
+    │   ├── v0.7/pages/          # Frozen 0.7.0 content — also restored from docs-archive
+    │   └── latest.yml           # GA alias — paths at ./v0.7/pages/; repointed at the next GA cut
     └── product-docs/            # GENERATED Python API reference (gitignored — `make docs` regenerates)
 ```
 
@@ -80,22 +86,23 @@ docs/                            ← nightly MDX lives here (sibling of fern/)
 File path                                                  Published URL
 ─────────────────────────────────────────────────────────  ─────────────────────────────────────────────────
 docs/guides/installation.mdx                               docs.nvidia.com/nemo/automodel/nightly/get-started/installation
-docs/fern/versions/v0.4/pages/get-started/installation.mdx docs.nvidia.com/nemo/automodel/v0.4/get-started/installation
-                                                           docs.nvidia.com/nemo/automodel/latest/get-started/installation  (latest mounts v0.4 content)
+docs/fern/versions/v0.7/pages/guides/installation.mdx       docs.nvidia.com/nemo/automodel/v0.7/get-started/installation
+                                                           docs.nvidia.com/nemo/automodel/latest/get-started/installation  (latest mounts v0.7 content)
 ```
 
-The **`docs/` top-level tree IS the nightly tree** — every PR lands there. The **`docs/fern/versions/v0.4/pages/` tree is a frozen 0.4.0 release snapshot**, only changed via deliberate back-port. `latest.yml` mounts `./v0.4/pages/` so `/latest/...` URLs serve the current GA — at the next GA cut, `latest.yml` repoints at the new train. The nightly and v0.4 trees were byte-for-byte identical when 0.4.0 shipped; they diverge as nightly accumulates post-release edits.
+The **`docs/` top-level tree is the nightly tree** — every PR lands there. The **`docs/fern/versions/v0.4/pages/`, `v0.5/pages/`, and `v0.7/pages/` trees are frozen release snapshots**, changed only through deliberate back-ports. `latest.yml` mounts `./v0.7/pages/` so `/latest/...` URLs serve the current GA — at the next GA cut, `latest.yml` repoints at the new train.
 
-**Only the nightly tree is on `main`.** The frozen `v0.4/pages/` snapshot lives on the **`docs-archive` branch** and is restored into the working copy before any Fern build — by `make docs-stitch` locally, or the `.github/actions/stitch-fern-versions` composite action in CI (publish, `fern check`, and preview all run it first). Fern reads one local tree and publishes a full-site snapshot, so the archived pages must be physically present at build time; they can't be sourced from another branch natively. The restore path is gitignored on `main`. To pull a version from an immutable tag instead of the branch: `make docs-check ARCHIVE_REF=docs/v0.4.0`.
+**Only the nightly tree is on `main`.** The frozen `v0.4/pages/`, `v0.5/pages/`, and `v0.7/pages/` snapshots live on the **`docs-archive` branch** and are restored into the working copy before Fern builds. Locally, `make docs-stitch` restores them; CI restores them before validation, preview, and publication. Fern reads one local tree and publishes a full-site snapshot, so the archived pages must be physically present at build time; they can't be sourced from another branch natively. The restore paths are gitignored on `main`. To use another archive ref, set `ARCHIVE_REF` when running Make; that ref must contain every archived page tree.
 
 ## Local Development
 
-From this directory (`cd docs/fern` first, or use `make -C docs/fern <target>` from anywhere):
+Run these commands from this directory (`cd docs/fern` first), or use `make -C docs/fern <target>` from the repository root:
 
 ```bash
 make docs           # docs-stitch + `fern docs md generate` + `fern docs dev` → http://localhost:3002
 make docs-stitch    # restore frozen backward-version pages from the docs-archive branch
-make docs-check     # docs-stitch + MDX syntax validation + `fern check`
+make docs-check     # shared check: source contracts (including dataset cards), model tables, archives, MDX, and `fern check`
+make docs-model-tables  # regenerate model-coverage tables
 make docs-preview   # docs-stitch + shared preview URL on *.docs.buildwithfern.com (needs DOCS_FERN_TOKEN)
 make docs-publish   # trigger the `Publish Fern Docs` workflow on origin/main
 ```
@@ -106,7 +113,7 @@ For first-time-on-this-machine setup, see the [Quickstart](#quickstart) above �
 
 ## Sidebar Fidelity Rule
 
-**The published v0.4.0 sidebar at docs.nvidia.com/nemo/automodel/latest is the source of truth for section captions, page titles, and Model Coverage child ordering.** Don't silently shorten "Install NeMo AutoModel" to "Installation" or rename a section caption — engineers and the docs PM diff this site against the published one and any drift looks like a content regression.
+**The published v0.4.0 sidebar at docs.nvidia.com/nemo/automodel/v0.4 is the reference for the original section captions, page titles, and Model Coverage child ordering.** Don't silently shorten "Install NeMo AutoModel" to "Installation" or rename a section caption — engineers and the docs PM diff this site against the published one and any drift looks like a content regression.
 
 If you want a shorter or different sidebar label, change the toctree-derived display name in the source — never just retitle in the converted MDX.
 
@@ -117,7 +124,7 @@ If you want a shorter or different sidebar label, change the toctree-derived dis
 ```yaml
 ---
 title: "<Page Title>"        # required — used by Fern as the page title and breadcrumb
-description: ""              # required (may be empty string) — SEO
+description: "<Concise page summary>"  # describe the page for search results
 position: 1                  # optional — orders auto-discovered folders
 ---
 ```
@@ -146,7 +153,7 @@ Use **version-agnostic paths** (no `/latest/`, `/v0.4/`, or `/nightly/` prefix):
 [LLM model list](/model-coverage/large-language-models/overview)
 ```
 
-The same MDX backs every version slug — a hard-coded prefix would jump readers across versions. Page slugs come from explicit `slug:` overrides in the version YAML, not from the (often verbose) display title — so `Install NeMo AutoModel` is at `/get-started/installation`, not `/get-started/install-nemo-automodel`.
+Version-agnostic links keep readers in their current documentation version; a hard-coded prefix can send them to another version. Page slugs come from explicit `slug:` overrides in the version YAML, not from the (often verbose) display title — so `Install NeMo AutoModel` is at `/get-started/installation`, not `/get-started/install-nemo-automodel`.
 
 ### Cross-Repo References (YAML Configs, Source Files)
 
@@ -177,33 +184,35 @@ and a main link, without a duplicate card row. Source aliases are counted once.
 
 ## Versioning
 
-`docs.yml` `versions:` lists three entries (matching the published version dropdown):
+`docs.yml` `versions:` lists five entries:
 
 | display-name | slug | availability | path |
 |---|---|---|---|
 | `Nightly` | `nightly` | `beta` | `./versions/nightly.yml` |
 | `Latest` | `latest` | `stable` | `./versions/latest.yml` |
+| `0.7.0 · 26.10` | `v0.7` | `stable` | `./versions/v0.7.yml` |
+| `0.5.0 · 26.06` | `v0.5` | `stable` | `./versions/v0.5.yml` |
 | `0.4.0 · 26.04` | `v0.4` | `stable` | `./versions/v0.4.yml` |
 
-**`nightly` reads the MDX directly from `docs/`** (via `path: ../../<...>.mdx` in `nightly.yml`) — every PR lands there, and (once wired up) the daily build publishes from that tree. **`v0.4` is the frozen 0.4.0 GA snapshot** with its own copy of every page under `docs/fern/versions/v0.4/pages/`; it only changes via deliberate back-ports from nightly. `latest.yml` mounts the current GA's content (today: `./v0.4/pages/...`).
+**`nightly` reads the MDX directly from `docs/`** (through `path: ../../<...>.mdx` in `nightly.yml`). Changes to `docs/` on `main` trigger publication. **`v0.4`, `v0.5`, and `v0.7` are frozen GA snapshots** under their respective `docs/fern/versions/<version>/pages/` directories; they change only through deliberate back-ports. `latest.yml` mounts the current GA's content at `./v0.7/pages/...`.
 
-When the next GA cuts (e.g. `v0.5`):
+When the next GA cuts (e.g. `v0.8`):
 
-1. From the repository root, create an exclusion-aware snapshot of nightly: `mkdir -p docs/fern/versions/v0.5/pages && rsync -a --exclude='fern' docs/ docs/fern/versions/v0.5/pages/`.
-2. Copy the nightly navigation with `cp docs/fern/versions/nightly.yml docs/fern/versions/v0.5.yml`, then replace each `../../` source prefix with `./v0.5/pages/` in the new file.
-3. Repoint the GA alias with `cp docs/fern/versions/v0.5.yml docs/fern/versions/latest.yml`.
-4. Add the new frozen-pin entry to `docs/fern/docs.yml` `versions:` (`display-name: "0.5.0 · 26.07"`, `slug: v0.5`, `availability: stable`); keep `v0.4` per support policy.
-5. Add redirects to `docs/fern/docs.yml` before the global catch-alls: map explicit `/nemo/automodel/v0.5/index.html` and `/nemo/automodel/v0.5/index` sources to `/nemo/automodel/v0.5`; map legacy `/nemo/automodel/0.5`, `/nemo/automodel/0.5/index.html`, and `/nemo/automodel/0.5/index` sources to `/nemo/automodel/v0.5`; and map `/nemo/automodel/0.5/:path*/index.html`, `/nemo/automodel/0.5/:path*.html`, and `/nemo/automodel/0.5/:path*` sources to `/nemo/automodel/v0.5/:path*`. Keep the root index rules explicit because `:path*` does not match an empty path.
-6. Commit `docs/fern/versions/v0.5/pages/` on the `docs-archive` branch and push that branch. On `main`, remove the pages subtree and add `docs/fern/versions/v0.5/pages/` to `.gitignore`; keep `v0.5.yml`, `latest.yml`, and `docs.yml` on `main`.
-7. Add `v0.5=docs-archive` to `archived-versions:` in `publish-fern-docs.yml` and `fern-docs-ci.yml`. Add the version to the `Restore trusted archived pages` loop in `fern-docs-preview.yml`. Update the `docs-stitch` target in `docs/fern/Makefile` to restore the new pages subtree for local builds as well.
-8. Keep `docs/` moving forward as nightly. The `v0.4/pages/` and `v0.5/pages/` trees are frozen and change only through deliberate back-ports on `docs-archive`.
-9. After the release configuration and archived pages are available, tag and push `docs/v0.5.0` to publish the version train.
+1. From the repository root, create an exclusion-aware snapshot of nightly: `mkdir -p docs/fern/versions/v0.8/pages && rsync -a --exclude='fern' docs/ docs/fern/versions/v0.8/pages/`.
+2. Copy the nightly navigation with `cp docs/fern/versions/nightly.yml docs/fern/versions/v0.8.yml`, then replace each `../../` source prefix with `./v0.8/pages/` in the new file.
+3. Repoint the GA alias with `cp docs/fern/versions/v0.8.yml docs/fern/versions/latest.yml`.
+4. Add the new frozen-pin entry to `docs/fern/docs.yml` `versions:` (`display-name: "0.8.0"`, `slug: v0.8`, `availability: stable`); keep existing version entries per support policy.
+5. Add redirects to `docs/fern/docs.yml` before the global catch-alls: map explicit `/nemo/automodel/v0.8/index.html` and `/nemo/automodel/v0.8/index` sources to `/nemo/automodel/v0.8`; map legacy `/nemo/automodel/0.8`, `/nemo/automodel/0.8/index.html`, and `/nemo/automodel/0.8/index` sources to `/nemo/automodel/v0.8`; and map `/nemo/automodel/0.8/:path*/index.html`, `/nemo/automodel/0.8/:path*.html`, and `/nemo/automodel/0.8/:path*` sources to `/nemo/automodel/v0.8/:path*`. Keep the root index rules explicit because `:path*` does not match an empty path.
+6. Commit `docs/fern/versions/v0.8/pages/` on the `docs-archive` branch and push that branch. On `main`, remove the pages subtree and add `docs/fern/versions/v0.8/pages/` to `.gitignore`; keep `v0.8.yml`, `latest.yml`, and `docs.yml` on `main`.
+7. Add the version to the `docs-stitch` target in `docs/fern/Makefile`, which the shared check uses in CI, publication, and local builds, and to the `Restore trusted archived pages` loop in `fern-docs-preview.yml`.
+8. Keep `docs/` moving forward as nightly. Existing archived page trees and the new `v0.8/pages/` tree are frozen and change only through deliberate back-ports on `docs-archive`.
+9. After the release configuration and archived pages are available, tag and push `docs/v0.8.0` to publish the version train.
 
 ## CI and Publishing
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `fern-docs-ci.yml` | `push: pull-request/[0-9]+` (FW-CI mirror) | MDX syntax validation + `fern check` on PRs |
+| `fern-docs-ci.yml` | `push: pull-request/[0-9]+` (FW-CI mirror) | Shared docs check (`tools/docs/check_docs.py`: source contracts including dataset cards, MDX syntax, and `fern check`) and documentation-tool regression tests on PRs |
 | `fern-docs-preview.yml` | `push: pull-request/[0-9]+` (approved mirror) | Stage docs with trusted tooling, publish a preview and update the comment |
 | `publish-fern-docs.yml` | push to `main` (`docs/**`), `docs/v*` tag, or manual | Publish to docs.nvidia.com/nemo/automodel |
 
@@ -211,7 +220,7 @@ Required org secret: **`DOCS_FERN_TOKEN`**, scoped to the fixed Fern CLI library
 
 Approved upstream PR mirrors that change docs or preview inputs get a preview URL posted as a 🌿 comment. Fork-origin PRs must first pass the mirror approval process; direct fork pushes do not publish previews. The workflow verifies the current PR head before publishing its comment and removes stale preview comments when docs changes are reverted.
 
-Preview configuration, navigation, components and tooling come from `main`; PR page content overlays that trusted tree. Newer main-only pages remain available, while explicit PR page deletions are applied relative to the merge base. Deleting a page still referenced by trusted navigation can fail the build until that navigation is updated on `main`. Archived v0.4/v0.5 pages come from `docs-archive`.
+Preview configuration, components, and tooling come from `main`; PR page content overlays that trusted tree. Pages that the PR moves or deletes stay in the staged tree, so retained pages and archived navigation that still reference them keep building. The preview validates the PR's nightly navigation and uses it in place of the trusted navigation, so new pages, including dataset cards, appear in the preview sidebar. Navigation entries are limited to pages, sections, folders already present in trusted navigation, and trusted or embedded WebP provider icons; page paths must reference existing Markdown or MDX files in the documentation content tree. Archived v0.4, v0.5, and v0.7 pages come from `docs-archive`.
 
 The preview workflow pins Fern 5.139.0, sets `FERN_NO_VERSION_REDIRECTION=true`, and verifies the exact expected preview host before commenting. It does not execute PR package scripts or make authenticated page-link requests.
 
@@ -234,7 +243,7 @@ PR titles follow Conventional Commits (e.g., `docs(fern): add gemma4 fine-tuning
 | `Folder not found: ./product-docs/...` in `fern docs dev` | Run `make docs` once; library generation populates `product-docs/` |
 | `Unexpected closing tag`, especially after raw HTML such as `<img>` | Use valid MDX/JSX syntax, for example self-close void elements as `<img ... />`; `make docs-check` catches this before publish |
 | `[ERR_PNPM_IGNORED_BUILDS]` on first `fern docs dev` | pnpm 10+ blocks esbuild's postinstall — `pnpm config set onlyBuiltDependencies '["esbuild"]' --location global`, then `rm -rf ~/.fern/app-preview` and retry |
-| Broken-link warning for version-agnostic path | `fern docs broken-links` false-positives on links without a version slug; the URLMap-based `validate_fern_internal_links.py` is authoritative |
+| Broken-link warning for version-agnostic path | Check the destination against the current version navigation and verify it in the preview before treating the warning as a broken route |
 | `JSX expressions must have one parent element` | Wrap multi-element JSX in `<>...</>` or a `<div>` |
 | Card badges have no spacing | Use `<Tag>` (NeMo AutoModel landing pattern), not raw HTML; spacing comes from the `nvidia` global theme's CSS |
 | Old Sphinx URL breaks | Add a `redirects:` entry in `docs.yml` |

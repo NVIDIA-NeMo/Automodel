@@ -83,7 +83,7 @@ def test_retired_model_routes_redirect_to_provider_indexes():
     _validate_redirects(Path(__file__).resolve().parents[5])
 
 
-def test_internal_links_from_model_coverage_resolve_to_nightly_routes():
+def test_internal_links_from_model_and_dataset_coverage_resolve_to_nightly_routes():
     _validate_internal_links(Path(__file__).resolve().parents[5])
 
 

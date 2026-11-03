@@ -377,6 +377,9 @@ def _validate_internal_links(repo_root: Path) -> None:
     routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
     broken_links: list[tuple[Path, str]] = []
     pages = set((repo_root / "docs" / "model-coverage").rglob("*.mdx")) | set(_model_card_paths(repo_root))
+    pages.update(
+        page for page in (repo_root / "docs" / "dataset-coverage").rglob("*") if page.suffix in {".md", ".mdx"}
+    )
     for page in sorted(pages):
         document = page.read_text(encoding="utf-8")
         for link in re.findall("\\]\\((/[^)#?]+)", document):
@@ -388,6 +391,6 @@ def _validate_internal_links(repo_root: Path) -> None:
                 broken_links.append((page.relative_to(repo_root), link))
     if broken_links:
         raise ValueError(
-            "Model coverage pages link to missing nightly routes:\n"
+            "Model and dataset coverage pages link to missing nightly routes:\n"
             + "\n".join((f"  - {page}: {link}" for (page, link) in broken_links))
         )

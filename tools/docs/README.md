@@ -15,6 +15,7 @@ uses the same command with `--keep-generated` to retain validated tables.
 | `cards.py` | Model-card discovery by slug and canonical-file selection from nightly navigation. |
 | `checks/sources.py` | Coordinates source contracts before generation. |
 | `checks/model_cards.py` | Card identity, descriptions, commands, and compatibility copies. |
+| `checks/dataset_cards.py` | Dataset catalog registration, card contract, kebab-case card paths, and Hub IDs referenced by example recipes. |
 | `checks/navigation.py` | Navigation, provider hierarchy, routes, redirects, and links. |
 | `checks/architecture.py` | Architecture reference sections and registry documentation coverage. |
 | `checks/recipes.py` | Recipe model discovery and publisher coverage; optional HF architecture resolution. |

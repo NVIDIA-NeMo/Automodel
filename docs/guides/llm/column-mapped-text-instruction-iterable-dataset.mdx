@@ -9,19 +9,30 @@ Unlike `ColumnMappedTextInstructionDataset` (map-style, non-streaming), this cla
 
 ## When to Use This Dataset
 
+Streaming datasets read examples incrementally, which lets training start before the full dataset downloads. Regular Hugging Face `Dataset` objects also support data larger than RAM through memory-mapped local files; streaming primarily changes when data is downloaded and processed. See the [Hugging Face dataset comparison](https://huggingface.co/docs/datasets/about_mapstyle_vs_iterable).
+
 Use `ColumnMappedTextInstructionIterableDataset` when you need:
 
 - **Streaming-only behavior** (e.g., to reduce accidental data leakages from full dataset materialization)
 - **Delta Lake/Databricks** (Unity Catalog, cloud lakehouse storage, DBFS, etc.)
-- **Very large datasets** where map-style loading/caching is undesirable
+- **Very large datasets** (hundreds of GB or TB) where map-style loading/caching is undesirable
+- **Fast startup** without downloading the full dataset, for example when experimenting with a subset of a large dataset
+
+Avoid streaming when:
+
+- Your dataset is small enough to fit comfortably in memory
+- You need random access to samples (for example, for certain sampling strategies)
+- You need to know the exact dataset length upfront
+- You require a full-dataset shuffle rather than buffer-based shuffling
 
 If you do *not* need streaming (and you want `len(ds)` / `ds[i]`), use [`ColumnMappedTextInstructionDataset`](/datasets/columnmapped-dataset).
 
 ## Key Differences vs ColumnMappedTextInstructionDataset
 
-- **Iterable**: you iterate (`for sample in ds:`); you cannot rely on `len(ds)` or `ds[i]`.
+- **Iterable**: you iterate (`for sample in ds:`); you cannot rely on `len(ds)` or `ds[i]`. Upstream metadata might provide a source row count, but filtering can change the number of usable samples.
 - **Always streaming**: there is no `streaming=` flag; it is always enabled.
-- **Repeat behavior**: `repeat_on_exhaustion=True` is currently the only supported mode, so the dataset restarts after the underlying stream is exhausted. Single-pass mode is not supported.
+- **Repeat behavior**: `repeat_on_exhaustion=True` is currently the only supported mode, so the dataset restarts after the underlying stream is exhausted. Single-pass mode is not supported, so set a finite `step_scheduler.max_steps` in your training recipe.
+- **Buffer shuffling**: Shuffling is done with a buffer (not the entire dataset), which might not provide perfect randomization.
 - **(Optional) sharding/shuffle helpers**: use `.shard(num_shards, index)` / `.shuffle(buffer_size, seed)` when supported by the underlying backend.
 
 The column mapping and tokenization logic are shared with `ColumnMappedTextInstructionDataset`. See [Tokenization Paths](/datasets/columnmapped-dataset#tokenization-paths) for details on output fields (`input_ids`, `labels`, `attention_mask`) and masking behavior.
@@ -52,6 +63,70 @@ ds = ColumnMappedTextInstructionIterableDataset(
 
 sample = next(iter(ds))
 print(sample.keys())  # input_ids / labels / attention_mask (and ___PAD_TOKEN_IDS___)
+```
+
+## Configure a Training Recipe
+
+Add these dataset, dataloader, and stopping-condition settings to your instruction-tuning recipe:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset.ColumnMappedTextInstructionIterableDataset
+  path_or_dataset_id: Muennighoff/natural-instructions
+  split: train
+  column_mapping:
+    context: definition
+    question: inputs
+    answer: targets
+  answer_only_loss_mask: true
+  use_hf_chat_template: true
+  repeat_on_exhaustion: true  # Automatically restart when stream ends
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 4
+  num_workers: 4
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+
+step_scheduler:
+  max_steps: 1000
+```
+
+This configuration:
+- Streams the dataset without loading it fully into memory
+- Automatically repeats when the stream is exhausted
+- Uses multiple workers for efficient data loading
+- Applies answer-only loss masking during tokenization
+
+## Shard and Shuffle Outside a Recipe
+
+AutoModel training recipes shard iterable datasets across data-parallel ranks and apply buffer shuffling. For direct Python use, the following example starts with one rank. Set `dp_rank` and `dp_world_size` to your data-parallel group values before sharding:
+
+```python
+from transformers import AutoTokenizer
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_iterable_dataset import (
+    ColumnMappedTextInstructionIterableDataset
+)
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+dp_rank, dp_world_size, epoch_num = 0, 1, 0
+
+dataset = ColumnMappedTextInstructionIterableDataset(
+    path_or_dataset_id="Muennighoff/natural-instructions",
+    split="train",
+    column_mapping={"context": "definition", "question": "inputs", "answer": "targets"},
+    tokenizer=tokenizer,
+)
+
+# Shard the dataset across data-parallel ranks
+dataset = dataset.shard(num_shards=dp_world_size, index=dp_rank)
+
+# Enable shuffling with a buffer
+dataset = dataset.shuffle(buffer_size=10000, seed=42)
+
+# Set epoch for deterministic shuffling across epochs
+dataset.set_epoch(epoch_num)
 ```
 
 ## Delta Lake/Databricks
@@ -207,6 +282,22 @@ dataset:
 **Authentication:** The Delta Lake loader automatically picks up credentials from environment variables (`DATABRICKS_TOKEN`, `AWS_ACCESS_KEY_ID`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.) if not explicitly provided in `delta_storage_options`.
 
 </Note>
+
+## Performance Considerations
+
+**Memory and Speed Trade-Offs**:
+- Streaming reduces memory usage but might be slower than in-memory datasets
+- Network latency can impact streaming performance for remote datasets
+- Use local caching when repeatedly accessing the same remote dataset
+
+**Buffer Size for Shuffling**:
+- Larger buffers provide better randomization but use more memory
+- Choose the buffer size based on sample size and available host memory
+- For perfect shuffling, you need a buffer size equal to the dataset size (defeating the purpose of streaming)
+
+**Prefetching**:
+- With data-loader workers enabled, prefetching can overlap data loading and training
+- Tune worker and prefetch settings based on network speed, batch size, and host memory
 
 ## Common Arguments
 
