@@ -14,6 +14,7 @@
 
 import copy
 import inspect
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -83,6 +84,13 @@ def sdpa_backend():
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
+
+
+@pytest.fixture
+def fp8_backend(sdpa_backend):
+    # The FP8 recipes: TE linears under ``te_fp8``. Tests that build an indexer from it patch
+    # ``initialize_linear_module`` so they run without Transformer Engine.
+    return replace(sdpa_backend, linear="te", te_fp8={"recipe": "block"})
 
 
 def _freqs(batch: int, seq_len: int, rope_dim: int) -> torch.Tensor:
@@ -516,3 +524,144 @@ class TestGlmMoeDsaMLA:
             mla.init_weights(torch.device("cpu"), init_std=0.01)
 
         assert trunc_normal.call_count == 5
+
+
+def _plain_linear(linear_impl, in_features, out_features, bias=False, device=None, dtype=torch.bfloat16):
+    return torch.nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
+
+
+def _indexer_without_te(config, backend):
+    """Build the indexer with plain Linear stand-ins for its TE projections (the FP8 recipes set linear='te')."""
+    with patch(
+        "nemo_automodel.components.models.glm_moe_dsa.layers.initialize_linear_module", side_effect=_plain_linear
+    ):
+        return GlmMoeDsaIndexer(config, backend)
+
+
+def test_indexer_weights_proj_stays_plain_linear_with_fp32_matmul_under_fp8_recipe(config, fp8_backend):
+    # wq_b / wk follow backend.linear (FP8 under te_fp8, like the checkpoint); weights_proj never
+    # goes through the backend helper because its output picks the attended keys.
+    with patch(
+        "nemo_automodel.components.models.glm_moe_dsa.layers.initialize_linear_module", side_effect=_plain_linear
+    ) as helper:
+        indexer = GlmMoeDsaIndexer(config, fp8_backend)
+
+    assert [call.kwargs["linear_impl"] for call in helper.call_args_list] == ["te", "te"]
+    assert [call.kwargs["out_features"] for call in helper.call_args_list] == [
+        config.index_n_heads * config.index_head_dim,
+        config.index_head_dim,
+    ]
+    assert type(indexer.weights_proj) is torch.nn.Linear
+
+    indexer.weights_proj.to(torch.bfloat16)  # bf16 compute weight, as under the FSDP2 mixed-precision policy
+    x = torch.randn(6, config.hidden_size).to(torch.bfloat16)
+    weights = indexer._head_weights(x)
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(weights, x.float() @ indexer.weights_proj.weight.float().T)
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_head_weights_are_an_fp32_gemm_without_fp8_recipe_too(config, sdpa_backend, ndim):
+    # The head follows the RL trainer / SGLang in every configuration: an fp32 GEMM on the bf16 weight,
+    # not the bf16 projection lifted to fp32 that a bf16 HF model computes. Inputs are chosen so the
+    # two differ, which keeps the policy observable.
+    torch.manual_seed(11)
+    indexer = GlmMoeDsaIndexer(config, sdpa_backend)
+    indexer.weights_proj.to(torch.bfloat16)
+    shape = (64, config.hidden_size) if ndim == 2 else (2, 32, config.hidden_size)
+    x = torch.randn(shape).to(torch.bfloat16)
+    bf16_rounding = torch.nn.functional.linear(x, indexer.weights_proj.weight).float()  # HF bf16 behaviour
+    fp32_gemm = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
+    assert not torch.equal(bf16_rounding, fp32_gemm)  # these inputs make the rounding visible
+
+    weights = indexer._head_weights(x)
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(weights, fp32_gemm, rtol=0, atol=0)
+    assert not torch.equal(weights, bf16_rounding)
+
+
+@pytest.mark.parametrize("fp8_recipe", [False, True])
+@pytest.mark.parametrize("autocast_enabled", [False, True])
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_head_weights_stay_fp32_under_bf16_autocast(
+    config, sdpa_backend, fp8_backend, fp8_recipe, autocast_enabled, ndim
+):
+    # The single-rank FSDP2 path wraps the model forward in a bf16 autocast; the head projection must
+    # still be an fp32 GEMM, not a bf16 GEMM whose result is cast afterwards, with or without FP8.
+    indexer = _indexer_without_te(config, fp8_backend if fp8_recipe else sdpa_backend)
+    indexer.weights_proj.to(torch.bfloat16)
+    shape = (6, config.hidden_size) if ndim == 2 else (2, 3, config.hidden_size)
+    x = torch.randn(shape).to(torch.bfloat16)
+    oracle = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())  # autocast is off here
+
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast_enabled):
+        if autocast_enabled:
+            # Negative control: the unguarded cast-then-linear is autocast-eligible and comes back bf16.
+            unguarded = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
+            assert unguarded.dtype == torch.bfloat16
+        weights = indexer._head_weights(x)
+
+    assert weights.dtype == torch.float32
+    torch.testing.assert_close(weights, oracle, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fp8_recipe", [False, True])
+def test_dense_indexer_forward_completes_under_bf16_autocast(config, sdpa_backend, fp8_backend, fp8_recipe):
+    torch.manual_seed(3)
+    indexer = _indexer_without_te(config, fp8_backend if fp8_recipe else sdpa_backend).to(torch.bfloat16)
+    batch, seq_len = 2, 9
+    x = torch.randn(batch, seq_len, config.hidden_size).to(torch.bfloat16)
+    q_resid = torch.randn(batch, seq_len, config.q_lora_rank).to(torch.bfloat16)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = indexer(x, q_resid, _freqs(batch, seq_len, config.qk_rope_head_dim))
+
+    assert out.shape == (batch, seq_len, min(config.index_topk, seq_len))
+    assert out.dtype == torch.int64
+
+
+@pytest.mark.parametrize("fp8_recipe", [False, True])
+def test_head_weights_keep_installed_lora_adapter(config, sdpa_backend, fp8_backend, fp8_recipe):
+    # LoRA patches ``weights_proj`` in place (it matches the default ``*_proj`` target); the head
+    # weights must include the adapter update instead of reading only the base weight.
+    from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+    from nemo_automodel.shared.peft_config import PeftConfig
+
+    torch.manual_seed(5)
+    backend = fp8_backend if fp8_recipe else sdpa_backend
+    indexer = _indexer_without_te(config, backend)
+    control = _indexer_without_te(config, backend)
+    control.load_state_dict(indexer.state_dict())
+    matched = apply_lora_to_linear_modules(
+        indexer,
+        PeftConfig(target_modules=["weights_proj"], dim=1, alpha=1, use_triton=False, use_memory_efficient_lora=False),
+    )
+    assert matched == 1
+    assert type(indexer.weights_proj) is not torch.nn.Linear
+    with torch.no_grad():
+        indexer.weights_proj.weight.zero_()
+        indexer.weights_proj.lora_A.weight.fill_(1.0)
+        indexer.weights_proj.lora_B.weight.fill_(1.0)
+
+    x = torch.ones(6, config.hidden_size)
+    adapted = indexer._head_weights(x)
+    assert adapted.dtype == torch.float32
+    # Zero base weight + rank-one all-ones adapter at scale alpha/dim = 1: every head sums the input.
+    torch.testing.assert_close(adapted, torch.full((6, config.index_n_heads), float(config.hidden_size)))
+    with torch.no_grad():
+        indexer.weights_proj.lora_B.weight.mul_(2.0)
+    torch.testing.assert_close(
+        indexer._head_weights(x), torch.full((6, config.index_n_heads), 2.0 * config.hidden_size)
+    )
+
+    # Unadapted control: the fp32 GEMM on the stored weight, with or without the FP8 recipe.
+    torch.testing.assert_close(control._head_weights(x), x @ control.weights_proj.weight.float().T)
+
+    # The adapted dense indexer still runs end to end.
+    batch, seq_len = 2, 5
+    out = indexer(
+        torch.randn(batch, seq_len, config.hidden_size),
+        torch.randn(batch, seq_len, config.q_lora_rank),
+        _freqs(batch, seq_len, config.qk_rope_head_dim),
+    )
+    assert out.shape == (batch, seq_len, min(config.index_topk, seq_len))
