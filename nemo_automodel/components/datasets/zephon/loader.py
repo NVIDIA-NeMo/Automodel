@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from collections.abc import Callable, Generator, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -128,7 +128,7 @@ class ZephonDataLoader(Iterator[TrainingBatch]):
         self._output_format = output_format
         self._packing_contract = packing_contract
         self._component_tokens: Counter[int] = Counter()
-        self._iterator: Generator[SampleBatch, None, None] | None = None
+        self._iterator: Iterator[SampleBatch] | None = None
         self._closed = False
         self._exhausted = False
 
@@ -177,16 +177,11 @@ class ZephonDataLoader(Iterator[TrainingBatch]):
                 {key: count / total for key, count in self._component_tokens.items()},
             )
         self._closed = True
-        iterator, self._iterator = self._iterator, None
         try:
-            if iterator is not None:
-                iterator.close()
+            # Keep the active iterator alive until Zephon finishes its cleanup.
+            self._pipeline.close()
         finally:
-            # Fresh DCP templates do not start a runtime. Release any additional
-            # pipeline-owned checkpoint runtime when its public cleanup API is available.
-            close_pipeline = getattr(self._pipeline, "close", None)
-            if close_pipeline is not None:
-                close_pipeline()
+            self._iterator = None
 
     def state_dict_template(self) -> dict[str, bytes]:
         """Describe DCP keys without starting a fresh pipeline or calibrating it."""
