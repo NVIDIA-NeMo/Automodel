@@ -156,3 +156,22 @@ def test_cudnn_attention_forward_backward(padding: bool, lora: bool, monkeypatch
     if padding:
         assert torch.count_nonzero(actual[~valid]) == 0
         assert torch.count_nonzero(x.grad[~valid]) == 0
+
+
+def test_cudnn_empty_shard_with_transposed_output_gradient() -> None:
+    """An empty CP shard must accept the head-major gradient from V expansion."""
+    torch.manual_seed(4645)
+    query = torch.randn(64, 96, 576, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    latent = torch.randn(64, 1, 576, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    indices = torch.full((64, 1, 64), -1, device="cuda", dtype=torch.int32)
+    lengths = torch.zeros(64, device="cuda", dtype=torch.int32)
+    valid_rows = torch.empty(0, device="cuda", dtype=torch.int64)
+    output = shared_cudnn.cudnn_sparse_attention(
+        query, latent, indices, 192**-0.5, topk_length=lengths, valid_row_indices=valid_rows
+    )
+    upstream = torch.randn(96, 64, 512, device="cuda", dtype=torch.bfloat16).transpose(0, 1)
+    assert not upstream.is_contiguous()
+    output.backward(upstream)
+    assert torch.count_nonzero(output) == 0
+    assert torch.count_nonzero(query.grad) == 0
+    assert torch.count_nonzero(latent.grad) == 0

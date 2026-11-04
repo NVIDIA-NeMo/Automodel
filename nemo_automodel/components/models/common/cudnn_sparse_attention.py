@@ -311,7 +311,9 @@ class _CudnnSparseAttention(torch.autograd.Function):
                 used_dummy = True
                 q_input = torch.zeros_like(q[:1])
                 out_input = torch.zeros_like(out[:1])
-                grad_input = torch.zeros_like(grad_output[:1])
+                # zeros_like preserves a head-major gradient's ambiguous size-one stride;
+                # cuDNN's CuTe conversion requires a canonical contiguous dummy layout.
+                grad_input = grad_output.new_zeros((1, *grad_output.shape[1:]))
                 lse_input = torch.zeros_like(lse[:1])
                 indices_kernel = torch.zeros_like(indices[:1])
                 topk_length_kernel = torch.ones_like(topk_length[:1])
