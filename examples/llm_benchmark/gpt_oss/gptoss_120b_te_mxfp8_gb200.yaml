@@ -142,5 +142,3 @@ ci:
   nodes: 8
   cluster_tag: gb200
   ep_size: 16
-  perf_testing:
-    schedule: nightly

@@ -222,5 +222,3 @@ ci:
   env_vars:
     # Keep each EP32 group within one NVLink block: 8 nodes x 4 GPUs.
     SBATCH_SEGMENT_SIZE: "8"
-  perf_testing:
-    schedule: weekly
