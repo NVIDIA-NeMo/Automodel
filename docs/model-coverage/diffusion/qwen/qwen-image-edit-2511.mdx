@@ -41,7 +41,7 @@ To try another checked-in recipe for this model, use the [`generate_qwen_image_e
 
 ## Single-GPU LoRA
 
-The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow_lora.yaml) uses BF16, rank 8, batch size 1, activation checkpointing, and single-rank DDP without FSDP. The 256p setup was validated on a GPU with 48 GiB of memory; 24 GiB cards and editing quality have not been validated.
+The [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow_lora.yaml) uses BF16, rank 8, batch size 1, activation checkpointing, and single-rank Distributed Data Parallel (DDP) without FSDP. The 256p setup was validated on a GPU with 48 GiB of memory; 24 GiB GPUs and editing quality have not been validated.
 
 ### Prepare the Cache
 
