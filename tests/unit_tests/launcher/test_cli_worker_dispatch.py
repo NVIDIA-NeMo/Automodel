@@ -38,27 +38,41 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.mark.parametrize("launcher", ["interactive", "interactive_explicit", "external", "skypilot", "nemo_run"])
 @pytest.mark.parametrize("recipe_form", ["string", "target"])
+@pytest.mark.parametrize("recipe_kind", ["training", "benchmark"])
 def test_launcher_command_executes_recipe(
-    launcher: str, recipe_form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    launcher: str, recipe_form: str, recipe_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A recipe module without a main block reproduces the speculative recipe contract.
     # Only model work and process/job submission are replaced. CLI parsing, recipe
     # resolution, config packaging and worker dispatch run their production code.
     module_name = "launcher_dispatch_probe"
     recipe_file = tmp_path / f"{module_name}.py"
+    base_import = ""
+    base_class = "object"
+    entry_method = "run_train_validation_loop"
+    event = "train"
+    if recipe_kind == "benchmark":
+        # Retain the real benchmark class's CLI entry contract, replacing only
+        # model setup and the GPU benchmark body.
+        base_import = "from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction\n"
+        base_class = "BenchmarkingRecipeForNextTokenPrediction"
+        entry_method = "run_benchmark"
+        event = "benchmark"
     recipe_file.write_text(
         "import json\n"
         "from pathlib import Path\n"
-        "class ProbeRecipe:\n"
+        f"{base_import}"
+        f"class ProbeRecipe({base_class}):\n"
         "    def __init__(self, config):\n"
+        "        self.partial_cuda_graph_manager = None\n"
         "        self.events = Path(config.get('events'))\n"
         "        self.events.write_text('init\\n')\n"
         "        observed = {key: config.get(key) for key in ('label', 'lr', 'restore_path')}\n"
         "        Path(config.get('observed')).write_text(json.dumps(observed))\n"
         "    def setup(self):\n"
         "        with self.events.open('a') as stream: stream.write('setup\\n')\n"
-        "    def run_train_validation_loop(self):\n"
-        "        with self.events.open('a') as stream: stream.write('train\\n')\n"
+        f"    def {entry_method}(self):\n"
+        f"        with self.events.open('a') as stream: stream.write('{event}\\n')\n"
         "        return 0\n"
     )
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -148,9 +162,10 @@ def test_launcher_command_executes_recipe(
     if launcher == "external":
         monkeypatch.setenv("LOCAL_RANK", "0")
         monkeypatch.setenv("TORCHELASTIC_RUN_ID", "external-torchrun")
-    assert app.main() == 0
+    expected_result = None if recipe_kind == "benchmark" and launcher == "external" else 0
+    assert app.main() == expected_result
     assert events.exists(), "The selected worker exited without constructing the recipe"
-    assert events.read_text().splitlines() == ["init", "setup", "train"]
+    assert events.read_text().splitlines() == ["init", "setup", event]
     assert json.loads(observed.read_text()) == {
         "label": overrides[1],
         "lr": 0.25,
