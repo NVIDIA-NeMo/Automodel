@@ -19,7 +19,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
-from nemo_automodel.components.models.kimi_k3.config import KimiK3Config
+from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK31Config
 from nemo_automodel.components.models.kimi_k3.cp import shard_batch_for_kimi_vlm_cp
 from nemo_automodel.components.models.kimi_k3.model import KimiK3ForCausalLM
 from nemo_automodel.components.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
@@ -493,6 +493,25 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                     module.reset_parameters()
                 elif isinstance(module, Rope2DPosEmbRepeated):
                     module.reset_parameters()
+
+
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    """Kimi K3.1 vision-language model: Kimi K3 with gated DSA on the full-attention layers.
+
+    The architecture differs from Kimi K3 only through ``text_config.dsa_config``, which
+    :class:`~nemo_automodel.components.models.kimi_k3.model.KimiMLAAttention` reads to attach
+    a sparse-attention indexer to the listed layers.
+    """
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        **kwargs: Any,
+    ) -> "KimiK31ForConditionalGeneration":
+        config = KimiK31Config.from_pretrained(pretrained_model_name_or_path)
+        return cls.from_config(config, *model_args, **kwargs)
 
 
 ModelClass = KimiK3ForConditionalGeneration

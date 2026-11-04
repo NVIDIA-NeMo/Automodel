@@ -145,6 +145,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.kimi_k3.model", "KimiK3ForCausalLM"),
         ),
         (
+            "KimiK31ForConditionalGeneration",
+            ("nemo_automodel.components.models.kimi_k3.multimodal", "KimiK31ForConditionalGeneration"),
+        ),
+        (
             "KimiVLForConditionalGeneration",
             ("nemo_automodel.components.models.kimivl.model", "KimiVLForConditionalGeneration"),
         ),
@@ -436,6 +440,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3Config"),
+    "kimi_k31": ("nemo_automodel.components.models.kimi_k3.config", "KimiK31Config"),
     "kimi_linear": ("nemo_automodel.components.models.kimi_k3.config", "KimiK3TextConfig"),
     "kimi_linear_48b_a3b": ("nemo_automodel.components.models.kimi_linear.config", "KimiLinear48BConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
@@ -485,6 +490,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 # Checkpoint model_type to local image/text processor implementation.
 _CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
     "kimi_k3": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
+    "kimi_k31": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
     "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
 }
 

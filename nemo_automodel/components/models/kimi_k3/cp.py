@@ -297,6 +297,33 @@ def all_gather_sequence(tensor: torch.Tensor, cp_group: Any, *, dim: int = 1) ->
     return _AllGatherSequence.apply(tensor, cp_group, dim)
 
 
+def document_causal_allowed(
+    q_doc_ids: torch.Tensor,
+    kv_doc_ids: torch.Tensor,
+    *,
+    q_global_start: int,
+) -> torch.Tensor:
+    """Mark the keys each query may attend to: causal and within its own document.
+
+    Args:
+        q_doc_ids: Tensor of shape [batch, query_sequence] with 1-based document ids.
+        kv_doc_ids: Tensor of shape [batch, key_sequence] with 1-based document ids.
+        q_global_start: Global sequence offset of the first query token.
+
+    Returns:
+        Boolean tensor of shape [batch, query_sequence, key_sequence], true where attention is allowed.
+    """
+    device = q_doc_ids.device
+    q_positions = torch.arange(q_doc_ids.shape[1], device=device) + q_global_start
+    kv_positions = torch.arange(kv_doc_ids.shape[1], device=device)
+    allowed = kv_positions[None, :] <= q_positions[:, None]
+    allowed = allowed[None, :, :] & (q_doc_ids[:, :, None] == kv_doc_ids[:, None, :]) & (kv_doc_ids[:, None, :] > 0)
+    # A padding query has no document to attend to; let it read position 0 so the
+    # softmax stays finite. Its output is discarded by the loss mask.
+    is_padding_query = (q_doc_ids <= _PAD_DOC_ID)[:, :, None]
+    return torch.where(is_padding_query, kv_positions[None, None, :] == 0, allowed)
+
+
 def build_document_causal_mask(
     q_doc_ids: torch.Tensor,
     kv_doc_ids: torch.Tensor,
@@ -315,17 +342,9 @@ def build_document_causal_mask(
     Returns:
         Additive mask tensor of shape [batch, 1, query_sequence, key_sequence].
     """
-    device = q_doc_ids.device
-    q_positions = torch.arange(q_doc_ids.shape[1], device=device) + q_global_start
-    kv_positions = torch.arange(kv_doc_ids.shape[1], device=device)
-    allowed = kv_positions[None, :] <= q_positions[:, None]
-    allowed = allowed[None, :, :] & (q_doc_ids[:, :, None] == kv_doc_ids[:, None, :]) & (kv_doc_ids[:, None, :] > 0)
-    # A padding query has no document to attend to; let it read position 0 so the
-    # softmax stays finite. Its output is discarded by the loss mask.
-    is_padding_query = (q_doc_ids <= _PAD_DOC_ID)[:, :, None]
-    allowed = torch.where(is_padding_query, kv_positions[None, None, :] == 0, allowed)
+    allowed = document_causal_allowed(q_doc_ids, kv_doc_ids, q_global_start=q_global_start)
     min_value = torch.finfo(dtype).min
-    return torch.zeros(allowed.shape, dtype=dtype, device=device).masked_fill_(~allowed, min_value).unsqueeze(1)
+    return torch.zeros(allowed.shape, dtype=dtype, device=allowed.device).masked_fill_(~allowed, min_value).unsqueeze(1)
 
 
 def _document_causal_block_mask(
@@ -372,6 +391,42 @@ def _document_causal_block_mask(
         device=q_doc_ids.device,
     )
     return block_mask
+
+
+def sparse_keep_block_mask(keep: torch.Tensor) -> BlockMask:
+    """Build a FlexAttention mask from a dense DSA keep-mask.
+
+    Args:
+        keep: Boolean tensor of shape [batch, query_sequence, key_sequence], true where a query
+            attends. It already folds in the causal and document constraints.
+
+    Returns:
+        BlockMask for local queries against global keys that reads ``keep`` directly.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+        """Look up one (query, key) pair of ``keep``.
+
+        Args:
+            batch_idx: Scalar tensor indexing the batch axis.
+            head_idx: Scalar tensor indexing the head axis (the mask is head independent).
+            q_idx: Scalar tensor indexing the local query axis.
+            kv_idx: Scalar tensor indexing the global key axis.
+
+        Returns:
+            Scalar boolean tensor, true where the query attends to the key.
+        """
+        return keep[batch_idx, q_idx, kv_idx]
+
+    return create_block_mask(
+        mask_mod,
+        B=keep.shape[0],
+        H=None,
+        Q_LEN=keep.shape[1],
+        KV_LEN=keep.shape[2],
+        device=keep.device,
+    )
 
 
 _COMPILED_FLEX_ATTENTION: list[Any] = [None]
