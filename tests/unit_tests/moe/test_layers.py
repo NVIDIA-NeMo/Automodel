@@ -1404,18 +1404,26 @@ class TestMoE:
     def test_moe_forwards_dispatcher_config_to_experts(self, moe_config, backend_config):
         """MoE should pass BackendConfig dispatcher knobs to flex dispatcher experts."""
         backend_config.experts = "torch_mm"
-        backend_config.dispatcher = "deepep"
+        backend_config.dispatcher = "hybridep"
         backend_config.dispatcher_num_sms = 12
         backend_config.dispatcher_share_token_dispatcher = False
         backend_config.dispatcher_async_dispatch = True
+        backend_config.dispatcher_hybridep_permute_fusion = True
+        backend_config.dispatcher_hybridep_num_sms_preprocessing = 132
+        backend_config.dispatcher_hybridep_num_blocks_permute = 112
+        backend_config.dispatcher_hybridep_num_blocks_unpermute = 111
         with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
             moe = MoE(moe_config, backend_config)
 
         assert isinstance(moe.experts, GroupedExpertsDeepEP)
-        assert moe.experts.dispatcher_backend == "deepep"
+        assert moe.experts.dispatcher_backend == "hybridep"
         assert moe.experts.dispatcher_num_sms == 12
         assert moe.experts.dispatcher_share_token_dispatcher is False
         assert moe.experts.dispatcher_async_dispatch is True
+        assert moe.experts.dispatcher_hybridep_permute_fusion is True
+        assert moe.experts.dispatcher_hybridep_num_sms_preprocessing == 132
+        assert moe.experts.dispatcher_hybridep_num_blocks_permute == 112
+        assert moe.experts.dispatcher_hybridep_num_blocks_unpermute == 111
 
     def test_moe_init_with_shared_experts(self, moe_config, backend_config):
         """Test MoE initialization with shared experts."""
@@ -1876,3 +1884,67 @@ class TestApplyBiasNotCompiled:
 
         # torch.compile wraps functions in OptimizedModule or similar
         assert not hasattr(_apply_bias, "_torchdynamo_orig_callable"), "_apply_bias should not be torch.compiled"
+
+
+class TestSigmoidGateScoringPrecision:
+    """Sigmoid routing must score in fp32 by default, like the softmax path.
+
+    HF sigmoid-router references compute ``sigmoid(logits.float())``; scoring in
+    bf16 quantizes scores at ~2e-3, which flips knife-edge selections against
+    fine-grained ``e_score_correction_bias`` lattices (AMINT-286).
+    """
+
+    def _sigmoid_config(self):
+        return MoEConfig(
+            n_routed_experts=16,
+            n_shared_experts=0,
+            n_activated_experts=4,
+            n_expert_groups=0,
+            n_limited_groups=0,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            aux_loss_coeff=0.0,
+            score_func="sigmoid",
+            route_scale=1.0,
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=128,
+            norm_topk_prob=True,
+            router_bias=False,
+            expert_bias=False,
+            expert_activation="swiglu",
+            force_e_score_correction_bias=True,
+            dtype=torch.bfloat16,
+        )
+
+    def test_sigmoid_scoring_matches_fp32_reference_on_bf16_inputs(self):
+        torch.manual_seed(0)
+        config = self._sigmoid_config()
+        gate = Gate(config)
+        with torch.no_grad():
+            gate.weight.copy_(torch.randn_like(gate.weight) * 0.05)
+            # Knife-edge lattice bias like the MiniMax-M2.7 / GLM-4.7 checkpoints:
+            # large magnitude, 1e-3 spacing.
+            gate.e_score_correction_bias.copy_(8.0 + torch.arange(config.n_routed_experts, dtype=torch.float32) * 1e-3)
+        gate.eval()
+
+        # x: Tensor of shape [tokens, hidden] in bf16, like real routed inputs.
+        x = torch.randn(512, config.dim, dtype=torch.bfloat16)
+        token_mask = torch.ones(x.shape[0], dtype=torch.bool)
+        weights, indices, _aux = gate(x, token_mask, None)
+
+        # fp32 reference: the bf16 gate matmul followed by fp32 sigmoid,
+        # bias-augmented selection, and fp32 top-k normalization.
+        scores_bf16 = F.linear(x, gate.weight.to(x.dtype))
+        ref_scores = torch.sigmoid(scores_bf16.float())
+        choice = ref_scores + gate.e_score_correction_bias
+        ref_indices = torch.topk(choice, config.n_activated_experts, dim=-1)[1]
+
+        assert torch.equal(indices.sort(dim=-1).values, ref_indices.sort(dim=-1).values)
+
+        ref_weights = ref_scores.gather(1, indices)
+        ref_weights = ref_weights / (ref_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        # The gate casts final weights back to the input dtype, mirroring the
+        # HF reference's top_k_weights.to(router_logits.dtype).
+        assert weights.dtype == x.dtype
+        assert torch.equal(weights, ref_weights.to(x.dtype))

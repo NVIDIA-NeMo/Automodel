@@ -21,6 +21,7 @@ and GlmMoeDsaMLA which integrates the indexer with Multi-head Latent Attention.
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 # Try to import fast_hadamard_transform, fall back to torch implementation
@@ -72,6 +73,9 @@ from nemo_automodel.components.models.common import (
 from nemo_automodel.components.models.deepseek_v3.rope_utils import apply_rotary_emb
 from nemo_automodel.components.models.glm_moe_dsa.cp import glm_dsa_cp_all_gather, glm_dsa_cp_enabled
 from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import (
+    cudnn_indexer_topk,
+    cudnn_sparse_attention,
+    is_cudnn_dsa_available,
     is_dsa_kernel_available,
     should_use_tilelang,
     tilelang_indexer_topk,
@@ -82,15 +86,15 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 def _dsa_kernel_backend(backend: BackendConfig) -> str:
-    """Resolve the DSA kernel path: TileLang sparse kernels or the dense torch path."""
-    return "tilelang" if backend.attn == "tilelang" else "torch"
+    """Resolve the DSA kernel path from the configured attention backend."""
+    return backend.attn if backend.attn in ("tilelang", "cudnn") else "torch"
 
 
 def _apply_index_rope_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_format: str) -> torch.Tensor:
     """Apply NON-interleaved (half-split) RoPE to the indexer's rope slice.
 
-    The DSA indexer uses half-split RoPE (``rotate_half``: pair dim ``j`` with ``j + d/2``),
-    unlike the main MLA attention which uses interleaved RoPE. ``freqs_cis`` is the same
+    Legacy DSA indexers use half-split RoPE (``rotate_half``: pair dim ``j`` with ``j + d/2``),
+    unlike checkpoints that request interleaved indexer RoPE. ``freqs_cis`` is the same
     complex tensor used by the MLA (``exp(i * theta_j * pos)`` for ``j in [0, d/2)``); we read
     its real/imag parts as cos/sin so the angles match exactly.
 
@@ -175,6 +179,9 @@ class GlmMoeDsaIndexer(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.hidden_size = config.hidden_size
         self.softmax_scale = self.head_dim**-0.5
+        self.rope_interleave = getattr(config, "indexer_rope_interleave", False)
+        if not isinstance(self.rope_interleave, bool):
+            raise ValueError("indexer_rope_interleave must be boolean")
 
         self.backend = backend
         linear_impl = backend.linear
@@ -201,14 +208,36 @@ class GlmMoeDsaIndexer(nn.Module):
         # LayerNorm for K (official uses LayerNorm, not RMSNorm). eps=1e-6 matches the reference / HF.
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype)
 
-        # Per-head weight projection from hidden states
-        self.weights_proj = initialize_linear_module(
-            linear_impl=linear_impl,
-            in_features=self.hidden_size,
-            out_features=self.num_heads,
-            bias=False,
-            dtype=dtype,
-        )
+        # Per-head weight projection from hidden states. Always a plain torch Linear whose GEMM runs in
+        # fp32 (see ``_head_weights``): its output drives top-k key selection, so it never runs through
+        # the FP8 GEMM that ``backend.linear='te'`` would pick for it, and it follows the GLM-5.3 RL
+        # trainer / SGLang precision in every configuration.
+        self.weights_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False, dtype=dtype)
+
+    def _head_weights(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-head indexer weights in fp32.
+
+        The projection follows the GLM-5.3 RL trainer / SGLang: one fp32 GEMM on the resident (bf16)
+        weight, in every configuration. HF Transformers lists ``indexer.weights_proj`` in
+        ``_keep_in_fp32_modules`` but enforces it only for fp16 loads, so a bf16 HF model rounds the
+        projection to bf16; that rounding is deliberately not reproduced (it only moves near-tied keys).
+        The GEMM runs with autocast disabled: ``F.linear`` is autocast-eligible, so casting the operands
+        alone would still produce bf16 under a bf16 autocast wrapper, and the dense scorer's
+        autocast-disabled head reduction needs fp32 operands. An installed adapter (LoRA/DoRA, possibly
+        with dropout) overrides ``forward``; it is always called so its update, dropout and magnitude
+        semantics are kept, and its output is lifted to fp32.
+
+        Args:
+            x: Hidden states of shape ``[tokens, hidden]`` (THD) or ``[batch, sequence, hidden]``.
+
+        Returns:
+            fp32 tensor of shape ``x.shape[:-1] + [index_n_heads]``.
+        """
+        proj = self.weights_proj
+        if type(proj).forward is nn.Linear.forward:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                return F.linear(x.float(), proj.weight.float())
+        return proj(x).float()
 
     def forward(
         self,
@@ -221,14 +250,25 @@ class GlmMoeDsaIndexer(nn.Module):
         """Compute top-k indices for sparse attention.
 
         Args:
-            x: Hidden states [B, S, hidden] or [T, hidden] for thd format
-            q_resid: Q lora residual from MLA [B, S, q_lora_rank] or [T, q_lora_rank]
-            freqs_cis: RoPE frequencies
-            attention_mask: Optional attention mask
-            **attn_kwargs: Additional attention kwargs (cu_seqlens, etc.)
+            x: Hidden-state tensor of shape ``[batch, sequence, hidden]`` for BSHD or
+                ``[tokens, hidden]`` for packed THD.
+            q_resid: Query-LoRA residual tensor of shape ``[batch, sequence, q_lora_rank]``
+                for BSHD or ``[tokens, q_lora_rank]`` for packed THD.
+            freqs_cis: Complex RoPE tensor of shape ``[batch, sequence, rope_head_dim / 2]``
+                for BSHD or ``[tokens, rope_head_dim / 2]`` for packed THD.
+            attention_mask: Optional key mask tensor of shape ``[batch, sequence]`` or
+                additive attention tensor of shape ``[batch, 1, sequence, sequence]``.
+            **attn_kwargs: Attention metadata. Optimized packed backends require an int32
+                ``cu_seqlens`` tensor of shape ``[sequences + 1]``. Packed CP may also
+                supply ``glm_dsa_cp_query_indices`` of shape ``[tokens]`` and
+                ``cu_seqlens_padded`` of shape ``[sequences + 1]``. The cuDNN backend
+                requires CUDA bfloat16 query/key tensors.
 
         Returns:
-            topk_indices: Indices of top-k positions [B, S, topk] or [T, topk]
+            Top-k index tensor. The optimized packed backends return contiguous int32
+            ``[tokens, 1, index_topk]`` with a fixed top-k width. The dense path returns
+            ``[batch, sequence, min(index_topk, sequence)]`` for BSHD or
+            ``[tokens, min(index_topk, tokens)]`` for THD.
         """
         if len(x.shape) == 2:
             qkv_format = "thd"
@@ -256,25 +296,62 @@ class GlmMoeDsaIndexer(nn.Module):
         # Split K into pe and nope parts (rope slice first, matching Q)
         k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
 
-        # Apply NON-interleaved (half-split) RoPE to the pe parts. The indexer uses half-split
-        # RoPE (matching the DSA reference / HF), unlike the interleaved RoPE of the MLA path.
-        q_pe = _apply_index_rope_half_split(q_pe, freqs_cis, qkv_format)
-        k_pe = _apply_index_rope_half_split(k_pe, freqs_cis, qkv_format)
+        # Honor the checkpoint's indexer layout independently of the MLA path.
+        # Missing/false flags preserve the legacy half-split rotation.
+        if self.rope_interleave:
+            q_pe = apply_rotary_emb(q_pe, freqs_cis, qkv_format)
+            k_pe = apply_rotary_emb(k_pe.unsqueeze(-2), freqs_cis, qkv_format).squeeze(-2)
+        else:
+            q_pe = _apply_index_rope_half_split(q_pe, freqs_cis, qkv_format)
+            k_pe = _apply_index_rope_half_split(k_pe, freqs_cis, qkv_format)
 
         # Combine pe and nope parts (rope slice first, matching the reference layout)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
         cp_group = attn_kwargs.get("_glm_dsa_cp_group")
         cp_enabled = glm_dsa_cp_enabled(cp_group)
+        dsa_backend = _dsa_kernel_backend(self.backend)
         if cp_enabled:
             if qkv_format != "thd":
                 raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
             k = glm_dsa_cp_all_gather(k, dim=0, cp_group=cp_group)
 
+        if dsa_backend == "cudnn":
+            if qkv_format != "thd":
+                raise ValueError(
+                    "cuDNN DSA indexer requires THD/packed sequences (qkv_format='thd'); "
+                    f"got '{qkv_format}'. Use backend.attn in {{te, sdpa}} for the BSHD dense path."
+                )
+            cu_seqlens = attn_kwargs.get("cu_seqlens")
+            if cu_seqlens is None:
+                raise ValueError("cuDNN DSA indexer requires 'cu_seqlens' in attn_kwargs (THD packing metadata).")
+            if not is_cudnn_dsa_available():
+                raise RuntimeError(
+                    "backend.attn='cudnn' requires the optional cuDNN DSA and FlashMLA kernels, "
+                    "but they are unavailable in this environment."
+                )
+            # Preserve the reference scaling in FP32. The cuDNN adapter owns the final bf16 cast and
+            # intentionally applies no additional scale to these per-head weights.
+            head_weights = self._head_weights(x) * (self.num_heads**-0.5) * self.softmax_scale
+            return cudnn_indexer_topk(
+                q.contiguous(),
+                k.contiguous(),
+                head_weights.contiguous(),
+                cu_seqlens.flatten().to(torch.int32),
+                self.index_topk,
+                query_indices=attn_kwargs.get("glm_dsa_cp_query_indices"),
+                cu_seqlens_padded=(
+                    attn_kwargs["cu_seqlens_padded"].flatten().to(torch.int32)
+                    if "cu_seqlens_padded" in attn_kwargs
+                    else None
+                ),
+                packed_metadata=attn_kwargs.get("_cudnn_dsa_packed_metadata"),
+            )
+
         # TileLang sparse path (opt-in via backend.attn == "tilelang"): the fused lighting-indexer
         # kernel computes logits + top-k directly, avoiding the dense [T, T_kv] score tensor. THD only.
-        if should_use_tilelang(
-            _dsa_kernel_backend(self.backend),
+        if dsa_backend == "tilelang" and should_use_tilelang(
+            dsa_backend,
             available=is_dsa_kernel_available("indexer"),
             kernel_name="indexer",
             tensors=(q, k),
@@ -290,7 +367,7 @@ class GlmMoeDsaIndexer(nn.Module):
                 raise ValueError("TileLang DSA indexer requires 'cu_seqlens' in attn_kwargs (THD packing metadata).")
             # Fold the index softmax_scale (head_dim ** -0.5) into the per-head weight: the kernel
             # computes relu(q·k) * w with no internal scale, and relu(s*x) == s*relu(x) for s > 0.
-            head_weights = self.weights_proj(x).float() * (self.num_heads**-0.5) * self.softmax_scale
+            head_weights = self._head_weights(x) * (self.num_heads**-0.5) * self.softmax_scale
             return tilelang_indexer_topk(
                 q.contiguous(),
                 k.contiguous(),
@@ -306,7 +383,9 @@ class GlmMoeDsaIndexer(nn.Module):
             )
 
         if cp_enabled:
-            raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
+            raise NotImplementedError(
+                "GLM DSA context parallelism is implemented only for backend.attn in {'tilelang', 'cudnn'}."
+            )
 
         # NOTE: the reference Indexer applies a Hadamard rotation (`rotate_activation`) only as part
         # of its FP8 scoring kernel. The Hadamard transform is orthogonal, so it leaves the q·k index
@@ -317,21 +396,26 @@ class GlmMoeDsaIndexer(nn.Module):
         # (n_heads ** -0.5) factor goes here and softmax_scale is applied to the q·k scores
         # below (relu(scale * x) == scale * relu(x)), then the head reduction is a matmul.
         # weights: [B, S, H] or [T, H]
-        weights = self.weights_proj(x).float() * (self.num_heads**-0.5)
+        weights = self._head_weights(x) * (self.num_heads**-0.5)
 
         # Per-head q·k scores with K kept single-head (no expand-to-heads), mirroring HF so the
         # index scores — and therefore the top-k selection — track the reference as closely as
         # floating point allows.
-        if qkv_format == "thd":
-            # q: [T, H, D], k: [T, D]  ->  [T, H, T]
-            scores = torch.matmul(q.float(), k.float().transpose(-1, -2))
-        else:
-            # q: [B, S, H, D], k: [B, S, D]  ->  [B, S, H, T]
-            scores = torch.matmul(q.float(), k.float().transpose(-1, -2).unsqueeze(1))
-        scores = torch.relu(scores * self.softmax_scale)
+        # Combine the query and head axes so all queries share one GEMM per batch,
+        # avoiding a batch of small [H, D] @ [D, T] products. Restore the reference
+        # [B, S, H, T] (or packed [T, H, T]) layout before reducing over heads.
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            scores = torch.matmul(q.float().flatten(-3, -2), k.float().transpose(-1, -2))
+        scores = scores.unflatten(-2, (seq_len, self.num_heads))
+        # The GEMM result is newly owned; keep the reference operation order while
+        # reusing its storage instead of creating two full FP32 score copies.
+        # Scale before ReLU: ReLU's backward saves its output, so a later in-place
+        # scaling would invalidate that saved tensor if scores receive a gradient.
+        scores = scores.mul_(self.softmax_scale).relu_()
 
         # Head-weighted sum via matmul: weights[..., 1, H] @ scores[..., H, T] -> [..., 1, T].
-        scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
 
         # Apply attention mask if provided. Convert a {0,1} keep-mask to an additive key mask
         # (kept -> 0, padding -> finfo.min) so padding keys are excluded from the top-k selection,
@@ -419,7 +503,14 @@ class GlmMoeDsaMLA(nn.Module):
             bias=False,
             dtype=dtype,
         )
-        self.q_a_layernorm = initialize_rms_norm_module(rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, dtype=dtype)
+        # Upstream GLM fixes the MLA latent RMSNorms at 1e-6 independently of
+        # the model-wide rms_norm_eps=1e-5 used by the decoder block norms.
+        self.q_a_layernorm = initialize_rms_norm_module(
+            rms_norm_impl=rms_norm_impl,
+            dim=self.q_lora_rank,
+            eps=1e-6,
+            dtype=dtype,
+        )
         self.q_b_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.q_lora_rank,
@@ -436,7 +527,10 @@ class GlmMoeDsaMLA(nn.Module):
             dtype=dtype,
         )
         self.kv_a_layernorm = initialize_rms_norm_module(
-            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, dtype=dtype
+            rms_norm_impl=rms_norm_impl,
+            dim=self.kv_lora_rank,
+            eps=1e-6,
+            dtype=dtype,
         )
         self.kv_b_proj = initialize_linear_module(
             linear_impl=linear_impl,
@@ -456,9 +550,9 @@ class GlmMoeDsaMLA(nn.Module):
         # states and must use the identical (YaRN-corrected) attention temperature.
         self.softmax_scale = mla_softmax_scale(config, self.qk_head_dim)
 
-        if attn_impl == "tilelang":
-            # The TileLang sparse path runs the SparseMLA kernel directly in forward; it never uses
-            # the dense attention module, and initialize_attn_module_and_func does not implement it.
+        if attn_impl in ("tilelang", "cudnn"):
+            # Optimized DSA paths run their sparse kernel directly in forward; neither uses the
+            # generic dense attention module, which does not implement these backend names.
             self.attn_module, self.attn_func = None, None
         else:
             self.attn_module, self.attn_func = initialize_attn_module_and_func(
@@ -494,13 +588,15 @@ class GlmMoeDsaMLA(nn.Module):
         `torch.full(..., finfo.min).scatter_(-1, topk_indices, 0)`
 
         Args:
-            topk_indices: Indices of top-k positions [B, S, topk] or [T, topk]
+            topk_indices: Integer tensor of shape [batch, sequence, top_k] or
+                [tokens, top_k] for packed THD inputs.
             seq_len: Sequence length
             qkv_format: 'bshd' or 'thd'
             bsz: Batch size (only used for bshd format)
             n_heads: Number of attention heads to expand to
             dtype: Data type for the output tensor
-            attention_mask: Optional attention mask to combine with (for SDPA)
+            attention_mask: Optional key keep mask of shape [batch, sequence],
+                or additive mask broadcastable to [batch, heads, sequence, sequence].
             union_across_batches: If True, union top-k across batches (for TE);
                                   if False, keep per-batch masks (for SDPA)
 
@@ -516,38 +612,27 @@ class GlmMoeDsaMLA(nn.Module):
         # TE's core_attention_bias tolerates -inf, which is why only the SDPA path was affected.
         neg = torch.finfo(dtype).min
 
+        num_tokens = topk_indices.shape[0] if qkv_format == "thd" else seq_len
+        mask_shape = (num_tokens, num_tokens) if qkv_format == "thd" else (bsz, seq_len, seq_len)
+        sparse_mask = torch.full(mask_shape, neg, device=device, dtype=dtype).scatter_(-1, topk_indices, 0.0)
+
+        # Top-k can include future positions when fewer than top_k causal keys exist.
+        # Apply causality before head expansion: masking the expanded TE bias would
+        # allocate and traverse an additional [1, heads, sequence, sequence] tensor.
+        causal_bool = torch.ones(num_tokens, num_tokens, dtype=torch.bool, device=device).triu(1)
+        sparse_mask.masked_fill_(causal_bool, neg)
+
         if qkv_format == "thd":
-            num_tokens = topk_indices.shape[0]
-            # Create mask directly in final shape [1, n_heads, T, T]
-            # All heads share the same mask, so we create [T, T] and expand
-            sparse_mask = torch.full((num_tokens, num_tokens), neg, device=device, dtype=dtype).scatter_(
-                -1, topk_indices, 0.0
-            )
             # expand creates a view, contiguous makes a copy
             sparse_mask = sparse_mask.view(1, 1, num_tokens, num_tokens).expand(1, n_heads, -1, -1).contiguous()
         else:
             if union_across_batches:
-                # For TE: create [B, S, S], scatter, union via max, then expand
-                sparse_mask = torch.full((bsz, seq_len, seq_len), neg, device=device, dtype=dtype).scatter_(
-                    -1, topk_indices, 0.0
-                )
                 # Union: max(0, finfo.min) = 0 for any position selected in any batch
                 sparse_mask = sparse_mask.max(dim=0, keepdim=True).values
                 sparse_mask = sparse_mask.view(1, 1, seq_len, seq_len).expand(1, n_heads, -1, -1).contiguous()
             else:
-                # For SDPA: create [B, S, S], scatter, expand (no contiguous needed)
-                sparse_mask = torch.full((bsz, seq_len, seq_len), neg, device=device, dtype=dtype).scatter_(
-                    -1, topk_indices, 0.0
-                )
+                # SDPA accepts a broadcast view over heads.
                 sparse_mask = sparse_mask.unsqueeze(1).expand(-1, n_heads, -1, -1)
-
-        # Enforce causality independently of the top-k selection: a query attends only to keys
-        # at positions <= its own. Required because at seq_len <= index_topk the top-k selects
-        # every token (including future) and the SDPA path consumes this mask with is_causal=False;
-        # without it the DSA attention is bidirectional and leaks the next token.
-        q_len, k_len = sparse_mask.shape[-2], sparse_mask.shape[-1]
-        causal_bool = torch.ones(q_len, k_len, dtype=torch.bool, device=sparse_mask.device).triu(1)
-        sparse_mask = sparse_mask.masked_fill(causal_bool, neg)
 
         # Combine with the attention mask if provided. Convert a {0,1} keep-mask to an additive
         # key mask (kept -> 0, padding -> finfo.min) and broadcast it over the key axis; adding a raw
@@ -570,21 +655,32 @@ class GlmMoeDsaMLA(nn.Module):
         prev_topk_indices: torch.Tensor | None = None,
         return_topk_indices: bool = False,
         **attn_kwargs: Any,
-    ):
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run MLA with (optionally shared) DSA sparse attention.
 
         Args:
-            x: Hidden states ``[B, S, hidden]`` (bshd) or ``[T, hidden]`` (thd).
-            freqs_cis: RoPE frequencies.
-            attention_mask: Optional additive attention mask.
-            prev_topk_indices: Top-k indices from the most recent "full" indexer layer.
-                Required (and only used) when this is a "shared" layer (``skip_topk=True``).
+            x: Hidden-state tensor of shape ``[batch, sequence, hidden]`` for BSHD or
+                ``[tokens, hidden]`` for packed THD.
+            freqs_cis: Complex RoPE tensor of shape ``[batch, sequence, rope_head_dim / 2]``
+                for BSHD or ``[tokens, rope_head_dim / 2]`` for packed THD.
+            attention_mask: Optional additive attention tensor of shape
+                ``[batch, 1, sequence, sequence]`` or key mask of shape ``[batch, sequence]``.
+            prev_topk_indices: Top-k index tensor from the most recent full indexer layer.
+                Optimized THD backends use int32 ``[tokens, 1, index_topk]``; the dense
+                BSHD path uses int64 ``[batch, sequence, min(index_topk, sequence)]``.
+                Required only for a shared layer (``skip_topk=True``).
             return_topk_indices: When ``True``, return ``(attn_out, topk_indices)`` so the
                 caller can thread the selection to subsequent shared layers (GLM IndexShare).
                 When ``False`` (default), return just ``attn_out``.
+            **attn_kwargs: Attention metadata. Optimized packed backends require an int32
+                ``cu_seqlens`` tensor of shape ``[sequences + 1]``. Packed CP may also
+                provide ``_glm_dsa_cp_group`` and packed query-position tensors. The cuDNN
+                backend requires CUDA bfloat16 inputs.
 
         Returns:
-            ``attn_out`` tensor, or ``(attn_out, topk_indices)`` when ``return_topk_indices``.
+            Attention output tensor of shape ``[batch, sequence, hidden]`` for BSHD or
+            ``[tokens, hidden]`` for packed THD. When ``return_topk_indices`` is true,
+            returns that tensor with the top-k index tensor described above.
         """
         if len(x.shape) == 2:
             qkv_format = "thd"
@@ -636,20 +732,20 @@ class GlmMoeDsaMLA(nn.Module):
         k_pe = k_pe.squeeze(head_unsqueeze_dim)
         cp_group = attn_kwargs.get("_glm_dsa_cp_group")
         cp_enabled = glm_dsa_cp_enabled(cp_group)
+        dsa_backend = _dsa_kernel_backend(self.backend)
         if cp_enabled:
             if qkv_format != "thd":
                 raise ValueError("GLM DSA context parallelism requires THD/packed sequences.")
             kv = glm_dsa_cp_all_gather(kv, dim=0, cp_group=cp_group)
             k_pe = glm_dsa_cp_all_gather(k_pe, dim=0, cp_group=cp_group)
 
-        # TileLang sparse path (opt-in via backend.attn == "tilelang"): run the gather-top-k sparse
-        # MLA kernel on the absorbed latent representation. The k_nope up-projection is folded into
-        # the query so attention runs over compressed latent KV, and w_vc maps the latent output back.
-        if _dsa_kernel_backend(self.backend) == "tilelang":
+        # Optimized sparse paths run on the absorbed latent representation. The k_nope
+        # up-projection is folded into the query, and w_vc maps the latent output back.
+        if dsa_backend in ("tilelang", "cudnn"):
             if qkv_format != "thd":
                 raise ValueError(
-                    "TileLang DSA sparse attention requires THD/packed sequences (qkv_format='thd'); "
-                    f"got '{qkv_format}'. Use backend.attn in {{te, sdpa}} for the bshd dense path."
+                    f"{dsa_backend} DSA sparse attention requires THD/packed sequences (qkv_format='thd'); "
+                    f"got '{qkv_format}'. Use backend.attn in {{te, sdpa}} for the BSHD dense path."
                 )
             materialize_effective_weight = getattr(self.kv_b_proj, "materialize_effective_weight", None)
             kv_b_weight = (
@@ -659,17 +755,42 @@ class GlmMoeDsaMLA(nn.Module):
             w_kc = w[:, : self.qk_nope_head_dim, :]
             w_vc = w[:, self.qk_nope_head_dim :, :]
             q_absorbed = torch.einsum("thd,hdc->thc", q_nope, w_kc.to(q_nope.dtype))
-            q_tl = torch.cat([q_absorbed, q_pe], dim=-1).to(torch.bfloat16)
+            q_sparse = torch.cat([q_absorbed, q_pe], dim=-1).to(torch.bfloat16)
             kv_latent = torch.cat([kv, k_pe], dim=-1).unsqueeze(1).to(torch.bfloat16)
-            if not should_use_tilelang(
-                "tilelang",
-                available=is_dsa_kernel_available("sparse_attn"),
-                kernel_name="sparse_attn",
-                tensors=(q_tl, kv_latent),
-                require_bf16=True,
-            ):
-                raise RuntimeError("TileLang sparse attention was selected but did not pass validation.")
-            attn_out = tilelang_sparse_attention(q_tl, kv_latent, topk_indices, w_vc.to(q_tl.dtype), self.softmax_scale)
+            if dsa_backend == "tilelang":
+                if not should_use_tilelang(
+                    "tilelang",
+                    available=is_dsa_kernel_available("sparse_attn"),
+                    kernel_name="sparse_attn",
+                    tensors=(q_sparse, kv_latent),
+                    require_bf16=True,
+                ):
+                    raise RuntimeError("TileLang sparse attention was selected but did not pass validation.")
+                attn_out = tilelang_sparse_attention(
+                    q_sparse, kv_latent, topk_indices, w_vc.to(q_sparse.dtype), self.softmax_scale
+                )
+            else:
+                if not is_cudnn_dsa_available():
+                    raise RuntimeError(
+                        "backend.attn='cudnn' requires the optional cuDNN DSA and FlashMLA kernels, "
+                        "but they are unavailable in this environment."
+                    )
+                expected_topk_shape = (num_tokens, 1, self.index_topk)
+                if tuple(topk_indices.shape) != expected_topk_shape:
+                    raise ValueError(
+                        "cuDNN DSA sparse attention requires fixed-width top-k indices of shape "
+                        f"{expected_topk_shape}; got {tuple(topk_indices.shape)}."
+                    )
+                latent_out = cudnn_sparse_attention(
+                    q_sparse,
+                    kv_latent,
+                    topk_indices,
+                    self.softmax_scale,
+                    topk_length=attn_kwargs.get("_cudnn_dsa_topk_length"),
+                    all_rows_nonempty=bool(attn_kwargs.get("_cudnn_dsa_all_rows_nonempty", False)),
+                    valid_row_indices=attn_kwargs.get("_cudnn_dsa_valid_row_indices"),
+                )
+                attn_out = torch.einsum("thc,hdc->thd", latent_out, w_vc.to(latent_out.dtype))
             x = self.o_proj(attn_out.flatten(1))
             if return_topk_indices:
                 return x, topk_indices

@@ -105,8 +105,16 @@ instruction-level aggregation).
 
 This recipe's `ci.downstream_eval` block registers it in the weekly convergence flow
 (`tests/ci_tests/configs/convergence/convergence_recipes.yml`): train 1000 steps → IFEval → **pass iff
-`|prompt_level_strict_acc − 0.5287| < 2·0.0215`** (band `[0.486, 0.572]`). The base ships no chat
-template; the recipe supplies the `-it` template via `dataset.chat_template`.
+`prompt_level_strict_acc > 0.5287 − 2·0.0455`** (floor `0.4378`). The gate is one-sided, so a higher
+score always passes. The base ships no chat template; the recipe supplies the `-it` template via
+`dataset.chat_template`.
+
+The `stderr` there is the **between-run** sigma of the full train→eval pipeline, not the within-eval
+bootstrap stderr from the table above (`0.0215`) — the two differ by ~2×, since the gate must absorb
+training variance and not just scoring noise. Nine runs of this recipe span 0.4492–0.5619 (stdev
+0.0455). Reproduce a failing run on the same commit before treating it as a regression, and
+re-measure both numbers when the recipe changes materially.
+
 ## Gotchas
 
 - **Base ships no chat template** → the recipe supplies the `-it` template via

@@ -31,7 +31,7 @@ from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegis
 # ---------------------------------------------------------------------------
 # 1. Every registered class must declare capabilities via exactly one pattern
 #
-# Modeled on tests/unit_tests/_transformers/test_doc_coverage.py: walk every
+# Modeled on tests/unit_tests/tools/docs/checks/test_architecture.py: walk every
 # entry in MODEL_ARCH_MAPPING, collect violations, and surface them in a
 # single actionable assertion. Any new model onboarded into the registry that
 # forgets to declare capabilities (or declares both patterns by mistake) will
@@ -128,6 +128,12 @@ def test_gemma4_dynamic_class_blocks_static_access():
 
     with pytest.raises(AttributeError):
         cls.ModelCapabilities  # noqa: B018  -- attribute access is the test
+
+
+def test_gemma4_declares_model_owned_context_parallel_attention():
+    """The Gemma4 p2p ring must not be rejected for lacking a TE backend."""
+    cls = ModelRegistry.get_model_cls_from_model_arch("Gemma4ForConditionalGeneration")
+    assert cls._owns_cp_attention is True
 
 
 def test_llama_declares_context_parallel_support():
@@ -230,6 +236,8 @@ def test_query_returns_canonical_type_for_static_class():
     assert caps.supports_cp is False
     assert caps.supports_ep is False
     assert caps.supports_thd is True
+    assert caps.supports_mtp_cp is False
+    assert caps.supports_mtp_cp_pp is False
     assert caps.supports_cp_vision_frame_sharding is False
 
 

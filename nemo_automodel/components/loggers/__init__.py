@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 
-__all__ = ["CometConfig", "MLflowConfig", "WandbConfig"]
+__all__ = ["CometConfig", "MLflowConfig", "TrackioConfig", "WandbConfig"]

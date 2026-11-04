@@ -37,7 +37,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -234,8 +234,8 @@ def _extract_rope_config(config: Qwen2Config) -> dict:
 
 def _compute_default_rope_parameters(
     config: Qwen2Config,
-    device: Optional[torch.device] = None,
-    seq_len: Optional[int] = None,
+    device: torch.device | None = None,
+    seq_len: int | None = None,
 ) -> Tuple[torch.Tensor, float]:
     """Local "default" RoPE init — transformers 5.x dropped it from ROPE_INIT_FUNCTIONS."""
     rope_params = _extract_rope_config(config)
@@ -255,7 +255,7 @@ class Qwen2RotaryEmbedding(nn.Module):
     the rope_type is unspecified.
     """
 
-    def __init__(self, config: Qwen2Config, device: Optional[torch.device] = None) -> None:
+    def __init__(self, config: Qwen2Config, device: torch.device | None = None) -> None:
         super().__init__()
         rope_params = _extract_rope_config(config)
         self.rope_type = rope_params.get("rope_type") or rope_params.get("type") or "default"
@@ -322,7 +322,7 @@ def apply_rotary_pos_emb(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
+    position_ids: torch.Tensor | None = None,
     unsqueeze_dim: int = 1,
     fused: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -382,7 +382,7 @@ def _bagel_fused_rope(
 class Qwen2MLP(nn.Module):
     """SwiGLU MLP with an independently configurable linear backend."""
 
-    def __init__(self, config: Qwen2Config, backend: Optional[BagelBackendConfig] = None) -> None:
+    def __init__(self, config: Qwen2Config, backend: BagelBackendConfig | None = None) -> None:
         super().__init__()
         self.backend = backend or BagelBackendConfig()
         self.hidden_size = config.hidden_size
@@ -413,8 +413,8 @@ class NaiveCache:
     """Dict-backed KV cache, one entry per layer (BAGEL inference helper)."""
 
     def __init__(self, num_layers: int) -> None:
-        self.key_cache: dict[int, Optional[torch.Tensor]] = {k: None for k in range(num_layers)}
-        self.value_cache: dict[int, Optional[torch.Tensor]] = {k: None for k in range(num_layers)}
+        self.key_cache: dict[int, torch.Tensor | None] = {k: None for k in range(num_layers)}
+        self.value_cache: dict[int, torch.Tensor | None] = {k: None for k in range(num_layers)}
 
     @property
     def num_layers(self) -> int:
@@ -432,7 +432,7 @@ class BaseNavitOutputWithPast(ModelOutput):
     """BAGEL packed decoder output with optional past key-value cache."""
 
     packed_query_sequence: torch.FloatTensor = None
-    past_key_values: Optional[NaiveCache] = None
+    past_key_values: NaiveCache | None = None
 
 
 def _pad_sequence(tensor: torch.Tensor, pad_size: int) -> torch.Tensor:
@@ -447,8 +447,8 @@ class _PackedAttentionBase(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
-        layer_idx: Optional[int] = None,
-        backend: Optional[BagelBackendConfig] = None,
+        layer_idx: int | None = None,
+        backend: BagelBackendConfig | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -488,8 +488,8 @@ class PackedAttention(_PackedAttentionBase):
     def __init__(
         self,
         config: Qwen2Config,
-        layer_idx: Optional[int] = None,
-        backend: Optional[BagelBackendConfig] = None,
+        layer_idx: int | None = None,
+        backend: BagelBackendConfig | None = None,
     ) -> None:
         super().__init__(config, layer_idx, backend=backend)
         if getattr(config, "qk_norm", False):
@@ -579,12 +579,12 @@ class PackedAttention(_PackedAttentionBase):
         query_lens: torch.Tensor,
         packed_query_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values: bool = True,
         is_causal: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[NaiveCache]]:
+    ) -> Tuple[torch.Tensor, NaiveCache | None]:
         packed_query_states = self.q_proj(packed_query_sequence).reshape(-1, self.num_heads, self.head_dim)
         packed_key_states = self.k_proj(packed_query_sequence).reshape(-1, self.num_key_value_heads, self.head_dim)
         packed_value_states = self.v_proj(packed_query_sequence).reshape(-1, self.num_key_value_heads, self.head_dim)
@@ -651,8 +651,8 @@ class PackedAttentionMoT(_PackedAttentionBase):
     def __init__(
         self,
         config: Qwen2Config,
-        layer_idx: Optional[int] = None,
-        backend: Optional[BagelBackendConfig] = None,
+        layer_idx: int | None = None,
+        backend: BagelBackendConfig | None = None,
     ) -> None:
         super().__init__(config, layer_idx, backend=backend)
         if getattr(config, "qk_norm", False):
@@ -692,8 +692,8 @@ class PackedAttentionMoT(_PackedAttentionBase):
         packed_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         packed_und_token_indexes: torch.LongTensor,
         packed_gen_token_indexes: torch.LongTensor,
-        mot_perm: Optional[torch.LongTensor] = None,
-        mot_inv: Optional[torch.LongTensor] = None,
+        mot_perm: torch.LongTensor | None = None,
+        mot_inv: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         freeze_und = getattr(self.config, "freeze_und", False)
 
@@ -891,15 +891,15 @@ class PackedAttentionMoT(_PackedAttentionBase):
         query_lens: torch.Tensor,
         packed_query_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values: bool = True,
         is_causal: bool = True,
         mode: str = "und",
-        packed_vae_token_indexes: Optional[torch.Tensor] = None,
-        packed_text_indexes: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[NaiveCache]]:
+        packed_vae_token_indexes: torch.Tensor | None = None,
+        packed_text_indexes: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, NaiveCache | None]:
         if mode == "und":
             packed_query_states = self.q_proj(packed_query_sequence).reshape(-1, self.num_heads, self.head_dim)
             packed_key_states = self.k_proj(packed_query_sequence).reshape(-1, self.num_key_value_heads, self.head_dim)
@@ -1067,8 +1067,8 @@ class Qwen2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
-        layer_idx: Optional[int] = None,
-        backend: Optional[BagelBackendConfig] = None,
+        layer_idx: int | None = None,
+        backend: BagelBackendConfig | None = None,
     ) -> None:
         super().__init__()
         self.backend = backend or BagelBackendConfig()
@@ -1114,12 +1114,12 @@ class Qwen2DecoderLayer(nn.Module):
         query_lens: torch.Tensor,
         packed_query_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values: bool = True,
         is_causal: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[NaiveCache]]:
+    ) -> Tuple[torch.Tensor, NaiveCache | None]:
         residual = packed_query_sequence
         packed_query_sequence = self.input_layernorm(packed_query_sequence)
 
@@ -1149,9 +1149,9 @@ class Qwen2MoTDecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
-        layer_idx: Optional[int] = None,
+        layer_idx: int | None = None,
         attn_module: type = PackedAttentionMoT,
-        backend: Optional[BagelBackendConfig] = None,
+        backend: BagelBackendConfig | None = None,
     ) -> None:
         super().__init__()
         self.backend = backend or BagelBackendConfig()
@@ -1182,8 +1182,8 @@ class Qwen2MoTDecoderLayer(nn.Module):
         packed_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         packed_und_token_indexes: torch.LongTensor,
         packed_gen_token_indexes: torch.LongTensor,
-        mot_perm: Optional[torch.LongTensor] = None,
-        mot_inv: Optional[torch.LongTensor] = None,
+        mot_perm: torch.LongTensor | None = None,
+        mot_inv: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         if mot_perm is not None:
             # MLM-style slice+concat routing at the scalar und/gen boundary.
@@ -1267,15 +1267,15 @@ class Qwen2MoTDecoderLayer(nn.Module):
         query_lens: torch.Tensor,
         packed_query_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values: bool = True,
         is_causal: bool = True,
         mode: str = "und",
-        packed_vae_token_indexes: Optional[torch.Tensor] = None,
-        packed_text_indexes: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[NaiveCache]]:
+        packed_vae_token_indexes: torch.Tensor | None = None,
+        packed_text_indexes: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, NaiveCache | None]:
         residual = packed_query_sequence
         if mode == "und":
             packed_query_sequence = self.input_layernorm(packed_query_sequence)
@@ -1377,7 +1377,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
     created for the final RMSNorm.
     """
 
-    def __init__(self, config: Qwen2Config, backend: Optional[BagelBackendConfig] = None) -> None:
+    def __init__(self, config: Qwen2Config, backend: BagelBackendConfig | None = None) -> None:
         super().__init__(config)
         self.backend = backend or BagelBackendConfig()
         self.padding_idx = config.pad_token_id
@@ -1417,10 +1417,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
         sample_lens: List[int],
         attention_mask,
         packed_position_ids: torch.Tensor,
-        packed_und_token_indexes: Optional[torch.LongTensor] = None,
-        packed_gen_token_indexes: Optional[torch.LongTensor] = None,
-        mot_perm: Optional[torch.LongTensor] = None,
-        mot_inv: Optional[torch.LongTensor] = None,
+        packed_und_token_indexes: torch.LongTensor | None = None,
+        packed_gen_token_indexes: torch.LongTensor | None = None,
+        mot_perm: torch.LongTensor | None = None,
+        mot_inv: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         freeze_und = getattr(self.config, "freeze_und", False)
         if freeze_und:
@@ -1488,14 +1488,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
         query_lens: torch.Tensor,
         packed_query_position_ids: torch.Tensor,
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values: bool = True,
         is_causal: bool = True,
         mode: str = "und",
-        packed_vae_token_indexes: Optional[torch.Tensor] = None,
-        packed_text_indexes: Optional[torch.Tensor] = None,
+        packed_vae_token_indexes: torch.Tensor | None = None,
+        packed_text_indexes: torch.Tensor | None = None,
     ) -> BaseNavitOutputWithPast:
         cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
         cos = cos.squeeze(0)
@@ -1557,7 +1557,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: Qwen2Config, backend: Optional[BagelBackendConfig] = None) -> None:
+    def __init__(self, config: Qwen2Config, backend: BagelBackendConfig | None = None) -> None:
         super().__init__(config)
         self.backend = backend or BagelBackendConfig()
         self.model = Qwen2Model(config, backend=self.backend)
@@ -1607,10 +1607,10 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         sample_lens: List[int],
         attention_mask,
         packed_position_ids: torch.Tensor,
-        packed_und_token_indexes: Optional[torch.LongTensor] = None,
-        packed_gen_token_indexes: Optional[torch.LongTensor] = None,
-        mot_perm: Optional[torch.LongTensor] = None,
-        mot_inv: Optional[torch.LongTensor] = None,
+        packed_und_token_indexes: torch.LongTensor | None = None,
+        packed_gen_token_indexes: torch.LongTensor | None = None,
+        mot_perm: torch.LongTensor | None = None,
+        mot_inv: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         # BAGEL's forward_train returns the raw hidden states; the upstream
         # training loop applies lm_head only on text-token positions to save
@@ -1633,14 +1633,14 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         query_lens: torch.Tensor,
         packed_query_position_ids: torch.Tensor,
         packed_query_indexes: torch.Tensor,
-        past_key_values: Optional[NaiveCache] = None,
-        key_values_lens: Optional[torch.Tensor] = None,
-        packed_key_value_indexes: Optional[torch.Tensor] = None,
+        past_key_values: NaiveCache | None = None,
+        key_values_lens: torch.Tensor | None = None,
+        packed_key_value_indexes: torch.Tensor | None = None,
         update_past_key_values: bool = True,
         is_causal: bool = True,
         mode: str = "und",
-        packed_vae_token_indexes: Optional[torch.Tensor] = None,
-        packed_text_indexes: Optional[torch.Tensor] = None,
+        packed_vae_token_indexes: torch.Tensor | None = None,
+        packed_text_indexes: torch.Tensor | None = None,
     ) -> BaseNavitOutputWithPast:
         return self.model(
             packed_query_sequence=packed_query_sequence,

@@ -235,7 +235,7 @@ def test_from_pretrained_prefers_dtype_over_deprecated_torch_dtype_default(monke
     )
 
     assert isinstance(model, DummyModel)
-    assert last_kwargs["dtype"] == "bfloat16"
+    assert last_kwargs["dtype"] == torch.bfloat16
     assert "torch_dtype" not in last_kwargs
 
 

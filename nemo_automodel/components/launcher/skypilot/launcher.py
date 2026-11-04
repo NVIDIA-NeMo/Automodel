@@ -14,9 +14,10 @@
 
 import logging
 import os
+import shlex
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import yaml
 
@@ -55,7 +56,7 @@ class SkyPilotLauncher(Launcher):
         job_conf_path: str,
         gpus_per_node: int,
         num_nodes: int,
-        extra_args: Optional[List[str]] = None,
+        extra_args: List[str] | None = None,
     ) -> str:
         repo_root = "~/sky_workdir"
         script_path = _recipe_module_path(recipe_target, repo_root)
@@ -70,15 +71,15 @@ class SkyPilotLauncher(Launcher):
             parts += [
                 "--nnodes=$SKYPILOT_NUM_NODES",
                 "--node_rank=$SKYPILOT_NODE_RANK",
-                "--rdzv_backend=c10d",
-                "--master_addr=$(echo $SKYPILOT_NODE_IPS | head -n1)",
+                '--master_addr="$(echo "$SKYPILOT_NODE_IPS" | head -n1)"',
                 "--master_port=12375",
             ]
 
         parts += [script_path, "-c", job_conf_path]
 
         if extra_args:
-            parts.extend(extra_args)
+            # ``run`` is executed by bash, so quote each override to pass it through verbatim.
+            parts.extend(shlex.quote(arg) for arg in extra_args)
 
         return " ".join(parts)
 
@@ -88,7 +89,7 @@ class SkyPilotLauncher(Launcher):
         config_path: Path,
         recipe_target: str,
         launcher_config: Dict[str, Any],
-        extra_args: Optional[List[str]] = None,
+        extra_args: List[str] | None = None,
     ) -> int:
         from nemo_automodel.components.launcher.skypilot.utils import submit_skypilot_job
 

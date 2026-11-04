@@ -30,7 +30,6 @@ with model-specific optimizations (YaRN, MLA, etc.).
 """
 
 import math
-from typing import Optional
 
 import torch
 from torch import nn
@@ -62,13 +61,16 @@ def apply_rotary_pos_emb(
         sin: Sine embeddings ``[B, S, D]`` or ``[T, D]``.
 
     Returns:
-        Rotated (q, k) tensors
+        Rotated Q/K with their respective input shapes and dtypes.
+        Rotation is computed in FP32; neither output aliases or mutates its input.
     """
-    cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
-    sin = sin.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
+    q_dtype, k_dtype = q.dtype, k.dtype
+    q, k = q.float(), k.float()
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return q_embed.to(q_dtype), k_embed.to(k_dtype)
 
 
 def apply_rotary_pos_emb_quack(
@@ -190,7 +192,7 @@ def _get_rope_config(config) -> tuple[float, dict]:
     return base, rope_scaling
 
 
-def _compute_default_inv_freq(config, device: Optional[torch.device] = None) -> tuple[torch.Tensor, float]:
+def _compute_default_inv_freq(config, device: torch.device | None = None) -> tuple[torch.Tensor, float]:
     """Computes inverse frequencies for standard RoPE."""
     base, _ = _get_rope_config(config)
     dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
@@ -201,7 +203,7 @@ def _compute_default_inv_freq(config, device: Optional[torch.device] = None) -> 
     return inv_freq, 1.0
 
 
-def _compute_llama3_inv_freq(config, device: Optional[torch.device] = None) -> tuple[torch.Tensor, float]:
+def _compute_llama3_inv_freq(config, device: torch.device | None = None) -> tuple[torch.Tensor, float]:
     """Computes inverse frequencies for Llama3-style RoPE with smooth interpolation.
 
     Branch logic (matches HF _compute_llama3_parameters):
@@ -244,11 +246,10 @@ class LlamaRotaryEmbedding(nn.Module):
 
     inv_freq: torch.Tensor
 
-    def __init__(self, config, device: Optional[torch.device] = None, rope_fusion: bool = False):
+    def __init__(self, config, device: torch.device | None = None, rope_fusion: bool = False):
         super().__init__()
         self.max_seq_len_cached = 0
         self.rope_fusion = rope_fusion
-        self.dtype = getattr(config, "torch_dtype", None) or torch.float32
 
         # ``default`` and ``llama3`` have local fast-path implementations. Every
         # other schedule (``yarn``, ``linear``, ``dynamic``, ``longrope``, ...)
@@ -296,10 +297,10 @@ class LlamaRotaryEmbedding(nn.Module):
         self.register_buffer("_freqs_cache", None, persistent=False)
 
     def _build_cache(self, seq_len: int, device: torch.device) -> None:
-        """Build cos/sin cache in config dtype for positions [0, seq_len)."""
+        """Build FP32 coefficient and raw-angle caches for positions [0, seq_len)."""
         self.max_seq_len_cached = seq_len
 
-        # Compute in float32 for precision, then convert to target dtype.
+        # Keep coefficients and raw angles in float32 through the rotation.
         # Recompute inv_freq from config instead of reading ``self.inv_freq``: the
         # registered buffer is rounded to the model dtype (e.g. bf16) by the
         # model-wide ``.to()`` in ``LlamaForCausalLM.__init__``, and upcasting a
@@ -310,15 +311,15 @@ class LlamaRotaryEmbedding(nn.Module):
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)  # [seq, head_dim]
 
-        self._cos_cache = (emb.cos() * self.attention_scaling).to(self.dtype)
-        self._sin_cache = (emb.sin() * self.attention_scaling).to(self.dtype)
+        self._cos_cache = emb.cos() * self.attention_scaling
+        self._sin_cache = emb.sin() * self.attention_scaling
         if self.rope_fusion:
             # TE fused rope expects raw angles in [seq, 1, 1, head_dim] format
-            self._freqs_cache = emb.to(self.dtype).unsqueeze(1).unsqueeze(1).contiguous()
+            self._freqs_cache = emb.unsqueeze(1).unsqueeze(1).contiguous()
 
     def _ensure_cache(self, seq_len: int, device: torch.device) -> None:
         """Build or grow the cos/sin cache so it covers positions ``[0, seq_len)``."""
-        if self._cos_cache is None or seq_len > self.max_seq_len_cached:
+        if self._cos_cache is None or self._cos_cache.dtype != torch.float32 or seq_len > self.max_seq_len_cached:
             self._build_cache(seq_len, device)
 
     @torch.no_grad()
@@ -357,9 +358,9 @@ class LlamaRotaryEmbedding(nn.Module):
                 frequency table spans the global token count ``T * cp_size``.
 
         Returns:
-            Cosine and sine tensors ``[B, S, D]`` or ``[T, D]``. When fused
+            FP32 cosine and sine tensors ``[B, S, D]`` or ``[T, D]``. When fused
             RoPE is enabled, the tuple also carries a global raw-frequency
-            table ``[S, 1, 1, D]`` as its third item.
+            table ``[S, 1, 1, D]`` in FP32 as its third item.
         """
         if qkv_format not in ("bshd", "thd"):
             raise ValueError(f"Unsupported qkv_format={qkv_format!r}; expected 'bshd' or 'thd'.")

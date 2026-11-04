@@ -5,9 +5,9 @@
 # found in the LICENSE file in the root directory of this source tree.
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal
 
 import torch
 import torch.nn as nn
@@ -31,7 +31,7 @@ class FP8Config:
     enabled: bool = False
     """Whether FP8 quantization is enabled."""
 
-    recipe_name: Optional[Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"]] = None
+    recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] | None = None
     """FP8 recipe to use. If None, uses tensorwise scaling with manual configuration."""
 
     enable_fsdp_float8_all_gather: bool = False
@@ -56,7 +56,7 @@ class FP8Config:
     def __init__(
         self,
         enabled: bool = False,
-        recipe_name: Optional[Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"]] = None,
+        recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] | None = None,
         enable_fsdp_float8_all_gather: bool = False,
         precompute_float8_dynamic_scale_for_fsdp: bool = False,
         force_recompute_fp8_weight_in_bwd: bool = False,
@@ -129,10 +129,10 @@ def _module_filter_fn(module, name, filter_fqns: List[str] = None):
 
 def apply_fp8_to_model(
     model: nn.Module,
-    config: Optional[FP8Config] = None,
+    config: FP8Config | None = None,
     # Individual parameter options for backward compatibility
-    filter_fqns: Optional[List[str]] = None,
-    recipe_name: Optional[str] = None,
+    filter_fqns: List[str] | None = None,
+    recipe_name: str | None = None,
     force_recompute_fp8_weight_in_bwd: bool = False,
     enable_fsdp_float8_all_gather: bool = False,
     emulate: bool = False,
@@ -200,6 +200,9 @@ def apply_fp8_to_model(
     # Handle config creation or recipe-based configuration
     if fp8_config.recipe_name is not None and fp8_config.recipe_name != "tensorwise":
         torchao_config = Float8LinearConfig.from_recipe_name(fp8_config.recipe_name)
+        # from_recipe_name does not take emulate, so carry the user's flag over
+        if fp8_config.emulate:
+            torchao_config = replace(torchao_config, emulate=True)
         logger.info(f"Using FP8 recipe: {fp8_config.recipe_name}")
 
         # Enable inductor precision cast emulation for rowwise recipe
@@ -323,7 +326,7 @@ def create_fp8_config_from_dict(config_dict: Dict[str, Any]) -> FP8Config:
     )
 
 
-def build_fp8_config(cfg: Optional[Dict[str, Any]]) -> FP8Config:
+def build_fp8_config(cfg: Dict[str, Any] | None) -> FP8Config:
     """Build a FP8 config from configuration.
 
     Args:

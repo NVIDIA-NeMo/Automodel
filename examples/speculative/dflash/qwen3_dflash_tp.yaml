@@ -57,3 +57,6 @@ optimizer:
 
 checkpoint:
   enabled: false
+
+ci:
+  cluster_tag: h100

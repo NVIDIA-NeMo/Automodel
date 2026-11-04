@@ -1,87 +1,65 @@
 ---
-title: "Moonlight"
-description: ""
-slug: model-coverage/large-language-models/moonshotai/moonlight
+title: "Moonlight-16B-A3B"
+description: "Fine-tune Moonlight-16B-A3B with NeMo AutoModel on 8 GPUs using FSDP2, 8-way expert parallelism, Transformer Engine, and DeepEP."
+slug: model-coverage/large-language-models/moonshotai/Moonlight-16B-A3B
 ---
-[Moonlight](https://huggingface.co/moonshotai/Moonlight-16B-A3B) is a Mixture-of-Experts language model from Moonshot AI trained using Muon optimizer. It uses the `DeepseekV3ForCausalLM` architecture with 16B total parameters and 3B activated per token.
 
-<Info>
+[Moonlight-16B-A3B](https://huggingface.co/moonshotai/Moonlight-16B-A3B) is a Mixture-of-Experts (MoE) language model from Moonshot AI with 16B total parameters and 3B active parameters. Moonshot AI reports training it on 5.7T tokens with the Muon optimizer.
 
-| | |
+The documented workflows cover HellaSwag fine-tuning, packed sequences, pretraining from configuration, and Tulu-3 fine-tuning.
+
+Set up NeMo AutoModel with the [latest container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) or follow the [installation instructions](/get-started/installation).
+
+## Fine-Tune Moonlight
+
+From the repository root, run:
+
+```bash
+uv run automodel examples/llm_finetune/moonlight/moonlight_16b_te.yaml \
+  --nproc-per-node 8 \
+  --checkpoint.enabled true \
+  --checkpoint.checkpoint_dir checkpoints/moonlight
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
 |---|---|
-| **Task** | Text Generation (MoE) |
-| **Architecture** | `DeepseekV3ForCausalLM` |
-| **Parameters** | 16B total / 3B active |
-| **HF Org** | [moonshotai](https://huggingface.co/moonshotai) |
+| Fine-tune the base checkpoint | Use [`moonlight_16b_te.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml). It fine-tunes on HellaSwag for two epochs with FSDP2 and eight-way expert parallelism. |
+| Fine-tune with packed sequences | Use [`moonlight_16b_te_packed_sequence.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml). It packs sequences to 1,024 tokens and uses `torch_mm` experts. |
+| Pretrain from configuration | Customize the [pretraining template](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml). Replace the data paths, configure Slurm, and submit it on one 8-GPU node. |
+| Reproduce the Tulu-3 workflow | Follow the [Tulu-3 run instructions](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/convergence/tulu3/models/moonlight-16b). Prefilter the data to 2,048 tokens and launch the fine-tuning script with `torchrun`. |
 
-</Info>
+## Model Reference
 
-## Available Models
+### Model Architecture
 
-- **Moonlight-16B-A3B**: 16B total, 3B activated
-
-## Architecture
-
-- `DeepseekV3ForCausalLM` (same architecture as DeepSeek-V3)
-
-## Example HF Models
-
-| Model | HF ID |
+| Property | Value |
 |---|---|
-| Moonlight 16B A3B | [`moonshotai/Moonlight-16B-A3B`](https://huggingface.co/moonshotai/Moonlight-16B-A3B) |
+| Hugging Face Architecture | `DeepseekV3ForCausalLM` |
+| Parameters | 16B total / 3B active |
+| Decoder Layers | 27 |
+| Hidden Size | 2,048 |
+| Attention | 16 attention heads and 16 key-value heads |
+| Feed-Forward Sizes | 11,264 dense / 1,408 per expert |
+| Experts | 64 routed / 2 shared / 6 selected per token |
+| Context Length | 8,192 tokens |
+| Vocabulary Size | 163,840 |
+| Weight Dtype | `bfloat16` |
+| Upstream Training | 5.7T tokens with Muon |
 
-## Example Recipes
+### Available Models
 
-| Recipe | Description |
+| Checkpoint | Type |
 |---|---|
-| [moonlight_16b_te.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te.yaml) | SFT — Moonlight 16B with Transformer Engine |
-| [moonlight_16b_te_packed_sequence.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/moonlight/moonlight_16b_te_packed_sequence.yaml) | SFT — Moonlight 16B with packed sequences |
+| [`moonshotai/Moonlight-16B-A3B`](https://huggingface.co/moonshotai/Moonlight-16B-A3B) | Pretrained base model used by the recipes above |
+| [`moonshotai/Moonlight-16B-A3B-Instruct`](https://huggingface.co/moonshotai/Moonlight-16B-A3B-Instruct) | Upstream instruction-tuned checkpoint |
 
-## Try with NeMo AutoModel
+## Related Resources
 
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
-
-```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras
-```
-
-**2. Run the recipe** from inside the repo:
-
-```bash
-uv run automodel --nproc-per-node=8 examples/llm_finetune/moonlight/moonlight_16b_te.yaml
-```
-
-<Accordion title="Run with Docker">
-**1. Pull the container** and mount a checkpoint directory:
-
-```bash
-docker run --gpus all -it --rm \
-  --shm-size=8g \
-  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.06.00
-```
-
-**2.** Navigate to the AutoModel directory (where the recipes are):
-
-```bash
-cd /opt/Automodel
-```
-
-**3. Run the recipe**:
-
-```bash
-automodel --nproc-per-node=8 examples/llm_finetune/moonlight/moonlight_16b_te.yaml
-```
-</Accordion>
-
-See the [Installation Guide](/get-started/installation) and [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
-
-## Fine-Tuning
-
-See the [LLM Fine-Tuning Guide](/recipes-e2e-examples/sft-peft).
-
-## Hugging Face Model Cards
-
-- [moonshotai/Moonlight-16B-A3B](https://huggingface.co/moonshotai/Moonlight-16B-A3B)
+- [Muon is Scalable for LLM Training](https://arxiv.org/abs/2502.16982)
+- [Moonshot AI Moonlight Repository](https://github.com/MoonshotAI/Moonlight)
+- [Fine-Tune Large MoE Models](/recipes-e2e-examples/large-moe-fine-tuning)
+- [Pretraining Guide](/recipes-e2e-examples/pretraining)
+- [Mixed-Precision Training Guide](/development/mixed-precision-training)
+- [Slurm Launcher Guide](/job-launchers/slurm-cluster)

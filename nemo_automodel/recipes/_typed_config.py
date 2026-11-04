@@ -20,9 +20,9 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
-``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
-``embedding_row_repair`` map to component config dataclasses; the ``optimizer``
-and ``loss_fn`` blocks resolve to a component
+``apply()``: ``wandb``/``trackio``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
+``embedding_row_repair``/``mfu``/``domain_mixture`` map to component config
+dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -46,11 +46,12 @@ from dataclasses import fields, is_dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
+    from nemo_automodel._transformers.mfu import MFUConfig
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
@@ -60,8 +61,10 @@ if TYPE_CHECKING:
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
+    from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig
     from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
+    from nemo_automodel.components.utils.model_utils import FreezeConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
@@ -130,8 +133,8 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
-    ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
-    ``loss_fn`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
+    ``wandb``, ``trackio``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
+    ``loss_fn``, ``domain_mixture`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
     :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig`);
@@ -142,9 +145,22 @@ class RecipeConfig:
         self._raw = raw
 
     @cached_property
+    def freeze_config(self) -> FreezeConfig | None:
+        """Return the validated parameter-freezing policy from the YAML boundary."""
+        from nemo_automodel.components.utils.model_utils import parse_freeze_config
+
+        node = self._raw.get("freeze_config", None)
+        return parse_freeze_config(_as_dict(node)) if node is not None else None
+
+    @cached_property
     def wandb(self) -> WandbConfig | None:
         node = self._raw.get("wandb", None)
         return WandbConfig.from_kwargs(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def trackio(self) -> TrackioConfig | None:
+        node = self._raw.get("trackio", None)
+        return TrackioConfig.from_kwargs(**_section_kwargs(node)) if node else None
 
     @cached_property
     def mlflow(self) -> MLflowConfig | None:
@@ -169,15 +185,25 @@ class RecipeConfig:
         node = self._raw.get("lr_scheduler", None)
         return LRSchedulerConfig(**_section_kwargs(node)) if node else None
 
-    @cached_property
-    def optimizer(self) -> "OptimizerConfig" | None:
+    def _optimizer_config(self, section: str) -> "OptimizerConfig" | None:
+        """Resolve one optimizer section through the shared typed boundary."""
         from nemo_automodel.components.optim.optimizer import build_optimizer_config
 
-        node = self._raw.get("optimizer", None)
+        node = self._raw.get(section, None)
         if node is None:
             return None
         factory, kwargs = _callable_and_kwargs(node)
         return build_optimizer_config(factory, kwargs)
+
+    @cached_property
+    def optimizer(self) -> "OptimizerConfig" | None:
+        """Return the primary model's configured optimizer policy."""
+        return self._optimizer_config("optimizer")
+
+    @cached_property
+    def head_optimizer(self) -> "OptimizerConfig" | None:
+        """Return the separately configured replicated decision-head optimizer."""
+        return self._optimizer_config("head_optimizer")
 
     @cached_property
     def dataloader(self) -> "DataloaderConfig" | None:
@@ -431,6 +457,13 @@ class RecipeConfig:
             unknown = sorted(set(packing_node) - packing_fields)
             if unknown:
                 raise TypeError(f"Unexpected VLM packing config field(s): {', '.join(unknown)}")
+            if packing_node.get("attn_implementation", None) is not None:
+                warnings.warn(
+                    "packed_sequence.attn_implementation is deprecated and ignored; "
+                    "the built model now supplies a structural packing contract",
+                    FutureWarning,
+                    stacklevel=2,
+                )
             packing = NeatPackConfig(
                 pack_size=packing_node.get("pack_size", max_length or 2048),
                 drop_long_samples=packing_node.get("drop_long_samples", False),
@@ -438,7 +471,6 @@ class RecipeConfig:
                 packing_ratio=packing_node.get("packing_ratio", 1.0),
                 balance_media_tokens=packing_node.get("balance_media_tokens", True),
                 collate_max_length=packing_node.get("collate_max_length", None),
-                attn_implementation=packing_node.get("attn_implementation", None),
                 packing_format=packing_node.get("packing_format", "neat"),
             )
 
@@ -507,11 +539,14 @@ class RecipeConfig:
         )
 
     @staticmethod
-    def resolve_diffusion_dataloader(node: Any) -> "DiffusionDataloaderConfig":
+    def resolve_diffusion_dataloader(
+        node: Any, *, default_drop_last: bool | None = None
+    ) -> "DiffusionDataloaderConfig":
         """Resolve a diffusion dataloader YAML target to its typed config.
 
         Args:
-            node: ``data.dataloader`` config node containing a supported legacy builder target.
+            node: Training or validation config node containing a supported dataloader target.
+            default_drop_last: Override the loader default when the node omits ``drop_last``.
 
         Returns:
             Typed dataloader config whose ``build`` accepts runtime rank and batch-size values.
@@ -548,6 +583,8 @@ class RecipeConfig:
         unknown = sorted(set(kwargs) - valid)
         if unknown:
             raise TypeError(f"Unexpected diffusion dataloader config field(s): {', '.join(unknown)}")
+        if default_drop_last is not None and "drop_last" in valid:
+            kwargs.setdefault("drop_last", default_drop_last)
         if "base_resolution" in kwargs:
             kwargs["base_resolution"] = tuple(kwargs["base_resolution"])
         return config_type(**kwargs)
@@ -557,6 +594,13 @@ class RecipeConfig:
         """Typed diffusion dataloader config resolved from ``data.dataloader``."""
         node = self._raw.get("data.dataloader", None)
         return self.resolve_diffusion_dataloader(node) if node is not None else None
+
+    @cached_property
+    def diffusion_validation_dataloader(self) -> "DiffusionDataloaderConfig" | None:
+        """Typed diffusion validation dataloader config resolved from ``data.validation_dataloader``."""
+        node = self._raw.get("data.validation_dataloader", None)
+        # Validation retains bucket tails without changing existing training/component defaults.
+        return self.resolve_diffusion_dataloader(node, default_drop_last=False) if node is not None else None
 
     @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:
@@ -605,12 +649,17 @@ class RecipeConfig:
     @cached_property
     def mtp(self) -> "MTPLossConfig":
         # MTP loss params are model-driven (scaling_factor comes from the model
-        # output / get_mtp_loss_scaling_factor; ignore_index is fixed) and are not
-        # exposed via YAML.  This typed accessor just lets recipes build MTP through
+        # output / get_mtp_loss_scaling_factor; ignore_index comes from the loss)
+        # and are not exposed via YAML. This typed accessor lets recipes build MTP through
         # the typed-config boundary like the other sections.
+        # distillation_mode is the one experimental exception: an opt-in YAML
+        # `mtp:` block lets a test config select the soft-distillation prototype
+        # without touching the model-driven fields.
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
-        return MTPLossConfig()
+        node = self._raw.get("mtp", None)
+        distillation_mode = _section_kwargs(node).get("distillation_mode", "hard") if node is not None else "hard"
+        return MTPLossConfig(distillation_mode=distillation_mode)
 
     @cached_property
     def prewarm(self) -> "PrewarmConfig | None":
@@ -620,11 +669,35 @@ class RecipeConfig:
         return PrewarmConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
+    def mfu(self) -> "MFUConfig":
+        from nemo_automodel._transformers.mfu import MFUConfig
+
+        node = self._raw.get("mfu", None)
+        return MFUConfig(**_section_kwargs(node)) if node else MFUConfig()
+
+    @cached_property
     def embedding_row_repair(self) -> "EmbeddingRowRepairConfig | None":
         from nemo_automodel.components.training.embedding_row_repair import EmbeddingRowRepairConfig
 
         node = self._raw.get("embedding_row_repair", None)
         return EmbeddingRowRepairConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def domain_mixture(self) -> "DomainMixtureConfig | None":
+        """Resolve the optional named-domain objective configuration."""
+        from nemo_automodel.components.training.domain_mixture import DomainMixtureConfig, DomainWeightConfig
+
+        node = self._raw.get("domain_mixture", None)
+        if node is None:
+            return None
+        kwargs = _section_kwargs(node)
+        domains = kwargs.pop("domains", None)
+        if domains is None:
+            raise ValueError("domain_mixture.domains is required")
+        return DomainMixtureConfig(
+            domains=tuple(DomainWeightConfig(**_as_dict(domain)) for domain in domains),
+            **kwargs,
+        )
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":

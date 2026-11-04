@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from typing import Any, Optional, Union
+from dataclasses import dataclass, replace
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
@@ -23,7 +23,6 @@ from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaC
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
-    initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -31,17 +30,25 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
 from nemo_automodel.components.models.glm_moe_dsa.cp import shard_glm_dsa_packed_cp_batch
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
+from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+def _uses_indexshare(config: GlmMoeDsaConfig) -> bool:
+    """Return whether the model has layers that reuse another layer's DSA indices."""
+    indexer_types = getattr(config, "indexer_types", None)
+    return indexer_types is not None and "shared" in indexer_types
 
 
 class Block(nn.Module):
@@ -164,6 +171,7 @@ class GlmMoeDsaModel(nn.Module):
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=False,
+            router_weights_fp32=True,
             dtype=model_dtype,
         )
         if moe_overrides:
@@ -207,10 +215,27 @@ class GlmMoeDsaModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the decoder stack, returning ``(hidden_states, topk_indices)``.
 
-        ``prev_topk_indices`` seeds the IndexShare running selection (used under pipeline
-        parallelism, where an earlier "full" layer lives on the previous stage); it is ``None``
-        in the single-process path. The returned ``topk_indices`` is the running selection at the
-        end of this stage's layers, so it can be carried to the next pipeline stage.
+        Args:
+            input_ids: Token IDs with shape ``[batch, sequence]`` (or packed
+                ``[tokens]``), or previous-stage hidden states with the matching token
+                axes plus ``[hidden]`` when this pipeline stage has no embedding.
+            position_ids: Optional integer positions with the same token axes as
+                ``input_ids``. Packed THD callers supply shape ``[tokens]``.
+            attention_mask: Optional token mask with shape ``[batch, sequence]`` or
+                additive attention mask broadcastable to ``[batch, heads, query, key]``.
+            padding_mask: Optional boolean mask with the input token axes; ``True``
+                marks padding. Packed THD callers supply shape ``[tokens]``.
+            prev_topk_indices: Optional previous pipeline stage's IndexShare selection,
+                shaped ``[batch, sequence, K]`` or packed ``[tokens, 1, K]``. Packed
+                values are global THD padded-storage K/V coordinates.
+            **attn_kwargs: Attention layout metadata. Packed THD uses ``cu_seqlens``
+                and optional ``cu_seqlens_padded`` of shape ``[sequences + 1]``, plus
+                optional ``glm_dsa_cp_query_indices`` of shape ``[tokens]`` containing
+                global padded-storage query coordinates.
+
+        Returns:
+            Hidden states with the input token axes plus ``[hidden]``, and the latest
+            IndexShare top-k tensor in the corresponding BSHD or packed THD layout.
         """
         if position_ids is None:
             position_ids = (
@@ -227,19 +252,57 @@ class GlmMoeDsaModel(nn.Module):
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
+        if self.backend.attn == "cudnn" and attn_kwargs.get("qkv_format") == "thd":
+            cu_seqlens = attn_kwargs.get("cu_seqlens")
+            if cu_seqlens is None:
+                raise ValueError("cuDNN DSA requires 'cu_seqlens' for packed THD input.")
+            cu_seqlens = cu_seqlens.flatten().to(device=h.device, dtype=torch.int32).contiguous()
+            query_indices = attn_kwargs.get("glm_dsa_cp_query_indices")
+            if query_indices is not None:
+                query_indices = query_indices.flatten().to(device=h.device, dtype=torch.int32).contiguous()
+            cu_seqlens_padded = attn_kwargs.get("cu_seqlens_padded")
+            if cu_seqlens_padded is not None:
+                cu_seqlens_padded = cu_seqlens_padded.flatten().to(device=h.device, dtype=torch.int32).contiguous()
+            cudnn_padding_mask = None
+            if padding_mask is not None:
+                cudnn_padding_mask = padding_mask.flatten().to(device=h.device, dtype=torch.bool).contiguous()
+            cp_size = int(attn_kwargs.get("cp_size", 1))
+            packed_metadata = prepare_cudnn_dsa_packed_metadata(
+                cu_seqlens,
+                h.shape[0] * cp_size,
+                query_indices=query_indices,
+                cu_seqlens_padded=cu_seqlens_padded,
+                padding_mask=cudnn_padding_mask,
+            )
+            attn_kwargs = dict(attn_kwargs)
+            attn_kwargs["cu_seqlens"] = cu_seqlens
+            if query_indices is not None:
+                attn_kwargs["glm_dsa_cp_query_indices"] = query_indices
+            if cu_seqlens_padded is not None:
+                attn_kwargs["cu_seqlens_padded"] = cu_seqlens_padded
+            attn_kwargs["_cudnn_dsa_packed_metadata"] = packed_metadata
+            attn_kwargs["_cudnn_dsa_topk_length"] = packed_metadata.causal_lengths.clamp_max(
+                int(self.config.index_topk)
+            ).contiguous()
+            attn_kwargs["_cudnn_dsa_all_rows_nonempty"] = packed_metadata.all_rows_nonempty
+            attn_kwargs["_cudnn_dsa_valid_row_indices"] = packed_metadata.valid_row_indices
+
         # IndexShare: thread the most recent "full" layer's top-k selection forward so the
-        # following "shared" layers can reuse it. Seeded from `prev_topk_indices` (carried from
-        # the previous pipeline stage); `None` on the first stage / all-"full" configs (GLM-5.1).
-        topk_indices = prev_topk_indices
+        # following "shared" layers can reuse it. Legacy GLM configs have no shared layers, so
+        # avoid retaining and propagating their per-layer selections.
+        uses_indexshare = _uses_indexshare(self.config)
+        topk_indices = prev_topk_indices if uses_indexshare else None
         for layer in self.layers.values():
-            h, topk_indices = layer(
+            h, layer_topk_indices = layer(
                 x=h,
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
-                prev_topk_indices=topk_indices,
+                prev_topk_indices=topk_indices if uses_indexshare else None,
                 **attn_kwargs,
             )
+            if uses_indexshare:
+                topk_indices = layer_topk_indices
 
         h = self.norm(h) if self.norm else h
         return h, topk_indices
@@ -268,6 +331,14 @@ class GlmMoeDsaModel(nn.Module):
 
 class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _packed_cp_attn_backends = ("tilelang", "cudnn")
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+    # Linear CE losses (ChunkedCrossEntropy / FusedLinearCrossEntropy) own the final projection
+    # under pipeline parallelism: the recipe sets ``_pp_return_hidden_states`` on the last stage,
+    # which then emits final hidden states instead of one [T, vocab] logits tensor per in-flight
+    # microbatch (GLM-5.3: 4096 x 154880 fp32 = 2.4 GiB each on an 80 GB H100).
+    _pp_return_hidden_states_supported: bool = True
+    _pp_return_hidden_states: bool = False
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -309,7 +380,11 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
-        self.backend = backend or BackendConfig()
+        resolved_backend = backend or BackendConfig()
+        # HF computes the GLM router projection and selected mixture weights in fp32.
+        if resolved_backend.gate_precision is None:
+            resolved_backend = replace(resolved_backend, gate_precision=torch.float32)
+        self.backend = resolved_backend
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GlmMoeDsaModel(
             config,
@@ -318,9 +393,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_overrides=moe_overrides,
         )
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
-        self.lm_head = initialize_linear_module(
-            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
-        )
+        # Plain torch Linear on purpose: the GLM-5.3 checkpoint keeps lm_head in bf16
+        # (``modules_to_not_convert``) and so do the RL trainer and SGLang, so it must stay out of
+        # the TE FP8 autocast that ``backend.linear='te'`` + ``te_fp8`` would otherwise apply to it.
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = GlmMoeDsaStateDictAdapter(
                 self.config, self.model.moe_config, self.backend, dtype=model_dtype
@@ -343,8 +419,8 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.model.update_moe_gate_bias()
 
     def should_pack_validation_with_training(self) -> bool:
-        """GLM DSA TileLang kernels require validation to use the THD packed layout."""
-        return getattr(self.backend, "attn", None) == "tilelang"
+        """Return whether validation must use the optimized packed THD layout."""
+        return getattr(self.backend, "attn", None) in ("tilelang", "cudnn")
 
     def prepare_model_inputs_for_cp(
         self,
@@ -365,8 +441,12 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             contiguous_local_indices,
         )
 
-        if getattr(self.backend, "attn", None) != "tilelang":
-            raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
+        attn_backend = getattr(self.backend, "attn", None)
+        if attn_backend not in self._packed_cp_attn_backends:
+            raise NotImplementedError(
+                "GLM DSA packed context parallelism requires backend.attn in {'tilelang', 'cudnn'}; "
+                f"got backend.attn={attn_backend!r}."
+            )
 
         cp_sharder = ContextParallelSharder(
             shard_batch=partial(
@@ -398,52 +478,104 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         seq_len: int,
         dtype: torch.dtype,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Declare PP inter-stage I/O metas, threading the IndexShare top-k as a carry tensor.
+        """Declare PP inter-stage I/O metas, adding a top-k carry only for IndexShare models.
 
-        Non-first stages additionally receive the previous "full" layer's top-k selection, and
-        non-last stages emit the running selection, so a stage that begins with a "shared" layer
-        has the top-k it needs (correct at any sequence length).
+        IndexShare models additionally receive and emit the previous "full" layer's top-k
+        selection so a stage that begins with a "shared" layer has the indices it needs. Models
+        with all-full indexers need only the hidden-state channel.
+
+        Args:
+            is_first: Whether this module is the first pipeline stage.
+            microbatch_size: Number of sequences in the pipeline microbatch.
+            seq_len: Sequence or packed-token length represented by the metadata.
+            dtype: Hidden-state and logits dtype.
+
+        Returns:
+            Pair of input and output metadata tuples. Optimized THD stages use hidden-state
+            tensors of shape ``[seq_len, hidden]`` and fixed-width top-k tensors of shape
+            ``[seq_len, 1, index_topk]``. Dense BSHD stages use ``[microbatch, seq_len, hidden]``
+            and ``[microbatch, seq_len, min(index_topk, seq_len)]``. Top-k carry metadata is
+            float32 because pipeline receive buffers require gradients.
         """
         hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
-        # TileLang's fused indexer always returns ``index_topk`` columns. Under
+        # Optimized indexers always return ``index_topk`` columns. Under TileLang
         # CP the query length is sharded (for example 4096 / cp8 = 512), while
         # K/V are gathered inside the model, so capping by the local query
         # length would under-declare the inter-stage carry shape.
         index_topk = int(self.config.index_topk)
-        topk = index_topk if self.backend.attn == "tilelang" else min(index_topk, seq_len)
+        optimized_thd = self.backend.attn in ("tilelang", "cudnn")
+        topk = index_topk if optimized_thd else min(index_topk, seq_len)
 
         def meta(shape: tuple[int, ...], dt: torch.dtype) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dt)
 
         # The inter-stage tensor RANK matches the attention backend's data format, so each stage's
         # forward emits its natural tensors and no per-boundary reshape is needed:
-        #   * TileLang DSA runs in THD (packed; batch folded into the token axis) -> 2D hidden
-        #     ``[T, H]`` and top-k ``[T, 1, topk]`` (the tilelang layout). tilelang implies THD.
+        #   * TileLang/cuDNN DSA run in THD (packed; batch folded into the token axis) -> 2D hidden
+        #     ``[T, H]`` and fixed-width top-k ``[T, 1, topk]``. Both backends imply THD.
         #   * sdpa/te/eager run dense bshd -> 3D hidden ``[B, S, H]`` and top-k ``[B, S, topk]``.
         # Top-k indices cross the boundary as float32: torch.distributed.pipelining calls
         # ``requires_grad_(True)`` on recv buffers and int dtypes can't require grad; float32 holds
-        # the index values losslessly and ``forward`` casts back (int32 for tilelang, int64 dense).
-        thd = self.backend.attn == "tilelang"
-        if thd:
+        # the index values losslessly and ``forward`` casts back (int32 for optimized THD, int64 dense).
+        if optimized_thd:
             hidden_meta = meta((seq_len, hidden_size), dtype)
             topk_meta = meta((seq_len, 1, topk), torch.float32)
         else:
             hidden_meta = meta((microbatch_size, seq_len, hidden_size), dtype)
             topk_meta = meta((microbatch_size, seq_len, topk), torch.float32)
 
+        uses_indexshare = _uses_indexshare(self.config)
         if is_first:
             inputs_meta = (meta((microbatch_size, seq_len), torch.long),)
-        else:
+        elif uses_indexshare:
             inputs_meta = (hidden_meta, topk_meta)
+        else:
+            inputs_meta = (hidden_meta,)
 
-        if self.lm_head is not None:
+        if self.lm_head is not None and not self._pp_return_hidden_states:
             # The last stage emits logits; compute_lm_head_logits restores [1, T, V] under THD.
             outputs_meta = (meta((microbatch_size, seq_len, vocab_size), dtype),)
-        else:
+        elif self.lm_head is not None:
+            # Linear CE owns the projection: the last stage emits the final hidden states in the
+            # same batch-restored layout as the logits ([1, T, H] under THD) and no top-k carry.
+            outputs_meta = (meta((microbatch_size, seq_len, hidden_size), dtype),)
+        elif uses_indexshare:
             outputs_meta = (hidden_meta, topk_meta)
+        else:
+            outputs_meta = (hidden_meta,)
 
         return inputs_meta, outputs_meta
+
+    def _pipeline_last_stage_output(
+        self, hidden: torch.Tensor, logits_to_keep: Union[int, torch.Tensor], is_thd: bool
+    ) -> torch.Tensor:
+        """Return the last pipeline stage's output: logits, or final hidden states for linear CE.
+
+        Args:
+            hidden: Final normalized hidden states in the backend layout (THD: ``[T, H]``;
+                bshd: ``[B, S, H]``).
+            logits_to_keep: Zero to project all positions, a positive integer to project the last
+                N positions, or an integer tensor of shape ``[selected_positions]`` indexing the
+                token/sequence axis. Ignored when returning hidden states; that branch keeps all
+                positions.
+            is_thd: Whether the stage ran in THD layout; a 2D result regains its leading batch dim.
+
+        Returns:
+            Logits of shape ``[batch, selected_sequence, vocab]``, where ``selected_sequence``
+            follows ``logits_to_keep``, or final hidden states of shape ``[batch, sequence, hidden]``
+            when ``_pp_return_hidden_states`` is set. Packed THD output restores a leading batch
+            dimension of one. The hidden-state branch aliases ``hidden`` directly or through an
+            ``unsqueeze`` view and does not mutate it; both branches match the output meta declared
+            by ``get_pipeline_stage_metas``.
+        """
+        if not self._pp_return_hidden_states:
+            return compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
+        # The linear CE loss projects from the hidden states itself, so no full logits tensor is
+        # kept per in-flight microbatch. Restore the leading batch dim like compute_lm_head_logits.
+        if is_thd and hidden.dim() == 2:
+            return hidden.unsqueeze(0)
+        return hidden
 
     def forward(
         self,
@@ -453,7 +585,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast | tuple[torch.Tensor, ...] | torch.Tensor:
         """Forward pass.
@@ -462,18 +594,39 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`, threading the IndexShare
         top-k internally (seeded ``None``).
 
-        Pipeline parallelism: ``input_ids`` is the upstream hidden state on non-first stages and
-        ``*carry`` holds the previous stage's running top-k selection. Non-last stages return
-        ``(hidden_states, topk_indices)`` and the last stage returns the ``logits`` tensor.
+        Pipeline parallelism: ``input_ids`` is the upstream hidden state on non-first stages.
+        IndexShare models additionally use ``*carry`` for the previous stage's running top-k
+        selection. Non-last stages return the declared pipeline outputs and the last stage returns
+        the ``logits`` tensor, or the final hidden states when a linear CE loss has set
+        ``_pp_return_hidden_states``.
 
         Args:
-            input_ids: Token IDs (BSHD ``[B, S]`` / THD ``[1, T]``) on the first stage, or the
-                upstream hidden state on later pipeline stages.
-            carry: Optional ``(topk_indices,)`` carried from the previous pipeline stage.
-            position_ids / attention_mask / padding_mask: Optional masks / positions.
+            input_ids: Token-ID tensor of shape ``[batch, sequence]`` (BSHD) or ``[1, tokens]``
+                (packed THD) on the first stage. On later stages, the upstream hidden-state
+                tensor has shape ``[batch, sequence, hidden]`` or ``[tokens, hidden]``.
+            carry: Optional top-k tensor carried from the previous pipeline stage. Optimized
+                THD backends use float32 ``[tokens, 1, index_topk]``; dense BSHD uses float32
+                ``[batch, sequence, min(index_topk, sequence)]``.
+            position_ids: Optional position-ID tensor of shape ``[batch, sequence]`` or
+                ``[1, tokens]`` for packed THD.
+            attention_mask: Optional key-mask tensor of shape ``[batch, sequence]`` or additive
+                mask of shape ``[batch, 1, sequence, sequence]``.
+            padding_mask: Optional padding-mask tensor of shape ``[batch, sequence]`` or
+                ``[1, tokens]`` for packed THD.
             logits_to_keep: If ``0``, project all positions; else only the last ``logits_to_keep``.
+                A tensor value contains the one-dimensional token indices to project.
             output_hidden_states: When set (single-process), carry final hidden states on the output.
-            **attn_kwargs: Additional arguments forwarded to the base model.
+            **attn_kwargs: Additional attention metadata forwarded to the base model. Packed THD
+                uses an int32 ``cu_seqlens`` tensor of shape ``[sequences + 1]`` and
+                ``qkv_format="thd"``.
+
+        Returns:
+            Single-process execution returns a causal-LM output whose logits tensor has shape
+            ``[batch, sequence, vocab]``. A non-last pipeline stage returns hidden states and
+            float32 top-k carry tensors in the layouts described above; the last stage returns
+            a logits tensor of shape ``[batch, sequence, vocab]``, or the full-sequence final
+            hidden states of shape ``[batch, sequence, hidden]`` when a linear CE loss has set
+            ``_pp_return_hidden_states`` (THD restores a leading batch dimension of one).
         """
 
         output_hidden_states = (
@@ -482,16 +635,18 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             else getattr(self.config, "output_hidden_states", False)
         )
 
+        uses_indexshare = _uses_indexshare(self.config)
+
         # Carry-in arrives as float32 (see get_pipeline_stage_metas, where the pipeline recv
         # buffer must be a grad-capable dtype); restore the int64 index values.
-        carry_in = carry[0] if carry else None
+        carry_in = carry[0] if uses_indexshare and carry else None
         is_thd = attn_kwargs.get("qkv_format") == "thd"
 
         prev_topk_indices = None
         if carry_in is not None:
             # The carry arrives in the backend's natural top-k layout (THD: [T, 1, topk]; bshd:
-            # [B, S, topk]) as float32. tilelang SparseMLA requires int32 indices; the dense path
-            # uses int64. Only the dtype differs -- no reshape (see get_pipeline_stage_metas).
+            # [B, S, topk]) as float32. Optimized THD kernels require int32 indices; the dense
+            # path uses int64. Only the dtype differs -- no reshape (see get_pipeline_stage_metas).
             prev_topk_indices = carry_in.to(torch.int32) if is_thd else carry_in.to(torch.int64)
 
         # THD: squeeze the leading batch dim on EVERY stage. First stage ``input_ids`` is token ids
@@ -519,26 +674,34 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         if self._is_pipeline_parallel_stage():
+            if not uses_indexshare:
+                if self.lm_head is not None:
+                    return self._pipeline_last_stage_output(hidden, logits_to_keep, is_thd)
+                return hidden
+
             # The top-k carry is non-differentiable (integer indices transported as float32), but
             # torch.distributed.pipelining treats every float inter-stage tensor as an activation
             # and demands a gradient for it on backward. We add zero-weight autograd links so the
             # carry it RECEIVES and the carry it SENDS both get a DEFINED (zero) gradient instead of
-            # ``None`` — values are unchanged (``+ x.sum() * 0.0``).
+            # ``None`` — values are unchanged. The received carry's link multiplies before summing
+            # so its gradient is a dense zero tensor: ``sum()`` alone would hand back an expanded
+            # (stride-0) gradient, which the pipeline records as the receive-buffer layout and
+            # P2P backends reject as non-contiguous.
             if self.lm_head is not None:
-                # Last stage: emit logits for the pipeline loss.
-                logits = compute_lm_head_logits(self.lm_head, hidden, logits_to_keep, is_thd=is_thd).logits
+                # Last stage: emit logits (or hidden states for a linear CE loss) for the pipeline loss.
+                output = self._pipeline_last_stage_output(hidden, logits_to_keep, is_thd)
                 if carry_in is not None:
-                    logits = logits + (carry_in.float().sum() * 0.0).to(logits.dtype)
-                return logits
+                    output = output + (carry_in.float() * 0.0).sum().to(output.dtype)
+                return output
             # Non-last stage: emit (hidden, float32 top-k carry) to the next stage. The tensors are
             # already in the backend's natural pipeline shape (THD: [T, H] + [T, 1, topk]; bshd:
             # [B, S, H] + [B, S, topk]) per get_pipeline_stage_metas, so no reshape is needed.
-            # (THD requires packed_sequence_size >= index_topk so the tilelang top-k width matches
-            # the meta's min(index_topk, seq_len).)
+            # Optimized THD indexers always return the fixed ``index_topk`` width declared by
+            # the pipeline metadata, including when it exceeds an individual packed sequence.
             zero_from_hidden = hidden.float().sum() * 0.0  # connected to grad-bearing hidden
             carry_out = topk_indices.to(torch.float32) + zero_from_hidden  # requires grad, value unchanged
             if carry_in is not None:
-                hidden = hidden + (carry_in.float().sum() * 0.0).to(hidden.dtype)  # defines grad(carry_in)
+                hidden = hidden + (carry_in.float() * 0.0).sum().to(hidden.dtype)  # dense zero grad(carry_in)
             return hidden, carry_out
 
         return compute_lm_head_logits(
@@ -563,7 +726,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                     b=cutoff_factor * final_out_std,
                 )
 
-        self.to(dtype)
+        cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
             if isinstance(layer.mlp, MoE):
                 layer.mlp.gate.e_score_correction_bias = torch.zeros(

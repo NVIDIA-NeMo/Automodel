@@ -1,0 +1,106 @@
+# Single-GPU MTP-only finetune for NVIDIA Nemotron 3.5 Lightning 30B-A3B.
+#
+# This checkpoint ships a real pretrained MTP layer (mtp.* weights in its
+# safetensors index). Freezes every other parameter, so training only
+# improves the self-speculative accept length (val_mtp_tau_sim, logged
+# during validation) without touching the base model's main-head quality.
+#
+# Run (single GPU):
+#   automodel examples/llm_finetune/mtp_finetune/nemotron_nano_v3_5_lightning_mtp_finetune.yaml --nproc-per-node 1
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 100000
+  val_every_steps: 50
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  # Reuse the checkpoint's single physical MTP layer for two prediction steps.
+  num_nextn_predict_layers: 2
+  mtp_use_repeated_layer: true
+  mtp_loss_scaling_factor: 0.1
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: torch
+
+compile:
+  enabled: false
+
+checkpoint:
+  enabled: false
+
+freeze_config:
+  freeze_modules:
+  - glob: "*"
+  unfreeze_modules:
+  - glob: "*mtp*"
+
+distributed:
+  strategy: fsdp2
+  dp_size: 1
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  path_or_dataset: rowan/hellaswag
+  split: validation
+  num_samples_limit: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-4
+  weight_decay: 0.1
+
+ci:
+  cluster_tag: gb10
+  recipe_owner: kashif
+  time: "00:20:00"
+  nodes: 1
+  nproc_per_node: 1
+  env_vars:
+    OMP_NUM_THREADS: 8
+    MKL_NUM_THREADS: 8

@@ -14,7 +14,7 @@
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -171,7 +171,7 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         self._quant_shapes_cache: dict[str, tuple] | None = None
 
     def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+        self, state_dict: dict[str, Any], exclude_key_regex: str | None = None, quantization: bool = False, **kwargs
     ) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.
 
@@ -199,10 +199,13 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
             List of (fqn, tensor) tuples in HuggingFace format
         """
         quantization = kwargs.get("quantization", False)
-        quantization = True
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
 
-        if fqn.startswith("model."):
+        # The outer "model." belongs to the native wrapper and is dropped on export.
+        # Adapter keys keep it: they are saved in native layout, and until now that was
+        # decided by them arriving under "base_model.", which the boundary is taking
+        # ownership of. ".lora_" asks the same question without depending on the prefix.
+        if ".lora_" not in fqn and fqn.startswith("model."):
             fqn = fqn[6:]
 
         if fqn.startswith("multi_modal_projector."):
@@ -371,18 +374,21 @@ class KimiK25VLStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter)
         peft_keys = {}
 
         for key, value in effective_state_dict.items():
-            if key.startswith("base_model."):
-                # PEFT adapter namespace. These keys are saved with their native-format
-                # path preserved (including the "base_model.model." outer prefix), so no
-                # HF->native renaming applies — only the per-expert expert-LoRA keys need
-                # recombining into the grouped tensors the model actually holds.
+            if ".lora_" in key:
+                # PEFT adapter factors. These are saved with their native-format path
+                # preserved, so no HF->native renaming applies -- only the per-expert
+                # expert-LoRA keys need recombining into the grouped tensors the model
+                # actually holds. Recognised by ".lora_" rather than the "base_model."
+                # outer prefix, which ModelState owns and #3867 moves out of the adapters'
+                # sight; it is also what export uses for the same decision above.
                 peft_keys[key] = value
             elif key.startswith("language_model.model."):
                 llm_key = key.replace("language_model.model.", "model.")
                 llm_keys[llm_key] = value
             elif key.startswith("language_model.lm_head."):
-                native_key = key.replace("language_model.lm_head.", "lm_head.")
-                native_state_dict[native_key] = value
+                # The VL model's head lives at model.language_model.lm_head.*; a top-level
+                # "lm_head." key matches no parameter and strict=False leaves the head at init.
+                native_state_dict["model." + key] = value
             elif key.startswith("mm_projector."):
                 # Map HF mm_projector keys to our multi_modal_projector structure
                 # mm_projector.proj.0.* -> multi_modal_projector.linear_1.*

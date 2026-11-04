@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Packed sliding-mask semantics follow Hugging Face Transformers (Apache-2.0):
+# https://github.com/huggingface/transformers/pull/46850
+# Revision: 1f3294c82c1d9153a531b7b21b178b432d52a6b4
+# Source: src/transformers/models/gemma4/modeling_gemma4.py, create_masks_for_vision_model.
 
 """Gemma4 MoE NeMo Automodel support.
 
@@ -20,11 +26,14 @@ MoE parallelizer.
 """
 
 from collections.abc import MutableMapping
-from typing import Any, Iterator, Optional, Union
+from typing import Any, Iterator, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
+from torch.nn.attention.flex_attention import BlockMask
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -85,6 +94,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -95,8 +105,14 @@ from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
+from .attention import prepare_gemma4_document_mask
+from .cp_attention import (
+    apply_gemma4_cp_attention_backend_policy,
+    gemma4_vision_group_ids,
+    set_gemma4_cp_dense_metadata,
+)
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
+from .parallelization import PARALLELIZER
 from .sdpa_fp32 import enable_gemma4_sdpa_fp32
 
 
@@ -127,6 +143,11 @@ class _Gemma4KVShareHolder:
     def get_mask_sizes(self, query_length: int, layer_idx=None) -> tuple[int, int]:
         # (kv_length, kv_offset): no cache -> kv spans the current query, zero offset.
         return query_length, 0
+
+    def get_query_offset(self, layer_idx=None) -> int:
+        # No cache -> queries start at position 0. transformers >=5.15 calls this
+        # unguarded from _preprocess_mask_arguments (is_sliding stays hasattr-guarded).
+        return 0
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         return key_states, value_states
@@ -214,7 +235,7 @@ class Gemma4Gate(nn.Module):
 
         # Rollout Routing Replay (R3): owns a handle only when enabled so the
         # default routing path stays a no-op.
-        self.router_replay: Optional[RouterReplay] = RouterReplay() if enable_routing_replay else None
+        self.router_replay: RouterReplay | None = RouterReplay() if enable_routing_replay else None
 
         # Thread dtype explicitly from config.torch_dtype so the router's own
         # params (proj weight + scale) stay aligned with the rest of the model
@@ -236,6 +257,18 @@ class Gemma4Gate(nn.Module):
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
+        """Select experts using FP32 router arithmetic.
+
+        Args:
+            x: Tensor of shape [..., hidden] with arbitrary leading dimensions.
+            token_mask: Optional boolean tensor matching x's leading dimensions;
+                unused by this router.
+            cp_mesh: Optional context-parallel mesh; unused by this router.
+
+        Returns:
+            Weights in the input dtype and integer expert indices, each shaped
+            [..., topk], followed by None for auxiliary loss.
+        """
         # Router math runs in fp32 regardless of parameter/activation storage
         # dtype. With bf16 storage (e.g. bf16 weights + fp32 master weights via
         # TE FusedAdam), bf16 logits can flip top-k expert selection, so keep
@@ -250,7 +283,8 @@ class Gemma4Gate(nn.Module):
         x_norm = self.norm(x).to(torch.float32)
         x_norm = x_norm * self.scale.to(torch.float32) * self.scalar_root_size
 
-        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
@@ -339,7 +373,6 @@ class Gemma4MoEDecoderLayer(nn.Module):
 
         # Reuse HF modules
         self.self_attn = Gemma4Attention(config=config, layer_idx=layer_idx)
-        attach_gemma4_cp_ring_attention(self.self_attn)
         self.mlp = Gemma4MLP(config, layer_idx)
 
         # Norms
@@ -491,10 +524,7 @@ def _build_unpacked_gemma4_causal_mask_mapping(
     past_key_values,
     position_ids: torch.Tensor | None,
     mm_token_type_ids: torch.Tensor | None,
-    pixel_values: torch.Tensor | None,
-    *,
-    is_training: bool,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | BlockMask | None]:
     """Build full and sliding masks for an unpacked Gemma4 batch.
 
     Args:
@@ -508,48 +538,28 @@ def _build_unpacked_gemma4_causal_mask_mapping(
             token positions.
         mm_token_type_ids: Optional tensor of shape ``[batch, sequence]``
             containing multimodal token types.
-        pixel_values: Optional tensor of shape
-            ``[images, channels, height, width]`` containing image pixels. It is
-            forwarded only to the legacy Gemma4 mask builder.
-        is_training: Whether the owning model is in training mode.
 
     Returns:
         Mapping from ``full_attention`` and ``sliding_attention`` to tensors of
         shape ``[batch, 1, query, key]`` or equivalent block masks produced by
-        the active Transformers implementation.
+        the active Transformers implementation. A plain causal FFPA mask may
+        be ``None``; a padded FFPA mask has shape ``[batch, sequence]``.
     """
-    from transformers.models.gemma4 import modeling_gemma4
-
-    legacy_mask_mapping = getattr(modeling_gemma4, "create_causal_mask_mapping", None)
-    if legacy_mask_mapping is not None:
-        return legacy_mask_mapping(
-            config=config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-            mm_token_type_ids=mm_token_type_ids,
-            pixel_values=pixel_values,
-            is_training=is_training,
-        )
-
-    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+    from transformers.models.gemma4.modeling_gemma4 import create_masks_for_vision_model
 
     block_sequence_ids = torch.full(inputs_embeds.shape[:2], -1, device=inputs_embeds.device)
     if mm_token_type_ids is not None:
         block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
-    mask_kwargs = {
-        "config": config,
-        "inputs_embeds": inputs_embeds,
-        "attention_mask": attention_mask,
-        "past_key_values": past_key_values,
-        "position_ids": position_ids,
-        "block_sequence_ids": block_sequence_ids,
-    }
-    return {
-        "full_attention": create_causal_mask(**mask_kwargs),
-        "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-    }
+    # Full layers are causal for every backend, including image batches. Only
+    # sliding layers add image edges, constrained by the sliding-window overlay.
+    return create_masks_for_vision_model(
+        config=config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+        block_sequence_ids=block_sequence_ids,
+    )
 
 
 def _build_packed_gemma4_causal_mask_mapping(
@@ -566,7 +576,23 @@ def _build_packed_gemma4_causal_mask_mapping(
 
     ``packed_seq_ids`` contains 1-based document ids and 0 for padding.
     Full-attention layers remain plain packed causal attention. Sliding layers
-    also include Gemma4's same-image-token bidirectional edges.
+    also include Gemma4's same-image-token bidirectional edges, clipped at the
+    window's left boundary.
+
+    Args:
+        packed_seq_ids: Tensor of shape [batch, sequence] with document ids.
+        mm_token_type_ids: Tensor of shape [batch, sequence] with image tokens
+            marked as 1, on the same device as packed_seq_ids.
+        dtype: Floating-point dtype used for additive masks.
+        sliding_window: Maximum causal lookback including the query, or no limit.
+        as_additive: Return additive masks instead of boolean masks.
+        as_block_mask: Return FlexAttention block masks instead of dense masks.
+        flex_block_size: Query/key block sizes for FlexAttention.
+
+    Returns:
+        Full/sliding masks of shape [batch, 1, query, key], or BlockMask objects
+        with the same logical layout. Padding queries are fully masked in dense
+        masks and attend only key zero in block masks to keep FlexAttention safe.
     """
     if packed_seq_ids.ndim != 2:
         raise ValueError(f"_packed_seq_ids must be a 2D [B, S] tensor, got shape={tuple(packed_seq_ids.shape)}")
@@ -596,17 +622,30 @@ def _build_packed_gemma4_causal_mask_mapping(
             allowed = (q_pack_id == kv_pack_id) & (q_pack_id > 0) & (kv_idx <= q_idx)
             return torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
 
-        def _sliding_mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+        def _sliding_mask_mod(
+            batch_idx: torch.Tensor, head_idx: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ) -> torch.Tensor:
+            """Evaluate one sliding-attention edge.
+
+            Args:
+                batch_idx: Scalar tensor with the batch index.
+                head_idx: Scalar tensor with the head index (mask is head-independent).
+                q_idx: Scalar tensor with the query position in the packed sequence.
+                kv_idx: Scalar tensor with the key position in the packed sequence.
+
+            Returns:
+                Scalar boolean tensor indicating whether the edge is allowed.
+            """
             q_pack_id = packed_seq_ids[batch_idx, q_idx]
             kv_pack_id = packed_seq_ids[batch_idx, kv_idx]
             same_doc = (q_pack_id == kv_pack_id) & (q_pack_id > 0)
             allowed = same_doc & (kv_idx <= q_idx)
-            if sliding_window is not None:
-                allowed = allowed & ((q_idx - kv_idx) < sliding_window)
             q_group = vision_group_ids[batch_idx, q_idx]
             kv_group = vision_group_ids[batch_idx, kv_idx]
             same_vision_group = (q_group == kv_group) & (q_group >= 0)
             allowed = (allowed | same_vision_group) & same_doc
+            if sliding_window is not None:
+                allowed = allowed & ((q_idx - kv_idx) < sliding_window)
             return torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
 
         return {
@@ -636,14 +675,12 @@ def _build_packed_gemma4_causal_mask_mapping(
     causal = kv_positions <= q_positions
 
     full_mask = same_doc & causal
-    sliding_mask = full_mask
-    if sliding_window is not None:
-        sliding_mask = sliding_mask & ((q_positions - kv_positions) < sliding_window)
-
     same_vision_group = (vision_group_ids[:, :, None] == vision_group_ids[:, None, :]) & (
         vision_group_ids[:, :, None] >= 0
     )
-    sliding_mask = (sliding_mask | same_vision_group) & same_doc
+    sliding_mask = (full_mask | same_vision_group) & same_doc
+    if sliding_window is not None:
+        sliding_mask = sliding_mask & ((q_positions - kv_positions) < sliding_window)
 
     full_mask = full_mask.view(batch_size, 1, seq_len, seq_len)
     sliding_mask = sliding_mask.view(batch_size, 1, seq_len, seq_len)
@@ -771,11 +808,8 @@ class Gemma4MoETextModelBackend(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # Build causal masks. When use_bidirectional_attention == "vision" (e.g.
-        # gemma-4-26B-A4B, gemma-4-31B), HF uses create_causal_mask_mapping to
-        # build a vision-aware mask where tokens inside the same vision group
-        # attend to each other bidirectionally (not just causally). Missing this
-        # logic causes gen_kl_error to be ~10x higher on multimodal inputs.
+        # Gemma4 adds same-image bidirectional edges only to sliding layers;
+        # full-attention layers remain causal, including multimodal batches.
         use_vision_bidirectional_mask = getattr(self.config, "use_bidirectional_attention", None) == "vision"
         if use_vision_bidirectional_mask and mm_token_type_ids is None:
             mm_token_type_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
@@ -790,13 +824,14 @@ class Gemma4MoETextModelBackend(nn.Module):
             # local-query/global-key Gemma4 mask from model metadata.
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
         elif use_vision_bidirectional_mask and packed_seq_ids is not None:
+            full_attention_head_dim = self.config.per_layer_config["full_attention"].head_dim
             causal_mask_mapping = _build_packed_gemma4_causal_mask_mapping(
                 packed_seq_ids.to(device=inputs_embeds.device),
                 mm_token_type_ids.to(device=inputs_embeds.device),
                 dtype=inputs_embeds.dtype,
                 sliding_window=getattr(self.config, "sliding_window", None),
                 as_block_mask=getattr(self.config, "_attn_implementation", None) == "flex_attention",
-                flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
+                flex_block_size=(32, 32) if full_attention_head_dim > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
             causal_mask_mapping = _build_unpacked_gemma4_causal_mask_mapping(
@@ -806,8 +841,6 @@ class Gemma4MoETextModelBackend(nn.Module):
                 past_key_values,
                 position_ids,
                 mm_token_type_ids,
-                pixel_values,
-                is_training=self.training,
             )
         else:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -882,11 +915,127 @@ class Gemma4MoEModel(HFGemma4Model):
 
 
 # ---------------------------------------------------------------------------
+# Model-owned context parallelism (shared with Gemma4 Unified)
+# ---------------------------------------------------------------------------
+class Gemma4ContextParallelMixin:
+    """Model-owned contiguous context parallelism for the Gemma4-family conditional-generation models.
+
+    The model owns CP batch sharding and its decoder-layer p2p attention ring. The recipe gets a
+    sharder-only :class:`ContextParallelSharder` from :meth:`prepare_model_inputs_for_cp`; its
+    ``shard_batch`` (:meth:`_cp_shard_batch_aux_only`) installs the ring on first use and records
+    ``cp_mesh``, and the model's forward embeds, splices vision and keeps this rank's contiguous slice.
+    """
+
+    # Gemma4 owns CP batch sharding and its decoder-layer p2p attention ring.
+    _owns_cp_attention = True
+    # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
+    # hands the model the CP submesh; None means the forward embeds/shards nothing
+    # for CP.
+    cp_mesh = None
+
+    def setup_cp_attention(self, cp_mesh) -> None:
+        """Install Gemma4's model-owned p2p ring CP attention (dense path).
+
+        Idempotent: flips the ``_cp_enabled`` flag the forward reads and installs
+        the ring on every self-attn module (each was given a per-module
+        ``setup_cp_attention`` by ``attach_gemma4_cp_ring_attention`` at
+        construction). Invoked from Gemma4's own batch-sharding callable
+        (``_cp_shard_batch_aux_only``) the first time the recipe hands it the CP
+        submesh, so the install is fully model-owned and needs no framework
+        dispatch.
+        """
+        if getattr(self, "_cp_enabled", False):
+            return
+        self._cp_enabled = True
+        for module in self.modules():
+            if module is self:
+                continue
+            module_setup = getattr(module, "setup_cp_attention", None)
+            if callable(module_setup):
+                module_setup(cp_mesh)
+
+    def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        """Gemma4-owned aux-only CP batch sharder that also self-installs the ring.
+
+        Exposed as ``ContextParallelSharder.shard_batch`` by the sharder-only
+        ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
+        submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
+        model-owned path (dense variants are not guaranteed to run the MoE
+        ``apply_cp``), so install the ring here (idempotent) and record
+        ``cp_mesh`` for the forward, which embeds, splices vision and keeps this
+        rank's contiguous slice per microbatch. Only the no-grad aux streams (and
+        the synthesized ``_packed_seq_ids``) are sharded here; ``input_ids`` /
+        ``pixel_values`` / ``mm_token_type_ids`` stay full for the forward.
+        """
+        self.setup_cp_attention(cp_mesh)
+        self.cp_mesh = cp_mesh
+        return make_contiguous_aux_only_shard_cp_batch_and_ctx(
+            cp_mesh,
+            tp_mesh,
+            batch,
+            loss_mask=loss_mask,
+            padding_token_id=padding_token_id,
+        )
+
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Return a sharder-only CP backend; embed + splice + slice happen in forward.
+
+        Sunk (Megatron-style per-microbatch) CP: the returned
+        :class:`ContextParallelSharder` contiguously shards only the no-grad
+        aux streams (labels/position_ids/loss_mask/padding_mask + the synthesized
+        ``_packed_seq_ids`` document map) via
+        :func:`make_contiguous_aux_only_shard_cp_batch_and_ctx` and leaves
+        ``input_ids`` / ``pixel_values`` / ``mm_token_type_ids`` full-length. The
+        forward then embeds, splices vision, builds the ``mm_token_type_ids`` /
+        ``_gemma4_vision_group_ids`` ring metadata (and dense Gemma4's
+        ``per_layer_inputs``) on the full sequence and keeps this rank's contiguous
+        slice, so the embeddings and vision tower are trainable under CP and the
+        PP×CP shared pre-embed graph no longer exists. Nothing is consumed here.
+        Defining this method is the opt-in signal the recipe checks
+        (``hasattr(model, "prepare_model_inputs_for_cp")``).
+
+        Args:
+            batch: The full-sequence batch; left intact (nothing consumed).
+            num_chunks: Accepted for hook-signature parity; unused (contiguous CP).
+        """
+        del num_chunks
+        if batch.get("input_ids") is None:
+            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=self._cp_shard_batch_aux_only,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
+
+
+# ---------------------------------------------------------------------------
 # Top-level conditional-generation model
 # ---------------------------------------------------------------------------
-class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
+class Gemma4ForConditionalGeneration(
+    Gemma4ContextParallelMixin, HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin
+):
     tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
+    # Whole-block activation checkpointing replays each decoder layer during backward.
+    # E2B/E4B tolerate that for two separate reasons, one per kind of layer:
+    #   * non-shared layers are the ones that call `past_key_values.update()`. A
+    #     training forward supplies no cache, so this class injects
+    #     `_Gemma4KVShareHolder`, whose `update()` returns its inputs unchanged --
+    #     the replay writes nothing and no `DynamicCache` is ever built.
+    #   * shared layers do not touch the cache at all; they read their source
+    #     layer's K/V out of HF's separate `shared_kv_states` mapping. Backward
+    #     recomputes blocks in reverse order, so a shared layer replays before its
+    #     source layer rewrites that entry, and reads the forward-era tensors.
+    # The claim is specific to this class: the sibling Gemma4 wrappers
+    # (`gemma4_unified`, `gemma4_drafter`) ride plain HF with an accumulating
+    # `DynamicCache` and must not set this.
+    kv_sharing_survives_checkpoint_replay = True
     # RoPE inv_freq must stay fp32: initialize_weights casts the model to bf16 and
     # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
     # modules afterwards (see llama/rope_utils.py).
@@ -897,16 +1046,67 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     # modules: they hold the vanilla-HF reference (ckpt_robustness tests) to the
     # same fp32 routing contract instead of letting it round the router to bf16.
     _keep_in_fp32_modules_strict = ["router.proj", "router.scale"]
-    # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
-    # hands the model the CP submesh; None means the forward embeds/shards nothing
-    # for CP.
-    cp_mesh = None
     """Gemma4 VL conditional generation model with NeMo MoE backend.
 
     When the checkpoint has ``enable_moe_block=True`` in its text config,
     replaces the HF-native language model with ``Gemma4MoETextModelBackend``
     (NeMo GroupedExperts + Gemma4Gate).  Otherwise falls through to vanilla HF.
     """
+
+    @property
+    def packed_metadata_entry_module(self) -> nn.Module:
+        """Prepare packed masks before this model applies its vision policy."""
+        return self
+
+    def validate_packed_attention_backend(self, attn_implementation: str) -> None:
+        """Reject Flash packing that cannot preserve native vision attention."""
+        text_config = self.config.text_config
+        if (
+            attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+            and text_config.use_bidirectional_attention == "vision"
+        ):
+            raise ValueError(
+                "Gemma4 vision packing requires SDPA or eager attention; Flash varlen cannot preserve "
+                "native image-bidirectional sliding attention."
+            )
+
+    def prepare_document_attention_mask(
+        self,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None,
+        mm_token_type_ids: torch.Tensor | None,
+        document_ids: torch.Tensor | None,
+    ) -> torch.Tensor | dict[str, torch.Tensor] | None:
+        """Compose document attention with the native full/sliding vision policy.
+
+        Args:
+            attention_mask: Compact integer attention IDs [batch, sequence],
+                a mask [batch, 1, sequence, sequence], a prepared mapping of
+                masks with that layout, or None for native masking.
+            mm_token_type_ids: Modality IDs [batch, sequence], or None for text.
+            document_ids: Original document IDs [batch, sequence], or None.
+
+        Returns:
+            Prepared boolean SDPA or additive eager masks [batch, 1, sequence,
+            sequence] for full/sliding layers; otherwise the original input.
+            Native CP returns None because its ring consumer owns masks.
+            No input tensor or model position is modified.
+        """
+        if getattr(self, "_cp_enabled", False):
+            # Native CP owns ring masks; compact IDs already describe its local shard.
+            return None
+        if (
+            document_ids is not None
+            and isinstance(attention_mask, torch.Tensor)
+            and attention_mask.ndim == 2
+            and attention_mask.dtype != torch.bool
+            and not attention_mask.is_floating_point()
+        ):
+            attention_mask = indexed_mask_to_4d_block_causal(attention_mask)
+        if document_ids is not None and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4:
+            return prepare_gemma4_document_mask(
+                self.config.text_config, attention_mask, mm_token_type_ids, document_ids, dtype=self.dtype
+            )
+        return attention_mask
 
     @classmethod
     def get_capabilities(cls, config: "Gemma4Config") -> ModelCapabilities:
@@ -940,7 +1140,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             )
         if getattr(config, "audio_config", None) is not None:
             # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it.
-            # CP supported; TP/PP/EP off. Two features beyond plain-dense 31B were
+            # TP and CP are supported; PP/EP stay off. Two features beyond plain-dense 31B were
             # exercised:
             #   * per-layer inputs (``hidden_size_per_layer_input``): under CP,
             #     built per microbatch on the full sequence inside the forward
@@ -956,16 +1156,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             #     recompute their own K/V -- identical between CP and non-CP, so
             #     parity holds either way (the dead shared-layer K/V projections
             #     are frozen by ``freeze_unused_kv_sharing_params``).
-            # TP is intentionally OFF: HF's ``Gemma4Model.forward`` builds the
-            # per-layer inputs via ``torch.where(multimodal_mask, pad_embedding,
-            # inputs_embeds)`` where ``pad_embedding`` is sliced from the (TP-
-            # sharded) embedding weight. Under DTensor this raises "mixed
-            # torch.Tensor and DTensor" -- an HF-side limitation we cannot fix
-            # without patching frozen transformers source. (Plain-dense 31B has
-            # no ``hidden_size_per_layer_input`` so it skips this branch and TP
-            # works there.)
+            #   * TP: Gemma4's model-owned dense-parallel forward computes PLE
+            #     from token ids and calls the sharded embedding modules instead
+            #     of indexing a DTensor weight inside HF's ``torch.where``.
             return ModelCapabilities(
-                supports_tp=False,
+                supports_tp=True,
                 supports_cp=True,
                 supports_pp=False,
                 supports_ep=False,
@@ -999,49 +1194,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             enable_gemma4_sdpa_fp32()
         return cls.from_config(config, *model_args, **kwargs)
 
-    def setup_cp_attention(self, cp_mesh) -> None:
-        """Install Gemma4's model-owned p2p ring CP attention (dense path).
-
-        Idempotent: flips the ``_cp_enabled`` flag the forward reads and installs
-        the ring on every self-attn module (each was given a per-module
-        ``setup_cp_attention`` by ``attach_gemma4_cp_ring_attention`` at
-        construction). Invoked from Gemma4's own batch-sharding callable
-        (``_cp_shard_batch_aux_only``) the first time the recipe hands it the CP
-        submesh, so the install is fully model-owned -- no framework dispatch is
-        required.
-        """
-        if getattr(self, "_cp_enabled", False):
-            return
-        self._cp_enabled = True
-        for module in self.modules():
-            if module is self:
-                continue
-            module_setup = getattr(module, "setup_cp_attention", None)
-            if callable(module_setup):
-                module_setup(cp_mesh)
-
-    def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-        """Gemma4-owned aux-only CP batch sharder that also self-installs the ring.
-
-        Exposed as ``ContextParallelSharder.shard_batch`` by the sharder-only
-        ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
-        submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
-        model-owned path (dense variants are not guaranteed to run the MoE
-        ``apply_cp``) -- so install the ring here (idempotent) and record
-        ``cp_mesh`` for the forward, which embeds, splices vision and keeps this
-        rank's contiguous slice per microbatch. Only the no-grad aux streams (and
-        the synthesized ``_packed_seq_ids``) are sharded here; ``input_ids`` /
-        ``pixel_values`` / ``mm_token_type_ids`` stay full for the forward.
-        """
-        self.setup_cp_attention(cp_mesh)
-        self.cp_mesh = cp_mesh
-        return make_contiguous_aux_only_shard_cp_batch_and_ctx(
-            cp_mesh,
-            tp_mesh,
-            batch,
-            loss_mask=loss_mask,
-            padding_token_id=padding_token_id,
-        )
+    def _apply_cp_attention_backend_policy(self) -> None:
+        """Apply the model-owned CP attention backend policy to the final module tree."""
+        apply_gemma4_cp_attention_backend_policy(self, Gemma4Attention)
 
     def __init__(
         self,
@@ -1101,16 +1256,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
         if not enable_moe:
-            # Dense Gemma4 — keep vanilla HF model. Attach the model-owned p2p ring
-            # CP attention to each HF self-attn so setup_cp_attention can install it
-            # when CP is enabled. (The MoE path attaches it per Gemma4MoEDecoderLayer.)
-            # ``cp_full_attn_backend: ffpa`` routes the full-attention head_dim=512
-            # ring chunks through the FFPA CuTeDSL kernel (eligibility re-checked per
-            # call in _ring_use_ffpa_varlen); default "flex" preserves prior behavior.
-            use_ffpa_cp = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower() == "ffpa"
-            for module in self.modules():
-                if isinstance(module, Gemma4Attention):
-                    attach_gemma4_cp_ring_attention(module, use_ffpa=use_ffpa_cp)
+            self._apply_cp_attention_backend_policy()
             return
 
         # --- MoE path: replace the text model ---
@@ -1122,6 +1268,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
+        self._apply_cp_attention_backend_policy()
 
         # Expose moe_config for the MoE parallelizer assertion
         self.model.moe_config = self.model.language_model.moe_config
@@ -1181,9 +1328,32 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
+        """Run Gemma4, retaining native image policy for document-causal inputs.
+
+        Args:
+            input_ids: Token IDs [batch, sequence], unless embeddings are supplied.
+            position_ids: Scalar decoder coordinates [batch, sequence].
+            attention_mask: Eligibility [batch, sequence] or an additive/boolean
+                mask [batch, 1, query, key]. A 4D document-causal mask marked by
+                ``_packed_seq_ids`` is composed with native image/window policy.
+            padding_mask: Boolean exclusions [batch, sequence] for native parallel paths.
+            inputs_embeds: Optional token embeddings [batch, sequence, hidden].
+            cache_position: Cache offsets [sequence].
+            pixel_values: Processor patches [images, patches, patch_features].
+            image_position_ids: Processor patch coordinates [images, patches, 2].
+            mm_token_type_ids: Processor modality IDs [batch, sequence].
+            logits_to_keep: Number of trailing logits or token indices [selected].
+            output_hidden_states: Whether to retain decoder hidden states.
+            **kwargs: Other native HF inputs, including original document IDs
+                ``_packed_seq_ids`` [batch, sequence] when packed.
+
+        Returns:
+            Native model output with logits [batch, selected_sequence, vocabulary]
+            and optional hidden states/cache/media features.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -1203,18 +1373,36 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 cache_position = torch.arange(seq_len, device=inputs_embeds.device)
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        if (
+            kwargs.get("_packed_seq_ids") is not None
+            and attention_mask is None
+            and not getattr(self, "_cp_enabled", False)
+        ) or any(kwargs.get(key) is not None for key in ("cu_seq_lens_q", "cu_seq_lens_k")):
+            self.validate_packed_attention_backend(text_config._attn_implementation)
+            if (
+                kwargs.get("_packed_seq_ids") is not None
+                and attention_mask is None
+                and not getattr(self, "_cp_enabled", False)
+            ):
+                raise ValueError("Configure packed attention before forwarding compact Gemma4 attention IDs")
         cp_enabled = getattr(self, "_cp_enabled", False)
+        tp_e_series_enabled = bool(
+            getattr(self, "_gemma4_tp_enabled", False) and getattr(text_config, "hidden_size_per_layer_input", 0)
+        )
         if not getattr(text_config, "enable_moe_block", False):
             per_layer_inputs = kwargs.pop("per_layer_inputs", None)
-            if cp_enabled:
+            if cp_enabled or tp_e_series_enabled:
                 if input_ids is None and inputs_embeds is None:
-                    raise ValueError("Gemma4 CP dense forward requires either input_ids or inputs_embeds.")
+                    raise ValueError("Gemma4 dense parallel forward requires either input_ids or inputs_embeds.")
 
-                # Sunk CP: embed + vision splice + per-layer inputs, then keep this
-                # rank's contiguous slice, per microbatch (see _cp_sunk_prepare_inputs).
-                # inputs_embeds is only pre-supplied on the legacy pre-embedded path,
-                # kept as a fallback; the sharder-only hook leaves input_ids full.
+                # Build embeddings and PLE through their modules instead of
+                # indexing embed_tokens.weight. The latter is a DTensor under TP
+                # and cannot participate in HF's Tensor-only torch.where branch.
+                # With CP, the same helper also keeps this rank's sequence slice.
                 vision_group_ids_local = kwargs.get("_gemma4_vision_group_ids")
+                has_vision_tokens = kwargs.get(
+                    "_gemma4_has_vision_tokens", pixel_values is not None or mm_token_type_ids is not None
+                )
                 if inputs_embeds is None:
                     prepared = self._cp_sunk_prepare_inputs(
                         input_ids=input_ids,
@@ -1226,6 +1414,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     per_layer_inputs = prepared["per_layer_inputs"]
                     mm_token_type_ids = prepared["mm_token_type_ids"]
                     vision_group_ids_local = prepared["_gemma4_vision_group_ids"]
+                    has_vision_tokens = prepared["_gemma4_has_vision_tokens"]
+                elif tp_e_series_enabled and per_layer_inputs is None:
+                    raise ValueError(
+                        "Gemma4 E-series TP requires input_ids when per_layer_inputs are not provided; "
+                        "the sharded embedding table cannot reverse arbitrary inputs_embeds back to token ids."
+                    )
 
                 use_cache = kwargs.pop("use_cache", None)
                 past_key_values = kwargs.pop("past_key_values", None)
@@ -1247,17 +1441,20 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 # rather than a plain causal mask (which corrupts multimodal attention).
                 # mm_token_type_ids / _gemma4_vision_group_ids are the forward-sliced
                 # streams; _packed_seq_ids and padding_mask ride the aux-only sharder.
-                cp_meta = {
-                    "mm_token_type_ids": mm_token_type_ids,
-                    "padding_mask": padding_mask,
-                    "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
-                    "_gemma4_vision_group_ids": vision_group_ids_local,
-                }
-                # Left set (not cleared) so the activation-checkpoint recompute in
-                # backward sees the same metadata; each CP forward overwrites it.
-                for _mod in self.modules():
-                    if getattr(_mod, "_cp_uses_attention_hook", False):
-                        _mod._cp_dense_metadata = cp_meta
+                if cp_enabled:
+                    set_gemma4_cp_dense_metadata(
+                        self,
+                        mm_token_type_ids=mm_token_type_ids,
+                        padding_mask=padding_mask,
+                        packed_seq_ids=kwargs.get("_packed_seq_ids"),
+                        vision_group_ids=vision_group_ids_local,
+                        has_vision_tokens=has_vision_tokens,
+                    )
+
+                # FSDP2 copies plain dict inputs while casting layer arguments.
+                # This model-owned mapping preserves one KV store across all
+                # source and shared layers, including the TP+FSDP path.
+                kwargs.setdefault("shared_kv_states", _FSDPSafeSharedKVStates())
 
                 text_outputs = self.model.language_model(
                     input_ids=None,
@@ -1272,11 +1469,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                     **kwargs,
                 )
                 hidden_states = text_outputs.last_hidden_state
-                logits = compute_lm_head_logits(
-                    self.lm_head,
-                    hidden_states,
-                    logits_to_keep,
-                ).logits
+                logits = self._dense_parallel_lm_head(hidden_states, logits_to_keep)
                 if (final_logit_softcapping := getattr(text_config, "final_logit_softcapping", None)) is not None:
                     logits = logits / final_logit_softcapping
                     logits = torch.tanh(logits)
@@ -1327,6 +1520,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # instead, which FSDP2 leaves as one shared object. setdefault avoids
             # overwriting a store a caller already provided (e.g. the drafter).
             kwargs.setdefault("shared_kv_states", _FSDPSafeSharedKVStates())
+            attention_mask = self.prepare_document_attention_mask(
+                attention_mask, mm_token_type_ids, kwargs.get("document_ids", kwargs.get("_packed_seq_ids"))
+            )
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -1358,6 +1554,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             inputs_embeds = prepared["inputs_embeds"]
             mm_token_type_ids = prepared["mm_token_type_ids"]
             kwargs["_gemma4_vision_group_ids"] = prepared["_gemma4_vision_group_ids"]
+            kwargs["_gemma4_has_vision_tokens"] = prepared["_gemma4_has_vision_tokens"]
             pixel_values = None  # spliced into inputs_embeds; not re-processed downstream
         else:
             if input_ids is not None and inputs_embeds is None:
@@ -1368,6 +1565,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 image_features = self.model.get_image_features(
                     pixel_values, image_position_ids=image_position_ids, return_dict=True
                 ).pooler_output
+                # transformers >=5.15 returns one tensor per image; earlier versions
+                # return them already stacked.
+                if not torch.is_tensor(image_features):
+                    image_features = torch.cat(image_features, dim=0)
                 image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
                 if mm_token_type_ids is not None:
@@ -1413,6 +1614,49 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             hidden_states=hidden_states if output_hidden_states else None,
         )
 
+    def _dense_parallel_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        logits_to_keep: Union[int, torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute dense Gemma4 logits while preserving the E-series tied TP weight.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden], replicated
+                across the Gemma4 tensor-parallel mesh.
+            logits_to_keep: Integer suffix length or 1D token-index tensor selecting
+                the sequence positions whose logits are returned.
+
+        Returns:
+            Tensor of shape [batch, selected_sequence, vocab]. Under E-series TP,
+            this is a DTensor sharded on the vocab axis; otherwise it is a local
+            tensor.
+        """
+        if getattr(self, "_gemma4_tp_enabled", False) and isinstance(self.lm_head.weight, DTensor):
+            if isinstance(logits_to_keep, int) and logits_to_keep == 0:
+                selected_hidden_states = hidden_states
+            else:
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                selected_hidden_states = hidden_states[:, slice_indices, :]
+
+            # The tied vocabulary shard is invoked through F.linear rather than
+            # lm_head.forward (the latter still owns pre-TP module hooks). Match
+            # the shared weight's effective dtype explicitly, mirroring the
+            # dtype boundary enforced by compute_lm_head_logits for other heads.
+            selected_hidden_states = selected_hidden_states.to(self.lm_head.weight.dtype)
+            replicated_hidden_states = DTensor.from_local(
+                selected_hidden_states,
+                device_mesh=self._gemma4_tp_mesh,
+                placements=(Replicate(),),
+                run_check=False,
+            )
+            return F.linear(replicated_hidden_states, self.lm_head.weight)
+        return compute_lm_head_logits(
+            self.lm_head,
+            hidden_states,
+            logits_to_keep,
+        ).logits
+
     def _get_special_image_mask(
         self,
         input_ids: torch.Tensor,
@@ -1453,42 +1697,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             raise ValueError("Gemma4 per-layer inputs require a valid pad_token_id.")
         return pad_token_id
 
-    def prepare_model_inputs_for_cp(
-        self,
-        batch: dict[str, Any],
-        *,
-        num_chunks: int = 1,
-    ) -> dict[str, Any]:
-        """Return a sharder-only CP backend; embed + splice + slice happen in forward.
-
-        Sunk (Megatron-style per-microbatch) CP: the returned
-        :class:`ContextParallelSharder` contiguously shards only the no-grad
-        aux streams (labels/position_ids/loss_mask/padding_mask + the synthesized
-        ``_packed_seq_ids`` document map) via
-        :func:`make_contiguous_aux_only_shard_cp_batch_and_ctx` and leaves
-        ``input_ids`` / ``pixel_values`` / ``mm_token_type_ids`` full-length. The
-        forward (:meth:`_cp_sunk_prepare_inputs`) then embeds, splices vision,
-        builds ``per_layer_inputs`` and the ``mm_token_type_ids`` /
-        ``_gemma4_vision_group_ids`` ring metadata on the full sequence and keeps
-        this rank's contiguous slice, so the embeddings and vision tower are
-        trainable under CP and the PP×CP shared pre-embed graph no longer exists.
-        Nothing is consumed here. Defining this method is the opt-in signal the
-        recipe checks (``hasattr(model, "prepare_model_inputs_for_cp")``).
-
-        Args:
-            batch: The full-sequence batch; left intact (nothing consumed).
-            num_chunks: Accepted for hook-signature parity; unused (contiguous CP).
-        """
-        del num_chunks
-        if batch.get("input_ids") is None:
-            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
-        return {
-            "cp_sharder": ContextParallelSharder(
-                shard_batch=self._cp_shard_batch_aux_only,
-                local_token_global_indices=contiguous_local_indices,
-            )
-        }
-
     def _cp_sunk_prepare_inputs(
         self,
         *,
@@ -1514,7 +1722,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             ``inputs_embeds`` and ``per_layer_inputs`` (this rank's contiguous
             slice; ``per_layer_inputs`` is None when the variant has none) plus the
             sliced ``mm_token_type_ids`` / ``_gemma4_vision_group_ids`` ring
-            metadata.
+            metadata and a rank-uniform ``_gemma4_has_vision_tokens`` flag.
         """
         cp_mesh = self.cp_mesh
         special_image_mask = self._get_special_image_mask(input_ids, mm_token_type_ids)
@@ -1525,6 +1733,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             image_features = self.model.get_image_features(
                 pixel_values, image_position_ids=image_position_ids, return_dict=True
             ).pooler_output
+            # transformers >=5.15 returns one tensor per image; earlier versions
+            # return them already stacked.
+            if not torch.is_tensor(image_features):
+                image_features = torch.cat(image_features, dim=0)
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
@@ -1534,6 +1746,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         # the FULL sequence, so it must be built here before the slice.
         mm_full = mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
         vision_group_ids_full = gemma4_vision_group_ids(mm_full)
+        # This is a rank-uniform Python flag because CP receives the full multimodal
+        # inputs on every rank. Avoid inspecting tensor contents here: ``.item()``
+        # would add a host/device synchronization to every training microbatch.
+        has_vision_tokens = pixel_values is not None or mm_token_type_ids is not None
 
         # Keep this rank's contiguous slice of every grad-carrying / per-token
         # stream, on the same layout the aux-only sharder used (pad sentinels match
@@ -1554,6 +1770,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             "per_layer_inputs": per_layer_inputs,
             "mm_token_type_ids": mm_local,
             "_gemma4_vision_group_ids": vision_group_local,
+            "_gemma4_has_vision_tokens": has_vision_tokens,
         }
 
     @torch.no_grad()
@@ -1564,8 +1781,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ) -> None:
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            for p in self.parameters():
-                p.data = p.data.to(dtype)
+            cast_model_to_dtype(self, dtype)
             return
 
         # Guard: HF's super().__init__() calls post_init() -> init_weights() ->
@@ -1588,4 +1804,5 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
 
 if _GEMMA4_HF_AVAILABLE:
+    Gemma4ForConditionalGeneration.parallelizer = PARALLELIZER
     ModelClass = Gemma4ForConditionalGeneration

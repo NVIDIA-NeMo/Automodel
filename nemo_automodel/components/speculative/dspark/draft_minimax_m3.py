@@ -27,8 +27,6 @@ attention and routed experts belong to the target model, not this draft (the
 draft is always dense, matching the DeepSeek V4 DSpark draft's convention).
 """
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -128,7 +126,7 @@ class MiniMaxM3DSparkAttention(nn.Module):
         target_hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
@@ -199,11 +197,11 @@ class MiniMaxM3DSparkDecoderLayer(nn.Module):
 
     def forward(
         self,
-        target_hidden_states: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        cos: Optional[torch.Tensor] = None,
-        sin: Optional[torch.Tensor] = None,
+        target_hidden_states: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
@@ -370,8 +368,8 @@ class MiniMaxM3DSparkModel(nn.Module):
     def predict_confidence_step(
         self,
         hidden_states: torch.Tensor,
-        prev_token_ids: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+        prev_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         if self.confidence_head is None:
             return None
         if self.confidence_head_with_markov:
@@ -388,7 +386,7 @@ class MiniMaxM3DSparkModel(nn.Module):
         *,
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, proposal_len = base_logits.shape[:2]
         if proposal_len == 0:
@@ -414,7 +412,7 @@ class MiniMaxM3DSparkModel(nn.Module):
         *,
         prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
-        hidden_states: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert base_logits.ndim == 2, (
             f"sample_draft_token_step expects base_logits shaped [batch, vocab], got {tuple(base_logits.shape)}."
@@ -437,9 +435,9 @@ class MiniMaxM3DSparkModel(nn.Module):
         self,
         *,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden_states: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del kwargs
@@ -462,7 +460,7 @@ class MiniMaxM3DSparkModel(nn.Module):
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        target_last_hidden_states: Optional[torch.Tensor] = None,
+        target_last_hidden_states: torch.Tensor | None = None,
     ) -> DSparkForwardOutput:
         bsz, seq_len = input_ids.shape
         device = input_ids.device

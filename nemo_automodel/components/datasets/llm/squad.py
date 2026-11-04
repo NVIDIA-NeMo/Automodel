@@ -56,7 +56,7 @@ def _formatting_prompts_func_with_chat_template(
 ):
     context = example.get("context", None) or ""
     question = example.get("question", None) or ""
-    answer = example["answers"]["text"][0].strip()
+    answer = example["answers"]["text"][0].strip() if example["answers"]["text"] else ""
 
     formatted_text = [
         {"role": "user", "content": f"Context: {context} Question: {question} Answer: "},

@@ -1,0 +1,60 @@
+recipe: TrainEagle3Recipe
+
+# EAGLE-4 stage 1: train the draft itself. Same recipe as EAGLE-3.1 plus
+# ``recipe_args.eagle4``, which gives the draft layer a sliding window and
+# writes the LlamaForCausalLMEagle4 draft config. EAGLE-4 drafts score the full
+# target vocabulary, so ``draft_vocab_size`` stays unset.
+#
+# Stage 2 (qwen3_8b_eagle4_candidate_head.yaml) trains the low-rank candidate
+# head on top of this run's final checkpoint; export the stage-2 checkpoint with
+#   python -m nemo_automodel.components.speculative.eagle.export_eagle4 \
+#       <stage-2 checkpoint>/model/consolidated --output-dir <export_dir>
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-8B
+  draft_attn_implementation: flash_attention_2
+  train_data_path: ./cache/dataset/perfectblend-qwen3-8b-regen-messages
+  val_data_path: null
+  train_split: null
+  val_split: null
+  output_dir: ./outputs/eagle4_qwen3_8b
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 7
+  freeze_embeddings: true
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+  packed_sequence_size: 4096
+
+  # EAGLE-3.1 drafter toggles; EAGLE-4 builds on both.
+  fc_norm: true
+  norm_output: true
+
+  eagle4:
+    # Context keys the draft layer attends to, itself included (null = full
+    # attention). Keep it below seq_length so training exercises the window
+    # the serving engine applies on long contexts.
+    sliding_window: 2048
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle4_qwen3_8b/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final
+
+ci:
+  cluster_tag: h100

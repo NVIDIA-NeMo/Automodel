@@ -27,3 +27,17 @@ def test_ministral3_recipe_uses_bf16_checkpoint() -> None:
 
     assert raw_config["model"]["pretrained_model_name_or_path"] == EXPECTED_CHECKPOINT
     assert raw_config["tokenizer"]["pretrained_model_name_or_path"] == EXPECTED_CHECKPOINT
+
+
+def test_ministral3_tokenizer_config_uses_tokenizers_backend_policy() -> None:
+    """The shipped recipe must use the explicit serialized-tokenizer policy."""
+    raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    tokenizer_config = raw_config["tokenizer"]
+
+    assert tokenizer_config["_target_"] == "nemo_automodel.NeMoAutoTokenizer.from_pretrained"
+    assert tokenizer_config["tokenizer_backend"] == "tokenizers"
+    assert tokenizer_config["fix_mistral_regex"] is True
+    assert tokenizer_config["split_special_tokens"] is True
+    assert tokenizer_config["add_bos_token"] is True
+    assert tokenizer_config["add_eos_token"] is False
+    assert "force_hf" not in tokenizer_config

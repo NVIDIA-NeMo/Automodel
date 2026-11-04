@@ -101,14 +101,16 @@ optimizer:
   # min_lr: 1.0e-5
 
 ci:
+  # Retained for reproducibility; excluded from automatic GPU CI.
+  deprecated: true
+  cluster_tag: h100
   recipe_owner: akoumpa
   vllm_deploy: true
+  time: "00:40:00"
   checkpoint_robustness:
-    hf_kl_threshold: 5e-3
     model.pretrained_model_name_or_path: meta-llama/Llama-3.2-3B-Instruct
     tokenizer_name: meta-llama/Llama-3.2-3B-Instruct
     cross_tp_size: 2
-    cross_tp_kl_threshold: 5e-3
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
 

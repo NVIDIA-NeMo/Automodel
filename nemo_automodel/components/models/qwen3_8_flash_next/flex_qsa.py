@@ -1,0 +1,302 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""FlexAttention execution of Qwen3.8-Flash-Next token-indexed sparse GQA.
+
+One code path serves every training layout: dense right-padded batches,
+packed (THD) rows, and context parallelism (local queries against gathered
+global K/V) all reduce to "each query row attends exactly to its route IDs".
+The routes are scattered into a boolean membership table, FlexAttention's
+BlockMask skips fully-masked 128x128 tiles, and the kernel avoids materializing
+dense attention scores. Rows whose routes are all ``-1`` (padding queries)
+produce exactly zero output and zero gradients.
+"""
+
+from __future__ import annotations
+
+import functools
+from dataclasses import dataclass
+
+import torch
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+
+@dataclass(frozen=True)
+class FlexQSAMask:
+    """Route-derived FlexAttention mask for one QSA layer call.
+
+    Attributes:
+        block_mask: ``BlockMask`` over ``[batch, query_length, kv_length]`` built from the
+            routed token IDs and shared by all heads.
+        has_routes: Boolean tensor of shape ``[batch, query_length]`` marking query rows with
+            at least one real route; rows without routes are zeroed after attention.
+        query_length: Number of query rows the mask was built for.
+        kv_length: Number of physical K/V rows the mask was built for.
+    """
+
+    block_mask: BlockMask
+    has_routes: torch.Tensor
+    query_length: int
+    kv_length: int
+
+
+_FLEX_BLOCK_SIZE = 128
+
+
+@functools.cache
+def _compiled_flex():
+    """Compile lazily so CPU-only imports never trigger inductor."""
+    return torch.compile(flex_attention, dynamic=False)
+
+
+def _routes_to_membership(
+    selected_token_ids: torch.Tensor,
+    kv_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scatter route IDs into a boolean membership table.
+
+    Args:
+        selected_token_ids: Global route IDs ``[B, S_q, K]``; negative or
+            out-of-range entries are padding.
+        kv_length: Number of physical K/V rows.
+
+    Returns:
+        Kernel-safe boolean membership ``[B, S_q, kv_length]`` and a boolean
+        ``[B, S_q]`` marking rows that selected at least one real token. Rows
+        without a real route select K/V row zero solely to keep the kernel's
+        softmax finite; the caller erases their output afterward.
+    """
+    batch_size, query_length, _ = selected_token_ids.shape
+    valid = (selected_token_ids >= 0) & (selected_token_ids < kv_length)
+    # scatter_ resolves duplicate indices nondeterministically, and every
+    # padding slot clamps onto index zero, so a padding False could evict a
+    # genuine True at token zero. scatter_add_ sums duplicates instead.
+    hit_counts = torch.zeros(batch_size, query_length, kv_length, dtype=torch.int32, device=selected_token_ids.device)
+    safe_ids = selected_token_ids.long().clamp(min=0, max=kv_length - 1)
+    hit_counts.scatter_add_(-1, safe_ids, valid.to(torch.int32))
+    membership = hit_counts > 0
+    has_routes = valid.any(dim=-1)
+    # FlexAttention's behavior for a fully-masked softmax row is not a stable
+    # contract. Route empty query rows to one finite score so neither forward
+    # nor backward can form 0/0; their result is masked out below.
+    membership[..., 0] |= ~has_routes
+    return membership, has_routes
+
+
+def _membership_flat_offset(
+    batch_idx: torch.Tensor,
+    query_idx: torch.Tensor,
+    kv_idx: torch.Tensor,
+    query_length: int,
+    kv_length: int,
+) -> torch.Tensor:
+    """Flat offset into a ``[B, S_q, kv_length]`` membership table, evaluated in int64.
+
+    FlexAttention inlines ``mask_mod`` into its Triton template and emits that
+    inlined index arithmetic in int32. The membership table crosses
+    ``INT32_MAX`` once ``B * S_q * kv_length > 2**31`` -- a square 46341-token
+    sequence is already past it -- and from that point ``query_idx * kv_length``
+    wraps negative inside the kernel. The wrapped address still lands in mapped
+    memory for a while, so the tail queries silently read a wrong mask before
+    the failure escalates to ``CUDA error: an illegal memory access`` at larger
+    sequence lengths. Widening the operands here keeps the generated address
+    arithmetic in int64.
+
+    Args:
+        batch_idx: Scalar batch coordinate supplied by FlexAttention.
+        query_idx: Scalar query coordinate, already clamped in range.
+        kv_idx: Scalar key/value coordinate, already clamped in range.
+        query_length: Number of query rows in the membership table.
+        kv_length: Number of physical K/V rows in the membership table.
+
+    Returns:
+        int64 offset of ``[batch_idx, query_idx, kv_idx]`` in the flattened table.
+    """
+    flat_query = batch_idx.to(torch.int64) * query_length + query_idx.to(torch.int64)
+    return flat_query * kv_length + kv_idx.to(torch.int64)
+
+
+def build_flex_qsa_mask(
+    selected_token_ids: torch.Tensor,
+    *,
+    kv_length: int,
+    device: torch.device,
+) -> FlexQSAMask:
+    """Build the FlexAttention mask for a set of routed token IDs.
+
+    Building the mask is the CPU-heavy part of the flex QSA path (a scatter into a
+    ``[B, S_q, kv_length]`` table followed by ``create_block_mask``). Callers that
+    evaluate the same routes twice, checkpoint forward and recompute, build it once
+    and hand it to :func:`flex_sparse_gqa_attention`.
+
+    Args:
+        selected_token_ids: int32/int64 route IDs ``[B, S_q, K]`` in global K/V
+            coordinates; ``-1`` and out-of-range entries are padding.
+        kv_length: Number of physical K/V rows.
+        device: CUDA device the attention will run on.
+
+    Returns:
+        The block mask, the ``[B, S_q]`` has-routes marker, and the extents it was built for.
+    """
+    if selected_token_ids.ndim != 3:
+        raise ValueError(f"selected_token_ids must be [B, S_q, K]; got {tuple(selected_token_ids.shape)}")
+    batch_size, query_length, _ = selected_token_ids.shape
+    membership, has_routes = _routes_to_membership(selected_token_ids, kv_length)
+    # Looked up through a flat int64 offset rather than membership[b, q, kv]:
+    # the inlined mask_mod indexes this table in int32, which overflows for
+    # long sequences. See _membership_flat_offset.
+    membership_flat = membership.reshape(-1)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        # FlexAttention pads Q/KV to block multiples and probes the padded
+        # coordinates; clamp the lookup and gate on in-range indices so the
+        # padding region can never alias real membership entries.
+        in_range = (q_idx < query_length) & (kv_idx < kv_length)
+        safe_q = torch.clamp(q_idx, max=query_length - 1)
+        safe_kv = torch.clamp(kv_idx, max=kv_length - 1)
+        offset = _membership_flat_offset(b, safe_q, safe_kv, query_length, kv_length)
+        return in_range & membership_flat[offset]
+
+    block_mask = _block_mask_from_membership(membership, mask_mod)
+    return FlexQSAMask(block_mask=block_mask, has_routes=has_routes, query_length=query_length, kv_length=kv_length)
+
+
+def _dense_blocks_to_ordered(dense_blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row block counts and column order, matching ``torch.nn.attention.flex_attention``.
+
+    Args:
+        dense_blocks: Boolean block occupancy ``[B, H, num_q_blocks, num_kv_blocks]``.
+
+    Returns:
+        int32 counts ``[B, H, num_q_blocks]`` and int32 kv-block indices
+        ``[B, H, num_q_blocks, num_kv_blocks]`` with the selected blocks first in
+        ascending order (stable descending argsort of the 0/1 occupancy).
+    """
+    occupancy = dense_blocks.to(torch.int32)
+    num_blocks = occupancy.sum(dim=-1)
+    indices = torch.argsort(occupancy, dim=-1, descending=True, stable=True)
+    return num_blocks.to(torch.int32).contiguous(), indices.to(torch.int32).contiguous()
+
+
+def _block_mask_from_membership(
+    membership: torch.Tensor,
+    mask_mod,
+    block_size: int = _FLEX_BLOCK_SIZE,
+) -> BlockMask:
+    """Build the FlexAttention ``BlockMask`` directly from the dense membership table.
+
+    ``create_block_mask`` would evaluate ``mask_mod`` through vmap at every
+    ``[B, S_q, KV]`` coordinate only to recover the membership table this module
+    already holds, then reduce it to block occupancy. The vmap evaluation is a
+    long chain of small host-side ops (about 8 ms per QSA layer on GB200);
+    reducing the existing table costs a handful of launches and yields the same
+    block structure. ``mask_mod`` is still attached so the kernel can resolve
+    partial blocks element-wise.
+
+    Args:
+        membership: Boolean ``[B, S_q, KV]`` table; ``True`` where a query may
+            attend a K/V row. ``S_q`` and ``KV`` need not be block multiples.
+        mask_mod: Element-wise FlexAttention mask function consistent with
+            ``membership`` inside ``[0, S_q) x [0, KV)`` and ``False`` outside.
+        block_size: Square sparse block size of the BlockMask.
+
+    Returns:
+        A ``BlockMask`` over ``[B, S_q, KV]`` with heads broadcast (``H = 1``),
+        equal to ``create_block_mask(mask_mod, B, None, S_q, KV)``.
+    """
+    batch_size, query_length, kv_length = membership.shape
+    padded_q = -(-query_length // block_size) * block_size
+    padded_kv = -(-kv_length // block_size) * block_size
+    padded = torch.nn.functional.pad(membership, (0, padded_kv - kv_length, 0, padded_q - query_length))
+    tiles = padded.view(batch_size, 1, padded_q // block_size, block_size, padded_kv // block_size, block_size)
+    tile_counts = tiles.permute(0, 1, 2, 4, 3, 5).sum(dim=(-2, -1))
+    full_tile = block_size * block_size
+    full_blocks = tile_counts == full_tile
+    partial_blocks = (tile_counts > 0) & ~full_blocks
+    kv_num_blocks, kv_indices = _dense_blocks_to_ordered(partial_blocks)
+    full_kv_num_blocks, full_kv_indices = _dense_blocks_to_ordered(full_blocks)
+    return BlockMask.from_kv_blocks(
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        BLOCK_SIZE=(block_size, block_size),
+        mask_mod=mask_mod,
+        seq_lengths=(query_length, kv_length),
+    )
+
+
+def flex_sparse_gqa_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    selected_token_ids: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    mask: FlexQSAMask | None = None,
+) -> torch.Tensor:
+    """Run route-sparse GQA through FlexAttention.
+
+    Args:
+        query: BF16 CUDA queries ``[B, S_q, Hq, D]``.
+        key: BF16 CUDA keys ``[B, S_kv, Hkv, D]``. ``S_kv`` may differ from
+            ``S_q``; under context parallelism it is the gathered global
+            length.
+        value: BF16 CUDA values ``[B, S_kv, Hkv, D]``.
+        selected_token_ids: int32/int64 route IDs ``[B, S_q, K]`` in global
+            K/V coordinates; ``-1`` and out-of-range entries are padding.
+        softmax_scale: Positive QK scale, defaulting to ``1 / sqrt(D)``.
+        mask: Optional mask previously built from ``selected_token_ids`` with
+            :func:`build_flex_qsa_mask`; built here when omitted.
+
+    Returns:
+        BF16 attention output ``[B, S_q, Hq, D]``. Padding-query rows are
+        exactly zero, matching the PyTorch oracle contract.
+    """
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        raise ValueError("flex QSA expects [B, S, H, D] query/key/value")
+    if key.shape != value.shape:
+        raise ValueError(f"key and value shapes must match, got {tuple(key.shape)} and {tuple(value.shape)}")
+    batch_size, query_length, num_query_heads, head_dim = query.shape
+    kv_length, num_kv_heads = key.shape[1], key.shape[2]
+    if num_kv_heads <= 0 or num_query_heads % num_kv_heads != 0:
+        raise ValueError(f"flex QSA requires Hq divisible by Hkv, got Hq={num_query_heads}, Hkv={num_kv_heads}")
+    if selected_token_ids.ndim != 3 or selected_token_ids.shape[:2] != (batch_size, query_length):
+        raise ValueError(
+            f"selected_token_ids must be [B, S_q, K] matching the queries; got {tuple(selected_token_ids.shape)}"
+        )
+    scale = head_dim**-0.5 if softmax_scale is None else float(softmax_scale)
+
+    if mask is None:
+        mask = build_flex_qsa_mask(selected_token_ids, kv_length=kv_length, device=query.device)
+    elif mask.query_length != query_length or mask.kv_length != kv_length:
+        raise ValueError(
+            "flex QSA mask extents disagree with the query/key tensors; "
+            f"mask=({mask.query_length}, {mask.kv_length}), tensors=({query_length}, {kv_length})"
+        )
+    block_mask, has_routes = mask.block_mask, mask.has_routes
+    output = _compiled_flex()(
+        query.permute(0, 2, 1, 3),
+        key.permute(0, 2, 1, 3),
+        value.permute(0, 2, 1, 3),
+        block_mask=block_mask,
+        scale=scale,
+        enable_gqa=True,
+    ).permute(0, 2, 1, 3)
+    # Padding-query rows (no real routes) must be exactly zero in both output
+    # and gradient, matching the oracle and the padded-gap training contract.
+    return output.masked_fill(~has_routes[:, :, None, None], 0)
+
+
+__all__ = ["FlexQSAMask", "build_flex_qsa_mask", "flex_sparse_gqa_attention"]

@@ -13,13 +13,13 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig
-from transformers.generation import GenerationConfig, GenerationMixin
+from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
@@ -29,17 +29,27 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
+from nemo_automodel.components.models.common.mtp import (
+    MTPContextParallelInputs,
+    prepare_mtp_context_parallel_inputs,
+)
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import (
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+    generation_config_from_model_config,
+    restore_pretrained_generation_config,
+)
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block
 from nemo_automodel.components.models.nemotron_v3.mtp import (
     _resolve_block_types_per_sublayer,
     build_mtp_config_from_hf,
     build_nemotron_v3_mtp,
 )
+from nemo_automodel.components.models.nemotron_v3.parallelization import PARALLELIZER
 from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import NemotronV3StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -57,8 +67,8 @@ class NemotronHCausalLMOutputWithPast(CausalLMOutputWithPast):
     which rebuild ``ModelOutput`` instances from declared fields only.
     """
 
-    mtp_per_depth_h: Optional[list[torch.Tensor]] = None
-    mtp_loss_scaling_factor: Optional[float] = None
+    mtp_per_depth_h: list[torch.Tensor] | None = None
+    mtp_loss_scaling_factor: float | None = None
 
 
 class NemotronV3Model(nn.Module):
@@ -313,6 +323,19 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     # Skip patch_hf_model_for_pp; our forward already handles PP routing.
     _pp_keep_self_forward: bool = True
 
+    def get_experts_implementation(self) -> dict[str, str | None]:
+        """Return the configured expert backend for Transformers generation hooks."""
+        return {"": getattr(self.config, "_experts_implementation", None)}
+
+    def set_experts_implementation(self, experts_implementation: str | dict[str, str | None]) -> None:
+        """Set the expert backend used by Transformers generation hooks."""
+        implementation = (
+            experts_implementation
+            if isinstance(experts_implementation, str)
+            else experts_implementation.get("", getattr(self.config, "_experts_implementation", None))
+        )
+        self.config._experts_implementation = implementation
+
     @classmethod
     def get_capabilities(cls, config) -> ModelCapabilities:
         """Return parallelism capabilities for a specific Nemotron-H config.
@@ -325,7 +348,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         is_moe = getattr(config, "n_routed_experts", None) is not None or "moe" in (
             getattr(config, "layers_block_type", None) or []
         )
-        return ModelCapabilities(supports_cp=True, supports_pp=True, supports_ep=is_moe)
+        return ModelCapabilities(supports_cp=True, supports_pp=True, supports_ep=is_moe, supports_mtp_cp=True)
 
     @classmethod
     def from_config(
@@ -364,7 +387,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             NemotronHForCausalLM instance
         """
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
-        return cls.from_config(config, *model_args, **kwargs)
+        model = cls.from_config(config, *model_args, **kwargs)
+        # The checkpoint's own generation settings win over the config-derived
+        # defaults, as in PreTrainedModel.from_pretrained.
+        restore_pretrained_generation_config(model, pretrained_model_name_or_path)
+        return model
 
     def __init__(
         self,
@@ -455,8 +482,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 dtype=dtype,
             )
 
-        # Required by GenerationMixin.generate().
-        self.generation_config = GenerationConfig()
+        # Required by GenerationMixin.generate(). Seeded from the model config like
+        # PreTrainedModel does, so eos/bos/pad are set: the consolidated export writes
+        # this object to generation_config.json, and a blank one there leaves the
+        # exported model with no stop token.
+        self.generation_config = generation_config_from_model_config(config)
 
     @property
     def device(self) -> torch.device:
@@ -486,7 +516,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         Wraps every decoder block (and MTP block, when present) with a
         non-reentrant checkpoint wrapper so that block activations are recomputed
         during the backward pass instead of being stored. This is the single-GPU
-        entry point: ``FSDP2Manager.parallelize`` calls it when ``world_size == 1``
+        entry point: ``ModelParallelizer.parallelize`` calls it when ``world_size == 1``
         (the expert-parallel path performs the equivalent wrapping inside the MoE
         parallelizer's ``apply_ac``). Without it, the hybrid Mamba2/Attention MoE
         keeps every block's activations live, which is what pushes single-GPU LoRA
@@ -585,6 +615,41 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             embeds.append(self.model.embed_tokens(cur_input_ids))
         return tuple(embeds)
 
+    def prepare_mtp_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        ignore_index: int = -100,
+    ) -> MTPContextParallelInputs | None:
+        """Prepare global MTP futures before context-parallel sharding.
+
+        The recipe calls this hook while ``batch`` is still in global sequence
+        order. It shifts future-token IDs, positions, and loss targets without
+        crossing packed-sequence boundaries. The recipe then shards each tensor
+        with the same :class:`ContextParallelSharder` instance as the main
+        inputs, avoiding both rank-local rolls and an all-gather.
+
+        Args:
+            batch: Unsharded model batch containing ``input_ids`` and ``labels``
+                with shape ``[batch, sequence]``. Missing ``position_ids`` are
+                synthesized in global order. ``seq_idx``, ``_packed_seq_ids``,
+                raw ``seq_lens_padded``, or ``cu_seqlens`` may describe
+                packed-sequence boundaries.
+            ignore_index: Fill value for invalid MTP loss targets.
+
+        Returns:
+            Globally ordered tensors for every enabled MTP depth, or ``None``
+            when MTP is disabled.
+        """
+        if not self.mtp_config.enabled:
+            return None
+
+        return prepare_mtp_context_parallel_inputs(
+            batch,
+            num_depths=self.mtp_config.num_layers,
+            ignore_index=ignore_index,
+        )
+
     def customize_pipeline_stage_modules(
         self,
         module_names_per_stage: list[list[str]],
@@ -653,20 +718,24 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
         *mtp_embed_inputs: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        causal_mask_mapping: Optional[dict[str, torch.Tensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Any] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        causal_mask_mapping: dict[str, torch.Tensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        past_key_values: Any | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
+        mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
+        padding_mask: torch.Tensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        compute_logits: bool = True,
+        compute_mtp: bool = True,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
         """Forward pass with optional loss computation.
@@ -701,6 +770,16 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             use_cache: Whether to return ``past_key_values`` for subsequent steps.
             cache_position: Token position indices for cache updates.
             position_ids: Position IDs (forwarded into MTP sublayer kwargs).
+            mtp_per_depth_input_ids: Optional globally shifted future-token IDs,
+                one tensor per MTP depth. Each tensor has shape [batch,
+                sequence], or [tokens] for THD, matching the local CP layout.
+                When supplied, MTP embeds these tensors directly instead of
+                rolling rank-local ``input_ids``.
+            mtp_per_depth_position_ids: Optional pre-computed future-token
+                position IDs, one tensor per MTP depth. Each tensor has shape
+                [batch, sequence], or [tokens] for THD, matching the local CP
+                layout of ``position_ids``. When supplied, MTP consumes these
+                tensors directly instead of rolling rank-local positions.
             padding_mask: Padding mask ``[B, S]`` used by the THD squeeze helper
                 and as the MoE / mamba 2D mask source.
             logits_to_keep: If > 0, only compute logits for the last
@@ -708,10 +787,21 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             output_hidden_states: Whether to return hidden states.
             return_dict: Accepted for API compatibility (always returns a
                 ``NemotronHCausalLMOutputWithPast`` off-PP).
+            compute_logits: Whether to materialize logits. Fused-linear loss callers
+                may disable this off-PP when they consume final hidden states directly.
+            compute_mtp: Whether to run the auxiliary MTP head. Disabling it
+                keeps its parameters and checkpoint topology intact for RL.
+                Only supported off-PP; defaults to True.
             **kwargs: Additional arguments forwarded to the base model
                 (e.g. ``qkv_format``, ``cu_seqlens``, ``cu_seqlens_padded``,
                 ``max_seqlen``, ``seq_idx``, ``cp_rank``, ``cp_size``,
-                ``_packed_seq_ids``).
+                ``_packed_seq_ids``). For THD, ``cu_seqlens_padded`` is an
+                integer tensor [documents + 1] or [1, documents + 1] of global
+                physical token offsets, including document padding, with optional
+                trailing -1000 sentinels. It differs from ``cu_seqlens``, which
+                accumulates real attention lengths, and from rank-local token
+                IDs. ``seq_idx`` and ``_packed_seq_ids`` contain per-token
+                document IDs [batch, sequence] in the local input layout.
 
         Returns:
             Off-PP: :class:`NemotronHCausalLMOutputWithPast` with ``logits``,
@@ -722,12 +812,33 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
               * mid stages: ``(hidden_states, *mtp_embed_inputs)`` arity ``1 + D``.
               * last stage: ``(logits, *mtp_per_depth_h, seq_idx)`` arity
                 ``1 + D + 1`` when MTP is enabled, else ``logits`` alone.
+                The int32 ``seq_idx`` tensor [batch, sequence] identifies
+                documents in that microbatch's physical token layout; its loss
+                must consume the same microbatch. Hidden states and MTP
+                embeddings have shape [batch, sequence, hidden], and logits
+                have shape [batch, sequence, vocab].
         """
         is_pp_stage = self._is_pipeline_parallel_stage()
+        if is_pp_stage and not compute_mtp:
+            raise ValueError("compute_mtp=False is only supported off-PP")
         is_first_stage = getattr(self.model, "embed_tokens", None) is not None
         has_lm_head = self.lm_head is not None
         mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
+        # CP shards are not contiguous sequence slices. MTP therefore cannot
+        # derive future-token embeddings or positions by rolling rank-local
+        # tensors; callers must provide both globally shifted tensors.
+        mtp_active = (
+            compute_mtp and self.mtp is not None and (self.training or (self.compute_mtp_in_eval and not use_cache))
+        )
+        cp_size = int(kwargs.get("cp_size", 1) or 1)
+        if cp_size > 1 and mtp_active:
+            precomputed_token_sources = int(bool(mtp_embed_inputs)) + int(mtp_per_depth_input_ids is not None)
+            if precomputed_token_sources != 1 or mtp_per_depth_position_ids is None:
+                raise ValueError(
+                    "Context-parallel MTP requires exactly one of precomputed per-depth embeddings or input IDs, "
+                    "together with per-depth position IDs"
+                )
 
         # Neat-packed SDPA: convert _packed_seq_ids (1-based [B,S] int, 0=pad)
         # to mamba's seq_idx and derive a 2D padding_mask. The neat collater
@@ -774,6 +885,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             attention_mask = None
             causal_mask_mapping = None
 
+        # Non-first PP stages skip squeeze_input_for_thd. Resolve this once
+        # per microbatch here so backbone and MTP attention reuse the same flag.
+        if squeeze_for_thd and kwargs.get("cu_seqlens_padded") is not None and kwargs.get("pad_between_seqs") is None:
+            kwargs["pad_between_seqs"] = not torch.equal(kwargs["cu_seqlens_padded"], kwargs["cu_seqlens"])
+
         # MoE needs a padding_mask; derive from attention_mask when missing.
         if padding_mask is None and attention_mask is not None and attention_mask.dim() == 2:
             padding_mask = attention_mask.bool().logical_not()
@@ -799,7 +915,12 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         if past_key_values is not None:
             past_key_values.has_previous_state = True
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        if compute_logits:
+            logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        else:
+            if labels is not None or is_pp_stage:
+                raise ValueError("compute_logits=False is only supported off-PP without labels.")
+            logits = hidden_states.new_empty((*hidden_states.shape[:-1], 0))
 
         loss = None
         # PP path defers loss to PipelineCausalLMLoss; only compute here off-PP.
@@ -817,7 +938,6 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         # Run the MTP heads in training, or in eval when explicitly requested for
         # validation acceptance metrics. Never on the cached generation path —
         # decoding feeds one token at a time and must not pay the MTP cost.
-        mtp_active = self.mtp is not None and (self.training or (self.compute_mtp_in_eval and not use_cache))
         if mtp_active:
             mtp_attention_mask = (
                 causal_mask_mapping.get("full_attention") if causal_mask_mapping is not None else attention_mask
@@ -835,6 +955,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 "qkv_format",
                 "cu_seqlens",
                 "cu_seqlens_padded",
+                "pad_between_seqs",
                 "max_seqlen",
                 "max_seqlen_q",
                 "max_seqlen_kv",
@@ -862,6 +983,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
             # tensors for the same reason.
             mtp_hidden = hidden_states
             mtp_embeds_for_call = tuple(mtp_embed_inputs) if mtp_embed_inputs else ()
+            mtp_input_ids_for_call = mtp_per_depth_input_ids
+            mtp_position_ids_for_call = mtp_per_depth_position_ids
             # SALM / multimodal: when inputs_embeds (pre-fused audio+text) are present
             # and no PP embeddings were provided, pre-roll them per depth so audio
             # positions carry the correct audio embedding rather than embed_fn(padding_id).
@@ -874,18 +997,40 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                     cur_emb = roll_tensor(cur_emb, shifts=-1, dim=-2)
                     salm_embed_inputs.append(cur_emb)
                 mtp_embeds_for_call = tuple(salm_embed_inputs)
-            if is_thd:
+            if squeeze_for_thd:
                 if mtp_hidden.dim() == 3 and mtp_hidden.shape[0] == 1:
                     mtp_hidden = mtp_hidden.squeeze(0)
                 mtp_embeds_for_call = tuple(
                     e.squeeze(0) if (e.dim() == 3 and e.shape[0] == 1) else e for e in mtp_embeds_for_call
                 )
+                if mtp_input_ids_for_call is not None:
+                    mtp_input_ids_for_call = tuple(
+                        ids.squeeze(0) if (ids.dim() == 2 and ids.shape[0] == 1) else ids
+                        for ids in mtp_input_ids_for_call
+                    )
+                if mtp_position_ids_for_call is not None:
+                    mtp_position_ids_for_call = tuple(
+                        p.squeeze(0) if (p.dim() == 2 and p.shape[0] == 1) else p for p in mtp_position_ids_for_call
+                    )
+            if mtp_position_ids_for_call is not None:
+                mtp_kwargs["position_ids_per_depth"] = mtp_position_ids_for_call
+
+            if mtp_embeds_for_call and mtp_input_ids_for_call is not None:
+                raise ValueError("MTP per-depth input IDs cannot be combined with pre-computed embeddings")
 
             if mtp_embeds_for_call:
                 # Final PP stage: embeddings produced upstream.
                 mtp_per_depth_h = self.mtp(
                     hidden_states=mtp_hidden,
                     embed_inputs=mtp_embeds_for_call,
+                    **mtp_kwargs,
+                )
+            elif mtp_input_ids_for_call is not None:
+                # Context parallel: IDs were shifted globally, then sharded.
+                mtp_per_depth_h = self.mtp(
+                    hidden_states=mtp_hidden,
+                    input_ids_per_depth=mtp_input_ids_for_call,
+                    embed_fn=self.model.embed_tokens,
                     **mtp_kwargs,
                 )
             else:
@@ -896,7 +1041,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                     embed_fn=self.model.embed_tokens,
                     **mtp_kwargs,
                 )
-            if is_thd and mtp_per_depth_h is not None:
+            if squeeze_for_thd and mtp_per_depth_h is not None:
                 mtp_per_depth_h = [h.unsqueeze(0) if h.dim() == 2 else h for h in mtp_per_depth_h]
         elif pp_mtp_enabled and has_lm_head:
             # Eval, or no MTP on this rank — emit empties to keep tuple arity.
@@ -919,7 +1064,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
                 assert mtp_per_depth_h is not None
                 # seq_idx tail sources, in order of preference:
                 #   1. kwargs["seq_idx"] (neat-path).
-                #   2. derived from kwargs["cu_seqlens"] (THD/TE path).
+                #   2. derived from kwargs["cu_seqlens_padded"] (physical THD offsets).
                 #   3. all-1 sentinel — loss-fn cross-boundary mask is a no-op.
                 if logits.dim() == 3:
                     _B, _S = logits.shape[:2]
@@ -930,13 +1075,16 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
                 _seq_idx_tail = kwargs.get("seq_idx", None)
                 if not isinstance(_seq_idx_tail, torch.Tensor):
-                    _cu = kwargs.get("cu_seqlens", None)
+                    _cu = kwargs.get("cu_seqlens_padded")
+                    if _cu is None and (is_thd or kwargs.get("cu_seqlens") is not None):
+                        raise ValueError("Packed MTP requires cu_seqlens_padded for physical document boundaries")
                     if isinstance(_cu, torch.Tensor):
                         _cu1d = _cu.squeeze(0) if (_cu.dim() == 2 and _cu.shape[0] == 1) else _cu
                         if _cu1d.dim() == 1:
+                            _cu1d = _cu1d[_cu1d != -1000]
                             _positions = torch.arange(_S, device=_cu1d.device)
                             # ``right=True`` so a position equal to a boundary
-                            # (first token of sub-seq k, position == cu_seqlens[k])
+                            # (first token of sub-seq k, position == cu_seqlens_padded[k])
                             # maps to k, not k-1 — matches mtp.py and layers.py.
                             _seq_idx_1d = torch.searchsorted(_cu1d[1:].contiguous(), _positions, right=True).to(
                                 torch.int32
@@ -990,11 +1138,11 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Any] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = True,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        past_key_values: Any | None = None,
+        cache_position: torch.LongTensor | None = None,
+        use_cache: bool | None = True,
         **kwargs,
     ) -> dict:
         """Prepare model inputs for each generation step.
@@ -1074,9 +1222,9 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
         Args:
             buffer_device: Device to use for buffer initialization
-            dtype: Target dtype for model weights
+            dtype: Target dtype for model weights; prepared per-parameter storage is preserved.
         """
-        buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        buffer_device = buffer_device or next(self.parameters()).device
         with buffer_device:
             self.model.initialize_weights(buffer_device=buffer_device)
             if self.lm_head is not None:
@@ -1088,4 +1236,5 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))
 
 
+NemotronHForCausalLM.parallelizer = PARALLELIZER
 ModelClass = NemotronHForCausalLM

@@ -142,6 +142,11 @@ async def _run_workload(
             "temperature": gen_cfg.temperature,
             "top_p": gen_cfg.top_p,
         }
+        # Omitted when unset: OpenAI has no top_k, and the engines that accept it
+        # as an extra treat -1 (not 0) as "disabled", so sending 0 would truncate
+        # the distribution to nothing.
+        if gen_cfg.top_k > 0:
+            payload["top_k"] = gen_cfg.top_k
         async with semaphore:
             try:
                 return await _chat_completion(session, url, payload, timeout_s=timeout_s, max_retries=max_retries)

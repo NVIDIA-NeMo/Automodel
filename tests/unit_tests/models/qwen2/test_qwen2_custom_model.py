@@ -23,7 +23,6 @@ from transformers import AutoModelForCausalLM, Qwen2Config, set_seed
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen2.model import Qwen2Attention
-from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
 
 set_seed(42)
 
@@ -86,7 +85,7 @@ class TestQwen2Model:
         )
 
     @pytest.mark.parametrize("rms_norm", ["torch_fp32", "te"])
-    def test_model_matches_hf_with_adapter_bidirectional(self, rms_norm, tmp_path):
+    def test_model_matches_hf_bidirectional(self, rms_norm, tmp_path):
         """Test bidirectional conversion between HF and custom models produces identical outputs.
 
         Parametrized over:
@@ -106,7 +105,6 @@ class TestQwen2Model:
 
         checkpoint = _create_checkpoint(TINY_DEFAULT_QWEN2_CONFIG, tmp_path)
         config = Qwen2Config.from_pretrained(checkpoint)
-        adapter = Qwen2StateDictAdapter(config)
 
         # Load HF model
         qwen2_model_hf = (
@@ -139,13 +137,10 @@ class TestQwen2Model:
 
         # Test forward direction: HF → Custom
         hf_state_dict = qwen2_model_hf.state_dict()
-        custom_state_dict_from_hf = adapter.from_hf(hf_state_dict)
-        # Use nn.Module.load_state_dict directly to bypass mixin (testing adapter, not mixin)
         # Note: strict=False because HF checkpoints don't have TE's _extra_state keys
-        torch.nn.Module.load_state_dict(qwen2_model_custom, custom_state_dict_from_hf, strict=False)
+        torch.nn.Module.load_state_dict(qwen2_model_custom, hf_state_dict, strict=False)
 
-        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
-        s = adapter.to_hf(torch.nn.Module.state_dict(qwen2_model_custom))
+        s = qwen2_model_custom.state_dict()
 
         for n1, p1 in hf_state_dict.items():
             p2 = s[n1]
@@ -174,9 +169,7 @@ class TestQwen2Model:
         )
 
         # Test reverse direction: Custom → HF
-        # Use nn.Module.state_dict directly to get native format (testing adapter, not mixin)
-        custom_state_dict = torch.nn.Module.state_dict(qwen2_model_custom)
-        hf_state_dict_from_custom = adapter.to_hf(custom_state_dict)
+        hf_state_dict_from_custom = qwen2_model_custom.state_dict()
 
         # Create new HF model and load converted state dict
         qwen2_model_hf_converted = (

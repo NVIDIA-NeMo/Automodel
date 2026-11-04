@@ -15,7 +15,7 @@
 import contextlib
 import logging
 import sys
-from typing import Any, Callable, Dict, Optional, cast
+from typing import Any, Callable, Dict, cast
 
 import torch
 import torch.distributed as dist
@@ -23,7 +23,7 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
-def configure_mlflow(cfg: Any) -> Optional[Any]:
+def configure_mlflow(cfg: Any) -> Any | None:
     """Configure MLflow on rank 0 and start (or resume) a run.
 
     Also installs a `sys.excepthook` so crashed jobs report as FAILED rather
@@ -70,7 +70,7 @@ def configure_mlflow(cfg: Any) -> Optional[Any]:
 
 def flatten_params_for_mlflow(
     params: Dict[str, Any],
-    max_depth: Optional[int] = 1,
+    max_depth: int | None = 1,
     prefix: str = "",
     _depth: int = 0,
 ) -> Dict[str, str]:
@@ -178,5 +178,5 @@ def _install_mlflow_failure_hook() -> None:
                 mlflow.end_run(status="FAILED")
         prev_excepthook(exc_type, exc_val, exc_tb)
 
-    hook._mlflow_failure_hook = True  # type: ignore[attr-defined]
+    setattr(hook, "_mlflow_failure_hook", True)
     sys.excepthook = hook

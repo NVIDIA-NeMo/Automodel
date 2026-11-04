@@ -13,7 +13,7 @@
 # limitations under the License.
 
 default:
-  image: ghcr.io/astral-sh/uv:0.8.22-python3.10-bookworm
+  image: ghcr.io/astral-sh/uv:0.8.22-python3.12-bookworm
   tags:
     - nemollm-common-aws
   interruptible: true
@@ -60,7 +60,7 @@ variables:
 lint:
   stage: lint
   variables:
-    UV_PYTHON: "3.10"
+    UV_PYTHON: "3.12"
   timeout: 10 minutes
   before_script:
     - uv sync --locked --only-group linting
@@ -74,7 +74,7 @@ lint:
 secret-detection:
   stage: lint
   variables:
-    UV_PYTHON: "3.10"
+    UV_PYTHON: "3.12"
     GIT_DEPTH: "0"
     RUNNER_SCRIPT_TIMEOUT: "5m"
   timeout: 10 minutes
@@ -89,7 +89,7 @@ secret-detection:
 recipe-validation:
   stage: lint
   variables:
-    UV_PYTHON: "3.10"
+    UV_PYTHON: "3.12"
     GIT_DEPTH: "0"
     RUNNER_SCRIPT_TIMEOUT: "5m"
   timeout: 10 minutes

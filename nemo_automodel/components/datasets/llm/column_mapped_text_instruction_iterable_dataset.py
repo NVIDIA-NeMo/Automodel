@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Union
 
 from torch.utils.data import IterableDataset
 
@@ -34,12 +34,12 @@ logger = logging.getLogger(__name__)
 
 def _load_streaming_dataset(
     path_or_dataset_id: Union[str, List[str]],
-    split: Optional[str] = None,
+    split: str | None = None,
     streaming: bool = False,
-    name: Optional[str] = None,
-    delta_storage_options: Optional[Dict[str, str]] = None,
-    delta_version: Optional[int] = None,
-    delta_sql_query: Optional[str] = None,
+    name: str | None = None,
+    delta_storage_options: Dict[str, str] | None = None,
+    delta_version: int | None = None,
+    delta_sql_query: str | None = None,
 ):
     """Load a dataset from HuggingFace Hub, local JSON/JSONL files, or Delta Lake tables.
 
@@ -189,19 +189,19 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
         column_mapping: Dict[str, str],
         tokenizer,
         *,
-        split: Optional[str] = None,
-        name: Optional[str] = None,
+        split: str | None = None,
+        name: str | None = None,
         answer_only_loss_mask: bool = True,
-        seq_length: Optional[int] = None,
+        seq_length: int | None = None,
         padding: Union[str, bool] = "do_not_pad",
         truncation: Union[str, bool] = "do_not_truncate",
-        start_of_turn_token: Optional[str] = None,
-        limit_dataset_samples: Optional[int] = None,
+        start_of_turn_token: str | None = None,
+        limit_dataset_samples: int | None = None,
         repeat_on_exhaustion: bool = True,
         use_hf_chat_template: bool = False,
-        delta_storage_options: Optional[Dict[str, str]] = None,
-        delta_version: Optional[int] = None,
-        delta_sql_query: Optional[str] = None,
+        delta_storage_options: Dict[str, str] | None = None,
+        delta_version: int | None = None,
+        delta_sql_query: str | None = None,
     ) -> None:
         if tokenizer is None:
             raise ValueError("Tokenizer is required")
@@ -302,7 +302,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
             self.dataset = self.dataset.shard(num_shards, index)
         return self
 
-    def shuffle(self, buffer_size: int = 1000, seed: Optional[int] = None):
+    def shuffle(self, buffer_size: int = 1000, seed: int | None = None):
         if self.dataset is not None and callable(getattr(self.dataset, "shuffle", None)):
             self.dataset = self.dataset.shuffle(buffer_size=buffer_size, seed=seed)
         return self

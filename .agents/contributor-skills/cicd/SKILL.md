@@ -34,8 +34,10 @@ include:
 Use the Conventional Commit title format in `AGENTS.md`, without bracket prefixes
 (e.g., `ci: expand internal CPU checks`). This applies to GitLab MRs too.
 
-See `CONTRIBUTING.md` for the full PR workflow, area/type labels, and DCO
-requirements.
+The `Validate PR title` check enforces this. Never use bracket-prefixed styles
+such as `[model] feat: …` — they fail validation.
+
+See `CONTRIBUTING.md` for DCO requirements.
 
 ### Branch Naming
 

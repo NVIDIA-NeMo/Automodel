@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Dict, Iterable, Iterator, Optional
+from typing import Any, Dict, Iterable, Iterator
 
 
 class ReservoirSampler:
@@ -33,7 +33,7 @@ class ReservoirSampler:
     yielded.
     """
 
-    def __init__(self, iterator: Iterable[Dict[str, Any]], buffer_size: int, seed: Optional[int] = None):
+    def __init__(self, iterator: Iterable[Dict[str, Any]], buffer_size: int, seed: int | None = None):
         """
         Reservoir sampler is a sampler that samples items from an iterator using a buffer.
         It is used to sample items from an iterator in a way that is memory efficient.
@@ -59,7 +59,7 @@ class ReservoirSampler:
         rng = random.Random(self._seed)
         it = iter(self._iterable)
 
-        buffer: list[Optional[Dict[str, Any]]] = []
+        buffer: list[Dict[str, Any] | None] = []
         for item in it:
             buffer.append(item)
             if len(buffer) == self._buffer_size:

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import pathlib
@@ -28,7 +29,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig
+from transformers import AutoConfig, LlamaConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -50,9 +51,12 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
     build_cached_eagle3_dataloader,
     read_manifest,
 )
+from nemo_automodel.components.datasets.llm.offline_cache import ensure_supervision_options_match
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_k3.config import KimiK3TextConfig
@@ -62,8 +66,15 @@ from nemo_automodel.components.speculative.eagle import (
     HFEagle3TargetModel,
     simulated_accept_length,
 )
-from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
+from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
+from nemo_automodel.components.speculative.eagle.eagle4 import (
+    CANDIDATE_HEAD_KEYS,
+    Eagle4CandidateHeadConfig,
+    Eagle4Config,
+)
+from nemo_automodel.components.speculative.eagle.registry import DraftSpec, resolve_eagle3_draft_spec
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
+from nemo_automodel.components.speculative.eagle.target import default_eagle3_aux_layer_ids
 from nemo_automodel.components.speculative.regen_loop import RegenRunner, resolve_regen_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
@@ -74,6 +85,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    read_load_metadata_with_gloo,
     should_sync_grads,
 )
 from nemo_automodel.recipes.llm.peagle_recipe import PeagleRecipeMixin
@@ -214,39 +226,65 @@ def _validate_cp_gates(
     target_attn_implementation: str | None = None,
     seq_length: int | None = None,
     cp_zigzag: bool = False,
+    cp_mode: str = "ring",
 ) -> None:
-    """Reject context-parallel combinations the EAGLE-3 target path cannot honor.
+    """Reject context-parallel combinations the EAGLE-3 path cannot honor.
 
-    CP shards the target forward along the sequence and forces ``is_causal`` (the
-    self_attn hooks strip the attention_mask), so it is incompatible with sequence
-    packing (which needs the 4D block-causal mask) and with the remote backend
-    (whose target runs out-of-process). Under CP the frozen target must route
-    through HuggingFace ``F.scaled_dot_product_attention`` -- that is the call the
-    K/V-gather hook intercepts -- and the draft runs the flash-attn ring, so all of
-    the target-backend / kernel / divisibility preconditions are checked here so a
-    misconfig fails at setup rather than mid-forward.
+    Two CP compute modes are supported for the draft:
+
+    * ``"ring"`` shards the frozen target too and forces ``is_causal`` (the
+      self_attn K/V-gather hook strips the attention_mask), so it is incompatible
+      with sequence packing (which needs the 4D block-causal mask); it pins the
+      flash-attn 2.8.x ring kernels and needs the HF-SDPA target so the hook can
+      intercept ``F.scaled_dot_product_attention``.
+    * ``"ulysses"`` runs the draft attention as an all-to-all over the full
+      (gathered) sequence, so it composes with packing and leaves the target on its
+      normal forward -- only sequence divisibility by ``cp_size`` applies.
+
+    The remote backend is unsupported under CP in either mode (the target runs
+    out-of-process). Preconditions are checked here so a misconfig fails at setup
+    rather than mid-forward.
     """
-    if cp_size > 1 and backend == "remote":
+    if cp_size <= 1:
+        return
+    if cp_mode not in ("ring", "ulysses"):
+        raise ValueError(f"Unknown cp_mode={cp_mode!r}; expected 'ring' or 'ulysses'.")
+    if backend == "remote":
         raise NotImplementedError(
             "Context parallelism (cp_size>1) is only supported with the colocated target "
             "backend; the remote backend runs the target out-of-process."
         )
-    if cp_size > 1 and packed_sequence_size > 0:
+    if cp_mode == "ulysses":
+        if cp_zigzag:
+            raise NotImplementedError(
+                "cp_zigzag is a ring-only sharding layout; set cp_zigzag=false for "
+                "cp_mode=ulysses (the all-to-all path is inherently load-balanced)."
+            )
+        # Ulysses reuses the ring's flash-attn dense/varlen private kernels, pinned to
+        # the 2.8.x positional signature, so require that exact version (not just import).
+        from nemo_automodel.components.speculative.eagle.ring_attention import require_flash_attn_version
+
+        require_flash_attn_version()
+        if seq_length is not None and seq_length % cp_size != 0:
+            raise ValueError(
+                f"Context parallelism (ulysses) requires seq_length ({seq_length}) divisible by cp_size ({cp_size})."
+            )
+        return
+    # ring mode
+    if packed_sequence_size > 0:
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) is not yet supported with sequence packing; CP "
-            "strips the 4D block-causal mask that packing relies on. Set cp_size=1 or "
+            "Context parallelism cp_mode=ring is not supported with sequence packing; the ring is "
+            "single-document causal. Use cp_mode=ulysses for CP + packing, or set cp_size=1 / "
             "packed_sequence_size=0."
         )
-    if cp_size <= 1:
-        return
     if not target_force_hf:
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+            "Context parallelism (cp_mode=ring) requires recipe_args.target_force_hf=true so the "
             "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
         )
     if target_attn_implementation != "sdpa":
         raise NotImplementedError(
-            "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa. "
+            "Context parallelism (cp_mode=ring) requires recipe_args.target_attn_implementation=sdpa. "
             "The K/V-gather hook intercepts F.scaled_dot_product_attention; any other backend "
             "(e.g. flash_attention_2, the HF auto-select default when flash-attn is installed) "
             "bypasses the hook, so each rank silently attends only its own shard."
@@ -297,6 +335,41 @@ def _best_effort(label: str, fn) -> None:
         logger.exception("error %s during cleanup", label)
 
 
+def _validate_cached_eagle3_manifest(
+    cache_dir: str, manifest: dict, draft_base_config, *, mask_reasoning_content: bool, mask_generation_prompt: bool
+) -> None:
+    """Validate that an EAGLE-3 offline cache matches the configured target and recipe options.
+
+    The cached trainer streams the precomputed aux features, draft-vocab targets
+    and ``loss_mask``/``position_mask`` as stored, so the target's vocabulary and
+    width and the recipe's mask options must be the ones the producer
+    (``precompute_eagle3``) ran with; a mismatch would otherwise crash
+    deep inside the draft or, for the mask, train silently on the wrong tokens.
+    """
+    if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
+        raise ValueError(
+            f"EAGLE-3 cache at {cache_dir} was built for target_vocab_size={manifest['target_vocab_size']}, "
+            f"but the configured target has {draft_base_config.vocab_size}. The cache does not match this target."
+        )
+    # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
+    # cache from a different-width target would otherwise crash deep inside
+    # ``fc`` with a confusing shape error.
+    expected_aux_dim = int(draft_base_config.hidden_size) * 3
+    if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
+        raise ValueError(
+            f"EAGLE-3 cache at {cache_dir} has aux_hidden_dim={manifest['aux_hidden_dim']}, but the configured "
+            f"target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 aux layers). "
+            "The cache was built for a different target."
+        )
+    ensure_supervision_options_match(
+        manifest,
+        {"mask_reasoning_content": mask_reasoning_content, "mask_generation_prompt": mask_generation_prompt},
+        cache_name="EAGLE-3",
+        cache_dir=cache_dir,
+        producer_name="precompute_eagle3",
+    )
+
+
 def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int, lk_loss_type=None) -> None:
     """Reject P-EAGLE (parallel_drafting) combinations its trainer cannot honor.
 
@@ -335,7 +408,150 @@ def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_siz
         )
 
 
-def _load_draft_weights(draft_model: torch.nn.Module, path: str) -> None:
+def _parse_eagle4_config(node) -> Eagle4Config | None:
+    """Build the typed ``recipe_args.eagle4`` config (``None`` when the section is absent)."""
+    if node is None:
+        return None
+    raw = node.to_dict() if hasattr(node, "to_dict") else dict(node)
+    candidate_head = raw.pop("candidate_head", None)
+    return Eagle4Config(
+        **raw,
+        candidate_head=None if candidate_head is None else Eagle4CandidateHeadConfig(**candidate_head),
+    )
+
+
+def _resolve_freeze_embeddings(recipe_cfg, parallel_drafting: bool) -> bool:
+    """Effective ``recipe_args.freeze_embeddings``, where a missing or null value means the default.
+
+    EAGLE-3 TTT freezes the draft embeddings by default; P-EAGLE trains them
+    (speculators sets ``embed_requires_grad=True`` for parallel drafting).
+    """
+    freeze_embeddings = recipe_cfg.get("freeze_embeddings", None)
+    return not parallel_drafting if freeze_embeddings is None else bool(freeze_embeddings)
+
+
+def _validate_eagle4_gates(
+    eagle4: Eagle4Config,
+    *,
+    draft_spec: DraftSpec,
+    parallel_drafting: bool,
+    cp_size: int,
+    draft_vocab_size: int | None,
+    lk_loss_type: str | None,
+    has_peft: bool,
+    has_decode_eval: bool,
+    draft_weights_path: str | None,
+    ttt_steps: int,
+    freeze_embeddings: bool,
+) -> None:
+    """Reject ``recipe_args.eagle4`` combinations the EAGLE-4 draft or its trainers cannot honor."""
+    if draft_spec.eagle4_draft_config is None:
+        raise ValueError(
+            f"eagle4 is not supported for this target's draft ({draft_spec.draft_cls.__name__}); see "
+            "DraftSpec.eagle4_draft_config in components/speculative/eagle/registry.py."
+        )
+    if parallel_drafting:
+        raise ValueError("eagle4 does not support parallel_drafting (P-EAGLE).")
+    if eagle4.sliding_window is not None and eagle4.sliding_window < ttt_steps:
+        raise ValueError(
+            f"eagle4.sliding_window ({eagle4.sliding_window}) must be at least ttt_steps ({ttt_steps}): the "
+            "depth-i query's window holds its i chain keys, so a smaller window leaves the deepest step no context."
+        )
+    if not freeze_embeddings:
+        raise ValueError(
+            "eagle4 drafts must keep the target's embeddings (recipe_args.freeze_embeddings: true): the EAGLE-4 "
+            "serving adapters load the target's embed_tokens into the draft, so trained draft embeddings would "
+            "be dropped at serving."
+        )
+    if cp_size > 1:
+        raise NotImplementedError("eagle4 does not support context parallelism (cp_size>1).")
+    if draft_vocab_size is not None:
+        raise ValueError(
+            "eagle4 drafts score the full target vocabulary (the candidate head rescores with the full "
+            "lm_head); leave recipe_args.draft_vocab_size unset."
+        )
+    if has_decode_eval:
+        raise ValueError(
+            "decode_eval serves the draft as a stock vLLM EAGLE-3 head, which has no sliding window or "
+            "candidate head; benchmark the exported EAGLE-4 draft in an EAGLE-4 serving engine instead."
+        )
+    if eagle4.candidate_head is not None:
+        if not draft_weights_path:
+            raise ValueError(
+                "eagle4.candidate_head trains on top of a trained EAGLE-4 draft; set "
+                "recipe_args.draft_weights_path to that draft's consolidated checkpoint."
+            )
+        if has_peft:
+            raise ValueError("eagle4.candidate_head trains only the candidate-head factors; remove peft.")
+        if lk_loss_type is not None:
+            raise ValueError("eagle4.candidate_head has its own loss; lk_loss_type does not apply.")
+
+
+def _check_candidate_head_warm_start(draft_config, path: str) -> None:
+    """Refuse a candidate-head stage whose draft structure differs from the warm-start draft's.
+
+    The sliding window, ``fc_norm`` / ``norm_output`` and the ordered auxiliary
+    target layers own no tensors, so a stage-2 run that disagrees with stage 1
+    would load cleanly and fit the candidate head to a frozen draft that attends
+    to, or is fed, something other than what it was trained on (and export that
+    wrong structure). Without the warm start's ``config.json`` none of this can
+    be checked, so it is required.
+    """
+    checkpoint_dir = pathlib.Path(path)
+    config_path = (checkpoint_dir.parent if checkpoint_dir.is_file() else checkpoint_dir) / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"The candidate-head stage needs the warm-start draft's config.json to check its structure ({config_path})."
+        )
+    saved = json.loads(config_path.read_text())
+    pairs = {
+        key: (saved.get(key), getattr(draft_config, key, None))
+        for key in ("layer_types", "sliding_window", "fc_norm", "norm_output")
+    }
+    saved_eagle_config = saved.get("eagle_config") or {}
+    run_eagle_config = getattr(draft_config, "eagle_config", None) or {}
+    pairs["aux_layer_ids"] = (
+        saved_eagle_config.get("eagle_aux_hidden_state_layer_ids"),
+        run_eagle_config.get("eagle_aux_hidden_state_layer_ids"),
+    )
+    mismatched = {
+        key: {"warm start": warm_start, "this run": this_run}
+        for key, (warm_start, this_run) in pairs.items()
+        if warm_start != this_run
+    }
+    if mismatched:
+        raise ValueError(
+            f"The candidate-head stage must keep the warm-start draft's structure; these differ: {mismatched}. "
+            "Set recipe_args.eagle4.sliding_window, fc_norm and norm_output as in the stage-1 run, and supervise "
+            "from the same target layers in the same order (aux_layer_ids, or the remote server / offline cache)."
+        )
+
+
+def _prepare_candidate_head_training(draft_model: LlamaEagle3DraftModel, missing_head_keys: frozenset[str]) -> None:
+    """Set up the EAGLE-4 candidate-head stage on a warm-started draft.
+
+    A stage-1 draft (no candidate head in its checkpoint) gets the factors from
+    the truncated SVD of its ``lm_head``; a checkpoint that already has both
+    factors keeps them. Every other draft parameter is then frozen.
+    """
+    if missing_head_keys == CANDIDATE_HEAD_KEYS:
+        draft_model.init_efficient_lm_head_from_lm_head()
+        logger.info("EAGLE-4 candidate head initialized from the truncated SVD of the draft lm_head")
+    elif missing_head_keys:
+        raise ValueError(
+            f"The warm-start checkpoint has only part of the candidate head (missing {sorted(missing_head_keys)})."
+        )
+    for name, param in draft_model.named_parameters():
+        param.requires_grad_(name in CANDIDATE_HEAD_KEYS)
+
+
+def _load_draft_weights(
+    draft_model: torch.nn.Module,
+    path: str,
+    *,
+    optional_keys: frozenset[str] = frozenset(),
+    target_copied_keys: frozenset[str] = frozenset(),
+) -> frozenset[str]:
     """Warm-start the draft from a previously trained draft's consolidated safetensors export.
 
     ``path`` is either a single ``.safetensors`` file or a directory (flat or
@@ -343,12 +559,32 @@ def _load_draft_weights(draft_model: torch.nn.Module, path: str) -> None:
     writes). Loaded with ``strict=False`` because the vocab-mapping buffers
     (``d2t``/``t2d``) are regenerated by ``set_vocab_mapping`` each run and
     need not be present.
+
+    ``optional_keys`` may be absent from the checkpoint (the EAGLE-4 candidate
+    head, which a stage-1 draft does not have yet); every other missing key is
+    an error. ``target_copied_keys`` hold the target's values in the draft right
+    now (an EAGLE-4 draft's embeddings, which the serving adapters replace with
+    the target's), and the checkpoint must not have trained them. Returns the
+    optional keys the checkpoint did not provide.
     """
     state_dict = load_hf_safetensors_state_dict(path)
     if not state_dict:
         raise FileNotFoundError(f"draft_weights_path={path!r} contains no .safetensors files")
-    if state_dict.keys().isdisjoint(draft_model.state_dict().keys()):
+    current_state = draft_model.state_dict()
+    if state_dict.keys().isdisjoint(current_state.keys()):
         raise ValueError(f"draft_weights_path={path!r} shares no keys with the draft model; wrong checkpoint?")
+    for key in target_copied_keys:
+        loaded, current = state_dict.get(key), current_state[key]
+        if loaded is None or loaded.shape != current.shape:
+            continue  # absent, or a shape mismatch that load_state_dict reports below
+        # Compare on the host (where the checkpoint already is) in the lower of the two precisions,
+        # so a stage that ran in another dtype does not read as trained.
+        dtype = loaded.dtype if loaded.element_size() <= current.element_size() else current.dtype
+        if not torch.equal(loaded.to(dtype), current.detach().to(device=loaded.device, dtype=dtype)):
+            raise ValueError(
+                f"draft_weights_path={path!r} has a trained {key}, but the EAGLE-4 serving adapters replace it "
+                "with the target's; retrain the draft stage with recipe_args.freeze_embeddings: true."
+            )
     # The checkpoint's persistent d2t/t2d buffers encode the draft-vocab mapping
     # its lm_head rows were trained for. This loads AFTER set_vocab_mapping, so
     # a silently differing checkpoint mapping would overwrite the run's freshly
@@ -372,6 +608,8 @@ def _load_draft_weights(draft_model: torch.nn.Module, path: str) -> None:
                 "draft_vocab_size) so the warm-started lm_head rows stay aligned."
             )
     missing, unexpected = draft_model.load_state_dict(state_dict, strict=False)
+    missing_optional = optional_keys.intersection(missing)
+    missing = [key for key in missing if key not in optional_keys]
     if missing:
         # A warm start with holes trains partially random submodules while
         # looking healthy; incomplete/mismatched checkpoints are a hard error.
@@ -381,6 +619,7 @@ def _load_draft_weights(draft_model: torch.nn.Module, path: str) -> None:
         )
     if unexpected:
         logger.warning("draft_weights_path: %d unused keys in %s (e.g. %s)", len(unexpected), path, unexpected[:3])
+    return missing_optional
 
 
 def _merged_lora_state_dict(draft_model) -> dict[str, torch.Tensor]:
@@ -508,15 +747,37 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # entirely and stream the cache instead. This is disk-heavy and largely
         # superseded by the online path -- see precompute_eagle3 for the warning.
         self.cached_target_path = recipe_cfg.get("cached_target_path", None)
+        self._cached_aux_layer_ids = None
         # P-EAGLE (parallel_drafting) only safely supports a colocated live target
         # on non-packed sequences; gate the unsupported combinations early, before
         # loading the target -- see _validate_peagle_gates.
-        if bool(recipe_cfg.get("parallel_drafting", False)):
+        parallel_drafting = bool(recipe_cfg.get("parallel_drafting", False))
+        # One value for the EAGLE-4 gate and the draft freeze below.
+        freeze_embeddings = _resolve_freeze_embeddings(recipe_cfg, parallel_drafting)
+        if parallel_drafting:
             _validate_peagle_gates(
                 backend=recipe_cfg.get("target_model_backend", "colocated"),
                 cached_target_path=self.cached_target_path,
                 packed_sequence_size=int(recipe_cfg.get("packed_sequence_size", 0) or 0),
                 lk_loss_type=recipe_cfg.get("lk_loss_type", None),
+            )
+        # EAGLE-4: sliding-window draft layer and low-rank candidate head, trained in
+        # two stages (see components/speculative/eagle/eagle4.py). Gated before the
+        # target loads, like P-EAGLE.
+        self.eagle4 = _parse_eagle4_config(recipe_cfg.get("eagle4", None))
+        if self.eagle4 is not None:
+            _validate_eagle4_gates(
+                self.eagle4,
+                draft_spec=draft_spec,
+                parallel_drafting=parallel_drafting,
+                cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
+                draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
+                lk_loss_type=recipe_cfg.get("lk_loss_type", None),
+                has_peft=self.cfg.get("peft", None) is not None,
+                has_decode_eval=recipe_cfg.get("decode_eval", None) is not None,
+                draft_weights_path=recipe_cfg.get("draft_weights_path", None),
+                ttt_steps=recipe_cfg.ttt_steps,
+                freeze_embeddings=freeze_embeddings,
             )
         self.dist_setup = None
         self.distributed_config = None
@@ -526,6 +787,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # from device_mesh when a colocated target builds one (None otherwise).
         self.cp_mesh = None
         self.dp_mesh = None
+        # CP compute mode for the draft: "ring" (default) or "ulysses" (all-to-all,
+        # composes with sequence packing). Set from config in _setup_online_target.
+        self.cp_mode = "ring"
         if self.cached_target_path is None:
             selected_token_ids, selected_token_mask = self._setup_online_target(
                 recipe_cfg, target_path, draft_base_config
@@ -541,7 +805,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 )
             selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, draft_base_config)
 
-        draft_config = draft_base_config.to_dict()
+        # An EAGLE-4 draft is built from the Llama-style LlamaForCausalLMEagle4
+        # config, never from a target-specific config class (whose validators
+        # would reject or rewrite the single windowed draft layer).
+        if self.eagle4 is not None:
+            draft_config = draft_spec.eagle4_draft_config(draft_base_config)
+            draft_config_cls, draft_cls = LlamaConfig, LlamaEagle3DraftModel
+        else:
+            draft_config = draft_base_config.to_dict()
+            draft_config_cls, draft_cls = type(draft_base_config), draft_spec.draft_cls
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
         draft_config["target_hidden_size"] = draft_base_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
@@ -576,11 +848,23 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # token id placed at masked multi-token-prediction slots; ``num_depths``
         # and the COD ratios are serialized into the draft ``config.json`` so the
         # saved checkpoint loads into vLLM's parallel-drafting runtime unchanged.
-        parallel_drafting = bool(recipe_cfg.get("parallel_drafting", False))
         draft_config["parallel_drafting"] = parallel_drafting
         mask_token_id = None
         if parallel_drafting:
             mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, draft_base_config)
+        if self.eagle4 is not None:
+            # A cached ``selected_token_ids_path`` can still carry a compressed map.
+            if draft_config["draft_vocab_size"] != draft_base_config.vocab_size:
+                raise ValueError(
+                    f"eagle4 needs the full target vocabulary ({draft_base_config.vocab_size} tokens) but the "
+                    f"draft-vocab mapping selects {draft_config['draft_vocab_size']}; drop "
+                    "recipe_args.selected_token_ids_path or point it at a full-vocabulary map."
+                )
+            draft_config.update(
+                self.eagle4.draft_config_updates(
+                    aux_layer_ids=self._supervision_aux_layer_ids(recipe_cfg, draft_base_config)
+                )
+            )
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
@@ -588,9 +872,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # with ``expected mat1 and mat2 to have the same dtype``.
         # Reuse the base config's concrete class (LlamaConfig / Phi3Config /
         # Gemma4TextConfig / ...) so architecture-specific defaults like
-        # attention_bias and head_dim flow into the draft.
-        draft_config_obj = type(draft_base_config).from_dict(draft_config)
-        self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        # attention_bias and head_dim flow into the draft (LlamaConfig for EAGLE-4).
+        draft_config_obj = draft_config_cls.from_dict(draft_config)
+        self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         # Seed draft embeddings from the target: directly from the live target,
         # or from the embeddings stored alongside the offline cache.
         embed_source = (
@@ -601,11 +885,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # compressed-vocab checkpoint carries the remap tables vLLM/SGLang need.
         # No-op when the vocab is not compressed. See set_vocab_mapping.
         self.draft_model.set_vocab_mapping(selected_token_ids)
-        # EAGLE-3 TTT freezes the draft embeddings by default; P-EAGLE trains them
-        # (speculators sets ``embed_requires_grad=True`` for parallel drafting).
-        # Either default can still be overridden via ``recipe_args.freeze_embeddings``.
-        freeze_embeddings_default = not parallel_drafting
-        freeze_embeddings = bool(recipe_cfg.get("freeze_embeddings", freeze_embeddings_default))
         if freeze_embeddings:
             self.draft_model.freeze_embeddings()
         # P-EAGLE memory knob: recompute the draft layers' activations in the
@@ -618,8 +897,20 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # what makes LoRA meaningful (adapters over a pretrained draft, not random
         # init) and doubles as plain continued full-FT training.
         draft_weights_path = recipe_cfg.get("draft_weights_path", None)
+        candidate_head = self.eagle4.candidate_head if self.eagle4 is not None else None
         if draft_weights_path:
-            _load_draft_weights(self.draft_model, draft_weights_path)
+            if candidate_head is not None:
+                _check_candidate_head_warm_start(self.draft_model.config, draft_weights_path)
+            missing_head_keys = _load_draft_weights(
+                self.draft_model,
+                draft_weights_path,
+                optional_keys=CANDIDATE_HEAD_KEYS if candidate_head is not None else frozenset(),
+                target_copied_keys=(
+                    frozenset({"model.embed_tokens.weight"}) if self.eagle4 is not None else frozenset()
+                ),
+            )
+            if candidate_head is not None:
+                _prepare_candidate_head_training(self.draft_model, missing_head_keys)
             # Adapter checkpoints record config.name_or_path as their base model;
             # point it at the actual warm-start draft, not the target the draft
             # config was cloned from.
@@ -658,18 +949,28 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if self.cp_group is not None:
                 from nemo_automodel.components.speculative.eagle.draft_llama import attach_eagle3_cp_attention
 
-                attach_eagle3_cp_attention(self.draft_model, self.cp_group, zigzag=self.cp_zigzag)
-            trainer_module = Eagle3TrainerModule(
-                self.draft_model,
-                selected_token_ids=selected_token_ids,
-                selected_token_mask=selected_token_mask,
-                ttt_steps=recipe_cfg.ttt_steps,
-                cp_group=self.cp_group,
-                cp_zigzag=self.cp_zigzag,
-                lk_loss_type=None if lk_loss_type is None else str(lk_loss_type),
-                lk_kl_scale=float(recipe_cfg.get("lk_kl_scale", 1.0)),
-                lk_kl_decay=float(recipe_cfg.get("lk_kl_decay", 3.0)),
-            ).to(self.device)
+                if self.cp_mode == "ulysses":
+                    n_heads = self.draft_model.config.num_attention_heads
+                    if n_heads % self.cp_mesh.size() != 0:
+                        raise ValueError(
+                            f"cp_mode=ulysses requires the draft num_attention_heads ({n_heads}) divisible by "
+                            f"cp_size ({self.cp_mesh.size()}); the all-to-all splits heads across cp ranks."
+                        )
+                attach_eagle3_cp_attention(self.draft_model, self.cp_group, mode=self.cp_mode, zigzag=self.cp_zigzag)
+            if candidate_head is not None:
+                trainer_module = candidate_head.build(self.draft_model, ttt_steps=recipe_cfg.ttt_steps).to(self.device)
+            else:
+                trainer_module = Eagle3TrainerModule(
+                    self.draft_model,
+                    selected_token_ids=selected_token_ids,
+                    selected_token_mask=selected_token_mask,
+                    ttt_steps=recipe_cfg.ttt_steps,
+                    cp_group=self.cp_group,
+                    cp_zigzag=self.cp_zigzag,
+                    lk_loss_type=None if lk_loss_type is None else str(lk_loss_type),
+                    lk_kl_scale=float(recipe_cfg.get("lk_kl_scale", 1.0)),
+                    lk_kl_decay=float(recipe_cfg.get("lk_kl_decay", 3.0)),
+                ).to(self.device)
         if self.dist_env.world_size > 1:
             # Under context parallelism the draft is replicated across cp ranks
             # (it runs on the full gathered sequence), so restrict the gradient
@@ -690,6 +991,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 process_group=dp_process_group,
             )
         self.trainer_module = trainer_module
+        # DDP broadcasts only inside the DP subgroup. The draft is replicated
+        # across TP, so align those independently initialized copies before the
+        # optimizer captures them and TP replica gradients are averaged.
+        broadcast_tp_replicas([self.trainer_module], self.device_mesh)
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
@@ -769,6 +1074,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self.cfg.to_dict(),
                 default_name="eagle3_" + str(target_path).rstrip("/").split("/")[-1],
             )
+
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            trackio_cfg.name = trackio_cfg.name or "eagle3_" + str(target_path).rstrip("/").split("/")[-1]
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
+            logger.info("Trackio experiment tracking enabled")
 
         # Optional periodic real-acceptance-length eval (rank 0 only): snapshot
         # the current draft on a cadence and measure accept_length inside an
@@ -893,6 +1205,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
             packed_sequence_size=recipe_cfg.get("packed_sequence_size", 0),
             dp_mesh=self.dp_mesh,
         )
@@ -976,6 +1289,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # submeshes are only built later, inside the colocated path).
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
+        self.cp_mode = recipe_cfg.get("cp_mode", "ring")
         _validate_cp_gates(
             cp_size,
             backend,
@@ -984,6 +1298,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             target_attn_implementation=recipe_cfg.get("target_attn_implementation", None),
             seq_length=int(recipe_cfg.get("seq_length", 0) or 0) or None,
             cp_zigzag=bool(recipe_cfg.get("cp_zigzag", False)),
+            cp_mode=self.cp_mode,
         )
         _validate_tp_gates(tp_size, backend, cp_size)
         # ``draft_base_config`` is None on the paths that never build a draft
@@ -1026,6 +1341,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                 packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )
@@ -1064,6 +1380,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            load_metadata_with_gloo=read_load_metadata_with_gloo(self.cfg.get("checkpoint", None)),
         )
         # Optional target attention backend (default: HF auto-select). Pin to
         # ``sdpa`` to dodge the Qwen3 FA2 ``s_aux=None`` crash in transformers.
@@ -1101,10 +1418,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # the draft trainer module). Mark the parameters explicitly so no future
         # code path accidentally trains the target -- matching EAGLE-1/2.
         self.target_model.requires_grad_(False)
+        # Ulysses CP shards only the draft (via the all-to-all attention): the target
+        # runs its normal full-sequence forward (block-causal under packing) and
+        # _maybe_shard_cp slices the gathered hidden states to the draft's shard. Ring
+        # CP instead shards the target here (cp_mesh drives run_target_cp_forward_and_gather).
+        target_cp_mesh = None if self.cp_mode == "ulysses" else self.cp_mesh
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
-            cp_mesh=self.cp_mesh,
+            cp_mesh=target_cp_mesh,
         )
 
     def _load_kimi_k3_target(self, recipe_cfg, target_path, text_config):
@@ -1245,6 +1567,27 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             max_retries=recipe_cfg.get("remote_max_retries", 3),
         )
 
+    def _supervision_aux_layer_ids(self, recipe_cfg, draft_base_config) -> list[int]:
+        """Return the target layers the draft's aux hidden states actually come from.
+
+        Live backends report the layers they capture (a remote server through its
+        model info), and an offline cache records the layers ``precompute_eagle3``
+        used; only a cache without that record falls back to
+        ``recipe_args.aux_layer_ids`` or the default EAGLE-3 recipe.
+        """
+        target = self.target_wrapper
+        if isinstance(target, RemoteEagle3TargetModel):
+            return list(target.model_info()["aux_layer_ids"])
+        live_aux_layer_ids = getattr(target, "aux_layer_ids", None)
+        if live_aux_layer_ids is not None:
+            return list(live_aux_layer_ids)
+        if self._cached_aux_layer_ids is not None:
+            return list(self._cached_aux_layer_ids)
+        aux_layer_ids = recipe_cfg.get("aux_layer_ids", None)
+        if aux_layer_ids is None:
+            aux_layer_ids = default_eagle3_aux_layer_ids(draft_base_config.num_hidden_layers)
+        return list(aux_layer_ids)
+
     def _resolve_prefetch_depth(self, recipe_cfg) -> int:
         """Validate and cap the prefetch depth for the configured backend."""
         depth = int(recipe_cfg.get("target_prefetch_depth", 0))
@@ -1266,6 +1609,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
     def _setup_cached_target(self, recipe_cfg, draft_base_config):
         """Offline path: stream a precomputed cache; no target model is loaded.
 
+        Keeps the manifest's ``aux_layer_ids`` (``None`` for caches that predate it)
+        so an EAGLE-4 draft config records the layers the cache was built from.
+
         Reads the cache manifest for the draft-vocab mapping and loads the stored
         target embeddings (the one target tensor the draft still needs). Sets
         ``self.target_model`` / ``self.target_wrapper`` to ``None`` and builds the
@@ -1276,22 +1622,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_model = None
         self.target_wrapper = None
         manifest = read_manifest(self.cached_target_path)
-        if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
-            raise ValueError(
-                f"EAGLE-3 cache at {self.cached_target_path} was built for target_vocab_size="
-                f"{manifest['target_vocab_size']}, but the configured target has {draft_base_config.vocab_size}. "
-                "The cache does not match this target."
-            )
-        # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
-        # cache from a different-width target would otherwise crash deep inside
-        # ``fc`` with a confusing shape error.
-        expected_aux_dim = int(draft_base_config.hidden_size) * 3
-        if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
-            raise ValueError(
-                f"EAGLE-3 cache at {self.cached_target_path} has aux_hidden_dim={manifest['aux_hidden_dim']}, "
-                f"but the configured target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 "
-                "aux layers). The cache was built for a different target."
-            )
+        self._cached_aux_layer_ids = manifest.get("aux_layer_ids")
+        _validate_cached_eagle3_manifest(
+            self.cached_target_path,
+            manifest,
+            draft_base_config,
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
+        )
         selected_token_ids = torch.tensor(manifest["selected_token_ids"], dtype=torch.long)
         selected_token_mask = torch.zeros(int(draft_base_config.vocab_size), dtype=torch.bool)
         selected_token_mask[selected_token_ids] = True
@@ -1317,10 +1655,20 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """Shard the draft supervision along the sequence for context parallelism.
 
         The target emits full-sequence aux/logits (gathered); the draft runs sharded,
-        so gather every ``[B, S, ...]`` tensor to this rank's cp shard (via a global
-        index) and inject the matching global ``position_ids``. The index is the
-        contiguous shard by default, or the load-balanced zig-zag layout (rank ``r``
-        owns chunks ``r`` and ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+        so every ``[batch, sequence, ...]`` tensor in ``inputs`` is index-selected to
+        this rank's cp shard (via a global index). Non-packed runs then get global
+        ``position_ids`` (the shard's indices); packed runs keep their sliced
+        per-document ``position_ids``. The index is the contiguous shard by default,
+        or the load-balanced zig-zag layout (rank ``r`` owns chunks ``r`` and
+        ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+
+        Args:
+            inputs: Trainer-input mapping; tensor values shaped
+                ``[batch, sequence, ...]`` (matching the full sequence length) are
+                sharded along the sequence axis, others pass through unchanged.
+
+        Returns:
+            The same mapping with sequence-length tensors replaced by their cp shard.
         """
         if getattr(self, "cp_group", None) is None:
             return inputs
@@ -1356,7 +1704,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
             for k, v in inputs.items()
         }
-        out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
+        # Synthesize position_ids only when the caller did not supply them: the
+        # non-packed path has none, so the shard's global indices are its positions.
+        # The packed path carries per-document position_ids (reset at each document
+        # boundary), already sliced to this shard above; overwriting them with a
+        # global arange would corrupt the packed RoPE.
+        if "position_ids" not in out:
+            out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
         return out
 
     def _all_reduce_draft_grads_over_cp(self) -> None:
@@ -1585,7 +1939,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         def write_recipe_metadata() -> None:
             self._save_extra_state(path, epoch=epoch)
             try:
-                save_config(self.cfg.raw_config, path)
+                save_config(self.cfg.to_yaml_dict(use_orig_values=True), path)
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
 
@@ -1811,10 +2165,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         )
 
     def _wandb_log(self, data: dict, step: int) -> None:
-        """Log a metrics dict to W&B when a run is active (rank 0)."""
+        """Log a metrics dict to W&B and Trackio when a run is active (rank 0)."""
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(data, step=step)
 
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
@@ -1885,6 +2242,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             _best_effort("stopping regen worker", self.regen_runner.shutdown)
         if getattr(self, "wandb_run", None) is not None:
             _best_effort("finishing W&B run", self.wandb_run.finish)
+        if getattr(self, "trackio_logger", None) is not None:
+            _best_effort("finishing Trackio run", self.trackio_logger.finish)
 
     def _train_epochs(self, start_epoch, is_ddp, pbar=None):
         """Run the epoch loop (extracted so :meth:`run_train_validation_loop` can
@@ -1978,6 +2337,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     if pending_micro_batches == self.grad_accumulation_steps:
                         if getattr(self, "cp_group", None) is not None:
                             self._all_reduce_draft_grads_over_cp()
+                        synchronize_tp_replica_gradients(
+                            [self.trainer_module],
+                            getattr(self, "device_mesh", None),
+                        )
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.lr_scheduler.step()
@@ -2071,6 +2434,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 # cp replicas of the draft desync permanently from here on.
                 if getattr(self, "cp_group", None) is not None:
                     self._all_reduce_draft_grads_over_cp()
+                synchronize_tp_replica_gradients(
+                    [self.trainer_module],
+                    getattr(self, "device_mesh", None),
+                )
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:

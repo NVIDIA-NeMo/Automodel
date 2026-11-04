@@ -54,7 +54,8 @@ class FlexAttention(torch.nn.Module):
     # while different tensor geometries and devices receive distinct masks.
     block_masks: ClassVar[dict[FLEX_ATTN_MASK_T, BlockMask]] = {}
 
-    def forward(
+    # PyTorch declares Module.forward as a writable Callable[..., Any], but modules override it with a method.
+    def forward(  # ty: ignore[invalid-mutable-override]
         self,
         q: torch.Tensor,
         k: torch.Tensor,

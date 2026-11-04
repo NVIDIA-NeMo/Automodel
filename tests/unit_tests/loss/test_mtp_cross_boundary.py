@@ -111,6 +111,78 @@ def _run_capture(
     return cap.captured_labels
 
 
+def test_precomputed_targets_preserve_global_shift_after_context_parallel_sharding():
+    """CP-local targets are consumed directly instead of rolled in local order."""
+    labels = torch.tensor([10, 12, 21, 23], dtype=torch.long)
+    mtp_per_depth_h = [torch.zeros((4, 3), requires_grad=True) for _ in range(2)]
+    precomputed_targets = [
+        torch.tensor([11, IGNORE, 22, IGNORE]),
+        torch.tensor([12, IGNORE, 23, IGNORE]),
+    ]
+    cap = _CaptureLoss()
+
+    with mock.patch("nemo_automodel.components.loss.mtp.calculate_loss", side_effect=lambda loss_fn, **kw: cap(**kw)):
+        calculate_mtp_loss(
+            loss_fn=mock.MagicMock(),
+            mtp_per_depth_h=mtp_per_depth_h,
+            mtp_per_depth_targets=precomputed_targets,
+            labels=labels,
+            model=mock.MagicMock(),
+            scaling_factor=1.0,
+        )
+
+    assert len(cap.captured_labels) == 2
+    for actual, expected in zip(cap.captured_labels, precomputed_targets):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_precomputed_target_count_must_match_mtp_depth():
+    labels = torch.zeros(4, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="Expected 2 mtp_per_depth_targets"):
+        calculate_mtp_loss(
+            loss_fn=mock.MagicMock(),
+            mtp_per_depth_h=[torch.zeros(4, 3), torch.zeros(4, 3)],
+            mtp_per_depth_targets=[torch.zeros(4, dtype=torch.long)],
+            labels=labels,
+            model=mock.MagicMock(),
+        )
+
+
+def test_precomputed_target_shape_must_match_local_labels():
+    labels = torch.zeros(4, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="target shape .* does not match labels shape"):
+        calculate_mtp_loss(
+            loss_fn=mock.MagicMock(),
+            mtp_per_depth_h=[torch.zeros(4, 3)],
+            mtp_per_depth_targets=[torch.zeros(5, dtype=torch.long)],
+            labels=labels,
+            model=mock.MagicMock(),
+        )
+
+
+@pytest.mark.parametrize(
+    "sequence_metadata",
+    [
+        {"cu_seqlens": torch.tensor([0, 4], dtype=torch.int32)},
+        {"seq_idx": torch.zeros(4, dtype=torch.long)},
+    ],
+)
+def test_precomputed_targets_are_mutually_exclusive_with_sequence_metadata(sequence_metadata):
+    labels = torch.zeros(4, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        calculate_mtp_loss(
+            loss_fn=mock.MagicMock(),
+            mtp_per_depth_h=[torch.zeros(4, 3)],
+            mtp_per_depth_targets=[torch.zeros(4, dtype=torch.long)],
+            labels=labels,
+            model=mock.MagicMock(),
+            **sequence_metadata,
+        )
+
+
 def test_cross_boundary_masked_via_seq_idx_1d():
     """Two 4-token sub-seqs in an 8-token packed sample. With seq_idx supplied
     directly, depth-0 must mask position 3 (rolls into sub-seq 1); depth-1 must
@@ -300,3 +372,72 @@ def test_2d_labels_and_3d_hidden_states_unchanged():
 
     for d, h in enumerate(captured_hidden):
         assert h.shape == (B, S, H), f"depth {d}: BSHD path should be unchanged, got {tuple(h.shape)}"
+
+
+@pytest.mark.parametrize("fallback", [None, [0, 4, 8], [[0, 4, 8], [0, 3, 8]]])
+def test_pipeline_mtp_tail_owns_each_microbatch_layout(fallback):
+    """A microbatch tail overrides absent, stale, or multi-layout fallback metadata."""
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    torch.manual_seed(4169)
+    model = torch.nn.Module()
+    model.mtp_outputs_are_logits = True
+    loss_fn = PipelineCausalLMLoss(MaskedCrossEntropy(), model, scaling_factor=0.3)
+    loss_fn.is_packed = True
+    loss_fn.cu_seqlens = None if fallback is None else torch.tensor(fallback, dtype=torch.int32)
+    for boundary in (4, 2):
+        labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, 9]])
+        seq_idx = torch.tensor([[7] * boundary + [9] * (8 - boundary)], dtype=torch.int32)
+        logits = torch.randn(3, 1, 8, 16, requires_grad=True)
+        actual = loss_fn((*logits.unbind(), seq_idx), labels)
+        expected = torch.nn.functional.cross_entropy(logits[0].flatten(0, 1), labels.flatten(), reduction="sum")
+        for depth in (1, 2):
+            target = torch.full_like(labels, -100)
+            for start, end in ((0, boundary), (boundary, 8)):
+                if end - start > depth:
+                    target[:, start : end - depth] = labels[:, start + depth : end]
+            expected = expected + 0.15 * torch.nn.functional.cross_entropy(
+                logits[depth].flatten(0, 1), target.flatten(), reduction="sum"
+            )
+        (actual_grad,) = torch.autograd.grad(actual, logits, retain_graph=True)
+        (expected_grad,) = torch.autograd.grad(expected, logits)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.parametrize("boundaries", [[], [0], [[0, 4, 8], [0, 3, 8]]])
+def test_pipeline_mtp_rejects_unusable_shared_boundaries(boundaries):
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    model = torch.nn.Module()
+    model.mtp_outputs_are_logits = True
+    loss_fn = PipelineCausalLMLoss(MaskedCrossEntropy(), model, scaling_factor=0.3)
+    loss_fn.is_packed = True
+    loss_fn.cu_seqlens = torch.tensor(boundaries, dtype=torch.int32)
+    logits = torch.randn(2, 1, 8, 16, requires_grad=True)
+    with pytest.raises(ValueError, match="Packed MTP requires"):
+        loss_fn(tuple(logits.unbind()), torch.ones(1, 8, dtype=torch.long))
+    assert logits.grad is None
+
+
+def test_joined_segmentation_allows_mtp_targets_across_original_documents():
+    # Labels are already next-token shifted. Auxiliary depths shift them further.
+    labels = torch.tensor([[11, 12, 20, 21, 22, 30]])
+    isolated = _run_capture(labels=labels, seq_idx=torch.tensor([[1, 1, 1, 2, 2, 2]]))
+    joined = _run_capture(labels=labels, seq_idx=torch.ones((1, 6), dtype=torch.long))
+    assert [target.tolist() for target in isolated] == [
+        [[12, 20, IGNORE, 22, 30, IGNORE]],
+        [[20, IGNORE, IGNORE, 30, IGNORE, IGNORE]],
+    ]
+    assert [target.tolist() for target in joined] == [
+        [[12, 20, 21, 22, 30, IGNORE]],
+        [[20, 21, 22, 30, IGNORE, IGNORE]],
+    ]
+    # mask_segment_starts is a separate label policy: masking b1 does not
+    # silently prohibit a later auxiliary target b2 across the subdocument boundary.
+    labels[0, 2] = IGNORE
+    masked_joined = _run_capture(labels=labels, seq_idx=torch.ones((1, 6), dtype=torch.long))
+    assert masked_joined[0].tolist() == [[12, IGNORE, 21, 22, 30, IGNORE]]
+    assert masked_joined[1].tolist() == [[IGNORE, 21, 22, 30, IGNORE, IGNORE]]

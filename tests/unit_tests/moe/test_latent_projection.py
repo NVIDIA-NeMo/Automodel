@@ -166,6 +166,44 @@ class TestMoELatentProjectionForward:
             experts_input = mock_experts.call_args[0][0]
             assert experts_input.shape[-1] == moe_config.moe_latent_size
 
+    def test_fc2_latent_proj_accepts_float32_expert_output(self, moe_config, backend_config):
+        """Test back-projection re-enters bf16 after an FSDP-style fp32 expert output."""
+        moe_config.moe_latent_size = 64
+        moe_config.n_shared_experts = 0
+        moe = MoE(moe_config, backend_config)
+
+        batch_size, seq_len = 2, 3
+        x = torch.randn(batch_size, seq_len, moe_config.dim, dtype=torch.bfloat16)
+        expert_output = torch.randn(
+            batch_size * seq_len,
+            moe_config.moe_latent_size,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+
+        with (
+            patch.object(moe.gate, "forward") as mock_gate,
+            patch.object(moe.experts, "forward") as mock_experts,
+        ):
+            mock_gate.return_value = (
+                torch.rand(batch_size * seq_len, moe_config.n_activated_experts, dtype=torch.bfloat16),
+                torch.randint(
+                    0,
+                    moe_config.n_routed_experts,
+                    (batch_size * seq_len, moe_config.n_activated_experts),
+                ),
+                None,
+            )
+            mock_experts.return_value = expert_output
+
+            output = moe(x)
+
+        assert output.dtype == torch.bfloat16
+        output.float().sum().backward()
+        assert expert_output.grad is not None
+        assert expert_output.grad.dtype == torch.float32
+        assert torch.isfinite(expert_output.grad).all()
+
     def test_forward_gate_receives_original_input(self, moe_config, backend_config, device):
         """Test that the gate receives the original (non-projected) input."""
         moe_config.moe_latent_size = 64

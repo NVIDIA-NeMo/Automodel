@@ -115,5 +115,6 @@ lr_scheduler:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: adil-a
   known_issue_id: AM-151

@@ -258,6 +258,34 @@ def test_forward_moe_cp_pixel_values_are_spliced_in_forward():
     assert out.logits.shape == (1, 4, cfg.text_config.vocab_size)
 
 
+def test_forward_moe_cp_accepts_per_image_pooler_output():
+    """transformers >=5.15 returns pooler_output as one tensor per image rather
+    than a single stacked tensor; both forms must splice to the same embeds."""
+    cfg = _cfg()
+    cfg.image_token_id = 2
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
+    model._cp_enabled = True
+    per_image = [torch.full((1, cfg.text_config.hidden_size), i + 1.0, dtype=torch.bfloat16) for i in range(2)]
+    captured = {}
+
+    def fake_lm(*args, **kwargs):
+        captured["inputs_embeds"] = kwargs.get("inputs_embeds")
+        return SimpleNamespace(last_hidden_state=torch.zeros(1, 4, cfg.text_config.hidden_size, dtype=torch.bfloat16))
+
+    with (
+        mock.patch.object(model.model, "get_image_features", return_value=SimpleNamespace(pooler_output=per_image)),
+        mock.patch.object(model.model.language_model, "forward", side_effect=fake_lm),
+    ):
+        out = model(input_ids=torch.tensor([[1, 2, 3, 2]]), pixel_values=torch.randn(2, 3, 8, 8))
+
+    # The two image rows land at the two image_token_id positions, in order.
+    embeds = captured["inputs_embeds"]
+    assert embeds.shape == (1, 4, cfg.text_config.hidden_size)
+    assert torch.equal(embeds[0, 1], per_image[0][0])
+    assert torch.equal(embeds[0, 3], per_image[1][0])
+    assert out.logits.shape == (1, 4, cfg.text_config.vocab_size)
+
+
 # ---------------------------------------------------------------------------
 # forward: dense CP branches
 # ---------------------------------------------------------------------------
@@ -434,8 +462,8 @@ def test_decoder_forward_flex_kernel_options_and_padding_branches():
     b, s = 1, 4
     x = torch.randn(b, s, tc.hidden_size, dtype=torch.bfloat16)
     pos = (
-        torch.randn(b, s, tc.head_dim // 2, dtype=torch.bfloat16),
-        torch.randn(b, s, tc.head_dim // 2, dtype=torch.bfloat16),
+        torch.randn(b, s, tc.per_layer_config[0].head_dim // 2, dtype=torch.bfloat16),
+        torch.randn(b, s, tc.per_layer_config[0].head_dim // 2, dtype=torch.bfloat16),
     )
     padding_mask = torch.tensor([[False, False, True, True]])
     captured = {}
@@ -514,7 +542,7 @@ def test_prepare_model_inputs_consumes_nothing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# get_capabilities: dense 31B supports CP; E2B/E4B (audio) does not; MoE does
+# get_capabilities: dense 31B and E2B/E4B support TP/CP; MoE supports CP/EP
 # ---------------------------------------------------------------------------
 def test_get_capabilities_plain_dense_supports_cp():
     caps = Gemma4ForConditionalGeneration.get_capabilities(_cfg(enable_moe_block=False))
@@ -525,13 +553,13 @@ def test_get_capabilities_plain_dense_supports_cp():
 
 
 def test_get_capabilities_dense_audio_variant_supports_cp():
-    # E2B/E4B: dense + audio_config present -> CP supported (kv-sharing +
-    # per-layer-inputs flow through the model-owned ring). TP/PP/EP stay off.
+    # E2B/E4B: dense + audio_config present -> TP/CP supported (kv-sharing +
+    # per-layer-inputs flow through model-owned distributed paths). PP/EP stay off.
     cfg = _cfg(enable_moe_block=False)
     cfg.audio_config = {}  # non-None marks the dense+audio variant (E2B/E4B)
     caps = Gemma4ForConditionalGeneration.get_capabilities(cfg)
     assert caps.supports_cp is True
-    assert caps.supports_tp is False
+    assert caps.supports_tp is True
     assert caps.supports_pp is False
     assert caps.supports_ep is False
 
@@ -557,6 +585,7 @@ def test_dense_init_attaches_ring_to_self_attention():
             "_packed_seq_ids",
             "padding_mask",
             "_gemma4_vision_group_ids",
+            "_gemma4_has_vision_tokens",
         )
         assert callable(m.setup_cp_attention)
 
@@ -664,8 +693,31 @@ def test_forward_dense_cp_stashes_metadata_on_ring_modules():
     assert hooked, "expected ring-hooked self_attn modules"
     for m in hooked:
         meta = m._cp_dense_metadata
-        assert set(meta) == {"mm_token_type_ids", "padding_mask", "_packed_seq_ids", "_gemma4_vision_group_ids"}
+        assert set(meta) == {
+            "mm_token_type_ids",
+            "padding_mask",
+            "_packed_seq_ids",
+            "_gemma4_vision_group_ids",
+            "_gemma4_has_vision_tokens",
+        }
         assert torch.equal(meta["_packed_seq_ids"], packed)
+        assert meta["_gemma4_has_vision_tokens"] is False
+
+    mm_token_type_ids = torch.tensor([[0, 1, 1, 0]])
+    with mock.patch.object(
+        model.model.language_model,
+        "forward",
+        return_value=SimpleNamespace(
+            last_hidden_state=hidden, past_key_values=None, hidden_states=None, attentions=None
+        ),
+    ):
+        model(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            mm_token_type_ids=mm_token_type_ids,
+            _packed_seq_ids=packed,
+        )
+    for m in hooked:
+        assert m._cp_dense_metadata["_gemma4_has_vision_tokens"] is True
 
 
 def test_forward_dense_cp_injects_kv_share_holder():
@@ -700,6 +752,10 @@ def test_kv_share_holder_is_cache_free_passthrough():
     assert h.get_seq_length(0, foo=1) == 0
     assert h.get_mask_sizes(13) == (13, 0)
     assert h.get_mask_sizes(7, layer_idx=3) == (7, 0)
+    # transformers >=5.15 calls get_query_offset unguarded from
+    # _preprocess_mask_arguments; no cache -> queries start at 0.
+    assert h.get_query_offset() == 0
+    assert h.get_query_offset(layer_idx=3) == 0
     k = torch.randn(1, 2, 4, 8)
     v = torch.randn(1, 2, 4, 8)
     out_k, out_v = h.update(k, v, layer_idx=0)

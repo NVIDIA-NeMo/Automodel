@@ -43,7 +43,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   torch_dtype: float32
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
 
 checkpoint:
@@ -116,3 +116,6 @@ lr_scheduler:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
+
+ci:
+  cluster_tag: h100

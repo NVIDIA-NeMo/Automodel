@@ -1,7 +1,7 @@
 ---
-title: "Ministral3 for Embedding"
-description: ""
-slug: model-coverage/embedding-models/mistralai/ministral3-bidirectional
+title: "Ministral-3-3B-Base-2512"
+description: "Reference Ministral-3-3B-Base-2512 checkpoint and architecture details for NeMo AutoModel, with model-family information, setup guidance, and upstream resources."
+slug: model-coverage/embedding-models/mistralai/Ministral-3-3B-Base-2512
 ---
 
 NeMo AutoModel loads [Mistral AI's Ministral3](https://mistral.ai/news/ministraux/) with the stock Hugging Face `Ministral3Model` and configurable text attention for embedding and dense retrieval tasks. It defaults to `is_causal: false`, so each token can attend to both past and future tokens without requiring a custom model implementation.

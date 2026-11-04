@@ -42,7 +42,7 @@ model and are enabled via ``dflash_config.projector_type='domino'``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -129,7 +129,7 @@ class DominoTrainerModule(DFlashTrainerModule):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
-        loss_decay_gamma: Optional[float] = None,
+        loss_decay_gamma: float | None = None,
         shift_label: bool = False,
     ):
         super().__init__(
@@ -339,7 +339,10 @@ class DominoTrainerModule(DFlashTrainerModule):
         bsz, n, bs = target_ids.shape
         # A tensor-parallel target's lm_head is column-parallel and returns
         # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.
-        base_logits = _to_full_tensor(self.lm_head(output_hidden))
+        # ``compute_logits`` applies the target's output transform (multiplier /
+        # softcapping); the low-rank correction below is then fit on top of the
+        # transformed base logits, matching what serving produces.
+        base_logits = _to_full_tensor(self.draft_model.compute_logits(output_hidden, self.lm_head))
         hidden4d, prev_ids = self._build_domino_head_inputs(
             input_ids=input_ids,
             anchor_positions=anchor_positions,

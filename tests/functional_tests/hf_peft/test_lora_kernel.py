@@ -73,3 +73,43 @@ def test_db_kernel(lora_params):
     baseline_dlora_b = torch.matmul(dy.t(), torch.matmul(x, lora_a.t())) * scale
     triton_dlora_b = lora_db_update_wrapper(lora_a, x.t(), dy, scale, dtype=dtype)
     assert torch.allclose(baseline_dlora_b, triton_dlora_b, atol=6e-2, rtol=6e-2)
+
+
+@pytest.mark.parametrize("lora_dtype", [torch.bfloat16, torch.float16])
+def test_memory_efficient_lora_declines_triton_on_mixed_dtype(lora_dtype):
+    """Mixed-dtype LoRA must fall back off the Triton kernels and match the torch path exactly.
+
+    The kernels hand their operands to ``tl.dot``, which asserts one dtype, and they run outside
+    autocast — so the FSDP2 ``output_dtype=float32`` layout from issue #3652 (FP32 activations,
+    BF16 adapters) used to abort compilation with "Both operands must be same dtype".
+
+    This calls ``apply_memory_efficient_lora`` directly rather than going through
+    ``apply_lora_to_linear_modules``: ``patch_linear_module`` force-disables Triton whenever
+    TransformerEngine is importable, and the CI image builds TE, so a recipe-level test could never
+    reach the kernels here.
+    """
+    from nemo_automodel.components._peft.lora import apply_memory_efficient_lora
+
+    torch.manual_seed(0)
+    scale = 2.5  # != 1.0 so a dropped scale cannot hide
+    x = torch.randn(64, 128, dtype=torch.float32, device="cuda")
+    lora_a = (0.05 * torch.randn(16, 128, device="cuda")).to(lora_dtype)
+    lora_b = (0.05 * torch.randn(96, 16, device="cuda")).to(lora_dtype)
+    grad_out = torch.randn(64, 96, dtype=torch.float32, device="cuda")
+
+    def run(use_triton_kernel):
+        xg = x.clone().requires_grad_(True)
+        a = lora_a.clone().requires_grad_(True)
+        b = lora_b.clone().requires_grad_(True)
+        with torch.autocast("cuda", dtype=lora_dtype):
+            out = apply_memory_efficient_lora(xg, a, b, scale, use_triton_kernel)
+        (out.float() * grad_out).sum().backward()
+        return out.float(), xg.grad, a.grad, b.grad
+
+    triton_path = run(True)  # must not raise: the kernels are declined for mixed dtype
+    torch_path = run(False)
+
+    assert triton_path[1].dtype == torch.float32
+    for name, got, want in zip(("out", "d_x", "d_lora_A", "d_lora_B"), triton_path, torch_path):
+        # Declining means literally running the torch path, so this is exact, not approximate.
+        torch.testing.assert_close(got, want, rtol=0, atol=0, msg=f"{name} diverged from the torch path")

@@ -103,7 +103,6 @@ peft:
   use_triton: True
 
 freeze_config:
-  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
@@ -116,5 +115,6 @@ freeze_config:
 #   wandb_save_dir:
 
 ci:
+  cluster_tag: h100
   recipe_owner: akoumpa
   time: "00:15:00"

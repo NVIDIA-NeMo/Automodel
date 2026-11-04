@@ -1,7 +1,6 @@
 ---
 name: nemo-automodel-launcher-config
-description: Configure NeMo AutoModel job launches for interactive runs, Slurm clusters, and SkyPilot cloud execution.
-when_to_use: Configuring Slurm or SkyPilot job submission, setting up multi-node launch scripts, debugging job submission failures, or switching between interactive and cluster launch modes.
+description: Configure NeMo AutoModel job launches for interactive runs, Slurm clusters, and SkyPilot cloud execution. Use when configuring Slurm or SkyPilot job submission, setting up multi-node launch scripts, debugging job submission failures, or switching between interactive and cluster launch modes.
 license: Apache-2.0
 metadata:
   author: NVIDIA
@@ -76,10 +75,13 @@ Do not use this skill for implementing or registering new model architectures, H
 
 ```bash
 # Single GPU
-automodel finetune llm -c config.yaml
+automodel config.yaml --nproc-per-node 1
 
-# Multi-GPU (all GPUs on current node)
-torchrun --nproc_per_node=8 -m nemo_automodel._cli.app finetune llm -c config.yaml
+# Multi-GPU (8 GPUs on current node)
+automodel config.yaml --nproc-per-node 8
+
+# Equivalent, driving torchrun yourself
+torchrun --nproc-per-node=8 -m nemo_automodel.cli.app config.yaml
 ```
 
 No additional YAML section is needed for interactive mode. The CLI routes to torchrun automatically when no `slurm:` or `skypilot:` section is present in the config.
@@ -212,7 +214,7 @@ and large artifacts, and turn it off for normal production training.
 - `components/launcher/slurm/template.py` - SBATCH script template generation
 - `components/launcher/slurm/utils.py` - Slurm submission utilities
 - `components/launcher/skypilot/config.py` - SkyPilotConfig dataclass
-- `_cli/app.py` - CLI entry point and launcher routing logic
+- `cli/app.py` - CLI entry point and launcher routing logic
 
 ## Pitfalls
 

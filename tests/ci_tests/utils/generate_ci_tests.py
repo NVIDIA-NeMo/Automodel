@@ -178,7 +178,13 @@ def _build_job(
     return job
 
 
-def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str) -> None:
+def _enrich_base_job(
+    job: Dict[str, Any],
+    ci_config: Dict[str, Any],
+    scope: str,
+    test_folder: str,
+    config: Path,
+) -> None:
     """Add base-only extras: resource overrides, env_vars, HAS_ROBUSTNESS, convergence time."""
     for ci_key, ci_var in CI_KEY_TO_VAR.items():
         if ci_key not in ci_config:
@@ -196,19 +202,26 @@ def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str)
     for key, value in ci_config.get("env_vars", {}).items():
         job["variables"][key] = str(value)
 
+    has_robustness = "checkpoint_robustness" in ci_config
     robustness_config = ci_config.get("checkpoint_robustness") or {}
-    job["variables"]["HAS_ROBUSTNESS"] = str(bool(robustness_config)).lower()
-    if robustness_config.get("process_isolation"):
+    job["variables"]["HAS_ROBUSTNESS"] = str(has_robustness).lower()
+    supports_process_isolation = test_folder in {"llm_finetune", "vlm_finetune"}
+    process_isolation = supports_process_isolation and robustness_config.get("process_isolation", True)
+    if has_robustness and process_isolation:
         job["variables"]["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] = "true"
         if "CHECKPOINT_ROBUSTNESS_PHASES" not in job["variables"]:
             robustness_phases = []
-            if robustness_config.get("check_source_load_parity"):
+            source_load_parity_enabled = not robustness_config.get("skip_source_load_parity", False)
+            if source_load_parity_enabled:
                 robustness_phases.extend(("source_load_reference", "source_load_parity"))
             robustness_phases.extend(("train_and_save", "automodel_reload"))
             if not robustness_config.get("skip_hf_reload"):
                 robustness_phases.append("hf_reload")
-            if not robustness_config.get("no_check_resume"):
+            if not robustness_config.get("skip_resume"):
                 robustness_phases.append("resume")
+            is_peft = "peft" in config.stem or "lora" in config.stem
+            if int(robustness_config.get("cross_tp_size") or 0) > 0 and not is_peft:
+                robustness_phases.append("cross_tp_reload")
             job["variables"]["CHECKPOINT_ROBUSTNESS_PHASES"] = " ".join(robustness_phases)
 
     # Convergence tests run for 2 epochs; double the slurm time allocation.
@@ -241,6 +254,10 @@ def generate_job(
     with open(f"{automodel_dir}/{config}", "r", encoding="utf-8") as rf:
         ci_config = (yaml.load(rf) or {}).get("ci") or {}
 
+    # Deprecated examples remain reproducible without scheduling GPU work.
+    if ci_config.get("deprecated") is True:
+        return []
+
     # allow_failure wins over known_issue_id.
     # known_issue_id alone skips the entire recipe (base + all variants).
     known_issue_id = ci_config.get("known_issue_id")
@@ -248,7 +265,7 @@ def generate_job(
     if known_issue_id and not recipe_allow_failure:
         return []
 
-    has_robustness = bool(ci_config.get("checkpoint_robustness"))
+    has_robustness = "checkpoint_robustness" in ci_config
     base_allow_failure = recipe_allow_failure or config.stem in (config_override.get("known_issue") or [])
 
     base_job = _build_job(
@@ -259,7 +276,7 @@ def generate_job(
         allow_failure=base_allow_failure,
         known_issue_id=known_issue_id,
     )
-    _enrich_base_job(base_job, ci_config, scope)
+    _enrich_base_job(base_job, ci_config, scope, test_folder, config)
     variants: list[tuple[str, Dict[str, Any]]] = [("", base_job)]
 
     # vLLM deploy variant. `ci.vllm_deploy_known_issue_id` suppresses just this
@@ -345,6 +362,17 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
         for suffix, job in generate_job(config, config_override, scope, test_folder, automodel_dir):
             job["variables"]["MODEL_FAMILY"] = model_name
             pipeline[f"{config_name}{suffix}{job_name_suffix}"] = job
+
+    # GitLab rejects a child with no runnable jobs after every recipe is excluded.
+    # Use the same untagged runner as the generation job; never launch Slurm.
+    if len(pipeline) == 1 and yml_configs:
+        pipeline[f"no_enrolled_{test_folder}_tests{job_name_suffix}"] = {
+            "stage": "functional_test",
+            "variables": {"GIT_STRATEGY": "none"},
+            "rules": [{"when": "always"}],
+            "script": ["echo 'No enrolled AutoModel recipes remain in this scope.'"],
+            "timeout": "5 minutes",
+        }
 
     return pipeline
 

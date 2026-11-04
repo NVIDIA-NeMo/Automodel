@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, Optional, Union
+from typing import Literal, Union
 
 import torch
 import torch.nn as nn
@@ -218,12 +218,12 @@ class EncoderVisionBlock(nn.Module):
         mlp_ratio: float,
         hidden_act: str,
         layer_norm_eps: float,
-        ls_init_value: Optional[float] = None,
-        max_grid_height: Optional[int] = None,
-        max_grid_width: Optional[int] = None,
+        ls_init_value: float | None = None,
+        max_grid_height: int | None = None,
+        max_grid_width: int | None = None,
         use_cls_token: bool = False,
         use_rope2d: bool = True,
-        rope_kwargs: Optional[dict] = None,
+        rope_kwargs: dict | None = None,
     ):
         super().__init__()
         rope_kwargs = rope_kwargs or {}
@@ -270,12 +270,12 @@ class EncoderVisionTransformer(nn.Module):
         mlp_ratio: float,
         hidden_act: str,
         layer_norm_eps: float,
-        ls_init_value: Optional[float] = None,
-        max_grid_height: Optional[int] = None,
-        max_grid_width: Optional[int] = None,
+        ls_init_value: float | None = None,
+        max_grid_height: int | None = None,
+        max_grid_width: int | None = None,
         use_cls_token: bool = False,
         use_rope2d: bool = True,
-        rope_kwargs: Optional[dict] = None,
+        rope_kwargs: dict | None = None,
     ):
         super().__init__()
         self.layers = depth

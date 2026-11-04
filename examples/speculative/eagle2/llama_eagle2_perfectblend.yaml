@@ -36,3 +36,6 @@ checkpoint:
   model_save_format: safetensors
   save_consolidated: true
   # restore_from: LATEST  # set to "LATEST", a subdir name like "epoch_1_step_100", or an absolute path
+
+ci:
+  cluster_tag: h100

@@ -50,13 +50,13 @@ model:
 
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512-BF16
+  padding_side: left
   tokenizer_backend: tokenizers
   fix_mistral_regex: true
   split_special_tokens: true
   add_bos_token: true
   add_eos_token: false
-  pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512-BF16
-  padding_side: left
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
@@ -158,6 +158,7 @@ distributed:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: yuhez
   time: "00:30:00"
   nodes: 1

@@ -62,7 +62,7 @@ from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 
-from .fsdp import register_diffusion_gemma_parallel_strategy
+from .fsdp import PARALLELIZER
 from .layers import (
     DiffusionGemmaMoEDecoderLayer,
     DiffusionGemmaRMSNorm,
@@ -659,9 +659,4 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
 
 
 ModelClass = DiffusionGemmaForBlockDiffusion
-
-# Register the pure-FSDP2 (ep_size=1) parallelization strategy so that
-# get_parallelization_strategy() selects it for this model. Done here (not in
-# the package __init__) so registration runs alongside model construction.
-
-register_diffusion_gemma_parallel_strategy()
+DiffusionGemmaForBlockDiffusion.parallelizer = PARALLELIZER

@@ -178,11 +178,15 @@ packed_sequence:
 
 The `packed_sequence` block accepts the following settings:
 - **packed_sequence_size**: Defines the total token length of each packed sequence. Higher values require more GPU memory.
-- **packing_strategy**: Selects `thd` (the default sequence-length-aware format) or `neat`. With `thd`, AutoModel disables packing when the model does not support `seq_lens`.
+- **packing_strategy**: Selects `thd` (the default sequence-length-aware format) or `neat`. With `thd`, AutoModel rejects models that cannot consume `seq_lens`; it does not silently disable packing.
 - **prepacked**: If `true`, treats the dataset as already packed and skips recipe-side packing.
 - **max_packs**: Optionally caps the number of packed samples created.
 - **drop_long_samples**: For `neat`, drops samples longer than `packed_sequence_size` when `true`. Otherwise, the packer raises an error.
 - **num_proc**: Specifies the number of worker processes used to tokenize the dataset before packing. Packing first runs one full pass over the dataset, which tokenizes every sample serially. Setting `num_proc > 1` front-loads that tokenization across processes, producing identical, order-preserving output. This defaults to `1` (serial). The speedup grows with the per-sample tokenization cost (such as long multi-turn chats and heavy chat templates) and available CPU cores. This runs independently on each data-parallel rank, so configure it so that `local_ranks * num_proc` does not oversubscribe the node's CPUs.
+
+### Attention backend selection
+
+LLM and VLM packing preserve the configured attention backend. SDPA/eager consumers use compatible attention masks; supported Hugging Face Flash Attention consumers use cumulative sequence lengths. Packed inputs are validated against the model's input format and attention requirements before training. THD requires a model/backend that consumes sequence-length metadata.
 
 ## Troubleshooting Tips
 

@@ -14,14 +14,19 @@
 
 from __future__ import annotations
 
+from typing import TypedDict, Unpack
+
 import torch
 from torch import nn
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
 _DSV4_CLASS_NAMES = {
     "DeepseekV4ForCausalLM",
     "DeepseekV4Model",
     "DeepseekV4Block",
+    "DeepseekV4VisionBlock",
+    "DeepseekV4VisionTransformer",
 }
 
 _DSV4_FP32_MODULE_SUFFIXES = (
@@ -36,10 +41,22 @@ _DSV4_FP32_MODULE_SUFFIXES = (
     "self_attn.compressor.indexer.wkv",
     "self_attn.compressor.indexer.wgate",
     "self_attn.compressor.indexer.ape_param",
+    "norm1",
+    "norm2",
+    "vision.norm",
 )
 
 _DSV4_RETURNED_FP32_PARAMETER_CLASS_NAMES = {
     "DeepseekV4FP32Parameter",
+}
+
+# These modules own fp32 parameters but explicitly upcast their arithmetic and
+# cast the result back to the incoming activation dtype.  Their nested FSDP
+# unit must therefore be transparent at the module boundary: casting the input
+# and forcing an fp32 output would leak fp32 activations into the following
+# bf16 projection.
+_DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES = {
+    "DeepseekV4VisionRMSNorm",
 }
 
 
@@ -115,15 +132,15 @@ def _floating_param_dtypes(module: nn.Module) -> set[torch.dtype]:
     return {param.dtype for param in module.parameters() if torch.is_floating_point(param)}
 
 
-def _fp32_mp_policy(mp_policy):
+def _fp32_mp_policy(mp_policy, *, preserve_activation_dtype: bool = False):
     if not isinstance(mp_policy, MixedPrecisionPolicy):
         return mp_policy
 
     return MixedPrecisionPolicy(
         param_dtype=torch.float32,
         reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
-        cast_forward_inputs=mp_policy.cast_forward_inputs,
+        output_dtype=None if preserve_activation_dtype else torch.float32,
+        cast_forward_inputs=False if preserve_activation_dtype else mp_policy.cast_forward_inputs,
     )
 
 
@@ -149,10 +166,20 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
     if module is None or _has_fsdp_state(module):
         return module
 
+    # An activation-checkpoint wrapper can own an fp32 island's FSDP unit; the
+    # wrapped module still decides whether the unit keeps the activation dtype.
+    wrapped = getattr(module, "_checkpoint_wrapped_module", module)
     return fully_shard(
         module,
         mesh=mesh,
-        mp_policy=_fp32_mp_policy(mp_policy) if fp32_policy else mp_policy,
+        mp_policy=(
+            _fp32_mp_policy(
+                mp_policy,
+                preserve_activation_dtype=wrapped.__class__.__name__ in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES,
+            )
+            if fp32_policy
+            else mp_policy
+        ),
         offload_policy=offload_policy,
         **_fsdp_kwargs_for_module(module, fsdp_kwargs),
     )
@@ -160,14 +187,26 @@ def _fully_shard_once(module: nn.Module, *, mesh, mp_policy, offload_policy, fp3
 
 def _iter_dsv4_fp32_modules(module: nn.Module):
     seen: set[int] = set()
+    selected_prefixes: list[str] = []
     for name, submodule in module.named_modules():
         if not name or id(submodule) in seen:
             continue
-        if not any(_matches_suffix(name, suffix) for suffix in _DSV4_FP32_MODULE_SUFFIXES):
+        # Activation checkpointing replaces an fp32 island with a wrapper that
+        # recursively contains the original module.  Once the wrapper is an
+        # FSDP unit, selecting its child as another unit would shard the same
+        # parameter twice on the same mesh.
+        if any(name.startswith(f"{prefix}.") for prefix in selected_prefixes):
+            continue
+        # A standalone vision tower names its final norm simply "norm".
+        # Match the shared vision norm type as well as paths relative to a model.
+        if submodule.__class__.__name__ not in _DSV4_SELF_CASTING_FP32_MODULE_CLASS_NAMES and not any(
+            _matches_suffix(name, suffix) for suffix in _DSV4_FP32_MODULE_SUFFIXES
+        ):
             continue
         if _floating_param_dtypes(submodule) != {torch.float32}:
             continue
         seen.add(id(submodule))
+        selected_prefixes.append(name)
         yield submodule
 
 
@@ -196,7 +235,20 @@ def _attach_hca_param_sync_group(module: nn.Module, mesh) -> None:
             setter(process_group)
 
 
-def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=None, **fsdp_kwargs):
+class DeepseekV4FSDPKwargs(TypedDict, total=False):
+    """Optional ``fully_shard`` arguments forwarded by :func:`fully_shard_deepseek_v4`."""
+
+    reshard_after_forward: bool | int | None
+    ignored_params: set[nn.Parameter] | None
+
+
+def fully_shard_deepseek_v4(
+    module: nn.Module | list[nn.Module],
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy,
+    offload_policy: OffloadPolicy | None = None,
+    **fsdp_kwargs: Unpack[DeepseekV4FSDPKwargs],
+) -> FSDPModule | list[FSDPModule]:
     """Apply FSDP2 to DeepSeek-V4 without mixing fp32 and bf16 params in one unit.
 
     This is intentionally model-specific.  DeepSeek-V4 keeps a small set of
@@ -208,7 +260,31 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
     policy requests bf16 compute.  In that case, preserve fp32 compute only for
     the explicitly listed reference-sensitive islands and let the parent block
     use the caller's bf16 policy.
+
+    Args:
+        module: One module, or a list of modules sharded together as one
+            cross-block FSDP unit under the caller's explicit policy.
+        mesh: Data-parallel shard mesh.
+        mp_policy: Caller's mixed-precision policy for the parent unit.
+        offload_policy: Optional CPU offload policy.
+        **fsdp_kwargs: Remaining ``fully_shard`` options, forwarded unchanged
+            except that ``ignored_params`` is filtered per FP32 island.
+
+    Returns:
+        The sharded module, or the list of sharded modules for a group input.
     """
+    if isinstance(module, list):
+        # Cross-block groups arrive with the helper's explicit FP32 policy.
+        # All members must preserve their natural output dtype, including the
+        # raw sink parameters that are consumed after their holder returns.
+        return fully_shard(
+            module,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            **fsdp_kwargs,
+        )
+
     is_dsv4 = _is_deepseek_v4_module(module)
     if is_dsv4:
         _attach_hca_param_sync_group(module, mesh)

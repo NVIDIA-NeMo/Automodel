@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -84,7 +83,7 @@ class NCCLTransport:
         self._host = host
         self._is_server = is_server
         self._rank = 0 if is_server else 1
-        self._pg: Optional[dist.ProcessGroup] = None
+        self._pg: dist.ProcessGroup | None = None
         self._initialized = False
         self._init_lock = threading.Lock()
         self._group_name = f"nemo_eagle_target_transfer_{nccl_port}"
@@ -140,7 +139,7 @@ class NCCLTransport:
                 self._initialized = False
                 return False
 
-    def send_tensors(self, tensor_dict: dict[str, Optional[torch.Tensor]], keys_order: list[str]) -> None:
+    def send_tensors(self, tensor_dict: dict[str, torch.Tensor | None], keys_order: list[str]) -> None:
         """Send tensors (server side) in ``keys_order``; skips ``None`` entries."""
         assert self._initialized and self._pg is not None, "NCCL transport not initialized"
         assert self._is_server, "only the server sends tensors"
@@ -156,16 +155,14 @@ class NCCLTransport:
                 tensor = tensor.view(torch.uint8)
             dist.send(tensor, dst=1, group=self._pg)
 
-    def recv_tensors(
-        self, metadata: dict[str, Optional[dict]], keys_order: list[str]
-    ) -> dict[str, Optional[torch.Tensor]]:
+    def recv_tensors(self, metadata: dict[str, dict | None], keys_order: list[str]) -> dict[str, torch.Tensor | None]:
         """Receive tensors (client side) per ``metadata`` in ``keys_order``."""
         from nemo_automodel.components.speculative.eagle.remote.protocol import dtype_from_code
 
         assert self._initialized and self._pg is not None, "NCCL transport not initialized"
         assert not self._is_server, "only the client receives tensors"
 
-        result: dict[str, Optional[torch.Tensor]] = {}
+        result: dict[str, torch.Tensor | None] = {}
         for key in keys_order:
             meta = metadata.get(key)
             if meta is None:

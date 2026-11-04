@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
@@ -29,10 +29,10 @@ class CometLogger:
     def __init__(
         self,
         project_name: str,
-        workspace: Optional[str] = None,
-        api_key: Optional[str] = None,
-        experiment_name: Optional[str] = None,
-        tags: Optional[list] = None,
+        workspace: str | None = None,
+        api_key: str | None = None,
+        experiment_name: str | None = None,
+        tags: list | None = None,
         auto_metric_logging: bool = False,
         **kwargs,
     ):
@@ -83,7 +83,7 @@ class CometLogger:
 
         self.experiment.log_parameters(params)
 
-    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None) -> None:
+    def log_metrics(self, metrics: Dict[str, float], step: int | None = None) -> None:
         """Log metrics to Comet.
 
         Args:

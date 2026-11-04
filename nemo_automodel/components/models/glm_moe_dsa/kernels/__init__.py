@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Vendored GLM-5.2 DSA TileLang kernels.
+"""GLM-5.2 DSA kernel adapters and vendored TileLang kernels.
+
+``cudnn_dsa.py`` is AutoModel's adapter for the optional cuDNN Frontend DSA
+and FlashMLA runtimes. The other kernel sources documented below are vendored.
 
 slime GLM-5.2 kernels
 ---------------------

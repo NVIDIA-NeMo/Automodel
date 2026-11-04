@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import json
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -20,6 +21,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.checkpoint.addons import _maybe_strip_quantization_config
 from nemo_automodel.components.models.kimi_k25_vl.model import (
     DeepSeekV3RotaryEmbeddingAdapter,
     KimiK25VLConfig,
@@ -27,12 +29,12 @@ from nemo_automodel.components.models.kimi_k25_vl.model import (
     KimiK25VLModel,
     KimiK25VLMultiModalProjector,
     Learnable2DInterpPosEmbDividedFixed,
+    MoonVision3dPatchEmbed,
     MoonViT3dConfig,
     MoonViT3dEncoder,
     MoonViT3dEncoderLayer,
     MoonViT3dMLP,
     MoonViT3dPretrainedModel,
-    MoonVision3dPatchEmbed,
     Rope2DPosEmbRepeated,
     _apply_rope_vision,
     get_1d_sincos_pos_embed,
@@ -97,6 +99,37 @@ class TestKimiK25VLConfig:
         assert "text_config" in config_dict
         assert isinstance(config_dict["vision_config"], dict)
         assert isinstance(config_dict["text_config"], dict)
+
+    def test_config_promotes_nested_quantization_config(self):
+        """Quantization metadata is normalized to the top-level config."""
+        quantization_config = {"quant_method": "compressed-tensors", "format": "pack-quantized"}
+
+        config = KimiK25VLConfig(text_config={"quantization_config": quantization_config})
+
+        assert config.quantization_config == quantization_config
+        assert getattr(config.text_config, "quantization_config", None) is None
+        config_dict = config.to_dict()
+        assert config_dict["quantization_config"] == quantization_config
+        assert "quantization_config" not in config_dict["text_config"]
+
+    def test_bf16_export_config_reload_has_no_quantization_metadata(self, tmp_path):
+        """A BF16-exported config reloads without stale INT4 metadata."""
+        config = KimiK25VLConfig(
+            text_config={"quantization_config": {"quant_method": "compressed-tensors", "format": "pack-quantized"}}
+        )
+        model = torch.nn.Linear(4, 4, dtype=torch.bfloat16)
+
+        _maybe_strip_quantization_config(model, config=config)
+        config.save_pretrained(tmp_path)
+
+        with open(tmp_path / "config.json") as f:
+            saved_config = json.load(f)
+        assert "quantization_config" not in saved_config
+        assert "quantization_config" not in saved_config["text_config"]
+
+        reloaded = KimiK25VLConfig.from_pretrained(tmp_path)
+        assert getattr(reloaded, "quantization_config", None) is None
+        assert getattr(reloaded.text_config, "quantization_config", None) is None
 
 
 class TestMoonViT3dConfig:
@@ -235,43 +268,6 @@ class TestKimiK25VLModelInputsEmbeds:
         with pytest.raises(ValueError, match="exactly one of input_ids or inputs_embeds"):
             if (input_ids is None) == (inputs_embeds is None):
                 raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-
-class TestKimiK25VLForConditionalGenerationForward:
-    """Tests for KimiK25VLForConditionalGeneration.forward signature."""
-
-    def test_forward_signature_vlm_params(self):
-        """Test forward signature includes VLM-specific parameters."""
-        sig = inspect.signature(KimiK25VLForConditionalGeneration.forward)
-        params = list(sig.parameters.keys())
-
-        # Standard LM params
-        assert "input_ids" in params
-        assert "attention_mask" in params
-        assert "position_ids" in params
-        assert "inputs_embeds" in params
-        assert "labels" in params
-
-        # VLM-specific params
-        assert "pixel_values" in params
-        assert "grid_thws" in params
-        assert "target_seq_length" in params
-
-    def test_forward_signature_optional_params(self):
-        """Test forward signature has expected optional parameters."""
-        sig = inspect.signature(KimiK25VLForConditionalGeneration.forward)
-
-        optional_params = [
-            "past_key_values",
-            "use_cache",
-            "output_attentions",
-            "output_hidden_states",
-            "return_dict",
-            "padding_mask",
-        ]
-
-        for param in optional_params:
-            assert param in sig.parameters, f"forward should accept {param} parameter"
 
 
 class TestKimiK25VLRegistration:

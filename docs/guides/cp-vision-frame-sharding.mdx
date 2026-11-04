@@ -42,6 +42,7 @@ distributed:
         mesh_dims: [cp]
         min_tokens: 2048
         min_frames: 32
+        min_local_patch_rows: 96
         cost_alpha: auto
 ```
 
@@ -71,6 +72,7 @@ The following table describes the vision frame sharding fields:
 | `mesh_dims` | `[cp]` | Selects the device-mesh dimensions used to distribute frames. Only `[cp]` is currently supported. |
 | `min_tokens` | `2048` | Minimum number of merged visual tokens that can activate sharding. Set it to `0` to always satisfy the token threshold. |
 | `min_frames` | `32` | Minimum number of independent image or video-frame units that can activate sharding even below `min_tokens`. Set it to `0` to always satisfy the frame threshold. |
+| `min_local_patch_rows` | `96` | Minimum pre-merge patch rows processed by each sharded rank that owns real frames. Smaller shards append whole, same-shaped zero frames and discard their outputs before the gather. Because this counts patch rows, it accounts for both frame count and resolution. Set it to `0` to disable local padding. |
 | `cost_alpha` | `auto` | Controls how frame cost is estimated for load balancing. `auto` uses the vision hidden size and is the recommended setting. A nonnegative integer overrides the inferred value. Setting it to `0` uses a purely quadratic attention-cost estimate. |
 
 Vision frame sharding uses the replicated path only when both the merged visual-token count is below
@@ -102,6 +104,24 @@ gradients for vision-tower weights that are replicated across TP ranks.
 If a batch contains fewer frames than CP ranks, the implementation adds minimal dummy
 frames so every rank participates in the vision forward and collectives. The corresponding
 embeddings are discarded and contribute no gradient.
+
+Frame sharding without local padding is mathematically valid. However, enabling frame
+sharding can make each rank's reduced-precision ViT input much smaller than the input used
+when frame sharding is disabled and the full vision tower is replicated. Tiny local shapes
+can select different kernel tiling and accumulation orders, increasing numerical variation
+relative to that replicated baseline. The default `min_local_patch_rows=96` is a
+conservative kernel-shape floor intended to improve this sharded-versus-replicated parity.
+
+A rank below the floor appends enough whole zero frames of the same resolution to reach it.
+Their outputs are removed before the differentiable gather, so they contribute no model
+token or gradient; they only change the local vision-kernel shape. Ranks that own only a
+rank-fill dummy remain minimal.
+
+This padding is a minor parity aid, not a correctness requirement, a bitwise-equivalence
+guarantee, or a throughput optimization. It adds some vision work and may be unnecessary
+for workloads whose unpadded sharded training already matches the frame-sharding-disabled
+baseline closely. Set `min_local_patch_rows: 0` after workload-specific convergence
+validation when avoiding that extra work is preferred.
 
 ## Check Your Workload
 

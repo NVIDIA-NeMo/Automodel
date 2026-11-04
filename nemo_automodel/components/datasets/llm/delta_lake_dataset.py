@@ -93,16 +93,16 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator
 
 from nemo_automodel.components.datasets.reservoir_sampler import ReservoirSampler
 
 logger = logging.getLogger(__name__)
 
 # Lazy imports to avoid requiring deltalake/pyspark when not used
-_DELTALAKE_AVAILABLE: Optional[bool] = None
-_DATABRICKS_SQL_AVAILABLE: Optional[bool] = None
-_PYSPARK_AVAILABLE: Optional[bool] = None
+_DELTALAKE_AVAILABLE: bool | None = None
+_DATABRICKS_SQL_AVAILABLE: bool | None = None
+_PYSPARK_AVAILABLE: bool | None = None
 
 
 def _check_deltalake_available() -> bool:
@@ -164,7 +164,7 @@ def _is_deletion_vectors_error(e: BaseException) -> bool:
     return "deletionvectors" in msg or "deletion vectors" in msg
 
 
-def _get_spark_session() -> Optional[Any]:
+def _get_spark_session() -> Any | None:
     """Get an active Spark session if available (Databricks notebooks/jobs).
 
     Returns:
@@ -258,7 +258,7 @@ _UNITY_STORAGE_TABLE_PATH_RE = re.compile(
 )
 
 
-def _parse_unity_storage_ids(path: str) -> Optional[Dict[str, str]]:
+def _parse_unity_storage_ids(path: str) -> Dict[str, str] | None:
     """Parse Unity Catalog managed storage IDs from a __unitystorage path.
 
     Databricks Unity Catalog managed tables use internal cloud locations like:
@@ -284,9 +284,9 @@ def _build_uc_table_fqn(catalog: str, schema: str, table: str) -> str:
 def _try_resolve_uc_table_from_system_tables(
     spark: Any,
     *,
-    table_id: Optional[str] = None,
-    storage_location: Optional[str] = None,
-) -> Optional[str]:
+    table_id: str | None = None,
+    storage_location: str | None = None,
+) -> str | None:
     """Best-effort reverse lookup of a UC table name via Databricks system tables."""
     candidates: list[str] = []
     if table_id:
@@ -322,7 +322,7 @@ def _try_resolve_uc_table_from_system_tables(
     return None
 
 
-def _resolve_uc_table_from_unity_storage_path(spark: Any, path: str) -> Optional[str]:
+def _resolve_uc_table_from_unity_storage_path(spark: Any, path: str) -> str | None:
     """If *path* looks like UC managed storage, try to resolve to catalog.schema.table."""
     ids = _parse_unity_storage_ids(path)
     if ids is None:
@@ -366,12 +366,12 @@ class DeltaLakeIterator:
     def __init__(
         self,
         table_path: str,
-        columns: Optional[list] = None,
-        storage_options: Optional[Dict[str, str]] = None,
+        columns: list | None = None,
+        storage_options: Dict[str, str] | None = None,
         batch_size: int = 1024,
-        version: Optional[int] = None,
-        sql_query: Optional[str] = None,
-        shard_info: Optional[tuple[int, int]] = None,
+        version: int | None = None,
+        sql_query: str | None = None,
+        shard_info: tuple[int, int] | None = None,
     ):
         if not _check_delta_reader_available():
             raise ImportError(
@@ -386,7 +386,7 @@ class DeltaLakeIterator:
         self.batch_size = batch_size
         self.version = version
         self.sql_query = sql_query
-        self._shard_info: Optional[tuple[int, int]] = None
+        self._shard_info: tuple[int, int] | None = None
 
         if shard_info is not None:
             num_shards, shard_index = shard_info
@@ -739,10 +739,10 @@ class DeltaLakeDataset:
     def __init__(
         self,
         table_path: str,
-        columns: Optional[list] = None,
-        storage_options: Optional[Dict[str, str]] = None,
-        version: Optional[int] = None,
-        sql_query: Optional[str] = None,
+        columns: list | None = None,
+        storage_options: Dict[str, str] | None = None,
+        version: int | None = None,
+        sql_query: str | None = None,
     ):
         self.table_path = _normalize_delta_path(table_path)
         self.columns = columns
@@ -750,8 +750,8 @@ class DeltaLakeDataset:
         self.version = version
         self.sql_query = sql_query
         self._epoch: int = 0
-        self._shard_info: Optional[tuple] = None  # (num_shards, shard_index)
-        self._shuffle_info: Optional[tuple] = None  # (buffer_size, seed)
+        self._shard_info: tuple | None = None  # (num_shards, shard_index)
+        self._shuffle_info: tuple | None = None  # (buffer_size, seed)
 
         # Eagerly create the internal iterator to validate the table
         self._data_iterator = DeltaLakeIterator(
@@ -795,7 +795,7 @@ class DeltaLakeDataset:
         self._data_iterator.shard(num_shards, index)
         return self
 
-    def shuffle(self, buffer_size: int = 1000, seed: Optional[int] = None) -> "DeltaLakeDataset":
+    def shuffle(self, buffer_size: int = 1000, seed: int | None = None) -> "DeltaLakeDataset":
         """Configure shuffling for the dataset.
 
         Note: For streaming Delta Lake datasets, shuffling is performed on-the-fly
@@ -847,7 +847,7 @@ class _LimitedDeltaLakeDataset:
         self._base.shard(num_shards, index)
         return self
 
-    def shuffle(self, buffer_size: int = 1000, seed: Optional[int] = None):
+    def shuffle(self, buffer_size: int = 1000, seed: int | None = None):
         self._base.shuffle(buffer_size, seed)
         return self
 

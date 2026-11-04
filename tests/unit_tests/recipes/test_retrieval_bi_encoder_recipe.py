@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.utils.model_utils import parse_freeze_config
 from nemo_automodel.components.datasets.llm.retrieval_collator import ProcessorMethodCollator
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.loggers.metric_logger import MetricLogger, MetricsSample
@@ -270,11 +271,13 @@ def test_retrieval_model_instantiate_kwargs_include_freeze_config():
         "freeze_vision_tower": True,
         "freeze_language_model": True,
     }
-    cfg = _DictLikeConfig(freeze_config=ConfigNode(freeze_config))
+    cfg = _DictLikeConfig(freeze_config=parse_freeze_config(freeze_config))
 
     kwargs = _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config)
 
-    assert kwargs["freeze_config"] == freeze_config
+    assert kwargs["freeze_config"] is cfg.freeze_config
+    assert kwargs["freeze_config"].freeze_vision_tower is True
+    assert kwargs["freeze_config"].freeze_language_model is True
 
 
 class _FakeCheckpointer:

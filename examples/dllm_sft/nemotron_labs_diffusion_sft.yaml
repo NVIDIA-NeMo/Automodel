@@ -116,5 +116,6 @@ dataloader:
 # Heavier than llada (8B, tp2, seq 8192, CPU offload); cold-cache budget covers
 # 8B download + tulu-3 + train + consolidate + reload + generate.
 ci:
+  cluster_tag: h100
   recipe_owner: zyzhou5
   time: "02:00:00"

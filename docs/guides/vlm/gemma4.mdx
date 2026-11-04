@@ -61,7 +61,7 @@ This guide runs **inside** the NeMo AutoModel Docker container:
 ```bash
 docker run -it --rm --gpus all --ipc=host --network host \
     -v $(pwd):/workspace \
-    nvcr.io/nvidia/nemo-automodel:26.06.00
+    nvcr.io/nvidia/nemo-automodel:26.10.00
 
 # Inside the container:
 huggingface-cli login          # needed for gated model access
@@ -329,7 +329,6 @@ lr_scheduler:
   lr_decay_style: cosine
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false

@@ -60,7 +60,16 @@ def ref_cce(monkeypatch):
     """
 
     def _ref(
-        hidden, lm_weight, targets, ignore_index=-100, softcap=None, reduction="sum", shift=False, filter_eps=None
+        hidden,
+        lm_weight,
+        targets,
+        ignore_index=-100,
+        softcap=None,
+        reduction="sum",
+        shift=False,
+        filter_eps=None,
+        accum_e_fp32=False,
+        impl="cce",
     ):
         logits = hidden.float() @ lm_weight.float().t()
         return F.cross_entropy(
@@ -110,7 +119,7 @@ def _inputs(requires_grad=False, seed=0):
 
 
 def _count_gathers():
-    """Patch _get_lm_head_weight in both namespaces with a counting wrapper."""
+    """Count weight retrievals at the shared materialization boundary."""
     n = {"c": 0}
     real = _lutils._get_lm_head_weight
 
@@ -120,7 +129,6 @@ def _count_gathers():
 
     return (
         n,
-        mock.patch.object(_mtp, "_get_lm_head_weight", side_effect=spy),
         mock.patch.object(_lutils, "_get_lm_head_weight", side_effect=spy),
     )
 
@@ -142,12 +150,48 @@ def test_mtp_loss_matches_reference(ref_cce):
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_mtp_loss_optionally_returns_unscaled_per_depth_losses(ref_cce):
+    torch.manual_seed(7)
+    m = _TinyModel()
+    hs, labels = _inputs(requires_grad=True)
+    output = calculate_mtp_loss(
+        FusedLinearCrossEntropy(reduction="sum"),
+        mtp_per_depth_h=hs,
+        labels=labels,
+        model=m,
+        scaling_factor=SF,
+        num_label_tokens=NLT,
+        ignore_index=IGN,
+        return_per_depth=True,
+    )
+    assert isinstance(output, _mtp.MTPLossOutput)
+
+    expected_per_depth = []
+    cur_labels = labels
+    for depth, hidden_states in enumerate(hs, start=1):
+        cur_labels = roll_tensor(cur_labels, shifts=-1, dim=-1)
+        masked = cur_labels.clone()
+        masked[..., -depth:] = IGN
+        logits = hidden_states.float() @ m.lm_head.weight.float().t()
+        expected_per_depth.append(
+            F.cross_entropy(logits.reshape(-1, V), masked.reshape(-1), ignore_index=IGN, reduction="sum") / NLT
+        )
+
+    assert len(output.per_depth_losses) == D
+    for actual, expected in zip(output.per_depth_losses, expected_per_depth):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(output.loss, sum(expected_per_depth) * (SF / D), rtol=1e-5, atol=1e-6)
+
+    output.loss.backward()
+    assert all(loss.grad_fn is not None for loss in output.per_depth_losses)
+
+
 def test_lm_head_gathered_once(ref_cce):
     torch.manual_seed(1)
     m = _TinyModel()
     hs, labels = _inputs()
-    n, p1, p2 = _count_gathers()
-    with p1, p2:
+    n, patch_weight = _count_gathers()
+    with patch_weight:
         calculate_mtp_loss(
             FusedLinearCrossEntropy(reduction="sum"),
             mtp_per_depth_h=[h.clone() for h in hs],
@@ -164,8 +208,8 @@ def test_lm_weight_passthrough_skips_gather(ref_cce):
     torch.manual_seed(1)
     m = _TinyModel()
     hs, labels = _inputs()
-    n, p1, p2 = _count_gathers()
-    with p1, p2:
+    n, patch_weight = _count_gathers()
+    with patch_weight:
         calculate_mtp_loss(
             FusedLinearCrossEntropy(reduction="sum"),
             mtp_per_depth_h=[h.clone() for h in hs],
@@ -254,7 +298,7 @@ def test_non_fused_path_does_not_gather_lm_head():
     with (
         mock.patch.object(_mtp, "calculate_loss", side_effect=fake_calc),
         mock.patch.object(
-            _mtp, "_get_lm_head_weight", side_effect=AssertionError("non-fused path must not gather the LM head")
+            _lutils, "_get_lm_head_weight", side_effect=AssertionError("non-fused path must not gather the LM head")
         ),
     ):
         calculate_mtp_loss(
@@ -291,8 +335,8 @@ def test_sharded_lm_head_gathers_once_and_matches(ref_cce):
         labels = torch.randint(0, V, (B, S))
         m = _TinyModel(weight=distribute_tensor(W_full.clone(), mesh, [Shard(0)]))
 
-        n, p1, p2 = _count_gathers()
-        with p1, p2:
+        n, patch_weight = _count_gathers()
+        with patch_weight:
             loss = calculate_mtp_loss(
                 FusedLinearCrossEntropy(reduction="sum"),
                 mtp_per_depth_h=hs,

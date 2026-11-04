@@ -33,6 +33,7 @@ from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncod
 from nemo_automodel.components.datasets.llm.retrieval_types import PASSAGE_MODALITY_NAMES
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import (
@@ -140,7 +141,7 @@ def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
     }
     freeze_config = cfg.get("freeze_config", None)
     if freeze_config is not None:
-        kwargs["freeze_config"] = freeze_config.to_dict()
+        kwargs["freeze_config"] = cfg.freeze_config
     if cfg.get("compile", None) is not None:
         kwargs["compile_config"] = build_compile_config(cfg.compile)
     return kwargs
@@ -301,6 +302,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
         self.temperature = self.cfg.get("temperature", 1.0)
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError(f"temperature must be finite and greater than 0, got {self.temperature!r}")
 
     def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
         """Build optimizer parameter groups for trainable model parameters."""
@@ -364,14 +367,20 @@ class TrainBiEncoderRecipe(BaseRecipe):
             )
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True),
+                model_name=self.cfg.model.pretrained_model_name_or_path,
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         self._log_experiment_details()
         self._log_library_versions()
 
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
-
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
 
         checkpoint_config = self.cfg.checkpoint
 
@@ -792,6 +801,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         has_nonfinite_grad_norm = False
         skip_reason = "a non-finite loss was detected on at least one data-parallel rank"
         if not skipped_update:
+            synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
             grad_norm = scale_grads_and_clip_grad_norm(
                 max_grad_norm,
                 self.model_parts,
@@ -976,6 +986,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
 
         self.metric_logger_train.log(log_data)
 
@@ -1014,6 +1027,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         if wandb.run is not None:
             wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
 
         self.metric_logger_valid.log(log_data)
 

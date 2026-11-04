@@ -107,3 +107,6 @@ optimizer:
   weight_decay: 0
   master_weight_bits: 32
   compress_state_dict: false
+
+ci:
+  cluster_tag: h100

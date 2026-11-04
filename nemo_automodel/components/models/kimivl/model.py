@@ -15,7 +15,7 @@
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -72,12 +72,12 @@ class KimiVLConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vision_config: Optional[Union[Dict, MoonViTConfig]] = None,
-        text_config: Optional[Union[Dict, DeepseekV3Config]] = None,
+        vision_config: Union[Dict, MoonViTConfig] | None = None,
+        text_config: Union[Dict, DeepseekV3Config] | None = None,
         ignore_index: int = -100,
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
-        architectures: Optional[List[str]] = None,
+        architectures: List[str] | None = None,
         **kwargs,
     ):
         if vision_config is None:
@@ -718,7 +718,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         labels=None,
         use_cache=None,
         output_attentions=None,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         return_dict=None,
         pixel_values=None,
         image_grid_hws=None,

@@ -19,6 +19,8 @@ the target wrapper, then train the draft via the trainer module -- on the actual
 component classes (not hand-rolled capture). Requires a GPU (FlexAttention).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, Qwen3Config
@@ -35,6 +37,7 @@ from nemo_automodel.components.speculative.dspark import Qwen3DSparkModel, build
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
 from nemo_automodel.components.speculative.dspark.registry import build_target_layer_ids
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
+from nemo_automodel.recipes.llm.train_dspark import TrainDSparkRecipe
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention backward requires a GPU")
 
@@ -112,6 +115,95 @@ def test_trainer_module_with_target_wrapper_trains():
         losses.append(out.loss.item())
 
     assert losses[-1] < losses[0], f"loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
+
+
+def test_recipe_loop_flushes_partial_accumulation_window():
+    """Exercise the live-target recipe loop and its trailing optimizer update."""
+    device, dtype = torch.device("cuda"), torch.float32
+    target_config = Qwen3Config(
+        vocab_size=VOCAB,
+        hidden_size=HIDDEN,
+        intermediate_size=2 * HIDDEN,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+    )
+    target_layer_ids = build_target_layer_ids(target_config.num_hidden_layers, 3)
+    target = AutoModelForCausalLM.from_config(target_config).to(device=device, dtype=dtype).eval()
+    target.requires_grad_(False)
+    target_wrapper = HFDSparkTargetModel(target, target_layer_ids=target_layer_ids)
+    model_args = _Args(
+        num_draft_layers=2,
+        target_layer_ids=target_layer_ids,
+        block_size=4,
+        mask_token_id=7,
+        num_anchors=16,
+        markov_rank=32,
+        markov_head_type="vanilla",
+        confidence_head_alpha=1.0,
+        confidence_head_with_markov=True,
+    )
+    draft = Qwen3DSparkModel(build_draft_config(target_config, model_args)).to(device=device, dtype=dtype)
+    draft.initialize_embeddings_and_head(
+        embed_tokens=target_wrapper.get_input_embeddings(),
+        lm_head=target_wrapper.get_output_embeddings(),
+        freeze=True,
+    )
+    trainer = DSparkTrainerModule(
+        draft,
+        loss_decay_gamma=4.0,
+        ce_loss_alpha=0.1,
+        l1_loss_alpha=0.9,
+        confidence_head_alpha=1.0,
+    ).to(device)
+    optimizer = torch.optim.AdamW([parameter for parameter in trainer.parameters() if parameter.requires_grad], lr=1e-3)
+
+    torch.manual_seed(5)
+    batches = []
+    for _ in range(3):
+        input_ids = torch.randint(0, VOCAB, (1, 16))
+        batches.append(
+            {
+                "input_ids": input_ids,
+                "attention_mask": torch.ones_like(input_ids),
+                "loss_mask": torch.ones_like(input_ids, dtype=torch.uint8),
+            }
+        )
+
+    recipe = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    recipe.trainer_module = trainer
+    recipe.target_wrapper = target_wrapper
+    recipe.train_dataloader = batches
+    recipe.val_dataloader = None
+    recipe.optimizer = optimizer
+    recipe.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    recipe.runtime = SimpleNamespace(global_step=0)
+    recipe.num_epochs = 1
+    recipe._resume_epoch = 0
+    recipe.total_optim_steps = 2
+    recipe.grad_accumulation_steps = 2
+    recipe.defer_fsdp_grad_sync = True
+    recipe.max_grad_norm = 1.0
+    recipe.block_size = 4
+    recipe.device = device
+    recipe.dist_env = SimpleNamespace(is_main=False)
+    recipe.log_every_steps = 100
+    recipe.metric_logger = None
+    recipe.wandb_run = None
+    recipe.save_checkpoint_every_epoch = False
+    recipe.ckpt_every_steps = None
+    recipe._make_progress_bar = lambda **kwargs: None
+    recipe._maybe_precompute_fp8_scales = lambda: None
+    recipe._maybe_save_step_checkpoint = lambda epoch: False
+    recipe._maybe_save_final_checkpoint = lambda completed_epochs: False
+    recipe._finalize_and_close_checkpointer = lambda: None
+
+    before = next(parameter for parameter in trainer.parameters() if parameter.requires_grad).detach().clone()
+    recipe.run_train_validation_loop()
+
+    assert recipe.runtime.global_step == 2
+    assert not torch.equal(next(parameter for parameter in trainer.parameters() if parameter.requires_grad), before)
 
 
 def test_trainer_module_trains_from_offline_cache(tmp_path):

@@ -14,7 +14,7 @@
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 class Launcher(ABC):
@@ -27,7 +27,7 @@ class Launcher(ABC):
         config_path: Path,
         recipe_target: str,
         launcher_config: Any,
-        extra_args: Optional[List[str]] = None,
+        extra_args: List[str] | None = None,
     ) -> int:
         """Launch a recipe job.
 

@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
 
 import torch
 from torch import nn
@@ -38,7 +37,7 @@ class VanillaMarkov(nn.Module):
     def compute_step_bias(
         self,
         token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+        hidden_states: torch.Tensor | None,
     ) -> torch.Tensor:
         del hidden_states
         return self.project_bias(self.get_prev_embeddings(token_ids))
@@ -48,7 +47,7 @@ class VanillaMarkov(nn.Module):
         logits: torch.Tensor,
         *,
         token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+        hidden_states: torch.Tensor | None,
     ) -> torch.Tensor:
         return logits + self.compute_step_bias(token_ids, hidden_states)
 
@@ -57,7 +56,7 @@ class VanillaMarkov(nn.Module):
         base_logits: torch.Tensor,
         *,
         token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+        hidden_states: torch.Tensor | None,
     ) -> torch.Tensor:
         if base_logits.size(2) == 0:
             return base_logits
@@ -69,7 +68,7 @@ class VanillaMarkov(nn.Module):
         base_logits: torch.Tensor,
         *,
         first_prev_token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+        hidden_states: torch.Tensor | None,
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, proposal_len = base_logits.shape[:2]
@@ -117,7 +116,7 @@ class GatedMarkovHead(VanillaMarkov):
     def compute_gate(
         self,
         token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+        hidden_states: torch.Tensor | None,
     ) -> torch.Tensor:
         assert hidden_states is not None
         prev_embeddings = self.get_prev_embeddings(token_ids)
@@ -127,7 +126,7 @@ class GatedMarkovHead(VanillaMarkov):
     def compute_step_bias(
         self,
         token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+        hidden_states: torch.Tensor | None,
     ) -> torch.Tensor:
         prev_embeddings = self.get_prev_embeddings(token_ids)
         gate = self.compute_gate(token_ids, hidden_states).to(dtype=prev_embeddings.dtype)
@@ -185,7 +184,7 @@ class RNNHead(VanillaMarkov):
     def compute_step_bias(
         self,
         token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+        hidden_states: torch.Tensor | None,
     ) -> torch.Tensor:
         """Stateless single-step bias (state initialized to zero).
 
@@ -203,7 +202,7 @@ class RNNHead(VanillaMarkov):
         base_logits: torch.Tensor,
         *,
         token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+        hidden_states: torch.Tensor | None,
     ) -> torch.Tensor:
         """Apply RNN bias during training (teacher-forced, unrolled over block_size).
 
@@ -239,7 +238,7 @@ class RNNHead(VanillaMarkov):
         base_logits: torch.Tensor,
         *,
         first_prev_token_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
+        hidden_states: torch.Tensor | None,
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressive sampling with RNN state.

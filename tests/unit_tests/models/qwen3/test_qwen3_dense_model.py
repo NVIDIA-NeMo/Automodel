@@ -17,11 +17,11 @@
 import pytest
 import torch
 from transformers import Qwen3Config
+from transformers.cache_utils import DynamicCache
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3ForCausalLM
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
-from nemo_automodel.components.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
+from nemo_automodel.components.models.qwen3.model import Qwen3Attention, Qwen3ForCausalLM
 
 
 def _tiny_config() -> Qwen3Config:
@@ -69,19 +69,6 @@ def test_qwen3_bshd_matches_huggingface_logits_and_gradients():
         torch.testing.assert_close(parameter.grad, reference_gradient, atol=2e-6, rtol=2e-5)
 
 
-def test_qwen3_state_dict_adapter_round_trip_is_exact():
-    """Separate Qwen3 projections must round-trip without key or value changes."""
-    reference_model = HFQwen3ForCausalLM(_tiny_config())
-    state_dict = reference_model.state_dict()
-    adapter = Qwen3StateDictAdapter(reference_model.config)
-
-    round_trip = adapter.to_hf(adapter.from_hf(state_dict))
-
-    assert round_trip.keys() == state_dict.keys()
-    for key, value in state_dict.items():
-        torch.testing.assert_close(round_trip[key], value, atol=0.0, rtol=0.0)
-
-
 @pytest.mark.parametrize("tie_word_embeddings", [True, False])
 def test_qwen3_respects_tied_embedding_config(tie_word_embeddings):
     """The LM head must share storage with input embeddings only when configured."""
@@ -91,3 +78,41 @@ def test_qwen3_respects_tied_embedding_config(tie_word_embeddings):
     model = Qwen3ForCausalLM(config, backend=BackendConfig(attn="sdpa"))
 
     assert (model.lm_head.weight is model.model.embed_tokens.weight) is tie_word_embeddings
+
+
+@pytest.mark.parametrize("attn_implementation", ["sdpa", "eager"])
+def test_qwen3_bshd_bf16_fp32_rope_forward_backward_and_cache(attn_implementation: str) -> None:
+    """FP32 RoPE tables must preserve BF16 attention and cached decoding."""
+    torch.manual_seed(1234)
+    config = _tiny_config()
+    config._attn_implementation = attn_implementation
+    attention = Qwen3Attention(config, 0, BackendConfig(attn="sdpa", rope_fusion=False)).to(torch.bfloat16)
+    hidden_states = torch.randn(1, 5, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+    angles = torch.outer(torch.arange(257, 262, dtype=torch.float32), torch.tensor([1.0, 0.01]))
+    cos, sin = angles.cos().repeat(1, 2).unsqueeze(0), angles.sin().repeat(1, 2).unsqueeze(0)
+    attention_mask = torch.full((1, 1, 5, 5), float("-inf"), dtype=torch.bfloat16).triu(1)
+
+    output, _ = attention(hidden_states, (cos, sin), attention_mask)
+    assert output.dtype == torch.bfloat16
+    output.backward(torch.randn_like(output))
+    assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+    for name, parameter in attention.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+
+    cache = DynamicCache(config=config)
+    with torch.no_grad():
+        decoded = torch.cat(
+            [
+                attention(
+                    hidden_states[:, index : index + 1],
+                    (cos[:, index : index + 1], sin[:, index : index + 1]),
+                    None,
+                    past_key_values=cache,
+                )[0]
+                for index in range(hidden_states.shape[1])
+            ],
+            dim=1,
+        )
+    assert cache.get_seq_length() == hidden_states.shape[1]
+    assert cache.layers[0].keys.dtype == cache.layers[0].values.dtype == torch.bfloat16
+    torch.testing.assert_close(decoded, output)

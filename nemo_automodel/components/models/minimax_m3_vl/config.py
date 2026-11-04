@@ -25,9 +25,26 @@ Mirrors the canonical sglang reference ``sglang.srt.configs.minimax_vl`` and the
 field set in the checkpoint's ``config.json``; keep them in sync.
 """
 
-from typing import Any, Optional, Union
+from typing import Any, Required, TypedDict, Union
 
 from transformers.configuration_utils import PretrainedConfig
+
+
+class MiniMaxM3QuantizationConfig(TypedDict, total=False):
+    """``quantization_config`` block of the released MiniMax M3 checkpoints.
+
+    M3 stores MXFP8 projections described by ``quant_method``, ``activation_scheme``,
+    ``weight_block_size`` and ``ignored_layers``. M3.1 adds NVFP4 packed routed
+    experts described by ``moe_quant_algo``, ``moe_quant_format`` and ``group_size``.
+    """
+
+    quant_method: Required[str]
+    activation_scheme: str
+    weight_block_size: list[int]
+    ignored_layers: list[str]
+    moe_quant_algo: str
+    moe_quant_format: str
+    group_size: int
 
 
 def _json_safe_value(value: Any) -> Any:
@@ -76,15 +93,17 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         scoring_func: str = "sigmoid",
         use_routing_bias: bool = True,
         routed_scaling_factor: float = 2.0,
-        moe_layer_freq: Optional[list[int]] = None,
+        moe_layer_freq: list[int] | None = None,
         # SwiGLU-OAI (GPT-OSS style) activation parameters
         swiglu_alpha: float = 1.702,
         swiglu_limit: float = 7.0,
         # Sparse attention (DeepSeek-style index branch, block-level top-k)
-        sparse_attention_config: Optional[dict] = None,
+        sparse_attention_config: dict | None = None,
         # Multi-token prediction
         num_mtp_modules: int = 1,
-        pad_token_id: Optional[int] = None,
+        # Checkpoint quantization metadata from config.json (None for BF16 checkpoints)
+        quantization_config: MiniMaxM3QuantizationConfig | None = None,
+        pad_token_id: int | None = None,
         **kwargs,
     ) -> None:
         self.hidden_size = hidden_size
@@ -118,6 +137,7 @@ class MiniMaxM3VLTextConfig(PretrainedConfig):
         self.swiglu_limit = swiglu_limit
         self.sparse_attention_config = sparse_attention_config
         self.num_mtp_modules = num_mtp_modules
+        self.quantization_config = quantization_config
         super().__init__(pad_token_id=pad_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def to_dict(self):
@@ -145,7 +165,7 @@ class MiniMaxM3VLVisionConfig(PretrainedConfig):
         attention_dropout: float = 0.0,
         hidden_act: str = "gelu",
         layer_norm_eps: float = 1e-5,
-        img_token_compression_config: Optional[dict] = None,
+        img_token_compression_config: dict | None = None,
         vision_segment_max_frames: int = 4,
         **kwargs,
     ) -> None:
@@ -183,8 +203,8 @@ class MiniMaxM3VLConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vision_config: Optional[Union[dict, MiniMaxM3VLVisionConfig]] = None,
-        text_config: Optional[Union[dict, MiniMaxM3VLTextConfig]] = None,
+        vision_config: Union[dict, MiniMaxM3VLVisionConfig] | None = None,
+        text_config: Union[dict, MiniMaxM3VLTextConfig] | None = None,
         image_token_index: int = 200025,
         video_token_index: int = 200026,
         image_seq_length: int = 576,
@@ -195,8 +215,9 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         patch_merge_bias: bool = True,
         vision_feature_layer: int = -1,
         vision_feature_select_strategy: str = "full",
-        img_token_compression_config: Optional[dict] = None,
-        image_grid_pinpoints: Optional[str] = None,
+        img_token_compression_config: dict | None = None,
+        image_grid_pinpoints: str | None = None,
+        quantization_config: MiniMaxM3QuantizationConfig | None = None,
         **kwargs,
     ) -> None:
         if vision_config is None:
@@ -223,6 +244,7 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         self.vision_feature_select_strategy = vision_feature_select_strategy
         self.img_token_compression_config = img_token_compression_config or {}
         self.image_grid_pinpoints = image_grid_pinpoints
+        self.quantization_config = quantization_config
         # Convenience mirror used by recipe/PP helpers.
         self.hidden_size = text_config.hidden_size
         self.max_position_embeddings = text_config.max_position_embeddings

@@ -14,8 +14,6 @@
 
 """Dense Kimi K3 MLA backbone for DSpark speculative-decoding training."""
 
-from typing import Optional
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -81,7 +79,7 @@ class KimiK3DSparkAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Attend from the noise block to the frozen target context plus itself.
@@ -165,7 +163,7 @@ class KimiK3DSparkDecoderLayer(nn.Module):
         self,
         target_hidden_states: torch.Tensor,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run one draft layer over the noise block against the target context.
@@ -196,6 +194,9 @@ class KimiK3DSparkModel(DeepseekV4DSparkModel):
     """DSpark draft with a dense K3 MLA backbone and no KDA or MoE layers."""
 
     _no_split_modules = ["KimiK3DSparkDecoderLayer"]
+    # The K3 target's KDA layers do not reset their state at packed document
+    # boundaries on the generic block-causal packing path.
+    supports_sequence_packing = False
 
     def __init__(self, config) -> None:
         nn.Module.__init__(self)
@@ -228,9 +229,9 @@ class KimiK3DSparkModel(DeepseekV4DSparkModel):
         self,
         *,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        noise_embedding: Optional[torch.Tensor] = None,
-        target_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        noise_embedding: torch.Tensor | None = None,
+        target_hidden_states: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Project the target context once, then run the draft layers over the noise block.

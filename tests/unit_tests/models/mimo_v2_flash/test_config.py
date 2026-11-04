@@ -12,7 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2FlashConfig
+import json
+
+import pytest
+import torch
+
+from nemo_automodel._transformers.model_init import get_hf_config
+from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, resolve_custom_config_cls
+from nemo_automodel.components.models.mimo_v2_flash.config import MiMoV2Config, MiMoV2FlashConfig
+
+
+@pytest.mark.parametrize("config_cls", [MiMoV2FlashConfig, MiMoV2Config])
+@pytest.mark.parametrize(
+    ("dtype_kwargs", "expected_dtype"),
+    [
+        ({}, torch.bfloat16),
+        ({"torch_dtype": "float32"}, torch.float32),
+        ({"torch_dtype": "bfloat16"}, torch.bfloat16),
+        ({"dtype": "float32"}, torch.float32),
+        ({"torch_dtype": "float32", "dtype": "bfloat16"}, torch.bfloat16),
+    ],
+)
+def test_config_preserves_dtype_on_save_and_load(config_cls, dtype_kwargs, expected_dtype, tmp_path):
+    config = config_cls(num_hidden_layers=2, **dtype_kwargs)
+    assert config.dtype == expected_dtype
+
+    config.save_pretrained(tmp_path)
+    restored = config_cls.from_pretrained(tmp_path)
+    assert restored.dtype == expected_dtype
 
 
 class TestMiMoV2FlashConfig:
@@ -95,3 +122,36 @@ class TestMiMoV2FlashConfig:
 
     def test_keys_to_ignore_at_inference(self):
         assert MiMoV2FlashConfig.keys_to_ignore_at_inference == ["past_key_values"]
+
+
+class TestMiMoV2Config:
+    def test_defaults_to_fused_layout(self):
+        cfg = MiMoV2Config()
+        assert cfg.attention_projection_layout == "fused_qkv"
+        assert cfg.apply_router_weight_after_down
+        assert not MiMoV2FlashConfig().apply_router_weight_after_down
+
+    def test_model_type_and_fused_layout(self):
+        cfg = MiMoV2Config(attention_projection_layout="fused_qkv")
+        assert cfg.model_type == "mimo_v2"
+        assert cfg.attention_projection_layout == "fused_qkv"
+
+    def test_rejects_unknown_projection_layout(self):
+        with pytest.raises(ValueError, match="attention_projection_layout"):
+            MiMoV2Config(attention_projection_layout="unknown")
+
+    def test_checkpoint_style_config_resolves_local_class(self, tmp_path):
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "mimo_v2", "architectures": ["MiMoV2ForCausalLM"]})
+        )
+
+        cfg = get_hf_config(tmp_path, attn_implementation="sdpa")
+
+        assert isinstance(cfg, MiMoV2Config)
+        assert cfg.attention_projection_layout == "fused_qkv"
+        assert cfg.apply_router_weight_after_down
+        assert resolve_custom_config_cls("mimo_v2") is MiMoV2Config
+        assert MODEL_ARCH_MAPPING["MiMoV2ForCausalLM"] == (
+            "nemo_automodel.components.models.mimo_v2_flash.model",
+            "MiMoV2ForCausalLM",
+        )

@@ -19,7 +19,9 @@ Different chat templates wrap tool calls in different syntax:
   ``<tool_call>{"name": ..., "arguments": ...}</tool_call>``
 * Llama 3.1+: ``<|python_tag|>{"name": ..., "parameters": ...}<|eom_id|>``
 * Mistral: ``[TOOL_CALLS][{...}, {...}]``
-* Harmony / GPT-OSS: ``<|channel|>commentary to=functions.NAME<|message|>{...}``
+* Harmony / GPT-OSS: ``<|channel|>commentary to=functions.NAME<|message|>{...}``,
+  or ``to=functions.NAME<|channel|>commentary<|message|>{...}`` with the recipient
+  in the role section, optionally with ``<|constrain|>json`` before ``<|message|>``
 
 This parser tries each known wrapper, then falls back to a generic JSON
 object scan. It is intentionally permissive: malformed JSON, missing
@@ -34,7 +36,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -50,17 +52,22 @@ class ParsedToolCall:
         raw: the source substring this was parsed from.
     """
 
-    name: Optional[str]
+    name: str | None
     arguments: Dict[str, Any]
     arguments_valid_json: bool
     raw: str
 
 
 # Harmony / GPT-OSS prefix anchor; the JSON body is then extracted with a
-# balanced-brace scanner so nested ``{...}`` arguments survive.
+# balanced-brace scanner so nested ``{...}`` arguments survive. The recipient
+# may sit in the channel section (``<|channel|>commentary to=functions.NAME``)
+# or in the role section (``to=functions.NAME<|channel|>commentary``), and a
+# ``<|constrain|>json`` token may precede ``<|message|>``. ``(?![\w\-])`` keeps
+# the name from backtracking into the header, which would be quadratic.
 _HARMONY_ANCHOR_RE = re.compile(
-    r"<\|channel\|>\s*commentary\s+to=functions\.(?P<name>[\w\-]+)[^<]*"
-    r"<\|message\|>\s*",
+    r"(?P<chan><\|channel\|>\s*commentary\s+)?to=functions\.(?P<name>[\w\-]+)(?![\w\-])"
+    r"(?(chan)|\s*<\|channel\|>\s*commentary\b)"
+    r"(?:[^<]|<\|constrain\|>)*<\|message\|>\s*",
 )
 # Qwen / Hermes / FunctionGemma / Gemma 3 / GLM-4. The closing ``</tool_call>``
 # is a strong anchor so non-greedy capture is safe here.
@@ -74,7 +81,7 @@ _LLAMA_ANCHOR_RE = re.compile(r"<\|python_tag\|>\s*")
 _MISTRAL_ANCHOR_RE = re.compile(r"\[TOOL_CALLS\]\s*")
 
 
-def _extract_balanced(text: str, start: int, opener: str, closer: str) -> Optional[str]:
+def _extract_balanced(text: str, start: int, opener: str, closer: str) -> str | None:
     """Return the substring from ``text[start]`` (which must be ``opener``)
     through its matching ``closer``, skipping over chars inside JSON strings.
 
@@ -127,7 +134,7 @@ def _coerce_args(args_value: Any) -> Tuple[Dict[str, Any], bool]:
     return {}, False
 
 
-def _from_call_object(obj: Dict[str, Any], raw: str) -> Optional[ParsedToolCall]:
+def _from_call_object(obj: Dict[str, Any], raw: str) -> ParsedToolCall | None:
     """Build a :class:`ParsedToolCall` from a ``{"name": ..., "arguments": ...}`` dict.
 
     Llama 3.1 emits ``parameters`` instead of ``arguments``; both are accepted.
@@ -314,7 +321,7 @@ def _coerce_gt_args(args_value: Any) -> Dict[str, Any]:
     return {}
 
 
-def _score_one_pair(pred: Optional[ParsedToolCall], gt: Dict[str, Any]) -> Dict[str, float]:
+def _score_one_pair(pred: ParsedToolCall | None, gt: Dict[str, Any]) -> Dict[str, float]:
     """Score a single (pred, gt) tool-call pair. ``pred`` may be ``None``."""
     metrics = {
         "has_call": 0.0,

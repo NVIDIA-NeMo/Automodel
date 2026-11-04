@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -140,10 +141,44 @@ def test_try_load_blend_from_json_invalid_root_type(tmp_path):
         try_load_blend_from_json(json_file)
 
 
-
 def test_get_list_of_files_raises_for_empty_glob(tmp_path):
     """Test that get_list_of_files raises when a glob pattern matches no files."""
     # Create a glob pattern that matches nothing in the tmp directory
     pattern = str(tmp_path / "no_match_*.bin")
     with pytest.raises(ValueError, match="No files matching glob"):
         get_list_of_files(pattern)
+
+
+@pytest.mark.parametrize("split_index,split_name", [(0, "train"), (1, "validation")])
+def test_two_source_split_uses_supported_blend_config(monkeypatch, split_index, split_name):
+    """A two-source train or validation split builds through the supported blend fields.
+
+    Regression: the builder used to reach an ``elif self.config.multiple_validation_sets``
+    branch for any multi-prefix split and raise ``AttributeError``, since that field exists
+    on NeMo's dataset config but not on ``BlendedMegatronDatasetConfig``.
+    """
+    from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegatronDatasetBuilder
+    from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import BlendedMegatronDatasetConfig
+
+    blends = [None, None, None]
+    blends[split_index] = (["python", "english"], [0.8, 0.2])
+    config = BlendedMegatronDatasetConfig(
+        random_seed=1, sequence_length=8, blend_per_split=blends, tokenizer=SimpleNamespace(name_or_path="fixture")
+    )
+    sizes = [None, None, None]
+    sizes[split_index] = 10
+    builder = BlendedMegatronDatasetBuilder(sizes, lambda: True, config, enabled_splits=[split_name])
+    sources = [list(range(20)), list(range(20))]
+    split_sources = [None, None, None]
+    split_sources[split_index] = sources
+    monkeypatch.setattr(builder, "_build_megatron_datasets_parallel", lambda *args: split_sources)
+    captured = {}
+
+    def capture(cls, rank, sync, datasets, weights, size, cfg):
+        captured.update(weights=weights, size=size, datasets=datasets)
+        return "blended"
+
+    monkeypatch.setattr(builder, "build_generic_dataset", capture)
+    result = builder._build_blended_dataset_splits()
+    assert result[split_index] == "blended"
+    assert captured == {"weights": [0.8, 0.2], "size": 10, "datasets": sources}

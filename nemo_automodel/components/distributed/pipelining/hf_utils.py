@@ -15,15 +15,20 @@
 import logging
 import types
 from collections.abc import MutableMapping
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Union
 
 import torch
 import torch.nn as nn
+
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+# Public Hugging Face FlashAttention argument names belong to this HF adapter.
+_FLASH_VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
 
 # Constants for identifying text/language modules in multimodal models
 TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
@@ -114,14 +119,14 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
 
     def pipeline_forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        causal_mask_mapping: Optional[dict] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        causal_mask_mapping: dict | None = None,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
         # For VLM models the text components (embed_tokens, layers, norm) live on a
@@ -179,6 +184,8 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
             position_embeddings = rotary_emb(hidden_states, position_ids)
 
         if hasattr(text_module, "layers") and text_module.layers is not None:
+            # Preserve the public FlashAttention metadata for this microbatch.
+            flash_kwargs = {key: kwargs[key] for key in _FLASH_VARLEN_KWARGS if key in kwargs}
             # Works for dict-like or list-like containers
             layer_iter = text_module.layers.values() if hasattr(text_module.layers, "values") else text_module.layers
             for decoder_layer in layer_iter:
@@ -196,6 +203,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    **flash_kwargs,
                 )
                 hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
@@ -220,16 +228,16 @@ def create_pipeline_forward_causal_lm() -> Callable:
 
     def pipeline_forward_causal_lm(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
@@ -301,14 +309,31 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
     def pipeline_forward_gemma4_text(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        padding_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Run retained decoder layers with native or model-prepared masks.
+
+        Args:
+            input_ids: Token IDs [batch, sequence] on the first stage, or hidden
+                states [batch, sequence, hidden] on a later stage.
+            attention_mask: Padding [batch, sequence], complete mask
+                [batch, 1, sequence, sequence], or full/sliding mapping of complete
+                masks prepared by the owning VLM. Masks are read-only.
+            position_ids: Rotary positions [batch, sequence].
+            inputs_embeds: Explicit hidden states [batch, sequence, hidden].
+            cache_position: Sequence offsets [sequence].
+            padding_mask: Optional token padding exclusions [batch, sequence].
+            **kwargs: Auxiliary model inputs; no document policy is inferred here.
+
+        Returns:
+            Hidden states [batch, sequence, hidden].
+        """
         if inputs_embeds is None:
             if hasattr(self, "embed_tokens") and self.embed_tokens is not None:
                 if input_ids is None:
@@ -327,22 +352,26 @@ def create_pipeline_forward_gemma4_text() -> Callable:
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        if padding_mask is None and attention_mask is not None:
-            padding_mask = attention_mask.bool().logical_not()
+        if isinstance(attention_mask, dict):
+            # The owning VLM has already composed document, image and window policy.
+            causal_mask_mapping = attention_mask
+        else:
+            if padding_mask is None and attention_mask is not None:
+                padding_mask = attention_mask.bool().logical_not()
 
-        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-        mask_kwargs = {
-            "config": self.config,
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "past_key_values": None,
-            "position_ids": position_ids,
-        }
-        causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-        }
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": None,
+                "position_ids": position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
 
         # Per-layer-type rotary embeddings: Gemma4RotaryEmbedding takes (x, pos_ids, layer_type)
         position_embeddings_map: dict = {}
@@ -409,39 +438,41 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
 
     def pipeline_forward_gemma4_vlm(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        image_position_ids: Optional[torch.LongTensor] = None,
-        mm_token_type_ids: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        image_position_ids: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs,
     ):
+        if (
+            kwargs.get("_packed_seq_ids") is not None
+            and attention_mask is None
+            and not getattr(self, "_cp_enabled", False)
+        ) or any(kwargs.get(key) is not None for key in ("cu_seq_lens_q", "cu_seq_lens_k")):
+            validator = getattr(self, "validate_packed_attention_backend", None)
+            if validator is not None:
+                validator(self.config.text_config._attn_implementation)
+            else:
+                raise ValueError("Packed Flash Gemma4 VLM pipeline attention is unsupported; use SDPA/eager")
+            if (
+                kwargs.get("_packed_seq_ids") is not None
+                and attention_mask is None
+                and not getattr(self, "_cp_enabled", False)
+            ):
+                raise ValueError("Configure packed attention before forwarding compact Gemma4 attention IDs")
         lang_model = self.model.language_model
         embed_tokens = getattr(lang_model, "embed_tokens", None)
         is_first_stage = embed_tokens is not None
 
-        # PP VLM: retrieve pixel_values from chunks stored by the training loop
-        if pixel_values is None and is_first_stage and getattr(self, "_vlm_pixel_values_chunks", None) is not None:
-            has_media_tokens = (
-                input_ids is not None
-                and hasattr(self.config, "image_token_id")
-                and (input_ids == self.config.image_token_id).any()
-            )
-            if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(self._vlm_pixel_values_chunks):
-                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                    image_grid_chunk = (
-                        self._vlm_image_grid_hws_chunks[chunk_idx]
-                        if getattr(self, "_vlm_image_grid_hws_chunks", None) is not None
-                        else None
-                    )
-                    if image_grid_chunk is not None:
-                        image_position_ids = image_grid_chunk
-                    self._vlm_chunk_idx = chunk_idx + 1
+        if pixel_values is None and is_first_stage:
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values = media.pixel_values
+                image_position_ids = media.image_grid
 
         if is_first_stage:
             if inputs_embeds is None:
@@ -452,7 +483,7 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
                 image_features = self.model.get_image_features(
                     pixel_values, image_position_ids=image_position_ids, return_dict=True
                 ).pooler_output
-                image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+                image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
 
                 if mm_token_type_ids is not None:
                     special_image_mask = mm_token_type_ids == 1
@@ -474,6 +505,12 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
 
         if cache_position is None and inputs_embeds is not None:
             cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+
+        if kwargs.get("_packed_seq_ids") is not None:
+            prepare_mask = getattr(self, "prepare_document_attention_mask", None)
+            if prepare_mask is None:
+                raise ValueError("Packed Gemma4 PP requires the AutoModel model-owned document-mask policy")
+            attention_mask = prepare_mask(attention_mask, mm_token_type_ids, kwargs["_packed_seq_ids"])
 
         hidden_states = lang_model(
             input_ids=None,
@@ -517,14 +554,14 @@ def create_pipeline_forward_mistral3_vlm() -> Callable:
 
     def pipeline_forward_mistral3_vlm(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        image_sizes: Optional[torch.Tensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        image_sizes: torch.Tensor | None = None,
         vision_feature_layer=None,
-        cache_position: Optional[torch.LongTensor] = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs,
     ):
         inner = self.model
@@ -532,27 +569,11 @@ def create_pipeline_forward_mistral3_vlm() -> Callable:
         embed_tokens = getattr(lang_model, "embed_tokens", None)
         is_first_stage = embed_tokens is not None
 
-        # PP VLM: under the training loop, pixel_values and image_sizes are
-        # popped from the batch before schedule.step() and pre-chunked onto
-        # stage0_model._vlm_pixel_values_chunks (and _vlm_image_grid_hws_chunks
-        # for image_sizes). Retrieve the current microbatch's chunk here so
-        # vision_tower actually receives its inputs. Mirrors the Gemma4 VLM
-        # path at create_pipeline_forward_gemma4_vlm().
         if pixel_values is None and is_first_stage:
-            chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            has_media_tokens = (
-                input_ids is not None
-                and hasattr(self.config, "image_token_id")
-                and (input_ids == self.config.image_token_id).any()
-            )
-            if chunks is not None and has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(chunks):
-                    pixel_values = chunks[chunk_idx]
-                    grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
-                    if grid_chunks is not None and chunk_idx < len(grid_chunks):
-                        image_sizes = grid_chunks[chunk_idx]
-                    self._vlm_chunk_idx = chunk_idx + 1
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values = media.pixel_values
+                image_sizes = media.image_grid
 
         if is_first_stage:
             if inputs_embeds is None:

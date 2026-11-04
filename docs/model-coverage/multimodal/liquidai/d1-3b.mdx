@@ -1,0 +1,56 @@
+---
+title: "d1-3B"
+description: "Adapt d1-3B decision readouts with NeMo AutoModel using experimental frozen-backbone text workflows, with a related D1 Omni example and scoped acceptance notes."
+slug: model-coverage/multimodal/liquidai/d1-3B
+---
+
+NeMo AutoModel provides experimental typed decision readouts for LiquidAI D1 models.
+The example keeps the backbone frozen and trains additive answer-token rows for D1-3B
+or the marker head for D1 Omni. Its adaptation workflow uses text-only records;
+the released vision and audio modules remain frozen.
+
+## Run a Baseline
+
+From the repository root, generate fictional training, validation, and test records:
+
+```bash
+uv run python tutorials/decision_models/decision_tutorial/data.py --output-dir data/soc_triage --seed 7
+```
+
+Then run the D1-3B baseline on a CUDA GPU:
+
+```bash
+uv run python examples/decision/d1_posttrain.py \
+  --model d1-3b --mode base --data-dir data/soc_triage \
+  --cache-dir runs/d1-cache --output-dir runs/d1-3b/base
+```
+
+Use `--model d1-omni` for Omni. The example loads D1-3B in BF16 and Omni in FP32,
+and pins model and tokenizer revisions. Subsequent `--mode sft` and `--mode rl`
+stages adapt the readout; RL requires `--input-dir` pointing to the selected SFT stage.
+These artifacts initialize readout weights and do not resume optimizer or scheduler state.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Lfm2VlForConditionalGeneration` (D1-3B); `D1OmniModel` (Omni) |
+| D1-3B checkpoint | [`LiquidAI/d1-3B`](https://huggingface.co/LiquidAI/d1-3B/tree/051bcc464b01b9f92942b364d9586b0ef5912432) |
+| D1 Omni checkpoint | [`LiquidAI/d1-omni-600M`](https://huggingface.co/LiquidAI/d1-omni-600M/tree/02b55d7076f15129e59ab3f94783f32c4b088674) |
+| Training scope | Single-device, frozen-backbone text decision readout adaptation |
+| Parallelism | These native model classes declare TP, CP, PP, and EP unsupported |
+
+Ordinary LFM2-VL checkpoints retain Hugging Face's implementation. The publisher's explicit D1
+configuration mapping selects the D1-specific arithmetic. Omni construction resolves pinned
+publisher perception code and requires `trust_remote_code=True`; cache these dependencies
+before offline use.
+The D1 examples do not establish distributed adaptation or downstream task quality.
+Downloaded publisher code and checkpoints retain their own license terms.
+
+## Related Resources
+
+- [Decision post-training examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/decision/README.md)
+- [Decision-model tutorials](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tutorials/decision_models/README.md)
+- [D1 numerical acceptance procedure and scope](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tests/functional_tests/decision_models/d1/README.md)

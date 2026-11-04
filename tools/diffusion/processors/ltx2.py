@@ -36,7 +36,7 @@ tokens (left padding) so cache tensors collate with ``torch.cat``.
 
 import inspect
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -101,7 +101,7 @@ class LTX2Processor(BaseVideoProcessor):
         return ["video"]
 
     @property
-    def frame_constraint(self) -> Optional[str]:
+    def frame_constraint(self) -> str | None:
         # Video VAE temporal compression is 8: pixel frame count must be 8n+1.
         return "8n+1"
 
@@ -176,7 +176,7 @@ class LTX2Processor(BaseVideoProcessor):
         self,
         video_path: str,
         target_size: Tuple[int, int],
-        num_frames: Optional[int] = None,
+        num_frames: int | None = None,
         resize_mode: str = "bilinear",
         center_crop: bool = True,
         **kwargs,

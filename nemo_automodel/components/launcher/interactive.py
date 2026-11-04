@@ -16,7 +16,7 @@ import importlib
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from nemo_automodel.components.launcher.base import Launcher
 
@@ -98,7 +98,7 @@ class InteractiveLauncher(Launcher):
         config_path: Path,
         recipe_target: str,
         launcher_config: Any = None,
-        extra_args: Optional[List[str]] = None,
+        extra_args: List[str] | None = None,
     ) -> int:
         try:
             from torch.distributed.run import determine_local_world_size, get_args_parser
@@ -117,7 +117,7 @@ class InteractiveLauncher(Launcher):
             )
             return self._run_recipe_in_process(recipe_target, config)
 
-        nproc_per_node: Optional[int] = launcher_config
+        nproc_per_node: int | None = launcher_config
         repo_root = _get_repo_root()
         script_path = _recipe_module_path(recipe_target, repo_root)
 

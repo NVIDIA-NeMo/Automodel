@@ -26,8 +26,9 @@ from typing import Any, Literal, Protocol
 import numpy as np
 import torch
 from PIL import Image
-from transformers.utils.hub import cached_file, extract_commit_hash
+from transformers.utils.hub import cached_file
 
+from nemo_automodel._transformers.auto_config import NeMoAutoConfig
 from nemo_automodel.shared.import_utils import safe_import
 
 logger = logging.getLogger(__name__)
@@ -108,14 +109,8 @@ class CheckpointMiningEncoderConfig:
 
         from nemo_automodel._transformers.auto_model import NeMoAutoModelBiEncoder
 
-        # Pin the downloaded config snapshot before loading weights and the processor.
-        # Use the 5.12-compatible Hub API rather than requiring Transformers 5.18's
-        # ResolvedRevision contract for this selective retrieval backport.
-        config_file = cached_file(model_name_or_path, "config.json", _raise_exceptions_for_missing_entries=False)
-        revision = extract_commit_hash(config_file, None) if config_file is not None else None
-        model_kwargs = {"use_liger_kernel": False, "use_sdpa_patching": True}
-        if revision is not None:
-            model_kwargs["revision"] = revision
+        revision = NeMoAutoConfig.resolve_revision(model_name_or_path)
+        model_kwargs = {"use_liger_kernel": False, "use_sdpa_patching": True, "revision": revision}
         if trust_remote_code:
             model_kwargs["trust_remote_code"] = True
         if attn_implementation is not None:
@@ -129,12 +124,8 @@ class CheckpointMiningEncoderConfig:
             raise ValueError("This checkpoint's backbone does not declare a supported retrieval processor.")
         module_name, class_name = processor_target.rsplit(".", 1)
         processor_class = getattr(import_module(module_name), class_name)
-        loading_options = {}
-        processor_revision = revision or model.config._commit_hash
-        if processor_revision is not None:
-            loading_options["revision"] = processor_revision
         processor = processor_class.from_pretrained(
-            model.config.name_or_path or model.source_model_path, **loading_options
+            model.config.name_or_path or model.source_model_path, revision=revision
         )
         logger.info("Resolved checkpoint retrieval processor: %s", processor)
         return CheckpointMiningEncoder(model=model, processor=processor, device=device)

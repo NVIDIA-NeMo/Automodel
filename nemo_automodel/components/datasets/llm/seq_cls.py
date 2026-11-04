@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar
 
 from datasets import load_dataset
 
@@ -60,9 +60,9 @@ class GLUE_MRPC:
         tokenizer,
         *,
         split: str = "train",
-        num_samples_limit: Optional[int] = None,
+        num_samples_limit: int | None = None,
         trust_remote_code: bool = True,
-        max_length: Optional[int] = 256,
+        max_length: int | None = 256,
     ) -> None:
         if isinstance(num_samples_limit, int):
             split = f"{split}[:{num_samples_limit}]"

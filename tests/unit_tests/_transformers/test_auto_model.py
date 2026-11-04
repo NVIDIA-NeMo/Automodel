@@ -34,7 +34,10 @@ from nemo_automodel._transformers.auto_model import (
     _patch_remote_code_compat,
     _resolve_distributed_setup,
 )
-from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision, instantiate_infrastructure
+from nemo_automodel._transformers.infrastructure import (
+    _apply_peft_and_lower_precision,
+    instantiate_infrastructure,
+)
 from nemo_automodel._transformers.model_init import (
     _filter_kwargs_for_init,
     _filter_meta_device_from_init_context,
@@ -188,17 +191,19 @@ class TestResolveMeshContext:
         moe_mesh = _FakeMesh({MeshAxisName.EP: 2, MeshAxisName.EP_SHARD: 2})
         mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
 
-        _, _, parallelize_fn, _ = instantiate_infrastructure(
+        context, _, parallelize_fn, _ = instantiate_infrastructure(
             distributed_config=FSDP2Config(multimodal=MultimodalDistributedConfig(frozen_sharding="replicate")),
             moe_parallel_config=MoEParallelizerConfig(),
             activation_checkpointing=False,
             mesh=mesh,
         )
 
+        assert context is not None
         assert parallelize_fn is not None
-        assert parallelize_fn.keywords["frozen_multimodal_sharding"] == "replicate"
+        assert context.strategy_config.multimodal.frozen_sharding == "replicate"
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestFromPretrainedDeviceMesh:
     def test_from_pretrained_accepts_device_mesh_as_topology_shortcut(self):
         device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 1, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
@@ -880,6 +885,58 @@ class TestApplyPeftAndLowerPrecision:
             assert mock_peft_config.use_triton is False
             assert "Disabling Triton with Pipeline Parallelism" in caplog.text
 
+    def test_apply_peft_applies_mxfp4_after_lora(self):
+        """MXFP4 expert storage is applied after LoRA module injection."""
+        model = MagicMock()
+        peft_config = MagicMock()
+        peft_config.expert_weight_format = "mxfp4"
+        events = []
+
+        with (
+            patch(
+                "nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules",
+                side_effect=lambda *args, **kwargs: events.append("lora"),
+            ) as apply_lora,
+            patch(
+                "nemo_automodel._transformers.infrastructure.apply_mxfp4_to_moe_experts",
+                side_effect=lambda model, **kwargs: events.append("mxfp4") or model,
+            ) as apply_mxfp4,
+        ):
+            _apply_peft_and_lower_precision(
+                model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
+
+        apply_lora.assert_called_once()
+        apply_mxfp4.assert_called_once_with(model)
+        assert events == ["lora", "mxfp4"]
+
+    def test_apply_peft_skips_mxfp4_for_unquantized_experts(self):
+        model = MagicMock()
+        peft_config = MagicMock()
+        peft_config.expert_weight_format = "unquantized"
+
+        with (
+            patch("nemo_automodel._transformers.infrastructure.apply_lora_to_linear_modules"),
+            patch("nemo_automodel._transformers.infrastructure.apply_mxfp4_to_moe_experts") as apply_mxfp4,
+        ):
+            _apply_peft_and_lower_precision(
+                model,
+                tp_size=1,
+                autopipeline=None,
+                peft_config=peft_config,
+                quantization_config=None,
+                fp8_config=None,
+                qat_quantizer=None,
+            )
+
+        apply_mxfp4.assert_not_called()
+
     def test_apply_fp8_when_configured(self):
         """When fp8_config provided, calls apply_fp8_to_model."""
         mock_model = MagicMock()
@@ -1088,6 +1145,7 @@ class TestNeedSetupCacheClassesMapping:
 # =============================================================================
 
 
+@pytest.mark.usefixtures("mock_hub_revision")
 class TestModelMappingKeyErrorFallback:
     """Test cases for _model_mapping KeyError fallback in _init_model."""
 
@@ -1205,7 +1263,7 @@ class TestModelMappingKeyErrorFallback:
             )
 
         assert is_custom is False
-        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == "auto"
+        assert cls._from_pretrained_parent_class.call_args.kwargs["dtype"] == "auto"
         assert fake_model.linear.weight.dtype == torch.bfloat16
         assert fake_model.norm.weight.dtype == torch.float32
         mock_wrap.assert_called_once_with(FakeModel)
@@ -1376,7 +1434,7 @@ class TestModelMappingKeyErrorFallback:
             )
 
         assert is_custom is False
-        assert cls._from_pretrained_parent_class.call_args.kwargs["torch_dtype"] == torch.bfloat16
+        assert cls._from_pretrained_parent_class.call_args.kwargs["dtype"] == torch.bfloat16
         assert fake_model.lm_head.weight is fake_model.embed_tokens.weight
         assert fake_model.lm_head.weight.dtype == torch.bfloat16
         assert fake_model.embed_tokens.weight.dtype == torch.bfloat16
@@ -1615,9 +1673,11 @@ class TestBuildModelRetryDepth:
                 _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert mock_init.call_count == 1
 
-    def test_retry_succeeds_within_limit(self):
+    @pytest.mark.parametrize("load_metadata_with_gloo", [False, True])
+    def test_retry_succeeds_within_limit(self, load_metadata_with_gloo: bool) -> None:
         """When the retried call succeeds, the model is returned normally."""
         build_kwargs, mock_config = self._make_build_kwargs()
+        build_kwargs["load_metadata_with_gloo"] = load_metadata_with_gloo
         sentinel_model = MagicMock()
         with (
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
@@ -1628,7 +1688,9 @@ class TestBuildModelRetryDepth:
                 "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
                 return_value=sentinel_model,
             ),
-            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model
+            ) as apply_infrastructure,
             patch("torch.cuda.current_device", return_value=0),
         ):
             mock_init.side_effect = [
@@ -1638,6 +1700,8 @@ class TestBuildModelRetryDepth:
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert result is sentinel_model
             assert mock_init.call_count == 2
+            assert apply_infrastructure.call_args.kwargs["load_metadata_with_gloo"] is load_metadata_with_gloo
+            assert all("load_metadata_with_gloo" not in call.kwargs for call in mock_init.call_args_list)
 
     def test_build_model_applies_runtime_patches_before_infrastructure(self):
         """Model runtime hooks run after construction and before sharding/checkpoint infra."""
@@ -1783,10 +1847,10 @@ class TestBuildModelRetryDepth:
         """HF meta init errors should retry even when Automodel did not pick meta init."""
         build_kwargs, mock_config = self._make_build_kwargs()
         sentinel_model = MagicMock()
-        dummy_manager_cls = type("DummyManager", (), {})
-        build_kwargs["model_wrapper"] = dummy_manager_cls()
+        from nemo_automodel.components.distributed import MegatronFSDPConfig, MeshContext
+
+        build_kwargs["model_wrapper"] = MeshContext(strategy_config=MegatronFSDPConfig())
         with (
-            patch("nemo_automodel._transformers.auto_model.MegatronFSDPManager", dummy_manager_cls),
             patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("eager", False)),
             patch("nemo_automodel._transformers.auto_model._init_model") as mock_init,
             patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
@@ -1807,6 +1871,78 @@ class TestBuildModelRetryDepth:
             result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
             assert result is sentinel_model
             assert mock_init.call_count == 2
+
+    def test_checkpoint_loading_uses_config_snapshot_not_cached_main(self, hf_config_hub):
+        from nemo_automodel._transformers.auto_config import NeMoAutoConfig
+
+        root, cache, ref, _ = hf_config_hub
+        # main and an unrelated weight index point to A; this config belongs to B.
+        (cache / "snapshots" / ("a" * 40) / "model.safetensors.index.json").write_text("{}")
+        config = NeMoAutoConfig.from_pretrained("test/config-race", cache_dir=str(root), revision="b" * 40)
+        config.name_or_path = "test/config-race"
+        build_kwargs, _ = self._make_build_kwargs()
+        from transformers.utils.hub import resolve_revision
+
+        build_kwargs.update(
+            is_hf_model=False,
+            cache_dir=str(root),
+            subfolder="nested",
+            revision=resolve_revision("test/config-race", "b" * 40, cache_dir=str(root)),
+        )
+        sentinel_model = MagicMock()
+        with (
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model
+            ) as apply,
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            _BaseNeMoAutoModelClass._build_model("test/config-race", **build_kwargs)
+        assert apply.call_args.kwargs["pretrained_model_name_or_path"] == str(
+            cache / "snapshots" / ("b" * 40) / "nested"
+        )
+        assert ref.read_text() == "a" * 40
+
+    def test_custom_model_under_ddp_still_needs_its_checkpoint(self):
+        """A MODEL_ARCH_MAPPING model under DDP reaches infrastructure unloaded and off meta.
+
+        DDP is excluded from meta-device init, and custom model constructors
+        only build the architecture, so ``apply_model_infrastructure`` has to be told the
+        weights are still missing. If either flag is wrong the model enters training
+        randomly initialized and nothing is raised.
+        """
+        build_kwargs, mock_config = self._make_build_kwargs()
+        build_kwargs["is_hf_model"] = False
+        from nemo_automodel.components.distributed import DDPConfig, MeshContext
+
+        build_kwargs["model_wrapper"] = MeshContext(strategy_config=DDPConfig())
+        sentinel_model = MagicMock()
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return sentinel_model
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch(
+                "nemo_automodel._transformers.capabilities.attach_capabilities_and_validate",
+                return_value=sentinel_model,
+            ),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", side_effect=capture),
+            patch("nemo_automodel._transformers.auto_model.get_hf_config", return_value=mock_config),
+            patch("nemo_automodel._transformers.auto_model._maybe_dequantize_fp8_for_peft", return_value=False),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert captured["is_meta_device"] is False
+        assert captured["weights_already_loaded"] is False
 
 
 class TestNeMoAutoModelForMultimodalLM:

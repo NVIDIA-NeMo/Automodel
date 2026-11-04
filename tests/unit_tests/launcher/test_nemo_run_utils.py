@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import sys
+from dataclasses import dataclass, field
 from unittest import mock
 
 import pytest
@@ -53,11 +54,7 @@ def _reset_mocks():
 class TestLoadExecutorFromFile:
     def test_loads_executor_from_map(self, tmp_path):
         executors_file = tmp_path / "executors.py"
-        executors_file.write_text(
-            "EXECUTOR_MAP = {\n"
-            '    "my_cluster": type("Exec", (), {"launch": True})(),\n'
-            "}\n"
-        )
+        executors_file.write_text('EXECUTOR_MAP = {\n    "my_cluster": type("Exec", (), {"launch": True})(),\n}\n')
         executor = load_executor_from_file("my_cluster", str(executors_file))
         assert hasattr(executor, "launch")
 
@@ -67,12 +64,7 @@ class TestLoadExecutorFromFile:
 
     def test_missing_key_raises_key_error(self, tmp_path):
         executors_file = tmp_path / "executors.py"
-        executors_file.write_text(
-            "EXECUTOR_MAP = {\n"
-            '    "cluster_a": "exec_a",\n'
-            '    "cluster_b": "exec_b",\n'
-            "}\n"
-        )
+        executors_file.write_text('EXECUTOR_MAP = {\n    "cluster_a": "exec_a",\n    "cluster_b": "exec_b",\n}\n')
         with pytest.raises(KeyError, match="not found in EXECUTOR_MAP"):
             load_executor_from_file("nonexistent", str(executors_file))
 
@@ -87,10 +79,7 @@ class TestLoadExecutorFromFile:
         # A callable that returns an object without a 'launch' attribute
         # should be called to produce the executor.
         executors_file.write_text(
-            "def _make_exec():\n"
-            '    return {"type": "slurm"}\n'
-            "\n"
-            'EXECUTOR_MAP = {"lazy": _make_exec}\n'
+            'def _make_exec():\n    return {"type": "slurm"}\n\nEXECUTOR_MAP = {"lazy": _make_exec}\n'
         )
         executor = load_executor_from_file("lazy", str(executors_file))
         assert executor == {"type": "slurm"}
@@ -114,9 +103,7 @@ class TestLoadExecutorFromFile:
 
     def test_key_error_shows_available_keys(self, tmp_path):
         executors_file = tmp_path / "executors.py"
-        executors_file.write_text(
-            'EXECUTOR_MAP = {"alpha": 1, "beta": 2, "gamma": 3}\n'
-        )
+        executors_file.write_text('EXECUTOR_MAP = {"alpha": 1, "beta": 2, "gamma": 3}\n')
         with pytest.raises(KeyError, match="alpha") as exc_info:
             load_executor_from_file("missing", str(executors_file))
         # All available keys should be listed
@@ -192,13 +179,16 @@ class TestApplyOverrides:
         executor.container_mounts = ["/old:/old"]
         executor.env_vars = {"OLD": "val"}
 
-        apply_overrides(executor, {
-            "nodes": 4,
-            "container_image": "new:v2",
-            "time": "08:00:00",
-            "container_mounts": ["/new:/new"],
-            "env_vars": {"NEW": "val2"},
-        })
+        apply_overrides(
+            executor,
+            {
+                "nodes": 4,
+                "container_image": "new:v2",
+                "time": "08:00:00",
+                "container_mounts": ["/new:/new"],
+                "env_vars": {"NEW": "val2"},
+            },
+        )
 
         assert executor.nodes == 4
         assert executor.container_image == "new:v2"
@@ -237,44 +227,106 @@ class TestSubmitNemoRunJob:
     def test_returns_zero(self, monkeypatch):
         mr, _ = self._make_mock()
         monkeypatch.setitem(sys.modules, "nemo_run", mr)
-        result = submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "my_job",
-                                     detach=True, tail_logs=False)
+        result = submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "my_job", detach=True, tail_logs=False)
         assert result == 0
 
     def test_experiment_created_with_job_name(self, monkeypatch):
         mr, _ = self._make_mock()
         monkeypatch.setitem(sys.modules, "nemo_run", mr)
-        submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "test_exp",
-                            detach=True, tail_logs=False)
+        submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "test_exp", detach=True, tail_logs=False)
         mr.Experiment.assert_called_once_with("test_exp")
 
     def test_experiment_add_called(self, monkeypatch):
         mr, me = self._make_mock()
         monkeypatch.setitem(sys.modules, "nemo_run", mr)
         script, executor = mock.MagicMock(), mock.MagicMock()
-        submit_nemo_run_job(script, executor, "job1",
-                            detach=True, tail_logs=False)
+        submit_nemo_run_job(script, executor, "job1", detach=True, tail_logs=False)
         me.add.assert_called_once_with(script, executor=executor, name="job1")
 
     def test_experiment_run_called_with_detach(self, monkeypatch):
         mr, me = self._make_mock()
         monkeypatch.setitem(sys.modules, "nemo_run", mr)
-        submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "job1",
-                            detach=True, tail_logs=True)
+        submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "job1", detach=True, tail_logs=True)
         me.run.assert_called_once_with(detach=True, tail_logs=True)
 
     def test_experiment_run_called_without_detach(self, monkeypatch):
         mr, me = self._make_mock()
         monkeypatch.setitem(sys.modules, "nemo_run", mr)
-        submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "job1",
-                            detach=False, tail_logs=False)
+        submit_nemo_run_job(mock.MagicMock(), mock.MagicMock(), "job1", detach=False, tail_logs=False)
         me.run.assert_called_once_with(detach=False, tail_logs=False)
 
     def test_empty_job_name_uses_automodel(self, monkeypatch):
         mr, me = self._make_mock()
         monkeypatch.setitem(sys.modules, "nemo_run", mr)
         script, executor = mock.MagicMock(), mock.MagicMock()
-        submit_nemo_run_job(script, executor, "",
-                            detach=True, tail_logs=False)
+        submit_nemo_run_job(script, executor, "", detach=True, tail_logs=False)
         mr.Experiment.assert_called_once_with("automodel")
         me.add.assert_called_once_with(script, executor=executor, name="automodel")
+
+
+@dataclass
+class _FakeSlurmExecutor:
+    """Stand-in with fixed fields, like the NeMo-Run executor dataclasses.
+
+    The tests above use ``MagicMock``, which fabricates any attribute on access,
+    so they cannot tell a real field from a name the executor does not have.
+    """
+
+    nodes: int = 1
+    ntasks_per_node: int = 1
+    partition: str = "batch"
+    env_vars: dict = field(default_factory=dict)
+    container_mounts: list = field(default_factory=list)
+
+
+class TestApplyOverridesRejectsUnknownAttributes:
+    def test_unknown_key_raises_instead_of_creating_a_phantom_attribute(self):
+        """A mistyped YAML key must fail loudly, not be silently absorbed."""
+        executor = _FakeSlurmExecutor()
+
+        with pytest.raises(ValueError, match="ntasks_per_nodes"):
+            apply_overrides(executor, {"ntasks_per_nodes": 8})
+
+        assert not hasattr(executor, "ntasks_per_nodes")
+        assert executor.ntasks_per_node == 1
+
+    def test_error_names_the_executor_and_lists_available_attributes(self):
+        executor = _FakeSlurmExecutor()
+
+        with pytest.raises(ValueError) as exc_info:
+            apply_overrides(executor, {"gpus_per_node": 8})
+
+        message = str(exc_info.value)
+        assert "_FakeSlurmExecutor" in message
+        assert "ntasks_per_node" in message
+        assert "partition" in message
+
+    def test_known_keys_still_apply_on_a_real_object(self):
+        """The accepted path must keep working off a MagicMock."""
+        executor = _FakeSlurmExecutor(env_vars={"EXISTING": "a"}, container_mounts=["/data:/data"])
+
+        apply_overrides(
+            executor,
+            {
+                "nodes": 4,
+                "partition": "gpu",
+                "env_vars": {"NEW": "b"},
+                "container_mounts": ["/models:/models"],
+            },
+        )
+
+        assert executor.nodes == 4
+        assert executor.partition == "gpu"
+        assert executor.env_vars == {"EXISTING": "a", "NEW": "b"}
+        assert executor.container_mounts == ["/data:/data", "/models:/models"]
+
+    def test_no_override_is_applied_when_a_later_key_is_unknown(self):
+        """The raise happens before the bad key is written; earlier keys already applied."""
+        executor = _FakeSlurmExecutor()
+
+        with pytest.raises(ValueError, match="paritition"):
+            apply_overrides(executor, {"nodes": 2, "paritition": "gpu"})
+
+        assert executor.nodes == 2
+        assert executor.partition == "batch"
+        assert not hasattr(executor, "paritition")

@@ -14,7 +14,10 @@
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
+from safetensors.torch import save_file
 
+from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
 from nemo_automodel.components.models.ling_v2.state_dict_adapter import BailingMoeV2StateDictAdapter
@@ -78,7 +81,7 @@ def backend_config():
         attn="sdpa",
         linear="torch",
         rms_norm="torch",
-        experts="torch",
+        experts="torch_mm",
         dispatcher="torch",
         enable_hf_state_dict_adapter=False,
     )
@@ -222,3 +225,139 @@ class TestRoundTrip:
                 hf_sd[f"model.layers.{L}.attention.dense.weight"],
             )
         torch.testing.assert_close(roundtripped["model.word_embeddings.weight"], hf_sd["model.word_embeddings.weight"])
+
+
+class TestLowMemoryDcpLoad:
+    def test_hf_reader_loads_qkv_and_experts_into_native_storage(self, adapter, config, moe_config, tmp_path):
+        q_size = config.num_attention_heads * config.head_dim
+        kv_size = config.num_key_value_heads * config.head_dim
+        native = {
+            "model.layers.1.self_attn.q_proj.weight": torch.zeros(q_size, config.hidden_size),
+            "model.layers.1.self_attn.k_proj.weight": torch.zeros(kv_size, config.hidden_size),
+            "model.layers.1.self_attn.v_proj.weight": torch.zeros(kv_size, config.hidden_size),
+            "model.layers.1.mlp.experts.gate_and_up_projs": torch.zeros(
+                moe_config.n_routed_experts, moe_config.dim, 2 * moe_config.moe_inter_dim
+            ),
+            "model.layers.1.mlp.experts.down_projs": torch.zeros(
+                moe_config.n_routed_experts, moe_config.moe_inter_dim, moe_config.dim
+            ),
+        }
+        generator = torch.Generator().manual_seed(7)
+        hf_checkpoint = {
+            "model.layers.1.attention.query_key_value.weight": torch.randn(
+                q_size + 2 * kv_size, config.hidden_size, generator=generator
+            )
+        }
+        for expert_id in range(moe_config.n_routed_experts):
+            hf_checkpoint[f"model.layers.1.mlp.experts.{expert_id}.gate_proj.weight"] = torch.randn(
+                moe_config.moe_inter_dim, moe_config.dim, generator=generator
+            )
+            hf_checkpoint[f"model.layers.1.mlp.experts.{expert_id}.up_proj.weight"] = torch.randn(
+                moe_config.moe_inter_dim, moe_config.dim, generator=generator
+            )
+            hf_checkpoint[f"model.layers.1.mlp.experts.{expert_id}.down_proj.weight"] = torch.randn(
+                moe_config.dim, moe_config.moe_inter_dim, generator=generator
+            )
+        save_file(hf_checkpoint, tmp_path / "model.safetensors")
+
+        destinations = adapter.to_hf(dict(native), for_checkpoint_load=True)
+        assert set(destinations) == set(hf_checkpoint)
+
+        # CPU tensors use the same checkpoint views but cannot trigger the CUDA/DTensor registration condition.
+        # Register the two grouped destinations explicitly to simulate the production DCP load lifecycle.
+        adapter._register_inplace_loaded_key("model.layers.1.mlp.experts.gate_and_up_projs", None)
+        adapter._register_inplace_loaded_key("model.layers.1.mlp.experts.down_projs", None)
+        dcp.load(destinations, storage_reader=_HuggingFaceStorageReader(path=tmp_path))
+
+        converted = adapter.from_hf(destinations)
+        grouped_keys = {
+            "model.layers.1.mlp.experts.gate_and_up_projs",
+            "model.layers.1.mlp.experts.down_projs",
+        }
+        assert grouped_keys.isdisjoint(converted)
+        assert grouped_keys <= adapter.view_loaded_native_keys
+        for key, value in converted.items():
+            native[key].copy_(value)
+
+        fused_qkv = hf_checkpoint["model.layers.1.attention.query_key_value.weight"]
+        torch.testing.assert_close(native["model.layers.1.self_attn.q_proj.weight"], fused_qkv[:q_size])
+        torch.testing.assert_close(
+            native["model.layers.1.self_attn.k_proj.weight"], fused_qkv[q_size : q_size + kv_size]
+        )
+        torch.testing.assert_close(native["model.layers.1.self_attn.v_proj.weight"], fused_qkv[q_size + kv_size :])
+        for expert_id in range(moe_config.n_routed_experts):
+            torch.testing.assert_close(
+                native["model.layers.1.mlp.experts.gate_and_up_projs"][expert_id, :, : moe_config.moe_inter_dim],
+                hf_checkpoint[f"model.layers.1.mlp.experts.{expert_id}.gate_proj.weight"].T,
+            )
+            torch.testing.assert_close(
+                native["model.layers.1.mlp.experts.gate_and_up_projs"][expert_id, :, moe_config.moe_inter_dim :],
+                hf_checkpoint[f"model.layers.1.mlp.experts.{expert_id}.up_proj.weight"].T,
+            )
+            torch.testing.assert_close(
+                native["model.layers.1.mlp.experts.down_projs"][expert_id],
+                hf_checkpoint[f"model.layers.1.mlp.experts.{expert_id}.down_proj.weight"].T,
+            )
+        assert set(native) == set(converted) | adapter.view_loaded_native_keys
+
+    def test_uses_only_fused_qkv_temporaries(self, adapter, config, moe_config):
+        q_size = config.num_attention_heads * config.head_dim
+        kv_size = config.num_key_value_heads * config.head_dim
+        q_proj = torch.randn(q_size, config.hidden_size)
+        k_proj = torch.randn(kv_size, config.hidden_size)
+        v_proj = torch.randn(kv_size, config.hidden_size)
+        grouped_gate_up = torch.randn(
+            moe_config.n_routed_experts,
+            moe_config.dim,
+            2 * moe_config.moe_inter_dim,
+        )
+        grouped_down = torch.randn(
+            moe_config.n_routed_experts,
+            moe_config.moe_inter_dim,
+            moe_config.dim,
+        )
+        native = {
+            "model.layers.1.self_attn.q_proj.weight": q_proj,
+            "model.layers.1.self_attn.k_proj.weight": k_proj,
+            "model.layers.1.self_attn.v_proj.weight": v_proj,
+            "model.layers.1.mlp.experts.gate_and_up_projs": grouped_gate_up,
+            "model.layers.1.mlp.experts.down_projs": grouped_down,
+        }
+
+        destinations = adapter.to_hf(native, for_checkpoint_load=True)
+
+        fused_qkv = destinations["model.layers.1.attention.query_key_value.weight"]
+        assert fused_qkv.shape == (q_size + 2 * kv_size, config.hidden_size)
+        assert fused_qkv.numel() == q_proj.numel() + k_proj.numel() + v_proj.numel()
+        qkv_storage = {
+            q_proj.untyped_storage().data_ptr(),
+            k_proj.untyped_storage().data_ptr(),
+            v_proj.untyped_storage().data_ptr(),
+        }
+        assert fused_qkv.untyped_storage().data_ptr() not in qkv_storage
+
+        gate_destination = destinations["model.layers.1.mlp.experts.0.gate_proj.weight"]
+        up_destination = destinations["model.layers.1.mlp.experts.0.up_proj.weight"]
+        down_destination = destinations["model.layers.1.mlp.experts.0.down_proj.weight"]
+        assert gate_destination.untyped_storage().data_ptr() == grouped_gate_up.untyped_storage().data_ptr()
+        assert up_destination.untyped_storage().data_ptr() == grouped_gate_up.untyped_storage().data_ptr()
+        assert down_destination.untyped_storage().data_ptr() == grouped_down.untyped_storage().data_ptr()
+
+    def test_capability_matches_runtime_expert_storage(self, adapter, monkeypatch):
+        assert adapter.supports_low_memory_dcp_load is True
+
+        adapter.backend.experts = "te"
+        adapter.backend.dispatcher = "deepep"
+        monkeypatch.setattr("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", lambda: 1)
+        assert adapter.supports_low_memory_dcp_load is True
+
+        monkeypatch.setattr("nemo_automodel.components.moe.state_dict_mixin.get_world_size_safe", lambda: 8)
+        assert adapter.supports_low_memory_dcp_load is False
+
+        adapter.backend.experts = "torch_mm"
+        adapter.backend.dispatcher = "mok"
+        assert adapter.supports_low_memory_dcp_load is False
+
+        adapter.backend.dispatcher = "torch"
+        adapter.moe_config.expert_bias = True
+        assert adapter.supports_low_memory_dcp_load is False

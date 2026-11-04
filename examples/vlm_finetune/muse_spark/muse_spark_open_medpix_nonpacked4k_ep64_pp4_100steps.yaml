@@ -1,0 +1,152 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Full Muse Spark Open (816B-A42B), MedPix-VQA images and Q/A.
+# Non-packed: one source sample per row, padded/truncated to 4096 model tokens.
+# 32 nodes / 256 H100: EP64, PP4 (interleaved1f1b), CP1, TP1, DP64.
+# LBS32 / GBS2048 / GA1 / PP microbatch1; both reshard flags and AC enabled.
+# Reuses the validated 32-node TE attention+linear and HybridEP settings.
+# After upstream #3991, gmm aliases native torch_mm; use its canonical name.
+# Preserves
+# compile_norm, fused LM head+CE, BF16 storage and AdamW.
+# Override model and processor checkpoint paths for a local copy. Launch via Slurm;
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is set by the launcher.
+#
+recipe: FinetuneRecipeForVLM
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 2048
+  # 256 GPUs / (PP=4 * CP=1 * TP=1) = DP=64; GBS=2048 gives GA=1.
+  local_batch_size: 32
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 5
+  num_epochs: null
+  max_steps: 100
+  log_remote_every_steps: 1
+
+dist_env:
+  backend: nccl
+  # Cold-start forwards can exceed the default 10-minute PP receive timeout.
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: meta-models/Muse-Spark-open-816B-A42B
+  dtype: bfloat16
+  config:
+    residual_dtype: fp32
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: torch_fp32
+    compile_norm: true
+    experts: torch_mm
+    dispatcher: hybridep
+    compile_router_weight: true
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: false
+    fake_gate_noise: 0.0
+    benchmark_static_routing: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    scale_grads_in_schedule: false
+    layers_per_stage: 8
+    patch_inner_model: false
+    patch_causal_lm_model: false
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+checkpoint:
+  enabled: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  reduction: sum
+  # Match the Muse checkpoint output_soft_cap_temp after the fused projection.
+  logit_softcapping: 20.0
+
+processor:
+  _target_: nemo_automodel.components.models.muse_spark.processing.build_muse_spark_processor
+  pretrained_model_name_or_path: meta-models/Muse-Spark-open-816B-A42B
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  persistent_workers: true
+  pin_memory: true
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    # The collator shifts once: 4097 before shifting -> 4096 model tokens.
+    max_length: 4097
+
+validation_dataset: none
+validation_dataloader: none
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: constant
+
+clip_grad_norm:
+  max_norm: 1.0
+
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: automodel-muse-spark
+  name: muse-spark-open-medpix-nonpacked4k-ep64pp4-100steps
+  dir: logs/muse_spark_open_medpix_nonpacked4k_ep64_pp4_100steps/wandb
+  mode: online
+  tags: [muse-spark-open, medpix, nonpacked4k, ep64, pp4, fp32-residual]
+
+ci:
+  cluster_tag: h100
+  recipe_owner: HuiyingLi
+  nodes: 32
+  time: "01:00:00"
+  max_steps: 2
+  env_vars:
+    RDZV_TIMEOUT: "900"
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True

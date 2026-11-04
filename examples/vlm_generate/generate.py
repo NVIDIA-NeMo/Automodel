@@ -33,7 +33,6 @@ import glob
 import json
 import logging
 import os
-from typing import Optional
 
 import requests
 import torch
@@ -42,6 +41,7 @@ from transformers import AutoProcessor
 
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components.checkpoint.addons import load_automodel_peft_config_dict
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.loggers.log_utils import setup_logging
 
@@ -95,23 +95,13 @@ def apply_peft_to_model(model: NeMoAutoModelForImageTextToText, checkpoint_path:
         model: The model to apply PEFT to
         checkpoint_path: Path to the checkpoint directory
     """
-    peft_dict = {}
-    peft_config_path = os.path.join(checkpoint_path, "model", "adapter_config.json")
-    automodel_peft_config_path = os.path.join(checkpoint_path, "model", "automodel_peft_config.json")
-    with open(peft_config_path, "r") as f:
-        restored_peft_config = json.load(f)
-        peft_dict["dim"] = restored_peft_config["r"]
-        peft_dict["alpha"] = restored_peft_config["lora_alpha"]
-    with open(automodel_peft_config_path, "r") as f:
-        automodel_peft_dict = json.load(f)
-        peft_dict |= automodel_peft_dict
-    peft_config = PeftConfig.from_dict(peft_dict)
+    peft_config = PeftConfig(**load_automodel_peft_config_dict(os.path.join(checkpoint_path, "model")))
     apply_lora_to_linear_modules(model, peft_config)
 
 
 def load_model_from_checkpoint(
     checkpoint_path: str,
-    base_model_path: Optional[str] = None,
+    base_model_path: str | None = None,
     use_liger_kernel: bool = False,
 ) -> NeMoAutoModelForImageTextToText:
     """Load a VLM model from a checkpoint.

@@ -16,7 +16,7 @@ Unit tests for :pyclass:`nemo_automodel.components.loss.kd_loss.KDLoss` and its
 tensor-parallel helpers.
 """
 
-from typing import Optional
+import sys
 
 import pytest
 import torch
@@ -25,10 +25,16 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.loss.kd_loss import (
     KDLoss,
+    _AllReduceForwardPassThroughBackward,
     _infer_tp_group_from_dtensor,
     _kl_forward_chunked,
     _kl_forward_tp,
 )
+from nemo_automodel.components.loss.utils import _normalize_kd_labels
+
+# Over the default 5s budget on purpose: this module spawns worker processes; every child re-imports torch from scratch.
+# Shrink the work or the process count before raising this further.
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 # ---------------------------------------------------------------------------
 # Reference implementation
@@ -41,7 +47,7 @@ def _reference_kd_loss(
     labels: torch.Tensor,
     ignore_index: int = -100,
     temperature: float = 1.0,
-    num_batch_labels: Optional[int] = None,
+    num_batch_labels: int | None = None,
 ) -> torch.Tensor:
     """Compute a trusted forward-KL reference.
 
@@ -101,14 +107,50 @@ def test_kd_loss_basic(temperature, upcast, unsqueeze):
     assert torch.allclose(loss, ref, atol=1e-6), f"Expected {ref}, got {loss}"
 
 
-def test_kd_loss_basic_no_labels():
-    """Returns zero when the entire batch is padding."""
-    student_logits = torch.tensor([[2.0, 0.5, -1.0], [0.1, 0.2, 0.3]])
-    teacher_logits = torch.tensor([[1.5, 0.0, -0.5], [0.2, -0.1, 0.0]])
-    labels = torch.tensor([-100, -100])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("chunk_size", [0, 2])
+def test_kd_loss_basic_no_labels(dtype, chunk_size):
+    """An ignored microbatch contributes zero loss and zero student gradients."""
+    student_logits = torch.full((2, 3, 8), 2000.0, dtype=dtype, requires_grad=True)
+    teacher_logits = torch.zeros_like(student_logits)
+    labels = torch.full((2, 3), -100)
 
-    loss = KDLoss()(student_logits, teacher_logits, labels)
+    loss = KDLoss(chunk_size=chunk_size)(student_logits, teacher_logits, labels)
     assert loss == 0.0
+    loss.backward()
+    torch.testing.assert_close(student_logits.grad, torch.zeros_like(student_logits))
+
+
+@pytest.mark.parametrize("chunk_size", [0, 2])
+def test_kd_loss_accumulation_with_ignored_microbatch(chunk_size):
+    """Ignoring one microbatch must preserve the supervised batch's update."""
+    torch.manual_seed(61)
+    student = torch.nn.Linear(4, 8)
+    reference = torch.nn.Linear(4, 8)
+    reference.load_state_dict(student.state_dict())
+    inputs = torch.randn(2, 3, 4)
+    teacher_logits = torch.randn(2, 3, 8)
+    labels = torch.tensor([[-100, -100, -100], [0, -100, 1]])
+    count = (labels != -100).sum().item()
+    loss_fn = KDLoss(chunk_size=chunk_size)
+    for i in range(2):
+        loss_fn(student(inputs[i]), teacher_logits[i], labels[i], num_batch_labels=count).backward()
+
+    ref_logits = reference(inputs[1])
+    valid = labels[1] != -100
+    ref_loss = F.kl_div(
+        F.log_softmax(ref_logits[valid], dim=-1),
+        F.log_softmax(teacher_logits[1][valid], dim=-1),
+        reduction="batchmean",
+        log_target=True,
+    )
+    ref_loss.backward()
+    for actual, expected in zip(student.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual.grad, expected.grad)
+    torch.optim.SGD(student.parameters(), lr=0.1).step()
+    torch.optim.SGD(reference.parameters(), lr=0.1).step()
+    for actual, expected in zip(student.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_kd_loss_ignore_index():
@@ -121,6 +163,14 @@ def test_kd_loss_ignore_index():
     ref = _reference_kd_loss(student_logits, teacher_logits, labels, ignore_index=-100)
 
     assert torch.allclose(loss, ref, atol=1e-6), f"Expected {ref}, got {loss}"
+
+
+def test_normalize_kd_labels_preserves_valid_labels_equal_to_kd_sentinel():
+    labels = torch.tensor([0, 1, -100])
+
+    normalized = _normalize_kd_labels(labels, loss_ignore_index=-100, kd_ignore_index=0)
+
+    torch.testing.assert_close(normalized, torch.tensor([-100, 1, 0]))
 
 
 def test_kd_loss_num_labels():
@@ -565,7 +615,7 @@ def test_infer_tp_group_plain_tensor_returns_none():
 # ---------------------------------------------------------------------------
 
 
-def _init_single_process_group() -> Optional[torch.distributed.ProcessGroup]:
+def _init_single_process_group() -> torch.distributed.ProcessGroup | None:
     """Initialise (or reuse) a trivial gloo group for single-process TP tests."""
     if not torch.distributed.is_available():
         return None
@@ -640,6 +690,17 @@ def test_kd_loss_tp_path_with_temperature(trivial_pg):
     )
 
 
+def test_tp_kl_reduction_does_not_mutate_saved_autograd_value(trivial_pg):
+    """The TP reduction must not mutate a tensor saved by an upstream autograd op."""
+    source = torch.randn(6, requires_grad=True)
+    local_kl = source.exp()
+
+    reduced_kl = _AllReduceForwardPassThroughBackward.apply(local_kl, trivial_pg)
+    reduced_kl.sum().backward()
+
+    torch.testing.assert_close(source.grad, local_kl.detach())
+
+
 def _run_two_process_tp_kl(rank: int, init_file: str) -> None:
     torch.distributed.init_process_group(
         backend="gloo",
@@ -666,3 +727,58 @@ def _run_two_process_tp_kl(rank: int, init_file: str) -> None:
 
 def test_kl_forward_tp_two_process_matches_full_vocab(tmp_path):
     mp.spawn(_run_two_process_tp_kl, args=(str(tmp_path / "tp_kl"),), nprocs=2, join=True)
+
+
+def _run_two_process_tp_kd_gradient(rank: int, init_file: str) -> None:
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        torch.manual_seed(29)
+        teacher_logits = torch.randn(6, 16)
+        student_logits = torch.randn(6, 16)
+        local_teacher = teacher_logits.chunk(2, dim=-1)[rank].contiguous()
+        local_student = student_logits.chunk(2, dim=-1)[rank].contiguous().requires_grad_()
+        labels = torch.tensor([0, 1, -100, 3, 4, 5])
+
+        actual = KDLoss(tp_group=torch.distributed.group.WORLD)(local_student, local_teacher, labels)
+        actual.backward()
+
+        full_student = student_logits.detach().requires_grad_()
+        teacher_logprob = F.log_softmax(teacher_logits, dim=-1)
+        student_logprob = F.log_softmax(full_student, dim=-1)
+        expected = F.kl_div(student_logprob, teacher_logprob, reduction="none", log_target=True).sum(-1)
+        expected = expected[labels != -100].mean()
+        expected.backward()
+
+        torch.testing.assert_close(
+            local_student.grad,
+            full_student.grad.chunk(2, dim=-1)[rank],
+            atol=1e-6,
+            rtol=1e-5,
+        )
+
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor, Shard
+
+        mesh = init_device_mesh("cpu", (2,))
+        sharded_student = DTensor.from_local(local_student.detach(), mesh, [Shard(-1)]).requires_grad_()
+        sharded_teacher = DTensor.from_local(local_teacher, mesh, [Shard(-1)])
+        ignored_labels = torch.full_like(labels, -100)
+        ignored_loss = KDLoss()(sharded_student, sharded_teacher, ignored_labels)
+        assert ignored_loss.item() == 0.0
+        ignored_loss.backward()
+        assert sharded_student.grad.placements == sharded_student.placements
+        torch.testing.assert_close(sharded_student.grad.to_local(), torch.zeros_like(local_student))
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="the CPU Gloo backend does not support multi-process tests on Windows"
+)
+def test_kd_loss_tp_two_process_matches_full_vocab_gradient(tmp_path):
+    mp.spawn(_run_two_process_tp_kd_gradient, args=(str(tmp_path / "tp_kd_gradient"),), nprocs=2, join=True)

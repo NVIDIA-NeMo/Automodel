@@ -83,6 +83,28 @@ def test_parse_cli_argv_missing_path(monkeypatch):
         cli.parse_cli_argv()
 
 
+@pytest.mark.parametrize("default_cfg_path", [None, "default.yaml"])
+def test_parse_cli_argv_config_equals_form(default_cfg_path):
+    """
+    --config=<path> should select the config just like --config <path>,
+    and must not leak into the overrides as a stray `config` key.
+    """
+    cfg_path, overrides = cli.parse_cli_argv(
+        default_cfg_path=default_cfg_path,
+        argv=["--config=model.yaml", "--seed=123"],
+    )
+    assert cfg_path == "model.yaml"
+    assert overrides == ["seed=123"]
+
+
+def test_parse_cli_argv_config_equals_empty_path():
+    """
+    --config= with an empty value should raise ValueError.
+    """
+    with pytest.raises(ValueError, match="Expected a path after --config"):
+        cli.parse_cli_argv(default_cfg_path="default.yaml", argv=["--config="])
+
+
 def test_parse_args_and_load_config(monkeypatch):
     """
     Full end-to-end check with mocked YAML loader, translate_value,
@@ -170,4 +192,24 @@ def test_parse_args_and_load_config_with_argv(monkeypatch):
         argv=["--opt.lr", "1e-4"],
     )
     assert returned_cfg is dummy_cfg
+    assert dummy_cfg._calls == [("opt.lr", "<T:1e-4>")]
+
+
+def test_parse_args_and_load_config_config_equals_form(monkeypatch):
+    """parse_args_and_load_config should load the file given as --config=<path>."""
+    dummy_cfg = DummyConfig()
+    loaded = []
+
+    def fake_load(path):
+        loaded.append(path)
+        return dummy_cfg
+
+    monkeypatch.setattr(cli, "load_yaml_config", fake_load, raising=True)
+    monkeypatch.setattr(cli, "translate_value", lambda s: f"<T:{s}>", raising=True)
+
+    cli.parse_args_and_load_config(
+        default_cfg_path="default.yaml",
+        argv=["--config=mine.yaml", "--opt.lr", "1e-4"],
+    )
+    assert loaded == ["mine.yaml"]
     assert dummy_cfg._calls == [("opt.lr", "<T:1e-4>")]

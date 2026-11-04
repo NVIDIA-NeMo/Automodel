@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Packed fallback guards adapted from Hugging Face Transformers (Apache-2.0):
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+# src/transformers/integrations/hub_kernels.py at
+# https://github.com/huggingface/transformers/commit/01f16c0e835edb224b11fb8596c6b13bb29bd515
+
 """Context-Parallel-aware wrapper for Qwen3.5 MoE GatedDeltaNet linear attention.
 
 When a CP mesh is attached (via ``apply_cp``), the forward pass:
@@ -33,9 +38,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.autograd import Function
 from torch.distributed.device_mesh import DeviceMesh
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeGatedDeltaNet,
+    causal_conv1d_fn,
+    causal_conv1d_update,
+    torch_chunk_gated_delta_rule,
+    torch_recurrent_gated_delta_rule,
+)
 
-from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
@@ -114,6 +126,21 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     def __init__(self, config, layer_idx: int):
         super().__init__(config, layer_idx)
         self._cp_mesh = None
+        # Transformers 5.15 moved kernel callables from instance attributes to decorated
+        # module-level fallbacks. Prefer the installed kernels, matching the pre-5.15
+        # behavior and the FLA implementation used by the context-parallel path.
+        has_causal_conv1d, fast_causal_conv1d_fn = safe_import_from("causal_conv1d", "causal_conv1d_fn")
+        _, self.causal_conv1d_update = safe_import_from(
+            "causal_conv1d", "causal_conv1d_update", alt=causal_conv1d_update
+        )
+        has_fla, chunk_gated_delta_rule = safe_import_from("fla.ops.gated_delta_rule", "chunk_gated_delta_rule")
+        _, self.recurrent_gated_delta_rule = safe_import_from(
+            "fla.ops.gated_delta_rule", "fused_recurrent_gated_delta_rule", alt=torch_recurrent_gated_delta_rule
+        )
+        # A decorated HF reference is callable even when its fast dependency is
+        # absent. Keep that distinct from kernels that support packed boundaries.
+        self.causal_conv1d_fn = fast_causal_conv1d_fn if has_causal_conv1d else None
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule if has_fla else None
         # HF created bare ``A_log``/``dt_bias`` in ``_parameters``; move them into a
         # native fp32 ``SSMGate`` submodule (built directly, not relocated at runtime).
         install_ssm_gate(self, fp32_dtype=_resolve_ssm_dtype(config))
@@ -133,27 +160,27 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         cache_position=None,
         attention_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         indices: torch.Tensor | None = None,
-    ):
+    ) -> torch.Tensor:
         """HF GatedDeltaNet forward with FSDP-safe fp32 gate computation.
 
-        Mirrors transformers==5.5 ``Qwen3_5GatedDeltaNet.forward`` (per-layer
-        cache API; gate via ``self._compute_gate(a)``) and adds packing-aware
-        plumbing:
+        Args:
+            hidden_states: Hidden states of shape [batch, sequence, hidden].
+            cache_params: Optional Hugging Face recurrent cache.
+            cache_position: Optional token positions of shape [sequence]; unused
+                by the Transformers 5.5-compatible path.
+            attention_mask: Optional validity or indexed document mask of shape
+                [batch, sequence].
+            cu_seqlens: Optional cumulative document lengths of shape
+                [documents + 1] on the compute device.
+            cu_seqlens_cpu: Optional CPU mirror of ``cu_seqlens`` with shape
+                [documents + 1] for FLA host-side chunk planning.
+            indices: Optional flattened valid-token indices of shape [tokens] on
+                the compute device.
 
-        * ``cu_seqlens`` -- per-document cumulative lengths from the indexed
-          attention mask. When supplied, FLA's chunk kernel resets state at
-          every document boundary.
-        * ``indices`` -- non-padding token indices. When supplied AND padding
-          is actually present (B>1 case), the layer unpads activations to
-          ``[1, total_valid, ...]`` before conv/FLA and re-pads on the way
-          out. For B=1 with no padding, ``indices`` covers the whole sequence
-          and unpadding is skipped (preserves the bit-exact fast path).
-
-        Both kwargs are produced by ``Qwen3_5DecoderLayerWithPacking``. As a
-        safety net for direct callers (e.g. unit tests that bypass the
-        decoder-layer subclass), the layer derives them from ``attention_mask``
-        when both are ``None`` and the mask is indexed.
+        Returns:
+            GatedDeltaNet output of shape [batch, sequence, hidden].
         """
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
 
@@ -163,15 +190,32 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             cache_params is not None and cache_params.has_previous_state(self.layer_idx) and seq_len == 1
         )
 
-        # Resolve packing kwargs. Fallback to mask-derivation only when neither
-        # was passed in (bypasses the decoder-layer subclass).
-        if not use_precomputed_states and cu_seqlens is None and indices is None:
-            if is_indexed_packed_mask(attention_mask):
-                indices_t, cu_seqlens_t, _ = get_unpad_data(attention_mask)
-                cu_seqlens = cu_seqlens_t.to(torch.long)
-                indices = indices_t
+        if (
+            not use_precomputed_states
+            and (cu_seqlens is None or indices is None)
+            and is_indexed_packed_mask(attention_mask)
+        ):
+            raise ValueError("Packed Qwen3.5 linear attention requires dataset-provided indices and cu_seqlens.")
+
+        if cu_seqlens is not None and cu_seqlens_cpu is None:
+            cu_seqlens_cpu = cu_seqlens.detach().cpu()
+        if cu_seqlens_cpu is not None and cu_seqlens_cpu.device.type != "cpu":
+            raise ValueError("cu_seqlens_cpu must reside on CPU for FLA host-side chunk planning.")
 
         is_packed = (not use_precomputed_states) and cu_seqlens is not None
+        if is_packed and self.causal_conv1d_fn is None:
+            raise ValueError(
+                "`causal_conv1d_fn` can't keep packed sequences apart without `causal-conv1d`. Install "
+                "`causal-conv1d` to train on packed sequences."
+            )
+        if is_packed and self.chunk_gated_delta_rule is None:
+            raise ValueError(
+                "`chunk_gated_delta_rule` can't keep packed sequences apart without `flash-linear-attention`. Install "
+                "`flash-linear-attention` to train on packed sequences."
+            )
+        chunk_gated_delta_rule = (
+            self.chunk_gated_delta_rule if self.chunk_gated_delta_rule is not None else torch_chunk_gated_delta_rule
+        )
         # Only unpad when there is actually padding to remove. For B=1 packs
         # without padding, ``indices`` covers ``[0, B*T)`` and we keep the
         # ``[B, T, ...]`` layout (bit-for-bit identical to the prior fast path).
@@ -181,7 +225,13 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         # (which drops padding entirely) or there is no padding to begin with.
         # Outside packing the original behavior is preserved.
         if not is_packed:
-            hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+            # transformers 5.15 dropped apply_mask_to_padding_states' shape guards, so it
+            # now multiplies by ``attention_mask[:, :, None]`` unconditionally. The helper
+            # documents a 2D padding mask; the 4D packed causal mask (materialized at
+            # cp_size<=1) broadcasts to 5D and raises. Only pass a 2D mask, matching the
+            # pre-5.15 behavior of skipping it for anything else.
+            if attention_mask is None or attention_mask.dim() == 2:
+                hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         if use_precomputed_states:
             conv_state = cache_params.layers[self.layer_idx].conv_states
@@ -216,23 +266,34 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 cache_params.update_conv_state(conv_state, self.layer_idx)
             if self.causal_conv1d_fn is not None:
                 # ``seq_idx`` for causal_conv1d_fn marks per-token segment ids.
-                # Source is the indexed mask, gathered at the same ``indices``
-                # used for unpadding so it lines up with the unpadded layout.
+                # Flattened batches need globally unique ids derived from the
+                # cumulative boundaries; document ids restart in every row.
                 if not is_packed:
                     seq_idx_for_conv = None
                 elif needs_unpad:
-                    seq_idx_for_conv = attention_mask.reshape(-1)[indices].unsqueeze(0).to(torch.int32).contiguous()
+                    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                    seq_idx_for_conv = torch.repeat_interleave(
+                        torch.arange(lengths.numel(), device=lengths.device, dtype=torch.int32),
+                        lengths,
+                        output_size=indices.numel(),
+                    ).unsqueeze(0)
                 else:
                     seq_idx_for_conv = attention_mask.to(torch.int32).contiguous()
+                # HF's fallback calls this input hidden_states; the CUDA kernel uses x.
                 mixed_qkv = self.causal_conv1d_fn(
-                    x=mixed_qkv,
+                    mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
                     bias=self.conv1d.bias,
                     activation=self.activation,
                     seq_idx=seq_idx_for_conv,
                 )
             else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :eff_seq_len])
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    weight=self.conv1d.weight.squeeze(1),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                )
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
@@ -258,7 +319,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                     value = value.reshape(1, batch_size * seq_len, *value.shape[2:])
                     g = g.reshape(1, batch_size * seq_len, *g.shape[2:])
                     beta = beta.reshape(1, batch_size * seq_len, *beta.shape[2:])
-                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                     query,
                     key,
                     value,
@@ -268,11 +329,12 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                     output_final_state=cache_params is not None,
                     use_qk_l2norm_in_kernel=True,
                     cu_seqlens=cu_seqlens,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
                 )
                 if not needs_unpad:
                     core_attn_out = core_attn_out.reshape(batch_size, seq_len, *core_attn_out.shape[2:])
             else:
-                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                     query,
                     key,
                     value,
@@ -326,9 +388,10 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         position_ids: torch.Tensor | None = None,
         qkv_format: str | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         indices: torch.Tensor | None = None,
         seq_index: torch.Tensor | None = None,
-    ):
+    ) -> torch.Tensor:
         """Run GatedDeltaNet with dense, round-robin CP, or packed contiguous CP.
 
         Args:
@@ -342,7 +405,9 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 ``[axes, batch, sequence]``.
             qkv_format: Optional attention layout tag; unused by this module.
             cu_seqlens: Optional packed boundaries of shape
-                ``[num_documents + 1]`` for the non-CP path.
+                [documents + 1] for the non-CP path.
+            cu_seqlens_cpu: Optional CPU mirror of ``cu_seqlens`` with shape
+                [documents + 1] for FLA host-side chunk planning.
             indices: Optional valid-token indices of shape ``[tokens]`` for the
                 non-CP packed path.
             seq_index: Optional global token positions of shape ``[sequence]``
@@ -359,6 +424,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 cache_params=cache_params,
                 attention_mask=attention_mask,
                 cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
                 indices=indices,
             )
 

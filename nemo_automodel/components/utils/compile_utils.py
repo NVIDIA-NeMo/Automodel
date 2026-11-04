@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
@@ -32,8 +32,8 @@ class CompileConfig:
     mode: str = "default"
     fullgraph: bool = False
     dynamic: bool = False
-    backend: Optional[str] = None
-    options: Optional[Dict[str, Any]] = None
+    backend: str | None = None
+    options: Dict[str, Any] | None = None
     dynamo_cache_size_limit: int = 256
 
     def __init__(
@@ -42,8 +42,8 @@ class CompileConfig:
         mode: str = "default",
         fullgraph: bool = False,
         dynamic: bool = False,
-        backend: Optional[str] = None,
-        options: Optional[Dict[str, Any]] = None,
+        backend: str | None = None,
+        options: Dict[str, Any] | None = None,
         dynamo_cache_size_limit: int = 256,
     ):
         self.enabled = enabled
@@ -272,7 +272,7 @@ def create_compile_config_from_dict(config_dict: Dict[str, Any]) -> CompileConfi
     )
 
 
-def build_compile_config(cfg: Optional[Dict[str, Any]]) -> CompileConfig:
+def build_compile_config(cfg: Dict[str, Any] | None) -> CompileConfig:
     """Build a compile config from configuration.
 
     Args:

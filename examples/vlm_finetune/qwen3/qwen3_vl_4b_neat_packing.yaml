@@ -97,10 +97,10 @@ validation_dataloader:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
 
 freeze_config:
-  freeze_embeddings: true
   freeze_vision_tower: true
   freeze_language_model: false
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "00:15:00"

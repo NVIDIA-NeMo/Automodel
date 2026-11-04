@@ -31,7 +31,7 @@ import logging
 import math
 import os
 import random
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -40,10 +40,12 @@ import torch.nn as nn
 from .adapters import (
     FlowMatchingContext,
     Flux2Adapter,
+    Flux3Adapter,
     FluxAdapter,
     HunyuanAdapter,
     LTX2Adapter,
     ModelAdapter,
+    QwenImage21Adapter,
     QwenImageAdapter,
     SimpleAdapter,
 )
@@ -138,7 +140,7 @@ class FlowMatchingPipeline:
         # Logging
         log_interval: int = 100,
         summary_log_interval: int = 10,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ):
         """
         Initialize the FlowMatching pipeline.
@@ -226,7 +228,7 @@ class FlowMatchingPipeline:
     def sample_timesteps(
         self,
         batch_size: int,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, str]:
         """
         Sample timesteps and compute sigma values with flow shift.
@@ -330,8 +332,8 @@ class FlowMatchingPipeline:
         model_pred: torch.Tensor,
         target: torch.Tensor,
         sigma: torch.Tensor,
-        batch: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        batch: Dict[str, Any] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Compute flow matching loss with optional weighting.
 
@@ -383,7 +385,7 @@ class FlowMatchingPipeline:
         global_step: int = 0,
         collect_metrics: bool = True,
         check_loss: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, Dict[str, Any]]:
         """
         Execute a single training step with flow matching.
 
@@ -630,15 +632,21 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
     Factory function to create a model adapter by name.
 
     Args:
-        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "qwen_image",
-            "qwen_image_edit", "ltx2")
+        adapter_type: Type of adapter ("hunyuan", "simple", "flux", "flux2", "flux3", "qwen_image",
+            "qwen_image_21", "qwen_image_edit", "ltx2", "hunyuan_image3")
         **kwargs: Additional arguments passed to the adapter constructor
 
     Returns:
         ModelAdapter instance
     """
-    # Imported lazily: the adapter is owned by the model package, and importing
-    # it here at module scope would load the Qwen model code for every recipe.
+
+    # Adapters owned by a model package are imported only when selected, so other recipes never load that
+    # model's code.
+    def hunyuan_image3_adapter(**adapter_kwargs) -> ModelAdapter:
+        from nemo_automodel.components.models.hunyuan_image3.flow_adapter import HunyuanImage3Adapter
+
+        return HunyuanImage3Adapter(**adapter_kwargs)
+
     from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
 
     adapters = {
@@ -646,9 +654,12 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
         "simple": SimpleAdapter,
         "flux": FluxAdapter,
         "flux2": Flux2Adapter,
+        "flux3": Flux3Adapter,
         "qwen_image": QwenImageAdapter,
+        "qwen_image_21": QwenImage21Adapter,
         "qwen_image_edit": QwenImageEditAdapter,
         "ltx2": LTX2Adapter,
+        "hunyuan_image3": hunyuan_image3_adapter,
     }
 
     if adapter_type not in adapters:
@@ -659,7 +670,7 @@ def create_adapter(adapter_type: str, **kwargs) -> ModelAdapter:
 
 def create_pipeline(
     adapter_type: str,
-    adapter_kwargs: Optional[Dict[str, Any]] = None,
+    adapter_kwargs: Dict[str, Any] | None = None,
     **pipeline_kwargs,
 ) -> FlowMatchingPipeline:
     """

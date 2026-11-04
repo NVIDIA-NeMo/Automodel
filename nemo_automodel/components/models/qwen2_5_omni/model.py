@@ -32,7 +32,7 @@ this module is intentionally minimal:
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -160,7 +160,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         use_cache: bool | None = None,
         rope_deltas: torch.LongTensor | None = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
         """Multimodal forward that mirrors HF's Thinker but supports cut-CE.

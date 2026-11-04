@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import yaml
 
+from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.config import DDPConfig, DistributedSetup, FSDP2Config
 from nemo_automodel.components.loss.cross_encoder_distill import GroupedScoreKLLoss
 from nemo_automodel.recipes.retrieval.distill_cross_encoder import DistillCrossEncoderRecipe
@@ -334,7 +335,9 @@ def _build_teacher_on(strategy, factory=None):
     recipe.student_internal_temperature = _STUDENT_TEMP
     recipe.student_vocab_size = _VOCAB_SIZE
     recipe.distributed_setup = DistributedSetup(
-        mesh_context=SimpleNamespace(name="student-mesh"),
+        mesh_context=MeshContext(
+            device_mesh=SimpleNamespace(mesh_dim_names=("dp",)), process_group=object()
+        ),
         strategy_config=strategy,
         activation_checkpointing=True,
     )
@@ -364,8 +367,10 @@ def test_teacher_setup_shares_the_student_mesh_and_leaves_it_unchanged():
     recipe, teacher_config = _build_teacher_on(strategy)
 
     teacher_setup = teacher_config.kwargs["distributed_setup"]
-    # Identity, not equality: a second DistributedSetup.build() would create new process groups.
-    assert teacher_setup.mesh_context is recipe.distributed_setup.mesh_context
+    # The policy context is copied, but meshes and process groups must be reused.
+    assert teacher_setup.mesh_context.device_mesh is recipe.distributed_setup.mesh_context.device_mesh
+    assert teacher_setup.mesh_context.moe_mesh is recipe.distributed_setup.mesh_context.moe_mesh
+    assert teacher_setup.mesh_context.process_group is recipe.distributed_setup.mesh_context.process_group
     assert recipe.distributed_setup.strategy_config is strategy
     assert recipe.distributed_setup.activation_checkpointing is True
     assert strategy.reshard_after_forward is False

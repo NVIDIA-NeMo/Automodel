@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, create_autospec, patch
 import pytest
 import torch
 import torch.nn as nn
+from packaging.version import Version
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -30,7 +31,9 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
 import nemo_automodel.components.distributed.parallelizer as parallelizer
+from nemo_automodel.components.distributed import fsdp_patches
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
+from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
     _extract_model_layer_groups,
@@ -64,6 +67,7 @@ def test_fsdp_accumulated_grad_guard_only_handles_missing_unsharded_param(monkey
 
     fake_module = SimpleNamespace(FSDPParam=FakeFSDPParam)
     monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_module)
+    monkeypatch.setattr(fsdp_patches, "get_torch_version", lambda: Version("2.14.1"))
 
     parallelizer._patch_fsdp_accumulated_grad_guard()
 
@@ -83,6 +87,22 @@ def test_fsdp_accumulated_grad_guard_only_handles_missing_unsharded_param(monkey
     wrapped = FakeFSDPParam.to_accumulated_grad_if_needed
     parallelizer._patch_fsdp_accumulated_grad_guard()
     assert FakeFSDPParam.to_accumulated_grad_if_needed is wrapped
+
+
+@pytest.mark.parametrize("version", ["2.15.0", "2.15.0a0+git1234.nv26.10"])
+def test_fsdp_accumulated_grad_guard_skips_torch_2_15(monkeypatch, version):
+    """torch 2.15 has no to_accumulated_grad_if_needed, so the guard leaves FSDPParam alone."""
+
+    class FakeFSDPParam:
+        pass
+
+    fake_module = SimpleNamespace(FSDPParam=FakeFSDPParam)
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_module)
+    monkeypatch.setattr(fsdp_patches, "get_torch_version", lambda: Version(version))
+
+    parallelizer._patch_fsdp_accumulated_grad_guard()
+
+    assert not hasattr(FakeFSDPParam, "to_accumulated_grad_if_needed")
 
 
 class MockModel(nn.Module):
@@ -1101,6 +1121,7 @@ class TestGetHfTpShardPlan:
             "layer3": "colwise_rep",
             "layer4": "rowwise_rep",
             "layer5": "sequence_parallel",
+            "layer6": "replicated_with_grad_allreduce",
         }
         model.config.tie_word_embeddings = True
 
@@ -1111,13 +1132,14 @@ class TestGetHfTpShardPlan:
         assert isinstance(result["layer3"], ColwiseParallel)
         assert isinstance(result["layer4"], RowwiseParallel)
         assert isinstance(result["layer5"], SequenceParallel)
+        assert isinstance(result["layer6"], ReplicatedWithGradAllReduce)
 
     def test_no_tp_plan_error(self):
         """Test error when no TP plan is found."""
         model = MockModel()
         model.config.tie_word_embeddings = True
 
-        with pytest.raises(AssertionError, match="Hugging Face tp plan is not supported"):
+        with pytest.raises(ValueError, match="Hugging Face TP plan is not supported"):
             get_hf_tp_shard_plan(model)
 
     def test_invalid_parallel_style_error(self):
@@ -1452,9 +1474,9 @@ class TestApplyFsdpShardingRecursively:
         )
 
 
-def test_default_parallelization_replicated_frozen_multimodal_params_are_ignored_by_root(monkeypatch):
+def test_model_parallelizer_replicated_frozen_multimodal_params_are_ignored_by_root(monkeypatch):
     """The dense root FSDP unit must ignore frozen multimodal params when replication is requested."""
-    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
     class InnerModel(nn.Module):
         def __init__(self):
@@ -1491,12 +1513,13 @@ def test_default_parallelization_replicated_frozen_multimodal_params_are_ignored
         module.set_modules_to_backward_prefetch = MagicMock()
         return module
 
-    result = DefaultParallelizationStrategy().parallelize(
+    model_parallelizer = ModelParallelizer()
+    monkeypatch.setattr(model_parallelizer, "_fully_shard_module", fake_fully_shard)
+    result = model_parallelizer._apply(
         model=model,
         device_mesh=device_mesh,
         activation_checkpointing=False,
         frozen_multimodal_sharding="replicate",
-        fully_shard_fn=fake_fully_shard,
     )
 
     assert result is model
@@ -1504,9 +1527,9 @@ def test_default_parallelization_replicated_frozen_multimodal_params_are_ignored
     assert root_kwargs["ignored_params"] == set(model.model.vision_tower.parameters())
 
 
-def test_default_parallelization_warns_for_per_layer_frozen_multimodal_policy(monkeypatch, caplog):
+def test_model_parallelizer_warns_for_per_layer_frozen_multimodal_policy(monkeypatch, caplog):
     """The expert per-layer policy makes its rank-uniform collective contract visible."""
-    from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+    from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
     class InnerModel(nn.Module):
         def __init__(self):
@@ -1539,13 +1562,14 @@ def test_default_parallelization_warns_for_per_layer_frozen_multimodal_policy(mo
         module.set_modules_to_backward_prefetch = MagicMock()
         return module
 
+    model_parallelizer = ModelParallelizer()
+    monkeypatch.setattr(model_parallelizer, "_fully_shard_module", fake_fully_shard)
     with caplog.at_level("WARNING"):
-        DefaultParallelizationStrategy().parallelize(
+        model_parallelizer._apply(
             model=model,
             device_mesh=device_mesh,
             activation_checkpointing=False,
             frozen_multimodal_sharding="per_layer",
-            fully_shard_fn=fake_fully_shard,
         )
 
     assert "rank-asymmetric modality execution can hang" in caplog.text
@@ -1949,7 +1973,7 @@ def _make_model_for_ac(
 
 class TestActivationCheckpointingKVSharing:
     """Tests for the KV-sharing–aware activation-checkpointing guards
-    in ``DefaultParallelizationStrategy.parallelize``.
+    in ``ModelParallelizer._apply``.
     """
 
     @pytest.fixture(autouse=True)
@@ -1966,10 +1990,10 @@ class TestActivationCheckpointingKVSharing:
             rejects non-Module values when replacing a registered child module.
             """
 
-            def __init__(self, inner, context_fn=None):
+            def __init__(self, inner, **kwargs):
                 super().__init__()
                 self._inner = inner
-                self._context_fn = context_fn
+                self.kwargs = kwargs
 
             @property
             def _checkpoint_wrapped_module(self):
@@ -1982,7 +2006,7 @@ class TestActivationCheckpointingKVSharing:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
-            lambda module, **kwargs: _Wrapped(module),
+            lambda module, **kwargs: _Wrapped(module, **kwargs),
         )
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
@@ -2007,16 +2031,17 @@ class TestActivationCheckpointingKVSharing:
         activation_checkpointing=True,
         activation_checkpointing_scope="all",
         enable_compile=False,
+        model_parallelizer=None,
     ):
         """Invoke the strategy under test and return the model."""
-        from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
+        from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
-        strategy = DefaultParallelizationStrategy()
+        model_parallelizer = model_parallelizer or ModelParallelizer()
         mesh = MagicMock(spec=DeviceMesh)
         tp_mesh = MagicMock()
         tp_mesh.size.return_value = 1  # no TP
         mesh.__getitem__ = lambda self_, key: tp_mesh
-        return strategy.parallelize(
+        return model_parallelizer._apply(
             model=model,
             device_mesh=mesh,
             activation_checkpointing=activation_checkpointing,
@@ -2336,25 +2361,6 @@ class TestActivationCheckpointingKVSharing:
             assert isinstance(layer.input_layernorm, self._Wrapped)
             assert isinstance(layer.post_attention_layernorm, self._Wrapped)
 
-    def test_bagel_parallelize_uses_full_layer_checkpointing(self):
-        """BAGEL wraps whole Qwen/SigLIP layers through the special AC path."""
-        model = _make_bagel_model(num_language_layers=2, num_vision_layers=2)
-
-        self._run_parallelize(model, activation_checkpointing=True)
-
-        language_layers = model.model.language_model.model.layers
-        vision_layers = model.model.vit_model.vision_model.encoder.layers
-        assert all(isinstance(layer, self._Wrapped) for layer in language_layers)
-        assert all(isinstance(layer, self._Wrapped) for layer in vision_layers)
-
-    # ------------------------------------------------------------------ #
-    # HF native gradient-checkpointing path
-    # ------------------------------------------------------------------ #
-
-    # ------------------------------------------------------------------ #
-    # Exception / edge-case branches
-    # ------------------------------------------------------------------ #
-
     def test_frozen_config_use_cache_except_branch(self):
         """When ``model.config.use_cache = False`` raises, the except branch runs."""
         model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=0)
@@ -2427,12 +2433,20 @@ class TestActivationCheckpointingKVSharing:
             assert not hasattr(layer, "mlp")
 
     # ------------------------------------------------------------------ #
-    # HF native gradient-checkpointing path
+    # HF-native gradient-checkpointing candidates
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _setup_hf_native_model(monkeypatch, num_kv_shared_layers):
-        """Helper: configure a model + fake transformers module for the HF native path."""
+    def _setup_hf_native_model(monkeypatch, num_kv_shared_layers, replay_safe_kv_sharing=False):
+        """Helper: configure a model + fake transformers module for the HF native path.
+
+        Args:
+            monkeypatch: pytest monkeypatch fixture.
+            num_kv_shared_layers: Value placed on the text config; > 0 marks the
+                model as KV-shared.
+            replay_safe_kv_sharing: Whether the model declares its shared-K/V store
+                safe under whole-block checkpoint replay, as Gemma4 E2B/E4B do.
+        """
         import types
 
         class _FakeGradLayer(_FakeLayer):
@@ -2449,27 +2463,72 @@ class TestActivationCheckpointingKVSharing:
             model.model.layers[i] = _FakeGradLayer()
         model.supports_gradient_checkpointing = True  # type: ignore[attr-defined]
         model.gradient_checkpointing_enable = MagicMock()  # type: ignore[attr-defined]
+        if replay_safe_kv_sharing:
+            model.kv_sharing_survives_checkpoint_replay = True  # type: ignore[attr-defined]
         return model
 
-    def test_hf_native_grad_ckpt_preserves_use_cache_with_kv_sharing(self, monkeypatch):
-        """Even when the HF native path is taken, use_cache stays True for KV-shared models."""
+    def test_hf_native_candidate_with_replay_safe_kv_sharing_uses_full_layer_checkpointing(self, monkeypatch):
+        """A model that declares its shared-K/V store replay-safe keeps whole-block wrapping.
+
+        ``apply_submodule_checkpointing`` leaves ``self_attn`` unwrapped for
+        KV-shared models, so routing Gemma4 E2B/E4B there drops attention
+        activations from checkpointing and inflates peak memory. The cache
+        contract is unchanged: ``use_cache`` still stays on.
+        """
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20, replay_safe_kv_sharing=True)
+        self._run_parallelize(model)
+
+        assert model.config.use_cache is True
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert all(isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        # Whole-block wrapping, not the sub-module fallback that skips self_attn.
+        inner_layers = [layer._checkpoint_wrapped_module for layer in model.model.layers]
+        assert all(not isinstance(inner.mlp, self._Wrapped) for inner in inner_layers)
+        assert all(not isinstance(inner.self_attn, self._Wrapped) for inner in inner_layers)
+
+    def test_model_sidecar_can_opt_into_full_layer_checkpointing(self):
+        """A protected sidecar hook owns model-specific whole-layer checkpointing."""
+        from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+
+        class FullLayerParallelizer(ModelParallelizer):
+            def _use_full_layer_activation_checkpointing(self, model):
+                return True
+
+        model = _make_model_for_ac(num_kv_shared_layers=20)
+        self._run_parallelize(model, model_parallelizer=FullLayerParallelizer())
+
+        assert all(isinstance(layer, self._Wrapped) for layer in model.model.layers)
+
+    def test_hf_native_candidate_with_plain_kv_sharing_uses_submodule_checkpointing(self, monkeypatch):
+        """A KV-shared model that does not opt in stays off whole-block checkpointing.
+
+        Native HF KV-shared models (e.g. ``Gemma3nForCausalLM``) keep an
+        accumulating ``DynamicCache`` while ``use_cache=True``. Replaying a whole
+        block calls ``Cache.update()`` a second time and backward dies with a
+        ``CheckpointError`` about changed K/V metadata, so they must stay on the
+        sub-module path that leaves ``self_attn`` unwrapped.
+        """
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=20)
         self._run_parallelize(model)
 
         assert model.config.use_cache is True
-        model.gradient_checkpointing_enable.assert_called_once_with(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert all(not isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        assert all(isinstance(layer.mlp, self._Wrapped) for layer in model.model.layers)
+        assert all(not isinstance(layer.self_attn, self._Wrapped) for layer in model.model.layers)
 
-    def test_hf_native_grad_ckpt_disables_use_cache_and_uses_non_reentrant(self, monkeypatch):
-        """HF native checkpointing disables cache and avoids reentrant FSDP2 forward hooks."""
+    def test_hf_native_candidate_uses_non_reentrant_full_layer_checkpointing(self, monkeypatch):
+        """HF-native candidates use full-layer checkpoint wrappers instead of the HF API."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+
         model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
         self._run_parallelize(model)
 
         assert model.config.use_cache is False
-        model.gradient_checkpointing_enable.assert_called_once_with(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert all(isinstance(layer, self._Wrapped) for layer in model.model.layers)
+        assert all(layer.kwargs["checkpoint_impl"] is CheckpointImpl.NO_REENTRANT for layer in model.model.layers)
+        assert all(layer.kwargs["preserve_rng_state"] is True for layer in model.model.layers)
 
     def test_hf_native_grad_ckpt_skips_frozen_layers(self, monkeypatch):
         """Frozen layers force scoped submodule wrapping instead of whole-model HF native GC."""
@@ -2625,15 +2684,23 @@ class TestSelectiveCheckpointCompile:
 
 
 class TestSingleGpuActivationCheckpointing:
-    """FSDP2Manager single-GPU (world_size==1) activation-checkpointing behavior."""
+    """ModelParallelizer single-GPU activation-checkpointing behavior."""
 
-    def _make_manager(self, monkeypatch, activation_checkpointing):
+    def _make_parallelizer_and_context(self, monkeypatch, activation_checkpointing):
         import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
-        from nemo_automodel.components.distributed.config import FSDP2Config
+        from nemo_automodel.components.distributed import FSDP2Config, ModelParallelizer
 
         monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
         config = FSDP2Config(activation_checkpointing=activation_checkpointing)
-        return fsdp2_mod.FSDP2Manager(config, device_mesh=MagicMock())
+        context = SimpleNamespace(
+            device_mesh=MagicMock(device_type="cpu"),
+            cp_size=1,
+            ep_size=1,
+            strategy_config=config,
+            activation_checkpointing=activation_checkpointing,
+            reapply_trainability=None,
+        )
+        return ModelParallelizer(), context
 
     def test_selective_wraps_layers_on_single_gpu(self, monkeypatch):
         """Selective AC is honored on a single GPU (not silently full-checkpointed)."""
@@ -2641,9 +2708,9 @@ class TestSingleGpuActivationCheckpointing:
 
         from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
 
-        manager = self._make_manager(monkeypatch, "selective")
+        model_parallelizer, context = self._make_parallelizer_and_context(monkeypatch, "selective")
         model = _make_model_for_ac(num_kv_shared_layers=0)
-        manager.parallelize(model)
+        model_parallelizer.parallelize(model, context)
 
         for layer in model.model.layers:
             assert isinstance(layer, CheckpointWrapper)
@@ -2654,9 +2721,9 @@ class TestSingleGpuActivationCheckpointing:
         """KV-shared models fall back to sub-module checkpointing, not whole-block."""
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-        manager = self._make_manager(monkeypatch, "selective")
+        model_parallelizer, context = self._make_parallelizer_and_context(monkeypatch, "selective")
         model = _make_model_for_ac(num_kv_shared_layers=20)
-        manager.parallelize(model)
+        model_parallelizer.parallelize(model, context)
 
         for layer in model.model.layers:
             assert not isinstance(layer, CheckpointWrapper)
@@ -2667,16 +2734,57 @@ class TestSingleGpuActivationCheckpointing:
         """Non-selective AC wraps layers on single GPU when the model is not an HF native GC candidate."""
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-        manager = self._make_manager(monkeypatch, True)
+        model_parallelizer, context = self._make_parallelizer_and_context(monkeypatch, True)
         model = _make_model_for_ac(num_kv_shared_layers=0)
         model.gradient_checkpointing_enable = MagicMock()
-        manager.parallelize(model)
+        model_parallelizer.parallelize(model, context)
 
         model.gradient_checkpointing_enable.assert_not_called()
         for layer in model.model.layers:
             assert not isinstance(layer, CheckpointWrapper)
             assert isinstance(layer.mlp, CheckpointWrapper)
             assert isinstance(layer.self_attn, CheckpointWrapper)
+
+    def test_model_sidecar_can_opt_into_full_layer_checkpointing_on_single_gpu(self, monkeypatch):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        from nemo_automodel.components.distributed import ModelParallelizer
+
+        class FullLayerParallelizer(ModelParallelizer):
+            def _use_full_layer_activation_checkpointing(self, model):
+                return True
+
+        _, context = self._make_parallelizer_and_context(monkeypatch, True)
+        model = _make_model_for_ac(num_kv_shared_layers=20)
+        FullLayerParallelizer().parallelize(model, context)
+
+        assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.layers)
+
+
+class TestFsdp2ShardingEnabled:
+    """`fsdp2_sharding_enabled` reports whether fully_shard — and its mixed-precision casts — apply."""
+
+    def test_disabled_on_single_rank_world(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
+
+        # The mesh is never inspected once the world is single-rank.
+        assert fsdp2_mod.fsdp2_sharding_enabled(MagicMock()) is False
+
+    def test_disabled_on_single_element_mesh(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 4)
+
+        assert fsdp2_mod.fsdp2_sharding_enabled(SimpleNamespace(size=lambda: 1)) is False
+
+    def test_enabled_on_multi_rank_mesh(self, monkeypatch):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 4)
+
+        assert fsdp2_mod.fsdp2_sharding_enabled(SimpleNamespace(size=lambda: 4)) is True
 
 
 class TestSelectiveCheckpointSaveOps:
@@ -3035,12 +3143,8 @@ class TestExtractModelLayers:
             assert [id(m) for m in groups["language"]] == [id(item) for item in lang], cls.__name__
             assert [id(m) for m in groups["vision"]] == [id(item) for item in vis], cls.__name__
 
-    def test_spec_resolving_no_modules_warns_and_returns_empty(self, caplog):
-        """A mapped model class whose spec FQNs all fail to resolve must warn.
-
-        This is the transformers-version-drift failure mode: extraction used to
-        return ``{}`` silently and activation checkpointing became a no-op.
-        """
+    def test_version_drift_uses_structural_layer_discovery(self):
+        """An unrecognized version-specific tree still exposes its language layers."""
         from transformers.models.qwen2_vl.modeling_qwen2_vl import (
             Qwen2VLForConditionalGeneration,
         )
@@ -3053,13 +3157,9 @@ class TestExtractModelLayers:
         language_model.layers = self._make_layers(2)
         model.language_model = language_model
 
-        with caplog.at_level("WARNING", logger=parallelizer.logger.name):
-            groups = _extract_model_layer_groups(model)
+        groups = _extract_model_layer_groups(model)
 
-        assert groups == {}
-        assert "Qwen2VLForConditionalGeneration" in caplog.text
-        assert "model.language_model.layers" in caplog.text
-        assert "model.visual.blocks" in caplog.text
+        assert groups == {"language": list(language_model.layers)}
 
     def test_moduledict_layer_container_flattens(self):
         """PP post-split: ``_reduce_attrs`` returns a ModuleDict.
@@ -3399,43 +3499,3 @@ class TestExtractModelLayers:
         assert len(result) == 5
         assert [id(r) for r in result[:2]] == [id(layer) for layer in language_layers]
         assert [id(r) for r in result[2:]] == [id(layer) for layer in vision_layers]
-
-
-class TestBagelFullLayerActivationCheckpointing:
-    """Tests for native BAGEL-style whole-layer activation checkpointing."""
-
-    def test_get_module_by_fqn_resolves_nested_module_and_missing_path(self):
-        """Nested FQN lookup returns the module or None for missing paths."""
-        model = _make_bagel_model()
-
-        result = parallelizer._get_module_by_fqn(model, "model.vit_model.vision_model.encoder.layers")
-
-        assert result is model.model.vit_model.vision_model.encoder.layers
-        assert parallelizer._get_module_by_fqn(model, "model.missing.layers") is None
-
-    def test_apply_bagel_full_layer_activation_checkpointing_wraps_each_layer(self, monkeypatch):
-        """BAGEL wraps Qwen and SigLIP layers once and skips already wrapped layers."""
-        model = _make_bagel_model(num_language_layers=2, num_vision_layers=3)
-        wrap_calls = []
-
-        def _fake_checkpoint_wrapper(module, **kwargs):
-            wrap_calls.append((module, kwargs))
-            return _CheckpointWrapped(module, **kwargs)
-
-        monkeypatch.setattr(parallelizer, "checkpoint_wrapper", _fake_checkpoint_wrapper)
-
-        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is True
-
-        language_layers = model.model.language_model.model.layers
-        vision_layers = model.model.vit_model.vision_model.encoder.layers
-        wrapped_layers = list(language_layers) + list(vision_layers)
-        assert len(wrap_calls) == 5
-        assert all(isinstance(layer, _CheckpointWrapped) for layer in wrapped_layers)
-        assert all(call_kwargs["checkpoint_impl"].name == "NO_REENTRANT" for _, call_kwargs in wrap_calls)
-
-        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is False
-        assert len(wrap_calls) == 5
-
-    def test_apply_bagel_full_layer_activation_checkpointing_ignores_other_models(self):
-        """Non-BAGEL models continue through the generic checkpointing path."""
-        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(nn.Module()) is False

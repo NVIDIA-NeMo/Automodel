@@ -172,6 +172,33 @@ class TestQwen3_5VLMMTPModel:
 
         assert model.state_dict_adapter.route_linear_attn_fp32_params
 
+    def test_vlm_prepares_mtp_inputs_for_context_parallelism(self):
+        cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)
+        model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend())
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        labels = torch.tensor([[2, 3, 4, 5]], dtype=torch.long)
+        position_ids = torch.arange(4).view(1, 1, 4).expand(3, 1, 4).clone()
+
+        prepared = model.prepare_mtp_inputs_for_cp(
+            {
+                "input_ids": input_ids,
+                "labels": labels,
+                "position_ids": position_ids,
+            }
+        )
+
+        assert model.ModelCapabilities().supports_mtp_cp
+        torch.testing.assert_close(prepared.input_ids[0], torch.tensor([[2, 3, 4, 0]]))
+        torch.testing.assert_close(prepared.targets[0], torch.tensor([[3, 4, 5, -100]]))
+        torch.testing.assert_close(
+            prepared.position_ids[0],
+            torch.tensor([[[1, 2, 3, 0]], [[1, 2, 3, 0]], [[1, 2, 3, 0]]]),
+        )
+        torch.testing.assert_close(
+            prepared.valid_masks[0],
+            torch.tensor([[True, True, True, False]]),
+        )
+
     def test_vlm_forward_emits_mtp_hidden_states_in_training(self):
         cfg = _tiny_vlm_config(mtp_num_hidden_layers=1)
         model = Qwen3_5ForConditionalGeneration(cfg, backend=_backend(), mtp_loss_scaling_factor=0.2)

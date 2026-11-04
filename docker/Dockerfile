@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
-ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.06-py3
+ARG CUDA_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.10-cuda13.4-devel-ubuntu24.04
+ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
 ARG BASE_IMAGE=cuda
 
 FROM ${CUDA_IMAGE} AS cuda
@@ -43,16 +43,73 @@ RUN apt-get update && apt-get install -y --only-upgrade gnupg && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv; drop the base image's own /usr/local/bin copy (vulnerable rustls-webpki)
-ENV UV_VERSION="0.11.24"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
-    rm -f /usr/local/bin/uv /usr/local/bin/uvx
-ENV PATH="/root/.local/bin:$PATH"
+# Replace bundled Nsight Systems binaries built with a vulnerable Go toolchain.
+# Match the pinned devtools release used by NVIDIA-NeMo/RL#4343.
+# Remove entire EFA metrics plugins bundled with a vulnerable Go toolchain after installation.
+RUN rm -rf /usr/local/cuda*/NsightSystems-cli-* /opt/nvidia/nsight-systems* && \
+    (apt-get remove --purge -y --allow-change-held-packages 'nsight-systems*' || true) && \
+    NSYS_VERSION="2026.5.1.161-265138896106v0" && \
+    NSYS_RELEASE=$(echo "${NSYS_VERSION}" | cut -d. -f1-3) && \
+    NSYS_REPO="https://developer.download.nvidia.com/devtools/repos/ubuntu$(. /etc/lsb-release; echo "${DISTRIB_RELEASE}" | tr -d .)/$(dpkg --print-architecture)" && \
+    curl -fsSL "${NSYS_REPO}/nvidia.pub" -o /usr/share/keyrings/nvidia-devtools.asc && \
+    echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.asc] ${NSYS_REPO}/ /" \
+        > /etc/apt/sources.list.d/nvidia-devtools.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends "nsight-systems-cli-${NSYS_RELEASE}=${NSYS_VERSION}" && \
+    rm -rf "/opt/nvidia/nsight-systems-cli/${NSYS_RELEASE}/target-linux-x64/plugins/efa_metrics" \
+        "/opt/nvidia/nsight-systems-cli/${NSYS_RELEASE}/target-linux-sbsa-armv8/plugins/efa_metrics" && \
+    rm -f /etc/apt/sources.list.d/nvidia-devtools.list /usr/share/keyrings/nvidia-devtools.asc && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pin uv and uvx with patched quinn-proto (GHSA-4w2j-m93h-cj5j) on the system path.
+# Remove the base image's root-local copies so stale vulnerable binaries are not shipped.
+ENV UV_VERSION="0.11.26"
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) \
+            uv_arch="x86_64"; \
+            uv_sha256="6426a73c3837e6e2483ee344cbc00f36394d179afcba6183cb77437e67db4af0"; \
+            ;; \
+        arm64) \
+            uv_arch="aarch64"; \
+            uv_sha256="befa1a59c91e96eb601b0fd9a97c03dd666f17baba644b2b4db9c59a767e387e"; \
+            ;; \
+        *) \
+            echo "Unsupported TARGETARCH for uv: ${TARGETARCH}" >&2; \
+            exit 1; \
+            ;; \
+    esac && \
+    uv_archive="uv-${uv_arch}-unknown-linux-gnu.tar.gz" && \
+    curl -fLSs -o "/tmp/${uv_archive}" \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${uv_archive}" && \
+    echo "${uv_sha256}  /tmp/${uv_archive}" | sha256sum -c - && \
+    tar -xzf "/tmp/${uv_archive}" -C /tmp && \
+    install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uv" /usr/local/bin/uv && \
+    install -m 0755 "/tmp/uv-${uv_arch}-unknown-linux-gnu/uvx" /usr/local/bin/uvx && \
+    rm -rf "/tmp/${uv_archive}" "/tmp/uv-${uv_arch}-unknown-linux-gnu" && \
+    rm -f /root/.local/bin/uv /root/.local/bin/uvx
+ENV PATH="/usr/local/bin:$PATH"
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_CACHE_DIR=/opt/uv_cache
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
-RUN uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+RUN if ! getent group "${RUNTIME_GID}" >/dev/null; then \
+        groupadd --gid "${RUNTIME_GID}" nemo-runtime; \
+    fi && \
+    if ! getent passwd "${RUNTIME_UID}" >/dev/null; then \
+        useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
+            --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime; \
+    fi && \
+    install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" \
+        /home/nemo-runtime \
+        /opt/Automodel \
+        /opt/uv_cache \
+        /opt/uv_cache/xdg && \
+    uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages && \
+    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
 
 # Torchrun uses uv venv
 RUN if [ -f /usr/local/bin/torchrun ]; then \
@@ -63,22 +120,45 @@ FROM update_base_container AS automodel_dep
 
 # Install TE
 ARG INSTALL_TE=True
-ARG TE_COMMIT=release_v2.14
-RUN if [ "$INSTALL_TE" = "True" ]; then \
+ARG TE_COMMIT=v2.20.2
+# TE 2.19+ expands the 100 family target to 107a when CUDA 13.4+ is used.
+ARG TE_CUDA_ARCHS="80;90;100;120"
+ARG TE_BUILD_MAX_JOBS=8
+ARG TE_BUILD_THREADS_PER_JOB=8
+# INSTALL_TE=False may reuse TE from the base image only when its PyTorch
+# binding is already compatible. Otherwise rebuild it against the exact
+# PyTorch/CUDA stack in this image to avoid carrying a stale native extension.
+RUN if [ "$INSTALL_TE" = "True" ] || \
+        ! python -c "from importlib.metadata import version; from packaging.version import Version; assert Version(version('transformer-engine')) >= Version('2.20.2'); import transformer_engine.pytorch"; then \
+    pip uninstall -y transformer-engine transformer-engine-cu12 transformer-engine-cu13 transformer-engine-torch && \
     git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
-    git fetch origin $TE_COMMIT && \
+    git fetch origin "$TE_COMMIT" && \
     git checkout FETCH_HEAD && \
-    git submodule init && git submodule update && \
+    git submodule update --init --recursive && \
     pip install nvidia-mathdx==25.1.1 && \
-    env NVTE_CUDA_ARCHS="80;90;100;120" NVTE_BUILD_THREADS_PER_JOB=8 pip install --no-cache-dir --no-build-isolation -v . && \
+    env \
+        NVTE_FRAMEWORK=pytorch \
+        NVTE_RELEASE_BUILD=0 \
+        NVTE_BUILD_METAPACKAGE=0 \
+        NVTE_CUDA_ARCHS="$TE_CUDA_ARCHS" \
+        NVTE_WITH_NCCL_EP=0 \
+        NVTE_BUILD_MAX_JOBS="$TE_BUILD_MAX_JOBS" \
+        NVTE_BUILD_THREADS_PER_JOB="$TE_BUILD_THREADS_PER_JOB" \
+        NVTE_NO_LOCAL_VERSION=1 \
+        pip install --no-cache-dir --no-build-isolation -v . && \
     cd ../ && rm -rf TransformerEngine; \
     fi
 
-# Install HybridEP / DeepEP: apt rdma-core v60 (build==runtime libibverbs), nvshmem wheel 3.6.5.
-# DEEPEP_COMMIT = 17cfb817 + DeepEP #638, padding max_num_of_tokens_per_rank to the combine-kernel chunk size.
+# Install HybridEP / DeepEP: nvshmem wheel 3.6.5.
+# The pinned hybrid-ep revision includes DeepEP #699, which inherits PyTorch's C++ standard
+# instead of forcing C++17 (PyTorch's Rubin builds require C++20).
+# deepep.patch also backports https://github.com/deepseek-ai/DeepEP/pull/564 for NVSHMEM 3.6.5 compatibility.
+# Remove the configs.cuh/ibgda_device.cuh hunks when the pinned revision includes that fix.
+# The pinned revision includes https://github.com/deepseek-ai/DeepEP/pull/750,
+# which falls back to DMA-BUF when legacy ibv_reg_mr registration fails.
 COPY docker/common/deepep.patch /opt/deepep.patch
-ARG DEEPEP_COMMIT=42144303752422ade37f24bca9e2dde12df70e09
+ARG DEEPEP_COMMIT=96e3d1fc77be942438673e88b07be21d454af8a9
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
@@ -100,7 +180,9 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
     NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
     ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
     apt-get update && apt-get install -y --no-install-recommends libnvidia-ml-dev && \
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install --no-cache-dir --no-build-isolation -v . && \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
+        TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" \
+        pip install --no-cache-dir --no-build-isolation -v . && \
     apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/* /opt/deepep.patch && \
     cd / && rm -rf DeepEP
@@ -108,16 +190,23 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages \
 # Install Bitsandbytes
 ARG INSTALL_BITSANDBYTES=True
 ARG BITSANDBYTES_COMMIT=0.49.2
+# Unset by default so cmake/make run exactly as before (serial make, no nvcc --threads);
+# upstream CI passes values to run make -j and compile the 8 CUDA targets in parallel.
+ARG BNB_BUILD_MAX_JOBS
+ARG BNB_BUILD_THREADS_PER_JOB
+# Include native Blackwell targets, especially SM121 for DGX Spark, instead of relying on forward-compatible PTX.
 RUN if [ $INSTALL_BITSANDBYTES = "True" ]; then \
     git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
     cd bitsandbytes && \
     git pull && \
     git fetch origin $BITSANDBYTES_COMMIT && \
     git checkout FETCH_HEAD && \
-    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110" -S . && \
-    make && \
+    cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="80;86;90;100;110;120;121" \
+        ${BNB_BUILD_THREADS_PER_JOB:+"-DCMAKE_CUDA_FLAGS=--threads ${BNB_BUILD_THREADS_PER_JOB}"} \
+        -S . && \
+    make ${BNB_BUILD_MAX_JOBS:+"-j${BNB_BUILD_MAX_JOBS}"} && \
     cmake -DCOMPUTE_BACKEND=cpu -S . && \
-    make && \
+    make ${BNB_BUILD_MAX_JOBS:+"-j${BNB_BUILD_MAX_JOBS}"} && \
     pip install . && \
     cd ../ && rm -rf bitsandbytes; \
     fi
@@ -131,7 +220,7 @@ RUN if [ "$INSTALL_UCCL_EP" = "True" ]; then \
     fi
 
 # ---- Wheel builder: compile the heavy AOT source packages off the uv-sync path (cached across uv.lock bumps).
-# torchao then FA3/FA4 as sequential steps so each compiles alone at full MAX_JOBS — no cross-compile OOM. FA3 is the long pole.
+# Build torchao, FlashMLA, then FA3/FA4 sequentially and cap compiler parallelism to stay within CI memory limits.
 FROM automodel_dep AS wheel_builder
 
 # torchao MXFP8: build w/ submodules (PyPI wheels omit mxfp8 CUDA kernels on aarch64); pin v0.17.0 (v0.14.1 ~2.5x slower; main needs nvidia-cutlass-dsl).
@@ -143,11 +232,29 @@ RUN mkdir -p /wheels && \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/torchao && \
     rm -rf /tmp/torchao
 
+# FlashMLA sparse prefill forward used by the GLM-5.2/5.3 cuDNN DSA backend.
+# This is the source revision used for the cuDNN numerical and full-model validation.
+ARG FLASH_MLA_REF=b7643bd54521f563b839b98289b5cd048c062ba2
+RUN git clone --filter=blob:none --no-checkout \
+        https://github.com/deepseek-ai/FlashMLA.git /tmp/FlashMLA && \
+    git -C /tmp/FlashMLA checkout "${FLASH_MLA_REF}" && \
+    git -C /tmp/FlashMLA submodule update --init --recursive && \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl MAX_JOBS=8 NVCC_THREADS=2 \
+        pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels /tmp/FlashMLA && \
+    rm -rf /tmp/FlashMLA
+
 # FA3 (Hopper-only, SM90a-locked, ~25 min nvcc) + FA4 cute (Blackwell, lightweight). arm64 -> skip FA3: GB200 target, QEMU cross-build impractical.
-ARG FLASH_ATTN_REF=002cce0a1
+# Pin >= #2762/#2507: older refs rebuilt the CuTe compile key every call when max_seqlen
+# is a tensor (varlen/packed), so HF models recompiled each step. Also picks up #2745
+# (fwd dynamic-shape correctness) and #2819 (faster SM100 mask compile).
+# Includes #2888: native head_dim=192 SM90 GQA backward postprocessing.
+ARG FLASH_ATTN_REF=3c2c6b31e730fd13e7d6f0d384af22684b24c532
 ARG INSTALL_FA3=true
-ARG INSTALL_FA4=false
+ARG INSTALL_FA4=true
 ARG TARGETARCH
+# MAX_JOBS (ninja jobs) for the FA3 build; the default keeps today's behavior, upstream CI passes
+# a higher value. NVCC_THREADS cannot help: each FA3 file compiles for one gencode target (sm_90a).
+ARG FA3_MAX_JOBS=16
 RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
         git clone --filter=blob:none https://github.com/Dao-AILab/flash-attention.git /tmp/fa && \
@@ -156,7 +263,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     fi && \
     if [ "$INSTALL_FA3" = "true" ]; then \
         cd /tmp/fa/hopper && \
-        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=$(nproc) NVCC_THREADS=2 \
+        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=${FA3_MAX_JOBS} NVCC_THREADS=2 \
         pip wheel --no-cache-dir --no-build-isolation --no-deps -w /wheels . ; \
     fi && \
     if [ "$INSTALL_FA4" = "true" ]; then \
@@ -164,17 +271,18 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
     fi && \
     rm -rf /tmp/fa
 
-FROM automodel_dep as automodel_final
+FROM automodel_dep AS automodel_dependencies
 
 WORKDIR /opt/Automodel
 
-# torchao MXFP8 + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
-# before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`), so uv sync won't prune or shadow them.
+# torchao MXFP8 + FlashMLA + FA3/FA4: prebuilt wheels from the wheel_builder stage, installed into system site-packages
+# before uv sync — pip targets system deps, uv the venv (torchao/FA gated `never`, FlashMLA absent from the lock),
+# so uv sync won't prune or shadow them.
 COPY --from=wheel_builder /wheels /tmp/wheels/
-ARG INSTALL_FA4=false
+ARG INSTALL_FA4=true
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
     if [ "$INSTALL_FA4" = "true" ]; then \
-        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" && \
+        pip install --no-cache-dir "nvidia-cutlass-dsl[cu13]==4.6.2" && \
         FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
         VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
         { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; }; \
@@ -184,53 +292,125 @@ RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && \
 # Address base image CVE
 RUN pip install "aiohttp>=3.14.3" \
         "black>=26.3.1" \
-        "GitPython>=3.1.50" \
+        "GitPython>=3.1.59" \
         "jaraco-context>=6.1.0" \
-        "jupyter-server>=2.20.0" \
-        "jupyterlab>=4.5.7" \
-        "mistune>=3.2.1" \
+        "jupyter-server>=2.21.1" \
+        "jupyterlab>=4.5.10" \
+        "mistune>=3.3.0" \
         "nbconvert>=7.17.0" \
         "notebook>=7.5.6" \
-        "onnx>=1.21.0" \
-        "pillow>=12.3.0" \
+        "onnx>=1.22.0" \
+        "pillow>=13.0.0" \
         "protobuf>=6.33.5" \
-        "setuptools>=80.10.2" \
+        "setuptools>=83.0.0" \
         "tornado>=6.5.5" \
         "urllib3>=2.7.0" && \
     pip uninstall -y nvidia-dali-cuda130 wandb && \
     rm -rf /opt/pytorch/pytorch/third_party/onnx
 
-COPY pyproject.toml uv.lock /opt/Automodel/
-COPY nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
-COPY docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common/
-COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} pyproject.toml uv.lock /opt/Automodel/
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} nemo_automodel/__init__.py nemo_automodel/package_info.py /opt/Automodel/nemo_automodel/
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/uv-pytorch.toml docker/common/uv-pytorch.lock /opt/Automodel/docker/common/
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 
 # Install Automodel
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
+# Include both Blackwell targets supported by the pinned MoK source.
+ARG MOK_ARCH=ALL
+# `msa` is SM100-only so it stays out of `all`, but the image needs it: the MiniMax M3 MSA
+# recipe under examples/vlm_finetune/ is auto-discovered into release CI.
 ARG UV_SYNC_ARGS="--locked"
+# MAX_JOBS for source builds inside uv sync (MagiAttention dominates); the default keeps today's
+# behavior, upstream CI passes a higher value.
+ARG UV_SYNC_MAX_JOBS=8
 # Preserve locally built wheels for source-only CUDA packages such as flash-attn,
-# causal-conv1d, mamba-ssm, and nv-grouped-gemm across BuildKit builds.
+# causal-conv1d and mamba-ssm across BuildKit builds. Separate GPU targets so
+# switching MOK_ARCH cannot reuse a wheel compiled for the other architecture.
+# Ray's runtime-env agent prepends thirdparty_files to sys.path, bypassing our
+# aiohttp CVE constraint. Remove the entire vendored HTTP dependency bundle so
+# the agent uses the coherent, patched dependency set installed by uv sync.
+# ray/jars/ray_dist.jar vendors a flagged jackson (GHSA-r7wm-3cxj-wff9) that upstream
+# has not bumped; Automodel uses Ray from Python only, so drop the Java worker jars.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
     MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY="90,100" \
         MAGI_ATTENTION_PREBUILD_FFA=0 \
-        MAX_JOBS=8 \
+        MAX_JOBS=${UV_SYNC_MAX_JOBS} \
         UV_CONCURRENT_INSTALLS=8 \
-        uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS && \
-    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))"
+        UV_CACHE_DIR=${UV_CACHE_DIR}/${MOK_ARCH} \
+        MOK_ARCH=${MOK_ARCH} \
+        uv sync --extra $AUTOMODEL_INSTALL --extra msa --extra mok --extra ffpa --all-groups $UV_SYNC_ARGS && \
+    python -c "import importlib.metadata as m; import magi_attention; print('magi-attention', m.version('magi-attention'))" && \
+    rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/jars && \
+    rm -rf ${UV_PROJECT_ENVIRONMENT}/lib/python*/site-packages/ray/_private/runtime_env/agent/thirdparty_files && \
+    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" ${UV_PROJECT_ENVIRONMENT}
+
+# CI can supply this stage as a digest-pinned named build context, skipping all
+# dependency compilation. Ordinary Docker builds still build the stage above.
+FROM automodel_dependencies AS automodel_final
+ARG BASE_IMAGE=cuda
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
 
 # Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
 ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
 
-COPY . /opt/Automodel
+# On Google Cloud A3 Ultra, A4, A4X and A4X Max machines, the NGC PyTorch base image's shell
+# init (/etc/shinit_v2) enables Google's NCCL profiler plugin (CoMMA), which by default uploads
+# NCCL telemetry to Google. Turn the telemetry off and do not load the plugin. The shell init
+# runs in every bash process and would set NCCL_PROFILER_PLUGIN=gcp again, so make it keep a
+# value that is already set. Run with NCCL_PROFILER_PLUGIN=gcp NCCL_TELEMETRY_MODE=3 to opt in.
+ENV NCCL_TELEMETRY_MODE=0 \
+    NCCL_PROFILER_PLUGIN=none
+RUN if [ -f /opt/gcp/nccl-plugins/lib64/libnccl-profiler-gcp.so ]; then \
+        sed -i 's/^\( *\)export NCCL_PROFILER_PLUGIN=gcp$/\1export NCCL_PROFILER_PLUGIN=${NCCL_PROFILER_PLUGIN:-gcp}/' /etc/shinit_v2 && \
+        grep -qF 'export NCCL_PROFILER_PLUGIN=${NCCL_PROFILER_PLUGIN:-gcp}' /etc/shinit_v2 || \
+        { echo "Update the NCCL_PROFILER_PLUGIN patch for this base image's /etc/shinit_v2" >&2; exit 1; }; \
+    fi
+
+COPY --chown=${RUNTIME_UID}:${RUNTIME_GID} . /opt/Automodel
+
+# The checkout is owned by RUNTIME_UID but the image still runs as root by default,
+# so Git would reject /opt/Automodel for dubious ownership. Trust it system-wide to
+# keep both identities able to read the repository history.
+RUN git config --system --add safe.directory /opt/Automodel
 
 # Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)
 RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi
+
+# Backport PyTorch #198292: the optional NVGEMM probe must tolerate CUTLASS
+# operators that cannot import against the FA4/FFPA-compatible CuTe DSL version.
+# This preserves torch.compile's other GEMM backends and all compiled tests.
+RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+        torch_dir=$(python -c "from pathlib import Path; import torch; print(Path(torch.__file__).parent)") && \
+        patch_file=/opt/Automodel/docker/common/pytorch-nvgemm-availability.patch && \
+        if git -C "$torch_dir" apply --check "$patch_file" 2>/dev/null; then \
+            git -C "$torch_dir" apply "$patch_file"; \
+        else \
+            git -C "$torch_dir" apply --reverse --check "$patch_file"; \
+        fi && \
+        python -c "from torch._inductor.utils import ensure_nv_universal_gemm_available; ensure_nv_universal_gemm_available()"; \
+    fi
+
+# Fail the image build before publication if PyTorch headers cannot compile as
+# C++20, torch._grouped_mm is unavailable, or a bundled native extension has
+# unresolved PyTorch/CUDA symbols. MoK links libcuda directly; use the toolkit's
+# stub only for this import check on builders without an NVIDIA driver.
+# Load installed pytest entry points too: system-site-packages can expose a
+# base-image plugin whose module is shadowed by an older venv dependency.
+RUN mkdir -p /tmp/cuda-driver-stubs && \
+    ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-driver-stubs/libcuda.so.1 && \
+    LD_LIBRARY_PATH=/tmp/cuda-driver-stubs:${LD_LIBRARY_PATH} \
+        MAX_JOBS=2 python docker/common/verify_native_runtime.py --base-image "$BASE_IMAGE" && \
+    rm -rf /tmp/cuda-driver-stubs && \
+    python -c "from _pytest.config import get_config; get_config().pluginmanager.load_setuptools_entrypoints('pytest11')"
 
 WORKDIR /opt/Automodel
 
@@ -238,7 +418,7 @@ COPY <<EOF /opt/venv/env.sh
 export UV_PROJECT_ENVIRONMENT=/opt/venv
 export PATH="/opt/venv/bin:$PATH"
 export UV_LINK_MODE=copy
-export PATH="/root/.local/bin:$PATH"
+export PATH="/usr/local/bin:$PATH"
 EOF
 
 RUN chmod +x /opt/venv/env.sh
@@ -254,3 +434,28 @@ ARG TARGETARCH
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-automodel/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
+
+# Runtime callers select this UID and set HOME/cache variables explicitly; the
+# published image remains root by default. Prove that the non-root contract
+# works before restoring that default.
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+RUN export HOME=/home/nemo-runtime \
+        XDG_CACHE_HOME=/opt/uv_cache/xdg && \
+    test "$(id -u)" = "${RUNTIME_UID}" && \
+    test -w "${HOME}" && \
+    test -w "${XDG_CACHE_HOME}" && \
+    test -w "${UV_CACHE_DIR}" && \
+    test -x /usr/local/bin/uv && \
+    test -x /usr/local/bin/uvx && \
+    test -x /opt/venv/bin/python && \
+    venv_site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
+    touch /opt/Automodel/.nonroot-write-probe \
+        /opt/venv/.nonroot-write-probe \
+        /opt/uv_cache/.nonroot-write-probe \
+        "${venv_site_packages}/.nonroot-write-probe" && \
+    rm /opt/Automodel/.nonroot-write-probe \
+        /opt/venv/.nonroot-write-probe \
+        /opt/uv_cache/.nonroot-write-probe \
+        "${venv_site_packages}/.nonroot-write-probe"
+
+USER root

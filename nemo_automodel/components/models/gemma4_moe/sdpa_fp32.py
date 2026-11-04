@@ -14,8 +14,6 @@
 
 """fp32 SDPA attention for Gemma4 (fix for #2208: fused bf16 SDPA NaNs on Hopper)."""
 
-from typing import Optional
-
 import torch
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
@@ -25,14 +23,31 @@ def sdpa_fp32_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
+    attention_mask: torch.Tensor | None = None,
     **kwargs,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Run SDPA with fp32 query/key/value and cast the output back to the input dtype."""
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run SDPA in FP32 and cast the output back to the query dtype.
+
+    Args:
+        module: Attention module holding scaling and causal-mask settings.
+        query: Tensor of shape [batch, query_heads, queries, head_dim].
+        key: Tensor of shape [batch, kv_heads, keys, head_dim].
+        value: Tensor with key's layout.
+        attention_mask: Optional mask broadcastable to
+            [batch, query_heads, queries, keys].
+        **kwargs: Arguments forwarded to the Hugging Face SDPA implementation.
+
+    Returns:
+        Attention output [batch, queries, query_heads, head_dim] in query's
+        dtype, and attention weights if supplied by the backend.
+    """
     in_dtype = query.dtype
     if attention_mask is not None and torch.is_tensor(attention_mask) and attention_mask.dtype.is_floating_point:
         attention_mask = attention_mask.float()
-    out, weights = sdpa_attention_forward(module, query.float(), key.float(), value.float(), attention_mask, **kwargs)
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        out, weights = sdpa_attention_forward(
+            module, query.float(), key.float(), value.float(), attention_mask, **kwargs
+        )
     return out.to(in_dtype), (weights.to(in_dtype) if torch.is_tensor(weights) else weights)
 
 

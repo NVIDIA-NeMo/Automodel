@@ -90,4 +90,5 @@ optimizer:
   weight_decay: 0.0
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi

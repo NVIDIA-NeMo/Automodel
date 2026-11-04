@@ -28,6 +28,7 @@ do not load the 30B real model.
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import torch
@@ -148,6 +149,53 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     assert sharder.local_token_global_indices is round_robin_local_indices
     # nothing consumed: input_ids / media stay for the forward
     assert batch["input_ids"] is input_ids and "pixel_values" in batch
+
+
+def test_prepare_model_inputs_for_cp_records_global_media_masks_for_thd():
+    """Packed THD defers sharding and records global image/sound placeholder masks."""
+    model = _make_omni_stub()
+    input_ids = torch.tensor([[1, IMG_TOKEN_ID, SOUND_TOKEN_ID, 4]])
+
+    out = model.prepare_model_inputs_for_cp({"input_ids": input_ids, "qkv_format": "thd"})
+
+    assert set(out) == {"_nemotron_omni_global_image_mask", "_nemotron_omni_global_sound_mask"}
+    assert out["_nemotron_omni_global_image_mask"].tolist() == [False, True, False, False]
+    assert out["_nemotron_omni_global_sound_mask"].tolist() == [False, False, True, False]
+
+
+def test_select_local_media_features_maps_global_placeholders_to_local_rows(monkeypatch):
+    """The local THD token order selects the matching global media-feature rows."""
+
+    def _partition_indices(
+        cu_seqlens: torch.Tensor,
+        total_tokens: int,
+        cp_size: int,
+        cp_rank: int,
+    ) -> torch.Tensor:
+        """Return a fixed Tensor of shape [local_tokens] for one global THD sequence."""
+        assert cu_seqlens.tolist() == [0, 8]
+        assert (total_tokens, cp_size, cp_rank) == (8, 2, 0)
+        return torch.tensor([0, 1, 6, 7])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformer_engine_torch",
+        SimpleNamespace(thd_get_partitioned_indices=_partition_indices),
+    )
+    features = torch.tensor([[10.0], [20.0], [30.0], [40.0]])
+    global_mask = torch.tensor([False, True, True, False, False, True, True, False])
+    local_selected = torch.tensor([False, True, True, False])
+
+    local = NemotronOmniForConditionalGeneration._select_local_media_features(
+        features,
+        global_mask,
+        local_selected,
+        torch.tensor([0, 8], dtype=torch.int32),
+        cp_size=2,
+        cp_rank=0,
+    )
+
+    torch.testing.assert_close(local, torch.tensor([[10.0], [40.0]]))
 
 
 def test_forward_text_only_embeds():

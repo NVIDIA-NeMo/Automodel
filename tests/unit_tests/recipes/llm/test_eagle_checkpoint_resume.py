@@ -40,9 +40,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.nn as nn
+import yaml
 
 from nemo_automodel.components.checkpoint.lifecycle import CheckpointLifecycle
 from nemo_automodel.components.checkpoint.utils import is_checkpoint_incomplete, mark_checkpoint_incomplete
+from nemo_automodel.components.config.loader import ConfigNode, translate_value
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
 
@@ -242,6 +244,50 @@ def test_eagle1_load_checkpoint_skips_incompatible_auto_detected_checkpoint(tmp_
     assert recipe._resume_epoch == 0
     recipe.checkpointer.load_model.assert_not_called()
     recipe.checkpointer.load_optimizer.assert_not_called()
+
+
+@pytest.mark.parametrize("recipe_factory", [_bare_eagle1_recipe, _bare_eagle3_recipe])
+def test_auto_resume_accepts_checkpoint_saved_with_cli_override(tmp_path, recipe_factory):
+    """config.yaml must record CLI overrides, or auto-resume rejects the run's own checkpoint."""
+    cfg = ConfigNode({"peft": {"dim": 8, "alpha": 32}})
+    cfg.set_by_dotted("peft", None)  # what `--peft None` does on the command line
+
+    recipe = recipe_factory(tmp_path)
+    recipe.cfg = cfg
+    recipe.runtime.global_step = 5
+    recipe.save_checkpoint(epoch=1, step=5, train_loss=0.5)
+
+    resumed = recipe_factory(tmp_path)
+    resumed.cfg = cfg
+    resumed.load_checkpoint(None)
+
+    assert resumed.runtime.global_step == 5
+    resumed.checkpointer.load_model.assert_called_once()
+
+
+@pytest.mark.parametrize("recipe_factory", [_bare_eagle1_recipe, _bare_eagle3_recipe])
+def test_auto_resume_rejects_peft_mismatch_with_tuple_cli_value(tmp_path, recipe_factory):
+    """A tuple CLI value must keep config.yaml safe-loadable, so the PEFT mismatch guard still runs."""
+    saved_cfg = ConfigNode({"peft": {"dim": 8, "alpha": 32}, "optimizer": {"betas": [0.9, 0.999]}})
+    saved_cfg.set_by_dotted("optimizer.betas", translate_value("(0.9, 0.95)"))
+
+    recipe = recipe_factory(tmp_path)
+    recipe.cfg = saved_cfg
+    recipe.runtime.global_step = 5
+    recipe.save_checkpoint(epoch=1, step=5, train_loss=0.5)
+
+    ckpt_path = os.path.join(recipe.checkpoint_config.checkpoint_dir, "epoch_1_step_5")
+    with open(os.path.join(ckpt_path, "config.yaml")) as f:
+        assert yaml.safe_load(f)["optimizer"]["betas"] == [0.9, 0.95]
+
+    resumed_cfg = ConfigNode({"peft": None, "optimizer": {"betas": [0.9, 0.999]}})
+    resumed_cfg.set_by_dotted("optimizer.betas", translate_value("(0.9, 0.95)"))
+    resumed = recipe_factory(tmp_path)
+    resumed.cfg = resumed_cfg
+    resumed.load_checkpoint(None)
+
+    assert resumed.runtime.global_step == 0
+    resumed.checkpointer.load_model.assert_not_called()
 
 
 def test_eagle1_save_checkpoint_skipped_when_disabled(tmp_path):

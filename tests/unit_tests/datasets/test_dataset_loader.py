@@ -28,12 +28,14 @@ from nemo_automodel.components.datasets.loader import (
     _DATASET_CONFIGS,
     CollatorConfig,
     DataloaderConfig,
+    NeatPackingConfig,
     ParallelAwareDataloader,
     ThdPackingConfig,
     _resolve_target,
     make_collate_fn,
     make_packing_config,
 )
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
@@ -282,6 +284,53 @@ def test_packing_config_warns_for_ignored_legacy_field():
     assert isinstance(config, ThdPackingConfig)
 
 
+def test_neat_packing_uses_default_contract(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
+        lambda dataset, **_: dataset,
+    )
+    config = NeatPackingConfig(packed_sequence_size=8)
+
+    dataset, collate_fn = config.build([])
+
+    assert dataset == []
+    assert collate_fn.keywords["packing"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
+
+
+def test_packing_config_build_preserves_deprecated_attention_keyword(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
+        lambda dataset, **_: dataset,
+    )
+    config = NeatPackingConfig(packed_sequence_size=8)
+
+    with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
+        _, collate_fn = config.build([], attn_implementation="flash_attention_2")
+
+    assert collate_fn.keywords["packing"].packed_mask_type == "flash_varlen"
+
+
+def test_dataloader_build_preserves_deprecated_attention_keyword(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.neat_packing.neat_pack_dataset",
+        lambda dataset, **_: dataset,
+    )
+    config = DataloaderConfig(
+        dataset_config=StaticDatasetConfig([{"input_ids": [1]}]),
+        packing=NeatPackingConfig(packed_sequence_size=8),
+        shuffle=False,
+    )
+
+    with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
+        loader = config.build(
+            dp_rank=0,
+            dp_world_size=1,
+            attn_implementation="flash_attention_2",
+        )
+
+    assert loader.collate_fn.keywords["packing"].packed_mask_type == "flash_varlen"
+
+
 def test_megatron_loader_preserves_schedule_and_sampler_config():
     config = RecipeConfig(
         ConfigNode(
@@ -379,3 +428,21 @@ def test_rank_ordering_context_wraps_only_dataset_construction():
     config.build(dp_rank=0, dp_world_size=1, dataset_build_context=BuildContext())
 
     assert events == ["enter", "dataset", "exit", "packing"]
+
+
+def test_thd_rejects_unsupported_model_instead_of_silently_disabling_packing():
+    with pytest.raises(ValueError, match="THD packing requires a model that consumes seq_lens"):
+        ThdPackingConfig(packed_sequence_size=8).build([], supports_seq_lens=False)
+
+
+def test_prepacked_thd_is_reported_as_packed_without_online_packing():
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    config = DataloaderConfig(dataset_config=StaticDatasetConfig([]), collate_fn=packed_sequence_thd_collater)
+    assert config.is_packed and config.output_format == "thd"
+
+
+def test_emits_thd_compatibility_alias_warns():
+    config = DataloaderConfig(dataset_config=StaticDatasetConfig([]))
+    with pytest.warns(FutureWarning, match="output_format"):
+        assert config.emits_thd is False

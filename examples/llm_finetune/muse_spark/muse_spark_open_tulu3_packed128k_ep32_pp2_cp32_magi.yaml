@@ -1,0 +1,179 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Validated on 16 HSG GB200 nodes (64 GPUs): full 62 layers, EP32/PP2/CP32/TP1,
+# DP1, interleaved 1F1B with VPP2, LBS8/GBS8/GA1, and 50 optimizer steps.
+# The dataset path must contain the frozen Tulu3 128K THD packs produced with
+# seed 1234: shuffle eligible documents before packing, then shuffle packed rows.
+# Override model and dataset paths explicitly on the CLI when using local copies.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 8
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  gc_every_steps: 5
+  num_epochs: null
+  max_steps: 50
+  log_remote_every_steps: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 15
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: meta-models/Muse-Spark-open-816B-A42B
+  dtype: bfloat16
+  config:
+    residual_dtype: fp32
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: magi
+    linear: torch
+    rms_norm: torch_fp32
+    compile_norm: true
+    experts: torch_mm
+    dispatcher: hybridep
+    compile_router_weight: true
+    rope_fusion: false
+    gate_precision: float32
+    fake_balanced_gate: false
+    fake_gate_noise: 0.0
+    benchmark_static_routing: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 32
+  pp_size: 2
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  multimodal:
+    frozen_sharding: per_layer
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 16
+    # Keep this disabled: the validated full run did not use receive-buffer pooling.
+    pp_recv_buffer_pool: false
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/muse_spark_open_tulu3_packed128k_ep32_pp2_cp32_magi/
+  # Avoid replicating distributed checkpoint load metadata on NCCL rank zero.
+  load_metadata_with_gloo: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  reduction: sum
+  impl: cce
+  logit_softcapping: 20.0
+
+dataset:
+  _target_: datasets.load_from_disk
+  dataset_path: data/tulu3_128k_longdoc_shuffle_v2/train
+
+packed_sequence:
+  packed_sequence_size: 131072
+  packing_strategy: thd
+  prepacked: true
+  pad_to_multiple_of: 64
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 8
+  num_workers: 0
+  pin_memory: true
+  drop_last: true
+  # Packed-row order is already frozen by the second deterministic shuffle.
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 5.0e-06
+  betas: [0.9, 0.95]
+  eps: 1.0e-08
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: float32
+  store_param_remainders: true
+  exp_avg_dtype: bfloat16
+  exp_avg_sq_dtype: bfloat16
+
+lr_scheduler:
+  lr_decay_style: constant
+
+clip_grad_norm:
+  max_norm: 1.0
+  backend: triton
+
+wandb:
+  enable: false
+  project: automodel-muse-spark
+  name: muse_spark_open_tulu3_packed128k_ep32_pp2_cp32_magi_50steps
+  mode: online
+  dir: logs/muse_spark_open_tulu3_packed128k_ep32_pp2_cp32_magi_50steps/wandb
+  tags:
+  - muse-spark-open
+  - tulu3
+  - packed128k
+  - magi
+  - ep32
+  - pp2
+  - cp32
+  - interleaved1f1b
+  - gloo-load-metadata
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 16
+  nproc_per_node: 4
+  cluster_tag: gb200
+  time: "02:00:00"
+  # Two steps cover the steady-state memory point that follows the first update.
+  max_steps: 2
+  # Release CI cannot access the frozen parity packs. Build a bounded public-data
+  # smoke set on the fly; this checks execution, not frozen-pack reproducibility.
+  release:
+    dataset:
+      _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+      path_or_dataset_id: allenai/tulu-3-sft-mixture
+      split: train[:8192]
+      seq_length: 131072
+      truncation: true
+      padding: do_not_pad
+      shuffle_seed: 1234
+    packed_sequence:
+      packed_sequence_size: 131072
+      packing_strategy: thd
+      prepacked: false
+      pad_to_multiple_of: 64
+      max_packs: 16
+    dataloader.shuffle: true
+  env_vars:
+    SBATCH_SEGMENT_SIZE: "16"
+    RDZV_TIMEOUT: "900"
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True

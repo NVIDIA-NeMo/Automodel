@@ -26,7 +26,7 @@ import struct
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch import distributed as dist
@@ -802,7 +802,7 @@ def _consolidate_safetensors_files(
     fqn_to_file_mapping: dict[str, str],
     num_threads: int,
     use_staging: bool = False,
-    staging_dir: Optional[str] = None,
+    staging_dir: str | None = None,
     cast_dtype: torch.dtype | None = None,
     fqn_to_dtype_mapping: dict[str, str] | None = None,
 ) -> dict[str, _OutputFileData]:
@@ -878,7 +878,7 @@ def consolidate_safetensors_files(
     fqn_to_index_mapping: dict[str, int],
     num_threads: int = 1,
     use_staging: bool = False,
-    staging_dir: Optional[str] = None,
+    staging_dir: str | None = None,
     cast_dtype: torch.dtype | None = None,
     fqn_to_dtype_mapping: dict[str, str] | None = None,
 ) -> None:
@@ -943,7 +943,7 @@ def _raise_if_any_rank_failed(
     distributed: bool,
     rank: int,
     world_size: int,
-    process_group: Optional[dist.ProcessGroup],
+    process_group: dist.ProcessGroup | None,
 ) -> None:
     """
     Share per-rank consolidation failures across ranks and raise if any rank failed.
@@ -994,9 +994,9 @@ def consolidate_safetensors_files_on_every_rank(
     output_dir: str,
     fqn_to_index_mapping: dict[str, int],
     num_threads: int = 1,
-    process_group: Optional[dist.ProcessGroup] = None,
+    process_group: dist.ProcessGroup | None = None,
     use_staging: bool = False,
-    staging_dir: Optional[str] = None,
+    staging_dir: str | None = None,
     cast_dtype: torch.dtype | None = None,
     fqn_to_dtype_mapping: dict[str, str] | None = None,
 ) -> None:

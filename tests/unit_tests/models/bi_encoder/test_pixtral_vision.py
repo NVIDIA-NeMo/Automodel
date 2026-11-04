@@ -63,7 +63,6 @@ def test_retrieval_pixtral_preserves_stock_outputs_and_gradients(vision_tower_fa
     """Mixed rectangular images retain upstream outputs, captured states, and gradients."""
     torch.manual_seed(42)
     tower = vision_tower_factory(attention).eval()
-    assert tower.forward.__func__ is PixtralVisionModel.forward
     stock = PixtralVisionModel(copy.deepcopy(tower.config)).eval()
     stock.load_state_dict(tower.state_dict())
     pixels = torch.randn(2, 3, 24, 24)

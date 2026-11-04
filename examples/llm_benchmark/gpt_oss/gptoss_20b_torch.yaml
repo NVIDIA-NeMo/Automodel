@@ -64,7 +64,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: openai/gpt-oss-20b
   trust_remote_code: true
   backend:
@@ -105,6 +105,7 @@ optimizer:
 
 
 ci:
+  cluster_tag: h100
   time: "00:15:00"
   nodes: 1
   env_vars:

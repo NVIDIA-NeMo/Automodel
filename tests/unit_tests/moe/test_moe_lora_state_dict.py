@@ -730,3 +730,179 @@ class TestMoELoRASaveRestoreMergeHF:
             assert "lora_" not in name, f"LoRA param {name} should be absent after merge"
         for name, _ in merged.named_modules():
             assert "lora_" not in name, f"LoRA module {name} should be absent after merge"
+
+
+class TestParamWrapperLayoutVersions:
+    """peft flipped the ParamWrapper layout for 3-D expert params in 0.19.1
+    (huggingface/peft#3165). Export emits the corrected layout by default with
+    an explicit legacy option; import resolves the layout from the checkpoint's
+    metadata stamp first, then from tensor shapes, and fails clearly when
+    neither settles it.
+    """
+
+    def _native(self):
+        base = "model.layers.0.mlp.experts"
+        return {
+            f"{base}.lora_gate_and_up_A": torch.randn(N_EXPERTS, DIM, LORA_DIM),
+            f"{base}.lora_gate_and_up_B": torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM),
+            f"{base}.lora_down_A": torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM),
+            f"{base}.lora_down_B": torch.randn(N_EXPERTS, LORA_DIM, DIM),
+        }
+
+    def _export(self, adapter, native, legacy=False):
+        out = {}
+        for fqn, tensor in native.items():
+            for key, value in adapter._convert_lora_to_paramwrapper(fqn, tensor.clone(), legacy_layout=legacy):
+                out[key] = value
+        return out
+
+    def test_default_export_uses_the_corrected_layout(self):
+        out = self._export(_Adapter(), self._native())
+
+        base = "model.layers.0.mlp.experts"
+        assert out[f"{base}.base_layer.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, DIM)
+        assert out[f"{base}.base_layer.lora_B.weight"].shape == (2 * MOE_INTER_DIM, LORA_DIM * N_EXPERTS)
+        assert out[f"{base}.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, MOE_INTER_DIM)
+        assert out[f"{base}.lora_B.weight"].shape == (DIM, LORA_DIM * N_EXPERTS)
+
+    def test_legacy_option_keeps_the_pre_flip_layout(self):
+        out = self._export(_Adapter(), self._native(), legacy=True)
+
+        base = "model.layers.0.mlp.experts"
+        assert out[f"{base}.base_layer.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, 2 * MOE_INTER_DIM)
+        assert out[f"{base}.base_layer.lora_B.weight"].shape == (DIM, LORA_DIM * N_EXPERTS)
+        assert out[f"{base}.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, DIM)
+        assert out[f"{base}.lora_B.weight"].shape == (MOE_INTER_DIM, LORA_DIM * N_EXPERTS)
+
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_round_trip_is_exact_for_both_layouts(self, legacy):
+        adapter = _Adapter()
+        native = self._native()
+        back = adapter._convert_paramwrapper_to_native(self._export(adapter, native, legacy=legacy))
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])
+
+    def test_import_detects_the_layout_from_shapes(self):
+        """A legacy-layout file loads correctly with no metadata stamp."""
+        adapter = _Adapter()
+        native = self._native()
+        back = adapter._convert_paramwrapper_to_native(self._export(adapter, native, legacy=True))
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])
+
+    def test_unambiguous_tensors_decide_the_layout_for_the_whole_file(self):
+        """A legacy MiniMax-M2-style file loads fully correctly without metadata.
+
+        With dim == 2 * moe_inter the gate_up pair is shape-ambiguous, but the
+        down pair is not; its vote decides the layout for the whole file.
+        """
+        adapter = _Adapter()
+        adapter.moe_config.dim = 2 * MOE_INTER_DIM
+        base = "model.layers.0.mlp.experts"
+        native = {
+            f"{base}.lora_gate_and_up_A": torch.randn(N_EXPERTS, 2 * MOE_INTER_DIM, LORA_DIM),
+            f"{base}.lora_gate_and_up_B": torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM),
+            f"{base}.lora_down_A": torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM),
+            f"{base}.lora_down_B": torch.randn(N_EXPERTS, LORA_DIM, 2 * MOE_INTER_DIM),
+        }
+        back = adapter._convert_paramwrapper_to_native(self._export(adapter, native, legacy=True))
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])
+
+    @pytest.mark.parametrize("layout, expect_key", [("peft-0.18", "lora_down_B"), ("peft-0.19.1", "lora_down_A")])
+    def test_metadata_hint_resolves_ambiguous_shapes(self, layout, expect_key):
+        """When shapes cannot distinguish the layouts, the metadata stamp decides."""
+        adapter = _Adapter()
+        adapter.moe_config.dim = MOE_INTER_DIM  # the down pair becomes shape-ambiguous
+        adapter._paramwrapper_layout_hint = layout
+        base = "model.layers.0.mlp.experts"
+
+        back = adapter._convert_paramwrapper_to_native(
+            {f"{base}.lora_A.weight": torch.randn(LORA_DIM * N_EXPERTS, MOE_INTER_DIM)}
+        )
+
+        assert list(back) == [f"{base}.{expect_key}"]
+
+    def test_ambiguous_shapes_without_metadata_fail_clearly(self):
+        adapter = _Adapter()
+        adapter.moe_config.dim = MOE_INTER_DIM
+        base = "model.layers.0.mlp.experts"
+
+        with pytest.raises(ValueError, match="huggingface/peft#3165"):
+            adapter._convert_paramwrapper_to_native(
+                {f"{base}.lora_A.weight": torch.randn(LORA_DIM * N_EXPERTS, MOE_INTER_DIM)}
+            )
+
+    @pytest.mark.parametrize("legacy, stamp", [(False, "peft-0.19.1"), (True, "peft-0.18")])
+    def test_metadata_stamp_agreeing_with_shapes_loads(self, legacy, stamp):
+        adapter = _Adapter()
+        native = self._native()
+        adapter._paramwrapper_layout_hint = stamp
+
+        back = adapter._convert_paramwrapper_to_native(self._export(adapter, native, legacy=legacy))
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])
+
+    def test_unknown_metadata_stamp_fails_clearly(self):
+        """Only the two known layout ids are accepted; anything else is an error, not 'modern'."""
+        adapter = _Adapter()
+        adapter._paramwrapper_layout_hint = "peft-0.21"
+
+        with pytest.raises(ValueError, match="Unknown peft ParamWrapper layout 'peft-0.21'"):
+            adapter._convert_paramwrapper_to_native(self._export(adapter, self._native()))
+
+    @pytest.mark.parametrize("file_is_legacy, stamp", [(True, "peft-0.19.1"), (False, "peft-0.18")])
+    def test_metadata_stamp_contradicting_shapes_fails_clearly(self, file_is_legacy, stamp):
+        """A stamp the tensor shapes rule out must not win silently, in either direction."""
+        adapter = _Adapter()
+        exported = self._export(adapter, self._native(), legacy=file_is_legacy)
+        adapter._paramwrapper_layout_hint = stamp
+
+        with pytest.raises(ValueError, match="do not belong together"):
+            adapter._convert_paramwrapper_to_native(exported)
+
+    @pytest.mark.parametrize("stamp", [None, "peft-0.19.1", "peft-0.18"])
+    def test_tensors_disagreeing_about_the_layout_fail_even_with_a_valid_stamp(self, stamp):
+        """A file mixing both layouts is corrupt; a valid stamp must not mask that."""
+        adapter = _Adapter()
+        native = self._native()
+        mixed = self._export(adapter, native, legacy=True)
+        modern_down_b = {
+            key: value
+            for key, value in self._export(adapter, native).items()
+            if key.endswith(".lora_B.weight") and "base_layer" not in key
+        }
+        mixed.update(modern_down_b)
+        adapter._paramwrapper_layout_hint = stamp
+
+        with pytest.raises(ValueError, match="disagree about their layout"):
+            adapter._convert_paramwrapper_to_native(mixed)
+
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_non_gated_experts_round_trip_for_both_layouts(self, legacy):
+        """Nemotron-V3-style non-gated experts (gate_up width == moe_inter)."""
+        adapter = _Adapter()
+        adapter.moe_config.expert_activation = "relu2"
+        base = "model.layers.0.mlp.experts"
+        native = {
+            f"{base}.lora_gate_and_up_A": torch.randn(N_EXPERTS, DIM, LORA_DIM),
+            f"{base}.lora_gate_and_up_B": torch.randn(N_EXPERTS, LORA_DIM, MOE_INTER_DIM),
+            f"{base}.lora_down_A": torch.randn(N_EXPERTS, MOE_INTER_DIM, LORA_DIM),
+            f"{base}.lora_down_B": torch.randn(N_EXPERTS, LORA_DIM, DIM),
+        }
+        exported = self._export(adapter, native, legacy=legacy)
+        if not legacy:
+            assert exported[f"{base}.base_layer.lora_A.weight"].shape == (LORA_DIM * N_EXPERTS, DIM)
+        back = adapter._convert_paramwrapper_to_native(exported)
+
+        assert set(back) == set(native)
+        for key in native:
+            torch.testing.assert_close(back[key], native[key])

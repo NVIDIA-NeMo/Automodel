@@ -16,6 +16,7 @@ import glob
 import json
 import os
 import shutil
+from dataclasses import fields
 from typing import TYPE_CHECKING, Protocol
 
 import torch
@@ -26,8 +27,16 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
     FQN_TO_DTYPE_MAPPING_FILENAME,
     FQN_TO_FILE_INDEX_MAPPING_FILENAME,
 )
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
-from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.components.moe.state_dict_mixin import (
+    _PARAMWRAPPER_LAYOUT_LEGACY,
+    _PARAMWRAPPER_LAYOUT_METADATA_KEY,
+    _PARAMWRAPPER_LAYOUT_MODERN,
+    MoESplitExpertsStateDictMixin,
+)
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.peft_config import PeftConfig as _AutomodelPeftConfig
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -269,6 +278,12 @@ class PeftAddon:
         process_group = kwargs.get("process_group")
         hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
         automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
+        adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
+        layout_stamp = _get_paramwrapper_layout_stamp(
+            adapter, v4_compatible, kwargs.get("legacy_paramwrapper_layout", False)
+        )
+        if layout_stamp is not None:
+            automodel_peft_metadata[_PARAMWRAPPER_LAYOUT_METADATA_KEY] = layout_stamp
         if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             model_part = model_state.model[0] if model_state is not None else None
@@ -355,7 +370,20 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     return config
 
 
-def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
+def _get_paramwrapper_layout_stamp(adapter, v4_compatible: bool, legacy_paramwrapper_layout: bool) -> "str | None":
+    """Which fused expert LoRA layout this PEFT save uses, for the metadata stamp.
+
+    peft flipped the ParamWrapper layout in 0.19.1 (huggingface/peft#3165);
+    stamping the layout into automodel_peft_config.json lets the loader
+    resolve it from metadata instead of tensor shapes. Returns None for
+    adapters that don't emit fused (v5 ParamWrapper) expert LoRA at all.
+    """
+    if v4_compatible or not getattr(adapter, "_v5_peft_target_parameters", ()):
+        return None
+    return _PARAMWRAPPER_LAYOUT_LEGACY if legacy_paramwrapper_layout else _PARAMWRAPPER_LAYOUT_MODERN
+
+
+def _get_automodel_peft_metadata(peft_config: _AutomodelPeftConfig) -> dict:
     """
     Get the PEFT metadata in the format expected by Automodel.
 
@@ -368,13 +396,36 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     """
     PEFT_KEYS = {"dim", "alpha"}
     result = {}
-    for k, v in peft_config.to_dict().items():
-        if k in PEFT_KEYS:
+    for config_field in fields(peft_config):
+        if config_field.name in PEFT_KEYS:
             continue
+        v = getattr(peft_config, config_field.name)
         if isinstance(v, torch.dtype):
             v = str(v)
-        result[k] = v
+        result[config_field.name] = v
     return result
+
+
+def load_automodel_peft_config_dict(model_path: str) -> dict:
+    """Read back the PEFT configuration ``PeftAddon`` saved in a ``model/`` checkpoint directory.
+
+    ``automodel_peft_config.json`` holds every ``PeftConfig`` field except ``dim`` and ``alpha``, which are taken
+    from the PEFT ``adapter_config.json`` (``r`` / ``lora_alpha``).
+
+    Args:
+        model_path: The checkpoint's ``model/`` directory.
+
+    Returns:
+        Constructor kwargs for ``PeftConfig``, excluding checkpoint-only metadata
+        such as the expert ParamWrapper layout stamp.
+    """
+    with open(os.path.join(model_path, "automodel_peft_config.json")) as f:
+        metadata = json.load(f)
+    with open(os.path.join(model_path, "adapter_config.json")) as f:
+        hf_config = json.load(f)
+    config_fields = {field.name for field in fields(_AutomodelPeftConfig)}
+    config = {key: value for key, value in metadata.items() if key in config_fields}
+    return {**config, "dim": hf_config["r"], "alpha": hf_config["lora_alpha"]}
 
 
 def _has_trainable_moe_lora_parameters(
@@ -470,7 +521,7 @@ def _extract_target_modules(
                 target_name = name.rsplit(".", 1)[0]
                 if target_name.startswith("_orig_mod."):
                     target_name = target_name[len("_orig_mod.") :]
-                target_name = target_name.replace("_checkpoint_wrapped_module.", "")
+                target_name = canonical_parameter_fqn(target_name)
 
                 # Expand combined projection names to individual HF projection names
                 last_component = target_name.rsplit(".", 1)[-1]
@@ -505,7 +556,7 @@ def _extract_target_modules(
                         expert_path = name[: -len(f".{lora_suffix}")]
                         if expert_path.startswith("_orig_mod."):
                             expert_path = expert_path[len("_orig_mod.") :]
-                        expert_path = expert_path.replace("_checkpoint_wrapped_module.", "")
+                        expert_path = canonical_parameter_fqn(expert_path)
 
                         group = "gate_and_up" if "gate_and_up" in lora_suffix else "down"
                         if (expert_path, group) in seen_expert_groups:
@@ -513,9 +564,11 @@ def _extract_target_modules(
                         seen_expert_groups.add((expert_path, group))
 
                         n_experts = param.shape[0]
+                        is_gated = getattr(adapter, "_is_gated_moe", True)
                         for expert_id in range(n_experts):
                             if group == "gate_and_up":
-                                final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
+                                if is_gated:
+                                    final_target_modules.add(f"{expert_path}.{expert_id}.gate_proj")
                                 final_target_modules.add(f"{expert_path}.{expert_id}.up_proj")
                             else:
                                 final_target_modules.add(f"{expert_path}.{expert_id}.down_proj")
@@ -531,6 +584,17 @@ def _extract_target_modules(
             final_target_modules = {
                 name[len("model.") :] if name.startswith("model.") else name for name in final_target_modules
             }
+
+    # Adapters whose HF checkpoint layout renames modules (e.g. Kimi K3's
+    # mlp.experts.{E}.gate_proj -> block_sparse_moe.experts.{E}.w1) convert the
+    # state-dict keys on save, so adapter_config.json's target_modules must get
+    # the same treatment or PEFT can't resolve them against the real model.
+    # The base method defaults to the identity; legacy adapters that don't
+    # subclass StateDictAdapter (e.g. kimivl) skip it, as before.
+    if isinstance(adapter, StateDictAdapter):
+        final_target_modules = {
+            adapter.map_peft_target_module_to_hf(name, v4_compatible=v4_compatible) for name in final_target_modules
+        }
 
     # Under pipeline parallelism each rank only holds the local stage's layers,
     # so named_modules() above yields layer-specific target names for that stage

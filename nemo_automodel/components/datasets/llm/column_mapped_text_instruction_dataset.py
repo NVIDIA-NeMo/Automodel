@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Union
 
 from datasets import VerificationMode, load_dataset
 from torch.utils.data import Dataset
@@ -96,9 +96,9 @@ def _str_is_hf_repo_id(val: str) -> bool:
 
 def _load_dataset(
     path_or_dataset_id: Union[str, List[str]],
-    split: Optional[str] = None,
+    split: str | None = None,
     streaming: bool = False,
-    name: Optional[str] = None,
+    name: str | None = None,
 ):
     """Load a dataset either from the Hugging Face Hub or from local JSON/JSONL files.
 
@@ -215,13 +215,13 @@ class ColumnMappedTextInstructionDataset(Dataset):
         column_mapping: Dict[str, str],
         tokenizer,
         *,
-        split: Optional[str] = "train",
-        name: Optional[str] = None,
+        split: str | None = "train",
+        name: str | None = None,
         answer_only_loss_mask: bool = True,
-        seq_length: Optional[int] = None,
+        seq_length: int | None = None,
         padding: Union[str, bool] = "do_not_pad",
         truncation: Union[str, bool] = "do_not_truncate",
-        limit_dataset_samples: Optional[int] = None,
+        limit_dataset_samples: int | None = None,
         use_hf_chat_template: bool = False,
     ) -> None:
         """

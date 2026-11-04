@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from torch import nn
@@ -91,11 +91,14 @@ class FusedLinearCEConfig(LossConfig):
         ignore_index: Label value marking padding tokens.
         logit_softcapping: Softcap logits before CE (0 = disabled).
         reduction: Reduction mode.
+        impl: ``"cce"`` (flat memory, slowest) or ``"torch_compile"`` (faster,
+            memory grows with supervised tokens x vocab).
     """
 
     ignore_index: int = -100
     logit_softcapping: float = 0.0
     reduction: str = "sum"
+    impl: Literal["cce", "torch_compile"] = "cce"
 
     def build(self) -> nn.Module:
         from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -103,6 +106,34 @@ class FusedLinearCEConfig(LossConfig):
         return FusedLinearCrossEntropy(
             ignore_index=self.ignore_index,
             logit_softcapping=self.logit_softcapping,
+            reduction=self.reduction,
+            impl=self.impl,
+        )
+
+
+@dataclass
+class ChunkedCEConfig(LossConfig):
+    """Chunked output projection and cross entropy.
+
+    Attributes:
+        chunk_len: Maximum token rows per output projection.
+        compile: Compile each chunk's projection and CE.
+        ignore_index: Ignored target value.
+        reduction: Reduction across all tokens.
+    """
+
+    chunk_len: int = 512
+    compile: bool = True
+    ignore_index: int = -100
+    reduction: str = "sum"
+
+    def build(self) -> nn.Module:
+        from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+
+        return ChunkedCrossEntropy(
+            chunk_len=self.chunk_len,
+            compile=self.compile,
+            ignore_index=self.ignore_index,
             reduction=self.reduction,
         )
 
@@ -142,7 +173,7 @@ class KDLossConfig(LossConfig):
         fp32_upcast: Cast logits to float32 for numerical stability.
         tp_group: Tensor-parallel process group the loss reduces over (runtime
             arg; usually left as ``None`` in YAML and supplied programmatically).
-        chunk_size: Vocab chunk size for the KD loss (0 = no chunking).
+        chunk_size: Number of valid tokens per KD loss chunk (0 = no chunking).
     """
 
     ignore_index: int = -100
@@ -160,6 +191,44 @@ class KDLossConfig(LossConfig):
             fp32_upcast=self.fp32_upcast,
             tp_group=self.tp_group,
             chunk_size=self.chunk_size,
+        )
+
+
+@dataclass
+class DFlashDecayLossConfig(LossConfig):
+    """``DFlashDecayLoss`` (DFlash draft training, decay + D-PACE objectives).
+
+    Attributes:
+        loss_gamma: Position-decay parameter γ (Eq. 4). ``None`` disables decay
+            (uniform weights). Ignored by the ``dpace*`` variants.
+        use_fused_linear_ce: Use the chunked linear-CE path (``forward_fused``)
+            so the full ``[batch, blocks, k, vocab]`` logits are never
+            materialised.
+        chunk_size: Predicted positions per chunk in the fused path.
+        normalize: Denominator policy — ``"tokens"`` (global ``num_tokens``) or
+            ``"mean"`` (effective weight sum for dflash, batch size times block
+            count for D-PACE).
+        loss_type: ``"dflash"`` or a ``"dpace*"`` variant.
+        dpace_alpha: Smoothing α for the D-PACE confidence product.
+    """
+
+    loss_gamma: float | None = 7.0
+    use_fused_linear_ce: bool = False
+    chunk_size: int = 1024
+    normalize: str = "tokens"
+    loss_type: str = "dflash"
+    dpace_alpha: float = 0.5
+
+    def build(self) -> nn.Module:
+        from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
+
+        return DFlashDecayLoss(
+            loss_gamma=self.loss_gamma,
+            use_fused_linear_ce=self.use_fused_linear_ce,
+            chunk_size=self.chunk_size,
+            normalize=self.normalize,
+            loss_type=self.loss_type,
+            dpace_alpha=self.dpace_alpha,
         )
 
 
@@ -193,8 +262,10 @@ class LossFromFactoryConfig(LossConfig):
 LOSS_CONFIG_REGISTRY: dict[str, type[LossConfig]] = {
     "MaskedCrossEntropy": MaskedCrossEntropyConfig,
     "FusedLinearCrossEntropy": FusedLinearCEConfig,
+    "ChunkedCrossEntropy": ChunkedCEConfig,
     "TEParallelCrossEntropy": TEParallelCEConfig,
     "KDLoss": KDLossConfig,
+    "DFlashDecayLoss": DFlashDecayLossConfig,
 }
 
 
@@ -277,6 +348,7 @@ def build_loss_module(loss: LossConfig | Callable[..., nn.Module], **loss_kwargs
 
 __all__ = [
     "LOSS_CONFIG_REGISTRY",
+    "DFlashDecayLossConfig",
     "FusedLinearCEConfig",
     "KDLossConfig",
     "LossConfig",

@@ -14,6 +14,7 @@
 
 
 import importlib
+import importlib.metadata
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -30,8 +31,15 @@ logger = logging.getLogger(__name__)
 # Models are loaded lazily on first access rather than imported at startup.
 # Optional third element is a set of tags (e.g. {"retrieval"}) used by
 # downstream code to classify model archs without importing them.
+# "hf_parallelizer" opts the HF wrapper into the owning package's
+# parallelization.PARALLELIZER; it requires compatibility with the HF layout.
 MODEL_ARCH_MAPPING = OrderedDict(
     [
+        (
+            "Lfm2VlForConditionalGeneration",
+            ("nemo_automodel.components.models.d1.vl_model", "Lfm2VlForConditionalGeneration"),
+        ),
+        ("D1OmniModel", ("nemo_automodel.components.models.d1.model", "D1OmniModel")),
         (
             "BagelForUnifiedMultimodal",
             (
@@ -64,7 +72,11 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
         (
             "DeepseekV4ForCausalLM",
-            ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
+            ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM", {"hf_parallelizer"}),
+        ),
+        (
+            "DeepseekV41ForCausalLM",
+            ("nemo_automodel.components.models.deepseek_v41.model", "DeepseekV41ForCausalLM"),
         ),
         (
             "DiffusionGemmaForBlockDiffusion",
@@ -73,6 +85,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Ernie4_5_MoeForCausalLM",
             ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
+        ),
+        (
+            "FlintForCausalLM",
+            ("nemo_automodel.components.models.flint.model", "FlintForCausalLM"),
         ),
         (
             "Glm4MoeForCausalLM",
@@ -87,8 +103,22 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.glm_moe_dsa.model", "GlmMoeDsaForCausalLM"),
         ),
         (
+            "Glm5NextForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.glm5_next.model",
+                "Glm5NextForConditionalGeneration",
+            ),
+        ),
+        (
             "Gemma4ForConditionalGeneration",
             ("nemo_automodel.components.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
+        ),
+        (
+            "Gemma4UnifiedForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.gemma4_unified.model",
+                "Gemma4UnifiedForConditionalGeneration",
+            ),
         ),
         (
             "Gemma4AssistantForCausalLM",
@@ -158,6 +188,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.mimo_v2_flash.model", "MiMoV2FlashForCausalLM"),
         ),
         (
+            "MiMoV2ForCausalLM",
+            ("nemo_automodel.components.models.mimo_v2_flash.model", "MiMoV2ForCausalLM"),
+        ),
+        (
+            "MiMoV25ForCausalLM",
+            ("nemo_automodel.components.models.mimo_v25.model", "MiMoV2ForCausalLM"),
+        ),
+        (
             "LagunaForCausalLM",
             ("nemo_automodel.components.models.laguna.model", "LagunaForCausalLM"),
         ),
@@ -190,6 +228,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "MistralLarge4ForConditionalGeneration",
+            ("nemo_automodel.components.models.mistral_large4.multimodal", "MistralLarge4ForConditionalGeneration"),
+        ),
+        (
+            "MistralLarge4ForCausalLM",
+            ("nemo_automodel.components.models.mistral_large4.model", "MistralLarge4ForCausalLM"),
+        ),
+        (
             "Mistral4ForCausalLM",
             ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
         ),
@@ -210,10 +256,17 @@ MODEL_ARCH_MAPPING = OrderedDict(
         ),
         (
             "NemotronHForCausalLM",
-            ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM"),
+            ("nemo_automodel.components.models.nemotron_v3.model", "NemotronHForCausalLM", {"hf_parallelizer"}),
         ),
         (
             "NemotronH_Nano_Omni_Reasoning_V3",
+            (
+                "nemo_automodel.components.models.nemotron_omni.model",
+                "NemotronOmniForConditionalGeneration",
+            ),
+        ),
+        (
+            "NemotronH_Omni_Reasoning_V3",
             (
                 "nemo_automodel.components.models.nemotron_omni.model",
                 "NemotronOmniForConditionalGeneration",
@@ -226,6 +279,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "MuseGlimmerForConditionalGeneration",
             ("nemo_automodel.components.models.muse_glimmer.model", "MuseGlimmerForConditionalGeneration"),
+        ),
+        (
+            "MuseSparkForConditionalGeneration",
+            ("nemo_automodel.components.models.muse_spark.model", "MuseSpark1xOmniForCausalLM"),
+        ),
+        (
+            "MuseSpark1xOmniForCausalLM",
+            ("nemo_automodel.components.models.muse_spark.model", "MuseSpark1xOmniForCausalLM"),
         ),
         (
             "LLaVAOneVision1_5_ForConditionalGeneration",
@@ -241,6 +302,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "HyMT2ForCausalLM",
             ("nemo_automodel.components.models.hy_mt2.model", "HyMT2ForCausalLM"),
+        ),
+        (
+            "HunyuanImage3ForCausalMM",
+            ("nemo_automodel.components.models.hunyuan_image3.model", "HunyuanImage3ForCausalMM"),
         ),
         (
             "Qwen2ForCausalLM",
@@ -276,16 +341,20 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_moe.model", "Qwen3MoeForCausalLM"),
         ),
         (
+            "BeamForCausalLM",
+            ("nemo_automodel.components.models.beam.model", "BeamForCausalLM"),
+        ),
+        (
             "Qwen3NextForCausalLM",
             ("nemo_automodel.components.models.qwen3_next.model", "Qwen3NextForCausalLM"),
         ),
         (
             "Qwen3_5ForCausalLM",
-            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM"),
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM", {"hf_parallelizer"}),
         ),
         (
             "Qwen3_5ForConditionalGeneration",
-            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration", {"hf_parallelizer"}),
         ),
         (
             "Qwen3OmniMoeForConditionalGeneration",
@@ -311,8 +380,22 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
         ),
         (
+            "Qwen3_8_FlashNextForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_8_flash_next.model", "Qwen3_8_FlashNextForConditionalGeneration"),
+        ),
+        (
+            # Immutable checkpoint dumps predate the Qwen3.8-Flash-Next rename.
+            "Qwen4ExpForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_8_flash_next.model", "Qwen3_8_FlashNextForConditionalGeneration"),
+        ),
+        (
             "Step3p6ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
+        ),
+        ("Step5ForCausalLM", ("nemo_automodel.components.models.step5.model", "Step5ForCausalLM")),
+        (
+            "Step5ForConditionalGeneration",
+            ("nemo_automodel.components.models.step5.model", "Step5ForConditionalGeneration"),
         ),
         (
             "Step3p5ForCausalLM",
@@ -334,12 +417,21 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "d1_omni": ("nemo_automodel.components.models.d1.config", "D1OmniConfig"),
+    "step5": ("nemo_automodel.components.models.step5.configuration", "Step5Config"),
+    "step5_vl": ("nemo_automodel.components.models.step5.configuration", "Step5VLConfig"),
     "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
+    "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41Config"),
+    "deepseek_v41_text": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41TextConfig"),
+    "deepseek_v41_vision": ("nemo_automodel.components.models.deepseek_v41.config", "DeepseekV41VisionConfig"),
+    "flint": ("nemo_automodel.components.models.flint.config", "FlintConfig"),
     "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
+    "glm5_next": ("nemo_automodel.components.models.glm5_next.config", "Glm5NextConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
+    "hunyuan_image_3_moe": ("nemo_automodel.components.models.hunyuan_image3.config", "HunyuanImage3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
@@ -351,6 +443,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "llama_nemotron_vl": ("nemo_automodel.components.models.llama_nemotron_vl.model", "LlamaNemotronVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
+    "mimo_v2": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2Config"),
     "minimax_m3_vl": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
     "ministral3_bidirec": (
         "nemo_automodel.components.models.ministral_bidirectional.model",
@@ -361,9 +454,38 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
         "Mistral3BidirectionalConfig",
     ),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "mistral_large4": ("nemo_automodel.components.models.mistral_large4.config", "MistralLarge4Config"),
     "muse_glimmer": ("nemo_automodel.components.models.muse_glimmer.config", "MuseGlimmerConfig"),
+    "muse_spark": (
+        "nemo_automodel.components.models.muse_spark.configuration_muse_spark",
+        "MuseSparkConfig",
+    ),
+    "musespark1x_omni": (
+        "nemo_automodel.components.models.muse_spark.config",
+        "MuseSpark1xOmniConfig",
+    ),
+    "qwen3_8_flash_next": ("nemo_automodel.components.models.qwen3_8_flash_next.config", "Qwen3_8_FlashNextConfig"),
+    "qwen3_8_flash_next_text": (
+        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "Qwen3_8_FlashNextTextConfig",
+    ),
+    # Immutable checkpoint dumps predate the Qwen3.8-Flash-Next rename.
+    "qwen4_exp": (
+        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "Qwen3_8_FlashNextLegacyConfig",
+    ),
+    "qwen4_exp_text": (
+        "nemo_automodel.components.models.qwen3_8_flash_next.config",
+        "Qwen3_8_FlashNextLegacyTextConfig",
+    ),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
+}
+
+# Checkpoint model_type to local image/text processor implementation.
+_CUSTOM_PROCESSOR_REGISTRATIONS: dict[str, tuple[str, str]] = {
+    "kimi_k3": ("nemo_automodel.components.models.kimi_k3.processing", "KimiK3Processor"),
+    "deepseek_v41": ("nemo_automodel.components.models.deepseek_v41.processing", "DeepseekV41Processor"),
 }
 
 # model_types whose custom model implementation should win over a transformers
@@ -418,7 +540,21 @@ def _register_custom_configs() -> None:
             logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
 
 
+def _register_custom_processors() -> None:
+    """Attach local processor implementations to their registered HF config classes."""
+    from transformers import AutoProcessor
+
+    for model_type, (module_path, cls_name) in _CUSTOM_PROCESSOR_REGISTRATIONS.items():
+        config_cls = resolve_custom_config_cls(model_type)
+        if config_cls is None:
+            continue
+        module = importlib.import_module(module_path)
+        processor_cls = getattr(module, cls_name)
+        AutoProcessor.register(config_cls, processor_cls, exist_ok=True)
+
+
 _register_custom_configs()
+_register_custom_processors()
 
 
 class _LazyArchMapping:
@@ -476,9 +612,15 @@ class _LazyArchMapping:
         self._extra[key] = value
 
     def register(self, key: str, value: Type[nn.Module], exist_ok: bool = False) -> None:
-        """Register a model class under the given architecture name."""
-        if not exist_ok and key in self._extra:
+        """Register a model class under the given architecture name.
+
+        Conflicts, including built-in architectures, require ``exist_ok=True``.
+        """
+        if not exist_ok and (key in self._auto_map or key in self._extra):
             raise ValueError(f"Duplicated model implementation for {key}")
+
+        self._auto_map.pop(key, None)
+        self._loaded.pop(key, None)
         self._extra[key] = value
 
     def has_tag(self, key: str, tag: str) -> bool:
@@ -508,6 +650,19 @@ class _ModelRegistry:
         if self.model_arch_name_to_cls is None:
             self.model_arch_name_to_cls = _LazyArchMapping(MODEL_ARCH_MAPPING)
         self._retrieval_archs = self.model_arch_name_to_cls.keys_with_tag("retrieval")
+        self._discover_entry_points()
+
+    def _discover_entry_points(self) -> None:
+        """Register architecture entry points without importing their modules."""
+        mapping = self.model_arch_name_to_cls
+        for ep in importlib.metadata.entry_points(group="nemo_automodel.architectures"):
+            if ep.name in mapping.keys():
+                logger.warning("Architecture %s is already registered; skipping entry point %s", ep.name, ep.value)
+                continue
+            module_path, _, class_name = ep.value.rpartition(":")
+            if not module_path or not class_name:
+                raise ValueError(f"Entry point {ep.name!r} value must be module.path:ClassName, got {ep.value!r}")
+            mapping._auto_map[ep.name] = (module_path, class_name)
 
     @property
     def supported_models(self):
@@ -555,6 +710,21 @@ class _ModelRegistry:
 @lru_cache
 def get_registry():
     return _ModelRegistry()
+
+
+def register_architecture(arch_name: str, model_cls: type[nn.Module], *, exist_ok: bool = False) -> None:
+    """Register a custom model class for an architecture name.
+
+    Args:
+        arch_name: Architecture name (e.g. ``"LlavaExampleNemotronForCausalLM"``).
+        model_cls: The model class (not a string path; the class object itself).
+        exist_ok: If True, replace an existing registration.
+
+    Raises:
+        ValueError: If *arch_name* is already a built-in or registered to a
+            different class and *exist_ok* is False.
+    """
+    ModelRegistry.register(arch_name, model_cls, exist_ok=exist_ok)
 
 
 ModelRegistry = get_registry()

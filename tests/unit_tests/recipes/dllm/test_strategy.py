@@ -12,18 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for dLLM strategies (MDLMStrategy, HybridStrategy, DFlashStrategy) and get_dllm_strategy."""
+"""Tests for dLLM strategies (MDLMStrategy, SCDDStrategy, HybridStrategy, DFlashStrategy) and get_dllm_strategy."""
 
 import types
+from pathlib import Path
 
 import pytest
 import torch
 
+from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.dllm_loss import (
     BlockDiffusionCrossEntropyLoss,
     DFlashDecayLoss,
     IDLMLoss,
     MDLMCrossEntropyLoss,
+    SCDDLoss,
+    UnoDistillLoss,
 )
 from nemo_automodel.recipes.dllm.strategy import (
     DLLM_STRATEGIES,
@@ -32,9 +37,14 @@ from nemo_automodel.recipes.dllm.strategy import (
     HybridStrategy,
     IDLMStrategy,
     MDLMStrategy,
+    SCDDStrategy,
+    UnoStrategy,
     _build_target_layer_ids,
     get_dllm_strategy,
 )
+from nemo_automodel.recipes.dllm.train_ft import DiffusionLMSFTRecipe
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def test_get_dllm_strategy_rejects_unknown_mode():
@@ -444,6 +454,303 @@ class TestIDLMStrategy:
 
 
 # ---------------------------------------------------------------------------
+# UnoStrategy tests
+# ---------------------------------------------------------------------------
+
+
+class TestUnoStrategy:
+    @pytest.fixture
+    def strategy(self):
+        return UnoStrategy()
+
+    def test_resolves_from_registry(self):
+        assert isinstance(get_dllm_strategy("uno"), UnoStrategy)
+
+    def test_create_loss_fn_reads_weights_and_block_length(self, strategy):
+        loss_fn = strategy.create_loss_fn({"block_length": 8, "tv_weight": 0.5, "kl_weight": 0.25})
+        assert isinstance(loss_fn, UnoDistillLoss)
+        assert (loss_fn.tv_weight, loss_fn.kl_weight, strategy.block_size) == (0.5, 0.25, 8)
+        default = strategy.create_loss_fn({})
+        assert (default.tv_weight, default.kl_weight) == (1.0, 0.0)  # released recipe: TV only
+
+    def test_pre_step_replaces_every_response_token_within_the_microbatch_range(self, strategy):
+        """Uno noise: rate 1 over the response, ids drawn from [0, max(input_ids) + 1) of the microbatch."""
+        generator = torch.Generator().manual_seed(0)
+
+        def apply_corruption(input_ids, loss_mask, microbatch_idx=0):
+            return strategy.apply_corruption(
+                input_ids, loss_mask, 999, eps=1e-3, block_size=None, half_life_ratio=None, generator=generator
+            )
+
+        input_ids = torch.randint(0, 50, (2, 16))
+        input_ids[1, 0] = 70  # microbatch max lives in another row's prompt
+        loss_mask = torch.zeros(2, 16, dtype=torch.long)
+        loss_mask[:, 8:] = 1
+        batch = {"input_ids": input_ids, "loss_mask": loss_mask}
+        num_noise, num_supervised = strategy.pre_step(
+            types.SimpleNamespace(_apply_corruption=apply_corruption), [batch]
+        )
+
+        assert num_noise == num_supervised == 16
+        assert torch.equal(batch["_noise_mask"], loss_mask.bool())
+        assert torch.equal(batch["_noisy_input_ids"][:, :8], input_ids[:, :8])
+        response = batch["_noisy_input_ids"][:, 8:]
+        assert ((response >= 0) & (response <= 70)).all()
+        assert torch.equal(batch["_clean_input_ids"], input_ids)
+
+    def test_pre_step_noise_range_includes_the_microbatch_max(self, strategy):
+        """The upper bound is max(input_ids) + 1 (exclusive), so the max id itself is drawn."""
+        generator = torch.Generator().manual_seed(0)
+
+        def apply_corruption(input_ids, loss_mask, microbatch_idx=0):
+            return strategy.apply_corruption(
+                input_ids, loss_mask, 999, eps=1e-3, block_size=None, half_life_ratio=None, generator=generator
+            )
+
+        input_ids = torch.zeros(1, 256, dtype=torch.long)
+        input_ids[0, 0] = 1
+        loss_mask = torch.ones(1, 256, dtype=torch.long)
+        loss_mask[0, 0] = 0
+        batch = {"input_ids": input_ids, "loss_mask": loss_mask}
+        strategy.pre_step(types.SimpleNamespace(_apply_corruption=apply_corruption), [batch])
+        assert set(batch["_noisy_input_ids"][0, 1:].tolist()) == {0, 1}
+
+    def test_apply_corruption_outside_pre_step_raises(self, strategy):
+        with pytest.raises(RuntimeError, match="pre_step"):
+            strategy.apply_corruption(
+                torch.zeros(1, 4, dtype=torch.long),
+                torch.ones(1, 4),
+                999,
+                eps=1e-3,
+                block_size=None,
+                half_life_ratio=None,
+            )
+
+    def test_sdpa_mask_uses_the_mixed_precision_param_dtype(self, strategy):
+        """Without autocast the additive mask is built in the FSDP2 param dtype, so it needs no input cast."""
+        vocab, seq_len = 32, 6
+        loss_fn = strategy.create_loss_fn({"block_length": 2})
+        seen = {}
+
+        class _TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(vocab, 8)
+                self.q_proj = torch.nn.Linear(8, 8)
+                self.head = torch.nn.Linear(8, vocab)
+                self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+
+            def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+                seen["mask_dtype"] = attention_mask.dtype
+                return types.SimpleNamespace(logits=self.head(self.q_proj(self.embed(input_ids))))
+
+        model = _TinyModel()
+        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["q_proj"], dim=4, alpha=8, use_triton=False))
+        recipe = types.SimpleNamespace(
+            dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+            model_parts=[model],
+            distributed_config=types.SimpleNamespace(
+                defer_fsdp_grad_sync=True,
+                autocast_dtype=None,
+                mp_policy=types.SimpleNamespace(param_dtype=torch.bfloat16),
+            ),
+            te_fp8=None,
+            device_mesh=None,
+            dllm_loss_fn=loss_fn,
+            _dllm_loss_buffer=[],
+            _dllm_loss_components_buffer=[],
+            _get_dp_group_size=lambda include_cp=True: 1.0,
+        )
+        clean = torch.randint(0, vocab, (1, seq_len))
+        noise_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+        noise_mask[:, seq_len // 2 :] = True
+        batch = {"_clean_input_ids": clean, "_noisy_input_ids": clean.clone(), "_noise_mask": noise_mask}
+
+        strategy.forward_backward(
+            recipe, 0, batch, loss_buffer=[], num_diffusion_tokens=int(noise_mask.sum()), num_batches=1, is_train=False
+        )
+
+        assert seen["mask_dtype"] == torch.bfloat16
+
+    def test_forward_backward_gates_lora_to_the_noisy_half(self, strategy):
+        """x_t logits use the adapter, x_0 logits are the frozen base, and only LoRA weights train."""
+        torch.manual_seed(0)
+        vocab, seq_len = 32, 6
+        loss_fn = strategy.create_loss_fn({"block_length": 2, "loss_chunk_size": 4})
+
+        class _TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(vocab, 8)
+                self.q_proj = torch.nn.Linear(8, 8)
+                self.head = torch.nn.Linear(8, vocab)
+                self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+
+            def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+                return types.SimpleNamespace(logits=self.head(self.q_proj(self.embed(input_ids))))
+
+        model = _TinyModel()
+        apply_lora_to_linear_modules(model, PeftConfig(target_modules=["q_proj"], dim=4, alpha=8, use_triton=False))
+        torch.nn.init.normal_(model.q_proj.lora_B.weight, std=0.5)
+
+        seen = {}
+
+        def recording_loss(logits, *args, **kwargs):
+            seen["logits"] = logits.detach()
+            return loss_fn(logits, *args, **kwargs)
+
+        recipe = types.SimpleNamespace(
+            dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+            model_parts=[model],
+            distributed_config=types.SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None),
+            te_fp8=None,
+            device_mesh=None,
+            dllm_loss_fn=recording_loss,
+            _dllm_loss_buffer=[],
+            _get_dp_group_size=lambda include_cp=True: 1.0,
+        )
+        clean = torch.randint(0, vocab, (1, seq_len))
+        noise_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+        noise_mask[:, seq_len // 2 :] = True
+        noisy = clean.clone()
+        noisy[noise_mask] = torch.randint(0, vocab, (int(noise_mask.sum()),))
+        batch = {"_clean_input_ids": clean, "_noisy_input_ids": noisy, "_noise_mask": noise_mask}
+        loss_buffer = []
+
+        strategy.forward_backward(
+            recipe, 0, batch, loss_buffer=loss_buffer, num_diffusion_tokens=int(noise_mask.sum()), num_batches=1
+        )
+
+        with torch.no_grad():
+            adapted = model(noisy).logits
+            hidden = model.embed(clean)
+            base = model.head(torch.nn.functional.linear(hidden, model.q_proj.weight, model.q_proj.bias))
+        torch.testing.assert_close(seen["logits"][:, :seq_len], adapted)
+        torch.testing.assert_close(seen["logits"][:, seq_len:], base)
+        assert model.q_proj._lora_token_gate is None
+        assert len(loss_buffer) == 1 and torch.isfinite(loss_buffer[0])
+        trained = {name for name, p in model.named_parameters() if p.grad is not None}
+        assert trained == {"q_proj.lora_A.weight", "q_proj.lora_B.weight"}
+
+    # Uno-Qwen3-8B curriculum: global batch 128 x 4096 tokens, 6 stages over 3 epochs.
+    UNO_QWEN3_8B_CURRICULUM = {
+        "tokens_per_step": 524288,
+        "stages": [
+            {"block_size": 2, "tokens": 2457862144},
+            {"block_size": 4, "tokens": 2457337856},
+            {"block_size": 6, "tokens": 2457862144},
+            {"block_size": 8, "tokens": 2457337856},
+            {"block_size": 12, "tokens": 2457862144},
+            {"block_size": 16, "tokens": 2457337856},
+        ],
+    }
+
+    @pytest.mark.parametrize(
+        ("step", "block_size"),
+        [(0, 2), (4687, 2), (4688, 4), (9375, 6), (23437, 12), (23438, 16), (28124, 16), (40000, 16)],
+    )
+    def test_curriculum_picks_block_size_from_the_optimizer_step(self, strategy, step, block_size):
+        """Stage boundaries land on the expected steps (alternating 4,688/4,687-step halves); steps past the
+        last stage keep its block size."""
+        strategy.create_loss_fn({"block_curriculum": self.UNO_QWEN3_8B_CURRICULUM})
+        assert strategy.block_size == 2
+        assert strategy._stage_end_steps == [4688, 9375, 14063, 18750, 23438, 28125]
+        recipe = types.SimpleNamespace(step_scheduler=types.SimpleNamespace(step=step))
+        assert strategy.pre_step(recipe, []) == (0, 0)
+        assert strategy.block_size == block_size
+
+    def test_without_curriculum_block_length_stays_fixed(self, strategy):
+        strategy.create_loss_fn({"block_length": 8})
+        strategy.pre_step(types.SimpleNamespace(step_scheduler=types.SimpleNamespace(step=10**6)), [])
+        assert strategy.block_size == 8
+
+    @pytest.mark.parametrize(
+        ("dllm_cfg", "match"),
+        [
+            ({"block_length": 4, "block_curriculum": UNO_QWEN3_8B_CURRICULUM}, "not both"),
+            ({"block_curriculum": {"stages": [{"block_size": 2, "tokens": 8}]}}, "tokens_per_step"),
+            ({"block_curriculum": {"tokens_per_step": 8, "stages": []}}, "non-empty"),
+            (
+                {
+                    "block_curriculum": {
+                        "tokens_per_step": 8,
+                        "stages": [{"block_size": 4, "tokens": 8}, {"block_size": 4, "tokens": 8}],
+                    }
+                },
+                "strictly increasing",
+            ),
+            (
+                {
+                    "block_curriculum": {
+                        "tokens_per_step": 8,
+                        "stages": [{"block_size": 2, "tokens": 8}, {"block_size": 4, "tokens": 4}],
+                    }
+                },
+                "shorter than one step",
+            ),
+        ],
+    )
+    def test_invalid_curriculum_is_rejected(self, strategy, dllm_cfg, match):
+        with pytest.raises(ValueError, match=match):
+            strategy.create_loss_fn(dllm_cfg)
+
+    @staticmethod
+    def _curriculum_recipe(global_batch_size, seq_length, max_steps):
+        return types.SimpleNamespace(
+            cfg=ConfigNode(
+                {"step_scheduler": {"global_batch_size": global_batch_size}, "dataset": {"seq_length": seq_length}}
+            ),
+            step_scheduler=types.SimpleNamespace(max_steps=max_steps),
+            distributed_config=types.SimpleNamespace(cp_size=1, tp_size=1),
+            peft_config=types.SimpleNamespace(use_dora=False),
+            model_parts=[
+                types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=151936))
+            ],
+            mask_token_id=151669,
+        )
+
+    def test_setup_extra_accepts_a_matching_batch_and_steps(self, strategy, caplog):
+        strategy.create_loss_fn({"block_curriculum": self.UNO_QWEN3_8B_CURRICULUM})
+        strategy.setup_extra(self._curriculum_recipe(128, 4096, 28125))
+        assert "differs from the block curriculum" not in caplog.text
+
+    def test_setup_extra_rejects_tokens_per_step_that_mismatches_the_batch(self, strategy):
+        """tokens_per_step must equal global_batch_size * seq_length."""
+        strategy.create_loss_fn({"block_curriculum": self.UNO_QWEN3_8B_CURRICULUM})
+        with pytest.raises(ValueError, match="global_batch_size \\* dataset.seq_length = 262144"):
+            strategy.setup_extra(self._curriculum_recipe(64, 4096, 28125))
+
+    def test_setup_extra_warns_when_max_steps_differs_from_the_curriculum(self, strategy, caplog):
+        strategy.create_loss_fn({"block_curriculum": self.UNO_QWEN3_8B_CURRICULUM})
+        strategy.setup_extra(self._curriculum_recipe(128, 4096, 1000))
+        assert "differs from the block curriculum's last stage end step 28125" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        [
+            ("peft_config", None, "add a `peft:` LoRA config"),
+            ("peft_config", types.SimpleNamespace(use_dora=True), "DoRA"),
+            ("distributed_config", types.SimpleNamespace(cp_size=1, tp_size=2), "tensor parallelism"),
+        ],
+    )
+    def test_setup_extra_rejects_unsupported_adapter_setups(self, strategy, field, value, match):
+        """The token-gated adapter needs plain LoRA and tp_size == 1; fail at setup, not at the first forward."""
+        strategy.create_loss_fn({"block_length": 4})
+        recipe = self._curriculum_recipe(128, 4096, 28125)
+        setattr(recipe, field, value)
+        with pytest.raises(ValueError, match=match):
+            strategy.setup_extra(recipe)
+
+    def test_setup_extra_fills_a_placeholder_mask_token_id(self, strategy):
+        """Uno has no mask token: a missing dllm.mask_token_id becomes an unused placeholder."""
+        strategy.create_loss_fn({"block_length": 4})
+        recipe = self._curriculum_recipe(128, 4096, 28125)
+        recipe.mask_token_id = None
+        strategy.setup_extra(recipe)
+        assert recipe.mask_token_id == 0
+
+
+# ---------------------------------------------------------------------------
 # DFlashStrategy — anchor-block sampling (CPU, no model loading)
 # ---------------------------------------------------------------------------
 
@@ -575,6 +882,8 @@ def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
                 "overlap_anchors": False,
                 "use_fused_linear_ce": False,
                 "ce_chunk_size": 17,
+                "loss_type": "dpace",
+                "dpace_alpha": 0.25,
             },
             "dataset": {"seq_length": 128},
         },
@@ -604,6 +913,39 @@ def test_dflash_setup_extra_resolves_fake_target_and_config(monkeypatch):
     assert isinstance(strategy.dflash_loss_fn, DFlashDecayLoss)
     assert strategy.dflash_loss_fn.loss_gamma == 4.0
     assert strategy.dflash_loss_fn.chunk_size == 17
+    assert strategy.dflash_loss_fn.loss_type == "dpace"
+    assert strategy.dflash_loss_fn.dpace_alpha == 0.25
+    # pre_step supplies the globally reduced batch-block denominator.
+    assert strategy.dflash_loss_fn.normalize == "tokens"
+
+
+def test_dflash_setup_extra_keeps_tokens_normalize_for_the_dflash_default(monkeypatch):
+    """Unlike D-PACE, ``loss_type="dflash"`` predates this recipe and keeps its
+    existing ``normalize="tokens"`` -- switching it would retune every already
+    deployed DFlash config built on this strategy."""
+    monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: _FakeTargetModel())
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
+
+    draft = types.SimpleNamespace(config=types.SimpleNamespace(block_size=8, num_target_layers=12, num_hidden_layers=3))
+    recipe = types.SimpleNamespace(
+        cfg={"dflash": {"target_model_id": "fake-target"}, "dataset": {}},
+        mask_token_id=None,
+        dist_env=types.SimpleNamespace(device=torch.device("cpu")),
+        model_parts=[draft],
+    )
+
+    strategy = DFlashStrategy()
+    strategy.setup_extra(recipe)
+
+    assert strategy.dflash_loss_fn.loss_type == "dflash"
+    assert strategy.dflash_loss_fn.normalize == "tokens"
+
+
+def test_dflash_setup_extra_rejects_context_parallel(monkeypatch):
+    recipe = types.SimpleNamespace(distributed_config=types.SimpleNamespace(cp_size=2))
+
+    with pytest.raises(ValueError, match="context parallelism"):
+        DFlashStrategy().setup_extra(recipe)
 
 
 def test_dflash_setup_extra_requires_target_model_id():
@@ -679,6 +1021,26 @@ def test_dflash_pre_step_stashes_target_and_anchor_tensors():
     assert batch["_dflash_block_output_ids"].shape == (2, 8)
     assert batch["_dflash_block_targets"].shape == (2, 6)
     assert batch["_dflash_block_mask"].sum().item() == 12.0
+
+
+def test_dpace_pre_step_routes_batch_block_denominator_to_recipe():
+    strategy = _make_strategy(block_size=4, overlap_anchors=False)
+    strategy.num_blocks_per_sample = 2
+    strategy.dflash_loss_fn = DFlashDecayLoss(loss_type="dpace")
+    strategy._run_target_forward = lambda input_ids, attention_mask, start: torch.ones(input_ids.size(0), start, 3)
+    recipe = types.SimpleNamespace(mask_token_id=MASK_ID, dist_env=types.SimpleNamespace(device=torch.device("cpu")))
+    batch = {
+        "input_ids": torch.arange(32, dtype=torch.long).view(2, 16),
+        "attention_mask": torch.ones(2, 16, dtype=torch.long),
+        "loss_mask": torch.ones(2, 16, dtype=torch.long),
+    }
+
+    num_noise, num_supervised = strategy.pre_step(recipe, [batch])
+    recipe.dllm_strategy = strategy
+    num_diffusion, num_ar = DiffusionLMSFTRecipe._compute_loss_denominators(recipe, [batch], num_noise, num_supervised)
+
+    assert (num_noise, num_supervised) == (12, 4)
+    assert (num_diffusion, num_ar) == (4, 4)
 
 
 @pytest.mark.parametrize("use_fused_linear_ce", [False, True])
@@ -1002,3 +1364,322 @@ class TestBlockDiffusionStrategy:
         # Bidirectional model -> attention_mask / use_cache dropped.
         assert "attention_mask" not in result
         assert "use_cache" not in result
+
+
+# ---------------------------------------------------------------------------
+# SCDDStrategy
+# ---------------------------------------------------------------------------
+
+
+SCDD_VOCAB = 64
+SCDD_MASK_ID = 63
+
+
+def _scdd_strategy(**cfg):
+    strategy = SCDDStrategy()
+    strategy.create_loss_fn({"vocab_size": SCDD_VOCAB, "mask_token_id": SCDD_MASK_ID, **cfg})
+    return strategy
+
+
+def test_get_dllm_strategy_resolves_scdd():
+    assert isinstance(get_dllm_strategy("scdd"), SCDDStrategy)
+    assert DLLM_STRATEGIES["scdd"] is SCDDStrategy
+
+
+def test_scdd_create_loss_fn_builds_scdd_loss_from_config():
+    strategy = SCDDStrategy()
+    loss_fn = strategy.create_loss_fn(
+        {
+            "vocab_size": SCDD_VOCAB,
+            "mask_token_id": SCDD_MASK_ID,
+            "num_timesteps": 256,
+            "uniform_ratio": 0.25,
+            "schedule_shape": 2.0,
+            "schedule_peak": 0.4,
+        }
+    )
+    assert isinstance(loss_fn, SCDDLoss)
+    assert (loss_fn.num_timesteps, loss_fn.max_ratio) == (256, 0.25)
+    assert (loss_fn.gamma_shape, loss_fn.t_peak) == (2.0, 0.4)
+
+
+def test_scdd_apply_corruption_keeps_t_on_the_discrete_grid():
+    """t must land on {1/T, ..., (T-1)/T}.
+
+    SCDDLoss reads t back out of p_mask and forms s = t - 1/T, so an off-grid t
+    (the old 1 - 1e-4 clamp) puts s off-grid too. The top point t = 1 stays
+    excluded because the schedule is fully absorbed there.
+    """
+    num_timesteps = 8
+    strategy = _scdd_strategy(num_timesteps=num_timesteps)
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (256, 4))
+    loss_mask = torch.ones(256, 4, dtype=torch.long)
+
+    _, _, p_mask = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        SCDD_MASK_ID,
+        eps=1e-3,
+        block_size=None,
+        half_life_ratio=None,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    t = p_mask[:, 0]
+    steps = t * num_timesteps
+    assert torch.allclose(steps, steps.round())
+    assert int(steps.min()) >= 1
+    assert int(steps.max()) == num_timesteps - 1
+
+
+def test_scdd_create_loss_fn_requires_vocab_size():
+    with pytest.raises(ValueError, match="dllm.vocab_size"):
+        SCDDStrategy().create_loss_fn({"mask_token_id": SCDD_MASK_ID})
+
+
+def test_scdd_apply_corruption_before_create_loss_fn_raises():
+    with pytest.raises(ValueError, match="create_loss_fn"):
+        SCDDStrategy().apply_corruption(
+            torch.zeros(1, 4, dtype=torch.long),
+            torch.ones(1, 4, dtype=torch.long),
+            SCDD_MASK_ID,
+            eps=1e-3,
+            block_size=None,
+            half_life_ratio=None,
+        )
+
+
+def _scdd_recipe(mask_token_id=SCDD_MASK_ID, vocab_size=SCDD_VOCAB, cp_size=1, loss_fn=None):
+    """Minimal recipe stand-in exposing what SCDDStrategy.setup_extra reads."""
+    model = types.SimpleNamespace(config=types.SimpleNamespace(vocab_size=vocab_size))
+    return types.SimpleNamespace(
+        mask_token_id=mask_token_id,
+        dllm_loss_fn=loss_fn if loss_fn is not None else SCDDLoss(mask_token_id=0),
+        model_parts=[model],
+        distributed_config=types.SimpleNamespace(cp_size=cp_size),
+    )
+
+
+def test_scdd_setup_extra_installs_the_resolved_mask_token_id():
+    """mask_token_id may only be known after the tokenizer is built, so the
+    loss module must pick up the recipe's resolved value."""
+    loss_fn = SCDDLoss(mask_token_id=0)
+    _scdd_strategy().setup_extra(_scdd_recipe(loss_fn=loss_fn))
+    assert loss_fn.mask_token_id == SCDD_MASK_ID
+
+
+def test_scdd_setup_extra_requires_a_mask_token_id():
+    with pytest.raises(ValueError, match="mask_token_id"):
+        _scdd_strategy().setup_extra(_scdd_recipe(mask_token_id=None))
+
+
+def test_scdd_setup_extra_rejects_a_mask_id_outside_the_model_vocab():
+    with pytest.raises(ValueError, match="outside the model vocab"):
+        _scdd_strategy().setup_extra(_scdd_recipe(mask_token_id=SCDD_VOCAB + 10))
+
+
+def test_scdd_setup_extra_rejects_a_vocab_size_mismatch():
+    """The corruption domain and the ELBO's non-[MASK] domain must both be the
+    model's output domain; a stale dllm.vocab_size silently changes the loss."""
+    with pytest.raises(ValueError, match="does not match the model vocab"):
+        _scdd_strategy().setup_extra(_scdd_recipe(vocab_size=SCDD_VOCAB + 128))
+
+
+def test_scdd_setup_extra_rejects_context_parallelism():
+    """The loss scores unsharded clean targets against the model logits, so a
+    sequence-sharded forward would silently mis-align them."""
+    with pytest.raises(ValueError, match="context parallelism"):
+        _scdd_strategy().setup_extra(_scdd_recipe(cp_size=2))
+
+
+def test_scdd_apply_corruption_contract():
+    strategy = _scdd_strategy(num_timesteps=100, uniform_ratio=0.2)
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (3, 64))
+    loss_mask = torch.zeros(3, 64, dtype=torch.long)
+    loss_mask[:, 16:] = 1
+
+    noisy, noise_mask, p_mask = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        SCDD_MASK_ID,
+        eps=1e-3,
+        block_size=None,
+        half_life_ratio=None,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    assert noisy.shape == input_ids.shape and noise_mask.shape == input_ids.shape
+    assert p_mask.shape == input_ids.shape and p_mask.dtype == torch.float32
+    # Only supervised positions may be corrupted.
+    assert torch.equal(noisy[loss_mask == 0], input_ids[loss_mask == 0])
+    assert not noise_mask[loss_mask == 0].any()
+    # p_mask carries one diffusion time per sequence, snapped to the 1/T grid.
+    t = p_mask[:, 0]
+    assert torch.equal(p_mask, t[:, None].expand_as(p_mask))
+    assert ((t > 0) & (t <= 1.0)).all()
+    torch.testing.assert_close(t * 100, (t * 100).round(), rtol=0, atol=1e-3)
+
+
+def test_scdd_apply_corruption_produces_both_channels():
+    """The point of SCDD is that some corrupted positions are wrong-but-visible
+    tokens, not just [MASK]."""
+    strategy = _scdd_strategy(num_timesteps=1000, uniform_ratio=0.4)
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (16, 256))
+    loss_mask = torch.ones_like(input_ids)
+    noisy, noise_mask, _ = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        SCDD_MASK_ID,
+        eps=1e-3,
+        block_size=None,
+        half_life_ratio=None,
+        generator=torch.Generator().manual_seed(1),
+    )
+    absorbed = noisy == SCDD_MASK_ID
+    transitioned = noise_mask & ~absorbed
+    assert absorbed.any() and transitioned.any()
+    assert (noisy[transitioned] != input_ids[transitioned]).all()
+
+
+def test_scdd_apply_corruption_is_seed_reproducible():
+    strategy = _scdd_strategy()
+    args = (torch.randint(0, SCDD_VOCAB - 1, (2, 32)), torch.ones(2, 32, dtype=torch.long), SCDD_MASK_ID)
+    kwargs = dict(eps=1e-3, block_size=None, half_life_ratio=None)
+    a = strategy.apply_corruption(*args, generator=torch.Generator().manual_seed(5), **kwargs)
+    b = strategy.apply_corruption(*args, generator=torch.Generator().manual_seed(5), **kwargs)
+    for x, y in zip(a, b):
+        assert torch.equal(x, y)
+
+
+def test_scdd_prepare_batch_feeds_the_corrupted_tokens():
+    strategy = _scdd_strategy()
+    clean = torch.randint(0, SCDD_VOCAB - 1, (2, 8))
+    noisy = clean.clone()
+    noisy[:, 0] = SCDD_MASK_ID
+    batch = {"input_ids": clean, "attention_mask": torch.ones(2, 8, dtype=torch.long)}
+    out = strategy.prepare_batch(batch, noisy, noisy != clean, clean)
+    assert torch.equal(out["input_ids"], noisy)
+    assert "attention_mask" not in out
+
+
+def test_scdd_normalizes_over_all_supervised_tokens():
+    """The SCDD ELBO has a term at every supervised position, corrupted or not,
+    so the denominator must not be the corrupted-only count."""
+    assert SCDDStrategy().normalization_mode == "supervised"
+
+
+def test_scdd_corruption_does_not_touch_the_global_rng():
+    """TP/CP peers share a data shard but not their global RNG state, so the
+    corruption must come exclusively from the step-seeded generator — otherwise
+    peers feed the sharded forward different inputs."""
+    strategy = _scdd_strategy()
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (2, 32))
+    loss_mask = torch.ones(2, 32, dtype=torch.long)
+    kwargs = dict(eps=1e-3, block_size=None, half_life_ratio=None)
+
+    torch.manual_seed(0)
+    expected = torch.rand(4)
+
+    torch.manual_seed(0)
+    peer_a = strategy.apply_corruption(
+        input_ids, loss_mask, SCDD_MASK_ID, generator=torch.Generator().manual_seed(1234), **kwargs
+    )
+    assert torch.equal(torch.rand(4), expected), "global RNG was consumed"
+
+    torch.manual_seed(999)  # a peer with a diverged global RNG state
+    peer_b = strategy.apply_corruption(
+        input_ids, loss_mask, SCDD_MASK_ID, generator=torch.Generator().manual_seed(1234), **kwargs
+    )
+    for a, b in zip(peer_a, peer_b):
+        assert torch.equal(a, b)
+
+
+def test_scdd_corruption_and_loss_agree_on_the_p_mask_contract():
+    """End-to-end guard on the strategy<->loss handshake: the strategy writes
+    the diffusion time into ``p_mask`` and the loss reads the schedule back out
+    of it. A drift in either direction silently trains the wrong objective."""
+    strategy = _scdd_strategy(num_timesteps=1000, uniform_ratio=0.2)
+    loss_fn = strategy.create_loss_fn(
+        {"vocab_size": SCDD_VOCAB, "mask_token_id": SCDD_MASK_ID, "num_timesteps": 1000, "uniform_ratio": 0.2}
+    )
+    input_ids = torch.randint(0, SCDD_VOCAB - 1, (4, 32))
+    loss_mask = torch.ones(4, 32, dtype=torch.long)
+
+    noisy, noise_mask, p_mask = strategy.apply_corruption(
+        input_ids,
+        loss_mask,
+        SCDD_MASK_ID,
+        eps=1e-3,
+        block_size=None,
+        half_life_ratio=None,
+        generator=torch.Generator().manual_seed(7),
+    )
+
+    logits = torch.randn(4, 32, SCDD_VOCAB, requires_grad=True)
+    out = loss_fn(
+        logits=logits,
+        target_ids=input_ids,
+        noise_mask=noise_mask,
+        p_mask=p_mask,
+        loss_mask=loss_mask,
+        noisy_input_ids=noisy,
+        num_diffusion_tokens=int(loss_mask.sum()),
+    )
+    assert torch.isfinite(out.total_loss)
+    out.total_loss.backward()
+    assert torch.isfinite(logits.grad).all() and logits.grad.abs().sum() > 0
+
+
+def test_scdd_create_loss_fn_threads_chunk_size():
+    """The loss's memory knob must be reachable from the recipe YAML, including
+    the explicit ``null`` that turns chunking off."""
+    strategy = SCDDStrategy()
+    base = {"vocab_size": SCDD_VOCAB, "mask_token_id": SCDD_MASK_ID}
+    assert strategy.create_loss_fn(base).chunk_size == 1024
+    assert strategy.create_loss_fn({**base, "chunk_size": 256}).chunk_size == 256
+    assert strategy.create_loss_fn({**base, "chunk_size": None}).chunk_size is None
+
+
+def test_shipped_scdd_recipe_builds_its_strategy_and_loss():
+    """The go-to recipe must stay loadable: a typo in dllm.mode or a schedule key
+    would otherwise only surface on an 8-GPU run."""
+    import yaml
+
+    config_path = REPO_ROOT / "examples" / "dllm_sft" / "llada_scdd.yaml"
+    cfg = yaml.safe_load(config_path.read_text())
+    dllm_cfg = cfg["dllm"]
+
+    strategy = get_dllm_strategy(dllm_cfg["mode"])
+    assert isinstance(strategy, SCDDStrategy)
+    loss_fn = strategy.create_loss_fn(dllm_cfg)
+    assert isinstance(loss_fn, SCDDLoss)
+    # Schedule values match the authors' released checkpoint config.
+    assert (loss_fn.num_timesteps, loss_fn.max_ratio) == (1000, 0.1)
+    assert (loss_fn.gamma_shape, loss_fn.t_peak) == (1.0, 0.5)
+    assert loss_fn.max_ratio > 0, "uniform_ratio 0 would silently degenerate SCDD to MDLM"
+    # The mask id must be inside the vocabulary the uniform channel samples over.
+    assert 0 <= dllm_cfg["mask_token_id"] < dllm_cfg["vocab_size"]
+    assert cfg["distributed"]["cp_size"] == 1, "SCDD rejects context parallelism"
+
+
+def test_shipped_uno_recipe_builds_its_strategy_and_loss():
+    """The go-to recipe must stay loadable and consistent: a mismatched curriculum or batch would
+    otherwise only surface on an 8-GPU run."""
+    import yaml
+
+    config_path = REPO_ROOT / "examples" / "dllm_sft" / "qwen3_8b_uno.yaml"
+    cfg = yaml.safe_load(config_path.read_text())
+    dllm_cfg = cfg["dllm"]
+
+    strategy = get_dllm_strategy(dllm_cfg["mode"])
+    assert isinstance(strategy, UnoStrategy)
+    loss_fn = strategy.create_loss_fn(dllm_cfg)
+    assert isinstance(loss_fn, UnoDistillLoss)
+    # Released Uno-Qwen3-8B recipe: TV only, curriculum 2 -> 16, 28,125 steps, LoRA r=128 / alpha=2048.
+    assert (loss_fn.tv_weight, loss_fn.kl_weight) == (1.0, 0.0)
+    assert strategy._stage_block_sizes == [2, 4, 6, 8, 12, 16]
+    assert strategy._stage_end_steps[-1] == cfg["step_scheduler"]["max_steps"] == 28125
+    tokens_per_step = cfg["step_scheduler"]["global_batch_size"] * cfg["dataset"]["seq_length"]
+    assert dllm_cfg["block_curriculum"]["tokens_per_step"] == tokens_per_step
+    assert (cfg["peft"]["dim"], cfg["peft"]["alpha"]) == (128, 2048)
+    assert cfg["distributed"]["cp_size"] == 1, "Uno rejects context parallelism"

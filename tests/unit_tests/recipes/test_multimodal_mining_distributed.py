@@ -27,6 +27,8 @@ import torch.multiprocessing as mp
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.retrieval.mine_hard_negatives import MineHardNegativesRecipe
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Encoder:
     def encode_queries(self, queries, *, batch_size):

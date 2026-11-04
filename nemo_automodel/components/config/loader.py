@@ -617,8 +617,9 @@ class ConfigNode:
                     redact_sensitive=redact_sensitive,
                     use_orig_values=use_orig_values,
                 )
-            # Lists
-            if isinstance(value, list):
+            # Lists and tuples (CLI values such as `(0.9, 0.95)` parse to tuples); emit plain
+            # sequences so the result stays loadable with yaml.safe_load.
+            if isinstance(value, (list, tuple)):
                 return [_convert(None, v) for v in value]
             # Dicts (shouldn't normally appear because we wrap into ConfigNode, but handle defensively)
             if isinstance(value, dict):
@@ -850,6 +851,6 @@ def load_yaml_config(path: str | Path) -> "ConfigNode":
     Returns:
         ConfigNode: A configuration node representing the YAML file.
     """
-    with open(path, "r") as f:
+    with Path(path).open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     return ConfigNode(raw)

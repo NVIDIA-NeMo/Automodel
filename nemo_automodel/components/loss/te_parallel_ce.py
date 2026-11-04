@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
 
 import torch
 
@@ -117,7 +116,7 @@ class TEParallelCrossEntropy:
         self,
         ignore_index: int = -100,
         reduction: str = "sum",
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_group: torch.distributed.ProcessGroup | None = None,
     ):
         """
         Cross entropy loss module based on TransformerEngine's parallel cross entropy triton kernel.
@@ -135,8 +134,8 @@ class TEParallelCrossEntropy:
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        num_label_tokens: Optional[int] = None,
+        mask: torch.Tensor | None = None,
+        num_label_tokens: int | None = None,
     ) -> torch.Tensor:
         """
         Compute parallel cross entropy loss that matches PyTorch's cross_entropy behavior.
@@ -149,6 +148,11 @@ class TEParallelCrossEntropy:
 
         Returns:
             Computed loss tensor
+
+        Note:
+            Per-token upstream gradients are supported for unreduced losses.
+            This class does not accept ``loss_weights``, so
+            ``_supports_loss_weights`` still rejects it for sample-weighted recipes.
         """
         if not HAVE_TE_PARALLEL_CE:
             raise ImportError(MISSING_TE_PARALLEL_CE_MSG)
@@ -186,7 +190,7 @@ class TEParallelCrossEntropy:
         elif self.reduction == "sum":
             loss = te_loss.sum()
             if num_label_tokens is not None:
-                loss = loss / num_label_tokens
+                loss = loss * 0.0 if num_label_tokens == 0 else loss / num_label_tokens
             return loss
         else:
             raise ValueError(f"Invalid reduction: {self.reduction}. Must be one of 'none', 'mean', 'sum'")

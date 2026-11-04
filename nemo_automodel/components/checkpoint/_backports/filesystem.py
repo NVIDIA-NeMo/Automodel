@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from enum import Enum
 from io import UnsupportedOperation
 from pathlib import Path
-from typing import IO, Any, Callable, Optional, Union, cast
+from typing import IO, Any, Callable, Union, cast
 
 import torch
 from torch import Tensor
@@ -102,7 +102,7 @@ class _StorageInfo:
     relative_path: str
     offset: int
     length: int
-    transform_descriptors: Optional[Sequence[str]] = None
+    transform_descriptors: Sequence[str] | None = None
 
     def __getstate__(self):
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -176,7 +176,7 @@ class _OverlappingCpuLoader(_TensorLoader):
     def __init__(
         self,
         resolve_fun: Callable,
-        stream: Optional[torch.Stream] = None,
+        stream: torch.Stream | None = None,
         inflight_threshhold: int = 1_000_000,
     ) -> None:
         self.resolve_fun = resolve_fun
@@ -262,7 +262,7 @@ class _StorageWriterTransforms:
     learning and gathering feedback.
     """
 
-    def __init__(self, extensions: Optional[Sequence[StreamTransformExtension]] = None) -> None:
+    def __init__(self, extensions: Sequence[StreamTransformExtension] | None = None) -> None:
         """
         If the extensions arg is None, this means the implementation
         should provide whatever defaults it chooses.  An empty
@@ -690,7 +690,7 @@ class _FileSystemWriter(StorageWriter):
         thread_count: int = 1,
         per_thread_copy_ahead: int = 10_000_000,
         overwrite: bool = True,
-        _extensions: Optional[Sequence[StreamTransformExtension]] = None,
+        _extensions: Sequence[StreamTransformExtension] | None = None,
         serialization_format: SerializationFormat = SerializationFormat.TORCH_SAVE,
         *args: Any,
         **kwargs: Any,
@@ -860,7 +860,7 @@ class _FileSystemWriter(StorageWriter):
 
         self.fs.rename(tmp_path, self.metadata_path)
 
-    def storage_meta(self) -> Optional[StorageMeta]:
+    def storage_meta(self) -> StorageMeta | None:
         return StorageMeta(checkpoint_id=self.checkpoint_id, save_id=self.save_id)
 
     @property
@@ -886,7 +886,7 @@ class _StorageReaderTransforms:
     learning and gathering feedback.
     """
 
-    def __init__(self, extension_registry: Optional[ExtensionRegistry] = None) -> None:
+    def __init__(self, extension_registry: ExtensionRegistry | None = None) -> None:
         self.extension_registry = ExtensionRegistry() if extension_registry is None else extension_registry
 
     def transform_load_stream(
@@ -907,7 +907,7 @@ class FileSystemReader(StorageReader):
     def __init__(
         self,
         path: Union[str, os.PathLike],
-        _extension_registry: Optional[ExtensionRegistry] = None,  # EXPERIMENTAL
+        _extension_registry: ExtensionRegistry | None = None,  # EXPERIMENTAL
     ) -> None:
         super().__init__()
         self.fs = FileSystem()
@@ -1039,7 +1039,7 @@ class FileSystemWriter(_FileSystemWriter, BlockingAsyncStager):
         per_thread_copy_ahead: int = 10_000_000,
         cache_staged_state_dict: bool = False,
         overwrite: bool = True,
-        _extensions: Optional[Sequence[StreamTransformExtension]] = None,
+        _extensions: Sequence[StreamTransformExtension] | None = None,
         serialization_format: SerializationFormat = SerializationFormat.TORCH_SAVE,
     ) -> None:
         """

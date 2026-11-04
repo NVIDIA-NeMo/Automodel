@@ -27,6 +27,7 @@ from nemo_automodel._transformers.retrieval import BiEncoderModel
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.utils.model_utils import (
+    FreezeConfig,
     apply_parameter_freezing,
 )
 from nemo_automodel.recipes.retrieval import train_bi_encoder
@@ -86,7 +87,7 @@ def setup_model(monkeypatch: pytest.MonkeyPatch) -> _VisualRetriever:
     def instantiate(self: ConfigNode, **kwargs: Any) -> _VisualRetriever:
         freeze_config = kwargs.get("freeze_config")
         if freeze_config is not None:
-            assert isinstance(freeze_config, dict)
+            assert isinstance(freeze_config, FreezeConfig)
             apply_parameter_freezing(model, freeze_config)
         return model
 

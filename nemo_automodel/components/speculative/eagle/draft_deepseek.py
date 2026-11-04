@@ -43,8 +43,6 @@ flash-attention remain follow-ups (orthogonal to the MLA attention this file add
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
@@ -422,9 +420,9 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
         input_ids: torch.Tensor,
         projected_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        cache_hidden: Optional[list[list[torch.Tensor]]] = None,
-        seq_lens: Optional[torch.Tensor] = None,
+        position_ids: torch.Tensor | None = None,
+        cache_hidden: list[list[torch.Tensor]] | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one EAGLE-3 TTT draft step (eager attention).
 

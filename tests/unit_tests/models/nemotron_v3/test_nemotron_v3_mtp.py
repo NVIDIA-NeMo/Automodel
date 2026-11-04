@@ -271,6 +271,22 @@ class TestMTPDisabled:
         assert out.loss is not None
         assert out.logits.shape == (2, 8, config.vocab_size)
 
+    @pytest.mark.run_only_on("GPU")
+    def test_compute_logits_false_skips_lm_head_and_returns_hidden_states(self, backend, monkeypatch):
+        model, config = _make_model(backend)
+        model.eval()
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+
+        def reject_lm_head(*args, **kwargs):
+            raise AssertionError("LM head must not run when compute_logits=False")
+
+        monkeypatch.setattr(model.lm_head, "forward", reject_lm_head)
+        out = model(input_ids, compute_logits=False, output_hidden_states=True)
+
+        assert out.logits.shape == (2, 8, 0)
+        assert out.hidden_states is not None
+        assert out.hidden_states[-1].shape == (2, 8, config.hidden_size)
+
 
 class TestMTPEnabled:
     def test_module_built_with_correct_layer_count(self, backend):

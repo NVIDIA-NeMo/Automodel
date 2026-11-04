@@ -15,7 +15,7 @@
 """State-dict adapter for the native Thinking Machines Inkling checkpoint."""
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -168,7 +168,7 @@ class InklingStateDictAdapter(StateDictAdapter):
     def to_hf(
         self,
         state_dict: dict[str, Any],
-        exclude_key_regex: Optional[str] = None,
+        exclude_key_regex: str | None = None,
         quantization: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
@@ -191,7 +191,7 @@ class InklingStateDictAdapter(StateDictAdapter):
     def from_hf(
         self,
         hf_state_dict: dict[str, Any],
-        device_mesh: Optional[DeviceMesh] = None,
+        device_mesh: DeviceMesh | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Load raw Inkling keys or an already-converted Transformers state dict."""
@@ -222,6 +222,12 @@ class InklingStateDictAdapter(StateDictAdapter):
 
         for key, value in hf_state_dict.items():
             if key.startswith("model.mtp.") or key.startswith("mtp.") or key.endswith("_scale_inv"):
+                continue
+
+            # Transformers 5.18 owns the embedding norm inside its embedding
+            # module; published checkpoints keep the separate raw norm key.
+            if key == "model.language_model.embed_tokens.embed_norm.weight":
+                state_dict["model.language_model.embed_norm.weight"] = value
                 continue
 
             if key.startswith(("model.llm.", "model.audio.", "model.visual.")):

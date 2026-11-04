@@ -1,0 +1,128 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Long-context text execution target, requiring the optional TE/HybridEP stack.
+# Override --dataset.dataset_path with the prepacked data.
+# Freeze eligible document order with seed1234 before packing, then packed-row
+# order with seed5678; the prepacked dataset must preserve document boundaries,
+# shifted targets, padding and position metadata. No reshuffle occurs here.
+# Four GB200 GPUs: TP1/PP1/CP4/EP4, inferred DP1, LBS2/GBS2, GA1. TE CP uses
+# all-to-all for the learned sinks, so CP must divide the four key/value heads.
+# BF16 resident bulk with FP32 protected head/sinks and FusedAdam FP32 masters;
+# BF16 moments and int16 master remainders require checkpoint/resume validation.
+# CE-only explicit aux coefficient0;128K is within source maxpositions262144.
+# This recipe is not evidence of a completed full-depth128K run.
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+seed: 1234
+step_scheduler:
+  global_batch_size: 2
+  local_batch_size: 2
+  max_steps: 50
+  num_epochs: null
+  ckpt_every_steps: 50
+  val_every_steps: 1000
+  gc_every_steps: 5
+  log_remote_every_steps: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: RecursiveSI/flint
+  dtype: bfloat16
+  config:
+    router_aux_loss_coef: 0.0
+    residual_dtype: fp32
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  trust_remote_code: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    gate_precision: null
+    enable_fsdp_optimizations: false
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 4
+  pp_size: 1
+  ep_size: 4
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+loss_fn:
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+  chunk_len: 256
+  compile: true
+  reduction: sum
+dataset:
+  _target_: datasets.load_from_disk
+  dataset_path: data/frozen_tulu3_packed128k
+packed_sequence:
+  packed_sequence_size: 131072
+  packing_strategy: thd
+  prepacked: true
+  pad_to_multiple_of: 64
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  batch_size: 2
+  num_workers: 0
+  pin_memory: true
+  drop_last: true
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 5.0e-06
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: float32
+  store_param_remainders: true
+  exp_avg_dtype: bfloat16
+  exp_avg_sq_dtype: bfloat16
+lr_scheduler:
+  lr_decay_style: constant
+clip_grad_norm:
+  max_norm: 1.0
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/flint_tulu3_packed128k_te
+  model_save_format: safetensors
+  save_consolidated: final
+  is_async: false
+  cpu_offload: false
+  v4_compatible: false
+  restore_from: null
+compile:
+  enabled: false
+wandb:
+  enable: false
+
+ci:
+  # Excluded from automatic GPU CI; requires user-provided training data.
+  deprecated: true
+  cluster_tag: gb200
+  recipe_owner: snowmanwwg
+  time: "02:00:00"
+  nodes: 1

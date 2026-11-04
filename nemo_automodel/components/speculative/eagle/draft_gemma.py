@@ -68,7 +68,9 @@ the draft ``lm_head`` and vocab mapping) is inherited unchanged from
 
 from __future__ import annotations
 
+import copy
 import logging
+from typing import Any
 
 from transformers import PretrainedConfig
 
@@ -124,6 +126,7 @@ def _normalize_gemma4_draft_config(config: PretrainedConfig) -> None:
     # 2. RoPE: flatten the nested per-attention-type schedule to a standard
     #    full-rotary Llama RoPE on the global base. Clearing ``rope_parameters``
     #    routes ``_get_rope_config`` down the flat ``rope_theta`` path.
+    full_attention_config = config.per_layer_config["full_attention"]
     config.rope_theta = _extract_global_rope_theta(config)
     config.rope_parameters = None
     config.rope_scaling = None
@@ -131,6 +134,9 @@ def _normalize_gemma4_draft_config(config: PretrainedConfig) -> None:
     # rotary; the target's global-attention ``partial_rotary_factor`` (0.25) and
     # larger ``global_head_dim`` (512) apply only inside the frozen target.
     config.partial_rotary_factor = 1.0
+    config.head_dim = full_attention_config.head_dim
+    config.num_key_value_heads = full_attention_config.num_key_value_heads
+    config.allow_global_per_layer_attribute_access = True
 
     # 3. MoE targets: the draft is a dense model, but on a MoE Gemma4
     #    (``enable_moe_block``) the config ``intermediate_size`` is the *per-expert*
@@ -145,6 +151,25 @@ def _normalize_gemma4_draft_config(config: PretrainedConfig) -> None:
     if getattr(config, "enable_moe_block", False):
         top_k = int(getattr(config, "top_k_experts", None) or 1)
         config.intermediate_size = int(config.intermediate_size) * top_k
+
+
+def gemma4_eagle4_draft_config(config: PretrainedConfig) -> dict[str, Any]:
+    """Return the Llama-style EAGLE-4 draft config of a Gemma4 target.
+
+    EAGLE-4 drafts are built from a ``LlamaConfig`` (the ``LlamaForCausalLMEagle4``
+    layout) rather than ``Gemma4TextConfig``, whose validators tie ``layer_types``
+    and ``per_layer_config`` to the target's layer count and force the last layer
+    to full attention. The Gemma4 quirks are reconciled exactly as for the EAGLE-3
+    draft (:func:`_normalize_gemma4_draft_config`, on a copy) and the flattened
+    global RoPE is written as a flat ``rope_parameters``.
+    """
+    normalized = copy.deepcopy(config)
+    _normalize_gemma4_draft_config(normalized)
+    draft_config = normalized.to_dict()
+    for key in ("model_type", "per_layer_config", "rope_scaling", "rope_theta"):
+        draft_config.pop(key, None)
+    draft_config["rope_parameters"] = {"rope_type": "default", "rope_theta": normalized.rope_theta}
+    return draft_config
 
 
 class Gemma4Eagle3DraftModel(LlamaEagle3DraftModel):

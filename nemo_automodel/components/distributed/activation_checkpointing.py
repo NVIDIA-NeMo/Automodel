@@ -37,12 +37,29 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
+    CheckpointWrapper,
     checkpoint_wrapper,
 )
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.shared.import_utils import get_torch_version, safe_import
+
+__all__ = [
+    "SELECTIVE_AC_WRAPPER_FLAG",
+    "apply_full_layer_checkpointing_to_layers",
+    "apply_selective_checkpointing_to_layers",
+    "apply_submodule_checkpointing",
+    "detect_kv_sharing_and_maybe_disable_cache",
+    "ensure_fsdp_ops_sac_ignored",
+    "ensure_profiler_ops_sac_ignored",
+    "ignore_sac_ops",
+    "is_selective_activation_checkpointing",
+    "make_selective_checkpoint_context_fn",
+    "sdpa_backend_snapshot_context_fn",
+    "transformer_engine_attention_backend_snapshot_context_fn",
+    "unwrap_checkpoint_wrapper",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +351,15 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     # flat communication buffer. When forward prefetch has already unsharded
     # the parameters, these setup ops occur only during recomputation. They do
     # not produce model activations: the FSDP copy ops populate the allocations.
+    #
+    # Parameters sharded on a non-zero dim (``fsdp_placement.dim != 0``, e.g.
+    # MoE expert weights under an expert-parallel FSDP shard axis) take a second
+    # copy-out path in ``foreach_all_gather_copy_out``: ``torch.chunk`` (which
+    # dispatches as ``aten.split.Tensor``) followed by ``torch.cat(..., out=)``
+    # into the unsharded parameter. Those two ops are parameter management as
+    # well and otherwise fail SAC replay with ``aten.split.Tensor encountered
+    # during backward but not found in storage`` whenever the expert unit is
+    # resharded between forward and recompute (per-microbatch gradient sync).
     ignore_sac_ops(
         list(
             map(
@@ -347,10 +373,26 @@ def ensure_fsdp_ops_sac_ignored() -> None:
                     "aten.empty.memory_format",
                     "aten.empty_like",
                     "aten.view",
+                    "aten.split.Tensor",
+                    "aten.cat.out",
                 ],
             )
         )
     )
+
+
+def ensure_moe_recompute_cache_ops_sac_ignored() -> None:
+    """Keep the deferred expert down projection's placeholder out of SAC's op-stream replay.
+
+    ``BackendConfig.dispatcher_recompute_cache="moe_tail"`` skips the down-projection GEMM in a checkpoint
+    recompute whose HybridEP combine is served from the forward's cache: ``moe/experts._DownProjGroupedMM``
+    then only allocates its output (``aten.new_empty``). That allocation exists in the recompute alone, and
+    selective checkpointing — including the router-saving context ``apply_ac`` installs under
+    ``ignore_router_for_ac`` — indexes every recompute op against the forward's stream
+    (``aten.new_empty.default encountered during backward but not found in storage``). The placeholder
+    carries no activation; it executes outside the accounting like FSDP's recompute-only allocations above.
+    """
+    ignore_sac_ops([getattr(getattr(torch.ops.aten, "new_empty", None), "default", None)])
 
 
 def make_selective_checkpoint_context_fn():
@@ -640,6 +682,26 @@ def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Mo
         if _replace_child_module(child, target, replacement):
             return True
     return False
+
+
+def apply_full_layer_checkpointing_to_layers(model: nn.Module, layers: List[nn.Module]) -> None:
+    """Wrap transformer layers with non-reentrant activation checkpointing."""
+    context_fn = functools.partial(
+        transformer_engine_attention_backend_snapshot_context_fn,
+        sdpa_backend_snapshot_context_fn,
+    )
+    for index, layer in enumerate(layers):
+        if isinstance(layer, CheckpointWrapper):
+            continue
+        wrapped_layer = checkpoint_wrapper(
+            layer,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            context_fn=context_fn,
+            preserve_rng_state=True,
+        )
+        if not _replace_child_module(model, layer, wrapped_layer):
+            raise RuntimeError(f"Could not replace layer {index} with an activation checkpoint wrapper.")
+        layers[index] = wrapped_layer
 
 
 def detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:

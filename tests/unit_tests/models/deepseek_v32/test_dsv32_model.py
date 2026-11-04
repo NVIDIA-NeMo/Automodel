@@ -15,6 +15,7 @@
 import importlib.util
 import sys
 import types
+from dataclasses import replace
 from unittest.mock import patch
 
 import torch
@@ -349,7 +350,10 @@ class TestDeepseekV32ForCausalLM:
         model = DeepseekV32ForCausalLM.from_config(cfg, backend=backend)
 
         assert isinstance(model, DeepseekV32ForCausalLM)
-        assert model.backend == backend
+        # V3.2 installs the model-owned fp32 router default on a copy; the caller's
+        # backend is otherwise threaded through unchanged and is never mutated.
+        assert model.backend == replace(backend, gate_precision=torch.float32)
+        assert backend.gate_precision is None
 
     def test_from_config_with_moe_config(self):
         """Test from_config with explicit MoE config."""

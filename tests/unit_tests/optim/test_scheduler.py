@@ -873,6 +873,125 @@ def test_load_state_dict_backward_compatibility(dummy_optimizer, caplog):
     assert scheduler.wd_incr_style == "cosine"
 
 
+def _resume_scheduler(optimizer, **overrides):
+    """Build a scheduler with the defaults used by the resume tests."""
+    kwargs = dict(
+        optimizer=optimizer,
+        init_lr=0.0,
+        max_lr=1.0,
+        min_lr=0.0,
+        lr_warmup_steps=10,
+        lr_decay_steps=100,
+        lr_decay_style="cosine",
+        start_wd=0.0,
+        end_wd=0.1,
+        wd_incr_steps=100,
+        wd_incr_style="linear",
+    )
+    kwargs.update(overrides)
+    return OptimizerParamScheduler(**kwargs)
+
+
+def test_load_state_dict_applies_checkpoint_weight_decay(dummy_optimizer):
+    """The weight decay written into the optimizer must follow the restored schedule.
+
+    ``step`` resolves the weight decay and writes it into ``param_groups``, so every
+    restored field has to be in place before it runs.  The training loop calls
+    ``optimizer.step()`` before ``scheduler.step(1)``, so a stale value here is applied
+    to a real update.
+    """
+    checkpoint = {
+        "max_lr": 1.0,
+        "min_lr": 0.0,
+        "lr_warmup_steps": 10,
+        "lr_decay_steps": 100,
+        "lr_decay_style": "cosine",
+        "num_steps": 50,
+        "start_wd": 0.0,
+        "end_wd": 0.1,
+        "wd_incr_steps": 100,
+        "wd_incr_style": "linear",
+    }
+    # Resume with a different weight-decay schedule in the constructor; the checkpoint
+    # values win, which is what use_checkpoint_opt_param_scheduler=True is for.
+    scheduler = _resume_scheduler(dummy_optimizer, end_wd=0.9, wd_incr_steps=1000)
+
+    scheduler.load_state_dict(checkpoint)
+
+    # 50/100 * 0.1 from the checkpoint, not 50/1000 * 0.9 == 0.045 from the constructor.
+    assert scheduler.get_wd() == pytest.approx(0.05)
+    for param_group in dummy_optimizer.param_groups:
+        assert param_group["weight_decay"] == pytest.approx(0.05)
+
+
+def test_load_state_dict_applies_checkpoint_learning_rate(dummy_optimizer):
+    """The learning rate written into the optimizer must follow the restored schedule."""
+    checkpoint = {
+        "max_lr": 1.0,
+        "min_lr": 0.0,
+        "lr_warmup_steps": 10,
+        "lr_decay_steps": 100,
+        "lr_decay_style": "cosine",
+        "num_steps": 50,
+        "start_wd": 0.0,
+        "end_wd": 0.1,
+        "wd_incr_steps": 100,
+        "wd_incr_style": "linear",
+    }
+    scheduler = _resume_scheduler(dummy_optimizer, max_lr=0.5, lr_decay_steps=200)
+
+    scheduler.load_state_dict(checkpoint)
+
+    expected = scheduler.get_lr(dummy_optimizer.param_groups[0])
+    for param_group in dummy_optimizer.param_groups:
+        assert param_group["lr"] == pytest.approx(expected)
+
+
+def test_load_state_dict_step_count_is_absolute(dummy_optimizer):
+    """``num_steps`` in the checkpoint is a position, not a delta, so loading is idempotent."""
+    checkpoint = {
+        "max_lr": 1.0,
+        "min_lr": 0.0,
+        "lr_warmup_steps": 10,
+        "lr_decay_steps": 100,
+        "lr_decay_style": "cosine",
+        "num_steps": 50,
+        "start_wd": 0.0,
+        "end_wd": 0.1,
+        "wd_incr_steps": 100,
+        "wd_incr_style": "linear",
+    }
+    scheduler = _resume_scheduler(dummy_optimizer)
+
+    scheduler.load_state_dict(checkpoint)
+    assert scheduler.num_steps == 50
+
+    scheduler.load_state_dict(checkpoint)
+    assert scheduler.num_steps == 50
+
+
+def test_load_state_dict_step_count_ignores_prior_progress(dummy_optimizer):
+    """A scheduler that has already advanced must land on the checkpoint's step, not past it."""
+    checkpoint = {
+        "max_lr": 1.0,
+        "min_lr": 0.0,
+        "lr_warmup_steps": 10,
+        "lr_decay_steps": 100,
+        "lr_decay_style": "cosine",
+        "num_steps": 50,
+        "start_wd": 0.0,
+        "end_wd": 0.1,
+        "wd_incr_steps": 100,
+        "wd_incr_style": "linear",
+    }
+    scheduler = _resume_scheduler(dummy_optimizer)
+    scheduler.step(20)
+
+    scheduler.load_state_dict(checkpoint)
+
+    assert scheduler.num_steps == 50
+
+
 def test_load_state_dict_partial_wd_info(dummy_optimizer, caplog):
     """
     Tests `load_state_dict` when weight decay information is missing from the state dict.

@@ -60,3 +60,6 @@ checkpoint:
   checkpoint_dir: /data/runs/vispec_qwen2_5_vl_stage1/checkpoints
   model_save_format: safetensors
   save_consolidated: final
+
+ci:
+  cluster_tag: h100

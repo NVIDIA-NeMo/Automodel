@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 OPEN_TOKEN = "<|open|>"
 CLOSE_TOKEN = "<|close|>"
@@ -34,7 +34,7 @@ class EncodeSegment:
 
 
 class _ImagePromptState:
-    def __init__(self, image_prompts: Optional[list[str]] = None):
+    def __init__(self, image_prompts: list[str] | None = None):
         self.image_prompts = image_prompts
         self.index = 0
 
@@ -196,7 +196,7 @@ def deep_sort_dict(obj: Any) -> Any:
     return obj
 
 
-def normalize_tool_arguments(arguments: Any) -> tuple[dict[str, Any], Optional[str]]:
+def normalize_tool_arguments(arguments: Any) -> tuple[dict[str, Any], str | None]:
     if arguments is None:
         return {}, None
     if isinstance(arguments, dict):
@@ -478,11 +478,11 @@ def _render_tool_declare(tools: Any, *, dynamic: bool = False) -> list[EncodeSeg
 
 def build_chat_segments(
     messages: list[Any],
-    tools: Optional[list[dict]] = None,
+    tools: list[dict] | None = None,
     *,
     add_generation_prompt: bool = True,
     thinking: bool = True,
-    image_prompts: Optional[list[str]] = None,
+    image_prompts: list[str] | None = None,
     **kwargs: Any,
 ) -> list[EncodeSegment]:
     # Re-sort tool results by tool_call_id at the lowest layer so every caller

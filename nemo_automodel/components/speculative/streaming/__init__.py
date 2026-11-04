@@ -38,8 +38,16 @@ This package owns:
   and :class:`~nemo_automodel.components.speculative.streaming.loader.FeatureDataLoader`
   -- the EAGLE-3 produce and consume sides that turn a target forward into
   refs and refs back into ``Eagle3TargetBatch`` instances.
+- :class:`~nemo_automodel.components.speculative.streaming.async_pipeline.AsyncFeaturePipeline`
+  -- runs the producer in a background thread so target forward and draft
+  backward overlap; :class:`~nemo_automodel.components.speculative.streaming.stores.shared_dir.SharedDirFeatureStore`
+  adds a POSIX shared-mount data plane for cross-process producer/consumer.
 """
 
+from nemo_automodel.components.speculative.streaming.async_pipeline import (
+    AsyncFeaturePipeline,
+    PromptSource,
+)
 from nemo_automodel.components.speculative.streaming.loader import FeatureDataLoader
 from nemo_automodel.components.speculative.streaming.producer import FeatureProducer
 from nemo_automodel.components.speculative.streaming.queue import (
@@ -59,8 +67,10 @@ from nemo_automodel.components.speculative.streaming.store import (
     StoreHealth,
 )
 from nemo_automodel.components.speculative.streaming.stores.local import LocalFeatureStore
+from nemo_automodel.components.speculative.streaming.stores.shared_dir import SharedDirFeatureStore
 
 __all__ = [
+    "AsyncFeaturePipeline",
     "FeatureAlgorithm",
     "FeatureDataLoader",
     "FeatureProducer",
@@ -68,8 +78,10 @@ __all__ = [
     "FeatureStore",
     "Lease",
     "LocalFeatureStore",
+    "PromptSource",
     "SampleRef",
     "SampleRefQueue",
+    "SharedDirFeatureStore",
     "StoreHandle",
     "StoreHealth",
     "VisibilityTimeout",

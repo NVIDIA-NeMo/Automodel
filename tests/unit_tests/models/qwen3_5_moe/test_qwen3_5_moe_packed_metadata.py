@@ -1,0 +1,131 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CPU regression coverage for checkpointed Qwen3.5-MoE packed metadata."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
+
+pytest.importorskip("transformers.models.qwen3_5_moe")
+
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+
+from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
+from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.packing import configure_packing
+from nemo_automodel.components.models.qwen3_5_moe.model import (
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5MoeTextModelBackend,
+)
+
+
+def test_reuses_packed_metadata_across_checkpointed_moe_layers(monkeypatch):
+    from nemo_automodel.components.moe.megatron import moe_utils
+
+    # Exercise the same activation math and custom backward eagerly: this test
+    # checks metadata reuse under checkpointing, not Inductor compilation. Its
+    # cold-start compiler cost otherwise exceeds the CPU unit-test budget.
+    for name in ("swiglu", "weighted_swiglu", "swiglu_back", "weighted_swiglu_back"):
+        compiled = getattr(moe_utils, name)
+        monkeypatch.setattr(moe_utils, name, compiled.__wrapped__)
+    torch.manual_seed(123)
+    config = Qwen3_5MoeTextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        intermediate_size=32,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_experts=2,
+        num_experts_per_tok=1,
+        max_position_embeddings=16,
+        rms_norm_eps=1e-6,
+        router_aux_loss_coef=0.01,
+        pad_token_id=0,
+        layer_types=["linear_attention", "linear_attention"],
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        use_cache=False,
+        torch_dtype="float32",
+    )
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+    model = Qwen3_5MoeTextModelBackend(config, backend).float().train()
+    linear_attn_modules = []
+    for name in list(model.layers):
+        linear_attn_modules.append(model.layers[name].linear_attn)
+        model.layers[name] = checkpoint_wrapper(
+            model.layers[name],
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        )
+
+    chunk_gated_delta_rule = MagicMock(side_effect=lambda *args, **_kwargs: (args[2], None))
+    for linear_attn in linear_attn_modules:
+        linear_attn.causal_conv1d_fn = MagicMock(side_effect=lambda x, **kwargs: x)
+        linear_attn.chunk_gated_delta_rule = chunk_gated_delta_rule
+        linear_attn.norm.forward = MagicMock(side_effect=torch.add)
+
+    attention_mask = torch.tensor([[1, 1, 0, 0], [1, 1, 2, 0]])
+    packed_metadata = build_packed_sequence_metadata(attention_mask)
+    output = model(
+        input_ids=torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+        attention_mask=attention_mask,
+        packed_token_indices=packed_metadata["packed_token_indices"],
+        cu_seqlens=packed_metadata["cu_seqlens"],
+    ).last_hidden_state
+    output.backward(torch.randn_like(output))
+
+    assert chunk_gated_delta_rule.call_count == 4
+    call_kwargs = [call.kwargs for call in chunk_gated_delta_rule.call_args_list]
+    device_cu_seqlens = call_kwargs[0]["cu_seqlens"]
+    cpu_cu_seqlens = call_kwargs[0]["cu_seqlens_cpu"]
+    assert cpu_cu_seqlens.device.type == "cpu"
+    assert cpu_cu_seqlens.tolist() == [0, 2, 4, 5]
+    assert all(kwargs["cu_seqlens"] is device_cu_seqlens for kwargs in call_kwargs)
+    assert all(kwargs["cu_seqlens_cpu"] is cpu_cu_seqlens for kwargs in call_kwargs)
+    expected_seq_idx = torch.tensor([[0, 0, 1, 1, 2]], dtype=torch.int32)
+    for linear_attn in linear_attn_modules:
+        assert all(
+            torch.equal(call.kwargs["seq_idx"], expected_seq_idx)
+            for call in linear_attn.causal_conv1d_fn.call_args_list
+        )
+
+
+@pytest.mark.parametrize("model_type", [Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration])
+def test_packed_te_is_rejected_before_installing_hooks(model_type):
+    # Validation depends on the declared model interface, not optional TE kernels.
+    model = model_type.__new__(model_type)
+    torch.nn.Module.__init__(model)
+    with pytest.raises(ValueError, match="full-attention blocks do not gather/scatter"):
+        configure_packing("te", model=model)
+    assert not model._forward_pre_hooks
+    model.validate_packed_attention_backend("sdpa")
+    model.validate_packed_attention_backend("fa4")

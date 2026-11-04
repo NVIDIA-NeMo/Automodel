@@ -66,7 +66,7 @@ model:
     rms_norm: torch_fp32
     rope_fusion: true
     dispatcher: hybridep
-    experts: gmm
+    experts: torch_mm
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -118,6 +118,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  cluster_tag: h100
   recipe_owner: hemildesai
   nodes: 8
   time: "01:00:00"

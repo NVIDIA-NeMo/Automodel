@@ -33,6 +33,39 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 class TestCreatePipelineForwardInner:
     """Test create_pipeline_forward_inner function."""
 
+    def test_public_flash_metadata_reaches_each_decoder_layer(self):
+        model = nn.Module()
+        model.embed_tokens = nn.Embedding(16, 4)
+        model.rotary_emb = None
+        model.norm = None
+
+        class CaptureLayer(nn.Module):
+            def forward(self, hidden_states, **kwargs):
+                """Capture decoder kwargs for hidden states [batch, sequence, hidden]."""
+                self.received = kwargs
+                return hidden_states
+
+        model.layers = nn.ModuleList([CaptureLayer(), CaptureLayer()])
+        offsets = torch.tensor([0, 2, 4], dtype=torch.int32)
+        metadata = {
+            "cu_seq_lens_q": offsets,
+            "cu_seq_lens_k": offsets,
+            "max_length_q": 2,
+            "max_length_k": 2,
+        }
+        positions = torch.tensor([[0, 1, 0, 1]])
+        create_pipeline_forward_inner("PipelineStage")(
+            model,
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            position_ids=positions,
+            causal_mask_mapping={"full_attention": None},
+            **metadata,
+        )
+        for layer in model.layers:
+            for key, value in metadata.items():
+                assert layer.received[key] is value
+            assert layer.received["position_ids"] is positions
+
     def test_returns_callable(self):
         forward_fn = create_pipeline_forward_inner("AutoModel")
         assert callable(forward_fn)
@@ -1200,18 +1233,25 @@ class TestPipelineForwardMistral3Vlm:
         call_kwargs = m.model.get_image_features.call_args.kwargs
         assert call_kwargs["vision_feature_layer"] == -1
 
-    def test_chunk_retrieval_skipped_when_no_image_tokens(self):
-        """If input_ids has no image_token_id, the chunk-retrieval gate
-        does not fire (defensive — text-only batches may still pass through)."""
+    def test_text_microbatch_advances_to_next_image_chunk(self):
+        """Text-only input consumes its empty chunk without calling the vision model."""
         m = self._make_first_stage_model(image_token_id=10)
-        m._vlm_pixel_values_chunks = [torch.zeros(1, 3, 8, 8)]
-        m._vlm_image_grid_hws_chunks = None
+        image = torch.ones(1, 3, 8, 8)
+        sizes = torch.tensor([[8, 8]])
+        m._vlm_pixel_values_chunks = [image[:0], image]
+        m._vlm_image_grid_hws_chunks = [sizes[:0], sizes]
         m._vlm_chunk_idx = 0
-        # input_ids contains NO image tokens (token 10 absent).
-        m.model.language_model.forward = Mock(return_value=torch.zeros(1, 5, 4, dtype=torch.bfloat16))
         m(input_ids=torch.tensor([[1, 2, 3, 4, 5]]), pixel_values=None)
         m.model.get_image_features.assert_not_called()
-        assert m._vlm_chunk_idx == 0  # unchanged
+        assert m._vlm_chunk_idx == 1
+
+        m.model.get_image_features.return_value = SimpleNamespace(pooler_output=(torch.zeros(1, 4),))
+        m.model.get_placeholder_mask.return_value = torch.zeros(1, 5, 4, dtype=torch.bool)
+        m(input_ids=torch.tensor([[10, 2, 3, 4, 5]]), pixel_values=None)
+        assert m._vlm_chunk_idx == 2
+        m.model.get_image_features.assert_called_once()
+        assert m.model.get_image_features.call_args.kwargs["pixel_values"] is image
+        assert m.model.get_image_features.call_args.kwargs["image_sizes"] is sizes
 
     def test_non_first_stage_passes_hidden_states(self):
         """Non-first stage: input_ids carries float hidden states — promote to

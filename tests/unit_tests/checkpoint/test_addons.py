@@ -25,11 +25,14 @@ from torch.nn.parallel import DistributedDataParallel
 from nemo_automodel.components.checkpoint.addons import (
     ConsolidatedHFAddon,
     _extract_target_modules,
+    _get_automodel_peft_metadata,
     _group_barrier,
     _is_group_rank_0,
     _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
+    load_automodel_peft_config_dict,
 )
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
 
@@ -284,6 +287,22 @@ def _make_model_with_named_modules(module_names):
     return root
 
 
+class _StubStateDictAdapter(StateDictAdapter):
+    """Minimal concrete StateDictAdapter, no renames of its own."""
+
+    def to_hf(self, state_dict, **kwargs):
+        """Identity pass-through; tensor values keep their native layouts."""
+        return state_dict
+
+    def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
+        """Identity pass-through; tensor values keep their HF layouts."""
+        return hf_state_dict
+
+    def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+        """Identity pass-through; ``tensor`` keeps its layout, whatever it is."""
+        return [(fqn, tensor)]
+
+
 class TestExtractTargetModules:
     """Tests for _extract_target_modules with combined-projection expansion."""
 
@@ -392,6 +411,64 @@ class TestExtractTargetModules:
         assert "layers.0.mlp.down_proj" in result
         assert all(not m.startswith("model.") for m in result)
 
+    def test_adapter_target_module_renames_applied(self):
+        """An adapter overriding map_peft_target_module_to_hf rewrites the entries.
+
+        Adapters that rename modules between the native and checkpoint layouts
+        (e.g. Kimi K3's expert projections) convert the saved keys, so the
+        target_modules metadata has to follow or PEFT can't resolve it.
+        """
+
+        class _RenamingAdapter(_StubStateDictAdapter):
+            def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
+                return name.replace(".mlp.experts.", ".block_sparse_moe.experts.")
+
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.mlp.experts.0.gate_proj.lora_A",
+                "model.layers.0.self_attn.q_proj.lora_A",
+            ]
+        )
+        model.state_dict_adapter = _RenamingAdapter()
+        result = _extract_target_modules(model)
+        assert "model.layers.0.block_sparse_moe.experts.0.gate_proj" in result
+        assert "model.layers.0.self_attn.q_proj" in result
+        assert all(".mlp.experts." not in m for m in result)
+
+    def test_adapter_without_override_keeps_target_modules_unchanged(self):
+        """Adapters that don't rename modules inherit the identity default."""
+        adapter = _StubStateDictAdapter()
+        assert adapter.map_peft_target_module_to_hf("model.layers.0.self_attn.q_proj") == (
+            "model.layers.0.self_attn.q_proj"
+        )
+
+        model = _make_model_with_named_modules(
+            [
+                "model.layers.0.mlp.experts.0.gate_proj.lora_A",
+                "model.layers.0.self_attn.q_proj.lora_A",
+            ]
+        )
+        model.state_dict_adapter = adapter
+        result = _extract_target_modules(model)
+        assert "model.layers.0.mlp.experts.0.gate_proj" in result
+        assert "model.layers.0.self_attn.q_proj" in result
+
+    def test_duck_typed_adapter_without_the_method_is_tolerated(self):
+        """Adapters that don't subclass StateDictAdapter must not crash the save.
+
+        llama, qwen2/3, and kimivl attach plain classes as state_dict_adapter,
+        and some tests attach mixin-only adapters; they have no
+        map_peft_target_module_to_hf and just keep their names.
+        """
+
+        class _BareAdapter:
+            pass
+
+        model = _make_model_with_named_modules(["model.layers.0.self_attn.q_proj.lora_A"])
+        model.state_dict_adapter = _BareAdapter()
+        result = _extract_target_modules(model)
+        assert result == ["model.layers.0.self_attn.q_proj"]
+
 
 class TestMaybeStripQuantizationConfig:
     """Tests for _maybe_strip_quantization_config."""
@@ -431,3 +508,78 @@ class TestMaybeStripQuantizationConfig:
         """No error when model has no config attribute."""
         model = nn.Linear(4, 4)
         _maybe_strip_quantization_config(model)
+
+
+class TestParamWrapperLayoutStamp:
+    """The PEFT save stamps the fused expert LoRA layout into
+    automodel_peft_config.json (peft flipped ParamWrapper in 0.19.1,
+    huggingface/peft#3165) so loads resolve it from metadata, not shapes."""
+
+    def test_v5_adapter_gets_the_modern_stamp_by_default(self):
+        from nemo_automodel.components.checkpoint.addons import _get_paramwrapper_layout_stamp
+
+        adapter = SimpleNamespace(_v5_peft_target_parameters=("mlp.experts.gate_up_proj",))
+        assert _get_paramwrapper_layout_stamp(adapter, False, False) == "peft-0.19.1"
+        assert _get_paramwrapper_layout_stamp(adapter, False, True) == "peft-0.18"
+
+    def test_non_v5_or_v4_saves_get_no_stamp(self):
+        from nemo_automodel.components.checkpoint.addons import _get_paramwrapper_layout_stamp
+
+        v5_adapter = SimpleNamespace(_v5_peft_target_parameters=("mlp.experts.gate_up_proj",))
+        plain_adapter = SimpleNamespace(_v5_peft_target_parameters=())
+        assert _get_paramwrapper_layout_stamp(plain_adapter, False, False) is None
+        assert _get_paramwrapper_layout_stamp(None, False, False) is None
+        assert _get_paramwrapper_layout_stamp(v5_adapter, True, False) is None
+
+
+class TestParamWrapperLayoutHintPlumbing:
+    def test_metadata_reader_round_trips(self, tmp_path):
+        import json as json_module
+
+        from nemo_automodel.components.checkpoint.checkpointing import _read_paramwrapper_layout_metadata
+
+        assert _read_paramwrapper_layout_metadata(tmp_path) is None
+        (tmp_path / "automodel_peft_config.json").write_text(json_module.dumps({"paramwrapper_layout": "peft-0.18"}))
+        assert _read_paramwrapper_layout_metadata(tmp_path) == "peft-0.18"
+
+    def test_hint_is_set_during_from_hf_and_cleared_after(self):
+        from nemo_automodel.components.checkpoint.checkpointing import _maybe_adapt_state_dict_from_hf
+
+        seen = {}
+
+        class _Adapter:
+            def from_hf(self, state_dict, device_mesh=None, **kwargs):
+                seen["hint"] = self._paramwrapper_layout_hint
+                return state_dict
+
+        model = nn.Module()
+        model.state_dict_adapter = _Adapter()
+        _maybe_adapt_state_dict_from_hf(model, {}, paramwrapper_layout_hint="peft-0.18")
+
+        assert seen["hint"] == "peft-0.18"
+        assert model.state_dict_adapter._paramwrapper_layout_hint is None
+
+
+@pytest.mark.parametrize("legacy_defaults", [False, True])
+def test_load_automodel_peft_config_dict_round_trips_the_saved_metadata(tmp_path, legacy_defaults: bool):
+    import json
+
+    from nemo_automodel.components._peft.lora import PeftConfig
+
+    peft = PeftConfig(
+        target_modules=["*.qkv_proj"], dim=16, alpha=8, lora_dtype=torch.bfloat16, use_memory_efficient_lora=False
+    )
+    metadata = _get_automodel_peft_metadata(peft)
+    assert "dim" not in metadata and "alpha" not in metadata
+    assert metadata["use_memory_efficient_lora"] is False
+    metadata.update({"paramwrapper_layout": "peft-0.19.1+", "future_checkpoint_field": True})
+    if legacy_defaults:
+        metadata.pop("use_memory_efficient_lora")
+    (tmp_path / "automodel_peft_config.json").write_text(json.dumps(metadata))
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "lora_alpha": 8}))
+    kwargs = load_automodel_peft_config_dict(str(tmp_path))
+    assert "paramwrapper_layout" not in kwargs and "future_checkpoint_field" not in kwargs
+    loaded = PeftConfig(**kwargs)
+    assert loaded.target_modules == ["*.qkv_proj"] and (loaded.dim, loaded.alpha) == (16, 8)
+    assert loaded.lora_dtype == "torch.bfloat16"
+    assert loaded.use_memory_efficient_lora is legacy_defaults

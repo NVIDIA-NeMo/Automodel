@@ -167,7 +167,9 @@ class TestFp32SafeRotaryEmbeddings:
         torch.testing.assert_close(rotary.inv_freq.float(), original.float())
 
     def test_vision_rotary_inv_freq_remains_fp32(self):
-        rotary = Fp32SafeQwen3_5MoeVisionRotaryEmbedding(dim=16)
+        from transformers import Qwen3_5MoeVisionConfig
+
+        rotary = Fp32SafeQwen3_5MoeVisionRotaryEmbedding(Qwen3_5MoeVisionConfig(hidden_size=64, num_heads=2))
         original = rotary.inv_freq.clone()
 
         rotary = rotary.to(torch.float16)
@@ -218,19 +220,19 @@ class TestQwen3_5MoeBlock:
         self, text_config_with_linear, moe_config, backend_config
     ):
         block = Qwen3_5MoeBlock(1, text_config_with_linear, moe_config, backend_config)
+        block.linear_attn.norm.weight.data.zero_()
 
         with (
             patch.object(block.input_layernorm, "reset_parameters"),
             patch.object(block.post_attention_layernorm, "reset_parameters"),
             patch.object(block.mlp, "init_weights"),
             patch("torch.nn.init.trunc_normal_") as mock_trunc,
-            patch.object(block.linear_attn.norm, "reset_parameters") as mock_norm_reset,
         ):
             block.init_weights(torch.device("cpu"))
 
         # 5 linear projections should be initialized: in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj
         assert mock_trunc.call_count == 5
-        mock_norm_reset.assert_called_once()
+        torch.testing.assert_close(block.linear_attn.norm.weight, torch.ones_like(block.linear_attn.norm.weight))
 
     def test_init_weights_linear_attention_norm_without_reset_parameters(
         self, text_config_with_linear, moe_config, backend_config

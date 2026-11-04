@@ -18,6 +18,8 @@ set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
 export CUDA_VISIBLE_DEVICES="0,1"
 
+LOG_FILE=$(mktemp)
+trap 'rm -f "$LOG_FILE"' EXIT
 
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run examples/llm_finetune/finetune.py \
     --config examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
@@ -40,4 +42,11 @@ TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnod
     --distributed.sequence_parallel false \
     --distributed.pipeline.pp_schedule 1f1b \
     --distributed.pipeline.pp_microbatch_size 1 \
-    --distributed.pipeline.scale_grads_in_schedule false
+    --distributed.pipeline.scale_grads_in_schedule false \
+    2>&1 | tee "$LOG_FILE"
+
+# Guard against bug in commit 00f40419 (PR #2983).
+if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
+    echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"
+    exit 1
+fi

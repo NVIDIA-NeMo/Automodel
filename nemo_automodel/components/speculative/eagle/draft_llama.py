@@ -88,12 +88,30 @@ P-EAGLE (parallel-drafting EAGLE-3) adds one further optional toggle:
   today (https://github.com/sgl-project/sglang/issues/23171). The flag only ever
   adds the ``mask_hidden`` key, so EAGLE-3 / EAGLE-3.1 checkpoints round-trip
   unchanged.
+
+EAGLE-4 (``config.architectures == ["LlamaForCausalLMEagle4"]``) keeps the
+EAGLE-3.1 layer and adds two config-driven structures, laid out like the
+``LlamaForCausalLMEagle4`` drafts served by TokenSpeed and the EAGLE-4 engines:
+
+* a sliding-window draft layer (``layer_types == ["sliding_attention"]`` with
+  ``sliding_window`` W): every query sees the last W keys up to itself, its TTT
+  chain included, as in the EAGLE-4 serving kernels (see
+  ``Eagle3LlamaAttention._block1_window``). The window is read only for an
+  EAGLE-4 config, because a draft config cloned from a Qwen-family target
+  carries a ``sliding_window`` its EAGLE-3 draft never used.
+* a low-rank candidate head (``config.efficient_lm_head_config`` with ``rank``
+  r and ``num_candidates`` K): ``efficient_lm_head(efficient_lm_head_down_proj(h))``
+  scores the full target vocabulary at rank r, the engine keeps the top K
+  tokens and rescores only those with the full ``lm_head``. The factors are
+  top-level keys (``efficient_lm_head.weight`` of shape ``[vocab, r]`` and
+  ``efficient_lm_head_down_proj.weight`` of shape ``[r, hidden]``) and require
+  the full target vocabulary (no ``d2t`` / ``t2d`` compression).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -139,6 +157,54 @@ def _load_flash_attn_func() -> tuple[bool, object | None, object | None]:
 _HAS_FA, _flash_attn_func, _flash_attn_varlen_func = _load_flash_attn_func()
 
 _SUPPORTED_ATTN_IMPLEMENTATIONS = ("eager", "flash_attention_2")
+
+# ``architectures`` entry of an EAGLE-4 draft; the serving engines register the
+# draft class under this name.
+EAGLE4_ARCHITECTURE = "LlamaForCausalLMEagle4"
+# Rows of the ``[vocab, hidden]`` lm_head processed at a time by the candidate-head SVD init.
+_SVD_CHUNK_ROWS = 32768
+
+
+def _draft_sliding_window(config: PretrainedConfig) -> int | None:
+    """Return the EAGLE-4 draft layer's context window W, or None for full attention.
+
+    ``layer_types`` decides when present (``["sliding_attention"]``), otherwise
+    ``use_sliding_window``. Non-EAGLE-4 configs always use full attention (see
+    the module docstring).
+    """
+    if EAGLE4_ARCHITECTURE not in (getattr(config, "architectures", None) or ()):
+        return None
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None:
+        enabled = "sliding_attention" in layer_types
+    else:
+        enabled = bool(getattr(config, "use_sliding_window", False))
+    if not enabled:
+        return None
+    window = getattr(config, "sliding_window", None)
+    if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+        raise ValueError(f"EAGLE-4 draft enables a sliding window but sliding_window={window!r}.")
+    return window
+
+
+def _apply_sliding_window(causal_mask: torch.Tensor, sliding_window: int) -> torch.Tensor:
+    """Mask the keys that lie ``sliding_window`` or more positions behind each query.
+
+    The masked entries are set to ``finfo(dtype).min`` (finite), so a padding
+    query whose whole window is padding still yields a finite softmax.
+
+    Args:
+        causal_mask: Tensor of shape ``[batch, 1, sequence, sequence]``, the
+            additive (query, key) mask of Block 1 (``0`` = attend).
+        sliding_window: Number of context keys a query sees, itself included.
+
+    Returns:
+        A new tensor of shape ``[batch, 1, sequence, sequence]``; ``causal_mask``
+        is not modified.
+    """
+    positions = torch.arange(causal_mask.shape[-1], device=causal_mask.device)
+    too_old = positions.view(1, -1) <= positions.view(-1, 1) - sliding_window  # [query, key]
+    return causal_mask.masked_fill(too_old, torch.finfo(causal_mask.dtype).min)
 
 
 def _build_causal_mask(
@@ -262,12 +328,18 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             self.num_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
         )
         self.rotary_emb = LlamaRotaryEmbedding(config)
+        # EAGLE-4 sliding window W (None = full causal attention); each TTT step
+        # applies its share of it to Block 1 (see _block1_window).
+        self.sliding_window = _draft_sliding_window(config)
         # Set by attach_eagle3_cp_attention when the draft runs under context
         # parallelism: the sequence is sharded across this cp group and the mixed
-        # causal/TTT-diagonal attention runs as a differentiable ring. None otherwise.
+        # causal/TTT-diagonal attention runs distributed. None otherwise.
         self._cp_group = None
+        # CP compute mode: "ring" (default, hand-written causal ring) or "ulysses"
+        # (all-to-all sequence<->head redistribution; composes with sequence packing).
+        self._cp_mode = None
         # When True the cp ring uses the load-balanced zig-zag layout (inputs must
-        # be sharded in zig-zag order); False uses the contiguous ring.
+        # be sharded in zig-zag order); False uses the contiguous ring. Ring only.
         self._cp_zigzag = False
 
     def _project_qkv(self, combined_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -330,7 +402,12 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             cache_v.append(v)
 
         if self._cp_group is not None:
-            attn_output = self._cp_ring_attention_forward(q, cache_k, cache_v, batch_size, seq_len)
+            if self._cp_mode == "ulysses":
+                attn_output = self._cp_ulysses_attention_forward(
+                    q, cache_k, cache_v, batch_size, seq_len, cu_seqlens, max_seqlen
+                )
+            else:
+                attn_output = self._cp_ring_attention_forward(q, cache_k, cache_v, batch_size, seq_len)
         elif self.attn_implementation == "flash_attention_2":
             attn_output = self._flash_attention_forward(
                 q, cache_k, cache_v, step_idx, batch_size, seq_len, cu_seqlens, max_seqlen
@@ -378,6 +455,25 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         batch_size: int,
         seq_len: int,
     ) -> torch.Tensor:
+        """Eager EAGLE-3 attention: Block 1 against ``K_0`` plus the TTT diagonals.
+
+        Args:
+            q: Tensor of shape ``[batch, heads, sequence, head_dim]``, this step's queries.
+            cache_k: Per-TTT-step keys, each a tensor of shape ``[batch, heads, sequence, head_dim]``.
+            cache_v: Per-TTT-step values, same layout as ``cache_k``.
+            attention_mask: Tensor of shape ``[batch, 1, sequence, sequence]``, the
+                additive (query, key) Block-1 mask; this step's EAGLE-4 window
+                (``_block1_window``) is applied on top of it here.
+            step_idx: Number of cached steps before this one.
+            batch_size: Batch size.
+            seq_len: Sequence length.
+
+        Returns:
+            Tensor of shape ``[batch, sequence, heads * head_dim]``.
+        """
+        window = self._block1_window(step_idx)
+        if window is not None:
+            attention_mask = _apply_sliding_window(attention_mask, window)
         # Block 1: full T x T causal attention against the step-0 keys.
         k0, v0 = cache_k[0], cache_v[0]
         attn_weights = torch.matmul(q, k0.transpose(-2, -1)) * self.scaling
@@ -430,15 +526,19 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
 
         With ``cu_seqlens`` (packing), Block 1 uses ``flash_attn_varlen_func`` for
         document-level causal attention; the position-wise Block 2 is unchanged.
+        This step's EAGLE-4 window w (``_block1_window``) limits Block 1 to the
+        last w keys (FlashAttention ``window_size=(w - 1, 0)``).
         """
         # FA2 expects (B, T, H, D); eager cache is (B, H, T, D).
         k0, v0 = cache_k[0], cache_v[0]
         q_fa = q.transpose(1, 2).contiguous()
         k0_fa = k0.transpose(1, 2).contiguous()
         v0_fa = v0.transpose(1, 2).contiguous()
+        window = self._block1_window(step_idx)
+        window_size = (-1, -1) if window is None else (window - 1, 0)
         if cu_seqlens is not None:
             attn_output_bhtd, lse_fa = self._flash_block1_varlen(
-                q_fa, k0_fa, v0_fa, cu_seqlens, max_seqlen, batch_size, seq_len
+                q_fa, k0_fa, v0_fa, cu_seqlens, max_seqlen, batch_size, seq_len, window_size
             )
         else:
             # ``softmax_lse`` is fp32 with shape (B, H, T): the log-sum-exp of the
@@ -449,6 +549,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
                 v0_fa,
                 softmax_scale=self.scaling,
                 causal=True,
+                window_size=window_size,
                 return_attn_probs=True,
             )
             # FA output is (B, T, H, D); bring back to (B, H, T, D) for the merge.
@@ -482,6 +583,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         max_seqlen: int,
         batch_size: int,
         seq_len: int,
+        window_size: tuple[int, int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Document-level causal Block 1 via ``flash_attn_varlen_func``.
 
@@ -489,6 +591,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         outputs back to ``[B, H, T, D]`` / ``[B, H, T]`` for the dense-path merge.
         Note varlen ``softmax_lse`` is ``[H, total_tokens]`` (head-major), unlike
         the dense ``[B, H, T]`` -- hence the explicit reshape + shape check.
+        ``window_size`` is FlashAttention's ``(left, right)`` Block-1 window.
         """
         if _flash_attn_varlen_func is None:
             raise ImportError(
@@ -509,6 +612,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.scaling,
             causal=True,
+            window_size=window_size,
             return_attn_probs=True,
         )
         # out_flat: [total_tokens, H, D] -> [B, H, T, D]
@@ -522,31 +626,108 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         lse_fa = lse_flat.transpose(0, 1).reshape(batch_size, seq_len, num_heads).permute(0, 2, 1)
         return attn_output_bhtd, lse_fa
 
+    def _block1_window(self, step_idx: int) -> int | None:
+        """Context keys Block 1 exposes to each query at TTT depth ``step_idx`` (None = unbounded).
 
-def attach_eagle3_cp_attention(model: nn.Module, cp_group, zigzag: bool = False) -> None:
+        The EAGLE-4 serving kernels give every query the last ``sliding_window``
+        keys up to itself. The depth-``step_idx`` query of row ``t`` stands at
+        position ``t + step_idx`` and ``step_idx`` of those keys are its own
+        chain (Block 2), leaving ``sliding_window - step_idx`` context keys.
+        """
+        if self.sliding_window is None:
+            return None
+        window = self.sliding_window - step_idx
+        if window < 1:
+            raise ValueError(
+                f"EAGLE-4 sliding_window={self.sliding_window} leaves no context key at TTT depth {step_idx}; "
+                "the window must be at least ttt_steps."
+            )
+        return window
+
+    def _cp_ulysses_attention_forward(
+        self,
+        q: torch.Tensor,
+        cache_k: list[torch.Tensor],
+        cache_v: list[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
+    ) -> torch.Tensor:
+        """Context-parallel EAGLE-3 attention via Ulysses (all-to-all) instead of the ring.
+
+        The sequence is sharded across ``self._cp_group``. Block-0 (``Q @ K_0^T``,
+        causal over the full sequence) is all-to-all'd so each rank holds the *full*
+        sequence for a subset of the heads, runs one dense or packed ``varlen``
+        FlashAttention, and is all-to-all'd back; the per-position TTT diagonals
+        (blocks ``i >= 1``) stay shard-local and merge into block-0 via the
+        online-softmax identity. Unlike the ring, ``cu_seqlens`` carries straight
+        through, so it composes with sequence packing (``cu_seqlens`` must then be
+        the GLOBAL, un-sharded document boundaries). See
+        :func:`~nemo_automodel.components.speculative.eagle.ulysses_attention.cached_ulysses_attention`.
+
+        Args:
+            q: This step's query, ``[batch, heads, seq_local, head_dim]`` (the
+                sequence is CP-sharded, so ``seq_local = seq_global / cp``).
+            cache_k: Per-TTT-step keys; ``cache_k[0]`` is the step-0 sequence key and
+                ``cache_k[i>=1]`` the diagonal steps, each already in FlashAttention
+                ``[batch, seq_local, heads, head_dim]`` layout and compute dtype.
+            cache_v: Per-TTT-step values, same layout as ``cache_k``.
+            batch_size: Batch size ``batch``.
+            seq_len: Local sequence length ``seq_local``.
+            cu_seqlens: GLOBAL (un-sharded) packed-document boundaries
+                ``[num_docs + 1]`` (int32), or ``None`` for a single causal stream.
+            max_seqlen: Longest document length for the packed path.
+
+        Returns:
+            Attention output ``[batch, seq_local, heads * head_dim]`` in the draft's
+            compute dtype, ready for ``o_proj``.
+        """
+        from nemo_automodel.components.speculative.eagle.ulysses_attention import cached_ulysses_attention
+
+        dt = self.o_proj.weight.dtype
+        q_fa = q.transpose(1, 2).contiguous().to(dt)  # [B, H, T_local, D] -> [B, T_local, H, D]
+        out = cached_ulysses_attention(q_fa, cache_k, cache_v, self._cp_group, self.scaling, cu_seqlens, max_seqlen)
+        return out.reshape(batch_size, seq_len, -1)
+
+
+def attach_eagle3_cp_attention(
+    model: nn.Module, cp_group, *, mode: Literal["ring", "ulysses"] = "ring", zigzag: bool = False
+) -> None:
     """Route every EAGLE-3 draft attention through the context-parallel ring path.
 
     Sets ``_cp_group`` on each :class:`Eagle3LlamaAttention` so its forward runs the
     differentiable causal-ring + TTT-diagonal attention over the cp-sharded sequence.
-    A no-op ``cp_group`` of size 1 leaves the plain per-rank path in place. With
-    ``zigzag=True`` the load-balanced zig-zag ring is used (the inputs must then be
-    sharded in zig-zag order); otherwise the contiguous ring.
+    A no-op ``cp_group`` of size 1 leaves the plain per-rank path in place.
+    ``mode`` selects the CP compute path: ``"ring"`` (default, hand-written causal
+    ring) or ``"ulysses"`` (all-to-all sequence<->head redistribution, which
+    composes with sequence packing). With ``zigzag=True`` the load-balanced zig-zag
+    ring is used (the inputs must then be sharded in zig-zag order); otherwise the
+    contiguous ring. ``zigzag`` applies to the ring mode only.
 
     Raises if the draft has no :class:`Eagle3LlamaAttention` to route (e.g. the
     DeepSeek MLA draft): the trainer would still shard/shift the sequence and
     renormalize the loss while each rank's attention silently saw only its own
     shard, so context parallelism must be refused rather than run wrong.
     """
+    if mode not in ("ring", "ulysses"):
+        raise ValueError(f"Unknown CP attention mode {mode!r}; expected 'ring' or 'ulysses'.")
     matched = 0
     for module in model.modules():
         if isinstance(module, Eagle3LlamaAttention):
+            if module.sliding_window is not None:
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) does not support the EAGLE-4 sliding-window draft "
+                    "layer; the ring and Ulysses paths attend over the full causal context."
+                )
             module._cp_group = cp_group
+            module._cp_mode = mode
             module._cp_zigzag = zigzag
             matched += 1
     if matched == 0:
         raise NotImplementedError(
             "Context parallelism (cp_size>1) for the EAGLE-3 draft is only implemented for the "
-            f"Eagle3LlamaAttention ring path; {type(model).__name__} exposes no such attention "
+            f"Eagle3LlamaAttention path; {type(model).__name__} exposes no such attention "
             "module (e.g. the DeepSeek MLA draft). Set cp_size=1 for this draft architecture."
         )
 
@@ -765,6 +946,38 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         # round-trip with no extra keys (see ``_PeagleDraftMixin``).
         if getattr(config, "parallel_drafting", False):
             self._init_peagle_parameters(config)
+            if _draft_sliding_window(config) is not None:
+                raise ValueError("The EAGLE-4 sliding-window draft layer does not support parallel_drafting.")
+
+        # EAGLE-4 low-rank candidate head, registered only when configured so
+        # EAGLE-3 checkpoints round-trip with no extra keys (see module docstring).
+        self.efficient_lm_head_down_proj: nn.Linear | None = None
+        self.efficient_lm_head: nn.Linear | None = None
+        head_config = getattr(config, "efficient_lm_head_config", None)
+        if head_config is not None:
+            rank = head_config.get("rank") if isinstance(head_config, dict) else None
+            if (
+                not isinstance(head_config, dict)
+                or head_config.get("type") != "low_rank"
+                or not isinstance(rank, int)
+                or rank <= 0
+            ):
+                raise ValueError(
+                    f"efficient_lm_head_config={head_config!r} is not supported; expected a dict with "
+                    "type='low_rank' and a positive integer rank."
+                )
+            if rank > min(config.hidden_size, config.vocab_size):
+                raise ValueError(
+                    f"efficient_lm_head_config rank={rank} exceeds min(hidden_size, vocab_size)="
+                    f"{min(config.hidden_size, config.vocab_size)}, so the factorization would not be low-rank."
+                )
+            if self.has_vocab_compression:
+                raise ValueError(
+                    "The EAGLE-4 candidate head scores the full target vocabulary; got "
+                    f"draft_vocab_size={self.draft_vocab_size} < vocab_size={config.vocab_size}."
+                )
+            self.efficient_lm_head_down_proj = nn.Linear(config.hidden_size, rank, bias=False)
+            self.efficient_lm_head = nn.Linear(rank, config.vocab_size, bias=False)
 
         self.post_init()
 
@@ -868,18 +1081,84 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
         already returned the post-norm state, so ``lm_head`` is applied
         directly to avoid a double normalisation.
         """
+        return self.lm_head(self._lm_head_input(hidden_states))
+
+    def _lm_head_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the post-``model.norm`` state the output heads read.
+
+        Args:
+            hidden_states: Tensor of shape ``[..., hidden]``, the output of
+                :meth:`forward` (already normed when ``config.norm_output`` is set).
+
+        Returns:
+            Tensor of shape ``[..., hidden]``; ``hidden_states`` itself when it
+            is already normed.
+        """
         if getattr(self.config, "norm_output", False):
-            return self.lm_head(hidden_states)
-        return self.lm_head(self.model.norm(hidden_states))
+            return hidden_states
+        return self.model.norm(hidden_states)
+
+    def compute_candidate_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Score the full vocabulary with the EAGLE-4 low-rank candidate head.
+
+        Serving keeps the top ``num_candidates`` of these scores and rescores
+        only those tokens with ``lm_head``; training fits the scores to the full
+        head's distribution (see ``Eagle4CandidateHeadTrainerModule``).
+
+        Args:
+            hidden_states: Tensor of shape ``[batch, sequence, hidden]``, the
+                output of :meth:`forward` (the same input as :meth:`compute_logits`).
+
+        Returns:
+            Rank-``r`` logits, a tensor of shape ``[batch, sequence, vocab]``.
+        """
+        if self.efficient_lm_head is None or self.efficient_lm_head_down_proj is None:
+            raise RuntimeError("compute_candidate_logits requires config.efficient_lm_head_config.")
+        return self.efficient_lm_head(self.efficient_lm_head_down_proj(self._lm_head_input(hidden_states)))
+
+    @torch.no_grad()
+    def init_efficient_lm_head_from_lm_head(self) -> None:
+        """Initialize the candidate-head factors to the best rank-``r`` approximation of ``lm_head``.
+
+        With ``lm_head.weight = U S V^T``, sets ``efficient_lm_head.weight =
+        U_r S_r^(1/2)`` and ``efficient_lm_head_down_proj.weight = S_r^(1/2) V_r^T``
+        (the truncated SVD, split evenly between the two factors). ``V_r`` and
+        ``S_r`` come from an fp64 eigendecomposition of the ``[hidden, hidden]``
+        Gram matrix, which is deterministic (so every rank initializes the same
+        factors) and never materializes a full fp32 copy of the head: both
+        passes over the ``[vocab, hidden]`` weight run ``_SVD_CHUNK_ROWS`` rows at a time.
+        """
+        if self.efficient_lm_head is None or self.efficient_lm_head_down_proj is None:
+            raise RuntimeError("init_efficient_lm_head_from_lm_head requires config.efficient_lm_head_config.")
+        weight = self.lm_head.weight  # [vocab, hidden]
+        rank = self.efficient_lm_head.weight.shape[1]
+        gram = torch.zeros(weight.shape[1], weight.shape[1], dtype=torch.float64, device=weight.device)
+        for rows in weight.split(_SVD_CHUNK_ROWS):
+            rows = rows.double()
+            gram += rows.T @ rows
+        eigenvalues, eigenvectors = torch.linalg.eigh(gram)  # ascending
+        top_values = eigenvalues[-rank:].flip(0)
+        top_vectors = eigenvectors[:, -rank:].flip(1)  # V_r: [hidden, rank]
+        # Directions with a negligible singular value carry no signal; zero them
+        # instead of dividing by ~0 (which would write inf into the factor).
+        significant = top_values > top_values[0] * 1e-12
+        root = top_values.clamp_min(0).pow(0.25)  # S_r^(1/2), since eigenvalues are S_r^2
+        inverse_root = torch.where(significant, root.reciprocal(), torch.zeros_like(root))
+        root = torch.where(significant, root, torch.zeros_like(root))
+        # U_r S_r^(1/2) = W V_r S_r^(-1/2), written chunk by chunk.
+        projection = top_vectors * inverse_root
+        for rows, up in zip(weight.split(_SVD_CHUNK_ROWS), self.efficient_lm_head.weight.split(_SVD_CHUNK_ROWS)):
+            up.copy_(rows.double() @ projection)
+        self.efficient_lm_head_down_proj.weight.copy_((top_vectors * root).T)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         projected_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        cache_hidden: Optional[list[list[torch.Tensor]]] = None,
-        seq_lens: Optional[torch.Tensor] = None,
+        position_ids: torch.Tensor | None = None,
+        cache_hidden: list[list[torch.Tensor]] | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one full-sequence draft update step.
 
@@ -905,7 +1184,16 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
             # Packed: structure comes from seq_lens (cu_seqlens for FA2 / block-causal
             # mask for eager), so the right-padding check below does not apply.
             seq_length = input_ids.shape[1]
-            if is_fa2:
+            # Under Ulysses CP the draft's block-0 all-to-alls into the FULL sequence,
+            # so cu_seqlens must span the global packed length (B * T_global), and the
+            # attention runs FlashAttention regardless of ``attn_implementation``.
+            attn0 = self.model.layers[0].self_attn
+            # _cp_mode == "ulysses" is only ever set together with _cp_group (by
+            # attach_eagle3_cp_attention), so it already implies a live cp group.
+            ulysses_cp = getattr(attn0, "_cp_mode", None) == "ulysses"
+            if ulysses_cp:
+                seq_length = seq_length * attn0._cp_group.size()
+            if is_fa2 or ulysses_cp:
                 # FA2 attends document-wise through cu_seqlens and never reads the 4D
                 # additive mask, so skip materializing the [B, 1, T, T] block-causal mask.
                 causal_mask = None

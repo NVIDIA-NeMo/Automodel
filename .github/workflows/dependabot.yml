@@ -5,7 +5,6 @@ on:
   workflow_dispatch: # Allow manual triggering
 
 permissions:
-  id-token: write
   contents: write
 
 jobs:
@@ -40,9 +39,6 @@ jobs:
       target-branch: ${{ matrix.target-branch }}
     secrets:
       PAT: ${{ secrets.PAT }}
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
       SSH_PWD: ${{ secrets.SSH_PWD }}
 

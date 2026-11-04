@@ -68,7 +68,7 @@ dist_env:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
-    _target_: transformers.AutoConfig.from_pretrained
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: openai/gpt-oss-120b
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
@@ -111,6 +111,7 @@ optimizer:
 
 
 ci:
+  cluster_tag: h100
   time: "00:30:00"
   nodes: 8
   ep_size: 64

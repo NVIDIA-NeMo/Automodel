@@ -110,6 +110,7 @@ optimizer:
 #   name: <your_wandb_exp_name>
 
 ci:
+  cluster_tag: h100
   # 32k CP8 reaches the divisibility floor at 32 nodes, but needs 64 nodes to avoid OOM.
   recipe_owner: huiyingl
   nodes: 64

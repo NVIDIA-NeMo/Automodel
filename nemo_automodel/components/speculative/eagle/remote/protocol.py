@@ -23,7 +23,6 @@ is the binary :mod:`wire` blob instead.
 from __future__ import annotations
 
 import json
-from typing import Optional
 
 import torch
 
@@ -34,6 +33,7 @@ EP_GENERATE = "generate"
 EP_SET_VOCAB_MAPPING = "set_vocab_mapping"
 EP_MODEL_INFO = "model_info"
 EP_INPUT_EMBEDDINGS = "input_embeddings"
+EP_OUTPUT_EMBEDDINGS = "output_embeddings"
 EP_INIT_NCCL = "init_nccl"
 EP_HEARTBEAT = "heartbeat"
 EP_DISCONNECT = "disconnect"
@@ -44,13 +44,12 @@ EP_HEALTH = "health"
 # inline as a wire blob.
 NCCL_HEADER = "X-NeMo-NCCL"
 
-# The fixed order tensors are sent/received in for one ``generate`` response.
-# Server send order and client recv order MUST agree on this list.
-SUPERVISION_KEYS = ["aux_hidden_states", "target_probs", "position_mask", "input_ids", "loss_mask"]
+# Default distance from a server's HTTP port to its NCCL rendezvous port.
+NCCL_PORT_OFFSET = 100
 
 
 def encode_nccl_metadata(
-    tensor_dict: dict[str, Optional[torch.Tensor]],
+    tensor_dict: dict[str, torch.Tensor | None],
     keys_order: list[str],
 ) -> bytes:
     """Encode tensor metadata (dtype code + shape) as a JSON HTTP body.
@@ -58,7 +57,7 @@ def encode_nccl_metadata(
     Only metadata is encoded -- no tensor data. The client uses it to allocate
     the receive buffers before the NCCL recv.
     """
-    metadata: dict[str, Optional[dict]] = {}
+    metadata: dict[str, dict | None] = {}
     for key in keys_order:
         tensor = tensor_dict.get(key)
         if tensor is None:
@@ -68,7 +67,7 @@ def encode_nccl_metadata(
     return json.dumps({"keys_order": keys_order, "metadata": metadata}).encode("utf-8")
 
 
-def decode_nccl_metadata(raw: bytes) -> tuple[list[str], dict[str, Optional[dict]]]:
+def decode_nccl_metadata(raw: bytes) -> tuple[list[str], dict[str, dict | None]]:
     """Decode the JSON metadata body into ``(keys_order, metadata)``."""
     payload = json.loads(raw.decode("utf-8"))
     return payload["keys_order"], payload["metadata"]

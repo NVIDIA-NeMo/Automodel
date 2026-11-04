@@ -102,6 +102,7 @@ optimizer:
 #   name: <your-run-name>
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 2                          # TP=4 * PP=4 = 16 GPUs = 2 nodes x 8 GPUs
   time: "00:30:00"

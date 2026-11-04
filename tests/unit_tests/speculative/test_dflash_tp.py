@@ -33,6 +33,7 @@ import nemo_automodel.recipes.llm.train_dflash as train_dflash
 from nemo_automodel.components.speculative.dflash.core import DFlashStepMetrics, DFlashTrainerModule, _to_full_tensor
 from nemo_automodel.components.speculative.dflash.domino_core import DominoStepMetrics, DominoTrainerModule
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
+from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 
 VOCAB = 64
@@ -278,7 +279,9 @@ def test_build_target_model_single_gpu_path(monkeypatch):
         device=torch.device("cpu"),
         compute_dtype=torch.float32,
     )
-    out = recipe._build_target_model({"target_attn_implementation": "sdpa"}, "target/path")
+    out = recipe._build_target_model(
+        {"target_attn_implementation": "sdpa"}, "target/path", resolve_dflash_draft_spec(["Qwen3ForCausalLM"])
+    )
 
     assert out is stub
     assert recipe.dist_setup is None and recipe.device_mesh is None and recipe.dp_mesh is None
@@ -318,7 +321,7 @@ def test_build_target_model_tensor_parallel_path(monkeypatch):
         device=torch.device("cpu"),
         compute_dtype=torch.bfloat16,
     )
-    out = recipe._build_target_model({}, "target/path")
+    out = recipe._build_target_model({}, "target/path", resolve_dflash_draft_spec(["Qwen3ForCausalLM"]))
 
     assert out is stub
     assert recipe.dist_setup is dist_setup

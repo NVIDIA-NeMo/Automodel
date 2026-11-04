@@ -48,3 +48,6 @@ checkpoint:
   checkpoint_dir: ./outputs/eagle1_qwen3_moe_mvp/checkpoints
   model_save_format: safetensors
   save_consolidated: true
+
+ci:
+  cluster_tag: h100

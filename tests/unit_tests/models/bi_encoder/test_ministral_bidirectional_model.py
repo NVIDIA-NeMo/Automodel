@@ -44,9 +44,7 @@ from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
 
-from transformers.models.ministral3.modeling_ministral3 import (
-    Ministral3Model as HFMinistral3Model,
-)
+from transformers.models.ministral3.modeling_ministral3 import Ministral3Model as HFMinistral3Model
 from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -57,19 +55,10 @@ from nemo_automodel._transformers.retrieval import (
     build_encoder_backbone,
     configure_encoder_metadata,
 )
-from nemo_automodel.components.checkpoint.addons import (
-    ConsolidatedHFAddon,
-    _maybe_save_custom_model_code,
-)
+from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, _maybe_save_custom_model_code
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
-from nemo_automodel.components.datasets.llm.retrieval_collator import (
-    ProcessorMethodCollator,
-)
-from nemo_automodel.components.datasets.llm.retrieval_dataset import (
-    CorpusInfo,
-    _transform_func,
-    load_corpus,
-)
+from nemo_automodel.components.datasets.llm.retrieval_collator import ProcessorMethodCollator
+from nemo_automodel.components.datasets.llm.retrieval_dataset import CorpusInfo, _transform_func, load_corpus
 from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 from nemo_automodel.components.models.ministral_bidirectional.model import (
     Ministral3BidirectionalConfig,
@@ -83,17 +72,12 @@ from nemo_automodel.components.models.ministral_bidirectional.processor import (
     PassageModality,
     load_image,
 )
-from nemo_automodel.recipes.retrieval.mining_encoder import (
-    CheckpointMiningEncoder,
-    CheckpointMiningEncoderConfig,
-)
-from nemo_automodel.recipes.retrieval.train_bi_encoder import (
-    _configure_sentence_transformer_export,
-)
+from nemo_automodel.recipes.retrieval.mining_encoder import CheckpointMiningEncoder, CheckpointMiningEncoderConfig
+from nemo_automodel.recipes.retrieval.train_bi_encoder import _configure_sentence_transformer_export
 
 # Over the default 5s budget on purpose: this module launches a fresh interpreter, which re-imports torch from scratch.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(70)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 
 def test_native_mining_and_training_use_wikissnq_binary_pixels(tmp_path, monkeypatch):
@@ -2069,9 +2053,7 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
 ) -> None:
     """The corpus-ID loader and both collators honor the examples' explicit caption policy."""
     from nemo_automodel.components.datasets.llm.retrieval_dataset import _transform_func
-    from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import (
-        flatten_bi_encoder_to_cross_encoder,
-    )
+    from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
 
     pixtral_processor.rerank_max_length = 64
     image = Image.new("RGB", (4, 4), (255, 0, 0))
@@ -2097,7 +2079,7 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
 
 @pytest.mark.runtime_budget(
     20,
-    reason="isolated Transformers startup and two export round trips took 15.6s on CI; allow runner variance",
+    reason="two export/reload paths share isolated interpreter startup; retain the internal 20s budget",
 )
 def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Trained heads export through both save paths into stock ST modules and portable Transformers."""

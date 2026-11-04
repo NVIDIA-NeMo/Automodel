@@ -14,10 +14,17 @@
 
 from pathlib import Path
 
+import pytest
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # ty: ignore[unresolved-import]
+
 from scripts.cuda_wheelhouse_lock import cache_fingerprint, load_locked_inputs
 
 _BUILD_SCRIPT = Path(".github/scripts/build-cuda-wheelhouse.sh")
-_CUDA_IMAGE = "nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04"
+_CUDA_IMAGE = "nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04@sha256:" + "a" * 64
 _TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
 
 
@@ -34,16 +41,15 @@ def _lock_contents(
         "flash-attn": "2.8.3",
         "mamba-ssm": "2.3.0",
         "numpy": "1.26.4",
-        "nv-grouped-gemm": "1.1.4.post8",
         "packaging": packaging_version,
         "psutil": "7.1.1",
         "pybind11": "3.0.1",
         "setuptools": "80.10.2",
         "torch": torch_version,
         "torchvision": torchvision_version,
-        "transformer-engine": "2.15.0",
-        "transformer-engine-cu13": "2.15.0",
-        "transformer-engine-torch": "2.15.0",
+        "transformer-engine": "2.19.0",
+        "transformer-engine-cu13": "2.19.0",
+        "transformer-engine-torch": "2.19.0",
         "unrelated-package": unrelated_version,
     }
     packages = []
@@ -62,7 +68,7 @@ def _lock_contents(
     return "\n\n".join(packages)
 
 
-def _fingerprint(tmp_path: Path, **lock_versions: str) -> str:
+def _fingerprint(tmp_path: Path, *, uv_settings: str = "", image: str = _CUDA_IMAGE, **lock_versions: str) -> str:
     lock_path = tmp_path / "uv.lock"
     lock_path.write_text(_lock_contents(**lock_versions))
     locked_inputs = load_locked_inputs(
@@ -72,14 +78,17 @@ def _fingerprint(tmp_path: Path, **lock_versions: str) -> str:
         platform_machine="x86_64",
         sys_platform="linux",
     )
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text("[tool.uv]\n" + uv_settings)
     return cache_fingerprint(
         locked_inputs,
         runner_os="Linux",
         python_version="3.12",
-        cuda_container_image=_CUDA_IMAGE,
+        cuda_container_image=image,
         torch_index=_TORCH_INDEX,
         torch_cuda_arch_list="9.0 10.0 12.0",
         build_script=_BUILD_SCRIPT,
+        pyproject=pyproject,
     )
 
 
@@ -101,6 +110,25 @@ def test_lock_manifest_pins_build_and_runtime_requirements(tmp_path):
     assert set(locked_inputs["build_tools"]) <= set(locked_inputs["constraints"])
     assert "torch==2.10.0+cu130" in locked_inputs["constraints"]
     assert "torchvision==0.25.0+cu130" in locked_inputs["constraints"]
+    assert "transformer-engine-torch==2.19.0" in locked_inputs["wheels"]
+
+
+def test_te_wheel_build_disables_optional_nccl_ep():
+    assert "export NVTE_WITH_NCCL_EP=0" in _BUILD_SCRIPT.read_text()
+    assert 'NVTE_WITH_NCCL_EP: "0"' in Path(".github/workflows/install-test.yml").read_text()
+
+
+def test_uv_cuda_builds_use_required_headers_without_nccl_ep():
+    build_variables = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["uv"]["extra-build-variables"]
+
+    assert build_variables["deep-ep"] == {
+        "CPLUS_INCLUDE_PATH": "/usr/local/cuda/include/cccl",
+    }
+    assert build_variables["transformer-engine-torch"] == {
+        "CPLUS_INCLUDE_PATH": "/usr/local/cuda/include:/usr/local/cuda/include/cccl",
+        "NVTE_BUILD_USE_NVIDIA_WHEELS": "1",
+        "NVTE_WITH_NCCL_EP": "0",
+    }
 
 
 def test_unrelated_lock_change_preserves_cache_fingerprint(tmp_path):
@@ -136,3 +164,27 @@ def test_build_tool_lock_change_invalidates_cache_fingerprint(tmp_path):
     updated = _fingerprint(tmp_path, packaging_version="26.0")
 
     assert updated != baseline
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        'no-build-isolation-package = ["mamba-ssm"]',
+        '[tool.uv.extra-build-variables.transformer-engine-torch]\nNVTE_WITH_NCCL_EP = "0"',
+        '[tool.uv.extra-build-dependencies]\ntransformer-engine-torch = ["torch"]',
+        '[tool.uv.config-settings]\nflag = "changed"',
+    ],
+)
+def test_uv_build_settings_invalidate_fingerprint(tmp_path: Path, settings: str) -> None:
+    baseline = _fingerprint(tmp_path)
+    assert _fingerprint(tmp_path, uv_settings=settings) != baseline
+
+
+def test_image_digest_invalidates_fingerprint(tmp_path: Path) -> None:
+    baseline = _fingerprint(tmp_path)
+    assert _fingerprint(tmp_path, image=_CUDA_IMAGE[:-64] + "b" * 64) != baseline
+
+
+def test_mutable_image_tag_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="pinned by sha256 digest"):
+        _fingerprint(tmp_path, image=_CUDA_IMAGE.split("@")[0])

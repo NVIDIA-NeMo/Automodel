@@ -68,9 +68,9 @@ def test_mesh_context_build_accepts_ddp_config(captured_raw_mesh_call):
     ctx = MeshContext.build(config, world_size=4)
 
     assert isinstance(ctx, MeshContext)
-    assert not hasattr(ctx, "strategy_config")
+    assert ctx.strategy_config is config
     assert captured_raw_mesh_call["strategy_config"] is config
-    assert not hasattr(ctx, "activation_checkpointing")
+    assert ctx.activation_checkpointing is False
     assert captured_raw_mesh_call["world_size"] == 4
 
 
@@ -83,8 +83,10 @@ def test_distributed_setup_config_accepts_megatron_fsdp_names(strategy, captured
     assert captured_raw_mesh_call["world_size"] == 4
 
 
-def test_mesh_context_build_accepts_existing_config(captured_raw_mesh_call):
-    config = FSDP2Config()
+@pytest.mark.parametrize("config", [FSDP2Config(), FSDP2Config(mp_policy=None)])
+def test_mesh_context_build_accepts_existing_config(captured_raw_mesh_call, config):
+    assert config.mp_policy.cast_forward_inputs is False
+    assert config.mp_policy.output_dtype is None
 
     ctx = MeshContext.build(config, world_size=8)
 
@@ -205,7 +207,7 @@ def test_distributed_setup_config_keeps_activation_checkpointing_separate(monkey
         world_size=2,
     )
 
-    assert not hasattr(setup.mesh_context, "activation_checkpointing")
+    assert setup.mesh_context.activation_checkpointing is True
     assert setup.activation_checkpointing is True
     assert setup.strategy_config.activation_checkpointing is False
 

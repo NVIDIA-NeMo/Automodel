@@ -122,13 +122,16 @@ def test_lora_patch_applies_to_selected_module_with_str_dtype(model):
     assert not isinstance(model.linear2, LinearLoRA)
 
 
-def test_peft_config_memory_efficient_lora_round_trip():
-    """PeftConfig should default memory-efficient LoRA on and preserve explicit overrides."""
+def test_peft_config_defaults_and_import_compatibility():
+    """The existing import exposes the dataclass with its defaults and explicit overrides."""
+    from nemo_automodel.components._peft.config import PeftConfig as ConfigPeftConfig
+    from nemo_automodel.shared.peft_config import PeftConfig as SharedPeftConfig
+
+    assert PeftConfig is ConfigPeftConfig is SharedPeftConfig
     assert PeftConfig().use_memory_efficient_lora is True
 
-    cfg = PeftConfig.from_dict({"use_memory_efficient_lora": False})
+    cfg = PeftConfig(use_memory_efficient_lora=False)
     assert cfg.use_memory_efficient_lora is False
-    assert cfg.to_dict()["use_memory_efficient_lora"] is False
 
 
 def test_forward_output_consistency(dummy_input):
@@ -191,6 +194,39 @@ def test_memory_efficient_lora_matches_legacy_forward_and_backward(input_shape):
     assert torch.allclose(x.grad, x_ref.grad)
     assert torch.allclose(lora_A.grad, lora_A_ref.grad)
     assert torch.allclose(lora_B.grad, lora_B_ref.grad)
+
+
+@pytest.mark.parametrize("input_shape", [(5, 16), (2, 3, 16)])
+def test_memory_efficient_lora_mixed_dtype_matches_legacy_forward_and_backward(input_shape):
+    """Custom autograd LoRA should preserve mixed-precision output and gradient contracts."""
+    torch.manual_seed(1234)
+    scale = 1.3
+    lora_dim = 4
+    out_features = 12
+
+    x = torch.randn(*input_shape, dtype=torch.float32, requires_grad=True)
+    lora_A = torch.randn(lora_dim, input_shape[-1], dtype=torch.bfloat16, requires_grad=True)
+    lora_B = torch.randn(out_features, lora_dim, dtype=torch.bfloat16, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    lora_A_ref = lora_A.detach().clone().requires_grad_(True)
+    lora_B_ref = lora_B.detach().clone().requires_grad_(True)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        efficient = apply_memory_efficient_lora(x, lora_A, lora_B, scale, False).float()
+        legacy = F.linear(F.linear(x_ref, lora_A_ref) * scale, lora_B_ref).float()
+
+    grad = torch.randn_like(legacy)
+    efficient.backward(grad)
+    legacy.backward(grad)
+
+    assert efficient.dtype == legacy.dtype == torch.float32
+    assert x.grad.dtype == x_ref.grad.dtype == torch.float32
+    assert lora_A.grad.dtype == lora_A_ref.grad.dtype == torch.bfloat16
+    assert lora_B.grad.dtype == lora_B_ref.grad.dtype == torch.bfloat16
+    torch.testing.assert_close(efficient, legacy)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(lora_A.grad, lora_A_ref.grad)
+    torch.testing.assert_close(lora_B.grad, lora_B_ref.grad)
 
 
 @pytest.mark.parametrize("input_shape", [(5, 16), (2, 3, 16)])
@@ -741,3 +777,78 @@ def test_linear_lora_negative_last_dim_shard_takes_async_shaping(single_rank_pg)
     bmm_spy.assert_not_called()
     assert isinstance(out, DTensor)
     assert torch.allclose(out.full_tensor(), ref, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("x_dtype", "lora_dtype", "expect_triton"),
+    [
+        (torch.float32, torch.float32, True),  # uniform: the Triton kernels are still used
+        (torch.bfloat16, torch.bfloat16, True),
+        (torch.float32, torch.bfloat16, False),  # issue #3652: fp32 activation, bf16 adapters
+        (torch.bfloat16, torch.float32, False),  # lora_dtype differing from the base weights
+    ],
+)
+def test_memory_efficient_lora_declines_triton_on_mixed_dtype(x_dtype, lora_dtype, expect_triton):
+    """The Triton kernels require one dtype for both matmul operands; mixed input must fall back.
+
+    ``tl.dot`` asserts "Both operands must be same dtype", and the kernels run outside autocast, so
+    nothing reconciles an FP32 activation with BF16 adapters (what FSDP2 ``output_dtype=float32``
+    produces). Declining here routes those to the torch matmul path instead of aborting compilation.
+    """
+    x = torch.randn(4, 8, dtype=x_dtype)
+    lora_A = torch.randn(2, 8, dtype=lora_dtype)
+    lora_B = torch.randn(6, 2, dtype=lora_dtype)
+
+    with patch("nemo_automodel.components._peft.lora.lora_forward_wrapper") as triton_forward:
+        triton_forward.return_value = torch.zeros(4, 6, dtype=x_dtype)
+        # The fallback is the torch matmul path, which relies on autocast to reconcile dtypes.
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            apply_memory_efficient_lora(x, lora_A, lora_B, 1.5, True)
+
+    assert triton_forward.called is expect_triton
+
+
+@pytest.mark.parametrize("use_triton", [False, True])
+def test_patched_lora_preserves_identity_and_linear_input_keyword(use_triton: bool) -> None:
+    base = nn.Linear(4, 3)
+    weight, bias = base.weight, base.bias
+    adapter = patch_linear_module(base, dim=2, use_triton=use_triton)
+    assert adapter is base
+    assert adapter.weight is weight
+    assert adapter.bias is bias
+    x = torch.randn(2, 4)
+    with patch(
+        "nemo_automodel.components._peft.lora.apply_memory_efficient_lora",
+        side_effect=lambda x, a, b, scale, *args: F.linear(F.linear(x, a) * scale, b),
+    ):
+        expected = adapter(x)
+        torch.testing.assert_close(adapter(x=x), expected)
+        torch.testing.assert_close(adapter(input=x), expected)
+    with pytest.raises(TypeError, match="either x or input"):
+        adapter(x=x, input=x)
+    with pytest.raises(TypeError, match="requires an input tensor"):
+        adapter()
+
+
+def test_patched_lora_restores_original_class_when_initialization_fails() -> None:
+    base = nn.Linear(4, 3)
+    original_class = type(base)
+    with pytest.raises(ZeroDivisionError):
+        patch_linear_module(base, dim=0)
+    assert type(base) is original_class
+
+
+def test_lora_kernel_launchers_report_missing_triton(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Python launchers must reject unavailable Triton before entering a JIT kernel."""
+    from nemo_automodel.components._peft import lora_kernel
+
+    monkeypatch.setattr(lora_kernel, "HAVE_TRITON", False)
+    value = torch.empty(1, 1)
+    launches = (
+        (lora_kernel.lora_forward_wrapper, (value, value, value, None, 1.0)),
+        (lora_kernel.lora_da_dx_update_wrapper, (value, value, value, value, 1.0)),
+        (lora_kernel.lora_db_update_wrapper, (value, value, value, 1.0)),
+    )
+    for launch, args in launches:
+        with pytest.raises(ImportError, match="triton is not installed"):
+            launch(*args)

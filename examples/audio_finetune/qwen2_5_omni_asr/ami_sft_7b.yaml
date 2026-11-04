@@ -62,7 +62,6 @@ distributed:
 # Full fine-tune: audio tower + language model trainable; vision tower frozen
 # (we never feed images on AMI).
 freeze_config:
-  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: false
   freeze_language_model: false
@@ -110,5 +109,6 @@ wandb:
   dir: ${oc.env:WANDB_DIR,result/wandb}
 
 ci:
+  cluster_tag: h100
   recipe_owner: yuekaizhang
   time: "00:30:00"

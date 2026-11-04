@@ -41,7 +41,7 @@ model:
     attn: te
     linear: te
     rms_norm: torch_fp32
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -122,4 +122,5 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: hemildesai

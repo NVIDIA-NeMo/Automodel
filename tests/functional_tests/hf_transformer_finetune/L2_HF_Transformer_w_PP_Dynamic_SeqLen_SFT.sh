@@ -51,15 +51,34 @@ COMMON_ARGS=(
     --distributed.pipeline.scale_grads_in_schedule false
 )
 
+LOG_FILE=$(mktemp)
+trap 'rm -f "$LOG_FILE"' EXIT
+
+# Guard against bug in commit 00f40419 (PR #2983). Checked after each schedule
+# because the metadata path differs between PipelineScheduleSingle and ...Multi.
+# The accumulated-gradient loss fixed by PR #3530 is a separate failure that this
+# smoke run cannot see; L2_Parallelism_PP_Grad_Accum_Parity.sh covers it
+# numerically.
+assert_static_pp_metadata() {
+    if grep -Eiq "dynamic .*metadata inference" "$LOG_FILE"; then
+        echo "ERROR: pipeline stages fell back to dynamic metadata inference instead of static metadata"
+        exit 1
+    fi
+}
+
 # --- Run 1: 1f1b (PipelineScheduleSingle) ---
 echo "=== PP dynamic seq_len: 1f1b ==="
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
-    --distributed.pipeline.pp_schedule 1f1b
+    --distributed.pipeline.pp_schedule 1f1b \
+    2>&1 | tee "$LOG_FILE"
+assert_static_pp_metadata
 
 # --- Run 2: interleaved1f1b (PipelineScheduleMulti) ---
 echo "=== PP dynamic seq_len: interleaved1f1b ==="
 TRANSFORMERS_OFFLINE=1 python -m torch.distributed.run --nproc_per_node=2 --nnodes=1 -m coverage run examples/llm_finetune/finetune.py \
     "${COMMON_ARGS[@]}" \
     --model.num_hidden_layers 8 \
-    --distributed.pipeline.pp_schedule interleaved1f1b
+    --distributed.pipeline.pp_schedule interleaved1f1b \
+    2>&1 | tee "$LOG_FILE"
+assert_static_pp_metadata
