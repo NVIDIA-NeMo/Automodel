@@ -17,14 +17,18 @@ slug: model-coverage/large-language-models/moonshotai/Kimi-K3.1-Pro
 | Parameters | 2.8T total / 104B activated |
 | Layers | 93: 69 KDA and 24 gated DSA |
 | Checkpoint | `moonshotai/Kimi-K3.1-Pro` |
-| Context length | 1,048,576 tokens; dense-mask training memory limits apply |
+| Context length | 1,048,576 tokens advertised by the checkpoint; this length has not been validated for training |
 
 ## Implementation Limits
 
-- Selection uses dense attention masks. Attention memory and compute remain quadratic in sequence length; this implementation does not provide the serving engines' sparse-kernel speedup.
-- Indexer scores use FP32 accumulation over the loaded BF16 projections, without the FP8 scoring path used by serving kernels.
+- The recipes select `backend.attn: cudnn`: the existing fused cuDNN indexer produces top-k coordinates, and the shared FlashMLA/cuDNN kernels attend directly to selected latent KV. This requires the optional cuDNN Frontend and FlashMLA dependencies and has been exercised on GB200. The `eager`/`sdpa` paths remain dense-mask references.
+- Indexer projections use BF16 with FP32 score accumulation; this is not the FP8 indexer used by some serving kernels. The indexer still scans all causal keys and its score buffer remains quadratic. Sparse MLA avoids expanding all per-head K/V and avoids dense attention over unselected keys.
 - The pretrained indexer stays frozen, including after LoRA injection. Hard top-k selection has no language-model-loss gradient into the indexer; indexer distillation training is not implemented.
-- A sequence of at most 2048 valid tokens exercises the dense path. Sparse-selection validation needs an individual sequence longer than 2048 tokens. Padding or packing short documents is insufficient.
+- A sequence of at most 2048 valid tokens keeps every causal key. Sparse-selection validation needs an individual sequence longer than 2048 tokens. Padding or packing short documents is insufficient.
+
+On GB200, FlashMLA forward pads the 96 query heads to 128, while cuDNN backward runs the native 96 heads. Direct API tests with cuDNN Frontend 1.27.0 and 1.32.1 confirmed native-96 backward support; the 1.32.1 forward API rejects the checkpoint's (96, 576) shape.
+
+The cuDNN path preserves the output gate and supports `kv_b_proj` LoRA through its effective weight. That projection requires zero LoRA dropout and does not support DoRA. Packed documents must be contiguous: interior masked holes within one document require the `sdpa` path.
 
 ## Text Recipes
 

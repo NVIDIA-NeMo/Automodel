@@ -16,7 +16,7 @@
 # Kimi K3.1 synthetic benchmark counterpart of kimi_k3_gb200.yaml.
 # Preserves the K3 benchmark precision and topology. No K3.1 throughput is claimed.
 # Rows <= 2048 keep all causal keys; use longer individual rows to exercise DSA selection.
-# The current masked DSA implementation does not provide sparse-kernel memory savings.
+# Uses the fused cuDNN indexer and FlashMLA/cuDNN sparse latent attention.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
 benchmark:
@@ -55,7 +55,7 @@ model:
   use_sdpa_patching: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: eager
+    attn: cudnn
     linear: torch
     rms_norm: torch_fp32
     experts: te

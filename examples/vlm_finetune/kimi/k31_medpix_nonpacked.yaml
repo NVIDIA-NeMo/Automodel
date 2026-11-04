@@ -13,19 +13,22 @@
 # limitations under the License.
 
 
-# Kimi K3.1 MedPix-VQA fine-tuning with nonpacked 4096-token inputs, CP1.
-# FP32 AdamW master weights / BF16 compute; EP32 x PP8 on 128 GB200 nodes.
-# Use the native K3 processor and collater; no image packing or image CP is requested.
+# Kimi K3.1 nonpacked MedPix training: FLA KDA and cuDNN sparse DSA, CP2.
+# BF16 parameters and AdamW moments; EP32 x PP8 on 64 four-GPU GB200 nodes.
+# Uses learned expert routing. Benchmark fake/static routing stays disabled.
+# FLA supports CP; the optional CP-incompatible fused KDA implementation is not used.
+# Native MedPix processing preserves individual examples and their padding.
 # Four-layer validation does not certify this full 93-layer topology.
 
 recipe: FinetuneRecipeForVLM
 step_scheduler:
   global_batch_size: 256
-  local_batch_size: 4
+  local_batch_size: 16
   ckpt_every_steps: 100
   val_every_steps: 100
   max_steps: 100
   num_epochs: 1
+  gc_every_steps: 10
 dist_env:
   backend: nccl
   timeout_minutes: 120
@@ -37,22 +40,28 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: moonshotai/Kimi-K3.1-Pro
   trust_remote_code: false
-  kda_mode: chunk
   use_liger_kernel: false
   use_sdpa_patching: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
+    attn: cudnn
     linear: torch
     rms_norm: torch_fp32
     experts: torch_mm
-    dispatcher: torch
+    dispatcher: hybridep
     rope_fusion: false
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
+    dispatcher_num_sms: 32
+    compile_situ: false
+    compile_norm: false
+    compile_router_weight: false
+    benchmark_static_routing: false
   revision: 6d0a0202956796543364d666ab19c6ad1a494ee1
-  dtype: float32
+  torch_dtype: bfloat16
+  text_config:
+    kda_chunk_impl: fla
 checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/kimi_k31_medpix_nonpacked
@@ -62,7 +71,7 @@ checkpoint:
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 1
+  cp_size: 2
   pp_size: 8
   ep_size: 32
   sequence_parallel: false
@@ -73,18 +82,17 @@ distributed:
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    pp_batch_size: 4
+    pp_batch_size: 16
     pp_seq_len: 4096
+    pp_recv_buffer_pool: true
   moe:
-    reshard_after_forward: false
-    wrap_outer_model: false
-  mp_policy:
-    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
-    param_dtype: bfloat16
-    reduce_dtype: float32
-    output_dtype: bfloat16
+    reshard_after_forward: true
+    wrap_outer_model: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
@@ -105,17 +113,19 @@ validation_dataloader: null
 optimizer:
   _target_: torch.optim.AdamW
   lr: 1.0e-05
-  weight_decay: 0.0
+  weight_decay: 0.01
   betas:
   - 0.9
   - 0.95
   eps: 1.0e-08
+  fused: true
 wandb:
   enable: false
 clip_grad_norm:
   max_norm: 1.0
 prewarm:
   comm_groups: true
+  cublas_backward: true
 processor:
   _target_: nemo_automodel.components.models.kimi_k3.processing.KimiK3Processor.from_pretrained
   pretrained_model_name_or_path: moonshotai/Kimi-K3.1-Pro
@@ -125,6 +135,8 @@ freeze_config:
   freeze_language_model: false
 ci:
   recipe_owner: huiyingl
-  nodes: 128
+  nodes: 64
   cluster_tag: gb200
   time: 01:30:00
+  env_vars:
+    SBATCH_SEGMENT_SIZE: '8'
