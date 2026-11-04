@@ -743,10 +743,26 @@ class TrainDFlashRecipe(SpecDecodeRecipeBase):
             all_have_valid = _all_ranks_have_valid(local_has_valid, is_ddp, self.device)
             if all_have_valid:
                 loss.backward()
+                # Read inside no_sync(): the context restores this flag on exit.
+                # Skipped forwards must not overwrite the last backward's state.
+                self._window_grads_synced = not is_ddp or self.trainer_module.require_backward_grad_sync
         if not all_have_valid:
             self._skipped_micro_batches += 1
             return None
         return metrics
+
+    def _sync_grads_before_clip(self) -> None:
+        """Average an unsynced trailing DDP window before TP sync and clipping."""
+        if isinstance(self.trainer_module, DistributedDataParallel) and not self._window_grads_synced:
+            # If the epoch's last batch is skipped, no backward carries DDP's
+            # reduction. Match DDP's mean over its own data-parallel group.
+            group = self.trainer_module.process_group
+            world_size = torch.distributed.get_world_size(group)
+            for param in self.trainer_module.parameters():
+                if param.grad is not None:
+                    torch.distributed.all_reduce(param.grad, group=group)
+                    param.grad.div_(world_size)
+        super()._sync_grads_before_clip()
 
     def _new_train_window(self) -> _DFlashTrainWindow:
         """Return an empty training-metric window."""

@@ -21,6 +21,7 @@ import torch
 from transformers import Qwen3VLConfig
 
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+from nemo_automodel.components.models.common.packing import get_packing_capabilities
 from nemo_automodel.components.models.qwen3_vl.model import Qwen3VLForConditionalGeneration
 
 _HAS_FA = torch.cuda.is_available() and importlib.util.find_spec("flash_attn") is not None
@@ -83,7 +84,9 @@ def test_packed_flash_attention_with_image_matches_isolated_documents() -> None:
         "image_grid_thw": image_grid_thw,
         "n_images": 1,
     }
-    batch = neat_packed_vlm_collater([packed_sample], attn_implementation="flash_attention_2")
+    batch = neat_packed_vlm_collater(
+        [packed_sample], attn_implementation="flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
+    )
 
     with torch.no_grad():
         packed_logits = model(
