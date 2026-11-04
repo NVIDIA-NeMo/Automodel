@@ -131,6 +131,7 @@ class Block(nn.Module):
         elif self.layer_type == "linear_attention":
             self.linear_attn.dt_bias.data.fill_(1.0)
             self.linear_attn.A_log.data.uniform_(0, 16).log_()
+            self.linear_attn.conv1d.reset_parameters()
             linear_list = [self.linear_attn.in_proj_qkvz, self.linear_attn.in_proj_ba, self.linear_attn.out_proj]
             for linear in linear_list:
                 nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)

@@ -624,6 +624,7 @@ class Qwen3_5DenseBlock(Block):
         elif self.layer_type == "linear_attention":
             self.linear_attn.dt_bias.data.fill_(1.0)
             self.linear_attn.A_log.data.uniform_(0, 16).log_()
+            self.linear_attn.conv1d.reset_parameters()
             for linear in (
                 self.linear_attn.in_proj_qkv,
                 self.linear_attn.in_proj_z,
