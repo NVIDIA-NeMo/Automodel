@@ -430,6 +430,39 @@ def test_rank_ordering_context_wraps_only_dataset_construction():
     assert events == ["enter", "dataset", "exit", "packing"]
 
 
+def test_native_thd_packing_build_preserves_dataset_and_collator(monkeypatch):
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    documents = [{"input_ids": [2, 3]}]
+    observed = []
+
+    def pack(dataset, **kwargs):
+        observed.append(kwargs)
+        return dataset
+
+    monkeypatch.setattr("nemo_automodel.components.datasets.llm.packed_sequence.pack_dataset", pack)
+    dataset, collator = ThdPackingConfig(packed_sequence_size=8).build(documents, cp_size=2)
+    assert dataset is documents
+    assert collator is packed_sequence_thd_collater
+    assert observed[0]["cp_size"] == 2
+
+
+def test_native_packing_uses_model_owned_cp_alignment(monkeypatch):
+    observed = []
+
+    def pack(dataset, **kwargs):
+        observed.append(kwargs["cp_size"])
+        return dataset
+
+    monkeypatch.setattr("nemo_automodel.components.datasets.llm.packed_sequence.pack_dataset", pack)
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.loader.ParallelAwareDataloader", lambda *args, **kwargs: kwargs
+    )
+    config = DataloaderConfig(dataset_config=StaticDatasetConfig([]), packing=ThdPackingConfig(packed_sequence_size=8))
+    config.build(dp_rank=0, dp_world_size=1, cp_size=2, packing_cp_size=1)
+    assert observed == [1]
+
+
 def test_thd_rejects_unsupported_model_instead_of_silently_disabling_packing():
     with pytest.raises(ValueError, match="THD packing requires a model that consumes seq_lens"):
         ThdPackingConfig(packed_sequence_size=8).build([], supports_seq_lens=False)

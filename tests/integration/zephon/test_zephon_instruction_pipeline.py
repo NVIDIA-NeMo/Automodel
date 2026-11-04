@@ -24,10 +24,10 @@ import torch
 from tokenizers import Tokenizer, models, pre_tokenizers, processors, trainers
 from transformers import PreTrainedTokenizerFast
 
-from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
+from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetBuildSchedule
 from nemo_automodel.components.datasets.zephon.config import (
-    ZephonPretokenizedTextSourceConfig,
-    ZephonInstructionSourceConfig,
+    ZephonInstructionDatasetConfig,
+    ZephonPretokenizedTextDatasetConfig,
 )
 from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
@@ -36,24 +36,31 @@ TAGGED = "{% for message in messages %}{% if message['role'] == 'assistant' %}{%
 PREFIX = "{% for message in messages %}{% if message['role'] == 'assistant' %}w4 {% endif %}{{ message['content'] }} {% endfor %}"
 
 
+def _training_schedule(config: DataloaderConfig) -> DatasetBuildSchedule:
+    return DatasetBuildSchedule(config.batch_size, config.batch_size, max_steps=1, val_check_interval=None)
+
+
 def _instruction_config(config, payloads, **settings):
-    path = Path(config.zephon.sources[0].path) / "text.jsonl"
+    path = Path(config.dataset_config.zephon.sources[0].path) / "text.jsonl"
     path.write_text("".join(json.dumps(payload) + "\n" for payload in payloads))
     return replace(
         config,
-        dataset_config=ZephonInstructionSourceConfig(column_mapping={"question": "q", "answer": "a"}, **settings),
         batch_size=1,
-        zephon=replace(
-            config.zephon,
-            packing=replace(
-                config.zephon.packing,
-                seq_len=15,
-                pack_algorithm="best_fit",
-                pack_num_bins=2,
-                max_num_documents=1,
-                max_num_documents_scope="bin",
+        dataset_config=ZephonInstructionDatasetConfig(
+            column_mapping={"question": "q", "answer": "a"},
+            **settings,
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(
+                    config.dataset_config.zephon.packing,
+                    seq_len=15,
+                    pack_algorithm="best_fit",
+                    pack_num_bins=2,
+                    max_num_documents=1,
+                    max_num_documents_scope="bin",
+                ),
+                source=replace(config.dataset_config.zephon.source, chunk_size=1),
             ),
-            source=replace(config.zephon.source, chunk_size=1),
         ),
     )
 
@@ -71,7 +78,9 @@ def test_chat_supervision_is_selected_inside_zephon(config, tokenizer, template,
     tokenizer.chat_template = template
     payload = {"q": "w0 w1", "a": "w2 w3"}
     config = _instruction_config(config, [payload], use_hf_chat_template=True, answer_only_loss_mask=answer_only)
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    ) as loader:
         batch = next(loader)
         length = len(tokens) - 1
         assert batch["input_ids"][0, :length].tolist() == tokens[:-1]
@@ -86,7 +95,9 @@ def test_chat_template_keeps_its_turn_marker_without_canonical_eos(config, token
     assert turn_end != tokenizer.eos_token_id
     tokenizer.chat_template = TAGGED.replace("[EOS]", "[EOT]")
     config = _instruction_config(config, [{"q": "w0 w1", "a": "w2 w3"}], use_hf_chat_template=True)
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    ) as loader:
         batch = next(loader)
         assert batch["input_ids"][0, :4].tolist() == [2, 3, 4, 5]
         assert batch["labels"][0, :4].tolist() == [-100, 4, 5, turn_end]
@@ -95,7 +106,7 @@ def test_chat_template_keeps_its_turn_marker_without_canonical_eos(config, token
 
 
 def test_sft_explicit_ids_override_bracketing_without_changing_template_or_tokenizer(
-    config: ZephonDataloaderConfig, tokenizer: PreTrainedTokenizerFast
+    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast
 ) -> None:
     tokenizer.add_special_tokens({"bos_token": "[BOS]", "additional_special_tokens": ["[INSERT_BOS]", "[INSERT_EOS]"]})
     original_bos, original_eos = tokenizer.bos_token_id, tokenizer.eos_token_id
@@ -110,7 +121,9 @@ def test_sft_explicit_ids_override_bracketing_without_changing_template_or_token
         bos_token_id=inserted_bos,
         eos_token_id=inserted_eos,
     )
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    ) as loader:
         batch = next(loader)
         assert batch["input_ids"][0, :6].tolist() == [inserted_bos, 2, 3, 4, 5, original_eos]
         assert batch["labels"][0, :6].tolist() == [-100, -100, 4, 5, original_eos, inserted_eos]
@@ -126,13 +139,18 @@ def test_prompt_worker_and_pretokenized_tokens_have_identical_delivery_and_repla
     config = _instruction_config(config, payloads)
     config = replace(
         config,
-        zephon=replace(
-            config.zephon,
-            runtime=replace(config.zephon.runtime, runner="process", mtp_mode=True),
-            workers=replace(config.zephon.workers, map_parallelism=2, tokenize_parallelism=2, pack_parallelism=2),
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                runtime=replace(config.dataset_config.zephon.runtime, runner="process", mtp_mode=True),
+                workers=replace(
+                    config.dataset_config.zephon.workers, map_parallelism=2, tokenize_parallelism=2, pack_parallelism=2
+                ),
+            ),
         ),
     )
-    pretokenized_path = Path(config.zephon.sources[0].path).parent / "pretokenized"
+    pretokenized_path = Path(config.dataset_config.zephon.sources[0].path).parent / "pretokenized"
     pretokenized_path.mkdir()
     (pretokenized_path / "tokens.jsonl").write_text(
         "".join(
@@ -141,12 +159,21 @@ def test_prompt_worker_and_pretokenized_tokens_have_identical_delivery_and_repla
     )
     pretokenized_config = replace(
         config,
-        dataset_config=ZephonPretokenizedTextSourceConfig(tokens_field="tokens"),
-        zephon=replace(config.zephon, sources=(replace(config.zephon.sources[0], path=str(pretokenized_path)),)),
+        dataset_config=ZephonPretokenizedTextDatasetConfig(
+            tokens_field="tokens",
+            zephon=replace(
+                config.dataset_config.zephon,
+                sources=(replace(config.dataset_config.zephon.sources[0], path=str(pretokenized_path)),),
+            ),
+        ),
     )
-    raw = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
-    tokens = pretokenized_config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
-    resumed = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+    raw = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    tokens = pretokenized_config.build(
+        tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(pretokenized_config)
+    )
+    resumed = config.build(
+        tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config)
+    )
     try:
         torch.testing.assert_close(next(tokens), next(raw))
         checkpoint = raw.state_dict()
@@ -164,7 +191,7 @@ def test_prompt_worker_and_pretokenized_tokens_have_identical_delivery_and_repla
     "tokenizer_eos,special_tokens", [(True, None), (False, "bos_eos")], ids=["tokenizer-specials", "explicit-bos-eos"]
 )
 def test_plain_sft_preserves_special_tokens_without_duplicates(
-    config: ZephonDataloaderConfig,
+    config: DataloaderConfig,
     tokenizer: PreTrainedTokenizerFast,
     tokenizer_eos: bool,
     special_tokens: str | None,
@@ -179,7 +206,9 @@ def test_plain_sft_preserves_special_tokens_without_duplicates(
     tokenizer.add_eos_token = tokenizer_eos
     assert tokenizer("w0 w1 w2 w3")["input_ids"] == [bos, 2, 3, 4, 5] + ([eos] if tokenizer_eos else [])
     config = _instruction_config(config, [{"q": "w0 w1", "a": "w2 w3"}], special_tokens=special_tokens)
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    ) as loader:
         batch = next(loader)
         assert batch["input_ids"][0, :5].tolist() == [bos, 2, 3, 4, 5]
         assert batch["labels"][0, :5].tolist() == [-100, -100, 4, 5, eos]
@@ -201,7 +230,9 @@ def test_plain_sft_supervises_answer_token_merged_with_prompt_whitespace(config)
     full = tokenizer("hello world", add_special_tokens=False)["input_ids"]
     assert len(prompt) == len(full) == 2 and prompt[-1] != full[-1]
     config = _instruction_config(config, [{"q": "hello", "a": "world"}])
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    ) as loader:
         batch = next(loader)
         assert batch["input_ids"][0, 0].item() == full[0]
         assert batch["labels"][0, 0].item() == full[1]
@@ -220,21 +251,29 @@ def test_instruction_mixture_uses_builtin_token_calibration(config, tokenizer, t
     config = replace(
         config,
         batch_size=1,
-        dataset_config=ZephonInstructionSourceConfig(column_mapping={"question": "q", "answer": "a"}),
-        zephon=replace(
-            config.zephon,
-            sources=tuple(sources),
-            packing=replace(config.zephon.packing, seq_len=31),
-            source=replace(
-                config.zephon.source,
-                chunk_size=8,
-                exhausted_policy="repeat",
-                stop_after_passes=4,
-                token_estimation={"calibration_samples": 8, "calibration_shards_min": 1, "calibration_shards_max": 1},
+        dataset_config=ZephonInstructionDatasetConfig(
+            column_mapping={"question": "q", "answer": "a"},
+            zephon=replace(
+                config.dataset_config.zephon,
+                sources=tuple(sources),
+                packing=replace(config.dataset_config.zephon.packing, seq_len=31),
+                source=replace(
+                    config.dataset_config.zephon.source,
+                    chunk_size=8,
+                    exhausted_policy="repeat",
+                    stop_after_passes=4,
+                    token_estimation={
+                        "calibration_samples": 8,
+                        "calibration_shards_min": 1,
+                        "calibration_shards_max": 1,
+                    },
+                ),
             ),
         ),
     )
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    ) as loader:
         short = total = 0
         for batch in loader:
             tokens = batch["input_ids"]
@@ -245,19 +284,23 @@ def test_instruction_mixture_uses_builtin_token_calibration(config, tokenizer, t
 
 
 def test_instruction_tokenization_without_packing_keeps_answer_supervision(
-    config: ZephonDataloaderConfig, tokenizer: PreTrainedTokenizerFast
+    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast
 ) -> None:
-    Path(config.zephon.sources[0].path, "text.jsonl").write_text('{"q":"w0 w1","a":"w2 w3"}\n' * 2)
+    Path(config.dataset_config.zephon.sources[0].path, "text.jsonl").write_text('{"q":"w0 w1","a":"w2 w3"}\n' * 2)
     selected = replace(
         config,
-        dataset_config=ZephonInstructionSourceConfig(column_mapping={"question": "q", "answer": "a"}),
-        zephon=replace(
-            config.zephon,
-            packing=replace(config.zephon.packing, pack_algorithm=None),
-            source=replace(config.zephon.source, chunk_size=1),
+        dataset_config=ZephonInstructionDatasetConfig(
+            column_mapping={"question": "q", "answer": "a"},
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(config.dataset_config.zephon.packing, pack_algorithm=None),
+                source=replace(config.dataset_config.zephon.source, chunk_size=1),
+            ),
         ),
     )
-    with closing(selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(selected))
+    ) as loader:
         batch = next(loader)
         assert batch["input_ids"].tolist() == [[2, 3, 4, 5, 1, 1, 1]] * 2
         assert batch["labels"].tolist() == [[-100, 4, 5, -100, -100, -100, -100]] * 2
