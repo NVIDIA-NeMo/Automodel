@@ -26,14 +26,11 @@ model:
   use_liger_kernel: false
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
+  paths: work/zephon-tiny/corpus
   tokenize_special_tokens: eos
   tokenizer:
     pretrained_model_name_or_path: work/zephon-tiny/tokenizer
   zephon:
-    sources:
-    - name: text
-      path: work/zephon-tiny/corpus
-      fmt: jsonl
     packing:
       seq_len: 63
     source:

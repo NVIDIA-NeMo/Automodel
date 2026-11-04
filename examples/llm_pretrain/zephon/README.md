@@ -101,6 +101,24 @@ You can also place the data settings in a TOML file and reference it with
 `dataset.zephon.data_config`. Inline YAML values override that file; relative
 source, cache, and checkpoint paths in TOML are resolved relative to the TOML file.
 
+To reuse native source fields, select a Zephon dataset config and supply one
+`dataset.path_or_dataset_id` or `dataset.paths` value instead of `zephon.sources`.
+A string or a list containing one path is accepted. A scalar
+`path_or_dataset_id: org/dataset` selects a Hugging Face dataset, with `name`
+for its subset and a simple named `split` (default `train`). Zephon reads the
+uploaded files or its supported Parquet conversion; Hugging Face dataset-card
+reader options and feature casting are not applied. Explicit Zephon URIs also
+work; encode their subset/split in the URI itself.
+
+Local paths must identify a dataset root containing the intended shards.
+Individual files, globs, Megatron binary prefixes and blend files require
+migration; the adapter never substitutes a parent directory. Multiple native
+paths are rejected because concatenation or natural corpus-size sampling does
+not mean equal Zephon weights. Use explicit `zephon.sources` and choose weights
+and token estimation for mixtures. Source declarations cannot be combined,
+including sources imported from TOML. Unsupported native formatting, truncation
+and sample-limit fields raise rather than being ignored.
+
 ### Pretokenized and prepacked text
 
 Tokenization and online packing are independent choices:
