@@ -95,7 +95,8 @@ Each versioned cache sample contains:
 - `prompt_embeddings`: `[sequence, hidden]`
 - `prompt_attention_mask`: `[sequence]`
 - `conditioning_tensors`: optional explicitly named tensors
-- `metadata`: original IDs, tensor shapes, token lengths, and the compound target/context bucket signature
+- `conditioning_tensors`: Optional explicitly named tensors
+- `metadata`: Original IDs, tensor shapes, token lengths, and the compound target and context bucket signature
 
 The top-level `metadata.json` records the source dataset ID, dataset config when provided, split, row limit, and preprocessing settings. Batches contain only compatible target and ordered-context shapes, and their CPU metadata includes target, context, text, and total token counts.
 
