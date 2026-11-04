@@ -554,10 +554,6 @@ class LlamaNemotronVLModel(PreTrainedModel):
                 f"Please use transformers <=4.53.x or >=4.56.0."
             )
 
-    def get_decoder(self) -> PreTrainedModel:
-        """Return the language model used as the retrieval text tower."""
-        return self.language_model
-
     def _embed_batch(self, inputs: Dict[str, Any], pool_type: str | None = None):
         """
         Encodes the inputs into a tensor of embeddings.

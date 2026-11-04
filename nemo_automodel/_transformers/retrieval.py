@@ -18,6 +18,7 @@ import inspect
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from copy import copy
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
@@ -131,6 +132,15 @@ def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedMode
             f"Got {type(extracted_model).__name__}."
         )
     return extracted_model
+
+
+def _get_submodule_parent_and_attr(model: nn.Module, submodule_path: str) -> tuple[nn.Module, str]:
+    """Return the parent module and final attribute name for a dotted submodule path."""
+    attrs = submodule_path.split(".")
+    parent = model
+    for attr in attrs[:-1]:
+        parent = getattr(parent, attr)
+    return parent, attrs[-1]
 
 
 def _get_supported_backbone_class(
@@ -398,6 +408,85 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
+def _ste_floor(y: torch.Tensor) -> torch.Tensor:
+    """Straight-through floor: forward = floor(y), backward = identity."""
+    return (y.floor() - y).detach() + y
+
+
+def tanh_int8_quantize(x: torch.Tensor) -> torch.Tensor:
+    """PPLX-style INT8 quantization with straight-through floor.
+
+    Forward: floor(127 * tanh(x) + 0.5), values in {-127, ..., 127}.
+    Backward: gradient flows through tanh as if floor were the identity.
+
+    The output is float-dtype with integer-valued entries; downstream cosine
+    similarity (via L2 normalization) works as usual.
+    """
+    y = 127.0 * torch.tanh(x) + 0.5
+    return _ste_floor(y)
+
+
+def _get_module_device_dtype(module: nn.Module) -> tuple[torch.device, torch.dtype]:
+    """Return a real device/dtype pair from a module's parameters or buffers."""
+    for parameter in module.parameters():
+        return parameter.device, parameter.dtype
+    for buffer in module.buffers():
+        return buffer.device, buffer.dtype
+    return torch.device("cpu"), torch.float32
+
+
+def _sum_nested_tensors(value) -> torch.Tensor | None:
+    """Sum tensors from nested model outputs so they can contribute a zero gradient."""
+    if isinstance(value, torch.Tensor):
+        return value.sum()
+    if isinstance(value, (list, tuple)):
+        total = None
+        for item in value:
+            item_sum = _sum_nested_tensors(item)
+            if item_sum is not None:
+                total = item_sum if total is None else total + item_sum
+        return total
+    return None
+
+
+def _dummy_vision_sum(model: nn.Module) -> torch.Tensor | None:
+    """Run a one-image dummy vision path for VLMs that expose get_image_features()."""
+    if not hasattr(model, "get_image_features") or not hasattr(model, "vision_tower"):
+        return None
+
+    vision_tower = model.vision_tower
+    device, dtype = _get_module_device_dtype(vision_tower)
+    patch_size = getattr(vision_tower, "patch_size", None)
+    if patch_size is None:
+        patch_size = getattr(getattr(vision_tower, "config", None), "patch_size", 16)
+    spatial_merge_size = getattr(getattr(model, "config", None), "spatial_merge_size", 1)
+    if isinstance(patch_size, (list, tuple)):
+        patch_height, patch_width = patch_size
+    else:
+        patch_height = patch_width = patch_size
+    if isinstance(spatial_merge_size, (list, tuple)):
+        spatial_merge_height, spatial_merge_width = spatial_merge_size
+    else:
+        spatial_merge_height = spatial_merge_width = spatial_merge_size
+
+    # HF Mistral3 squeezes projected image features; keep more than one merged token
+    # so that the token dimension survives before its split-by-image step.
+    image_height = int(patch_height) * int(spatial_merge_height) * 2
+    image_width = int(patch_width) * int(spatial_merge_width) * 2
+
+    dummy_pixels = torch.zeros(1, 3, image_height, image_width, device=device, dtype=dtype)
+    dummy_image_sizes = torch.tensor([[image_height, image_width]], device=device, dtype=torch.long)
+    dummy_outputs = model.get_image_features(
+        pixel_values=dummy_pixels,
+        image_sizes=dummy_image_sizes,
+        return_dict=True,
+    )
+    dummy_sum = _sum_nested_tensors(getattr(dummy_outputs, "pooler_output", None))
+    if dummy_sum is None:
+        dummy_sum = _sum_nested_tensors(dummy_outputs)
+    return dummy_sum
+
+
 def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
 
@@ -461,10 +550,10 @@ def build_encoder_backbone(
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
-        loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
         is_causal: Whether the retrieval text backbone uses causal self-attention. When omitted, a saved policy is
             restored; otherwise embedding defaults to bidirectional and scoring preserves the backbone's native mode.
-        model_args: Positional arguments forwarded to the backbone model's constructor.
+        loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
+        model_args: Positional arguments forwarded to the backbone model constructor.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -721,7 +810,9 @@ class _StockHFMetadataExporter:
         del tokenizer, original_model_path
         self.model_part.get_hf_export_config()
 
-    def save(self, *, hf_metadata_dir: str, tokenizer, original_model_path: str | None, v4_compatible: bool) -> None:
+    def save(
+        self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None, v4_compatible: bool
+    ) -> None:
         """Write stock model metadata and optional processor assets."""
         from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
 
@@ -749,6 +840,7 @@ class BiEncoderModel(nn.Module):
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
+        output_embedding_quantization: str | None = None,
         is_causal: bool | None = None,
     ) -> None:
         super().__init__()
@@ -765,6 +857,20 @@ class BiEncoderModel(nn.Module):
             self.sentence_transformer_export_config = export_config
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
         self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
+        resolved_output_embedding_quantization = output_embedding_quantization
+        if resolved_output_embedding_quantization is None:
+            resolved_output_embedding_quantization = getattr(self.config, "output_embedding_quantization", None)
+
+        if resolved_output_embedding_quantization is not None and resolved_output_embedding_quantization not in (
+            "int8",
+        ):
+            raise ValueError(
+                f"Unsupported output_embedding_quantization {resolved_output_embedding_quantization!r}. "
+                f"Supported: None, 'int8'."
+            )
+
+        self.output_embedding_quantization = resolved_output_embedding_quantization
+        self.config.output_embedding_quantization = resolved_output_embedding_quantization
 
     @classmethod
     def build(
@@ -776,6 +882,8 @@ class BiEncoderModel(nn.Module):
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         trust_remote_code: bool = False,
+        *,
+        output_embedding_quantization: str | None = None,
         is_causal: bool | None = None,
         **hf_kwargs: Any,
     ) -> "BiEncoderModel":
@@ -800,7 +908,11 @@ class BiEncoderModel(nn.Module):
             **hf_kwargs,
         )
         is_causal = _resolve_is_causal(config, is_causal)
-        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, hf_kwargs)
+        metadata_kwargs = dict(hf_kwargs)
+        commit_hash = getattr(config, "_commit_hash", None)
+        if commit_hash is not None:
+            metadata_kwargs["revision"] = commit_hash
+        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, metadata_kwargs)
         pooling, l2_normalize = _resolve_bi_encoder_options(
             config,
             saved_options,
@@ -823,6 +935,7 @@ class BiEncoderModel(nn.Module):
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
+            output_embedding_quantization=output_embedding_quantization,
             is_causal=is_causal,
         )
         if saved_options is not None:
@@ -962,6 +1075,11 @@ class BiEncoderModel(nn.Module):
         model_inputs = {k: v for k, v in input_dict.items() if k not in ["kd_labels", "run_dummy_vision"]}
         if "run_dummy_vision" in forward_args and "run_dummy_vision" in input_dict:
             model_inputs["run_dummy_vision"] = input_dict["run_dummy_vision"]
+        dummy_vision_sum = None
+        if "run_dummy_vision" not in forward_args and input_dict.get("run_dummy_vision") is not False:
+            if self.training and model_inputs.get("pixel_values") is None:
+                dummy_vision_sum = _dummy_vision_sum(self.model)
+
         outputs = self.model(
             **model_inputs,
             return_dict=True,
@@ -972,12 +1090,17 @@ class BiEncoderModel(nn.Module):
             hidden_state = outputs.last_hidden_state
         else:
             hidden_state = outputs.hidden_states[-1]
+        if dummy_vision_sum is not None:
+            hidden_state = hidden_state + dummy_vision_sum.to(hidden_state.dtype) * 0.0
+
         embeds = pool(
             last_hidden_states=hidden_state,
             attention_mask=input_dict["attention_mask"],
             pool_type=self.pooling,
         )
 
+        if self.output_embedding_quantization == "int8":
+            embeds = tanh_int8_quantize(embeds.float()).to(embeds.dtype)
         if self.l2_normalize:
             embeds = F.normalize(embeds, dim=-1)
 
@@ -1011,6 +1134,9 @@ class CrossEncoderModel(nn.Module):
         is_causal = _resolve_text_backbone_is_causal(model, model.config, is_causal)
         _set_text_backbone_is_causal(model, is_causal)
         _init_encoder_common(self, model)
+        fsdp_output_dtype = getattr(model, "_nemo_fsdp_output_dtype", None)
+        if fsdp_output_dtype is not None:
+            self._nemo_fsdp_output_dtype = fsdp_output_dtype
         self.is_causal = is_causal
 
     def _get_consolidated_hf_metadata_exporter(
@@ -1093,6 +1219,26 @@ class CrossEncoderModel(nn.Module):
         inputs.setdefault("return_dict", True)
         return self.model(**inputs)
 
+    def freeze_score_head(self) -> None:
+        """Freeze the scoring head while leaving the base model trainable.
+
+        The scoring head consists of the parameters owned by the Hugging Face
+        task model but not by its ``base_model``. This covers both linear score
+        projections and multi-layer classification heads without depending on
+        model-specific attribute names.
+        """
+        base_model_parameter_ids = {id(param) for param in self.model.base_model.parameters()}
+        frozen_parameters = 0
+        for param in self.model.parameters():
+            if id(param) not in base_model_parameter_ids:
+                param.requires_grad_(False)
+                frozen_parameters += 1
+
+        if frozen_parameters:
+            logger.info("Froze %d cross-encoder score-head parameters", frozen_parameters)
+        else:
+            logger.warning("Cross-encoder has no score-head parameters separate from its base model")
+
 
 def _get_layers(model: nn.Module) -> nn.ModuleList:
     """Locate the transformer block list on a HuggingFace backbone."""
@@ -1109,6 +1255,58 @@ def _get_layers(model: nn.Module) -> nn.ModuleList:
     raise AttributeError("Could not locate transformer layers on model (tried .layers, .model.layers, .transformer.h)")
 
 
+def _get_config_hidden_size(config) -> int:
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is not None:
+        return int(hidden_size)
+    text_config = getattr(config, "text_config", None)
+    if isinstance(text_config, dict):
+        hidden_size = text_config.get("hidden_size")
+    else:
+        hidden_size = getattr(text_config, "hidden_size", None)
+    if hidden_size is not None:
+        return int(hidden_size)
+    raise AttributeError("Could not infer hidden_size from config.hidden_size or config.text_config.hidden_size")
+
+
+def _resolve_projection_checkpoint_path(
+    pretrained_model_name_or_path: str,
+    projection_path: str | None = None,
+) -> Path:
+    if projection_path is not None:
+        return Path(projection_path)
+
+    model_path = Path(pretrained_model_name_or_path)
+    if model_path.name == "consolidated" and model_path.parent.name == "model":
+        return model_path.parent.parent / "projection.pt"
+    raise ValueError(
+        "restore_projection expects pretrained_model_name_or_path to point to "
+        "epoch_0_step_x/model/consolidated, or projection_path to be set explicitly."
+    )
+
+
+class _RetrieverStudentProjectionStateDictAdapter(EncoderStateDictAdapter):
+    def __init__(self, student_adapter: EncoderStateDictAdapter) -> None:
+        super().__init__()
+        self.student_adapter = student_adapter
+
+    def to_hf(self, state_dict, **kwargs):
+        student_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("student."):
+                student_state_dict[key[len("student.") :]] = value
+        return self.student_adapter.to_hf(student_state_dict, **kwargs)
+
+    def from_hf(self, hf_state_dict, device_mesh=None, **kwargs):
+        student_state_dict = self.student_adapter.from_hf(hf_state_dict, device_mesh=device_mesh, **kwargs)
+        return {f"student.{key}": value for key, value in student_state_dict.items()}
+
+    def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+        if not fqn.startswith("student."):
+            return []
+        return self.student_adapter.convert_single_tensor_to_hf(fqn[len("student.") :], tensor, **kwargs)
+
+
 class RetrieverStudentWithProjection(nn.Module):
     """Bi-encoder student with a trainable linear projection into teacher space."""
 
@@ -1120,7 +1318,13 @@ class RetrieverStudentWithProjection(nn.Module):
     ) -> None:
         super().__init__()
         self.student = student
-        student_hidden = int(self.student.model.config.hidden_size)
+        self.config = student.config
+        self.name_or_path = getattr(student, "name_or_path", None)
+        self.source_model_path = getattr(student, "source_model_path", None)
+        self.source_repository_path = getattr(student, "source_repository_path", None)
+        self.state_dict_adapter = _RetrieverStudentProjectionStateDictAdapter(student.state_dict_adapter)
+        self.sentence_transformer_export_config = getattr(student, "sentence_transformer_export_config", None)
+        student_hidden = _get_config_hidden_size(self.student.model.config)
         self.student_hidden = student_hidden
         self.teacher_hidden = int(teacher_hidden_size)
 
@@ -1145,6 +1349,8 @@ class RetrieverStudentWithProjection(nn.Module):
         l2_normalize: bool = False,
         capture_layers: Sequence[int] | None = None,
         trust_remote_code: bool = True,
+        restore_projection: bool = False,
+        projection_path: str | None = None,
         **kwargs,
     ) -> "RetrieverStudentWithProjection":
         from nemo_automodel import NeMoAutoModelBiEncoder
@@ -1156,7 +1362,50 @@ class RetrieverStudentWithProjection(nn.Module):
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
-        return cls(student=student, teacher_hidden_size=teacher_hidden_size, capture_layers=capture_layers)
+        model = cls(
+            student=student,
+            teacher_hidden_size=teacher_hidden_size,
+            capture_layers=capture_layers,
+        )
+        if restore_projection:
+            model.restore_projection_from_checkpoint(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                projection_path=projection_path,
+            )
+        return model
+
+    def restore_projection_from_checkpoint(
+        self,
+        pretrained_model_name_or_path: str,
+        projection_path: str | None = None,
+    ) -> None:
+        checkpoint_path = _resolve_projection_checkpoint_path(pretrained_model_name_or_path, projection_path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Could not find distillation projection checkpoint: {checkpoint_path}")
+
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if "weight" in state:
+            projection_state = {"weight": state["weight"], "bias": state.get("bias")}
+        elif "projection.weight" in state:
+            projection_state = {
+                "weight": state["projection.weight"],
+                "bias": state.get("projection.bias"),
+            }
+        else:
+            raise RuntimeError(f"Projection checkpoint {checkpoint_path} does not contain projection weights")
+
+        expected_shape = tuple(self.projection.weight.shape)
+        loaded_shape = tuple(projection_state["weight"].shape)
+        if loaded_shape != expected_shape:
+            raise RuntimeError(
+                f"Projection checkpoint shape mismatch: checkpoint={loaded_shape}, model={expected_shape}"
+            )
+
+        if projection_state["bias"] is None:
+            raise RuntimeError(f"Projection checkpoint {checkpoint_path} does not contain projection bias")
+        self.projection.load_state_dict(projection_state, strict=True)
+
+        logger.info("Restored distillation projection head from %s", checkpoint_path)
 
     def attach_intermediate_capture(self, layer_indices: Iterable[int]) -> "RetrieverStudentWithProjection":
         self._capture.attach(_get_layers(self.student.model), layer_indices)
@@ -1169,6 +1418,32 @@ class RetrieverStudentWithProjection(nn.Module):
         # Keep the save format HF-compatible for evaluator tooling: this stores
         # only the student backbone; the projection is saved by the recipe.
         self.student.save_pretrained(save_directory, **kwargs)
+
+    def _get_consolidated_hf_metadata_exporter(
+        self,
+        *,
+        tokenizer=None,
+        original_model_path: str | None = None,
+    ):
+        get_exporter = getattr(self.student, "_get_consolidated_hf_metadata_exporter", None)
+        if not callable(get_exporter):
+            return None
+        return get_exporter(tokenizer=tokenizer, original_model_path=original_model_path)
+
+    def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
+        configure_prompts = getattr(self.student, "configure_sentence_transformer_prompts", None)
+        if callable(configure_prompts):
+            configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
+        self.sentence_transformer_export_config = getattr(self.student, "sentence_transformer_export_config", None)
+
+    def disable_sentence_transformer_export(self) -> None:
+        disable_export = getattr(self.student, "disable_sentence_transformer_export", None)
+        if callable(disable_export):
+            disable_export()
+        self.sentence_transformer_export_config = getattr(self.student, "sentence_transformer_export_config", None)
+
+    def get_hf_export_config(self) -> PretrainedConfig:
+        return self.student.get_hf_export_config()
 
     def _encode(self, input_dict: dict) -> torch.Tensor:
         if not input_dict:
@@ -1204,7 +1479,7 @@ class RetrieverTeacherEmbeddingEncoder(nn.Module):
         for param in self.teacher.parameters():
             param.requires_grad_(False)
 
-        self.hidden_size = int(self.teacher.model.config.hidden_size)
+        self.hidden_size = _get_config_hidden_size(self.teacher.model.config)
         self._capture = LayerCapture(detach=True)
         if capture_layers:
             self.attach_intermediate_capture(capture_layers)

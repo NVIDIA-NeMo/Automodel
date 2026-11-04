@@ -19,16 +19,17 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel._transformers.retrieval import RetrieverStudentWithProjection
+from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.recipes.retrieval import distill_bi_encoder as mod
 from nemo_automodel.recipes.retrieval.distill_bi_encoder import (
     _build_or_none,
     _cfg_get_path,
-    _clean_path,
-    _copy_checkpoint_metadata,
     _dp_group_src_rank,
-    _mirror_hf_metadata,
     _move_to_device,
-    _strip_student_prefix,
+    _repeat_queries_to_match_docs,
+    _split_grouped_passages,
     _unpack_qpn,
 )
 from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
@@ -37,6 +38,108 @@ from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderReci
 class _DictLikeConfig(SimpleNamespace):
     def get(self, key, default=None):
         return getattr(self, key, default)
+
+
+class _FakeEncoder(nn.Module):
+    def __init__(self, hidden_size=4):
+        super().__init__()
+        self.config = SimpleNamespace(hidden_size=hidden_size)
+        self.model = SimpleNamespace(config=self.config)
+        self.name_or_path = ""
+        self.source_model_path = None
+        self.source_repository_path = None
+        self.state_dict_adapter = EncoderStateDictAdapter()
+        self.sentence_transformer_export_config = SimpleNamespace(query_prompt="", document_prompt="")
+
+    def forward(self, inputs):
+        return torch.zeros(inputs["input_ids"].shape[0], self.model.config.hidden_size)
+
+    def configure_sentence_transformer_prompts(self, query_prompt, document_prompt):
+        self.sentence_transformer_export_config.query_prompt = query_prompt
+        self.sentence_transformer_export_config.document_prompt = document_prompt
+
+    def disable_sentence_transformer_export(self):
+        self.sentence_transformer_export_config = None
+
+
+class _OptimizerGroupingModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.vision_tower = nn.Module()
+        self.vision_tower.linear = nn.Linear(4, 4)
+        self.vision_tower.norm = nn.LayerNorm(4)
+        self.multi_modal_projector = nn.Linear(4, 4)
+        self.language_model = nn.Linear(4, 4)
+        self.projection = nn.Linear(4, 6)
+
+
+def _param_group_by_id(optimizer):
+    return {id(param): group for group in optimizer.param_groups for param in group["params"]}
+
+
+# ---------------------------------------------------------------------------
+# RetrieverStudentWithProjection projection restore
+# ---------------------------------------------------------------------------
+def test_retriever_student_restores_projection_from_epoch_checkpoint(tmp_path):
+    checkpoint_dir = tmp_path / "epoch_0_step_10"
+    consolidated_dir = checkpoint_dir / "model" / "consolidated"
+    consolidated_dir.mkdir(parents=True)
+    weight = torch.full((6, 4), 0.25)
+    bias = torch.full((6,), -0.5)
+    torch.save({"weight": weight, "bias": bias, "in_features": 4, "out_features": 6}, checkpoint_dir / "projection.pt")
+
+    model = RetrieverStudentWithProjection(student=_FakeEncoder(hidden_size=4), teacher_hidden_size=6)
+    model.restore_projection_from_checkpoint(str(consolidated_dir))
+
+    assert torch.equal(model.projection.weight.detach().cpu(), weight)
+    assert torch.equal(model.projection.bias.detach().cpu(), bias)
+
+
+def test_retriever_student_projection_restore_checks_shape(tmp_path):
+    student_dir = tmp_path / "step_10" / "student"
+    student_dir.mkdir(parents=True)
+    torch.save({"weight": torch.ones(5, 4), "bias": torch.zeros(5)}, student_dir / "projection.pt")
+
+    model = RetrieverStudentWithProjection(student=_FakeEncoder(hidden_size=4), teacher_hidden_size=6)
+    with pytest.raises(RuntimeError, match="Projection checkpoint shape mismatch"):
+        model.restore_projection_from_checkpoint(str(student_dir), projection_path=str(student_dir / "projection.pt"))
+
+
+def test_retriever_student_projection_restore_requires_consolidated_path(tmp_path):
+    student_dir = tmp_path / "step_10" / "student"
+    student_dir.mkdir(parents=True)
+
+    model = RetrieverStudentWithProjection(student=_FakeEncoder(hidden_size=4), teacher_hidden_size=6)
+    with pytest.raises(ValueError, match="epoch_0_step_x/model/consolidated"):
+        model.restore_projection_from_checkpoint(str(student_dir))
+
+
+def test_retriever_student_projection_export_strips_wrapper_and_projection():
+    model = RetrieverStudentWithProjection(student=_FakeEncoder(hidden_size=4), teacher_hidden_size=6)
+    state_dict = {
+        "student.model.language_model.layers.0.self_attn.q_proj.weight": torch.ones(1),
+        "student.model.multi_modal_projector.linear_1.weight": torch.ones(1),
+        "projection.weight": torch.ones(6, 4),
+        "projection.bias": torch.ones(6),
+    }
+
+    hf_state_dict = model.state_dict_adapter.to_hf(state_dict)
+
+    assert sorted(hf_state_dict) == [
+        "language_model.layers.0.self_attn.q_proj.weight",
+        "multi_modal_projector.linear_1.weight",
+    ]
+
+
+def test_retriever_student_projection_delegates_sentence_transformer_export_config():
+    model = RetrieverStudentWithProjection(student=_FakeEncoder(hidden_size=4), teacher_hidden_size=6)
+
+    model.configure_sentence_transformer_prompts(query_prompt="query:", document_prompt="passage:")
+
+    assert model.sentence_transformer_export_config.query_prompt == "query:"
+    assert model.sentence_transformer_export_config.document_prompt == "passage:"
+    assert model.student.sentence_transformer_export_config.query_prompt == "query:"
+    assert model.student.sentence_transformer_export_config.document_prompt == "passage:"
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +223,20 @@ def test_unpack_qpn_without_negatives():
     assert mask is None
 
 
+def test_unpack_qpn_preserves_vlm_fields():
+    batch = _base_qpn_batch()
+    batch["d_pixel_values"] = torch.randn(8, 3, 16, 16)
+    batch["d_image_sizes"] = torch.tensor([[16, 16]] * 8)
+    batch["d_pixel_attention_mask"] = torch.ones(8, 16, 16, dtype=torch.bool)
+
+    _q, d, n, mask = _unpack_qpn(batch)
+
+    assert set(d) == {"input_ids", "attention_mask", "pixel_values", "image_sizes", "pixel_attention_mask"}
+    assert d["pixel_values"].shape == (8, 3, 16, 16)
+    assert n is None
+    assert mask is None
+
+
 def test_unpack_qpn_with_valid_negatives():
     batch = _base_qpn_batch()
     batch["n_input_ids"] = torch.randint(0, 10, (2, 3, 5))
@@ -130,6 +247,23 @@ def test_unpack_qpn_with_valid_negatives():
 
     assert n["input_ids"].shape == (6, 5)
     assert n["attention_mask"].shape == (6, 5)
+    assert torch.equal(mask, batch["n_mask"])
+
+
+def test_unpack_qpn_flattens_negative_vlm_fields():
+    batch = _base_qpn_batch()
+    batch["n_input_ids"] = torch.randint(0, 10, (2, 3, 5))
+    batch["n_attention_mask"] = torch.ones(2, 3, 5, dtype=torch.long)
+    batch["n_pixel_values"] = torch.randn(2, 3, 3, 16, 16)
+    batch["n_image_sizes"] = torch.tensor([[[16, 16], [16, 16], [16, 16]]] * 2)
+    batch["n_mask"] = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.long)
+
+    _q, _d, n, mask = _unpack_qpn(batch)
+
+    assert n["input_ids"].shape == (6, 5)
+    assert n["attention_mask"].shape == (6, 5)
+    assert n["pixel_values"].shape == (6, 3, 16, 16)
+    assert n["image_sizes"].shape == (6, 2)
     assert torch.equal(mask, batch["n_mask"])
 
 
@@ -167,26 +301,127 @@ def test_unpack_qpn_all_masked_negatives_returns_none():
 
 
 # ---------------------------------------------------------------------------
-# _strip_student_prefix
+# grouped-passage helpers
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("prefix", ["student.model.", "module.student.model.", "model."])
-def test_strip_student_prefix_variants(prefix):
-    t = torch.randn(2)
-    state = {f"{prefix}layers.0.weight": t, "projection.weight": torch.randn(2)}
+def test_repeat_queries_to_match_grouped_documents():
+    s_q = torch.randn(2, 4)
+    t_q = torch.randn(2, 8)
+    s_d = torch.randn(6, 8)
 
-    stripped = _strip_student_prefix(state)
+    s_q_rep, t_q_rep = _repeat_queries_to_match_docs(s_q, t_q, s_d)
 
-    assert set(stripped) == {"layers.0.weight"}
-    assert torch.equal(stripped["layers.0.weight"], t)
+    assert s_q_rep.shape == (6, 4)
+    assert t_q_rep.shape == (6, 8)
+    assert torch.equal(s_q_rep[0], s_q[0])
+    assert torch.equal(s_q_rep[2], s_q[0])
+    assert torch.equal(s_q_rep[3], s_q[1])
 
 
-def test_strip_student_prefix_already_backbone_drops_projection():
-    t = torch.randn(2)
-    state = {"encoder.weight": t, "projection.weight": torch.randn(2), "projection.bias": torch.randn(2)}
+def test_split_grouped_passages_returns_positive_and_negatives():
+    reps = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(8, 3)
 
-    stripped = _strip_student_prefix(state)
+    pos, neg = _split_grouped_passages(reps, batch_size=2, n_passages=4, label="test")
 
-    assert set(stripped) == {"encoder.weight"}
+    assert pos.shape == (2, 3)
+    assert neg.shape == (2, 3, 3)
+    assert torch.equal(pos[0], reps[0])
+    assert torch.equal(neg[0, 0], reps[1])
+
+
+def test_sync_projection_gradients_allreduces_missing_grads(monkeypatch):
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = nn.Linear(2, 3)
+
+    model = _Model()
+    model.projection.weight.grad = torch.ones_like(model.projection.weight)
+    model.projection.bias.grad = torch.ones_like(model.projection.bias)
+
+    calls = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        calls.append(tensor)
+        tensor.mul_(2.0)
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    recipe = mod.EmbeddingDistillRecipe.__new__(mod.EmbeddingDistillRecipe)
+    recipe.model_parts = [model]
+    recipe._get_dp_group = lambda include_cp: None
+    recipe._get_dp_group_size = lambda include_cp: 2
+
+    recipe._sync_projection_gradients()
+
+    assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# optimizer parameter groups
+# ---------------------------------------------------------------------------
+def test_student_lr_overrides_preserve_decay_and_no_decay_groups():
+    base_lr = 1.0e-5
+    base_wd = 0.1
+    vision_lr = 1.0e-6
+    projector_lr = 3.0e-4
+    distill_projection_lr = 3.0e-3
+
+    model = _OptimizerGroupingModel()
+    recipe = mod.EmbeddingDistillRecipe.__new__(mod.EmbeddingDistillRecipe)
+    recipe.cfg = _DictLikeConfig(
+        optimizer={
+            "lr": base_lr,
+            "distill_projection_lr": distill_projection_lr,
+            "vision_tower_lr": vision_lr,
+            "multi_modal_projector_lr": projector_lr,
+        },
+    )
+    recipe.model_parts = [model]
+
+    optimizer = torch.optim.AdamW(recipe._build_optimizer_param_groups(), lr=base_lr, weight_decay=base_wd)
+    assert "distill_projection_lr" not in recipe.cfg.optimizer
+    assert "vision_tower_lr" not in recipe.cfg.optimizer
+    assert "multi_modal_projector_lr" not in recipe.cfg.optimizer
+    recipe.optimizer = [optimizer]
+    recipe._apply_student_lr_overrides()
+
+    scheduler = OptimizerParamScheduler(
+        optimizer,
+        init_lr=base_lr,
+        max_lr=base_lr,
+        min_lr=base_lr,
+        lr_warmup_steps=0,
+        lr_decay_steps=100,
+        lr_decay_style="constant",
+        start_wd=base_wd,
+        end_wd=base_wd,
+        wd_incr_steps=100,
+        wd_incr_style="constant",
+    )
+    scheduler.step(1)
+
+    group_by_param = _param_group_by_id(optimizer)
+    vision_linear = model.vision_tower.linear
+    vision_norm = model.vision_tower.norm
+
+    assert group_by_param[id(vision_linear.weight)]["lr"] == pytest.approx(vision_lr)
+    assert group_by_param[id(vision_linear.weight)]["weight_decay"] == pytest.approx(base_wd)
+    assert group_by_param[id(vision_linear.bias)]["lr"] == pytest.approx(vision_lr)
+    assert group_by_param[id(vision_linear.bias)]["weight_decay"] == pytest.approx(0.0)
+    assert group_by_param[id(vision_norm.weight)]["lr"] == pytest.approx(vision_lr)
+    assert group_by_param[id(vision_norm.weight)]["weight_decay"] == pytest.approx(0.0)
+
+    assert group_by_param[id(model.multi_modal_projector.weight)]["lr"] == pytest.approx(projector_lr)
+    assert group_by_param[id(model.multi_modal_projector.weight)]["weight_decay"] == pytest.approx(base_wd)
+    assert group_by_param[id(model.multi_modal_projector.bias)]["lr"] == pytest.approx(projector_lr)
+    assert group_by_param[id(model.multi_modal_projector.bias)]["weight_decay"] == pytest.approx(0.0)
+
+    assert group_by_param[id(model.language_model.weight)]["lr"] == pytest.approx(base_lr)
+    assert group_by_param[id(model.language_model.weight)]["weight_decay"] == pytest.approx(base_wd)
+    assert group_by_param[id(model.projection.weight)]["lr"] == pytest.approx(distill_projection_lr)
+    assert group_by_param[id(model.projection.weight)]["weight_decay"] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -200,98 +435,20 @@ def test_dp_group_src_rank_error_returns_zero():
     # A bogus group object makes torch.distributed raise, which is swallowed.
     assert _dp_group_src_rank(object()) == 0
 
-
-# ---------------------------------------------------------------------------
-# filesystem helpers
-# ---------------------------------------------------------------------------
-def test_clean_path_file_dir_and_symlink(tmp_path):
-    f = tmp_path / "f.txt"
-    f.write_text("x")
-    _clean_path(f)
-    assert not f.exists()
-
-    d = tmp_path / "d"
-    d.mkdir()
-    (d / "inner.txt").write_text("y")
-    _clean_path(d)
-    assert not d.exists()
-
-    target = tmp_path / "target.txt"
-    target.write_text("z")
-    link = tmp_path / "link.txt"
-    link.symlink_to(target)
-    _clean_path(link)
-    assert not link.exists()
-    assert target.exists()
-
-
-def test_mirror_hf_metadata_copies_non_weight_files(tmp_path):
-    src = tmp_path / "src"
-    src.mkdir()
-    (src / "config.json").write_text("{}")
-    (src / "tokenizer.json").write_text("{}")
-    (src / "model.safetensors").write_text("weights")
-    (src / "pytorch_model.bin").write_text("weights")
-    (src / "model.safetensors.index.json").write_text("{}")
-
-    dst = tmp_path / "dst"
-    _mirror_hf_metadata(src, dst)
-
-    names = {p.name for p in dst.iterdir()}
-    assert names == {"config.json", "tokenizer.json"}
-
-
-def test_mirror_hf_metadata_overwrite_behavior(tmp_path):
-    src = tmp_path / "src"
-    src.mkdir()
-    (src / "config.json").write_text("new")
-
-    dst = tmp_path / "dst"
-    dst.mkdir()
-    (dst / "config.json").write_text("old")
-
-    _mirror_hf_metadata(src, dst, overwrite=False)
-    assert (dst / "config.json").read_text() == "old"
-
-    _mirror_hf_metadata(src, dst, overwrite=True)
-    assert (dst / "config.json").read_text() == "new"
-
-
-def test_mirror_hf_metadata_missing_src_is_noop(tmp_path):
-    dst = tmp_path / "dst"
-    _mirror_hf_metadata(tmp_path / "does_not_exist", dst)
-
-    assert not dst.exists()
-
-
-def test_copy_checkpoint_metadata_skips_safetensors(tmp_path):
-    src = tmp_path / "src"
-    src.mkdir()
-    (src / "config.json").write_text("{}")
-    (src / "pytorch_model.bin").write_text("weights")
-    (src / "model.safetensors").write_text("weights")
-    (src / "model.safetensors.index.json").write_text("{}")
-
-    dst = tmp_path / "dst"
-    dst.mkdir()
-    _copy_checkpoint_metadata(src, dst)
-
-    names = {p.name for p in dst.iterdir()}
-    assert names == {"config.json", "pytorch_model.bin"}
-
-
 # ---------------------------------------------------------------------------
 # setup() intermediate-loss guards
 # ---------------------------------------------------------------------------
 def _make_recipe_with_cfg(cfg):
     recipe = mod.EmbeddingDistillRecipe.__new__(mod.EmbeddingDistillRecipe)
     recipe.cfg = cfg
+    recipe.optimizer = []
     return recipe
 
 
 def test_setup_default_intermediate_loss_inherits_layer_pairs(monkeypatch):
     monkeypatch.setattr(mod.TrainBiEncoderRecipe, "setup", lambda self: None)
     monkeypatch.setattr(mod.EmbeddingDistillRecipe, "_sync_projection_parameters", lambda self: None)
+    monkeypatch.setattr(mod.EmbeddingDistillRecipe, "_log_trainable_parameter_summary", lambda self: None)
     cfg = _DictLikeConfig(
         intermediate_loss_weight=0.0,
         layer_pairs=[[1, 2], [3, 4]],

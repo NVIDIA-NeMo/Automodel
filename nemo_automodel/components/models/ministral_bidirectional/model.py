@@ -31,6 +31,12 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3PreTrainedModel,
 )
 from transformers.utils import logging
+from transformers.utils.generic import merge_with_config_defaults
+from transformers.utils.output_capturing import capture_outputs
+
+if TYPE_CHECKING:
+    from .reranker_export import Mistral3RerankerMetadataExporter
+
 
 from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
 
@@ -113,8 +119,9 @@ class Ministral3BidirectionalModel(Ministral3Model):
         Returns:
             Output with floating-point last_hidden_state [batch, sequence, hidden],
             where hidden is config.hidden_size, and the optional Transformers cache.
-            In causal mode, optional hidden states and attentions follow the Hugging
-            Face Ministral3Model.forward output contract.
+            Optional hidden states [batch, sequence, hidden] and attentions
+            [batch, heads, sequence, key_sequence] follow the Hugging Face
+            Ministral3Model.forward output contract in both attention modes.
         """
         if getattr(self.config, "is_causal", False):
             return super().forward(
@@ -128,6 +135,35 @@ class Ministral3BidirectionalModel(Ministral3Model):
                 **kwargs,
             )
 
+        return self._forward_bidirectional(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+    @merge_with_config_defaults
+    @capture_outputs
+    def _forward_bidirectional(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Any,
+    ) -> BaseModelOutputWithPast:
+        """Apply the public forward tensor contract with bidirectional attention.
+
+        Uses the HF output-capture contract for optional hidden states and
+        attentions, including config defaults and tuple returns.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -408,6 +444,7 @@ class Mistral3BidirectionalModel(Mistral3Model):
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         run_dummy_vision: bool | None = None,
+        force_dummy_vision: bool = False,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, ...] | Mistral3ModelOutputWithPast:
         """Run text or multimodal inputs through one FSDP root forward.
@@ -432,6 +469,7 @@ class Mistral3BidirectionalModel(Mistral3Model):
                 text-only inputs. Defaults to enabled in training. Sharded vision
                 layers always participate during evaluation, even when false, to
                 preserve collective ordering across ranks with different modalities.
+            force_dummy_vision: Execute the dummy vision path even for an unsharded frozen teacher.
             **kwargs: Additional arguments forwarded to the stock Mistral3 model.
 
         Returns:
@@ -452,10 +490,12 @@ class Mistral3BidirectionalModel(Mistral3Model):
             When ``return_dict`` is false, return these fields in the listed order,
             omitting fields whose value is ``None``.
         """
-        needs_dummy_vision = self.training and run_dummy_vision is not False
+        needs_dummy_vision = force_dummy_vision or (self.training and run_dummy_vision is not False)
         if pixel_values is None and not self.training:
-            needs_dummy_vision = run_dummy_vision is True or any(
-                isinstance(module, FSDPModule) for module in self.vision_tower.modules()
+            needs_dummy_vision = (
+                force_dummy_vision
+                or run_dummy_vision is True
+                or any(isinstance(module, FSDPModule) for module in self.vision_tower.modules())
             )
         if needs_dummy_vision and pixel_values is None:
             if inputs_embeds is None:
@@ -533,6 +573,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
 
     config_class = Mistral3BidirectionalConfig
     base_model_prefix = "model"
+    _nemo_fsdp_output_dtype = torch.float32
 
     @classmethod
     def supports_config(cls, config: PretrainedConfig) -> bool:
@@ -651,6 +692,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         run_dummy_vision: bool | None = None,
+        force_dummy_vision: bool = False,
         **kwargs: Any,
     ) -> SequenceClassifierOutputWithPast | tuple[torch.Tensor, ...]:
         """Score each multimodal question-document sequence.
@@ -679,6 +721,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
             run_dummy_vision: Whether text-only inputs should run dummy vision.
                 Sharded vision always participates during evaluation to keep
                 collectives aligned across ranks with different modalities.
+            force_dummy_vision: Execute the dummy vision path even for an unsharded frozen teacher.
             **kwargs: Additional arguments forwarded to ``Mistral3BidirectionalModel``.
 
         Returns:
@@ -718,6 +761,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             run_dummy_vision=run_dummy_vision,
+            force_dummy_vision=force_dummy_vision,
             **kwargs,
         )
         pooled_hidden_states = pool(

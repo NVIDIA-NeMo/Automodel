@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .distill_bi_encoder import EmbeddingDistillRecipe
+from .distill_cross_encoder import DistillCrossEncoderRecipe
 from .mine_hard_negatives import MineHardNegativesRecipe
 from .train_bi_encoder import TrainBiEncoderRecipe
 from .train_cross_encoder import TrainCrossEncoderRecipe
@@ -22,4 +23,5 @@ __all__ = [
     "TrainBiEncoderRecipe",
     "TrainCrossEncoderRecipe",
     "EmbeddingDistillRecipe",
+    "DistillCrossEncoderRecipe",
 ]

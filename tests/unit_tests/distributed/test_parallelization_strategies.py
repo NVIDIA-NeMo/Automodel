@@ -20,6 +20,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel
@@ -330,6 +331,31 @@ class TestModelParallelizer:
         mock_distributed_env["extract_layer_groups"].assert_called_once_with(model)
         mock_distributed_env["apply_fsdp"].assert_called_once()
         mock_distributed_env["fully_shard"].assert_called()
+
+    def test_parallelize_preserves_requested_fp32_root_output(
+        self, strategy, mock_device_mesh, mock_distributed_env
+    ):
+        """Only the root policy should preserve the reranker's FP32 logits."""
+        mesh, _, _, _ = mock_device_mesh
+        model = MockModel()
+        model._nemo_fsdp_output_dtype = torch.float32
+        mp_policy = parallelizer_mod.MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
+        )
+
+        strategy._apply(model=model, device_mesh=mesh, mp_policy=mp_policy)
+
+        child_policy = mock_distributed_env["apply_fsdp"].call_args.args[2]
+        root_policy = mock_distributed_env["fully_shard"].call_args.kwargs["mp_policy"]
+        assert child_policy is mp_policy
+        assert child_policy.output_dtype == torch.bfloat16
+        assert root_policy is not mp_policy
+        assert root_policy.param_dtype == torch.bfloat16
+        assert root_policy.output_dtype == torch.float32
+
 
     def test_fsdp_sharding_hook_forwards_the_positional_contract(
         self, strategy, mock_device_mesh, mock_distributed_env, monkeypatch

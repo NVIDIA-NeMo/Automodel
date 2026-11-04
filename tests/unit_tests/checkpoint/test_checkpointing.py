@@ -4066,6 +4066,27 @@ class TestDoLoad:
 
         mock_msc.open.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/output/model_checkpoints/run/step-100/optim",
+            "/output/models/run/step-100/optim",
+        ],
+    )
+    def test_peft_optimizer_under_model_named_parent_uses_dcp(self, path):
+        """Model-prefixed parents must not route optimizer state through the PEFT adapter loader."""
+        ckptr = self._make_checkpointer(is_peft=True)
+        state_dict = {"optim": {"state": {}}}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            patch("nemo_automodel.components.checkpoint.checkpointing._load_safetensors") as mock_adapter_load,
+        ):
+            Checkpointer._do_load(ckptr, state_dict, path)
+
+        mock_dcp.load.assert_called_once()
+        mock_adapter_load.assert_not_called()
+
     def test_peft_cloud_load_still_routes_through_msc_reader(self):
         """MSC writer is called with the exact checkpoint path, not a modified subpath."""
         ckptr = self._make_checkpointer(is_peft=True)
@@ -4240,6 +4261,27 @@ class TestDoSavePEFT:
 
         mock_msc.open.assert_not_called()
         mock_sf.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/output/model_checkpoints/run/step-100/optim",
+            "/output/models/run/step-100/optim",
+        ],
+    )
+    def test_optimizer_under_model_named_parent_uses_dcp(self, path):
+        """Model-prefixed parents must not route optimizer state through the PEFT adapter saver."""
+        ckptr = _make_ckptr(is_peft=True, is_async=False)
+        state_dict = {"optim": {"state": {}}}
+
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
+            patch("nemo_automodel.components.checkpoint.checkpointing._save_safetensors") as mock_adapter_save,
+        ):
+            Checkpointer._do_save(ckptr, state_dict, path)
+
+        mock_dcp.save.assert_called_once()
+        mock_adapter_save.assert_not_called()
 
     def test_peft_adapter_path_appended_correctly(self):
         """PEFT cloud save opens exactly '<path>/adapter_model.safetensors'."""

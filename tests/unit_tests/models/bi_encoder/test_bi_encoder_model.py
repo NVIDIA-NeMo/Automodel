@@ -20,7 +20,8 @@ import torch
 import nemo_automodel._transformers.auto_model as am
 import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
 import nemo_automodel.recipes.retrieval.train_bi_encoder as tbe
-from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
+from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel, _dummy_vision_sum
+from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
     distributed_maxsim_scores_and_labels,
@@ -92,6 +93,67 @@ class _ToyBackboneWithoutDummyFlag(torch.nn.Module):
         return _ToyBackboneOutput(hidden_state)
 
 
+class _ToyCrossEncoderBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(name_or_path="")
+        self.encoder = torch.nn.Linear(4, 4)
+        self.score = torch.nn.Sequential(
+            torch.nn.Linear(4, 2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(2, 1),
+        )
+
+    @property
+    def base_model(self):
+        return self.encoder
+
+
+class _ToyVisionBackboneWithoutDummyFlag(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(name_or_path="")
+        self.vision_tower = torch.nn.Conv2d(3, 1, kernel_size=1, bias=False)
+        self.dummy_pixel_values = None
+        self.dummy_image_sizes = None
+
+    def get_image_features(self, pixel_values, image_sizes, return_dict=True):
+        self.dummy_pixel_values = pixel_values
+        self.dummy_image_sizes = image_sizes
+        return SimpleNamespace(pooler_output=(self.vision_tower(pixel_values),))
+
+    def forward(self, input_ids, attention_mask, return_dict=True, output_hidden_states=True):
+        hidden_state = input_ids.float().unsqueeze(-1).expand(*input_ids.shape, 2)
+        return _ToyBackboneOutput(hidden_state)
+
+
+class _ToyMistralLikeVisionTower(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.patch_size = (14, 16)
+
+
+class _ToyMistralLikeVisionBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(name_or_path="", spatial_merge_size=2)
+        self.vision_tower = _ToyMistralLikeVisionTower()
+        self.dummy_pixel_values = None
+        self.dummy_image_sizes = None
+        self.merged_token_count = None
+
+    def get_image_features(self, pixel_values, image_sizes, return_dict=True):
+        self.dummy_pixel_values = pixel_values
+        self.dummy_image_sizes = image_sizes
+        patch_height, patch_width = self.vision_tower.patch_size
+        merged_height = image_sizes[0, 0].item() // (patch_height * self.config.spatial_merge_size)
+        merged_width = image_sizes[0, 1].item() // (patch_width * self.config.spatial_merge_size)
+        self.merged_token_count = merged_height * merged_width
+        if self.merged_token_count <= 1:
+            raise RuntimeError("dummy image must produce more than one merged token")
+        return SimpleNamespace(pooler_output=(pixel_values.sum().reshape(1),))
+
+
 def _apply_common_mocks(monkeypatch):
     """Mock CUDA-dependent infrastructure so tests run without a GPU."""
     monkeypatch.setattr(am, "instantiate_infrastructure", lambda **kwargs: (None, None, None, None))
@@ -151,6 +213,30 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert last_kwargs["detach_distributed_inbatch_negatives"] is False
     assert last_kwargs["is_causal"] is True
     assert last_kwargs["some_other_kwarg"] == "x"
+
+
+def test_from_pretrained_prefers_dtype_over_deprecated_torch_dtype_default(monkeypatch):
+    last_kwargs = {}
+
+    def fake_build(**kwargs):
+        nonlocal last_kwargs
+        last_kwargs = kwargs
+        return DummyModel()
+
+    _apply_common_mocks(monkeypatch)
+    monkeypatch.setattr(BiEncoderModel, "build", staticmethod(fake_build))
+    monkeypatch.setattr(am, "apply_model_infrastructure", lambda model, **kwargs: model)
+
+    model = am.NeMoAutoModelBiEncoder.from_pretrained(
+        pretrained_model_name_or_path="some/path",
+        dtype="bfloat16",
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+    )
+
+    assert isinstance(model, DummyModel)
+    assert last_kwargs["dtype"] == torch.bfloat16
+    assert "torch_dtype" not in last_kwargs
 
 
 def test_from_pretrained_defers_omitted_wrapper_options_to_saved_metadata(monkeypatch):
@@ -269,9 +355,27 @@ def test_cross_encoder_from_pretrained(monkeypatch, is_causal):
     # CrossEncoder build should NOT receive pooling or l2_normalize
     assert "pooling" not in last_kwargs
     assert "l2_normalize" not in last_kwargs
+    assert last_kwargs["is_causal"] is is_causal
     assert last_kwargs["model_name_or_path"] == "mock-model"
     assert last_kwargs["attn_implementation"] == "eager"
     assert last_kwargs["is_causal"] is is_causal
+
+
+@pytest.mark.parametrize("freeze_score_head", [False, True])
+def test_cross_encoder_score_head_freezing(freeze_score_head):
+    backbone = _ToyCrossEncoderBackbone()
+    model = CrossEncoderModel(backbone)
+
+    apply_parameter_freezing(
+        model,
+        {
+            "freeze_vision_tower": False,
+            "freeze_score_head": freeze_score_head,
+        },
+    )
+
+    assert all(param.requires_grad for param in backbone.encoder.parameters())
+    assert all(param.requires_grad is not freeze_score_head for param in backbone.score.parameters())
 
 
 def test_cross_encoder_retries_without_liger(monkeypatch):
@@ -312,6 +416,37 @@ def test_bi_encoder_drops_run_dummy_vision_when_backbone_does_not_support_it():
 
     assert backbone.received_kwargs == {"return_dict": True, "output_hidden_states": True}
     assert embeddings.shape == (1, 2)
+
+
+def test_bi_encoder_runs_zero_contribution_dummy_vision_for_full_vlm_backbone():
+    backbone = _ToyVisionBackboneWithoutDummyFlag()
+    model = BiEncoderModel(backbone, pooling="avg", l2_normalize=False)
+    model.train()
+
+    embeddings = model(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "attention_mask": torch.tensor([[1, 1]]),
+            "run_dummy_vision": True,
+        }
+    )
+    embeddings.sum().backward()
+
+    assert embeddings.shape == (1, 2)
+    assert backbone.dummy_pixel_values.shape == (1, 3, 32, 32)
+    assert torch.equal(backbone.dummy_image_sizes, torch.tensor([[32, 32]]))
+    assert backbone.vision_tower.weight.grad is not None
+
+
+def test_dummy_vision_sum_uses_multiple_merged_tokens_for_mistral3_like_backbone():
+    backbone = _ToyMistralLikeVisionBackbone()
+
+    dummy_sum = _dummy_vision_sum(backbone)
+
+    assert dummy_sum is not None
+    assert backbone.dummy_pixel_values.shape == (1, 3, 56, 64)
+    assert torch.equal(backbone.dummy_image_sizes, torch.tensor([[56, 64]]))
+    assert backbone.merged_token_count == 4
 
 
 def test_maxsim_scores_and_labels_masks_padding_before_maxsim():
@@ -514,14 +649,17 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
 
-    def fake_all_reduce(ranks_with_ids: torch.Tensor) -> None:
+    def fake_all_reduce(ranks_with_ids: torch.Tensor, op=torch.distributed.ReduceOp.SUM, group=None) -> None:
         """Simulate the ID-presence sum when both fixture ranks supply document IDs.
 
         Args:
             ranks_with_ids: Scalar tensor of shape [], updated in place with the sum across two ranks.
         """
-        assert ranks_with_ids.item() == 1
-        ranks_with_ids.mul_(2)
+        if op == torch.distributed.ReduceOp.MAX:
+            assert ranks_with_ids.item() == 0
+        else:
+            assert ranks_with_ids.item() == 1
+            ranks_with_ids.mul_(2)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
@@ -539,15 +677,29 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
         return torch.cat([remote_doc_ids, tensor], dim=0)
 
     captured = {}
+    cross_entropy = tbe.F.cross_entropy
 
-    def fake_cross_entropy(scores, labels):
+    def capture_cross_entropy(
+        scores: torch.Tensor, labels: torch.Tensor, *, reduction: str = "mean"
+    ) -> torch.Tensor:
+        """Capture loss inputs while preserving the real cross-entropy computation.
+
+        Args:
+            scores: Tensor of shape [batch, passages] containing similarity scores.
+            labels: Tensor of shape [batch] containing positive passage indices.
+            reduction: Reduction applied to the per-query losses.
+
+        Returns:
+            Tensor of shape [batch] for no reduction, or a scalar tensor otherwise.
+        """
         captured["scores"] = scores.detach().clone()
         captured["labels"] = labels.detach().clone()
-        return -scores.gather(1, labels.unsqueeze(1)).mean()
+        captured["reduction"] = reduction
+        return cross_entropy(scores, labels, reduction=reduction)
 
     monkeypatch.setattr(inbatch_neg_utils, "dist_gather_tensor_with_dim1_padding", fake_gather_with_dim1_padding)
     monkeypatch.setattr(inbatch_neg_utils, "dist_gather_tensor", fake_gather_tensor)
-    monkeypatch.setattr(tbe.F, "cross_entropy", fake_cross_entropy)
+    monkeypatch.setattr(tbe.F, "cross_entropy", capture_cross_entropy)
 
     batch = {
         "q_input_ids": torch.tensor(
@@ -577,6 +729,7 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
         ((4, 2), False, False),
     ]
     assert gather_tensor_calls == [((4,), False)]
+    assert captured["reduction"] == "none"
     assert torch.equal(captured["labels"], torch.tensor([4, 6]))
     assert captured["scores"].shape == (2, 8)
     assert captured["scores"][0, 0].item() == torch.finfo(captured["scores"].dtype).min
@@ -585,4 +738,6 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     assert captured["scores"][1, 6].item() > torch.finfo(captured["scores"].dtype).min
     assert len(loss_buffer) == 1
     assert torch.isfinite(loss_buffer[0])
+    torch.testing.assert_close(loss_buffer[0], cross_entropy(captured["scores"], captured["labels"]))
     assert model.scale.grad is not None
+    assert torch.isfinite(model.scale.grad)

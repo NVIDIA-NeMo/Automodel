@@ -2281,3 +2281,35 @@ def test_text_reranker_export_rejects_left_truncation():
     collator = CrossEncoderCollator(tokenizer=tokenizer, rerank_max_length=16)
     with pytest.raises(ValueError, match="right truncation"):
         collator.configure_tokenizer_for_export()
+
+
+def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
+    from nemo_automodel._transformers import retrieval
+
+    class CompositeConfig(PretrainedConfig):
+        is_composition = True
+
+        def __init__(self):
+            self.llm_config = PretrainedConfig(hidden_size=16)
+            super().__init__()
+
+        def get_text_config(self, decoder=False):
+            assert decoder is True
+            return self.llm_config
+
+    class CompositeBackbone(nn.Module):
+        main_input_name = "pixel_values"
+
+        def __init__(self):
+            super().__init__()
+            self.config = CompositeConfig()
+            self.config.name_or_path = ""
+            self.decoder_tower = _CausalityModule(self.config.llm_config, True)
+
+        def get_decoder(self):
+            return self.decoder_tower
+
+    encoder = retrieval.BiEncoderModel(CompositeBackbone(), pooling="last", l2_normalize=True)
+
+    assert encoder.sentence_transformer_export_config is None
+    encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")

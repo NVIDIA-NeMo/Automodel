@@ -423,6 +423,9 @@ model:
   temperature: 1.0
   torch_dtype: bfloat16
 
+freeze_config:
+  freeze_score_head: false
+
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
@@ -455,6 +458,9 @@ The following settings control cross-encoder behavior:
 - `prompt_template`: controls how the pair is serialized before tokenization. It must include `{query}` and `{passage}`.
 - `n_passages`: number of candidates per query. The positive passage must remain first in each group because labels point
   to index `0`.
+- `freeze_score_head`: when `true`, freezes the cross-encoder classification/scoring head while leaving the base language
+  model trainable. Use this when fine-tuning a pretrained reranker whose existing single-score head should stay fixed;
+  do not enable it when starting from a base model with a newly initialized scoring head.
 
 The complete example is
 [examples/retrieval/cross_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/llama3_2_1b.yaml).

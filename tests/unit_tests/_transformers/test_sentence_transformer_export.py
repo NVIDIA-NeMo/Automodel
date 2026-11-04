@@ -288,6 +288,26 @@ def test_generated_sentence_transformer_assets_preserve_repository_and_model_roo
     assert not (metadata_dir / "LICENSE.txt").exists()
 
 
+def test_generated_sentence_transformer_assets_reject_output_embedding_quantization(tmp_path):
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        output_embedding_quantization="int8",
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+
+    with pytest.raises(ValueError, match="does not support output_embedding_quantization"):
+        _save_generated_sentence_transformer_assets(
+            model,
+            SentenceTransformerExportConfig(),
+            original_model_path=None,
+            hf_metadata_dir=str(tmp_path),
+            tokenizer=SimpleNamespace(model_max_length=512),
+        )
+
+    assert not any(tmp_path.iterdir())
+
+
 def test_generated_sentence_transformer_assets_reject_unrepresentable_pooling(tmp_path):
     metadata_dir = tmp_path / "metadata"
     metadata_dir.mkdir()

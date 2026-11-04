@@ -1163,14 +1163,14 @@ class _NeMoAutoModelForRetrievalBase:
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         use_liger_kernel: bool = True,
         use_sdpa_patching: bool = True,
-        sdpa_method: List[SDPBackend] | None = None,
-        torch_dtype="auto",
+        sdpa_method: list[SDPBackend] | None = None,
+        torch_dtype: str | torch.dtype = "auto",
         distributed_setup: DistributedSetup | None = None,
-        device_mesh: Optional["DeviceMesh"] = None,
-        compile_config: Optional["CompileConfig"] = None,
+        device_mesh: "DeviceMesh | None" = None,
+        compile_config: "CompileConfig | None" = None,
         peft_config: dict | None = None,
         freeze_config: "FreezeConfig | dict[str, bool] | None" = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
 
@@ -1343,6 +1343,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
+        output_embedding_quantization: str | None = None,
         is_causal: bool | None = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -1362,6 +1363,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
                 negatives during training.
             detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed
                 in-batch-negative losses. Set to false for full cross-rank gradient flow.
+            output_embedding_quantization: Optional quantization-aware training mode applied to emitted embeddings
+                after pooling and before L2 normalization. Currently supports ``None`` or ``"int8"``.
             is_causal: Whether the text backbone uses causal self-attention. When omitted, restores a saved policy or
                 defaults to non-causal attention.
             **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
@@ -1375,6 +1378,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
+            output_embedding_quantization=output_embedding_quantization,
             is_causal=is_causal,
             **kwargs,
         )

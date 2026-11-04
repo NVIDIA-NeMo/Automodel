@@ -202,7 +202,7 @@ def test_load_openai_messages_local_and_errors(tmp_path, monkeypatch):
 
 
 def test_load_openai_messages_local_skip_invalid_samples(tmp_path):
-    
+
     jsonl = tmp_path / "broken.jsonl"
     jsonl.write_text(
         "\n".join(

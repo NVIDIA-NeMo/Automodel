@@ -2005,7 +2005,8 @@ def test_mistral3_layer_discovery_through_retrieval_wrappers(reranker: bool, wra
     }
 
 
-def test_mistral3_unsharded_eval_dummy_vision_is_opt_in() -> None:
+@pytest.mark.parametrize("dummy_option", ["run_dummy_vision", "force_dummy_vision"])
+def test_mistral3_unsharded_eval_dummy_vision_is_opt_in(dummy_option: str) -> None:
     """Ordinary text inference avoids vision; opting in changes no hidden states."""
     model = Mistral3BidirectionalModel(_tiny_mistral3_bidirectional_vlm_config()).eval()
     calls = []
@@ -2014,7 +2015,7 @@ def test_mistral3_unsharded_eval_dummy_vision_is_opt_in() -> None:
     with torch.no_grad():
         expected = model(**inputs).last_hidden_state
         assert not calls
-        actual = model(**inputs, run_dummy_vision=True).last_hidden_state
+        actual = model(**inputs, **{dummy_option: True}).last_hidden_state
     hook.remove()
     assert calls == [True]
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -2077,8 +2078,8 @@ def test_mistral3_corpus_image_caption_policy_reaches_processor(
 
 
 @pytest.mark.runtime_budget(
-    75,
-    reason="two real export/reload paths plus isolated Transformers and ST inference took 56.8s under CI coverage",
+    20,
+    reason="two export/reload paths share isolated interpreter startup; retain the internal 20s budget",
 )
 def test_mistral3_reranker_export_reloads_without_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Trained heads export through both save paths into stock ST modules and portable Transformers."""
@@ -2353,6 +2354,23 @@ def test_mistral3_reranker_uses_tokenizer_limit_for_default_inference(
     assert overridden["input_ids"].shape[1] == 96
 
 
+def test_mistral3_vlm_initializes_parent_once(monkeypatch):
+    config = _tiny_mistral3_bidirectional_vlm_config()
+    parent_init = Mistral3Model.__init__
+    calls = []
+
+    def tracking_init(model, model_config):
+        calls.append(model_config)
+        parent_init(model, model_config)
+
+    monkeypatch.setattr(Mistral3Model, "__init__", tracking_init)
+
+    model = Mistral3BidirectionalModel(config)
+
+    assert calls == [config]
+    assert isinstance(model.language_model, Ministral3BidirectionalModel)
+
+
 def test_mistral3_reranker_checkpointer_preserves_trained_head_dtype(tmp_path):
     """Consolidation uses this step's head, not source Dense weights or source BF16 rounding."""
     from safetensors.torch import load_file, save_file
@@ -2600,3 +2618,38 @@ def test_mistral3_reranker_finetune_from_head_layouts(tmp_path, legacy):
     loss = restored(input_ids=torch.tensor([[1, 2, 3]]), attention_mask=torch.ones(1, 3)).logits.sum()
     loss.backward()
     assert torch.isfinite(restored.model.score.weight.grad).all()
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("from_config", [False, True])
+def test_ministral_optional_outputs_and_gradients_match_hf(is_causal, from_config):
+    from copy import deepcopy
+
+    config = tiny_bidirectional_config()
+    config.num_hidden_layers = 2
+    config.is_causal = is_causal
+    config.use_cache = False
+    config.output_hidden_states = from_config
+    config.output_attentions = from_config
+    actual = Ministral3BidirectionalModel(config)
+    reference = HFMinistral3Model(deepcopy(config))
+    reference.load_state_dict(actual.state_dict())
+    ids = torch.tensor([[2, 3, 4, 5], [6, 7, 0, 0]])
+    mask = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]])
+    options = {} if from_config else {"output_hidden_states": True, "output_attentions": True}
+    outputs = actual(input_ids=ids, attention_mask=mask, **options)
+    expected = reference(input_ids=ids, attention_mask=mask, **options)
+    assert len(outputs.hidden_states) == 3
+    assert len(outputs.attentions) == 2
+    for field in ("hidden_states", "attentions"):
+        for value, ref in zip(getattr(outputs, field), getattr(expected, field)):
+            torch.testing.assert_close(value, ref, rtol=1e-5, atol=1e-6)
+    upstream = torch.randn_like(outputs.last_hidden_state) * mask.unsqueeze(-1)
+    (outputs.last_hidden_state * upstream).sum().backward()
+    (expected.last_hidden_state * upstream).sum().backward()
+    for parameter, ref_parameter in zip(actual.parameters(), reference.parameters()):
+        torch.testing.assert_close(parameter.grad, ref_parameter.grad, rtol=1e-5, atol=1e-6)
+    with torch.no_grad():
+        result = actual(input_ids=ids, attention_mask=mask, return_dict=False, **options)
+    assert isinstance(result, tuple)
+    torch.testing.assert_close(result[0], expected.last_hidden_state)

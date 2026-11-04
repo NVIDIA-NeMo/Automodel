@@ -123,10 +123,9 @@ def _pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_t
 
 class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
     """
-    Llama Bidirectional Model with a sequence classification/regression head.
+    Llama retrieval model with a sequence classification or regression head.
 
-    This model adds a classification head on top of the bidirectional Llama model
-    and includes configurable pooling strategies.
+    Retrieval pooling and temperature behavior is preserved in both attention modes.
     """
 
     config_class = LlamaBidirectionalConfig

@@ -16,21 +16,154 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+
 
 import pytest
 import torch
 
+from nemo_automodel._transformers.retrieval import CrossEncoderModel
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.recipes.retrieval import train_cross_encoder as recipe_module
-from nemo_automodel.recipes.retrieval.train_cross_encoder import (
-    TrainCrossEncoderRecipe,
-    accuracy,
-    batch_mrr,
+from nemo_automodel.components.models.llama_bidirectional.model import (
+    LlamaBidirectionalConfig,
+    LlamaBidirectionalForSequenceClassification,
 )
+from nemo_automodel.components.models.qwen3_reranker.model import (
+    Qwen3RerankerConfig,
+    Qwen3RerankerForCausalReranking,
+)
+from nemo_automodel.recipes.retrieval.train_cross_encoder import TrainCrossEncoderRecipe, accuracy, batch_mrr
+from nemo_automodel.recipes.retrieval import train_cross_encoder as recipe_module
 
 # ---------------------------------------------------------------------------
 # temperature configuration
 # ---------------------------------------------------------------------------
+
+
+def _tiny_llama_cross_encoder(*, temperature: float) -> CrossEncoderModel:
+    config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=32,
+        num_labels=1,
+        temperature=temperature,
+    )
+    return CrossEncoderModel(LlamaBidirectionalForSequenceClassification(config))
+
+
+def _tiny_qwen3_cross_encoder(*, temperature: float) -> CrossEncoderModel:
+    config = Qwen3RerankerConfig(
+        yes_token_id=5,
+        no_token_id=7,
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=32,
+        head_dim=8,
+        temperature=temperature,
+    )
+    return CrossEncoderModel(Qwen3RerankerForCausalReranking(config))
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"temperature": 0.3},
+        {"model": {"temperature": 0.02}},
+        {"temperature": 0.3, "model": {"temperature": 1.0}},
+        {"temperature": 1.0, "model": {"temperature": 0.02}},
+        {"temperature": 0.3, "model": {"temperature": 0.02}},
+        {"temperature": 0.3, "model": {"temperature": None}},
+    ],
+)
+def test_recipe_defers_temperature_validation_until_model_is_built(config):
+    recipe = TrainCrossEncoderRecipe(ConfigNode(config))
+
+    assert recipe.temperature == config.get("temperature", 1.0)
+
+
+def test_recipe_rejects_two_active_non_unit_temperatures():
+    config = ConfigNode({"temperature": 0.3, "model": {"temperature": 0.02}})
+    recipe = TrainCrossEncoderRecipe(config)
+    model = _tiny_llama_cross_encoder(temperature=0.02)
+
+    assert model.effective_score_temperature == 0.02
+    with pytest.raises(
+        ValueError,
+        match="Set either top-level temperature or model.temperature to 1.0",
+    ):
+        recipe._validate_model(model)
+
+
+def test_recipe_allows_configured_temperature_when_qwen3_does_not_apply_it():
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 0.3, "model": {"temperature": 0.02}}))
+    model = _tiny_qwen3_cross_encoder(temperature=0.02)
+
+    assert model.effective_score_temperature == 1.0
+    recipe._validate_model(model)
+
+
+def test_recipe_allows_null_override_when_loaded_model_uses_unit_temperature():
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 0.3, "model": {"temperature": None}}))
+    model = _tiny_llama_cross_encoder(temperature=1.0)
+
+    assert model.effective_score_temperature == 1.0
+    recipe._validate_model(model)
+
+
+def test_recipe_allows_active_model_temperature_when_recipe_temperature_is_unit():
+    recipe = TrainCrossEncoderRecipe(ConfigNode({"temperature": 1.0, "model": {"temperature": 0.02}}))
+    model = _tiny_llama_cross_encoder(temperature=0.02)
+
+    assert model.effective_score_temperature == 0.02
+    recipe._validate_model(model)
+
+
+@pytest.mark.parametrize("explicit_null", [False, True], ids=["omitted", "null"])
+def test_recipe_rejects_checkpoint_temperature_when_model_override_is_absent(tmp_path, explicit_null):
+    checkpoint_config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=32,
+        num_labels=1,
+        temperature=0.02,
+    )
+    LlamaBidirectionalForSequenceClassification(checkpoint_config).save_pretrained(tmp_path)
+    model_build_kwargs = {"temperature": None} if explicit_null else {}
+    recipe_model_config = {"pretrained_model_name_or_path": str(tmp_path)}
+    if explicit_null:
+        recipe_model_config["temperature"] = None
+
+    model = CrossEncoderModel.build(model_name_or_path=str(tmp_path), **model_build_kwargs)
+    recipe = TrainCrossEncoderRecipe(
+        ConfigNode(
+            {
+                "temperature": 0.3,
+                "model": recipe_model_config,
+            }
+        )
+    )
+
+    assert model.config.temperature == 0.02
+    assert model.effective_score_temperature == 0.02
+    with pytest.raises(
+        ValueError,
+        match="Set either top-level temperature or model.temperature to 1.0",
+    ):
+        recipe._validate_model(model)
+
+
 
 
 @pytest.mark.parametrize("temperature", [1.0, 0.02])
@@ -185,6 +318,35 @@ def test_batch_mrr_wider_output():
     torch.testing.assert_close(mrr_sum, torch.tensor(19.0 / 12.0))
 
 
+def test_cross_encoder_nonfinite_loss_is_detected_before_backward(monkeypatch):
+    logits = torch.tensor([[float("inf")], [0.0]], requires_grad=True)
+    recipe = TrainCrossEncoderRecipe.__new__(TrainCrossEncoderRecipe)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.distributed_config = SimpleNamespace(autocast_dtype=None, defer_fsdp_grad_sync=True)
+    recipe.model_parts = [Mock(return_value=SimpleNamespace(logits=logits))]
+    recipe.train_n_passages = 2
+    recipe.temperature = 1.0
+    recipe._acc_buffer = []
+    recipe.step_scheduler = SimpleNamespace(step=7, epoch=0)
+    recipe._has_nonfinite_across_dp = lambda local_has_nonfinite: local_has_nonfinite
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.retrieval.train_cross_encoder.get_sync_ctx", lambda *args, **kwargs: nullcontext()
+    )
+
+    loss_buffer = []
+    skipped_update = recipe._forward_backward_step(
+        0,
+        {"input_ids": torch.ones(2, 1, dtype=torch.long), "labels": torch.tensor([0])},
+        loss_buffer=loss_buffer,
+        num_batches=1,
+    )
+
+    assert skipped_update is True
+    assert len(loss_buffer) == 1
+    assert torch.isnan(loss_buffer[0])
+    assert logits.grad is None
+
+
 class _ScoreModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -218,6 +380,7 @@ def test_recipe_loss_and_gradients_use_float32_before_temperature(monkeypatch, t
         distributed_config=None,
         step_scheduler=SimpleNamespace(step=0, epoch=0),
         _acc_buffer=[],
+        _has_nonfinite_across_dp=lambda value: value,
     )
     monkeypatch.setattr(recipe_module, "_get_autocast_ctx", lambda _: nullcontext())
     monkeypatch.setattr(recipe_module, "get_sync_ctx", lambda *args, **kwargs: nullcontext())

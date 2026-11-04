@@ -34,6 +34,7 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _group_params_by_dtype,
     _make_compute_dtype_fn,
     _mp_policy_with_param_dtype,
+    _mp_policy_with_output_dtype,
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     get_internal_fsdp_mp_policy,
@@ -749,6 +750,24 @@ def test_mp_policy_with_bf16_param_dtype_preserves_policy():
     assert copied_policy.reduce_dtype == torch.float32
     assert copied_policy.output_dtype == torch.bfloat16
     assert copied_policy.cast_forward_inputs is True
+
+
+def test_mp_policy_with_output_dtype_copies_policy():
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+        cast_forward_inputs=True,
+    )
+
+    copied_policy = _mp_policy_with_output_dtype(mp_policy, torch.float32)
+
+    assert copied_policy is not mp_policy
+    assert copied_policy.param_dtype == torch.bfloat16
+    assert copied_policy.reduce_dtype == torch.float32
+    assert copied_policy.output_dtype == torch.float32
+    assert copied_policy.cast_forward_inputs is True
+    assert mp_policy.output_dtype == torch.bfloat16
 
 
 def test_internal_fsdp_mp_policy_drops_only_output_dtype():

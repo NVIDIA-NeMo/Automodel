@@ -181,6 +181,31 @@ def test_apply_parameter_freezing(dummy_model, freeze_cfg: Dict, expect: Dict):
     assert dummy_model.token_embed.weight.requires_grad is True
 
 
+def test_apply_parameter_freezing_delegates_score_head_freezing():
+    class DummyCrossEncoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.language_model = nn.Linear(4, 4)
+            self.score_head = nn.Sequential(nn.Linear(4, 2), nn.ReLU(), nn.Linear(2, 1))
+
+        def freeze_score_head(self) -> None:
+            for param in self.score_head.parameters():
+                param.requires_grad_(False)
+
+    model = DummyCrossEncoder()
+    model_utils.apply_parameter_freezing(
+        model,
+        {
+            "freeze_vision_tower": False,
+            "freeze_language_model": False,
+            "freeze_score_head": True,
+        },
+    )
+
+    assert _all_requires_grad(model.language_model)
+    assert not _any_requires_grad(model.score_head)
+
+
 def test_apply_parameter_freezing_supports_generic_module_selectors():
     """Generic selectors match fully qualified module names and unfreeze wins on overlap."""
 
@@ -1075,3 +1100,16 @@ def test_freeze_video_embedder_false_keeps_video_embedder_trainable(video_embedd
     )
 
     assert _all_requires_grad(video_embedder_model.patch_generator.video_embedder)
+
+
+@pytest.mark.parametrize("projector_name", ["multi_modal_projector", "multimodal_projector", "mm_projector"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_legacy_projector_freezing_survives_typed_config(projector_name, enabled):
+    model = nn.ModuleDict({projector_name: nn.Linear(4, 4), "language_model": nn.Linear(4, 4)})
+    config = model_utils.parse_freeze_config({
+        "freeze_vision_tower": False,
+        "freeze_multimodal_projector": enabled,
+    })
+    model_utils.apply_parameter_freezing(model, config)
+    assert all(parameter.requires_grad is not enabled for parameter in model[projector_name].parameters())
+    assert all(parameter.requires_grad for parameter in model["language_model"].parameters())

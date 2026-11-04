@@ -1,0 +1,59 @@
+      - [5999, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ar_unrolled_8B_ragas2_scores_1_2.json]
+      - [3659, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_bn_unrolled_8B_ragas2_scores_1_2.json]
+      - [6971, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_en_unrolled_8B_ragas2_scores_1_2.json]
+      - [8432, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_es_unrolled_8B_ragas2_scores_1_2.json]
+      - [4007, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_fa_unrolled_8B_ragas2_scores_1_2.json]
+      - [4767, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_fi_unrolled_8B_ragas2_scores_1_2.json]
+      - [2157, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_fr_unrolled_8B_ragas2_scores_1_2.json]
+      - [2209, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_hi_unrolled_8B_ragas2_scores_1_2.json]
+      - [9365, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_id_unrolled_8B_ragas2_scores_1_2.json]
+      - [6676, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ja_unrolled_8B_ragas2_scores_1_2.json]
+      - [1908, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ko_unrolled_8B_ragas2_scores_1_2.json]
+      - [9535, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ru_unrolled_8B_ragas2_scores_1_2.json]
+      - [2378, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_sw_unrolled_8B_ragas2_scores_1_2.json]
+      - [3915, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_te_unrolled_8B_ragas2_scores_1_2.json]
+      - [4611, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_th_unrolled_8B_ragas2_scores_1_2.json]
+      - [3059, /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_zh_unrolled_8B_ragas2_scores_1_2.json]
+
+
+# Re-mined
+      - [10000, /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mldr_en_perc95_small.json]
+      - [170000, /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/hotpotqa.json] # benchmark
+      - [100231, /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/nq.json]
+      - [87599, /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/squad.json]
+      - [80001, /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/stackexchange.json]
+      - [29721, /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/hover.json]
+      - [50001, /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/combined_SynthInstrShortLong.json]
+
+# Arguana Synth
+      - [2760, /home/rosmulski/scratch/filtering_repo/mined_hardnegs/instr_qwen3_8B/arguana_synth_v2_2760_qwen3_8B_0.95_perc.json]
+      - [9660, /home/rosmulski/scratch/filtering_repo/mined_hardnegs/instr_qwen3_8B/arguana_synth_v1_9660_qwen3_8B_0.95_perc.json]
+      - [9600, /home/rosmulski/scratch/filtering_repo/mined_hardnegs/instr_qwen3_8B/arguana_synth_gpt_oss_20B_9660_qwen3_8B_0.95_perc.json]
+      - [11040, /home/rosmulski/scratch/filtering_repo/mined_hardnegs/instr_qwen3_8B/arguana_synth_mixtral_10k_qwen3_8B_0.95_perc.json]
+      - [60000, /home/rosmulski/scratch/filtering_repo/mined_hardnegs/instr_qwen3_8B/arguana_synth_gpt_oss_120B_100k_qwen3_8B_0.95_perc.json]
+
+# Spartqa benchmark for commercial use
+# 99248
+# https://jirasw.nvidia.com/browse/DGPTT-3701
+# /home/rosmulski/scratch/datasets/mteb_new_datasets/spartqa.json
+
+
+# /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/fever.json # 140085. benchmark, but in 11M
+
+
+# DBLP-Citation-network-V17.jsonl
+# scidocs benchmark -- non-commercial
+# - [25000, /home/rosmulski/scratch/filtering_repo/mined_hardnegs/instr_qwen3_8B/scidocs_1M_qwen3_8B_0.95_perc.json] # 1M
+
+# /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/triviaqa.json -- check subset https://jirasw.nvidia.com/browse/DGPTT-789
+
+# Pre-train?
+      - [1000000, /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/nv-embed-v2-non-retrieval/training_datasets/paq.json]
+
+      # MLQA is benchmark
+      - [87570, /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.ar.json]
+      - [89996, /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.de.json]
+      - [91933, /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.es.json]
+      - [92704, /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.hi.json]
+      - [85853, /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/mlqa-translate-train.zh.json]
+

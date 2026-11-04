@@ -50,6 +50,7 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
+from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
@@ -892,7 +893,32 @@ class Checkpointer:
             optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
-        self._do_load(state_dict, os.path.join(weights_path, "optim"))
+        path = os.path.join(weights_path, "optim")
+        flat_state, mappings = flatten_state_dict(state_dict)
+        multiplier_keys = {
+            key for key in flat_state if ".param_groups." in key and key.endswith((".lr_mult", ".wd_mult"))
+        }
+        missing_mults = set()
+        storage_reader = _maybe_msc_reader(path, None)
+        if multiplier_keys:
+            missing_mults = multiplier_keys - set(_get_checkpoint_metadata(path, storage_reader).state_dict_metadata)
+        if missing_mults:
+            # Older schedulers used 1.0 for absent multipliers. Preserve that run's
+            # update rule, rather than importing the new run's constructed ratios.
+            # Only these optional scalar fields may be missing; moments remain strict.
+            legacy_groups = []
+            for key in missing_mults:
+                group = state_dict
+                for part in mappings[key][:-1]:
+                    group = group[part]
+                field = mappings[key][-1]
+                del group[field]
+                legacy_groups.append((group, field))
+            self._do_load(state_dict, path, storage_reader=storage_reader)
+            for group, field in legacy_groups:
+                group[field] = 1.0
+        else:
+            self._do_load(state_dict, path)
         optimizer_state.load_state_dict(state_dict)
 
     def _load_model_in_parts(

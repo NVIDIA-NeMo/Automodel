@@ -77,6 +77,32 @@ setattr(config_obj, key, value)
 Setting a non-existent attribute silently creates a phantom field — the test
 passes but the recipe fails for a real user.
 
+### Internal GitLab MR coverage
+
+For MRs targeting `internal` in the internal GitLab fork, `.gitlab-ci.yml` owns
+the CPU suite selection. Prefer whole CPU-compatible directories and simple
+path globs over individual test files; related non-retrieval tests are welcome
+when they keep selection simple and execution quick.
+
+- Ensure new retrieval tests are included, even when they live outside the
+  existing selected directories. New files inside a selected directory are
+  discovered automatically. Do not move upstream tests just to fit the selector.
+- Use the job's dependency setup and pytest command for local verification,
+  including `--cpu`, `-m "not pleasefixme"`, and its offline environment variables.
+  Set `HF_HOME` to a writable scratch directory when running outside GitLab.
+  Do not add `--with_downloads`; use tiny local fixtures or mocked I/O. `--cpu`
+  selects the repository's device fixture, not a universal CPU-safety guarantee.
+- Select paths before pytest imports test modules. Whole-tree `-k` or `-m`
+  filtering does not protect collection from optional GPU/media imports.
+- For selection changes, compare `--collect-only -q` node IDs before and after:
+  retain existing coverage, confirm newly added files are collected, then run
+  the expanded suite. Check JUnit results, skips, and durations, not just exit
+  status. Aim to keep MR feedback within a few minutes; measure before sharding.
+- Keep assertions intact. Exclusions or new skips require a specific CPU,
+  dependency, or offline limitation and, if temporary, a tracked removal
+  condition. Leave GPU, real-checkpoint, and download-dependent validation to
+  the appropriate upstream or separately configured workflow.
+
 ## Adding a Functional Test
 
 1. Place the test under `tests/functional_tests/`.

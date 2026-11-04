@@ -168,6 +168,17 @@ copies byte-identical; no path alias entry in `catalog.py` is required.
 
 ---
 
+## Internal GitLab fork
+
+For work targeting `internal` in the GitLab fork
+`aire/research/retriever/forks/automodel`, follow the internal GitLab section of
+`.agents/contributor-skills/cicd/SKILL.md` and the internal MR test guidance in
+`.agents/contributor-skills/testing/SKILL.md`. This applies to feature branches
+targeting that fork too; do not identify the workflow by the checked-out branch
+name alone. Keep upstream GitHub instructions separate from this fork's MR checks.
+
+---
+
 ## Architecture Overview
 
 ```

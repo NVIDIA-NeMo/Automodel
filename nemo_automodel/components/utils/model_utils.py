@@ -417,6 +417,8 @@ class FreezeConfig:
     freeze_vision_tower: bool | None = None
     freeze_audio_tower: bool = False
     freeze_language_model: bool = False
+    freeze_multimodal_projector: bool = False
+    freeze_score_head: bool = False
     freeze_video_embedder: bool = False
     freeze_parameters: tuple[str, ...] | None = None
     unfreeze_parameters: tuple[str, ...] | None = None
@@ -444,7 +446,13 @@ class FreezeConfig:
             raise TypeError(
                 f"FreezeConfig.freeze_vision_tower must be a boolean or None; got {self.freeze_vision_tower!r}."
             )
-        for field_name in ("freeze_audio_tower", "freeze_language_model", "freeze_video_embedder"):
+        for field_name in (
+            "freeze_audio_tower",
+            "freeze_language_model",
+            "freeze_video_embedder",
+            "freeze_multimodal_projector",
+            "freeze_score_head",
+        ):
             value = getattr(self, field_name)
             if not isinstance(value, bool):
                 raise TypeError(f"FreezeConfig.{field_name} must be a boolean; got {value!r}.")
@@ -468,6 +476,8 @@ _FREEZE_CONFIG_OPTIONS = {
     "freeze_audio_tower",
     "freeze_language_model",
     "freeze_video_embedder",
+    "freeze_multimodal_projector",
+    "freeze_score_head",
 }
 
 
@@ -541,7 +551,14 @@ def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> Free
         return [_parse_module_selector(entry, field_name=field_name) for entry in entries]
 
     legacy_booleans = {}
-    for option in ("freeze_vision_tower", "freeze_audio_tower", "freeze_language_model", "freeze_video_embedder"):
+    for option in (
+        "freeze_vision_tower",
+        "freeze_audio_tower",
+        "freeze_language_model",
+        "freeze_video_embedder",
+        "freeze_multimodal_projector",
+        "freeze_score_head",
+    ):
         value = config.get(option, None)
         if value is None:
             continue
@@ -695,6 +712,8 @@ def apply_parameter_freezing(
         - freeze_vision_tower: bool (default True in legacy-only configurations)
         - freeze_audio_tower: bool (default False)
         - freeze_language_model: bool (default False)
+        - freeze_multimodal_projector: bool (default False)
+        - freeze_score_head: bool (default False)
         - freeze_video_embedder: bool (default False)
     """
     parsed_freeze_config = parse_freeze_config(freeze_config)
@@ -721,11 +740,23 @@ def apply_parameter_freezing(
         (freeze_vision_tower, "vision_tower", ("vision", "visual", "image_encoder")),
         (freeze_config.freeze_audio_tower, "audio_tower", ("audio", "audio_encoder", "speech", "sound")),
         (freeze_config.freeze_language_model, "language_model", ("language", "text", "llm")),
+        (
+            freeze_config.freeze_multimodal_projector,
+            "multi_modal_projector",
+            ("multi_modal_projector", "multimodal_projector", "mm_projector"),
+        ),
         (freeze_config.freeze_video_embedder, None, ("patch_generator.video_embedder",)),
     )
     for enabled, attribute_name, name_patterns in legacy_freeze_aliases:
         if enabled:
             _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns)
+
+    if freeze_config.freeze_score_head:
+        freeze_score_head = getattr(model, "freeze_score_head", None)
+        if callable(freeze_score_head):
+            freeze_score_head()
+        else:
+            logger.warning("freeze_score_head requested but model does not expose freeze_score_head()")
 
     _apply_module_selectors(
         model, freeze_config.freeze_modules or [], requires_grad=False, strict=strict, field_name="freeze_modules"

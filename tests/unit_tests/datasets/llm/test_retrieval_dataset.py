@@ -15,10 +15,12 @@
 import json
 import runpy
 import sys
+from io import BytesIO
 from typing import Any, Dict
 
 import pytest
 from datasets import Dataset
+from PIL import Image
 
 import nemo_automodel.components.datasets.llm.retrieval_dataset as rd
 import nemo_automodel.components.datasets.llm.retrieval_dataset_inline as rdi
@@ -54,6 +56,26 @@ class DummyCorpus(rd.AbstractDataset):
 
     def get_all_ids(self):
         return sorted(list(self._id_to_doc.keys()))
+
+
+@pytest.mark.parametrize("encoded", [False, True])
+def test_vdr_dataset_accepts_decoded_and_encoded_hf_images(encoded):
+    image = Image.new("RGB", (3, 2), (255, 0, 0))
+    stored_image = image
+    if encoded:
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        stored_image = {"bytes": buffer.getvalue(), "path": None}
+
+    dataset = rd.VDRDataset.__new__(rd.VDRDataset)
+    dataset.data = [{"id": "doc-1", "image": stored_image}]
+    dataset.docid2idx = {"doc-1": 0}
+
+    document = dataset.get_document_by_id("doc-1")
+
+    assert isinstance(document["image"], Image.Image)
+    assert document["image"].size == (3, 2)
+    assert document["text"] == ""
 
 
 def _mock_hf_load_dataset_returning(train_examples):
@@ -263,11 +285,16 @@ def test_transform_func_image_conversion():
         "c": DummyCorpus({"p": {"text": "t", "image": img, "nr_ocr": ""}}),
     }
     examples = {"question": ["Q"], "corpus_id": ["c"], "pos_doc": [[{"id": "p"}]], "neg_doc": [[{"id": "p"}]]}
-    out = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, use_text_in_document=True)
+    out = rd._transform_func(
+        examples,
+        num_neg_docs=1,
+        corpus_dict=corpus_dict,
+        use_text_in_document=True,
+    )
     # conversion called
     assert isinstance(out["doc_image"][0][0], DummyImage)
     assert img.convert_called_with == "RGB"
-    # text is preserved (trim logic without leading spaces result)
+    # text is preserved when use_text_in_document is enabled
     assert out["doc_text"][0][0] == "t"
 
     out_without_text = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
@@ -937,7 +964,13 @@ def test_load_datasets_inline_jsonl(tmp_path):
     row0 = dataset[0]
     assert row0["question"] == "Explain transformers"
     assert row0["corpus_id"] == rdi.INLINE_CORPUS_ID
-    assert row0["pos_doc"][0]["id"] == ""
+    positive_id = row0["pos_doc"][0]["id"]
+    assert positive_id.startswith("inline:")
+    assert len({positive_id, *(doc["id"] for doc in row0["neg_doc"])}) == 3
+    # IDs describe documents, so reloading in a different query order preserves them.
+    f.write_text("\n".join(json.dumps(record) for record in reversed(records)))
+    reordered, _ = rdi.load_datasets(str(f))
+    assert reordered[1]["pos_doc"][0]["id"] == positive_id
     assert row0["pos_doc"][0]["text"].startswith("Transformers are")
     assert [d["text"] for d in row0["neg_doc"]] == ["RNNs are...", "CNNs are..."]
 

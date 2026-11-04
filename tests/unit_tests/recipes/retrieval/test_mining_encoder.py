@@ -449,3 +449,26 @@ def test_recipe_unload_releases_model_and_preserves_metadata(backend):
     if backend != "legacy":
         with pytest.raises(RuntimeError, match="already been released"):
             encoder.encode_queries(["question"], batch_size=1)
+
+
+def test_checkpoint_weights_and_processor_use_same_downloaded_snapshot(monkeypatch):
+    """A moving Hub branch cannot load the processor from a different weight revision."""
+    sha = "a" * 40
+    model = _PixelModel()
+    model.model = SimpleNamespace(retrieval_processor_target="fixture.Processor")
+    model.config = SimpleNamespace(name_or_path="org/model", _commit_hash="stale-config-value")
+    model.source_model_path = "org/model"
+    load_model = MagicMock(return_value=model)
+    load_processor = MagicMock(return_value=_PixelProcessor())
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.retrieval.mining_encoder.NeMoAutoConfig.resolve_revision",
+        lambda *args, **kwargs: sha,
+    )
+    monkeypatch.setattr("nemo_automodel._transformers.auto_model.NeMoAutoModelBiEncoder.from_pretrained", load_model)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.retrieval.mining_encoder.import_module",
+        lambda _: SimpleNamespace(Processor=SimpleNamespace(from_pretrained=load_processor)),
+    )
+    CheckpointMiningEncoderConfig().build(model_name_or_path="org/model", device=torch.device("cpu"))
+    assert load_model.call_args.kwargs["revision"] == sha
+    load_processor.assert_called_once_with("org/model", revision=sha)

@@ -198,4 +198,3 @@ Base vs the CoderForge-SFT (gentler `lr 5e-6`) checkpoints, same harness, all 50
 | **SFT step 499** | **122** | **24.4%** |
 
 CoderForge SFT lifts Qwen3-32B **+6.2 points** (18.2% → 24.4%) — a real SWE-bench gain.
-

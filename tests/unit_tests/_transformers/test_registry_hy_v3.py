@@ -15,7 +15,6 @@
 """Verify HYV3 model + config are registered in nemo_automodel._transformers.registry."""
 
 
-
 class TestArchMapping:
     def test_hyv3_arch_registered(self):
         from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
@@ -59,9 +58,10 @@ class TestCustomConfigRegistration:
 
 
 class TestSupportedBackbonesIntact:
-    """Sanity check that hy_v3 registration didn't disturb existing backbones."""
+    """Sanity check that hy_v3 registration did not disturb legacy retrieval backbones."""
 
-    def test_llama_still_in_supported_backbones(self):
+    def test_legacy_llama_still_in_supported_backbones(self):
         from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
 
         assert "llama" in SUPPORTED_BACKBONES
+        assert "llama_bidirec" in SUPPORTED_BACKBONES

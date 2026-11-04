@@ -205,7 +205,8 @@ def test_setup_validates_structured_export_processor(
             recipe.setup()
 
 
-def test_cross_encoder_setup_saves_text_training_template(setup_model, monkeypatch):
+@pytest.mark.parametrize("save_consolidated", [False, "final", "every"])
+def test_cross_encoder_setup_saves_text_training_template(setup_model, monkeypatch, save_consolidated):
     """Actual text recipe setup binds the configured collator format to its tokenizer."""
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -224,6 +225,7 @@ def test_cross_encoder_setup_saves_text_training_template(setup_model, monkeypat
     )
     config = ConfigNode(
         {
+            "checkpoint": {"save_consolidated": save_consolidated},
             "model": {"_target_": "nemo_automodel._transformers.retrieval.CrossEncoderModel"},
             "tokenizer": {"_target_": "transformers.AutoTokenizer.from_pretrained"},
             "optimizer": {"_target_": "torch.optim.SGD", "lr": 0.01},
@@ -255,6 +257,9 @@ def test_cross_encoder_setup_saves_text_training_template(setup_model, monkeypat
     monkeypatch.setattr(train_bi_encoder.RecipeConfig, "validation_dataloaders", property(stop))
     with pytest.raises(_ReachedValidationLoader):
         TrainCrossEncoderRecipe(config).setup()
+    if save_consolidated is False:
+        assert tokenizer.chat_template is None
+        return
     rendered = tokenizer.apply_chat_template(
         [{"role": "query", "content": "hello"}, {"role": "document", "content": "world"}],
         chat_template="reranking",

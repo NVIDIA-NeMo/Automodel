@@ -482,6 +482,12 @@ def _validate_sentence_transformer_export(
     """Validate generated metadata inputs before rank-zero-only checkpoint I/O."""
     export_config = export_config or SentenceTransformerExportConfig()
     input_mode = getattr(export_config, "input_mode", "text")
+    if getattr(model_part, "output_embedding_quantization", None) is not None:
+        raise ValueError(
+            "Sentence Transformers export does not support output_embedding_quantization; "
+            "disable it to export inference metadata that matches training embeddings."
+        )
+
     pooling = getattr(model_part, "pooling", None)
     if pooling not in _SENTENCE_TRANSFORMER_POOLING_KEYS:
         raise ValueError(f"Pooling mode {pooling!r} cannot be represented by standard Sentence Transformers metadata.")

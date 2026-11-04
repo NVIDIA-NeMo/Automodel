@@ -20,6 +20,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.utils.model_utils import parse_freeze_config
+from nemo_automodel.components.datasets.llm.retrieval_collator import ProcessorMethodCollator
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.loggers.metric_logger import MetricLogger, MetricsSample
 from nemo_automodel.recipes.retrieval import train_bi_encoder
@@ -113,6 +116,50 @@ def test_configure_sentence_transformer_export_retains_separator_for_text_prompt
         use_dataset_instruction=False,
     )
 
+    _configure_sentence_transformer_export(_Model(), collator)
+
+    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": None}
+
+
+def test_configure_sentence_transformer_export_retains_structured_prompt_separator():
+    captured = {}
+
+    class _Model(torch.nn.Module):
+        sentence_transformer_export_config = SimpleNamespace(input_mode="structured_multimodal")
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            captured.update(kwargs)
+
+    collator = SimpleNamespace(
+        query_prefix="query:",
+        passage_prefix="passage:",
+        use_dataset_instruction=False,
+    )
+
+    _configure_sentence_transformer_export(_Model(), collator)
+
+    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": None}
+
+
+def test_configure_sentence_transformer_export_reads_processor_method_collator_prompts():
+    captured = {}
+
+    class _Model(torch.nn.Module):
+        sentence_transformer_export_config = SimpleNamespace(input_mode="structured_multimodal")
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            captured.update(kwargs)
+
+    class _Processor:
+        query_prefix = "query:"
+        passage_prefix = "passage:"
+
+        def collate(self, batch):
+            return batch
+
+    collator = ProcessorMethodCollator(_Processor(), "collate")
+    assert collator.query_prefix == "query:"
+    assert collator.passage_prefix == "passage:"
     _configure_sentence_transformer_export(_Model(), collator)
 
     assert captured == {"query_prompt": "query: ", "document_prompt": "passage: ", "tokenizer": None}
@@ -217,19 +264,51 @@ def test_retrieval_model_instantiate_kwargs_include_compile_config():
     assert kwargs["compile_config"].dynamic is False
 
 
+def test_retrieval_model_instantiate_kwargs_include_freeze_config():
+    distributed_setup = object()
+    peft_config = object()
+    freeze_config = {
+        "freeze_vision_tower": True,
+        "freeze_language_model": True,
+    }
+    cfg = _DictLikeConfig(freeze_config=parse_freeze_config(freeze_config))
+
+    kwargs = _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config)
+
+    assert kwargs["freeze_config"] is cfg.freeze_config
+    assert kwargs["freeze_config"].freeze_vision_tower is True
+    assert kwargs["freeze_config"].freeze_language_model is True
+
+
 class _FakeCheckpointer:
+    def __init__(self):
+        self.wait_calls = 0
+
     def maybe_wait_for_staging(self):
-        pass
+        self.wait_calls += 1
 
 
 class _FakeOptimizer:
     param_groups = [{"lr": 1e-5}]
 
+    def __init__(self):
+        self.step_calls = 0
+        self.zero_grad_calls = 0
+
     def step(self):
-        pass
+        self.step_calls += 1
 
     def zero_grad(self):
-        pass
+        self.zero_grad_calls += 1
+
+
+class _FakeLRScheduler:
+    def __init__(self):
+        self.step_calls = 0
+
+    def step(self, increment):
+        assert increment == 1
+        self.step_calls += 1
 
 
 class _FakeStepScheduler:
@@ -246,14 +325,17 @@ def _make_recipe_for_optim_step(distributed_config):
     recipe.moe_mesh = None
     recipe.checkpointer = _FakeCheckpointer()
     recipe.optimizer = [_FakeOptimizer()]
-    recipe.lr_scheduler = None
+    recipe.lr_scheduler = [_FakeLRScheduler()]
     recipe.step_scheduler = _FakeStepScheduler()
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
     recipe.loss_average_window = deque(maxlen=50)
+    recipe.log_modality_loss = False
     recipe.timestamp = 0.0
     recipe._get_dp_group_size = lambda include_cp=True: 1
 
     def _fake_forward_backward_step(*args, **kwargs):
         kwargs["loss_buffer"].append(torch.tensor(1.0))
+        return False
 
     recipe._forward_backward_step = _fake_forward_backward_step
     return recipe
@@ -287,6 +369,62 @@ def test_retrieval_optim_step_keeps_sharded_clip_path_for_fsdp2(monkeypatch):
     recipe._run_train_optim_step([{}], max_grad_norm=1.0)
 
     assert captured["use_torch_clip_grad_norm"] is False
+
+
+def test_retrieval_optim_step_updates_on_finite_values(monkeypatch):
+    recipe = _make_recipe_for_optim_step(FSDP2Config())
+    monkeypatch.setattr(train_bi_encoder, "scale_grads_and_clip_grad_norm", lambda *args, **kwargs: 0.5)
+
+    metrics = recipe._run_train_optim_step([{}], max_grad_norm=1.0).metrics
+
+    assert recipe.optimizer[0].step_calls == 1
+    assert recipe.optimizer[0].zero_grad_calls == 1
+    assert recipe.lr_scheduler[0].step_calls == 1
+    assert recipe.checkpointer.wait_calls == 1
+    assert metrics["loss"] == 1.0
+    assert metrics["grad_norm"] == 0.5
+    assert metrics["skipped_update"] == 0.0
+
+
+def test_retrieval_optim_step_skips_nonfinite_loss(monkeypatch):
+    recipe = _make_recipe_for_optim_step(FSDP2Config())
+
+    def _nonfinite_forward(*args, **kwargs):
+        kwargs["loss_buffer"].append(torch.tensor(float("nan")))
+        return True
+
+    def _unexpected_clip(*args, **kwargs):
+        raise AssertionError("gradient clipping must not run after a non-finite loss")
+
+    recipe._forward_backward_step = _nonfinite_forward
+    monkeypatch.setattr(train_bi_encoder, "scale_grads_and_clip_grad_norm", _unexpected_clip)
+
+    metrics = recipe._run_train_optim_step([{}], max_grad_norm=1.0).metrics
+
+    assert recipe.optimizer[0].step_calls == 0
+    assert recipe.optimizer[0].zero_grad_calls == 1
+    assert recipe.lr_scheduler[0].step_calls == 0
+    assert recipe.checkpointer.wait_calls == 0
+    assert metrics["loss"] == 0.0
+    assert metrics["skipped_update"] == 1.0
+    assert metrics["nonfinite_loss_microbatches"] == 1.0
+    assert metrics["nonfinite_grad_norm"] == 0.0
+
+
+def test_retrieval_optim_step_skips_nonfinite_grad_norm(monkeypatch):
+    recipe = _make_recipe_for_optim_step(FSDP2Config())
+    monkeypatch.setattr(train_bi_encoder, "scale_grads_and_clip_grad_norm", lambda *args, **kwargs: float("inf"))
+
+    metrics = recipe._run_train_optim_step([{}], max_grad_norm=1.0).metrics
+
+    assert recipe.optimizer[0].step_calls == 0
+    assert recipe.optimizer[0].zero_grad_calls == 1
+    assert recipe.lr_scheduler[0].step_calls == 0
+    assert recipe.checkpointer.wait_calls == 0
+    assert metrics["loss"] == 1.0
+    assert metrics["grad_norm"] == 0.0
+    assert metrics["skipped_update"] == 1.0
+    assert metrics["nonfinite_grad_norm"] == 1.0
 
 
 class _RecordingMetricLogger:
@@ -464,3 +602,15 @@ def test_checkpoint_flushes_metrics_to_disk_mid_run(tmp_path):
     assert seen[4] == [1, 2, 3], "the checkpoint flush must have made the covered steps durable"
     assert seen[6] == [1, 2, 3], "and no further flush happens until the run ends"
     assert _durable_steps(logfile) == [1, 2, 3, 4, 5, 6], "close() drains the remainder"
+
+
+@pytest.mark.parametrize("template,side", [("{query} {passage} </s>", "right"), ("{query} {passage}", "left")])
+def test_reranker_export_restrictions_only_apply_when_requested(template, side):
+    from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
+
+    tokenizer = SimpleNamespace(truncation_side=side, chat_template="original")
+    collator = CrossEncoderCollator(128, tokenizer=tokenizer, prompt_template=template)
+    _configure_sentence_transformer_export(SimpleNamespace(), collator, export_reranker=False)
+    assert tokenizer.chat_template == "original"
+    with pytest.raises(ValueError, match="Text reranker export requires"):
+        _configure_sentence_transformer_export(SimpleNamespace(), collator, export_reranker=True)

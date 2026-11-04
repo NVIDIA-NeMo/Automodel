@@ -1,0 +1,174 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# To run this recipe, please use the following command:
+# python examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml
+# Or with torchrun for multi-GPU:
+# torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/ministral3_3b_instruct.yaml
+
+
+recipe: TrainBiEncoderRecipe
+
+seed: 42
+
+temperature: 0.02
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 2
+  ckpt_every_steps: 1000
+  val_every_steps: 500
+  num_epochs: 1
+  log_remote_every_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 15
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_1B
+  trust_remote_code: true
+  pooling: avg
+  l2_normalize: true
+  use_liger_kernel: true
+  use_sdpa_patching: true
+  dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: true
+
+tokenizer:
+  _target_: nemo_automodel.components.models.ministral_bidirectional.processor.Mistral3BiEncoderProcessor.from_pretrained
+  pretrained_model_name_or_path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/nemotron_4_embed_vl/pixtral_nemotron_3_embed_1B
+  q_max_length: 512
+  p_max_length: 4096
+  query_prefix: "query:"
+  passage_prefix: "passage:"
+  pad_to_multiple_of: 8
+  image_longest_edge: 1284
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: bi_encoder
+  data_dir_list:
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/arxiv_qa_smolvlm_iteration1_mined_data_9949.json 
+      num_samples: 9949
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/tatdqa_smolvlm_iteration1_mined_data_13188.json 
+      num_samples: 13188
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/docvqa_smolvlm_iteration2_mined_data_39302.json 
+      num_samples: 39302
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/infovqa_smolvlm_iteration2_mined_data_10038.json 
+      num_samples: 10038
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/wiki-ss-nq_smolvlm-iteration1_only-iamge-for-mining_mined_data_only-iamge-for-mining_44002.json 
+      num_samples: 44002
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/docmatix_100k_smolvlm_iteration1_mined_data_100k.json 
+      num_samples: 100000
+    - path: /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/pdf_synthetic_mine_among_all_colpali_45718.json
+      num_samples: 45718
+  data_type: train
+  n_passages: 4
+  seed: 42
+  do_shuffle: true
+
+dataloader:
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.ProcessorMethodCollator
+    collator_fn_name: process_queries_documents_biencoder
+  shuffle: true
+  num_workers: 4
+
+# Optional: Uncomment to enable validation
+# validation_dataloader:
+#   _target_: torchdata.stateful_dataloader.StatefulDataLoader
+#   dataset:
+#     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+#     model_type: bi_encoder
+#     data_dir_list: training_datasets/validation.json
+#     data_type: eval
+#     n_passages: 5
+#     seed: 42
+#     do_shuffle: false
+#     max_train_samples: 1000
+#     train_data_select_offset: 0
+#   collate_fn:
+#     _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
+#     q_max_len: 512
+#     p_max_len: 512
+#     query_prefix: "query:"
+#     passage_prefix: "passage:"
+#     padding: longest
+#     pad_to_multiple_of: 8
+#   batch_size: 2
+#   shuffle: false
+#   num_workers: 0
+
+# LoRA/PEFT configuration
+# Uncomment and configure for LoRA/PEFT
+# peft:
+#   _target_: nemo_automodel.components._peft.lora.PeftConfig
+#   target_modules:
+#     - "*.q_proj"
+#     - "*.k_proj"
+#     - "*.v_proj"
+#     - "*.o_proj"
+#     - "*.gate_proj"
+#     - "*.up_proj"
+#     - "*.down_proj"
+#   exclude_modules: []
+#   match_all_linear: false
+#   dim: 16
+#   alpha: 32
+#   use_triton: false
+#
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 1.0e-4
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+
+lr_scheduler:
+  lr_warmup_steps: 0
+  lr_decay_style: linear
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/model_checkpoints/ministral3_1b_gabriel_stage_1_epoch_1
+  model_save_format: safetensors
+  save_consolidated: final
+  max_recent_checkpoints: 2
+  #restore_from: /lustre/fsw/portfolios/datascience/users/gmoreira/model_checkpoints/ministral3_3b_vl/ministral3_3b_fp8_ac_all_fsdp2_lr2e6-20260713/epoch_0_step_1856
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  activation_checkpointing: true
+  activation_checkpointing_scope: all
+  reshard_after_forward: false
+  enable_fsdp2_prefetch: false
+
+# Uncomment and configure for W&B logging
+wandb:
+  project: Inform-simlm-embedding
+  entity: nvidia-merlin
+  name: ministral3_1b_gabriel_stage_1_epoch_1
+  enable: true
+#   save_dir: <your_wandb_save_dir> 

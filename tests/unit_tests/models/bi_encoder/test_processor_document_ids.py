@@ -104,15 +104,16 @@ def test_records_without_ids_remain_supported():
     assert result["d_input_ids"].shape[0] == 4
 
 
-def test_inline_jsonl_loader_omits_absent_ids_before_processor_collation(tmp_path):
+def test_inline_jsonl_loader_preserves_generated_ids_through_processor_collation(tmp_path):
     source = tmp_path / "inline.jsonl"
     source.write_text(json.dumps({"query": "user need", "pos_doc": "positive", "neg_doc": ["negative"]}) + "\n")
     dataset = make_retrieval_dataset(data_dir_list=str(source), data_type="train", n_passages=2)
     feature = dataset[0]
-    assert feature["doc_id"] == ["", ""]
+    assert len(set(feature["doc_id"])) == 2
+    assert all(identifier.startswith("inline:") for identifier in feature["doc_id"])
 
     batch = ProcessorMethodCollator(processor(), "process_queries_documents_biencoder")([feature])
-    assert "passage_doc_ids" not in batch
+    assert batch["passage_doc_ids"].tolist() == [document_id_to_int64(value) for value in feature["doc_id"]]
     assert batch["d_input_ids"].shape[0] == 2
 
 

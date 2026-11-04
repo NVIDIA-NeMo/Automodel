@@ -24,7 +24,10 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe, _get_autocast_ctx
+from nemo_automodel.recipes.retrieval.train_bi_encoder import (
+    TrainBiEncoderRecipe,
+    _get_autocast_ctx,
+)
 from nemo_automodel.shared.import_utils import safe_import
 
 _, wandb = safe_import("wandb")
@@ -103,7 +106,7 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
 
         self.metric_logger_train.log(log_data)
 
-        msg = "step {} | epoch {} | loss {:.4f} | train_acc {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
+        msg = "step {} | epoch {} | loss {:.4f} | train_acc {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s | skipped_update {:.0f}".format(
             log_data.step,
             log_data.epoch,
             log_data.metrics["loss"],
@@ -112,6 +115,7 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
             log_data.metrics["lr"],
             log_data.metrics["mem"],
             log_data.metrics["time_per_step"],
+            log_data.metrics.get("skipped_update", 0.0),
         )
         logging.info(msg)
 
@@ -127,7 +131,23 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
         is_train: bool = True,
         modality_loss_buffers=None,
     ):
-        """Forward and backward pass for a single micro-batch."""
+        """Run the forward and optional backward pass for one microbatch.
+
+        Args:
+            idx: Microbatch index within the optimizer step.
+            batch: Mapping containing model-input token tensors of shape
+                [batch * passages, sequence], optional image tensors of shape
+                [batch * passages, images, channels, height, width], and labels
+                of shape [batch].
+            loss_buffer: List receiving detached scalar loss tensors of shape [].
+            num_batches: Number of microbatches in the optimizer step.
+            is_train: Whether to run backward and non-finite synchronization.
+            modality_loss_buffers: Unused compatibility argument inherited from the
+                bi-encoder recipe.
+
+        Returns:
+            Whether this microbatch caused the optimizer update to be skipped.
+        """
         batch = {
             k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
@@ -153,11 +173,24 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
             # forward apply model.temperature there; recipe validation rejects configurations
             # where both temperatures are non-unit.
             #
-            # Recipe-owned scaling and cross entropy use fp32. A backbone-owned
-            # temperature has already been applied in the backbone's score dtype;
-            # preserve that checkpoint behavior rather than scaling a second time.
+            # Up-cast to fp32 BEFORE the division. The backbone emits bf16 logits, and
+            # dividing by a small temperature magnifies them (10x at temperature=0.1),
+            # pushing them onto a coarse part of the bf16 grid -- at magnitude ~32 the
+            # spacing is 0.25, which distorts the softmax and every gradient through it.
+            # Staying in fp32 through cross_entropy costs nothing at this tensor size.
             outputs.logits = outputs.logits.view(-1, self.train_n_passages).float() / self.temperature
             loss = F.cross_entropy(outputs.logits, labels)
+
+            has_nonfinite_loss = loss is None or not bool(torch.isfinite(loss.detach()).all().item())
+            if is_train:
+                if has_nonfinite_loss:
+                    self._log_nonfinite_loss(idx, loss)
+                has_nonfinite_loss = self._has_nonfinite_across_dp(has_nonfinite_loss)
+                if has_nonfinite_loss:
+                    if loss is not None:
+                        loss_buffer.append(loss.clone().detach())
+                    self._acc_buffer.append(accuracy(outputs.logits, labels))
+                    return True
 
             loss_buffer.append(loss.clone().detach())
             self._acc_buffer.append(accuracy(outputs.logits, labels))
@@ -167,6 +200,7 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
                 # FSDP/DDP will handle averaging across DP ranks automatically
                 scaled_loss = loss / num_batches
                 scaled_loss.backward()
+        return False
 
     def _run_validation_epoch(self, val_dataloader):
         """Run validation for one epoch and compute loss, accuracy@1, and MRR."""
