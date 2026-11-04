@@ -50,14 +50,9 @@ model:
     experts: torch_mm
     dispatcher: hybridep
     rope_fusion: false
-    fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
     dispatcher_num_sms: 32
-    compile_situ: false
-    compile_norm: false
-    compile_router_weight: false
-    benchmark_static_routing: false
   revision: 6d0a0202956796543364d666ab19c6ad1a494ee1
   torch_dtype: bfloat16
   text_config:
@@ -91,8 +86,7 @@ distributed:
   reshard_after_forward: true
   defer_fsdp_grad_sync: false
 loss_fn:
-  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
-  impl: torch_compile
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA

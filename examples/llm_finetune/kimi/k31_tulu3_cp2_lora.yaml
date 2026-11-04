@@ -53,7 +53,6 @@ model:
     experts: torch_mm
     dispatcher: torch
     rope_fusion: false
-    fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
   revision: 6d0a0202956796543364d666ab19c6ad1a494ee1
