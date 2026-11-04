@@ -745,16 +745,44 @@ class ConfigNode:
         Set (or append) a value in the config using a dotted key.
 
         e.g. set_by_dotted("foo.bar.abc", 1) will ensure self.foo.bar.abc == 1
+
+        A numeric part indexes into an existing list, as in ``get``:
+        set_by_dotted("optimizer.betas.1", 0.98) replaces only that element.
         """
         parts = dotted_key.split(".")
         node = self
+        owner = self  # nearest ConfigNode, used to wrap values stored in lists
         # walk / create intermediate ConfigNodes
         for p in parts[:-1]:
-            if p not in node.__dict__ or not isinstance(node.__dict__[p], ConfigNode):
-                node.__dict__[p] = ConfigNode({})
-            node = node.__dict__[p]
+            if isinstance(node, list):
+                node = node[self._list_index(node, p, dotted_key)]
+            else:
+                if p not in node.__dict__ or not isinstance(node.__dict__[p], (ConfigNode, list)):
+                    node.__dict__[p] = ConfigNode({})
+                node = node.__dict__[p]
+            if isinstance(node, ConfigNode):
+                owner = node
+            elif not isinstance(node, list):
+                raise TypeError(
+                    f"Cannot set '{dotted_key}': '{p}' is a {type(node).__name__}, not a config node or list"
+                )
         # wrap the final leaf value
-        node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
+        if isinstance(node, list):
+            node[self._list_index(node, parts[-1], dotted_key)] = owner._wrap("", value)
+        else:
+            node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
+
+    @staticmethod
+    def _list_index(items: list[Any], part: str, dotted_key: str) -> int:
+        """Return the list position named by one dotted-key part, or raise."""
+        try:
+            idx = int(part)
+            items[idx]
+        except (ValueError, IndexError):
+            raise IndexError(
+                f"Cannot set '{dotted_key}': '{part}' is not a valid index into a list of length {len(items)}"
+            ) from None
+        return idx
 
     def _format(self, level: int = 0, *, use_orig_values: bool = True) -> str:
         """Return a string representation of the configuration node with indentation.
