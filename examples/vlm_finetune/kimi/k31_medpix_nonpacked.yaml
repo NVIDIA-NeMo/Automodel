@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-# Kimi K3.1 nonpacked MedPix training: FLA KDA and cuDNN sparse DSA, CP2.
+# Kimi K3.1 nonpacked MedPix training: FLA KDA and cuDNN sparse DSA, CP1.
 # BF16 parameters and AdamW moments; EP32 x PP8 on 64 four-GPU GB200 nodes.
 # Uses learned expert routing. Benchmark fake/static routing stays disabled.
 # FLA supports CP; the optional CP-incompatible fused KDA implementation is not used.
@@ -23,7 +23,7 @@
 recipe: FinetuneRecipeForVLM
 step_scheduler:
   global_batch_size: 256
-  local_batch_size: 16
+  local_batch_size: 8
   ckpt_every_steps: 100
   val_every_steps: 100
   max_steps: 100
@@ -66,7 +66,7 @@ checkpoint:
 distributed:
   strategy: fsdp2
   tp_size: 1
-  cp_size: 2
+  cp_size: 1
   pp_size: 8
   ep_size: 32
   sequence_parallel: false
@@ -77,7 +77,7 @@ distributed:
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    pp_batch_size: 16
+    pp_batch_size: 8
     pp_seq_len: 4096
     pp_recv_buffer_pool: true
   moe:
