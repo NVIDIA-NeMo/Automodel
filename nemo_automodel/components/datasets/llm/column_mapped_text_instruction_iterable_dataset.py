@@ -265,7 +265,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
 
     def __iter__(self) -> Iterator[Dict[str, List[int]]]:
         while True:
-            num_yielded = 0
+            yielded_any = False
             for row in self.dataset:
                 mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
                 # Skip rows missing required fields
@@ -277,12 +277,12 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
                     continue
                 if not _check_all_values_equal_length(tokenized):
                     continue
-                num_yielded += 1
+                yielded_any = True
                 yield tokenized
 
             if not self.repeat_on_exhaustion:
                 return
-            if num_yielded == 0:
+            if not yielded_any:
                 # Looping again would never produce a sample and training would hang silently.
                 raise ValueError(
                     "No valid samples were produced from a full pass over the dataset. Check that "
