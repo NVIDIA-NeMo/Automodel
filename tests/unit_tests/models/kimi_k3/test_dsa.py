@@ -15,6 +15,8 @@
 """Kimi K3.1 gated DSA: config, indexer selection and the sparse MLA paths."""
 
 import copy
+from datetime import timedelta
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -587,3 +589,154 @@ def test_flops_short_sequences_cost_dsa_layers_as_dense_mla():
 
     assert kimi_k3_flops(KimiK31Config(), seq_len=2048) == kimi_k3_flops(KimiK3Config(), seq_len=2048)
     assert kimi_k3_flops(KimiK31Config(), seq_len=2049) != kimi_k3_flops(KimiK3Config(), seq_len=2049)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("targeting", [{}, {"target_modules": ["*_proj"]}, {"match_all_linear": True}])
+def test_indexer_stays_frozen_after_peft_trainability_rebinding(targeting: dict[str, list[str] | bool]) -> None:
+    from nemo_automodel._transformers.infrastructure import _apply_trainability_policy
+    from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+    from nemo_automodel.shared.peft_config import PeftConfig
+
+    model = KimiK3ForCausalLM(_tiny_text_config(_tiny_dsa_config()), backend=_backend())
+    apply_lora_to_linear_modules(model, PeftConfig(dim=2, alpha=2, **targeting))
+    indexer = model.model.layers["1"].self_attn.indexer
+    assert any("lora_" in name for name, _ in indexer.named_parameters())
+
+    # Loading or sharding can replace Parameters and restore requires_grad=True.
+    indexer.wk.weight = torch.nn.Parameter(indexer.wk.weight.detach().clone())
+    for _ in range(2):
+        _apply_trainability_policy(model, peft_enabled=True, freeze_config=None, strict=True)
+        assert not any(parameter.requires_grad for parameter in indexer.parameters())
+        assert model.model.layers["1"].self_attn.q_b_proj.lora_A.weight.requires_grad
+
+
+@pytest.mark.cpu_only
+def test_indexer_freeze_overrides_explicit_unfreeze_on_wrapped_models() -> None:
+    from nemo_automodel._transformers.infrastructure import _apply_trainability_policy
+    from nemo_automodel.components.utils.model_utils import parse_freeze_config
+
+    model = KimiK3ForCausalLM(_tiny_text_config(_tiny_dsa_config()), backend=_backend())
+    wrapped = torch.nn.Sequential(model)
+    freeze_config = parse_freeze_config({"unfreeze_modules": [{"path": "0.model.layers.1.self_attn.indexer"}]})
+    _apply_trainability_policy(wrapped, peft_enabled=False, freeze_config=freeze_config, strict=True)
+    assert not any(parameter.requires_grad for parameter in model.model.layers["1"].self_attn.indexer.parameters())
+    assert model.model.layers["1"].self_attn.q_b_proj.weight.requires_grad
+
+
+@pytest.mark.cpu_only
+def test_indexer_lora_checkpoint_resume_matches_next_step(tmp_path: Path) -> None:
+    from nemo_automodel._transformers.infrastructure import _apply_trainability_policy
+    from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+    from nemo_automodel.shared.peft_config import PeftConfig
+
+    torch.manual_seed(11)
+    model = KimiK3ForCausalLM(_tiny_text_config(_tiny_dsa_config()), backend=_backend())
+    model.initialize_weights(buffer_device=torch.device("cpu"))
+    apply_lora_to_linear_modules(model, PeftConfig(dim=2, alpha=2))
+    _apply_trainability_policy(model, peft_enabled=True, freeze_config=None, strict=True)
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=0.01)
+    input_ids = torch.arange(1, 10).unsqueeze(0)
+    model(input_ids=input_ids).logits.square().mean().backward()
+    optimizer.step()
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict()}, checkpoint_path)
+
+    restored = copy.deepcopy(model)
+    checkpoint = torch.load(checkpoint_path, weights_only=True)
+    # assign=True models checkpoint loading that replaces the Parameter objects.
+    restored.load_state_dict(checkpoint["model"], assign=True)
+    _apply_trainability_policy(restored, peft_enabled=True, freeze_config=None, strict=True)
+    restored_optimizer = torch.optim.AdamW([p for p in restored.parameters() if p.requires_grad], lr=0.01)
+    restored_optimizer.load_state_dict(checkpoint["optimizer"])
+    for current_model, current_optimizer in ((model, optimizer), (restored, restored_optimizer)):
+        current_optimizer.zero_grad(set_to_none=True)
+        current_model(input_ids=input_ids).logits.square().mean().backward()
+        current_optimizer.step()
+        assert not any(p.requires_grad for p in current_model.model.layers["1"].self_attn.indexer.parameters())
+        assert set(current_optimizer.state) == {p for p in current_model.parameters() if p.requires_grad}
+    for (name, parameter), (restored_name, restored_parameter) in zip(
+        model.named_parameters(), restored.named_parameters()
+    ):
+        assert name == restored_name
+        torch.testing.assert_close(parameter, restored_parameter, rtol=0, atol=0)
+
+
+def _run_indexer_lora_ddp(rank: int, world_size: int, init_file: str) -> None:
+    import torch.distributed as dist
+
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+    from nemo_automodel.components.distributed import DDPConfig, MeshContext
+    from nemo_automodel.shared.peft_config import PeftConfig
+
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        torch.manual_seed(7)
+        model = KimiK3ForCausalLM(_tiny_text_config(_tiny_dsa_config()), backend=_backend())
+        model.initialize_weights(buffer_device=torch.device("cpu"))
+        # Compare DDP reductions with a single-process FP32 reference.
+        model.float()
+        model = apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=MeshContext(strategy_config=DDPConfig()),
+            peft_config=PeftConfig(dim=2, alpha=2, lora_dtype=torch.float32),
+        )
+        # A single-rank strategy can return the unwrapped model. Always exercise
+        # a real reducer, including its second-forward unused-parameter check.
+        if not isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            model = torch.nn.parallel.DistributedDataParallel(model)
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=0.01)
+        reference = copy.deepcopy(model.module)
+        reference_params = [parameter for parameter in reference.parameters() if parameter.requires_grad]
+        reference_optimizer = torch.optim.AdamW(reference_params, lr=0.01)
+        indexer_before = {
+            name: parameter.detach().clone() for name, parameter in model.named_parameters() if ".indexer." in name
+        }
+        before = [parameter.detach().clone() for parameter in trainable]
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            reference_optimizer.zero_grad(set_to_none=True)
+            input_ids = (torch.arange(9).unsqueeze(0) + rank + 1) % 64
+            loss = model(input_ids=input_ids).logits.square().mean()
+            loss.backward()
+            global_ids = (torch.arange(9).unsqueeze(0) + torch.arange(world_size).unsqueeze(1) + 1) % 64
+            reference(input_ids=global_ids).logits.square().mean().backward()
+            assert torch.isfinite(loss)
+            for name, parameter in model.named_parameters():
+                if ".indexer." in name:
+                    assert not parameter.requires_grad and parameter.grad is None
+                elif parameter.requires_grad:
+                    assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter, expected in zip(trainable, reference_params):
+                torch.testing.assert_close(parameter.grad, expected.grad, rtol=1e-4, atol=1e-7)
+            optimizer.step()
+            reference_optimizer.step()
+            for parameter, expected in zip(trainable, reference_params):
+                torch.testing.assert_close(parameter, expected, rtol=1e-4, atol=1e-7)
+        assert any(not torch.equal(old, new) for old, new in zip(before, trainable))
+        assert set(optimizer.state) == set(trainable)
+        for name, parameter in model.named_parameters():
+            if name in indexer_before:
+                torch.testing.assert_close(parameter, indexer_before[name], rtol=0, atol=0)
+        for parameter in trainable:
+            peers = [torch.empty_like(parameter) for _ in range(world_size)]
+            dist.all_gather(peers, parameter.detach())
+            for peer in peers:
+                torch.testing.assert_close(peer, parameter, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_indexer_lora_ddp_completes_two_optimizer_steps(tmp_path: Path, world_size: int) -> None:
+    torch.multiprocessing.spawn(
+        _run_indexer_lora_ddp, args=(world_size, str(tmp_path / "gloo_init")), nprocs=world_size, join=True
+    )

@@ -426,7 +426,9 @@ class KimiDSAIndexer(nn.Module):
     ``index_topk`` highest-scoring visible keys of every query. The selection is a hard top-k,
     so the language-model loss sends no gradient into the indexer: it runs without autograd
     and its parameters are frozen (``requires_grad=False``) at their checkpoint values, which
-    keeps DDP unused-parameter checks and optimizers from tracking them. Parameter names match the checkpoint
+    keeps DDP unused-parameter checks and optimizers from tracking them. The infrastructure
+    reapplies this freeze after PEFT injection and parameter replacement, including any adapters.
+    Parameter names match the checkpoint
     (``self_attn.indexer.{wq_b,wk,weights_proj,k_norm}``).
     """
 
@@ -519,6 +521,17 @@ class KimiDSAIndexer(nn.Module):
         for module in (self.wq_b, self.wk, self.weights_proj):
             nn.init.normal_(module.weight, mean=0.0, std=init_std)
         self.k_norm.reset_parameters()
+
+
+def freeze_kimi_k3_indexer_params(model: nn.Module) -> None:
+    """Keep discrete DSA indexers frozen after adapters or replacement parameters are installed.
+
+    Args:
+        model: Model, wrapper, or pipeline stage containing Kimi K3 DSA indexers.
+    """
+    for module in model.modules():
+        if isinstance(module, KimiDSAIndexer):
+            module.requires_grad_(False)
 
 
 class KimiMLAAttention(nn.Module):
