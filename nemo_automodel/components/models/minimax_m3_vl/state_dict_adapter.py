@@ -926,14 +926,17 @@ class MiniMaxM3DSparkStateDictAdapter(StateDictAdapter):
         """Rename released draft tensors to native names.
 
         Args:
-            hf_state_dict: Mapping from released names to tensors in their parameter
-                layout. An MXFP8 ``weight`` with its ``weight_scale_inv`` is decoded to
-                BF16. The mapping is consumed.
+            hf_state_dict: Mapping from released names to tensors. An MXFP8
+                ``<name>.weight`` is FP8 e4m3 with shape [output, input], paired with
+                ``<name>.weight_scale_inv``, uint8 E8M0 exponents with shape
+                [output, ceil(input / 32)]. Other tensors keep their parameter shape.
+                The mapping is consumed.
             device_mesh: Unused because the draft has no routed experts.
             **kwargs: Additional checkpoint protocol arguments.
 
         Returns:
-            Mapping from native names to tensors, with no scale entries.
+            Mapping from native names to tensors, with no scale entries. A decoded pair
+            is a new BF16 tensor with shape [output, input]; the rest are the same objects.
 
         Raises:
             ValueError: A scale has no matching weight, or an FP8 weight has no scale.

@@ -250,6 +250,53 @@ def test_setup_warm_starts_the_draft_and_keeps_the_target_embeddings(monkeypatch
         torch.testing.assert_close(state[key], saved[key], rtol=0, atol=0)
 
 
+def test_warm_start_reads_a_recipe_export_and_a_restored_checkpoint_replaces_it(
+    monkeypatch, tmp_path, served_model, caplog
+):
+    build_checkpointer = TrainDSparkRecipe._build_checkpointer
+    load_checkpoint = TrainDSparkRecipe.load_checkpoint
+    url, model = served_model
+    _patch_recipe_setup(monkeypatch, model.config)
+    monkeypatch.setattr(TrainDSparkRecipe, "_build_checkpointer", build_checkpointer)
+    monkeypatch.setattr(TrainDSparkRecipe, "load_checkpoint", load_checkpoint)
+
+    def recipe_in(name: str, **recipe_overrides) -> TrainDSparkRecipe:
+        cfg = _remote_cfg(tmp_path, remote_urls=[url], output_dir=str(tmp_path / name), **recipe_overrides)
+        cfg["checkpoint"] = _CfgNode(enabled=True)
+        recipe = TrainDSparkRecipe(cfg)
+        recipe.setup()
+        return recipe
+
+    def train_and_save(recipe: TrainDSparkRecipe) -> dict[str, torch.Tensor]:
+        with torch.no_grad():
+            for parameter in recipe.draft_model.layers.parameters():
+                parameter.add_(1.0)
+        recipe.runtime.global_step = 4
+        recipe.tokenizer = None  # the stub has nothing to save
+        recipe.save_checkpoint(epoch=1, step=4, is_final_checkpoint=True)
+        recipe.checkpointer.close()
+        return {key: value.detach().clone() for key, value in recipe.draft_model.state_dict().items()}
+
+    def assert_same_draft(recipe: TrainDSparkRecipe, expected: dict[str, torch.Tensor]) -> None:
+        state = recipe.draft_model.state_dict()
+        assert state.keys() == expected.keys()
+        for key, value in state.items():
+            torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
+
+    trained = train_and_save(recipe_in("first"))
+    consolidated = tmp_path / "first" / "checkpoints" / "epoch_1_step_4" / "model" / "consolidated"
+
+    warm_started = recipe_in("second", draft_weights_path=str(consolidated))
+    assert warm_started.runtime.global_step == 0
+    assert_same_draft(warm_started, trained)
+
+    trained_more = train_and_save(warm_started)
+    resumed = recipe_in("second", draft_weights_path=str(consolidated))
+    assert resumed.runtime.global_step == 4
+    assert_same_draft(resumed, trained_more)
+    assert "replaces the weights" in caplog.text
+
+
 def test_remote_setup_rejects_a_server_with_different_capture_layers(monkeypatch, tmp_path, served_model):
     url, model = served_model
     _patch_recipe_setup(monkeypatch, model.config)

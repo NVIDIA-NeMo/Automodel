@@ -96,7 +96,11 @@ moments, so its first steps move every weight by about the full LR. Set
 The key set must match the draft exactly, and an earlier run's `target_layer_ids` and
 `mask_token_id` must match this run's. With `freeze_embeddings: true` the embedding and
 LM head stay the target's, and any copies in the checkpoint are ignored. With
-`freeze_embeddings: false` they come from the checkpoint.
+`freeze_embeddings: false` they come from the checkpoint; the MiniMax M3.1 Flash and
+DeepSeek V4.1 Flash drafts require `true`.
+
+Every rank decodes the whole draft in host memory before it is sharded. For DeepSeek
+V4.1 Flash that is about 31 GB per rank in BF16.
 
 ## DeepSeek V4.1 Flash
 
