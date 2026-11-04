@@ -53,7 +53,8 @@ def chunk_vlm_media(
     Args:
         pixel_values: Image-major pixels [images, channels, height, width],
             padded patches [images, max_patches, features], or flat patches
-            [total_patches, features], or a list of [channels, height, width]
+            [total_patches, features] / [total_patches, channels, patch_h, patch_w],
+            or a list of [channels, height, width]
             tensors with possibly different image sizes.
         image_grid: Per-image metadata [images, coordinates]. For flat patches,
             the product of each grid gives the corresponding patch count.
@@ -71,7 +72,9 @@ def chunk_vlm_media(
     pixel_values_chunks: list[torch.Tensor | list[torch.Tensor]] = []
     image_grid_chunks: list[torch.Tensor] = []
 
-    if isinstance(pixel_values, list) or (pixel_values.ndim == 4 and n_images_per_sample is not None):
+    if isinstance(pixel_values, list) or (
+        pixel_values.ndim == 4 and pixel_values.shape[0] == n_images and n_images_per_sample is not None
+    ):
         # Complete images (possibly ragged), with explicit sample ownership.
         # Counts take precedence even when total images happens to equal batch
         # size: [0, 2] is not the same ownership as one image on each sample.
@@ -101,7 +104,7 @@ def chunk_vlm_media(
         # 4D full-image tensors and 3D padded-patch tensors are indexed by sample.
         pixel_values_chunks = list(pixel_values.chunk(n_microbatches, dim=0))
         image_grid_chunks = list(image_grid.chunk(n_microbatches, dim=0))
-    elif pixel_values.dim() in (3, 4) and n_images_per_sample is not None:
+    elif pixel_values.dim() in (3, 4) and pixel_values.shape[0] == n_images and n_images_per_sample is not None:
         # Image-major layouts: explicit ownership also covers zero-image documents.
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)
         # Match torch.chunk-style uneven splits so trailing samples are not dropped.
@@ -114,7 +117,7 @@ def chunk_vlm_media(
             pixel_values_chunks.append(pixel_values[img_start:img_end])
             image_grid_chunks.append(image_grid[img_start:img_end])
     elif n_images_per_sample is not None:
-        # General flat-patch layout: map samples -> media entries -> patches.
+        # Flat patches, including Kimi's 4D patches: map samples -> images -> patches.
         patch_counts = image_grid.prod(dim=1)
         cumsum_patches = torch.cumsum(patch_counts, dim=0)
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)

@@ -42,3 +42,17 @@ def test_four_dimensional_images_follow_unequal_counts():
     torch.testing.assert_close(chunks[1], pixels[1:])
     torch.testing.assert_close(size_chunks[0], sizes[:1])
     torch.testing.assert_close(size_chunks[1], sizes[1:])
+
+
+@pytest.mark.parametrize("counts,patch_cut,image_cut", [([1, 1], 4, 1), ([2, 0], 12, 2), ([0, 2], 0, 0)])
+def test_four_dimensional_flat_patches_follow_image_grids(counts: list[int], patch_cut: int, image_cut: int) -> None:
+    """Kimi image patches retain their channel/spatial axes when split for PP."""
+    pixels = torch.arange(12 * 3 * 14 * 14).reshape(12, 3, 14, 14)
+    grids = torch.tensor([[1, 2, 2], [1, 2, 4]])
+    chunks, grid_chunks = chunk_vlm_media(
+        pixels, grids, batch_size=2, n_microbatches=2, n_images_per_sample=torch.tensor(counts)
+    )
+    torch.testing.assert_close(chunks[0], pixels[:patch_cut])
+    torch.testing.assert_close(chunks[1], pixels[patch_cut:])
+    torch.testing.assert_close(grid_chunks[0], grids[:image_cut])
+    torch.testing.assert_close(grid_chunks[1], grids[image_cut:])
