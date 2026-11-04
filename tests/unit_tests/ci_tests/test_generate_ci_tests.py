@@ -104,6 +104,9 @@ def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():
 
     for config in Path("examples").rglob("*.yaml"):
         recipe = YAML(typ="safe").load(config) or {}
+        # Dataset-mixture YAML files are lists, not recipes with CI settings.
+        if not isinstance(recipe, dict):
+            continue
         robustness = (recipe.get("ci") or {}).get("checkpoint_robustness") or {}
         found = sorted(removed_keys & robustness.keys())
         if found:
