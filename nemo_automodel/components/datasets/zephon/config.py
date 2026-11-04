@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import re
 import tomllib
 from abc import abstractmethod
 from dataclasses import dataclass, field, fields, replace
@@ -252,8 +253,9 @@ class ZephonOptions:
     checkpoint: ZephonCheckpointOptions = field(default_factory=ZephonCheckpointOptions)
 
     def __post_init__(self) -> None:
-        if not self.sources or len({source.name for source in self.sources}) != len(self.sources):
-            raise ValueError("Zephon needs at least one source with unique names")
+        # A dataset config can supply its source through a native path field.
+        if len({source.name for source in self.sources}) != len(self.sources):
+            raise ValueError("Zephon source names must be unique")
 
 
 _Context = TypeVar("_Context", bound=StreamBuildContext)
@@ -266,6 +268,14 @@ class ZephonStreamDatasetConfig(StreamDatasetConfig[_Context, _Result], Generic[
 
     zephon: ZephonOptions = field(default_factory=ZephonOptions)
     output_format: BatchOutputFormat = "batched"
+    path_or_dataset_id: str | list[str] | None = None
+    """Single local dataset root or HF dataset ID, as on native instruction configs."""
+    paths: str | Path | list[str] | None = None
+    """Single dataset root; native blends and Megatron binary inputs require explicit migration."""
+    split: str | None = None
+    """Named HF split when path_or_dataset_id is a bare HF ID; defaults to train."""
+    name: str | None = None
+    """HF subset/configuration when path_or_dataset_id is a bare HF ID."""
 
     options_type: ClassVar[type[ZephonOptions]] = ZephonOptions
     # Keep initialization and calibration outside rank-first ordering.
@@ -277,8 +287,93 @@ class ZephonStreamDatasetConfig(StreamDatasetConfig[_Context, _Result], Generic[
             object.__setattr__(self, "zephon", zephon_options_from_values(self.zephon, options_type=self.options_type))
         elif not isinstance(self.zephon, self.options_type):
             raise TypeError(f"zephon must be {self.options_type.__name__} or a settings mapping")
+        native_source = self._native_source()
+        if native_source is not None:
+            object.__setattr__(self, "zephon", replace(self.zephon, sources=(native_source,)))
+            # Keep only the canonical declaration, including across dataclasses.replace().
+            object.__setattr__(self, "path_or_dataset_id", None)
+            object.__setattr__(self, "paths", None)
+            object.__setattr__(self, "split", None)
+            object.__setattr__(self, "name", None)
+        if not self.zephon.sources:
+            raise ValueError("Zephon needs sources: set path_or_dataset_id, paths or zephon.sources")
         if self.output_format not in ("batched", "thd"):
             raise ValueError("output_format must be batched or thd")
+
+    def _native_source(self) -> ZephonSource | None:
+        """Normalize supported native source fields without changing source selection.
+
+        Native multi-file concatenation and unweighted Megatron blends do not
+        mean equal-weight Zephon mixtures. Individual files likewise cannot be
+        replaced with their parent directories without selecting extra data.
+        """
+        if self.path_or_dataset_id is not None and self.paths is not None:
+            raise ValueError("Choose only one source declaration: path_or_dataset_id, paths or zephon.sources")
+        value = self.path_or_dataset_id if self.path_or_dataset_id is not None else self.paths
+        if value is None:
+            if self.split is not None or self.name is not None:
+                raise ValueError("split and name require path_or_dataset_id with a bare HF dataset ID")
+            return None
+        if self.zephon.sources:
+            raise ValueError(
+                "Choose only one source declaration: path_or_dataset_id, paths or zephon.sources (including TOML)"
+            )
+        # The native instruction loader recognizes bare HF IDs only for scalar strings.
+        bare_hf_id = (
+            self.path_or_dataset_id is not None
+            and isinstance(value, str)
+            and re.fullmatch(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", value) is not None
+            and not Path(value).exists()
+        )
+        if bare_hf_id:
+            split = self.split if self.split is not None else "train"
+            for field_name, selection in (("split", split), ("name", self.name)):
+                if selection is not None and (
+                    not isinstance(selection, str) or re.fullmatch(r"[a-zA-Z0-9_.-]+", selection) is None
+                ):
+                    raise ValueError(
+                        f"Zephon requires a simple named HF {field_name}; split slicing and ratios are unsupported"
+                    )
+            subset = f"{self.name}/" if self.name is not None else ""
+            return ZephonSource(name="source_0", path=f"hf://{value}/{subset}{split}")
+        if self.name is not None or self.split not in (None, "train"):
+            raise ValueError(
+                "split and name can select only a bare HF dataset ID; use an explicit source URI otherwise"
+            )
+        if isinstance(value, list):
+            if not value:
+                raise ValueError("Zephon source paths must not be empty")
+            if len(value) != 1:
+                raise ValueError(
+                    "Native path lists and weighted blends are not translated into equal-weight Zephon mixtures; "
+                    "configure zephon.sources with explicit weights and source.token_estimation instead"
+                )
+            value = value[0]
+        if not isinstance(value, (str, Path)) or not str(value).strip():
+            raise ValueError("Zephon source must be one nonempty path; split-specific blend mappings are unsupported")
+        path = str(value)
+        if any(marker in path for marker in ("*", "?", "[", "]")):
+            raise ValueError("Zephon source paths require a dataset root, not a file glob or split expression")
+        local = "://" not in path
+        local_directory = local and Path(path).is_dir()
+        suffix = Path(path).suffix.lower()
+        if not local_directory and (
+            suffix in (".bin", ".idx") or local and (Path(path + ".bin").is_file() or Path(path + ".idx").is_file())
+        ):
+            raise ValueError(
+                "Zephon cannot read Megatron .bin/.idx datasets; export documents to a Zephon-readable format"
+            )
+        if not local_directory and (
+            suffix in (".json", ".jsonl", ".parquet", ".arrow")
+            or local
+            and Path(path).is_file()
+            and suffix != ".manifest"
+        ):
+            raise ValueError(
+                "Zephon source paths require a dataset root, not an individual file or a blend JSON file; "
+                "use a directory containing exactly the intended shards (its parent is not selected automatically)"
+            )
+        return ZephonSource(name="source_0", path=path)
 
     # Delivery carries document metadata, including for offline-packed input.
     is_packed: ClassVar[bool] = True
