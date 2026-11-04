@@ -114,3 +114,5 @@ ci:
     hf_device_map_auto: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
+  perf_testing:
+    schedule: nightly
