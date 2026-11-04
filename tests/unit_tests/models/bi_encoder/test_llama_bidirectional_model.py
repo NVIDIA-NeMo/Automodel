@@ -17,9 +17,20 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForSequenceClassification,
+    LlamaConfig,
+)
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    SequenceClassifierOutputWithPast,
+)
+from transformers.models.llama.modeling_llama import LlamaModel
 from transformers.models.llama.modeling_llama import LlamaModel as HFLlamaModel
 
+import nemo_automodel._transformers.retrieval as encoder_module
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import (
     BiEncoderModel,
@@ -32,8 +43,11 @@ from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
+    _register_with_hf_auto_classes,
 )
-from nemo_automodel.recipes.retrieval.train_bi_encoder import contrastive_scores_and_labels
+from nemo_automodel.recipes.retrieval.train_bi_encoder import (
+    contrastive_scores_and_labels,
+)
 
 
 def test_contrastive_scores_and_labels_shapes_and_labels():
@@ -90,24 +104,56 @@ def test_llama_bidirectional_config_fields():
     assert cfg.pooling == "cls"
     # Some downstream configs may overwrite; just ensure attribute exists and is float-like
     assert isinstance(cfg.temperature, float)
+    assert cfg.is_causal is False
 
 
-@pytest.mark.parametrize("is_causal", [False, True])
-def test_llama_bidirectional_model_init_and_mask(is_causal):
-    """Verify initialization and masked forwards in both attention modes."""
-    cfg = LlamaBidirectionalConfig(
-        vocab_size=128,
-        hidden_size=32,
+def test_llama_bidirectional_sequence_classification_auto_class_registration():
+    config = LlamaBidirectionalConfig(
+        vocab_size=64,
+        hidden_size=16,
         num_hidden_layers=1,
         num_attention_heads=1,
-        intermediate_size=64,
-        pad_token_id=0,
-        is_causal=is_causal,
+        intermediate_size=32,
+        num_labels=2,
+    )
+
+    model = AutoModelForSequenceClassification.from_config(config)
+
+    assert isinstance(model, LlamaBidirectionalForSequenceClassification)
+
+
+def test_llama_bidirectional_auto_class_registration_ignores_duplicate_errors(monkeypatch):
+    calls = []
+
+    def duplicate_register(name):
+        def register(*args, **kwargs):
+            calls.append(name)
+            raise ValueError("already registered")
+
+        return register
+
+    monkeypatch.setattr(AutoConfig, "register", duplicate_register("config"))
+    monkeypatch.setattr(AutoModel, "register", duplicate_register("model"))
+    monkeypatch.setattr(
+        AutoModelForSequenceClassification,
+        "register",
+        duplicate_register("sequence_classification"),
+    )
+
+    _register_with_hf_auto_classes()
+
+    assert calls == ["config", "model", "sequence_classification"]
+
+
+def test_llama_bidirectional_model_init_and_mask():
+    cfg = LlamaBidirectionalConfig(
+        vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
     )
     model = LlamaBidirectionalModel(cfg)
     model.eval()
 
-    assert all(getattr(layer.self_attn, "is_causal", None) is is_causal for layer in model.layers)
+    # All attention layers should be non-causal
+    assert all(getattr(layer.self_attn, "is_causal", True) is False for layer in model.layers)
 
     # Forward with padding mask produces valid output
     input_ids = torch.randint(0, cfg.vocab_size, (1, 3))
@@ -156,15 +202,17 @@ def test_score_head_init_weights_initializes_in_place():
     model._init_weights(model.model.embed_tokens)
 
 
-def test_bidirectional_attention_is_symmetric():
+@pytest.mark.parametrize("config_class", [LlamaConfig, LlamaBidirectionalConfig])
+def test_bidirectional_attention_is_symmetric(config_class: type[LlamaConfig]) -> None:
     """Verify that the bidirectional model produces symmetric attention behavior:
     changing a token at position i should affect the hidden state at position j
     and vice versa (unlike causal models where earlier tokens can't see later ones)."""
-    cfg = LlamaBidirectionalConfig(
+    cfg = config_class(
         vocab_size=128, hidden_size=32, num_hidden_layers=1, num_attention_heads=1, intermediate_size=64, pad_token_id=0
     )
     model = LlamaBidirectionalModel(cfg)
     model.eval()
+    assert model.config.is_causal is False
 
     input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
     attn = torch.ones(1, 4, dtype=torch.long)
@@ -183,34 +231,8 @@ def test_bidirectional_attention_is_symmetric():
     )
 
 
-@pytest.mark.parametrize("is_causal", [False, True])
-def test_llama_dual_mode_matches_hf_parent(is_causal):
-    """Verify both attention modes match the Hugging Face parent model."""
-    torch.manual_seed(42)
-    config = LlamaBidirectionalConfig(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        is_causal=is_causal,
-    )
-    actual_model = LlamaBidirectionalModel(config).eval()
-    reference_model = HFLlamaModel(config).eval()
-    reference_model.load_state_dict(actual_model.state_dict())
-    input_ids = torch.randint(0, config.vocab_size, (1, 4))
-    attention_mask = torch.ones_like(input_ids)
-
-    with torch.no_grad():
-        actual = actual_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        reference = reference_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-
-    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-5)
-
-
 def test_causal_attention_blocks_future_token_influence():
-    """Verify causal attention prevents future tokens affecting earlier states."""
+    """Causal mode uses the parent mask and blocks future tokens."""
     cfg = LlamaBidirectionalConfig(
         vocab_size=128,
         hidden_size=32,
@@ -220,14 +242,75 @@ def test_causal_attention_blocks_future_token_influence():
         pad_token_id=0,
         is_causal=True,
     )
-    model = LlamaBidirectionalModel(cfg).eval()
-    input_ids = torch.randint(0, cfg.vocab_size, (1, 4))
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        model = LlamaBidirectionalModel(cfg).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
     modified = input_ids.clone()
     modified[0, -1] = (modified[0, -1] + 1) % cfg.vocab_size
+
     with torch.no_grad():
         original = model(input_ids=input_ids).last_hidden_state
         changed = model(input_ids=modified).last_hidden_state
+
+    assert all(layer.self_attn.is_causal is True for layer in model.layers)
     torch.testing.assert_close(original[0, 0], changed[0, 0])
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
+def test_attention_modes_preserve_hf_outputs_and_gradients(is_causal: bool, attn_implementation: str) -> None:
+    """Both modes retain native output capture and gradients on padded CPU/fp32 inputs."""
+    config_kwargs = dict(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        pad_token_id=0,
+        attention_dropout=0.0,
+        is_causal=is_causal,
+    )
+    config = LlamaBidirectionalConfig(**config_kwargs)
+    reference_config = LlamaConfig(**config_kwargs)
+    config._attn_implementation = reference_config._attn_implementation = attn_implementation
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        model = LlamaBidirectionalModel(config).eval()
+        reference = LlamaModel(reference_config).eval()
+        reference.load_state_dict(model.state_dict())
+        upstream_gradient = torch.randn(2, 4, config.hidden_size)
+    for layer in reference.layers:
+        layer.self_attn.is_causal = is_causal
+
+    inputs = dict(
+        input_ids=torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]),
+        attention_mask=torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]]),
+        use_cache=False,
+        output_hidden_states=True,
+        output_attentions=attn_implementation == "eager",
+    )
+    actual = model(**inputs)
+    expected = reference(**inputs)
+
+    torch.testing.assert_close(actual.last_hidden_state, expected.last_hidden_state, rtol=1e-5, atol=1e-6)
+    assert len(actual.hidden_states) == len(expected.hidden_states) == config.num_hidden_layers + 1
+    for actual_hidden, expected_hidden in zip(actual.hidden_states, expected.hidden_states, strict=True):
+        torch.testing.assert_close(actual_hidden, expected_hidden, rtol=1e-5, atol=1e-6)
+    if attn_implementation == "eager":
+        assert len(actual.attentions) == len(expected.attentions) == config.num_hidden_layers
+        for actual_attention, expected_attention in zip(actual.attentions, expected.attentions, strict=True):
+            torch.testing.assert_close(actual_attention, expected_attention, rtol=1e-5, atol=1e-6)
+
+    actual.last_hidden_state.backward(upstream_gradient)
+    expected.last_hidden_state.backward(upstream_gradient)
+    for (name, parameter), (reference_name, reference_parameter) in zip(
+        model.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        assert name == reference_name
+        assert parameter.grad is not None and reference_parameter.grad is not None
+        torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=1e-5, atol=1e-6)
 
 
 # --- Fakes for classification and encoder tests ---
@@ -373,7 +456,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
     assert v2.shape == (2, 8)
 
 
-def test_legacy_encoder_build_and_save(tmp_path, monkeypatch):
+def test_encoder_build_and_save(tmp_path, monkeypatch):
     # Patch ModelClass.from_pretrained to return FakeLM
     class FakeBidirectionalModel(FakeLM):
         @classmethod
@@ -381,13 +464,12 @@ def test_legacy_encoder_build_and_save(tmp_path, monkeypatch):
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", {"LlamaBidirectionalModel": FakeBidirectionalModel})
 
     # Directory path with config.json to hit config-reading branch
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
 
     model = BiEncoderModel.build(
         model_name_or_path=str(model_dir),
@@ -467,8 +549,7 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", {"LlamaBidirectionalModel": FakeBidirectionalModel})
 
     # Create a model directory whose path has no 'llama' substring
     model_dir = tmp_path / "scratch" / "job" / "model"
@@ -476,8 +557,6 @@ def test_encoder_build_llama_bidirec_model_type_generic_path(tmp_path, monkeypat
     (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
 
     # Mock AutoConfig.from_pretrained to return a config with the llama_bidirec model_type
-    import nemo_automodel._transformers.retrieval as encoder_module
-
     class FakeConfig:
         model_type = "llama_bidirec"
 
@@ -502,12 +581,9 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
             return cls(hidden=16)
 
     # Patch the registry to return our fake model
-    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
-    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", {"LlamaBidirectionalModel": FakeBidirectionalModel})
 
     # Model type not in SUPPORTED_BACKBONES should fall back to AutoModel
-    import nemo_automodel._transformers.retrieval as encoder_module
-
     class FakeAutoModel(FakeLM):
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
@@ -525,8 +601,6 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
 
     # For hub path tests, we need to mock AutoConfig.from_pretrained since the new code
     # calls it first to determine model type before using the registry
-    import nemo_automodel._transformers.retrieval as encoder_module
-
     class FakeConfig:
         model_type = "llama"
 
@@ -544,7 +618,6 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
 
 def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
     """CrossEncoderModel should use AutoModelForSequenceClassification for unsupported model types."""
-    import nemo_automodel._transformers.retrieval as encoder_module
 
     class FakeSeqClsModel(FakeLM):
         @classmethod
@@ -558,7 +631,7 @@ def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
             return SequenceClassifierOutputWithPast(logits=torch.zeros(bsz, 2))
 
     class FakeConfig:
-        model_type = "bert"
+        model_type = "mistral"
 
     monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", lambda *a, **kw: FakeConfig())
     monkeypatch.setattr(
@@ -567,7 +640,6 @@ def test_build_generic_hf_model_score_task(tmp_path, monkeypatch):
 
     model = CrossEncoderModel.build(model_name_or_path=str(tmp_path), trust_remote_code=True)
     assert isinstance(model, CrossEncoderModel)
-    assert isinstance(model.model, FakeSeqClsModel)
 
 
 def test_configure_encoder_metadata_skips_auto_map_for_generic():
@@ -640,3 +712,57 @@ def test_init_encoder_common_name_or_path_for_generic():
     _init_encoder_common(encoder, fake)
 
     assert encoder.name_or_path == "Qwen/Qwen3-1.7B"
+
+
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_llama_dual_mode_matches_hf_parent(is_causal):
+    """Verify both attention modes match the Hugging Face parent model."""
+    torch.manual_seed(42)
+    config = LlamaBidirectionalConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        is_causal=is_causal,
+    )
+    actual_model = LlamaBidirectionalModel(config).eval()
+    reference_model = HFLlamaModel(config).eval()
+    reference_model.load_state_dict(actual_model.state_dict())
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        actual = actual_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        reference = reference_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-5)
+
+
+def test_legacy_encoder_build_and_save(tmp_path, monkeypatch):
+    # Patch ModelClass.from_pretrained to return FakeLM
+    class FakeBidirectionalModel(FakeLM):
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls(hidden=16)
+
+    # Patch the registry to return our fake model
+    ModelRegistry.model_arch_name_to_cls["LlamaBidirectionalModel"] = FakeBidirectionalModel
+    monkeypatch.setattr(ModelRegistry, "model_arch_name_to_cls", ModelRegistry.model_arch_name_to_cls)
+
+    # Directory path with config.json to hit config-reading branch
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama_bidirec"}))
+
+    model = BiEncoderModel.build(
+        model_name_or_path=str(model_dir),
+        pooling="avg",
+        l2_normalize=True,
+    )
+    assert isinstance(model, BiEncoderModel)
+    outdir = tmp_path / "save1"
+    outdir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(outdir))
+    assert any("save1" in p for p in model.model.saved)

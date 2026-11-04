@@ -46,9 +46,7 @@ class GroupedScoreKLLoss(nn.Module):
         if reference_temperature is not None and (
             not math.isfinite(reference_temperature) or reference_temperature <= 0
         ):
-            raise ValueError(
-                f"reference_temperature must be > 0 and finite when provided, got {reference_temperature}"
-            )
+            raise ValueError(f"reference_temperature must be > 0 and finite when provided, got {reference_temperature}")
         self.temperature = float(temperature)
         self.reference_temperature = None if reference_temperature is None else float(reference_temperature)
 

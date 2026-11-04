@@ -21,6 +21,7 @@ from torch import nn
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 
 
 def _make_stepped_adam_parts(
@@ -209,3 +210,133 @@ def test_native_pipeline_optimizer_state_dcp_round_trip_across_ranks(tmp_path):
         nprocs=world_size,
         join=True,
     )
+def _grouped_adamw_with_scheduler() -> tuple[nn.Module, torch.optim.AdamW, OptimizerParamScheduler]:
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [model[0].weight]},
+            {"params": [model[0].bias], "weight_decay": 0.0},
+            {"params": list(model[1].parameters()), "lr": 5e-3, "weight_decay": 0.0},
+        ],
+        lr=1e-3,
+        weight_decay=0.1,
+    )
+    scheduler = OptimizerParamScheduler(
+        optimizer,
+        init_lr=1e-3,
+        max_lr=1e-3,
+        min_lr=1e-3,
+        lr_warmup_steps=0,
+        lr_decay_steps=10,
+        lr_decay_style="constant",
+        start_wd=0.1,
+        end_wd=0.1,
+        wd_incr_steps=10,
+        wd_incr_style="constant",
+    )
+    return model, optimizer, scheduler
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["flattened", "native"])
+def test_optimizer_checkpoint_restores_group_mults(tmp_path, native):
+    model, optimizer, scheduler = _grouped_adamw_with_scheduler()
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    scheduler.step(1)
+    checkpointer = Checkpointer(
+        CheckpointingConfig(
+            checkpoint_dir=tmp_path, model_save_format="safetensors", save_consolidated=False, is_peft=native
+        ),
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+        moe_mesh=object() if native else None,
+    )
+    checkpointer.save_optimizer(optimizer, model, str(tmp_path), [scheduler])
+
+    resumed_model, resumed_optimizer, resumed_scheduler = _grouped_adamw_with_scheduler()
+    # A different head lr in the resumed run must not change the saved multiplier.
+    for group in resumed_optimizer.param_groups:
+        group["lr_mult"] = 1.0
+    checkpointer.load_optimizer(resumed_optimizer, resumed_model, str(tmp_path), [resumed_scheduler])
+
+    assert resumed_scheduler.num_steps == 1
+    assert [g["lr_mult"] for g in resumed_optimizer.param_groups] == pytest.approx([1.0, 1.0, 5.0])
+    assert [g["wd_mult"] for g in resumed_optimizer.param_groups] == pytest.approx([1.0, 0.0, 0.0])
+    assert [g["weight_decay"] for g in resumed_optimizer.param_groups] == pytest.approx([0.1, 0.0, 0.0])
+    assert [g["lr"] for g in resumed_optimizer.param_groups] == pytest.approx([1e-3, 1e-3, 5e-3])
+    _assert_adam_states_equal(resumed_optimizer, optimizer)
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["flattened", "native"])
+@pytest.mark.parametrize("keep_lr_mult", [False, True])
+def test_legacy_scheduler_checkpoint_preserves_next_update(tmp_path, native, keep_lr_mult):
+    model, optimizer, scheduler = _grouped_adamw_with_scheduler()
+    # Legacy schedulers did not insert multiplier keys. Explicit user multipliers
+    # were supported, and must survive independently of missing defaults.
+    for group in optimizer.param_groups:
+        if not keep_lr_mult:
+            group.pop("lr_mult")
+        group.pop("wd_mult")
+    scheduler.step(1)
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    checkpointer = Checkpointer(
+        CheckpointingConfig(
+            checkpoint_dir=tmp_path, model_save_format="safetensors", save_consolidated=False, is_peft=native
+        ),
+        dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=object() if native else None,
+    )
+    try:
+        checkpointer.save_optimizer(optimizer, model, str(tmp_path), [scheduler])
+        resumed_model, resumed_optimizer, resumed_scheduler = _grouped_adamw_with_scheduler()
+        resumed_model.load_state_dict(model.state_dict())
+        checkpointer.load_optimizer(resumed_optimizer, resumed_model, str(tmp_path), [resumed_scheduler])
+        assert [g["wd_mult"] for g in resumed_optimizer.param_groups] == [1.0, 1.0, 1.0]
+        assert [g["lr_mult"] for g in resumed_optimizer.param_groups] == (
+            [1.0, 1.0, 5.0] if keep_lr_mult else [1.0, 1.0, 1.0]
+        )
+        for m, o, s in ((model, optimizer, scheduler), (resumed_model, resumed_optimizer, resumed_scheduler)):
+            m(torch.tensor([[0.25, -0.5]])).square().sum().backward()
+            o.step()
+            s.step(1)
+        for expected, actual in zip(model.parameters(), resumed_model.parameters()):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert resumed_scheduler.num_steps == scheduler.num_steps
+        for expected, actual in zip(optimizer.param_groups, resumed_optimizer.param_groups):
+            assert actual["lr"] == expected["lr"]
+            assert actual["weight_decay"] == expected["weight_decay"]
+        for expected, actual in zip(optimizer.state.values(), resumed_optimizer.state.values()):
+            for key in expected:
+                torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+    finally:
+        checkpointer.close()
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["flattened", "native"])
+def test_legacy_multiplier_compatibility_keeps_missing_moments_strict(tmp_path, native):
+    from torch.distributed.checkpoint.api import CheckpointException
+
+    model, optimizer, scheduler = _grouped_adamw_with_scheduler()
+    for group in optimizer.param_groups:
+        group.pop("lr_mult")
+        group.pop("wd_mult")
+    state = OptimizerState(
+        model, optimizer, [scheduler], is_peft=native, has_expert_parallelism=native
+    ).state_dict()
+    if native:
+        del state["optim"]["state"][0]["exp_avg"]
+    else:
+        del state["optim"][next(key for key in state["optim"] if key.endswith(".exp_avg"))]
+    checkpointer = Checkpointer(
+        CheckpointingConfig(checkpoint_dir=tmp_path, save_consolidated=False, is_peft=native),
+        dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=object() if native else None,
+    )
+    try:
+        checkpointer._do_save(state, str(tmp_path / "optim"))
+        resumed_model, resumed_optimizer, resumed_scheduler = _grouped_adamw_with_scheduler()
+        with pytest.raises(CheckpointException, match="Missing key.*exp_avg"):
+            checkpointer.load_optimizer(resumed_optimizer, resumed_model, str(tmp_path), [resumed_scheduler])
+    finally:
+        checkpointer.close()

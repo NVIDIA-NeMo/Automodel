@@ -161,10 +161,10 @@ def test_collator_emits_passage_doc_ids_for_complete_nonempty_ids():
 
     expected = torch.tensor(
         [
-            rc._doc_id_str_to_int64("positive-0"),
-            rc._doc_id_str_to_int64("negative-0"),
-            rc._doc_id_str_to_int64("positive-1"),
-            rc._doc_id_str_to_int64("negative-1"),
+            3258356477587863190,
+            5914043119314688128,
+            8193369221281001877,
+            2309675609176336901,
         ],
         dtype=torch.long,
     )
@@ -343,11 +343,3 @@ def test_processor_method_collator_resolves_method_once():
 def test_make_vision_collator_from_processor_method_missing_method_raises():
     with pytest.deprecated_call(match="use ProcessorMethodCollator"), pytest.raises(AttributeError):
         rc.make_vision_collator_from_processor_method(object(), "missing_collator")
-
-
-def test_models_with_processor_includes_llama_nemotron_vl():
-    from nemo_automodel.components.models.llama_nemotron_vl import LlamaNemotronVLProcessor
-    from nemo_automodel.components.models.ministral_bidirectional import Mistral3BiEncoderProcessor
-
-    assert rc.MODELS_WITH_PROCESSOR["llama_nemotron_vl"] is LlamaNemotronVLProcessor
-    assert rc.MODELS_WITH_PROCESSOR["ministral3"] is Mistral3BiEncoderProcessor

@@ -43,6 +43,7 @@ EXCLUDED_RECIPE_PREFIXES = (
 
 EXCLUDED_RECIPE_FILES = {
     Path("examples/retrieval/data_utils/mining_config.yaml"),
+    Path("examples/retrieval/data_utils/mining_multimodal_config.yaml"),
     # Command-only configs: launched via
     # `python -m nemo_automodel.recipes.llm.precompute_dspark_dist -c <config>`
     # (torchrun for multi-node), so they have no recipe-class entry point by design.

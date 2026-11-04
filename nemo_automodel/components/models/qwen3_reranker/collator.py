@@ -25,7 +25,7 @@ model definition stay independently importable.
 """
 
 import hashlib
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any
 
 import torch
 from transformers import DataCollatorWithPadding
@@ -103,7 +103,7 @@ class Qwen3ContextAwareRerankerCollator(DataCollatorWithPadding):
     #
     # The base instruction is Qwen3-Reranker's own, verbatim, so a row with no context is
     # byte-identical to the out-of-the-box prompt.
-    DEFAULT_INSTRUCTIONS: Dict[frozenset, str] = {
+    DEFAULT_INSTRUCTIONS: dict[frozenset[str], str] = {
         frozenset(): ("Given a web search query, retrieve relevant passages that answer the query"),
         frozenset({"reasoning"}): (
             "Given a user generated web search query and the user's reasoning trace that "
@@ -124,7 +124,7 @@ class Qwen3ContextAwareRerankerCollator(DataCollatorWithPadding):
     }
 
     @staticmethod
-    def _normalize_instructions(raw: dict) -> Dict[frozenset, str]:
+    def _normalize_instructions(raw: dict[str | tuple[str, ...] | frozenset[str], str]) -> dict[frozenset[str], str]:
         """Normalize instruction keys to frozensets of field name strings.
 
         Accepts three key formats so callers can use whichever is most natural:
@@ -137,7 +137,7 @@ class Qwen3ContextAwareRerankerCollator(DataCollatorWithPadding):
               "reasoning"           → frozenset({"reasoning"})
               "global_query,reasoning" → frozenset({"global_query","reasoning"})
         """
-        result: Dict[frozenset, str] = {}
+        result: dict[frozenset[str], str] = {}
         for key, val in raw.items():
             if isinstance(key, frozenset):
                 result[key] = val
@@ -153,20 +153,20 @@ class Qwen3ContextAwareRerankerCollator(DataCollatorWithPadding):
     def __init__(
         self,
         rerank_max_length: int,
-        *args,
-        instructions: dict = None,
-        system_message: str = None,
+        *args: Any,
+        instructions: dict[str | tuple[str, ...] | frozenset[str], str] | None = None,
+        system_message: str | None = None,
         reasoning_drop_prob: float = 0.5,
         global_query_drop_prob: float = 0.5,
         drop_seed: int = 42,
-        global_query_max_length: int = None,
-        sub_query_max_length: int = None,
-        reasoning_max_length: int = None,
-        passage_max_length: int = None,
-        prefix_template: str = None,
-        suffix_template: str = None,
-        **kwargs,
-    ):
+        global_query_max_length: int | None = None,
+        sub_query_max_length: int | None = None,
+        reasoning_max_length: int | None = None,
+        passage_max_length: int | None = None,
+        prefix_template: str | None = None,
+        suffix_template: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         """
         Args:
             rerank_max_length: Maximum total token length (prefix + middle + suffix).
@@ -180,19 +180,19 @@ class Qwen3ContextAwareRerankerCollator(DataCollatorWithPadding):
                 prediction is the yes/no decision. Defaults to ``DEFAULT_SUFFIX_TEMPLATE``.
             instructions: Dict mapping present context field names to instruction strings.
                 Keys may be ``frozenset``, ``tuple``, or comma-separated ``str``
-                (YAML-friendly). Defaults to ``DEFAULT_INSTRUCTIONS``. Ignored when
-                ``instruction`` (singular) is set.
+                (YAML-friendly). Defaults to ``DEFAULT_INSTRUCTIONS``.
             system_message: Override the system prompt. Defaults to ``DEFAULT_SYSTEM``.
             reasoning_drop_prob: Probability of REMOVING a non-empty reasoning trace at
                 collation time (no placeholder is substituted). Drawn per query, not
                 per passage. Default 0.5. Set to 0.0 at eval/inference.
             global_query_drop_prob: Same, for the original question. Default 0.5.
             drop_seed: Seed for both draws; with the epoch it fixes the whole schedule.
+            *args: Positional arguments for Hugging Face DataCollatorWithPadding.
+            **kwargs: Keyword arguments for Hugging Face DataCollatorWithPadding.
         """
         self.rerank_max_length = rerank_max_length
-        # DataCollatorWithPadding does not accept an ``args`` kwarg; the retrieval
-        # collators accept and stash it for callers that pass a config object through.
-        self.args = kwargs.pop("args", None)
+        # Accept the legacy retrieval config argument without retaining unused state.
+        kwargs.pop("args", None)
         super().__init__(*args, **kwargs)
         # PER-ITEM caps, each applied to its own field BEFORE the prompt is assembled, so
         # every item is guaranteed its own share and no item can be starved by another.
@@ -294,7 +294,7 @@ class Qwen3ContextAwareRerankerCollator(DataCollatorWithPadding):
         u = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big") / 2.0**64
         return u >= prob
 
-    def _format_one(self, query: str, doc: str, reasoning: str = None, global_query: str = None) -> str:
+    def _format_one(self, query: str, doc: str, reasoning: str | None = None, global_query: str | None = None) -> str:
         """Build the user-turn text for a single (query, doc) pair.
 
         Order: decide which context fields survive the drop draws, cap each surviving
@@ -361,7 +361,7 @@ class Qwen3ContextAwareRerankerCollator(DataCollatorWithPadding):
         doc = self._truncate_tokens(doc, self.passage_max_length)
         return f"<Instruct>: {instruction}\n<Query>: {query_block}\n<Document>: {doc}"
 
-    def _truncate_tokens(self, text: str, limit: int = None) -> str:
+    def _truncate_tokens(self, text: str, limit: int | None = None) -> str:
         """Cut ``text`` to at most ``limit`` tokens. No-op when limit is None."""
         if not limit or not text:
             return text
@@ -370,7 +370,20 @@ class Qwen3ContextAwareRerankerCollator(DataCollatorWithPadding):
             return text
         return self.tokenizer.decode(ids[:limit])
 
-    def __call__(self, features: List[Dict[str, Any]]) -> "BatchEncoding":
+    def __call__(self, features: list[dict[str, Any]]) -> "BatchEncoding":
+        """Tokenize flattened query-document rows into a padded batch.
+
+        Args:
+            features: One mapping per pair with question and doc_text strings, optional
+                reasoning/global_query strings, and num_labels giving the number of queries.
+
+        Returns:
+            BatchEncoding with input_ids and attention_mask of shape
+            [pairs, sequence], where pairs is the flattened query-by-passage axis.
+            Their tensor or list format follows return_tensors. When num_labels is
+            supplied, labels is a PyTorch int64 tensor of shape [queries] selecting
+            the first (positive) passage in each group.
+        """
         query_examples = [x["question"] for x in features]
         doc_examples = [x["doc_text"] for x in features]
         reasoning_examples = [x.get("reasoning") for x in features]

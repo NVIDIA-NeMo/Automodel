@@ -181,14 +181,22 @@ def test_raw_scores_use_each_models_own_internal_temperature():
 # ---------------------------------------------------------------------------
 # Teacher isolation
 # ---------------------------------------------------------------------------
-def test_teacher_sees_the_same_batch_including_image_fields():
+@pytest.mark.parametrize("with_images", [False, True])
+def test_teacher_sees_same_inputs_with_teacher_only_dummy_vision(with_images):
+    """The frozen teacher keeps vision collectives active without altering student inputs."""
     recipe = _make_recipe()
+    batch = _make_batch()
+    if not with_images:
+        batch.pop("pixel_values")
 
-    _run_step(recipe, _make_batch())
+    _run_step(recipe, batch)
 
     student_batch = recipe.model_parts[0].seen_batches[0]
     teacher_batch = recipe.teacher_model.seen_batches[0]
-    assert set(student_batch) == set(teacher_batch) == {"features", "pixel_values"}
+    expected_inputs = {"features", "pixel_values"} if with_images else {"features"}
+    assert set(student_batch) == expected_inputs
+    assert set(teacher_batch) == expected_inputs | {"force_dummy_vision"}
+    assert teacher_batch["force_dummy_vision"] is True
     for key in student_batch:
         assert torch.equal(student_batch[key], teacher_batch[key])
 

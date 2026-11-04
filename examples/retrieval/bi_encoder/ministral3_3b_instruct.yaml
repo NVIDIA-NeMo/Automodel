@@ -41,6 +41,7 @@ model:
   trust_remote_code: true
   pooling: avg
   l2_normalize: true
+  is_causal: false
   use_liger_kernel: true
   use_sdpa_patching: true
   torch_dtype: bfloat16

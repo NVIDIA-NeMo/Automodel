@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import nemo_automodel._transformers.auto_model as am
+import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
 import nemo_automodel.recipes.retrieval.train_bi_encoder as tbe
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel, _dummy_vision_sum
 from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
@@ -258,6 +259,7 @@ def test_from_pretrained_defers_omitted_wrapper_options_to_saved_metadata(monkey
 
     assert last_kwargs["pooling"] is None
     assert last_kwargs["l2_normalize"] is None
+    assert last_kwargs["is_causal"] is None
 
 
 def _assert_retries_without_liger(monkeypatch, build_model_cls, auto_model_cls):
@@ -326,7 +328,8 @@ def test_from_pretrained_retries_without_sdpa(monkeypatch):
     _assert_retries_without_sdpa(monkeypatch, BiEncoderModel, am.NeMoAutoModelBiEncoder)
 
 
-def test_cross_encoder_from_pretrained(monkeypatch):
+@pytest.mark.parametrize("is_causal", [None, False, True], ids=["native", "bidirectional", "causal"])
+def test_cross_encoder_from_pretrained(monkeypatch, is_causal):
     calls = {"build": 0}
     last_kwargs = {}
 
@@ -345,14 +348,17 @@ def test_cross_encoder_from_pretrained(monkeypatch):
     monkeypatch.setattr(am, "_patch_attention", lambda m, _: m)
     monkeypatch.setattr(am, "apply_model_infrastructure", fake_apply_infrastructure)
 
-    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model", is_causal=True)
+    policy_kwargs = {} if is_causal is None else {"is_causal": is_causal}
+    model = am.NeMoAutoModelCrossEncoder.from_pretrained("mock-model", attn_implementation="eager", **policy_kwargs)
     assert isinstance(model, DummyModel)
     assert calls["build"] == 1
     # CrossEncoder build should NOT receive pooling or l2_normalize
     assert "pooling" not in last_kwargs
     assert "l2_normalize" not in last_kwargs
-    assert last_kwargs["is_causal"] is True
+    assert last_kwargs["is_causal"] is is_causal
     assert last_kwargs["model_name_or_path"] == "mock-model"
+    assert last_kwargs["attn_implementation"] == "eager"
+    assert last_kwargs["is_causal"] is is_causal
 
 
 @pytest.mark.parametrize("freeze_score_head", [False, True])
@@ -628,8 +634,6 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     detach_distributed_inbatch_negatives,
 ):
     """Exercise the trainer branch that gathers token embeddings across ranks."""
-    import nemo_automodel.components.models.common.inbatch_neg_utils as inbatch_neg_utils
-
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
@@ -644,6 +648,20 @@ def test_forward_backward_step_supports_distributed_multi_vector_inbatch_negativ
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def fake_all_reduce(ranks_with_ids: torch.Tensor, op=torch.distributed.ReduceOp.SUM, group=None) -> None:
+        """Simulate the ID-presence sum when both fixture ranks supply document IDs.
+
+        Args:
+            ranks_with_ids: Scalar tensor of shape [], updated in place with the sum across two ranks.
+        """
+        if op == torch.distributed.ReduceOp.MAX:
+            assert ranks_with_ids.item() == 0
+        else:
+            assert ranks_with_ids.item() == 1
+            ranks_with_ids.mul_(2)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
     gather_with_padding_calls = []
 

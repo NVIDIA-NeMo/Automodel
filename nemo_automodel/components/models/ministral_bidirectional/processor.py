@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import os
 from enum import IntEnum
 from io import BytesIO
@@ -28,12 +30,53 @@ from PIL import Image
 from tokenizers.normalizers import Replace, Sequence
 from transformers import BatchEncoding, PixtralProcessor
 from transformers.tokenization_utils_tokenizers import TokenizersBackend
+from transformers.utils import cached_file
 
 _CONTROL_TOKEN_ESCAPE = "\u200c"
 _CONTROL_TOKEN_ESCAPE_POLICY = "mistral_retrieval_zwnj_prefix_v1"
 _CONTROL_TOKEN_PREFIXES = ("[", "<")
 
-_MISTRAL_RETRIEVAL_CHAT_TEMPLATE = """
+_MISTRAL_RETRIEVAL_CHAT_TEMPLATE = r"""
+{%- if messages | length == 2 and messages[0]['role'] == 'query' and messages[1]['role'] == 'document' -%}
+{# Render the checkpoint's query/document training format without BOS/EOS. #}
+{%- macro text_content(content) -%}
+  {%- if content is string -%}
+    {{- content | replace('[', '[\u200c') | replace('<', '<\u200c') -}}
+  {%- else -%}
+    {%- set ns = namespace(first=true) -%}
+    {%- for block in content -%}
+      {%- if block['type'] == 'text' -%}
+        {%- if not ns.first -%}{{- '\n\n' -}}{%- endif -%}
+        {{- block['text'] | replace('[', '[\u200c') | replace('<', '<\u200c') -}}
+        {%- set ns.first = false -%}
+      {%- elif block['type'] not in ['image', 'image_url'] -%}
+        {{- raise_exception('Only text and image documents are supported') -}}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- set ns = namespace(images=0) -%}
+{%- if messages[0]['content'] is not string -%}
+  {%- for block in messages[0]['content'] -%}
+    {%- if block['type'] != 'text' -%}{{- raise_exception('Queries must be text') -}}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- if messages[1]['content'] is not string -%}
+  {%- for block in messages[1]['content'] -%}
+    {%- if block['type'] in ['image', 'image_url'] -%}{%- set ns.images = ns.images + 1 -%}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- if ns.images > 1 -%}{{- raise_exception('At most one image per document is supported') -}}{%- endif -%}
+{%- set rendered -%}
+  {%- if ns.images -%}{{- '[IMG] ' -}}{%- endif -%}
+  {%- if use_prompt_template | default(true) -%}{{- 'query: ' -}}{%- endif -%}
+  {{- text_content(messages[0]['content']) -}}
+  {{- '\n\npassage: ' if use_prompt_template | default(true) else '\n' -}}
+  {{- text_content(messages[1]['content']) -}}
+{%- endset -%}
+{{- rendered | trim if ns.images else rendered -}}
+
+{%- else -%}
 {# nemo-mistral-retrieval-v1
    Derived from the Mistral Ministral-3 instruct chat template render_content
    macro and its image-before-text canonicalization. Retrieval adaptation:
@@ -50,7 +93,7 @@ _MISTRAL_RETRIEVAL_CHAT_TEMPLATE = """
     {%- set ns = namespace(has_output=false) -%}
     {%- for block in content -%}
         {%- if block["type"] == "text" -%}
-            {%- if ns.has_output %}{{ "\\n\\n" }}{% endif -%}
+            {%- if ns.has_output %}{{ "\n\n" }}{% endif -%}
             {{- block["text"] -}}
             {%- set ns.has_output = true -%}
         {%- else -%}
@@ -86,16 +129,21 @@ _MISTRAL_RETRIEVAL_CHAT_TEMPLATE = """
     {{- raise_exception("User content must be a string or a list of text and image blocks") -}}
 {%- endif -%}
 {%- endmacro -%}
-{%- if messages | length == 1 and messages[0]["role"] == "user" -%}
-    {{- render_user_content(messages[0]["content"]) -}}
-{%- elif messages | length == 2
-    and messages[0]["role"] == "system"
-    and messages[1]["role"] == "user" -%}
-    {{- render_text_content(messages[0]["content"], "System content") -}}
-    {{- " " -}}
-    {{- render_user_content(messages[1]["content"]) -}}
-{%- else -%}
+{%- if not ((messages | length == 1 and messages[0]["role"] == "user")
+    or (messages | length == 2
+        and messages[0]["role"] == "system"
+        and messages[1]["role"] == "user")) -%}
     {{- raise_exception("Retrieval inputs require one user message with an optional leading system prefix") -}}
+{%- endif -%}
+{# Iterate messages so vLLM can trace message.content into the rendering macros. #}
+{%- for message in messages -%}
+    {%- if message["role"] == "system" -%}
+        {%- set prefix = render_text_content(message["content"], "System content") -%}
+        {{- prefix.rstrip(" ") ~ " " -}}
+    {%- else -%}
+        {{- render_user_content(message["content"]) -}}
+    {%- endif -%}
+{%- endfor -%}
 {%- endif -%}
 """.strip()
 
@@ -117,7 +165,7 @@ def _apply_mistral_retrieval_ownership_policy(tokenizer: TokenizersBackend) -> s
 
 
 class PassageModality(IntEnum):
-    """Identify whether a retrieval passage contains text, an image, or both."""
+    """Document modality encoded in a multimodal retrieval batch."""
 
     TEXT_ONLY = 0
     IMAGE_ONLY = 1
@@ -125,11 +173,24 @@ class PassageModality(IntEnum):
 
 
 def load_image(image: Any) -> Image.Image:
-    """Load an image from a PIL object, local path, base64 string, or bytes."""
+    """Load one retrieval image without fetching remote content.
+
+    Args:
+        image: PIL image, local path, or a mapping containing ``disk_path``,
+            ``base64``, or ``bytes``. Encoded payloads require the mapping form.
+
+    Returns:
+        The decoded PIL image.
+
+    Raises:
+        ValueError: If the input is unsupported or contains a remote URL.
+    """
     if isinstance(image, Image.Image):
         return image
-    if isinstance(image, str) and os.path.exists(image):
-        return Image.open(image)
+    if isinstance(image, str):
+        if os.path.exists(image):
+            return Image.open(image)
+        raise FileNotFoundError(f"Retrieval image does not exist: {image}")
     if isinstance(image, dict):
         if "disk_path" in image:
             return Image.open(image["disk_path"])
@@ -139,7 +200,7 @@ def load_image(image: Any) -> Image.Image:
             raise ValueError("Remote image URLs are not supported; use disk_path, base64, or bytes.")
         if "bytes" in image:
             return Image.open(BytesIO(image["bytes"]))
-    raise ValueError(f"Invalid image: {image}")
+    raise ValueError(f"Invalid image type: {type(image).__name__}")
 
 
 class Mistral3BiEncoderProcessor(PixtralProcessor):
@@ -149,12 +210,58 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
     its tokenizer treats raw control markers as processor-owned, while its chat
     template marks externally supplied text for ordinary tokenization. Direct
     retrieval query/document helpers apply the same text marker because they do
-    not render the chat template. Saving defaults to the stock Pixtral class for
-    portable bi-encoder checkpoints; cross-encoder recipes preserve this class
-    because their evaluation path requires its custom batching helper.
+    not render the chat template. Training helpers and the retrieval template
+    normalize trailing ASCII spaces in query/document prefixes and add one separator
+    before content. This class always installs its built-in retrieval template,
+    including when loading a checkpoint, so training and export share that policy.
+    Custom saved templates are not preserved by this training processor.
+
+    Saving defaults to the stock Pixtral class for portable bi-encoder checkpoints;
+    cross-encoder recipes preserve this class because their evaluation path requires
+    its custom batching helper.
     """
 
     _export_as_stock_processor = True
+
+    @classmethod
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str | os.PathLike, **kwargs: Any
+    ) -> "Mistral3BiEncoderProcessor":
+        """Restore saved retrieval prompts unless explicitly overridden.
+
+        Args:
+            pretrained_model_name_or_path: Local checkpoint or Hugging Face model identifier.
+            **kwargs: Standard processor loading arguments and explicit runtime overrides.
+
+        Returns:
+            Processor with Sentence Transformers query/document prompts and saved image settings.
+
+        Raises:
+            ValueError: If saved retrieval prompt metadata is malformed or a prompt-policy override conflicts with
+                the saved retrieval chat template.
+        """
+        metadata_path = cached_file(
+            pretrained_model_name_or_path,
+            "config_sentence_transformers.json",
+            **{
+                key: kwargs[key]
+                for key in ("cache_dir", "revision", "token", "local_files_only", "subfolder")
+                if key in kwargs
+            },
+            _raise_exceptions_for_missing_entries=False,
+        )
+        if metadata_path is not None:
+            with open(metadata_path) as stream:
+                metadata = json.load(stream)
+            if not isinstance(metadata, dict) or not isinstance(metadata.get("prompts", {}), dict):
+                raise ValueError("config_sentence_transformers.json must contain a prompts mapping")
+            for argument, prompt_name in (("query_prefix", "query"), ("passage_prefix", "document")):
+                prompt = metadata.get("prompts", {}).get(prompt_name)
+                if prompt is not None and not isinstance(prompt, str):
+                    raise ValueError(f"Sentence Transformers {prompt_name} prompt must be a string")
+                if argument not in kwargs and prompt is not None:
+                    kwargs[argument] = prompt
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
 
     def check_argument_for_proper_class(
         self,
@@ -252,18 +359,46 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             image_end_token=image_end_token,
             **kwargs,
         )
-        self.chat_template = _apply_mistral_retrieval_ownership_policy(self.tokenizer)
+        default_chat_template = _apply_mistral_retrieval_ownership_policy(self.tokenizer)
+        # Validate saved reranker settings before installing the current template.
+        # Training helpers and exported inference must use the same prefix policy.
+        if chat_template is not None and "{# nemo-mistral-retrieval-v1" in chat_template:
+            saved_prompt_setting = chat_template.split("\n", 1)[0]
+            if (
+                saved_prompt_setting
+                in (
+                    "{%- set use_prompt_template = false -%}",
+                    "{%- set use_prompt_template = true -%}",
+                )
+                and saved_prompt_setting != f"{{%- set use_prompt_template = {str(use_prompt_template).lower()} -%}}"
+            ):
+                raise ValueError("use_prompt_template conflicts with the saved retrieval chat template")
+        prompt_setting = "true" if use_prompt_template else "false"
+        self.chat_template = "{%- set use_prompt_template = " + prompt_setting + " -%}\n" + default_chat_template
+        self.tokenizer.chat_template = self.chat_template
         self.q_max_length = q_max_length if q_max_length is not None else q_max_len
         self.p_max_length = p_max_length if p_max_length is not None else p_max_len
         self.rerank_max_length = rerank_max_length
         self.pad_to_multiple_of = pad_to_multiple_of
-        self.query_prefix = query_prefix
-        self.passage_prefix = passage_prefix
+        # Training helpers and the chat template own one separator after each prefix.
+        self.query_prefix = query_prefix.rstrip(" ")
+        self.passage_prefix = passage_prefix.rstrip(" ")
         self.padding = padding
         if image_longest_edge is not None:
             self.image_longest_edge = image_longest_edge
         self.use_prompt_template = use_prompt_template
         self.export_as_stock_processor = export_as_stock_processor
+        self._sync_reranker_defaults()
+
+    def _sync_reranker_defaults(self) -> None:
+        """Keep standard processor defaults independent of the training truncation limit."""
+        if not self.export_as_stock_processor:
+            self.tokenizer.init_kwargs.update(
+                padding=self.padding,
+                truncation=True,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+            )
+            self.tokenizer.init_kwargs.pop("max_length", None)
 
     @property
     def image_longest_edge(self) -> int | None:
@@ -282,7 +417,22 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         truncation: bool = True,
         **kwargs: Any,
     ) -> BatchEncoding:
-        """Process query strings into tokenized model inputs."""
+        """Process query strings into tokenized model inputs.
+
+        Args:
+            queries: Query texts for a batch of size ``batch``.
+            return_tensors: Output format, ``"pt"`` or ``"np"``.
+            padding: Padding strategy for tokenization.
+            truncation: Whether to truncate query tokens.
+            **kwargs: Extra keyword arguments forwarded to ``PixtralProcessor``.
+
+        Returns:
+            A mapping with integer ``input_ids`` and ``attention_mask`` of shape
+            [batch, query_sequence], padded according to ``padding``. Values are
+            PyTorch tensors or NumPy arrays according to ``return_tensors``.
+            Unpadded ragged NumPy token fields are object arrays of shape [batch],
+            containing one token array per query; PyTorch requires rectangular batches.
+        """
         if return_tensors not in ("pt", "np"):
             raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
 
@@ -320,8 +470,14 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             **kwargs: Extra keyword arguments forwarded to ``PixtralProcessor``.
 
         Returns:
-            A dictionary with token fields and, when images are present,
-            ``pixel_values`` and ``image_sizes``.
+            A mapping with integer ``input_ids`` and ``attention_mask`` of shape
+            [documents, document_sequence]. Image inputs add channels-first
+            ``pixel_values`` of shape [images, channels, height, width] and
+            ``image_sizes`` of shape [images, 2], storing height then width before
+            batch padding. Both image fields are None for text-only batches.
+            Values are PyTorch tensors or NumPy arrays according to ``return_tensors``.
+            Unpadded ragged NumPy token fields are object arrays of shape [documents],
+            containing one token array per document; PyTorch requires rectangular batches.
         """
         if return_tensors not in ("pt", "np"):
             raise ValueError(f"Invalid return_tensors: {return_tensors!r}. Must be 'pt' or 'np'.")
@@ -360,7 +516,65 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         return_tensors: Literal["pt", "np"] = "pt",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Process grouped retrieval examples into the bi-encoder batch format."""
+        """Process grouped retrieval examples into the bi-encoder batch format.
+
+        Args:
+            features: Query examples with aligned ``doc_text`` and ``doc_image``
+                candidate lists. Optional ``doc_id`` lists must contain one
+                string per candidate. An all-empty list means IDs are absent;
+                populated IDs must be present for every candidate in the batch.
+                Distributed callers must use the same ID policy on every rank.
+            return_tensors: Output format, ``"pt"`` or ``"np"``.
+            **kwargs: Extra keyword arguments forwarded to the query and document processors.
+
+        Returns:
+            A mapping with ``q_input_ids`` and ``q_attention_mask`` of shape
+            [batch, query_sequence], and ``d_input_ids`` and ``d_attention_mask``
+            of shape [documents, document_sequence]. Documents are flattened in
+            query order, retaining each query's candidate order. ``d_pixel_values``
+            has shape [images, channels, height, width] and ``d_image_sizes`` has
+            shape [images, 2] in height-width order; both are None without images.
+            Integer ``passage_modality`` has shape [documents] and zero ``labels``
+            has shape [batch]. Values use the requested PyTorch or NumPy backend.
+            Unpadded ragged NumPy token fields are object arrays of shape [batch]
+            or [documents], containing per-example token arrays; PyTorch requires rectangular batches.
+            When supplied, ``passage_doc_ids``
+            is an int64 array of shape [documents] in that same order, outside
+            the q_/d_ model-input namespaces, for duplicate-positive masking.
+
+        Raises:
+            ValueError: Supplied document IDs are partially populated or misaligned.
+        """
+        passage_doc_ids = None
+        if any("doc_id" in feature for feature in features):
+            id_groups = []
+            for feature in features:
+                if "doc_id" not in feature:
+                    id_groups.append(None)
+                    continue
+                ids = feature.get("doc_id")
+                if (
+                    not isinstance(ids, (list, tuple))
+                    or len(ids) != len(feature["doc_text"])
+                    or len(ids) != len(feature["doc_image"])
+                    or not all(isinstance(doc_id, str) for doc_id in ids)
+                    or (any(ids) and not all(ids))
+                ):
+                    raise ValueError(
+                        "doc_id must contain one aligned string per candidate, either all empty or all nonempty"
+                    )
+                id_groups.append(ids if all(ids) else None)
+            if any(ids is not None for ids in id_groups):
+                passage_doc_ids = []
+                # Keep this stdlib encoding inline so exported processors need
+                # no AutoModel installation. Tests lock parity with the shared
+                # text-collator encoding in shared/retrieval_ids.py.
+                for ids in id_groups:
+                    if ids is None:
+                        raise ValueError("doc_id must use the same present or absent ID policy in every example")
+                    for doc_id in ids:
+                        digest = hashlib.md5(doc_id.encode("utf-8")).digest()[:8]
+                        passage_doc_ids.append(int.from_bytes(digest, "little", signed=False) & ((1 << 63) - 1))
         queries = []
         pos_neg_text_batch = []
         pos_neg_image_batch = []
@@ -388,8 +602,12 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         merged_batch_dict = self.merge_batch_dict(query_batch_dict, doc_batch_dict)
         if return_tensors == "pt":
             merged_batch_dict["passage_modality"] = torch.tensor(doc_modalities, dtype=torch.long)
+            if passage_doc_ids is not None:
+                merged_batch_dict["passage_doc_ids"] = torch.tensor(passage_doc_ids, dtype=torch.long)
         elif return_tensors == "np":
             merged_batch_dict["passage_modality"] = np.asarray(doc_modalities, dtype=np.int64)
+            if passage_doc_ids is not None:
+                merged_batch_dict["passage_doc_ids"] = np.asarray(passage_doc_ids, dtype=np.int64)
         return self.add_dummy_labels(queries, merged_batch_dict, return_tensors=return_tensors)
 
     def prompt_template_question_passage(self, question: str, text: str) -> str:
@@ -426,8 +644,14 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
             **kwargs: Extra keyword arguments forwarded to ``PixtralProcessor``.
 
         Returns:
-            A dictionary containing model inputs and a ``labels`` tensor of shape
-            [query_groups] when ``num_labels`` is present.
+            A mapping with integer ``input_ids`` and ``attention_mask`` of shape
+            [pairs, sequence], retaining flattened query-document pair order.
+            ``pixel_values`` has shape [images, channels, height, width] and
+            ``image_sizes`` has shape [images, 2] in height-width order; both are
+            None without images. Zero integer ``labels`` has shape [query_groups]
+            when ``num_labels`` is present. Values use the requested PyTorch or NumPy backend.
+            Unpadded ragged NumPy token fields are object arrays of shape [pairs],
+            containing one token array per pair; PyTorch requires rectangular batches.
         """
 
         if return_tensors not in ("pt", "np"):
@@ -474,7 +698,23 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         return batch
 
     def merge_batch_dict(self, query_batch_dict: dict[str, Any], doc_batch_dict: dict[str, Any]) -> dict[str, Any]:
-        """Prefix and merge query/document processor outputs."""
+        """Prefix and merge query and document processor outputs.
+
+        Args:
+            query_batch_dict: Query mapping, typically containing ``input_ids``
+                and ``attention_mask`` of shape [batch, query_sequence]. Tensor
+                or NumPy values of arbitrary rank and non-array values are accepted.
+            doc_batch_dict: Document mapping, typically containing ``input_ids``
+                and ``attention_mask`` of shape [documents, document_sequence],
+                ``pixel_values`` of shape [images, channels, height, width], and
+                ``image_sizes`` of shape [images, 2] in height-width order. Image
+                fields may be None; other arbitrary-rank values are also accepted.
+
+        Returns:
+            One mapping with query keys prefixed by ``q_`` and document keys by ``d_``.
+            Values retain their original shapes, dtypes and devices, and alias the
+            input values without copying. Neither input mapping is mutated.
+        """
         merged_batch_dict = {}
         for key, value in query_batch_dict.items():
             merged_batch_dict[f"q_{key}"] = value
@@ -518,6 +758,27 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         images: list[Image.Image] | None = None,
         **kwargs: Any,
     ) -> BatchEncoding:
+        """Tokenize text and optional images with the retrieval length policy.
+
+        Args:
+            text: Text strings in batch order.
+            max_length: Maximum sequence length when truncation is enabled.
+            return_tensors: Output backend, ``"pt"`` or ``"np"``.
+            padding: Padding strategy, or None to use the processor default.
+            truncation: Whether to truncate text tokens.
+            images: Optional PIL images aligned with image placeholders in ``text``.
+            **kwargs: Additional arguments forwarded to ``PixtralProcessor``.
+
+        Returns:
+            Mapping with integer ``input_ids`` and ``attention_mask`` of shape
+            [batch, sequence]. Image batches also contain ``pixel_values`` of shape
+            [images, channels, height, width] and ``image_sizes`` of shape [images, 2]
+            in height-width order. Values use the requested PyTorch or NumPy backend.
+            Image fields are absent without images. Unpadded ragged NumPy token fields
+            are object arrays of shape [batch] containing per-example token arrays;
+            PyTorch requires rectangular batches. Additional requested tokenizer outputs
+            follow the Pixtral/Transformers-defined layouts.
+        """
         if padding is None:
             padding = self.padding
         if truncation and max_length is None:
@@ -598,6 +859,8 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
                 push_to_hub=push_to_hub,
                 **kwargs,
             )
+        self._sync_reranker_defaults()
+        type(self).register_for_auto_class("AutoProcessor")
         return PixtralProcessor.save_pretrained(self, save_directory, push_to_hub=push_to_hub, **kwargs)
 
     @staticmethod
@@ -618,10 +881,3 @@ class Mistral3BiEncoderProcessor(PixtralProcessor):
         for prefix in _CONTROL_TOKEN_PREFIXES:
             text = text.replace(prefix, f"{prefix}{_CONTROL_TOKEN_ESCAPE}")
         return text
-
-
-def _register_with_hf_auto_classes() -> None:
-    Mistral3BiEncoderProcessor.register_for_auto_class("AutoProcessor")
-
-
-_register_with_hf_auto_classes()

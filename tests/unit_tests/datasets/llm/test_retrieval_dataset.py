@@ -964,7 +964,13 @@ def test_load_datasets_inline_jsonl(tmp_path):
     row0 = dataset[0]
     assert row0["question"] == "Explain transformers"
     assert row0["corpus_id"] == rdi.INLINE_CORPUS_ID
-    assert row0["pos_doc"][0]["id"] == ""
+    positive_id = row0["pos_doc"][0]["id"]
+    assert positive_id.startswith("inline:")
+    assert len({positive_id, *(doc["id"] for doc in row0["neg_doc"])}) == 3
+    # IDs describe documents, so reloading in a different query order preserves them.
+    f.write_text("\n".join(json.dumps(record) for record in reversed(records)))
+    reordered, _ = rdi.load_datasets(str(f))
+    assert reordered[1]["pos_doc"][0]["id"] == positive_id
     assert row0["pos_doc"][0]["text"].startswith("Transformers are")
     assert [d["text"] for d in row0["neg_doc"]] == ["RNNs are...", "CNNs are..."]
 

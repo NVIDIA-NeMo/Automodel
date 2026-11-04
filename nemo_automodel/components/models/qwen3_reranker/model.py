@@ -49,17 +49,40 @@ downstream consumers use it:
 The model is auto-discovered by ``ModelRegistry`` via the ``ModelClass`` export.
 """
 
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Optional
+from os import PathLike
+from typing import Any
 
 import torch
 import torch.nn.functional as F
+from transformers import PretrainedConfig
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.utils import can_return_tuple, logging
 
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_tie_word_embeddings_flip,
+    reject_unsupported_tie_word_embeddings,
+)
+
 logger = logging.get_logger(__name__)
+
+
+def _validate_reranker_options(
+    *, num_labels: int | None = None, pooling: str | None = None, temperature: float | None = None
+) -> None:
+    """Reject classifier options that cannot describe a single raw yes/no score."""
+    if num_labels not in (None, 1):
+        raise ValueError("Qwen3 causal reranking returns one score per pair; num_labels must be 1.")
+    if pooling is not None:
+        raise ValueError("Qwen3 causal reranking scores the final prompt token; pooling is not supported.")
+    if temperature is not None:
+        raise ValueError(
+            "Qwen3 causal reranking returns raw scores; set temperature on the training recipe, not model."
+        )
 
 
 class Qwen3RerankerConfig(Qwen3Config):
@@ -77,13 +100,16 @@ class Qwen3RerankerConfig(Qwen3Config):
 
     def __init__(
         self,
-        yes_token_id: Optional[int] = None,
-        no_token_id: Optional[int] = None,
-        **kwargs,
+        yes_token_id: int | None = None,
+        no_token_id: int | None = None,
+        **kwargs: Any,
     ) -> None:
         self.yes_token_id = yes_token_id
         self.no_token_id = no_token_id
+        num_labels = kwargs.pop("num_labels", None)
         super().__init__(**kwargs)
+        # A causal checkpoint's default label map does not describe reranker outputs.
+        self.num_labels = 1 if num_labels is None else num_labels
 
     def to_dict(self) -> dict:
         """Serialize as a plain ``Qwen3ForCausalLM`` config.
@@ -187,6 +213,28 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
     """
 
     config_class = Qwen3RerankerConfig
+    # The published Qwen3-Reranker checkpoints set tie_word_embeddings=True, and the class
+    # reuses the backbone's lm_head rather than adding a head of its own, so both the tied
+    # and untied layouts load. Declared explicitly because the registry requires every
+    # lm_head-bearing class to state its support rather than defaulting silently.
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
+    # Declared rather than inherited so the alias this class relies on is stated where the
+    # policy is: scoring reads the yes/no rows of lm_head, so which tensor lm_head.weight
+    # aliases is load-bearing here, not incidental.
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    def __init__(self, config: Qwen3RerankerConfig) -> None:
+        _validate_reranker_options(
+            num_labels=config.num_labels,
+            pooling=getattr(config, "pooling", None),
+            temperature=getattr(config, "temperature", None),
+        )
+        # Before super().__init__, on the original config, so an unsupported tie_word_embeddings
+        # fails at construction rather than after the weights have loaded. BOTH accepts either
+        # setting, so this never fires for this class today -- it is here so that narrowing the
+        # policy later cannot silently produce a model with a randomly-initialised head.
+        reject_unsupported_tie_word_embeddings(type(self), config)
+        super().__init__(config)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -198,41 +246,122 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         supports_ep: bool = False
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+    def supports_config(cls, config: PretrainedConfig) -> bool:
+        """Use causal reranking only for checkpoints declaring a compatible LM head."""
+        return bool(set(config.architectures or ()) & {"Qwen3ForCausalLM", cls.__name__})
+
+    @classmethod
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str | PathLike[str] | None, *args: Any, **kwargs: Any
+    ) -> "Qwen3RerankerForCausalReranking":
         """Load weights and resolve the "yes"/"no" token ids if not already set.
 
         Explicit ``yes_token_id``/``no_token_id`` (e.g. from the recipe YAML or a
         saved config) take precedence; otherwise they are resolved from the
         tokenizer of ``pretrained_model_name_or_path``.
+
+        In-memory loads use ``config.name_or_path`` to locate the tokenizer.
+        A checkpoint's saved embedding ties cannot be overridden in either direction.
         """
-        model = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-        # Use getattr so this works whether model.config is Qwen3RerankerConfig
-        # (fresh base model) or a plain Qwen3Config with yes/no ids stored as
-        # extra attributes (checkpoint saved with the vLLM-compatible format).
-        if getattr(model.config, "yes_token_id", None) is None or getattr(model.config, "no_token_id", None) is None:
+        _validate_reranker_options(
+            num_labels=kwargs.pop("num_labels", None),
+            pooling=kwargs.pop("pooling", None),
+            temperature=kwargs.pop("temperature", None),
+        )
+        hub_kwargs = {
+            key: kwargs[key]
+            for key in ("cache_dir", "force_download", "local_files_only", "token", "revision", "subfolder")
+            if key in kwargs
+        }
+        trust_remote_code = kwargs.get("trust_remote_code", False)
+        checkpoint_config = None
+        if pretrained_model_name_or_path is not None:
+            checkpoint_config = cls.config_class.from_pretrained(pretrained_model_name_or_path, **hub_kwargs)
+
+        config = kwargs.pop("config", None)
+        if isinstance(config, PretrainedConfig):
+            config = deepcopy(config)
+            if not isinstance(config, cls.config_class):
+                attn_implementation = config._attn_implementation
+                config = cls.config_class.from_dict(config.to_dict())
+                config._attn_implementation = attn_implementation
+        else:
+            config, kwargs = cls.config_class.from_pretrained(
+                config or pretrained_model_name_or_path, return_unused_kwargs=True, **kwargs
+            )
+        for name in ("tie_word_embeddings", "yes_token_id", "no_token_id"):
+            if name in kwargs:
+                setattr(config, name, kwargs.pop(name))
+        if checkpoint_config is not None:
+            reject_tie_word_embeddings_flip(checkpoint_config, config, cls.__name__)
+
+        if getattr(config, "yes_token_id", None) is None or getattr(config, "no_token_id", None) is None:
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-            if getattr(model.config, "yes_token_id", None) is None:
-                model.config.yes_token_id = tokenizer.convert_tokens_to_ids("yes")
-            if getattr(model.config, "no_token_id", None) is None:
-                model.config.no_token_id = tokenizer.convert_tokens_to_ids("no")
-            logger.info(
-                f"Resolved reranker tokens: yes_token_id={model.config.yes_token_id}, "
-                f"no_token_id={model.config.no_token_id}"
+            tokenizer_source = pretrained_model_name_or_path or config.name_or_path
+            if not tokenizer_source:
+                raise ValueError("Set yes_token_id/no_token_id or config.name_or_path for in-memory reranker loading.")
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_source, trust_remote_code=trust_remote_code, **hub_kwargs
             )
-        return model
+            if getattr(config, "yes_token_id", None) is None:
+                config.yes_token_id = tokenizer.convert_tokens_to_ids("yes")
+            if getattr(config, "no_token_id", None) is None:
+                config.no_token_id = tokenizer.convert_tokens_to_ids("no")
+            logger.info(
+                "Resolved reranker tokens: yes_token_id=%s, no_token_id=%s", config.yes_token_id, config.no_token_id
+            )
+        # Config loading consumes Hub options that the weight loader still needs.
+        kwargs.update(hub_kwargs)
+        return super().from_pretrained(pretrained_model_name_or_path, *args, config=config, **kwargs)
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        """Alias ``lm_head`` to the input embeddings when the config asks for it.
+
+        Declared model-locally rather than inherited: transformers v5 does not reliably tie a
+        custom model from the dict-shaped ``_tied_weights_keys`` alone, so the config flag is
+        honoured explicitly (mirroring ``Qwen2ForCausalLM``). This matters here because
+        scoring reads the yes/no rows of ``lm_head``; if the tie silently failed to apply, the
+        head would drift from the embeddings it is supposed to share and the published
+        checkpoint's scores would not reproduce.
+        """
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     @can_return_tuple
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        **kwargs,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        **kwargs: Any,
     ) -> SequenceClassifierOutputWithPast:
+        """Score each query-document pair at its last attended token.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence]; omit when inputs_embeds is given.
+            attention_mask: Tensor of shape [batch, sequence], with 1 for attended tokens
+                and 0 for padding. Left or right padding is supported; every row must
+                attend to at least one token.
+            position_ids: Optional tensor of shape [batch, sequence].
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
+            labels: Optional tensor of shape [batch] containing binary relevance classes
+                (0 for no, 1 for yes), not next-token IDs. The training recipe instead
+                computes its own loss over each query's candidate passages.
+            **kwargs: Hugging Face decoder options. Per-position vocabulary logits and
+                generation through this training class are unsupported.
+
+        Returns:
+            SequenceClassifierOutputWithPast with logits of shape [batch, 1], holding
+            logit(yes) - logit(no) in the LM head's output dtype. With labels, loss is a
+            float32 scalar. When requested, hidden_states contains tensors of shape
+            [batch, sequence, hidden], and attentions contains tensors of shape
+            [batch, heads, sequence, key_sequence]. past_key_values is the decoder's
+            Hugging Face cache, whose keys and values have shape
+            [batch, key_value_heads, cached_sequence, head_dim] per layer.
+        """
         if attention_mask is None:
             raise ValueError("attention_mask is required to locate the final token for yes/no scoring")
         if getattr(self.config, "yes_token_id", None) is None or getattr(self.config, "no_token_id", None) is None:

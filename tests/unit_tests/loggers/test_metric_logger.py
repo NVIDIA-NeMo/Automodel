@@ -166,3 +166,55 @@ def test_metric_logger_dist_nonzero_noop(tmp_path, monkeypatch):
     else:
         # If file was not created, that's also acceptable
         assert True
+
+
+def test_flush_method_is_callable_and_not_shadowed_by_the_flag(tmp_path):
+    """The ``flush=`` constructor flag and the ``flush()`` method must coexist.
+
+    Storing the flag as ``self.flush`` replaced the method with a bool on every instance,
+    so the first caller -- the recipe, at its first checkpoint -- got
+    ``TypeError: 'bool' object is not callable``.
+    """
+    logger = MetricLogger(str(tmp_path / "metrics.jsonl"), flush=True, append=False)
+    try:
+        assert callable(logger.flush)
+    finally:
+        logger.close()
+
+
+def test_flush_persists_buffered_records_without_closing(tmp_path):
+    """flush() is what lets a caller align durability with an external event.
+
+    buffer_size is far larger than the number of records, so nothing reaches the file on
+    record count alone; only the explicit flush can put them there, and the file must stay
+    open for further writes afterwards.
+    """
+    logfile = tmp_path / "metrics.jsonl"
+    logger = MetricLogger(str(logfile), append=False, buffer_size=1000)
+    try:
+        logger.log(metric_logger_mod.MetricsSample(step=1, epoch=0, metrics={"loss": 1.0}))
+        logger.log(metric_logger_mod.MetricsSample(step=2, epoch=0, metrics={"loss": 2.0}))
+        assert _read_jsonl(logfile) == [], "buffer_size not reached, so nothing is durable yet"
+
+        logger.flush()
+        rows = _read_jsonl(logfile)
+        assert [r["step"] for r in rows] == [1, 2]
+
+        # still usable: the flush drained the buffer, it did not close the file
+        logger.log(metric_logger_mod.MetricsSample(step=3, epoch=0, metrics={"loss": 3.0}))
+        logger.flush()
+        assert [r["step"] for r in _read_jsonl(logfile)] == [1, 2, 3]
+    finally:
+        logger.close()
+
+
+def test_flush_on_an_empty_buffer_is_a_no_op(tmp_path):
+    """The recipe flushes at every checkpoint, including ones with nothing buffered."""
+    logfile = tmp_path / "metrics.jsonl"
+    logger = MetricLogger(str(logfile), append=False, buffer_size=1000)
+    try:
+        logger.flush()
+        logger.flush()
+        assert logfile.read_text() == ""
+    finally:
+        logger.close()

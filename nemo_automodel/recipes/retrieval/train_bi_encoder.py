@@ -27,7 +27,9 @@ import torch.nn.functional as F
 from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components.checkpoint.config import SaveConsolidatedMode
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.llm.retrieval_collator import CrossEncoderCollator
 from nemo_automodel.components.datasets.llm.retrieval_types import PASSAGE_MODALITY_NAMES
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -84,9 +86,13 @@ def _unwrap_model_for_attrs(model):
     return getattr(model, "module", model)
 
 
-def _configure_sentence_transformer_export(model, collate_fn) -> None:
-    """Bind the training collator's exact static prompts to bi-encoder export metadata."""
+def _configure_sentence_transformer_export(model, collate_fn, *, tokenizer=None, export_reranker: bool = True) -> None:
+    """Bind static prompts and validate export against the runtime tokenizer or processor."""
     model = _unwrap_model_for_attrs(model)
+    if isinstance(collate_fn, CrossEncoderCollator):
+        if export_reranker:
+            collate_fn.configure_tokenizer_for_export()
+        return
     configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
     if configure_prompts is None:
         return
@@ -112,12 +118,10 @@ def _configure_sentence_transformer_export(model, collate_fn) -> None:
                     "does not expose static query_prefix and passage_prefix metadata."
                 )
             return
-        export_config = getattr(model, "sentence_transformer_export_config", None)
-        prompt_separator = "" if getattr(export_config, "input_mode", "text") == "structured_multimodal" else " "
-        query_prompt = f"{collate_fn.query_prefix}{prompt_separator}" if collate_fn.query_prefix else ""
-        document_prompt = f"{collate_fn.passage_prefix}{prompt_separator}" if collate_fn.passage_prefix else ""
+        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
+        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
 
-    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
+    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt, tokenizer=tokenizer)
 
 
 def _get_autocast_ctx(distributed_config):
@@ -298,10 +302,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self.temperature = self.cfg.get("temperature", 1.0)
 
-    def _validate_model(self, model: torch.nn.Module) -> None:
-        """Validate the constructed model before building dependent components."""
-        del model
-
     def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
         """Build optimizer parameter groups for trainable model parameters."""
         model = self.model_parts[0]
@@ -438,7 +438,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 )
 
         self.dataloader = materialize_loader(dataloader_config)
-        _configure_sentence_transformer_export(self.model_parts[0], self.dataloader.collate_fn)
+        _configure_sentence_transformer_export(
+            self.model_parts[0],
+            self.dataloader.collate_fn,
+            tokenizer=self.tokenizer,
+            export_reranker=(
+                checkpoint_config.enabled
+                and checkpoint_config.model_save_format.value == "safetensors"
+                and checkpoint_config.save_consolidated != SaveConsolidatedMode.FALSE
+            ),
+        )
         self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
         self.log_modality_loss = bool(self.cfg.get("log_modality_loss", False))
 
@@ -469,10 +478,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 
-        # Train metrics reach disk at least as often as the checkpoint they accompany,
-        # capped at the default so a long checkpoint interval cannot buffer unboundedly.
-        # flush because a buffered write only reaches the file object, whose own buffer is
-        # lost with the process. Validation is rare enough to write every point.
+        # buffer_size bounds how many records can be pending, so a hard kill that runs no
+        # cleanup loses at most one checkpoint interval of train metrics; it is NOT what keeps
+        # metrics in step with checkpoints, since it counts records rather than watching
+        # checkpoint boundaries. The explicit flush after each successful checkpoint is what
+        # provides that. flush=True because a buffered write only reaches the file object,
+        # whose own buffer dies with the process. Validation is rare enough to write every
+        # point.
         train_logger_kwargs = {"flush": True}
         if self.step_scheduler.ckpt_every_steps > 0:
             train_logger_kwargs["buffer_size"] = min(DEFAULT_BUFFER_SIZE, self.step_scheduler.ckpt_every_steps)
@@ -490,6 +502,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.load_checkpoint(restore_from)
         self._log_step_scheduler_details(self.step_scheduler)
+
+    def _validate_model(self, model: torch.nn.Module) -> None:
+        """Validate recipe-specific model settings before constructing the optimizer.
+
+        Args:
+            model: Constructed retrieval model, including infrastructure wrappers.
+        """
 
     def run_train_validation_loop(self):
         """Run the training loop over all epochs and batches."""
@@ -526,6 +545,20 @@ class TrainBiEncoderRecipe(BaseRecipe):
                             train_loss=train_log_data.metrics["loss"],
                             val_loss=val_loss,
                         )
+                        # Flush once the checkpoint save returns, so the metrics describing the
+                        # steps it covers are durable by the time the loop moves on rather than
+                        # waiting for the buffer to fill. This is a post-save boundary, not an
+                        # atomic one: a crash between the save completing and this flush leaves
+                        # the checkpoint on disk with those records still buffered. Buffer size alone
+                        # does not give this: it counts records, and the count only lines up
+                        # with checkpoint steps while training runs from step 0 with periodic
+                        # checkpoints. Resuming at a step that is not a multiple of
+                        # ckpt_every_steps, or a checkpoint taken at an epoch boundary or the
+                        # final step, leaves the two out of phase.
+                        if self.metric_logger_train is not None:
+                            self.metric_logger_train.flush()
+                        if self.metric_logger_valid is not None:
+                            self.metric_logger_valid.flush()
                     self._maybe_collect_garbage()
 
                     # Poll per step; the StepScheduler iterators stop on the flag.
@@ -659,6 +692,12 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
                 preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
+                passage_doc_ids = batch.get("passage_doc_ids")
+                if world_size > 1:
+                    ranks_with_ids = torch.tensor(int(passage_doc_ids is not None), device=q_reps.device)
+                    torch.distributed.all_reduce(ranks_with_ids)
+                    if 0 < ranks_with_ids.item() < world_size:
+                        raise ValueError("Every rank must use the same present or absent passage_doc_ids policy")
 
                 if use_multi_vector_scoring:
                     all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
@@ -684,7 +723,6 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
                 if attr_model.l2_normalize:
                     scores = scores / self.temperature
-                passage_doc_ids = batch.get("passage_doc_ids")
                 if passage_doc_ids is not None:
                     all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
                     mask_gathered_passages_same_doc_as_positive(

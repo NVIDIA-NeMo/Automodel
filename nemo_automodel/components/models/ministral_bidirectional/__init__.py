@@ -21,7 +21,13 @@ from nemo_automodel.components.models.ministral_bidirectional.model import (
     Mistral3BidirectionalModel,
     Mistral3VLBidirectionalForSequenceClassification,
 )
-from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor
+from nemo_automodel.shared.import_utils import safe_import_from
+
+_, Mistral3BiEncoderProcessor = safe_import_from(
+    "nemo_automodel.components.models.ministral_bidirectional.processor",
+    "Mistral3BiEncoderProcessor",
+    msg="Mistral3BiEncoderProcessor requires the vision dependencies from the diffusion extra.",
+)
 
 __all__ = [
     "Ministral3BidirectionalModel",
