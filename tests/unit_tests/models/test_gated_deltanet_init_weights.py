@@ -178,6 +178,10 @@ def _check_initialize_weights(build, device: torch.device, monkeypatch: pytest.M
     model.initialize_weights(buffer_device=device, dtype=torch.float32)
     uninitialized = [n for n, p in model.named_parameters() if not torch.isfinite(p).all()]
     assert not uninitialized, uninitialized
+    # HF-style normal(0, initializer_range=0.02) conv init, not torch's kaiming default (std about 0.29 for kernel 4)
+    for name, parameter in model.named_parameters():
+        if name.endswith("linear_attn.conv1d.weight"):
+            assert 0.01 < parameter.std().item() < 0.04, (name, parameter.std().item())
 
     assert _use_torch_fallbacks(model, monkeypatch) == 1
     model.train()

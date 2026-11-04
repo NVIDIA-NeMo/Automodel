@@ -378,6 +378,8 @@ class TestDenseTextBackbone:
         backbone.init_weights(torch.device("cpu"))
         uninitialized = [n for n, p in backbone.named_parameters() if not torch.isfinite(p).all()]
         assert not uninitialized, uninitialized
+        conv_std = backbone.layers["1"].linear_attn.conv1d.weight.std().item()
+        assert 0.01 < conv_std < 0.04, conv_std  # HF-style normal(0, 0.02), not torch's kaiming default
 
         # The first forward/backward through the real convolution and recurrence is finite.
         linear_attn = backbone.layers["1"].linear_attn
