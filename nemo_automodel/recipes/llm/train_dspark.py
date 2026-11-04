@@ -141,6 +141,7 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     unsupported_parallel_axes,
     validate_dspark_parallelism_axes,
 )
+from nemo_automodel.recipes.llm._dspark_warm_start import load_dspark_draft_weights
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_activation_checkpointing,
     apply_draft_compile,
@@ -637,7 +638,7 @@ class TrainDSparkRecipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
-        raise_if_peft_configured(self.cfg, type(self).__name__)
+        raise_if_peft_configured(self.cfg, type(self).__name__, supports_draft_weights=True)
         # The draft is sharded directly with fully_shard over the default world
         # mesh (no explicit MeshContext), so _dp_allreduce reduces over the world group.
         # A DeepSeek V4 target additionally needs its own expert-parallel / FSDP mesh,
@@ -1223,11 +1224,21 @@ class TrainDSparkRecipe(BaseRecipe):
             # never builds a distributed setup, so it is excluded by construction.
             embed_src = gather_full_weight_module(embed_src)
             head_src = gather_full_weight_module(head_src)
+        freeze_embeddings = bool(recipe_cfg.get("freeze_embeddings", True))
         self.draft_model.initialize_embeddings_and_head(
             embed_tokens=embed_src,
             lm_head=head_src,
-            freeze=bool(recipe_cfg.get("freeze_embeddings", True)),
+            freeze=freeze_embeddings,
         )
+        draft_weights_path = recipe_cfg.get("draft_weights_path", None)
+        if draft_weights_path:
+            load_dspark_draft_weights(
+                self.draft_model,
+                str(draft_weights_path),
+                keep_target_embeddings=freeze_embeddings,
+                target_layer_ids=target_layer_ids,
+                mask_token_id=self.mask_token_id,
+            )
         # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede AC and the FSDP2/DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
         # Optional torch.compile of the draft, in place; after the fp8 swap.
@@ -1558,6 +1569,8 @@ class TrainDSparkRecipe(BaseRecipe):
 
         if is_rank_0:
             logger.info("Resuming from checkpoint: %s", ckpt_dir)
+            if self.cfg.get("recipe_args.draft_weights_path", None):
+                logger.warning("Resuming from %s replaces the weights from recipe_args.draft_weights_path.", ckpt_dir)
 
         draft_model = self._module().draft_model
         self.checkpointer.load_model(draft_model, os.path.join(ckpt_dir, "model"))

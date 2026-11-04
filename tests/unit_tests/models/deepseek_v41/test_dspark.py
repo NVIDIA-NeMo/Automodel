@@ -23,6 +23,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41DSparkConfig, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone, DeepseekV41DSparkModel
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
+from nemo_automodel.recipes.llm._dspark_warm_start import load_dspark_draft_weights
 
 # Keep a hard watchdog for draft-model tests; slower cases declare exact runtime budgets below.
 pytestmark = pytest.mark.timeout(70)
@@ -202,11 +203,8 @@ def test_released_quantized_checkpoint_targets() -> None:
     assert released["mtp.2.confidence_head.proj.weight"].dtype == torch.float32
 
 
-def test_quantized_checkpoint_load_and_training_resume(tmp_path: Path) -> None:
-    config = _config(hidden_size=32, quantization_config={"quant_method": "fp8"})
-    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
-    model = DeepseekV41DSparkModel(config, backend, num_anchors=1, enable_confidence_head=True)
-
+def _released_quantized_source(model: DeepseekV41DSparkModel) -> dict[str, torch.Tensor]:
+    """Return released-layout tensors: quantized weights decode to 8, the rest are 3."""
     source = {}
     for key, tensor in model.state_dict_adapter.to_hf(
         model.state_dict(), quantization=True, for_checkpoint_load=True
@@ -219,6 +217,37 @@ def test_quantized_checkpoint_load_and_training_resume(tmp_path: Path) -> None:
             source[key] = torch.full(tensor.shape, 2.0, dtype=torch.float32).to(tensor.dtype)
         else:
             source[key] = torch.full_like(tensor, 3).contiguous()
+    return source
+
+
+def test_warm_start_reads_the_draft_embedded_in_a_released_checkpoint(tmp_path: Path) -> None:
+    config = _config(hidden_size=32, quantization_config={"quant_method": "fp8"})
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    model = DeepseekV41DSparkModel(config, backend, num_anchors=1, enable_confidence_head=True)
+    embed_before = model.embed_tokens.weight.detach().clone()
+    lm_head_before = model.lm_head.weight.detach().clone()
+    source = _released_quantized_source(model)
+    source["layers.0.attn.wq_a.weight"] = torch.zeros(2, 2)  # a target tensor in the same checkpoint
+    save_file(source, tmp_path / "model.safetensors")
+
+    load_dspark_draft_weights(
+        model, str(tmp_path), keep_target_embeddings=True, target_layer_ids=[0, 1], mask_token_id=31
+    )
+
+    state = model.state_dict()
+    assert (state["mtp.0.attn.wq_a.weight"] == 8).all()
+    assert (state["mtp.0.ffn.experts.gate_and_up_projs"] == 8).all()
+    assert (state["mtp.2.confidence_head.proj.weight"] == 3).all()
+    torch.testing.assert_close(state["embed_tokens.weight"], embed_before, rtol=0, atol=0)
+    torch.testing.assert_close(state["lm_head.weight"], lm_head_before, rtol=0, atol=0)
+
+
+def test_quantized_checkpoint_load_and_training_resume(tmp_path: Path) -> None:
+    config = _config(hidden_size=32, quantization_config={"quant_method": "fp8"})
+    backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch")
+    model = DeepseekV41DSparkModel(config, backend, num_anchors=1, enable_confidence_head=True)
+
+    source = _released_quantized_source(model)
     checkpoint = tmp_path / "released"
     checkpoint.mkdir()
     save_file(source, checkpoint / "model.safetensors")

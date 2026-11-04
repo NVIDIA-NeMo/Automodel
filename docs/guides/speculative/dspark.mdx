@@ -72,6 +72,31 @@ are reduced across data-parallel ranks and written to
 | `confidence_head_alpha` / `confidence_head_with_markov` | confidence-head weight and conditioning |
 | `confidence_head_stop_gradient` | DeepSeek V4.1 only: train the confidence head on detached inputs so its loss cannot back-propagate into the draft backbone (default `false`) |
 | `packed_sequence_size` | packs documents into rows of this many tokens when greater than 0 (Qwen3, DeepSeek V4, and DeepSeek V4.1 targets; online text-only data with `cp_size: 1` and `target_model_backend: colocated`) |
+| `draft_weights_path` | starts a new run from existing draft weights (see [Warm Start](#warm-start)) |
+
+## Warm Start
+
+Set `recipe_args.draft_weights_path` to start a new run from existing draft weights,
+for example to adapt a released draft to a fine-tuned target. It takes a local
+`.safetensors` file or directory:
+
+| Source | Path |
+|--------|------|
+| An earlier run | `<checkpoint>/model/consolidated` |
+| MiniMax M3.1 Flash release | the checkpoint's `dspark/` folder |
+| DeepSeek V4.1 Flash release | the checkpoint folder, which embeds the draft under `mtp.*` |
+
+Only the weights come from this path. The optimizer, LR schedule, RNG, and step
+counter start fresh; use `checkpoint.restore_from` to continue a run instead. A
+checkpoint found in `checkpoint_dir` is restored as usual and replaces the warm-start
+weights, so give a warm-started run its own `output_dir`. Adam also starts with empty
+moments, so its first steps move every weight by about the full LR. Set
+`optimizer.warmup_ratio` above `0` to keep them from disturbing a trained draft.
+
+The key set must match the draft exactly, and an earlier run's `target_layer_ids` and
+`mask_token_id` must match this run's. With `freeze_embeddings: true` the embedding and
+LM head stay the target's, and any copies in the checkpoint are ignored. With
+`freeze_embeddings: false` they come from the checkpoint.
 
 ## DeepSeek V4.1 Flash
 
@@ -92,9 +117,10 @@ this recipe requires the same normalized confidence input; loading released
 confidence weights does not preserve their original predictions. Full-scale
 training stability with this normalization still requires validation.
 
-The recipe starts those trainable DSpark weights from a fresh initialization
-and copies only the frozen embedding and LM head from the target. Use
-`checkpoint.restore_from` to resume a DSpark checkpoint produced by NeMo AutoModel.
+The recipe starts those trainable DSpark weights from a fresh initialization, or
+from the released draft with [`draft_weights_path`](#warm-start), and copies the
+frozen embedding and LM head from the target. Use `checkpoint.restore_from` to
+resume a DSpark checkpoint produced by NeMo AutoModel.
 The V4.1 technical report does not name the dataset used for the dedicated
 DSpark stage, so the example data path is illustrative rather than a claim
 about the released model's training data.

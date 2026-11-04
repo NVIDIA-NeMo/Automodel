@@ -927,14 +927,29 @@ class MiniMaxM3DSparkStateDictAdapter(StateDictAdapter):
 
         Args:
             hf_state_dict: Mapping from released names to tensors in their parameter
-                layout. The mapping is consumed.
+                layout. An MXFP8 ``weight`` with its ``weight_scale_inv`` is decoded to
+                BF16. The mapping is consumed.
             device_mesh: Unused because the draft has no routed experts.
             **kwargs: Additional checkpoint protocol arguments.
 
         Returns:
-            Mapping from native names to the same tensor objects.
+            Mapping from native names to tensors, with no scale entries.
+
+        Raises:
+            ValueError: A scale has no matching weight, or an FP8 weight has no scale.
         """
-        return {_dspark_native_key(key): hf_state_dict.pop(key) for key in list(hf_state_dict)}
+        native: dict[str, Any] = {}
+        for key in [key for key in hf_state_dict if not key.endswith("_scale_inv")]:
+            value = hf_state_dict.pop(key)
+            scale = hf_state_dict.pop(f"{key}_scale_inv", None)
+            if scale is not None:
+                value = dequantize_mxfp8(value, scale)
+            elif value.dtype == torch.float8_e4m3fn:
+                raise ValueError(f"Quantized weight {key} is missing its scale tensor")
+            native[_dspark_native_key(key)] = value
+        if hf_state_dict:
+            raise ValueError(f"Checkpoint scales have no matching weight: {sorted(hf_state_dict)[:3]}")
+        return native
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
         """Rename one native draft tensor.

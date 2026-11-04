@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, Qwen3Config
 
 os.environ["NEMO_EAGLE_ENABLE_NCCL"] = "0"
@@ -225,6 +226,28 @@ def test_remote_setup_seeds_draft_from_server_and_feeds_colocated_features(monke
     )
     torch.testing.assert_close(recorded["input_ids"], batch["input_ids"], rtol=0, atol=0)
     assert recorded["seq_lens"] is None
+
+
+def test_setup_warm_starts_the_draft_and_keeps_the_target_embeddings(monkeypatch, tmp_path, served_model):
+    url, model = served_model
+    _patch_recipe_setup(monkeypatch, model.config)
+    first = TrainDSparkRecipe(_remote_cfg(tmp_path, remote_urls=[url]))
+    first.setup()
+    saved = {key: (value + 1.0).contiguous() for key, value in first.draft_model.state_dict().items()}
+    path = tmp_path / "draft.safetensors"
+    save_file(saved, path)
+
+    recipe = TrainDSparkRecipe(_remote_cfg(tmp_path, remote_urls=[url], draft_weights_path=str(path)))
+    recipe.setup()
+
+    assert recipe.runtime.global_step == 0
+    state = recipe.draft_model.state_dict()
+    torch.testing.assert_close(state["embed_tokens.weight"], model.get_input_embeddings().weight)
+    torch.testing.assert_close(state["lm_head.weight"], model.get_output_embeddings().weight)
+    trainable = [key for key in state if key not in ("embed_tokens.weight", "lm_head.weight")]
+    assert trainable
+    for key in trainable:
+        torch.testing.assert_close(state[key], saved[key], rtol=0, atol=0)
 
 
 def test_remote_setup_rejects_a_server_with_different_capture_layers(monkeypatch, tmp_path, served_model):
