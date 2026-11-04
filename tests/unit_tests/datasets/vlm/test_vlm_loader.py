@@ -27,6 +27,7 @@ from transformers import ProcessorMixin
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule, StreamDatasetConfig
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.datasets.vlm import loader as vlm_loader
 from nemo_automodel.components.datasets.vlm.collate_fns import (
@@ -36,8 +37,10 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
 from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig, PreTokenizedDatasetWrapperConfig
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
+    VlmDataloaderBuild,
     VlmDataloaderConfig,
     VlmProcessorConfig,
+    VlmStreamBuildContext,
     VlmVideoProcessorConfig,
 )
 from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
@@ -898,3 +901,99 @@ def test_native_build_uses_its_collator_without_resolving_stream_position_state(
     )
     assert events == ["enter", "processor", "dataset", "exit"]
     assert list(result.dataloader) == [(["item:one", "item:two"], 0)]
+
+
+@pytest.mark.parametrize("is_training", [True, False])
+def test_stream_build_delegates_runtime_context_and_restores_rng(is_training):
+    contexts = []
+    processor = DummyProcessor()
+    expected = VlmDataloaderBuild(dataloader=iter(()), processor=processor)
+
+    class StreamConfig(StreamDatasetConfig[VlmStreamBuildContext, VlmDataloaderBuild]):
+        is_packed = True
+        output_format = "thd"
+
+        def build(self, *, context: VlmStreamBuildContext) -> VlmDataloaderBuild:
+            contexts.append((context, torch.rand(1)))
+            return expected
+
+    def must_not_run():
+        raise AssertionError("The outer loader constructed a stream-owned processor or position state")
+
+    config = VlmDataloaderConfig(
+        dataset_config=StreamConfig(),
+        processor_config=VlmProcessorConfig(factory=must_not_run),
+        chat_template="template text",
+    )
+    assert config.is_packed
+    assert config.output_format == "thd"
+    rng_state = torch.get_rng_state().clone()
+    schedule = DatasetBuildSchedule(2, 8, 4, None)
+    result = config.build(
+        pretrained_model_name_or_path="processor-path",
+        seed=17,
+        batch_size=2,
+        dp_rank=1,
+        dp_world_size=2,
+        cp_size=1,
+        training_schedule=schedule,
+        is_training=is_training,
+        position_state_factory=must_not_run,
+        ignore_index=-9,
+    )
+    assert result is expected
+    torch.testing.assert_close(torch.get_rng_state(), rng_state, atol=0, rtol=0)
+    context, random_value = contexts[0]
+    assert context.seed == 17
+    assert context.batch_size == 2
+    assert context.dp_rank == 1 and context.dp_world_size == 2
+    assert context.pretrained_model_name_or_path == "processor-path"
+    assert context.processor_config is config.processor_config
+    assert context.chat_template == "template text"
+    assert context.position_state_factory is must_not_run
+    assert context.training_schedule is schedule
+    assert context.ignore_index == -9
+    assert context.is_training is is_training
+    result = config.build(
+        pretrained_model_name_or_path="processor-path", seed=17, batch_size=2, dp_rank=1, dp_world_size=2
+    )
+    assert result is expected
+    torch.testing.assert_close(contexts[1][1], random_value, atol=0, rtol=0)
+    torch.testing.assert_close(torch.get_rng_state(), rng_state, atol=0, rtol=0)
+
+
+def test_stream_build_failure_restores_rng():
+    class FailingStream(StreamDatasetConfig[VlmStreamBuildContext, VlmDataloaderBuild]):
+        def build(self, *, context: VlmStreamBuildContext) -> VlmDataloaderBuild:
+            torch.rand(1)
+            raise ValueError("source construction failed")
+
+    config = VlmDataloaderConfig(dataset_config=FailingStream())
+    rng_state = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="source construction failed"):
+        config.build(pretrained_model_name_or_path="unused", batch_size=2, dp_rank=0, dp_world_size=1, seed=17)
+    torch.testing.assert_close(torch.get_rng_state(), rng_state, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "loader_settings",
+    [
+        {"packing": NeatPackConfig(pack_size=32)},
+        {"pretokenization": PreTokenizedDatasetWrapperConfig()},
+        {"collator": VlmCollatorConfig(factory=list)},
+        {"num_workers": 2},
+        {"shuffle": False},
+        {"pin_memory": True},
+        {"persistent_workers": True},
+        {"prefetch_factor": 2},
+        {"drop_last": True},
+    ],
+)
+def test_stream_rejects_ignored_native_settings_before_build(loader_settings):
+    class StreamConfig(StreamDatasetConfig[VlmStreamBuildContext, VlmDataloaderBuild]):
+        def build(self, *, context: VlmStreamBuildContext) -> VlmDataloaderBuild:
+            raise AssertionError("Invalid native settings reached stream construction")
+
+    config = VlmDataloaderConfig(dataset_config=StreamConfig(), **loader_settings)
+    with pytest.raises(ValueError, match="Stream datasets"):
+        config.build(pretrained_model_name_or_path="unused", batch_size=2, dp_rank=0, dp_world_size=1)

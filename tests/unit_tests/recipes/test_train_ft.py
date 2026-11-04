@@ -4434,10 +4434,15 @@ def test_recipe_saves_terminal_state_at_closed_pass_frontier() -> None:
 def test_zephon_setup_preserves_requested_attention_backend(monkeypatch, tmp_path, attention_backend):
     """Zephon setup preserves the configured SDPA or eager attention backend."""
     from nemo_automodel._transformers.kernel_patches import _apply_preload_overrides
-    from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig, ZephonOptions, ZephonSource
+    from nemo_automodel.components.datasets.loader import DataloaderConfig
+    from nemo_automodel.components.datasets.zephon.config import ZephonOptions, ZephonSource, ZephonTextDatasetConfig
 
     _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
-    config = ZephonDataloaderConfig(zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),)))
+    config = DataloaderConfig(
+        dataset_config=ZephonTextDatasetConfig(
+            zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),))
+        )
+    )
     monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: config))
     module = "nemo_automodel.recipes.llm.train_ft"
     recipe_type = TrainFinetuneRecipeForNextTokenPrediction
@@ -4476,13 +4481,17 @@ def test_common_loader_build_keeps_rng_owned_by_loader_and_rank_order(monkeypatc
 
     from nemo_automodel.components.datasets.loader import DataloaderConfig
     from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
-    from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig, ZephonOptions, ZephonSource
+    from nemo_automodel.components.datasets.zephon.config import ZephonOptions, ZephonSource, ZephonTextDatasetConfig
 
     _patch_setup_minimals(monkeypatch, lambda *args, **kwargs: None)
     if backend == "native":
         config = DataloaderConfig(dataset_config=SimpleNamespace(build=lambda: []), seed=123)
     else:
-        config = ZephonDataloaderConfig(zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),)))
+        config = DataloaderConfig(
+            dataset_config=ZephonTextDatasetConfig(
+                zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),))
+            )
+        )
     monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: config))
     recipe_type = TrainFinetuneRecipeForNextTokenPrediction
     monkeypatch.setattr(recipe_type, "_packing_contract", property(lambda self: DEFAULT_PACKED_SEQUENCE_CONTRACT))
@@ -4510,7 +4519,7 @@ def test_common_loader_build_keeps_rng_owned_by_loader_and_rank_order(monkeypatc
         yield
         events.append("rank-exit")
 
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", rng_context)
+    monkeypatch.setattr("nemo_automodel.components.datasets.loader.ScopedRNG", rng_context)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.FirstRankPerNode", rank_context)
 
     class BuildReached(Exception):

@@ -25,14 +25,12 @@ model:
   attn_implementation: flash_attention_2
   use_liger_kernel: false
 dataset:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonInstructionDatasetConfig
   column_mapping: {question: question, answer: answer}
   answer_only_loss_mask: true
   use_hf_chat_template: false
-  _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDatasetConfig
   tokenizer:
     pretrained_model_name_or_path: work/zephon-tiny/tokenizer
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
   zephon:
     sources:
     - name: instructions

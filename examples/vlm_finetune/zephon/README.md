@@ -6,7 +6,7 @@ for AutoModel’s `FinetuneRecipeForVLM`.
 ## Train
 
 Install AutoModel with its [VLM dependencies](../../../README.md#getting-started).
-In [train.yaml](train.yaml), set `dataloader.zephon.sources[0].path` to your
+In [train.yaml](train.yaml), set `dataset.zephon.sources[0].path` to your
 JSONL shard directory, then run from the repository root:
 
 ```bash
@@ -22,6 +22,11 @@ conversation format, with image paths accessible to every training rank:
 ```
 
 ## How it works
+
+The recipe selects `ZephonVlmDatasetConfig` under `dataset`. AutoModel’s regular
+VLM dataloader configuration delegates construction to it; `dataset.zephon`
+configures the source, packing and runtime, while `processor` and
+`dataset.chat_template` select the processor and conversation template.
 
 AutoModel’s processor applies the chat template and expands image placeholders
 before Zephon measures and bin-packs the documents. Training supervises assistant

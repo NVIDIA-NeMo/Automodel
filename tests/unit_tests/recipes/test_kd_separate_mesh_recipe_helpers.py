@@ -25,6 +25,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
@@ -113,6 +114,23 @@ _RECIPE_CASES = (
         id="vlm",
     ),
 )
+
+
+def test_llm_kd_rejects_stream_datasets_before_model_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nemo_automodel.components.datasets.loader import DataloaderConfig, StreamDatasetConfig
+
+    class StreamConfig(StreamDatasetConfig):
+        def build(self, *, context):
+            raise AssertionError("Stream construction must not start for an unsupported recipe")
+
+    verify_tokenizers = Mock()
+    monkeypatch.setattr(llm_kd, "_verify_tokenizer_compatibility", verify_tokenizers)
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.cfg = SimpleNamespace(dataloader=DataloaderConfig(dataset_config=StreamConfig()))
+
+    with pytest.raises(ValueError, match="Stream-loader knowledge distillation"):
+        recipe.setup()
+    verify_tokenizers.assert_not_called()
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
@@ -319,7 +337,7 @@ def test_kd_setup_preserves_requested_storage_dtype(monkeypatch, recipe_module, 
     monkeypatch.setattr(parent_cls, "setup", stop_parent_setup)
 
     recipe = object.__new__(recipe_cls)
-    recipe.cfg = cfg
+    recipe.cfg = RecipeConfig(cfg)
 
     with pytest.raises(SetupStopped):
         recipe.setup()
