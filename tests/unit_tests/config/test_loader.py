@@ -108,6 +108,17 @@ def test_resolve_target_error():
         _resolve_target("surely.does.not.exist")
 
 
+def test_resolve_target_reports_missing_dependency_of_existing_module(tmp_path: Path, monkeypatch):
+    """A dependency missing inside an existing module surfaces as itself, not as a missing attribute."""
+    (tmp_path / "needs_missing_dep.py").write_text(
+        "import nemo_automodel_missing_dependency_for_test  # noqa: F401\n\nclass Target:\n    pass\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with pytest.raises(ModuleNotFoundError, match="nemo_automodel_missing_dependency_for_test"):
+        _resolve_target("needs_missing_dep.Target")
+
+
 def test_confignode_wrap_and_fn_resolution(tmp_module):
     """
     * Scalar values must be translated.

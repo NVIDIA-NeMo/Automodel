@@ -312,7 +312,12 @@ def _resolve_target(dotted_path: str) -> Any:
 
         try:
             module = importlib.import_module(module_name)
-        except ModuleNotFoundError:
+        except ModuleNotFoundError as e:
+            # Only a missing candidate (or one of its parents) means "try a shorter prefix".
+            # A dependency missing inside an existing module is the real error; falling back
+            # would report it as an unresolvable attribute instead.
+            if e.name is not None and not (module_name == e.name or module_name.startswith(e.name + ".")):
+                raise
             continue
 
         obj = module
