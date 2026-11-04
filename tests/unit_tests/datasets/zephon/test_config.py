@@ -12,75 +12,117 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Declarative recipe configuration and validation without pipeline execution."""
+"""Declarative stream configuration and validation without pipeline execution."""
 
-from dataclasses import replace
+from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.loader import (
+    DataloaderConfig,
+    DatasetBuildSchedule,
+    NeatPackingConfig,
+    TextStreamBuildContext,
+    make_dataset_config,
+)
 from nemo_automodel.components.datasets.zephon.config import (
-    ZephonDataloaderConfig,
     ZephonOptions,
     ZephonPackingOptions,
+    ZephonPretokenizedTextDatasetConfig,
     ZephonSource,
-    ZephonTextSourceConfig,
+    ZephonTextDatasetConfig,
     ZephonWorkerOptions,
 )
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
+_SETTINGS = {"sources": [{"name": "text", "path": "unused"}]}
+_CONTRACT = PackingCapabilities(packed_mask_type="block_causal", max_sequence_length=32)
+
+
+def _recipe(*, dataset_type="ZephonTextDatasetConfig", dataset=None, loader=None, **recipe):
+    return {
+        "dataset": {
+            "_target_": f"nemo_automodel.components.datasets.zephon.{dataset_type}",
+            "zephon": deepcopy(_SETTINGS),
+            **(dataset or {}),
+        },
+        "dataloader": loader or {},
+        "step_scheduler": {"max_steps": 10, "local_batch_size": 1, "global_batch_size": 1},
+        **recipe,
+    }
+
+
+def _schedule(*, batch_size=1, global_batch_size=None, max_steps=10):
+    return DatasetBuildSchedule(
+        local_batch_size=batch_size,
+        global_batch_size=batch_size if global_batch_size is None else global_batch_size,
+        max_steps=max_steps,
+        val_check_interval=None,
+    )
+
+
+def _context(**kwargs):
+    return TextStreamBuildContext(
+        **{
+            "seed": 42,
+            "batch_size": 1,
+            "dp_rank": 0,
+            "dp_world_size": 1,
+            "tokenizer": None,
+            "packing_contract": _CONTRACT,
+            "training_schedule": _schedule(),
+            **kwargs,
+        }
+    )
+
 
 def test_toml_inline_override_relative_paths_and_native_validation(tmp_path):
     (tmp_path / "recipe.toml").write_text('seq_len = 17\nrepeat = false\n[[sources]]\nname="text"\npath="text.jsonl"\n')
-    raw = ConfigNode(
-        {
-            "dataset": {"_target_": "nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig"},
-            "dataloader": {
-                "_target_": "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
-                "zephon": {"data_config": str(tmp_path / "recipe.toml"), "seq_len": 23},
-            },
-            "step_scheduler": {"max_steps": 2, "local_batch_size": 3},
-        }
+    raw = _recipe(
+        dataset={"zephon": {"data_config": str(tmp_path / "recipe.toml"), "packing": {"seq_len": 23}}},
+        step_scheduler={"max_steps": 2, "local_batch_size": 3},
     )
-    config = RecipeConfig(raw).dataloader
-    assert config.zephon.packing.seq_len == 23
+    config = RecipeConfig(ConfigNode(raw)).dataloader
+    assert isinstance(config, DataloaderConfig)
+    assert config.dataset_config.zephon.packing.seq_len == 23
     assert config.batch_size == 3
-    assert config.zephon.sources[0].path == str(tmp_path / "text.jsonl")
-    assert config.zephon.source.exhausted_policy is None
+    assert config.dataset_config.zephon.sources[0].path == str(tmp_path / "text.jsonl")
+    assert config.dataset_config.zephon.source.exhausted_policy is None
     with pytest.raises(ValueError, match="context parallelism"):
-        config.validate_parallelism(cp_size=2)
-    config.validate_parallelism(cp_size=1)
-    validation_values = raw.to_dict()
+        config.dataset_config.validate_parallelism(cp_size=2)
+    config.dataset_config.validate_parallelism(cp_size=1)
+    validation_values = deepcopy(raw)
     validation_values["validation_dataset"] = validation_values["dataset"]
-    validation_values["validation_dataloader"] = validation_values["dataloader"]
-    with pytest.raises(ValueError, match="Zephon validation is not supported"):
-        _ = RecipeConfig(ConfigNode(validation_values)).validation_dataloaders
+    validation = RecipeConfig(ConfigNode(validation_values)).validation_dataloaders["default"]
+    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_text_pipeline") as create:
+        with pytest.raises(ValueError, match="Zephon validation is not supported"):
+            validation.build(dp_rank=0, dp_world_size=1, is_training=False)
+        create.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "override, message",
     [
-        ({"packed_sequence": {"packed_sequence_size": 16}}, "Native packing"),
+        ({"packed_sequence": {"packed_sequence_size": 16}}, "stream dataset owns packing"),
         ({"step_scheduler": {"max_steps": 0}}, "positive"),
         ({"step_scheduler": {"max_steps": True}}, "positive"),
-        ({"domain_mixture": {"domains": []}}, "loss reweighting"),
     ],
 )
-def test_invalid_recipe_configs_fail_before_build(tmp_path, override, message):
-    values = {
-        "dataset": {"_target_": "nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig"},
-        "dataloader": {
-            "_target_": "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
-            "zephon": {"sources": [{"name": "text", "path": str(tmp_path)}]},
-        },
-        "step_scheduler": {"max_steps": 10},
-        **override,
-    }
-    with pytest.raises(ValueError, match=message):
-        RecipeConfig(ConfigNode(values)).dataloader
+def test_invalid_recipe_configs_fail_before_source_build(override, message):
+    values = _recipe(**override)
+    config = RecipeConfig(ConfigNode(values)).dataloader
+    schedule = _schedule(max_steps=values["step_scheduler"]["max_steps"])
+    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_text_pipeline") as create:
+        with pytest.raises(ValueError, match=message):
+            config.build(dp_rank=0, dp_world_size=1, training_schedule=schedule, packing_contract=_CONTRACT)
+        create.assert_not_called()
 
 
 @pytest.mark.parametrize("recipe_name", ["tiny", "model_parallel"])
@@ -89,8 +131,9 @@ def test_shipped_yaml_resolves(recipe_name):
 
     path = Path(__file__).resolve().parents[4] / f"examples/llm_pretrain/zephon/{recipe_name}.yaml"
     config = RecipeConfig(ConfigNode(yaml.safe_load(path.read_text())))
-    assert config.dataloader.zephon.packing.seq_len == 63
-    assert config.dataloader.zephon.source.stop_after_passes == 1
+    assert isinstance(config.dataloader, DataloaderConfig)
+    assert config.dataloader.dataset_config.zephon.packing.seq_len == 63
+    assert config.dataloader.dataset_config.zephon.source.stop_after_passes == 1
     assert config.dataloader.batch_size == config.get("step_scheduler.local_batch_size")
 
 
@@ -115,76 +158,52 @@ def test_operator_parallelism_accepts_default_or_positive_workers(name):
             ZephonOptions(sources=sources, workers=ZephonWorkerOptions(**{name: invalid}))
 
 
-def test_shared_zephon_option_resolution_keeps_explicit_seed_and_rejects_unknowns():
-    values = {"sources": [{"name": "text", "path": "unused"}], "seed": 9}
-
-    def resolve(settings, **loader_overrides):
-        return ZephonDataloaderConfig.from_recipe(
-            ZephonTextSourceConfig, {}, {"zephon": settings, **loader_overrides}, seed=42, batch_size=1, packing={}
-        )
-
-    assert resolve(values).zephon.seed == 9
-    assert isinstance(values["sources"], list)
-    assert resolve({"sources": values["sources"]}).zephon.seed == 42
-    with pytest.raises(ValueError, match="Unexpected Zephon option"):
-        resolve({**values, "unknown": 1})
-    with pytest.raises(ValueError, match="Unexpected Zephon loader fields"):
-        resolve(values, num_workers=2)
+def test_zephon_options_are_declarative_and_do_not_copy_recipe_seed():
+    values = _recipe(seed=9)
+    original = deepcopy(values)
+    loader = RecipeConfig(ConfigNode(values)).dataloader
+    assert loader.seed == 9
+    assert "seed" not in asdict(loader.dataset_config.zephon)
+    assert values == original
+    with pytest.raises(ValueError, match="Unexpected Zephon option.*seed"):
+        ZephonTextDatasetConfig(zephon={**_SETTINGS, "seed": 9})
+    with pytest.raises(ValueError, match="Unexpected Zephon option.*unknown"):
+        ZephonTextDatasetConfig(zephon={**_SETTINGS, "unknown": 1})
 
 
-def test_raw_text_defaults_and_policy_precedence():
-    sources = [{"name": "text", "path": "unused"}]
-    config = ZephonDataloaderConfig.from_recipe(
-        ZephonTextSourceConfig, {}, {"zephon": {"sources": sources}}, seed=42, batch_size=1, packing={}
-    )
-    assert config.dataset_config.tokenize_special_tokens == "bos_eos"
+def test_raw_text_defaults_and_explicit_policy():
+    config = ZephonTextDatasetConfig(zephon=_SETTINGS)
+    assert config.tokenize_special_tokens == "bos_eos"
     assert config.zephon.workers.fetch_parallelism == 2
     assert config.zephon.workers.tokenize_parallelism == 3
-    config = ZephonDataloaderConfig.from_recipe(
-        ZephonTextSourceConfig,
-        {"tokenize_special_tokens": "none"},
-        {"zephon": {"sources": sources, "tokenize_special_tokens": "eos"}},
-        seed=42,
-        batch_size=1,
-        packing={},
-    )
-    assert config.dataset_config.tokenize_special_tokens == "none"
+    assert replace(config, tokenize_special_tokens="none").tokenize_special_tokens == "none"
     with pytest.raises(ValueError, match="resolved model tokenizer"):
-        config.build(dp_rank=0, dp_world_size=1)
+        config.build(context=_context())
 
 
-@pytest.mark.parametrize("origin", ["toml", "inline"])
+@pytest.mark.parametrize("policy", ["eos", "none"])
 @pytest.mark.filterwarnings("error::DeprecationWarning")
-def test_reference_special_token_policy_maps_to_dataset_without_warnings(tmp_path, origin):
-    settings = {"sources": [{"name": "text", "path": "unused"}], "tokenize_special_tokens": "eos"}
-    if origin == "toml":
-        path = tmp_path / "recipe.toml"
-        path.write_text('tokenize_special_tokens = "eos"\n[[sources]]\nname = "text"\npath = "unused"\n')
-        settings = {"data_config": str(path)}
-
-    def resolve(dataset_values):
-        return ZephonDataloaderConfig.from_recipe(
-            ZephonTextSourceConfig,
-            dataset_values,
-            {"zephon": settings},
-            seed=42,
-            batch_size=1,
-            packing={},
-        )
-
-    assert resolve({}).dataset_config.tokenize_special_tokens == "eos"
-    assert resolve({"tokenize_special_tokens": "none"}).dataset_config.tokenize_special_tokens == "none"
+def test_special_token_policy_is_explicit_on_the_dataset_without_warnings(policy):
+    config = ZephonTextDatasetConfig(zephon=_SETTINGS, tokenize_special_tokens=policy)
+    assert config.tokenize_special_tokens == policy
+    with pytest.raises(ValueError, match="Unexpected Zephon option.*tokenize_special_tokens"):
+        ZephonTextDatasetConfig(zephon={**_SETTINGS, "tokenize_special_tokens": policy})
 
 
-def test_numeric_token_overrides_require_corresponding_explicit_insertion() -> None:
-    assert ZephonTextSourceConfig(bos_token_id=0, eos_token_id=7).bos_token_id == 0
+def test_numeric_token_overrides_require_corresponding_explicit_insertion():
+    assert (
+        ZephonTextDatasetConfig(
+            zephon=_SETTINGS, tokenize_special_tokens="bos_eos", bos_token_id=0, eos_token_id=7
+        ).bos_token_id
+        == 0
+    )
     for invalid_id in (True, -1, 1.5, "7"):
         with pytest.raises(ValueError, match="nonnegative integer"):
-            ZephonTextSourceConfig(eos_token_id=invalid_id)
+            ZephonTextDatasetConfig(zephon=_SETTINGS, tokenize_special_tokens="bos_eos", eos_token_id=invalid_id)
     for token_name, opposite_policy in (("bos_token_id", "eos"), ("eos_token_id", "bos")):
         for policy in (opposite_policy, "none", "tokenizer_default"):
             with pytest.raises(ValueError, match=f"{token_name} requires an explicit"):
-                ZephonTextSourceConfig(tokenize_special_tokens=policy, **{token_name: 7})
+                ZephonTextDatasetConfig(zephon=_SETTINGS, tokenize_special_tokens=policy, **{token_name: 7})
 
 
 @pytest.mark.parametrize(
@@ -198,88 +217,77 @@ def test_packing_defaults_are_resolved_once(algorithm, expected):
     assert options.packing.shuffle_after_pack is expected
 
 
-def test_toml_missing_file_source_path_and_source_options_have_context(tmp_path):
-    settings = {"data_config": str(tmp_path / "missing.toml")}
-
-    def resolve():
-        return ZephonDataloaderConfig.from_recipe(
-            ZephonTextSourceConfig, {}, {"zephon": settings}, seed=42, batch_size=1, packing={}
+@pytest.mark.parametrize(
+    "target,kwargs",
+    [
+        ("ZephonTextDatasetConfig", {}),
+        ("ZephonPretokenizedTextDatasetConfig", {}),
+    ],
+)
+def test_unknown_dataset_fields_are_actionable(target, kwargs):
+    with pytest.raises(TypeError, match=f"{target} got unexpected dataset config field.*typo"):
+        make_dataset_config(
+            f"nemo_automodel.components.datasets.zephon.{target}", {"zephon": _SETTINGS, **kwargs, "typo": 1}
         )
 
+
+def test_toml_missing_file_source_path_and_source_options_have_context(tmp_path):
+    settings = {"data_config": str(tmp_path / "missing.toml")}
     with pytest.raises(ValueError, match="data_config file does not exist.*missing.toml"):
-        resolve()
+        ZephonTextDatasetConfig(zephon=settings)
     path = tmp_path / "invalid.toml"
     path.write_text('[[sources]]\nname="broken"\n')
     settings["data_config"] = str(path)
     with pytest.raises(ValueError, match="source 'broken'.*nonempty path"):
-        resolve()
+        ZephonTextDatasetConfig(zephon=settings)
     path.write_text('[[sources]]\nname="broken"\npath="data"\ntyop=1\n')
     with pytest.raises(ValueError, match="source 'broken'.*tyop"):
-        resolve()
+        ZephonTextDatasetConfig(zephon=settings)
 
 
 @pytest.mark.parametrize(
     "global_batch,local_batch,canonical,valid", [(16, 2, 4, True), (12, 2, 4, False), (6, 2, 3, True)]
 )
-def test_pinned_canonical_step_alignment_fails_before_runtime(global_batch, local_batch, canonical, valid):
-    raw = {
-        "dataset": {"_target_": "nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig"},
-        "dataloader": {
-            "_target_": "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
-            "zephon": {
-                "sources": [{"name": "text", "path": "unused"}],
-                "canonical_replicas": canonical,
-            },
-        },
-        "step_scheduler": {"max_steps": 2, "global_batch_size": global_batch, "local_batch_size": local_batch},
-    }
+def test_pinned_canonical_step_alignment_fails_before_source_build(global_batch, local_batch, canonical, valid):
+    config = ZephonTextDatasetConfig(zephon={**_SETTINGS, "checkpoint": {"canonical_replicas": canonical}})
+    context = _context(
+        batch_size=local_batch, training_schedule=_schedule(batch_size=local_batch, global_batch_size=global_batch)
+    )
     if valid:
-        assert RecipeConfig(ConfigNode(raw)).dataloader.zephon.checkpoint.canonical_replicas == canonical
+        config.validate_context(context)
     else:
-        with pytest.raises(ValueError, match="canonical_replicas.*lane windows"):
-            RecipeConfig(ConfigNode(raw)).dataloader
+        with patch("nemo_automodel.components.datasets.zephon.pipeline.create_text_pipeline") as create:
+            with pytest.raises(ValueError, match="canonical_replicas.*lane windows"):
+                config.build(context=context)
+            create.assert_not_called()
 
 
-def test_unknown_raw_text_source_field_is_actionable():
-    with pytest.raises(ValueError, match="Unexpected ZephonTextSourceConfig dataset fields.*typo"):
-        ZephonDataloaderConfig.from_recipe(
-            ZephonTextSourceConfig,
-            {"typo": 1},
-            {"zephon": {"sources": [{"name": "text", "path": "unused"}]}},
-            seed=42,
-            batch_size=1,
-            packing={},
-        )
-
-
-def test_output_format_recipe_choice_and_early_validation(tmp_path):
-    values = {
-        "dataset": {"_target_": "nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig"},
-        "dataloader": {
-            "_target_": "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
-            "output_format": "thd",
-            "zephon": {"sources": [{"name": "text", "path": str(tmp_path)}]},
-        },
-        "step_scheduler": {"max_steps": 2},
-    }
+def test_output_format_recipe_choice_and_delegated_metadata():
+    values = _recipe(
+        dataset={"output_format": "thd", "zephon": {**_SETTINGS, "packing": {"seq_len": 17, "pack_algorithm": None}}}
+    )
     loader = RecipeConfig(ConfigNode(values)).dataloader
     assert loader.output_format == "thd"
     assert loader.is_packed
+    assert loader.packed_sequence_length == 17
+    assert loader.dataset_builds_on_all_ranks
+    assert loader.packing is None
     with pytest.raises(ValueError, match="accepts seq_lens"):
-        loader.build(tokenizer=None, dp_rank=0, dp_world_size=1, supports_seq_lens=False)
-    values["dataloader"]["output_format"] = "neat"
+        loader.build(
+            dp_rank=0,
+            dp_world_size=1,
+            supports_seq_lens=False,
+            training_schedule=_schedule(),
+            packing_contract=_CONTRACT,
+        )
+    values["dataset"]["output_format"] = "neat"
     with pytest.raises(ValueError, match="output_format"):
         RecipeConfig(ConfigNode(values)).dataloader
-    del values["dataloader"]["output_format"]
+    del values["dataset"]["output_format"]
     assert RecipeConfig(ConfigNode(values)).dataloader.output_format == "batched"
 
 
 def test_grouped_options_merge_inline_overrides_per_setting(tmp_path):
-    from nemo_automodel.components.datasets.zephon.config import (
-        resolve_zephon_recipe_settings,
-        zephon_options_from_recipe,
-    )
-
     recipe = tmp_path / "data.toml"
     recipe.write_text(
         '[[sources]]\nname="text"\npath="corpus"\n'
@@ -288,10 +296,9 @@ def test_grouped_options_merge_inline_overrides_per_setting(tmp_path):
         '[checkpoint]\naggregate_dir="checkpoints"\n'
         "[source]\ntoken_estimation=false\nstop_after_passes=2\n"
     )
-    values = resolve_zephon_recipe_settings(
-        {"zephon": {"data_config": str(recipe), "packing": {"seq_len": 23}, "workers": {"tokenize_parallelism": 4}}}
-    )
-    options = zephon_options_from_recipe(values, seed=9)
+    settings = {"data_config": str(recipe), "packing": {"seq_len": 23}, "workers": {"tokenize_parallelism": 4}}
+    original = deepcopy(settings)
+    options = ZephonTextDatasetConfig(zephon=settings).zephon
     assert options.packing.seq_len == 23
     assert options.packing.pack_algorithm == "best_fit"
     assert options.packing.drop_oversized is True
@@ -302,13 +309,10 @@ def test_grouped_options_merge_inline_overrides_per_setting(tmp_path):
     assert options.cache.cache_limit_bytes == 4096
     assert options.checkpoint.aggregate_dir == str(tmp_path / "checkpoints")
     assert options.sources[0].path == str(tmp_path / "corpus")
-    assert options.seed == 9
+    assert settings == original
 
 
 def test_grouped_options_reject_unknown_misplaced_or_duplicate_fields():
-    from nemo_automodel.components.datasets.zephon.config import zephon_options_from_recipe
-
-    sources = [{"name": "text", "path": "unused"}]
     for settings, message in (
         ({"workers": {"seq_len": 8}}, "Unexpected Zephon workers"),
         ({"packing": {"unknown": 1}}, "Unexpected Zephon packing"),
@@ -316,22 +320,21 @@ def test_grouped_options_reject_unknown_misplaced_or_duplicate_fields():
         ({"seq_len": 8, "packing": {"seq_len": 9}}, "packing.seq_len only once"),
     ):
         with pytest.raises(ValueError, match=message):
-            zephon_options_from_recipe({"sources": sources, **settings}, seed=42)
+            ZephonTextDatasetConfig(zephon={**_SETTINGS, **settings})
 
 
-def test_model_input_limit_resolves_length_without_mutating_recipe(tmp_path: Path) -> None:
-    config = ZephonDataloaderConfig(zephon=ZephonOptions(sources=(ZephonSource(name="text", path=str(tmp_path)),)))
-    contract = PackingCapabilities(packed_mask_type="block_causal", max_sequence_length=32)
-    assert config.resolve_sequence_length(packing_contract=contract) == 32
+def test_model_input_limit_resolves_length_without_mutating_recipe():
+    config = ZephonTextDatasetConfig(zephon=_SETTINGS)
+    assert config.resolve_sequence_length(packing_contract=_CONTRACT) == 32
     assert config.packed_sequence_length == 0 and config.zephon.packing.seq_len is None
     smaller = replace(config, zephon=replace(config.zephon, packing=ZephonPackingOptions(seq_len=16)))
-    assert smaller.resolve_sequence_length(packing_contract=contract) == 16
+    assert smaller.resolve_sequence_length(packing_contract=_CONTRACT) == 16
     assert smaller.packed_sequence_length == 16
-    unknown = replace(contract, max_sequence_length=None)
+    unknown = replace(_CONTRACT, max_sequence_length=None)
     assert smaller.resolve_sequence_length(packing_contract=unknown) == 16
     with patch("nemo_automodel.components.datasets.zephon.pipeline.create_text_pipeline") as create:
         with pytest.raises(ValueError, match="no known input-token limit"):
-            config.build(tokenizer=object(), dp_rank=0, dp_world_size=1, packing_contract=unknown)
+            config.build(context=_context(tokenizer=object(), packing_contract=unknown))
         for xdoc in (False, True):
             oversized = replace(
                 smaller,
@@ -341,15 +344,12 @@ def test_model_input_limit_resolves_length_without_mutating_recipe(tmp_path: Pat
             )
             with pytest.raises(ValueError, match="exceeds the model input-token limit"):
                 oversized.build(
-                    tokenizer=object(),
-                    dp_rank=0,
-                    dp_world_size=1,
-                    packing_contract=replace(contract, max_sequence_length=8),
+                    context=_context(tokenizer=object(), packing_contract=replace(_CONTRACT, max_sequence_length=8))
                 )
         create.assert_not_called()
 
 
-def test_disabled_packing_defaults_and_incompatible_options() -> None:
+def test_disabled_packing_defaults_and_incompatible_options():
     options = ZephonPackingOptions(pack_algorithm=None)
     assert options.drop_oversized is False and options.shuffle_after_pack is False
     for invalid in ({"pack_num_bins": 2}, {"max_num_documents": 2}, {"drop_oversized": True}):
@@ -360,25 +360,130 @@ def test_disabled_packing_defaults_and_incompatible_options() -> None:
             ZephonPackingOptions(seq_len=length)
 
 
-def test_pretokenized_recipe_selects_optional_packing(tmp_path: Path) -> None:
-    from nemo_automodel.components.datasets.zephon import ZephonPretokenizedTextSourceConfig
-
+def test_pretokenized_recipe_selects_optional_packing():
     for algorithm in ("wrap", None):
-        values = {
-            "dataset": {
-                "_target_": "nemo_automodel.components.datasets.zephon.ZephonPretokenizedTextSourceConfig",
-                "tokens_field": "tokens",
-            },
-            "dataloader": {
-                "_target_": "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
-                "zephon": {
-                    "sources": [{"name": "tokens", "path": str(tmp_path)}],
-                    "packing": {"seq_len": 7, "pack_algorithm": algorithm},
-                },
-            },
-            "step_scheduler": {"max_steps": 2},
-        }
-        loader = RecipeConfig(ConfigNode(values)).dataloader
-        assert isinstance(loader.dataset_config, ZephonPretokenizedTextSourceConfig)
+        loader = RecipeConfig(
+            ConfigNode(
+                _recipe(
+                    dataset_type="ZephonPretokenizedTextDatasetConfig",
+                    dataset={
+                        "tokens_field": "tokens",
+                        "zephon": {**_SETTINGS, "packing": {"seq_len": 7, "pack_algorithm": algorithm}},
+                    },
+                )
+            )
+        ).dataloader
+        assert isinstance(loader.dataset_config, ZephonPretokenizedTextDatasetConfig)
         assert loader.dataset_config.tokens_field == "tokens"
-        assert loader.zephon.packing.pack_algorithm == algorithm
+        assert loader.dataset_config.zephon.packing.pack_algorithm == algorithm
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        ({"is_training": False}, "Zephon validation"),
+        ({"cp_size": 2, "packing_cp_size": 1}, "context parallelism"),
+        ({"training_schedule": None}, "runtime training_schedule"),
+        ({"training_schedule": _schedule(batch_size=2)}, "optimizer accounting"),
+        ({"domain_mixture": {}}, "loss reweighting"),
+    ],
+)
+def test_runtime_validation_precedes_source_construction(kwargs, message):
+    loader = DataloaderConfig(dataset_config=ZephonTextDatasetConfig(zephon=_SETTINGS))
+    runtime = {
+        "dp_rank": 0,
+        "dp_world_size": 1,
+        "training_schedule": _schedule(),
+        "packing_contract": _CONTRACT,
+        **kwargs,
+    }
+    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_text_pipeline") as create:
+        with pytest.raises(ValueError, match=message):
+            loader.build(**runtime)
+        create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"packing": NeatPackingConfig(packed_sequence_size=16)},
+        {"collate_fn": list},
+        {"num_workers": 1},
+        {"shuffle": False},
+        {"pin_memory": True},
+        {"prefetch_factor": 2},
+        {"persistent_workers": True},
+        {"group_by_length": True},
+        {"batch_sampler_config": object()},
+        {"shuffle_buffer_size": 42},
+        {"drop_last": True},
+    ],
+)
+def test_stream_rejects_ignored_native_settings(settings):
+    loader = DataloaderConfig(dataset_config=ZephonTextDatasetConfig(zephon=_SETTINGS), **settings)
+    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_text_pipeline") as create:
+        with pytest.raises(ValueError, match="stream dataset owns packing"):
+            loader.build(dp_rank=0, dp_world_size=1, training_schedule=_schedule(), packing_contract=_CONTRACT)
+        create.assert_not_called()
+
+
+def test_common_build_scopes_rng_but_preserves_explicit_shared_seed(monkeypatch):
+    from nemo_automodel.components.datasets import loader as loader_module
+
+    dataset = ZephonTextDatasetConfig(zephon=_SETTINGS)
+    loader = DataloaderConfig(dataset_config=dataset, seed=91, batch_size=2)
+    events = []
+    contexts = []
+    output = iter(())
+
+    @contextmanager
+    def rng_scope(*, seed, ranked):
+        events.append(("enter", seed, ranked))
+        yield
+        events.append("exit")
+
+    def build(self, *, context):
+        assert events[-1] == ("enter", 91, True)
+        contexts.append(context)
+        return output
+
+    @contextmanager
+    def rank_first():
+        raise AssertionError("All-rank stream construction must not enter rank-first ordering")
+        yield
+
+    monkeypatch.setattr(loader_module, "ScopedRNG", rng_scope)
+    monkeypatch.setattr(ZephonTextDatasetConfig, "build", build)
+    for _ in range(2):
+        assert (
+            loader.build(
+                dp_rank=0,
+                dp_world_size=1,
+                tokenizer=object(),
+                dataset_build_context=rank_first(),
+                training_schedule=_schedule(batch_size=2),
+                packing_contract=_CONTRACT,
+            )
+            is output
+        )
+    assert [context.seed for context in contexts] == [91, 91]
+    assert [context.batch_size for context in contexts] == [2, 2]
+    assert events == [("enter", 91, True), "exit", ("enter", 91, True), "exit"]
+    assert loader.seed == 91 and dataset.zephon.packing.seq_len is None
+
+
+def test_common_build_restores_rng_after_stream_construction(monkeypatch):
+    dataset = ZephonTextDatasetConfig(zephon=_SETTINGS)
+    loader = DataloaderConfig(dataset_config=dataset, seed=91)
+    before = torch.get_rng_state().clone()
+    observed = []
+
+    def build(self, *, context):
+        observed.append(torch.rand(3))
+        return iter(())
+
+    monkeypatch.setattr(ZephonTextDatasetConfig, "build", build)
+    for _ in range(2):
+        loader.build(dp_rank=0, dp_world_size=1)
+        assert torch.equal(torch.get_rng_state(), before)
+    assert torch.equal(observed[0], observed[1])

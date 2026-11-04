@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from nemo_automodel.components.datasets.zephon.config import (
-        ZephonPretokenizedTextSourceConfig,
+        ZephonPretokenizedTextDatasetConfig,
     )
 
 
@@ -83,15 +83,13 @@ def resolve_token_ids(tokenizer: PreTrainedTokenizerBase, *, pad_token_id: int |
         return TokenIds(bos, eos, unknown)
     if eos is not None:
         return TokenIds(bos, eos, eos)
-    raise ValueError(
-        "No padding ID is available; set dataloader.zephon.packing.pad_token_id to an existing vocabulary ID"
-    )
+    raise ValueError("No padding ID is available; set dataset.zephon.packing.pad_token_id to an existing vocabulary ID")
 
 
 def _validate_pretokenized_document(
     payload: Mapping[str, Any],
     *,
-    config: ZephonPretokenizedTextSourceConfig,
+    config: ZephonPretokenizedTextDatasetConfig,
     valid_token_ids: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Validate tokens and supervision without allocating the delivered payload.
@@ -149,7 +147,7 @@ def _validate_pretokenized_document(
 def normalize_pretokenized_document(
     payload: Mapping[str, Any],
     *,
-    config: ZephonPretokenizedTextSourceConfig,
+    config: ZephonPretokenizedTextDatasetConfig,
     valid_token_ids: np.ndarray,
     preserve_positions: bool = False,
 ) -> dict[str, np.ndarray]:

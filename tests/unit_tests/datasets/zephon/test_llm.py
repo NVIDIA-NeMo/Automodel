@@ -17,7 +17,9 @@
 import numpy as np
 import pytest
 
-from nemo_automodel.components.datasets.zephon.config import ZephonPretokenizedTextSourceConfig
+from nemo_automodel.components.datasets.zephon.config import (
+    ZephonPretokenizedTextDatasetConfig,
+)
 from nemo_automodel.components.datasets.zephon.llm import (
     measure_pretokenized_document,
     normalize_pretokenized_document,
@@ -25,25 +27,11 @@ from nemo_automodel.components.datasets.zephon.llm import (
 )
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
-
-def test_pad_override_and_eos_collision(tokenizer):
-    assert resolve_token_ids(tokenizer, pad_token_id=None).pad == tokenizer.eos_token_id
-    with pytest.raises(ValueError, match="contradicts"):
-        resolve_token_ids(tokenizer, pad_token_id=2)
-    with pytest.raises(ValueError, match="vocabulary"):
-        resolve_token_ids(tokenizer, pad_token_id=999)
-    with pytest.raises(ValueError, match="vocabulary"):
-        resolve_token_ids(tokenizer, pad_token_id=1.0)
-
-
-@pytest.mark.parametrize("pad_id", [True, 1.0])
-def test_padding_id_requires_an_integer(tokenizer, pad_id):
-    with pytest.raises(ValueError, match="existing tokenizer vocabulary ID"):
-        resolve_token_ids(tokenizer, pad_token_id=pad_id)
+_SETTINGS = {"sources": [{"name": "text", "path": "unused"}]}
 
 
 def test_pretokenized_schema_preserves_unshifted_tokens_and_masks():
-    config = ZephonPretokenizedTextSourceConfig(tokens_field="tokens")
+    config = ZephonPretokenizedTextDatasetConfig(zephon=_SETTINGS, tokens_field="tokens")
     actual = normalize_pretokenized_document(
         {"tokens": [2, 3, 1], "loss_mask": [0, 1, 1]}, config=config, valid_token_ids=np.arange(6, dtype=np.int64)
     )
@@ -67,8 +55,26 @@ def test_pretokenized_schema_preserves_unshifted_tokens_and_masks():
             normalize_pretokenized_document(malformed, config=config, valid_token_ids=np.arange(6, dtype=np.int64))
 
 
+def test_pad_override_and_eos_collision(tokenizer):
+    assert resolve_token_ids(tokenizer, pad_token_id=None).pad == tokenizer.eos_token_id
+    with pytest.raises(ValueError, match="contradicts"):
+        resolve_token_ids(tokenizer, pad_token_id=2)
+    with pytest.raises(ValueError, match="vocabulary"):
+        resolve_token_ids(tokenizer, pad_token_id=999)
+    with pytest.raises(ValueError, match="vocabulary"):
+        resolve_token_ids(tokenizer, pad_token_id=1.0)
+
+
+@pytest.mark.parametrize("pad_id", [True, 1.0])
+def test_padding_id_requires_an_integer(tokenizer, pad_id):
+    with pytest.raises(ValueError, match="existing tokenizer vocabulary ID"):
+        resolve_token_ids(tokenizer, pad_token_id=pad_id)
+
+
 def test_pretokenized_validation_preserves_vocabulary_holes_and_signed_range():
-    config = ZephonPretokenizedTextSourceConfig()
+    config = ZephonPretokenizedTextDatasetConfig(
+        zephon=_SETTINGS,
+    )
     valid = np.array([0, 2, 5, np.iinfo(np.int64).max], dtype=np.int64)
     for tokens in ([2, 5], np.array([2, 5], dtype=np.uint64), [2, np.iinfo(np.int64).max]):
         actual = normalize_pretokenized_document({"input_ids": tokens}, config=config, valid_token_ids=valid)
@@ -80,7 +86,7 @@ def test_pretokenized_validation_preserves_vocabulary_holes_and_signed_range():
 
 
 def test_pretokenized_short_and_unsupervised_documents_are_retained():
-    config = ZephonPretokenizedTextSourceConfig(tokens_field="tokens")
+    config = ZephonPretokenizedTextDatasetConfig(zephon=_SETTINGS, tokens_field="tokens")
     valid = np.arange(6, dtype=np.int64)
     for payload in (
         {"tokens": []},
@@ -99,7 +105,9 @@ def test_pretokenized_short_and_unsupervised_documents_are_retained():
 
 
 def test_pretokenized_positions_preserve_only_valid_offline_boundaries() -> None:
-    config = ZephonPretokenizedTextSourceConfig()
+    config = ZephonPretokenizedTextDatasetConfig(
+        zephon=_SETTINGS,
+    )
     payload = {"input_ids": [2, 3, 4, 5], "positions": [0, 1, 0, 1]}
     kwargs = {"config": config, "valid_token_ids": np.arange(6, dtype=np.int64)}
     actual = normalize_pretokenized_document(payload, preserve_positions=True, **kwargs)

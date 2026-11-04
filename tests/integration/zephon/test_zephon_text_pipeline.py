@@ -24,16 +24,22 @@ import torch
 from transformers import PreTrainedTokenizerFast
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetBuildSchedule
 from nemo_automodel.components.datasets.packing import BatchOutputFormat
-from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
-from nemo_automodel.components.datasets.zephon.config import ZephonPretokenizedTextSourceConfig
+from nemo_automodel.components.datasets.zephon.config import ZephonPretokenizedTextDatasetConfig
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
 
+def _training_schedule(config: DataloaderConfig) -> DatasetBuildSchedule:
+    return DatasetBuildSchedule(config.batch_size, config.batch_size, max_steps=1, val_check_interval=None)
+
+
 def test_real_finite_stream_and_continuing_iter(config, tokenizer):
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    ) as loader:
         first = next(loader)
         assert iter(loader) is loader
         second = next(iter(loader))
@@ -50,16 +56,23 @@ def test_real_finite_stream_and_continuing_iter(config, tokenizer):
 
 
 def test_text_explicit_ids_override_insertion_without_changing_tokenizer(
-    config: ZephonDataloaderConfig, tokenizer: PreTrainedTokenizerFast
+    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast
 ) -> None:
     config = replace(
         config,
         dataset_config=replace(
-            config.dataset_config, tokenize_special_tokens="bos_eos", bos_token_id=0, eos_token_id=40
+            config.dataset_config,
+            tokenize_special_tokens="bos_eos",
+            bos_token_id=0,
+            eos_token_id=40,
+            zephon=replace(
+                config.dataset_config.zephon, packing=replace(config.dataset_config.zephon.packing, seq_len=4)
+            ),
         ),
-        zephon=replace(config.zephon, packing=replace(config.zephon.packing, seq_len=4)),
     )
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    ) as loader:
         batch = next(loader)
         assert batch["input_ids"][0].tolist() == [0, 2, 3, 4]
         assert batch["labels"][0].tolist() == [2, 3, 4, 40]
@@ -96,7 +109,15 @@ def test_configured_backend_reaches_packed_loader(config, tokenizer, backend, mo
     )
     assert model.config._attn_implementation == backend
     contract = configure_packing_for_models([model])
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, packing_contract=contract)) as loader:
+    with closing(
+        config.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            packing_contract=contract,
+            training_schedule=_training_schedule(config),
+        )
+    ) as loader:
         batch = next(loader)
         assert batch["_packed_seq_ids"].shape == batch["input_ids"].shape == (2, 7)
         assert batch["_packed_seq_ids"].tolist()[0] == [1, 1, 1, 1, 2, 2, 2]
@@ -113,8 +134,10 @@ def test_configured_backend_reaches_packed_loader(config, tokenizer, backend, mo
 
 
 def test_fresh_loader_checkpoint_replays_inflight_batches(config, tokenizer):
-    loader = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
-    restored = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+    loader = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    restored = config.build(
+        tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config)
+    )
     try:
         next(loader)
         state = loader.state_dict()
@@ -132,14 +155,24 @@ def test_xdoc_and_boundary_label_mask_are_independent(config, tokenizer):
     configs = [
         replace(
             config,
-            zephon=replace(
-                config.zephon,
-                training=replace(config.zephon.training, allow_cross_document_attention=xdoc, mask_segment_starts=mask),
+            dataset_config=replace(
+                config.dataset_config,
+                zephon=replace(
+                    config.dataset_config.zephon,
+                    training=replace(
+                        config.dataset_config.zephon.training,
+                        allow_cross_document_attention=xdoc,
+                        mask_segment_starts=mask,
+                    ),
+                ),
             ),
         )
         for xdoc, mask in ((False, False), (True, False), (False, True), (True, True))
     ]
-    loaders = [cfg.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1) for cfg in configs]
+    loaders = [
+        cfg.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(cfg))
+        for cfg in configs
+    ]
     try:
         batches = [next(loader) for loader in loaders]
         torch.testing.assert_close(batches[0]["labels"], batches[1]["labels"])
@@ -179,6 +212,7 @@ def test_common_text_build_does_not_enter_native_context_or_wrap_collation(confi
             supports_seq_lens=False,
             cp_size=1,
             ignore_index=-321,
+            training_schedule=_training_schedule(config),
         )
     ) as loader:
         batch = next(loader)
@@ -187,7 +221,9 @@ def test_common_text_build_does_not_enter_native_context_or_wrap_collation(confi
         assert loader.use_distributed_checkpointing
 
     with pytest.raises(ValueError, match="context parallel"):
-        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, cp_size=2)
+        config.build(
+            tokenizer=tokenizer, dp_rank=0, dp_world_size=1, cp_size=2, training_schedule=_training_schedule(config)
+        )
 
 
 def test_document_id_model_consumes_real_loader_and_respects_xdoc(config, tokenizer):
@@ -215,12 +251,22 @@ def test_document_id_model_consumes_real_loader_and_respects_xdoc(config, tokeni
     for xdoc in (False, True):
         selected = replace(
             config,
-            zephon=replace(
-                config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=xdoc)
+            dataset_config=replace(
+                config.dataset_config,
+                zephon=replace(
+                    config.dataset_config.zephon,
+                    training=replace(config.dataset_config.zephon.training, allow_cross_document_attention=xdoc),
+                ),
             ),
         )
         with closing(
-            selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, packing_contract=contract)
+            selected.build(
+                tokenizer=tokenizer,
+                dp_rank=0,
+                dp_world_size=1,
+                packing_contract=contract,
+                training_schedule=_training_schedule(selected),
+            )
         ) as loader:
             batch = next(loader)
             assert "document_ids" not in batch
@@ -242,25 +288,46 @@ def test_document_id_model_consumes_real_loader_and_respects_xdoc(config, tokeni
 
 
 def test_raw_text_without_packing_keeps_documents_separate_and_pads(
-    config: ZephonDataloaderConfig, tokenizer: PreTrainedTokenizerFast
+    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast
 ) -> None:
     selected = replace(
         config,
-        zephon=replace(
-            config.zephon,
-            packing=replace(config.zephon.packing, pack_algorithm=None, seq_len=None),
-            source=replace(config.zephon.source, chunk_size=1),
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(config.dataset_config.zephon.packing, pack_algorithm=None, seq_len=None),
+                source=replace(config.dataset_config.zephon.source, chunk_size=1),
+            ),
         ),
     )
     contract = PackingCapabilities("block_causal", max_sequence_length=7)
-    with closing(selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, packing_contract=contract)) as loader:
+    with closing(
+        selected.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            packing_contract=contract,
+            training_schedule=_training_schedule(selected),
+        )
+    ) as loader:
         batch = next(loader)
         assert batch["input_ids"].tolist() == [[2, 3, 4, 1, 1, 1, 1], [3, 4, 5, 1, 1, 1, 1]]
         assert batch["labels"].tolist() == [[3, 4, 1, -100, -100, -100, -100], [4, 5, 1, -100, -100, -100, -100]]
         assert batch["_packed_seq_ids"].tolist() == [[1, 1, 1, 1, 0, 0, 0]] * 2
-    assert selected.zephon.packing.seq_len is None
-    Path(config.zephon.sources[0].path, "text.jsonl").write_text('{"text":"w0 w1 w2 w3 w4 w5 w6 w7 w8"}\n' * 2)
-    with closing(selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, packing_contract=contract)) as loader:
+    assert selected.dataset_config.zephon.packing.seq_len is None
+    Path(config.dataset_config.zephon.sources[0].path, "text.jsonl").write_text(
+        '{"text":"w0 w1 w2 w3 w4 w5 w6 w7 w8"}\n' * 2
+    )
+    with closing(
+        selected.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            packing_contract=contract,
+            training_schedule=_training_schedule(selected),
+        )
+    ) as loader:
         with pytest.raises((ValueError, RuntimeError), match=r"exceeding seq_len\+1"):
             next(loader)
 
@@ -277,21 +344,31 @@ def test_pretokenized_measurement_allocates_tokens_and_finite_repeat_cap(config,
     pretokenized = replace(
         config,
         batch_size=1,
-        dataset_config=ZephonPretokenizedTextSourceConfig(tokens_field="tokens"),
-        zephon=replace(
-            config.zephon,
-            sources=tuple(sources),
-            packing=replace(config.zephon.packing, seq_len=31),
-            source=replace(
-                config.zephon.source,
-                chunk_size=8,
-                exhausted_policy="repeat",
-                stop_after_passes=4,
-                token_estimation={"calibration_samples": 8, "calibration_shards_min": 1, "calibration_shards_max": 1},
+        dataset_config=ZephonPretokenizedTextDatasetConfig(
+            tokens_field="tokens",
+            zephon=replace(
+                config.dataset_config.zephon,
+                sources=tuple(sources),
+                packing=replace(config.dataset_config.zephon.packing, seq_len=31),
+                source=replace(
+                    config.dataset_config.zephon.source,
+                    chunk_size=8,
+                    exhausted_policy="repeat",
+                    stop_after_passes=4,
+                    token_estimation={
+                        "calibration_samples": 8,
+                        "calibration_shards_min": 1,
+                        "calibration_shards_max": 1,
+                    },
+                ),
             ),
         ),
     )
-    with closing(pretokenized.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        pretokenized.build(
+            tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(pretokenized)
+        )
+    ) as loader:
         short = total = 0
         for batch in loader:
             tokens = torch.cat((batch["input_ids"], batch["labels"][:, -1:]), dim=1)
@@ -303,7 +380,7 @@ def test_pretokenized_measurement_allocates_tokens_and_finite_repeat_cap(config,
 
 
 def test_pretokenized_mixed_supervision_preserves_all_targets(config, tokenizer):
-    path = Path(config.zephon.sources[0].path) / "text.jsonl"
+    path = Path(config.dataset_config.zephon.sources[0].path) / "text.jsonl"
     path.write_text(
         json.dumps({"input_ids": [2], "loss_mask": [0]})
         + "\n"
@@ -315,14 +392,17 @@ def test_pretokenized_mixed_supervision_preserves_all_targets(config, tokenizer)
     config = replace(
         config,
         batch_size=1,
-        dataset_config=ZephonPretokenizedTextSourceConfig(),
-        zephon=replace(
-            config.zephon,
-            packing=replace(config.zephon.packing, seq_len=5),
-            source=replace(config.zephon.source, chunk_size=1),
+        dataset_config=ZephonPretokenizedTextDatasetConfig(
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(config.dataset_config.zephon.packing, seq_len=5),
+                source=replace(config.dataset_config.zephon.source, chunk_size=1),
+            )
         ),
     )
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(config))
+    ) as loader:
         batch = next(loader)
         assert batch["input_ids"].tolist() == [[2, 3, 4, 5, 6]]
         assert batch["labels"].tolist() == [[-100, -100, 5, 6, 1]]
@@ -331,9 +411,9 @@ def test_pretokenized_mixed_supervision_preserves_all_targets(config, tokenizer)
 
 @pytest.mark.parametrize("output_format", ["batched", "thd"])
 def test_prepacked_boundaries_and_single_document_fallback(
-    config: ZephonDataloaderConfig, tokenizer: PreTrainedTokenizerFast, output_format: BatchOutputFormat
+    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast, output_format: BatchOutputFormat
 ) -> None:
-    path = Path(config.zephon.sources[0].path, "text.jsonl")
+    path = Path(config.dataset_config.zephon.sources[0].path, "text.jsonl")
     path.write_text(
         json.dumps({"input_ids": [2, 3, 4, 5, 6, 1], "positions": [0, 1, 2, 0, 1, 2]})
         + "\n"
@@ -342,24 +422,35 @@ def test_prepacked_boundaries_and_single_document_fallback(
     )
     selected = replace(
         config,
-        dataset_config=ZephonPretokenizedTextSourceConfig(),
-        output_format=output_format,
-        zephon=replace(
-            config.zephon,
-            packing=replace(config.zephon.packing, pack_algorithm=None),
-            runtime=replace(config.zephon.runtime, runner="process" if output_format == "batched" else "threads"),
-            source=replace(config.zephon.source, chunk_size=1),
-            training=replace(config.zephon.training, mask_segment_starts=True),
+        dataset_config=ZephonPretokenizedTextDatasetConfig(
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(config.dataset_config.zephon.packing, pack_algorithm=None),
+                runtime=replace(
+                    config.dataset_config.zephon.runtime, runner="process" if output_format == "batched" else "threads"
+                ),
+                source=replace(config.dataset_config.zephon.source, chunk_size=1),
+                training=replace(config.dataset_config.zephon.training, mask_segment_starts=True),
+            ),
+            output_format=output_format,
         ),
     )
     for xdoc in (False, True):
         selected = replace(
             selected,
-            zephon=replace(
-                selected.zephon, training=replace(selected.zephon.training, allow_cross_document_attention=xdoc)
+            dataset_config=replace(
+                selected.dataset_config,
+                zephon=replace(
+                    selected.dataset_config.zephon,
+                    training=replace(selected.dataset_config.zephon.training, allow_cross_document_attention=xdoc),
+                ),
             ),
         )
-        with closing(selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+        with closing(
+            selected.build(
+                tokenizer=tokenizer, dp_rank=0, dp_world_size=1, training_schedule=_training_schedule(selected)
+            )
+        ) as loader:
             batch = next(loader)
             assert batch["input_ids"].tolist() == [[2, 3, 4, 5, 6, 1, 1], [7, 1, 8, 1, 1, 1, 1]]
             assert batch["labels"].tolist() == [[3, 4, -100, 6, 1, -100, -100], [1, 8, 1, -100, -100, -100, -100]]

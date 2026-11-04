@@ -20,11 +20,12 @@ from unittest.mock import patch
 import pytest
 from transformers import PreTrainedTokenizerFast
 from zephon import Pipeline
+from zephon.work import StaticMixtureWorkSource, TokenEstimation
 
+from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
-    ZephonDataloaderConfig,
-    ZephonPretokenizedTextSourceConfig,
-    ZephonTextSourceConfig,
+    ZephonPretokenizedTextDatasetConfig,
+    ZephonTextDatasetConfig,
 )
 from nemo_automodel.components.datasets.zephon.pipeline import create_text_pipeline
 from tests.utils.zephon_text_fixtures import config as config
@@ -33,8 +34,9 @@ from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
 @pytest.mark.parametrize("source_kind", ["text", "pretokenized"])
 def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, source_kind):
+    config = config.dataset_config
     if source_kind == "pretokenized":
-        config = replace(config, dataset_config=ZephonPretokenizedTextSourceConfig())
+        config = ZephonPretokenizedTextDatasetConfig(zephon=config.zephon)
     config = replace(
         config,
         zephon=replace(
@@ -49,10 +51,16 @@ def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, so
                 shuffle_parallelism=7,
             ),
             runtime=replace(config.zephon.runtime, prefetch_buffer_size=8),
+            source=replace(config.zephon.source, token_estimation={"calibration_samples": 4}),
             packing=replace(config.zephon.packing, shuffle_after_pack=True, shuffle_buffer_size=8),
         ),
     )
     with (
+        patch("zephon.work.StaticMixtureWorkSource", wraps=StaticMixtureWorkSource) as source,
+        patch("zephon.work.TokenEstimation", wraps=TokenEstimation) as estimation,
+        patch.object(
+            Pipeline, "preflight_tokenizers", autospec=True, side_effect=Pipeline.preflight_tokenizers
+        ) as preflight,
         patch.object(Pipeline, "fetch_parallelism", autospec=True, side_effect=Pipeline.fetch_parallelism) as fetch,
         patch.object(Pipeline, "prefetch", autospec=True, side_effect=Pipeline.prefetch) as prefetch,
         patch.object(Pipeline, "map_transform", autospec=True, side_effect=Pipeline.map_transform) as normalize,
@@ -62,8 +70,13 @@ def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, so
         patch.object(Pipeline, "shuffle", autospec=True, side_effect=Pipeline.shuffle) as shuffle,
         patch.object(Pipeline, "map_batch", autospec=True, side_effect=Pipeline.map_batch) as batch_map,
     ):
-        create_text_pipeline(config, tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+        create_text_pipeline(config, tokenizer=tokenizer, seed=91, batch_size=2, dp_rank=0, dp_world_size=1)
         batch_map.assert_not_called()
+        assert source.call_args.kwargs["seed"] == 91
+        assert shuffle.call_args.kwargs["seed"] == 91
+        assert estimation.call_args.kwargs["calibration_samples"] == 4
+        assert (estimation.call_args.kwargs["measure"] is not None) == (source_kind == "pretokenized")
+        assert preflight.call_args.kwargs["strict"] is True
         assert fetch.call_args.args[1] == 2
         assert prefetch.call_args.kwargs["parallelism"] == 3
         assert pack.call_args.kwargs["parallelism"] == 6
@@ -79,11 +92,12 @@ def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, so
 
 
 def test_numeric_overrides_reject_unknown_vocabulary_ids_before_source_start(
-    config: ZephonDataloaderConfig, tokenizer: PreTrainedTokenizerFast
+    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast
 ) -> None:
-    source_config = ZephonTextSourceConfig(tokenize_special_tokens="eos", eos_token_id=9999)
-    config = replace(config, dataset_config=source_config)
+    source = ZephonTextDatasetConfig(
+        zephon=config.dataset_config.zephon, tokenize_special_tokens="eos", eos_token_id=9999
+    )
     with patch("nemo_automodel.components.datasets.zephon.pipeline.create_source_pipeline") as create_source:
         with pytest.raises(ValueError, match="eos_token_id=9999 is not an existing tokenizer vocabulary ID"):
-            create_text_pipeline(config, tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+            create_text_pipeline(source, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
         create_source.assert_not_called()

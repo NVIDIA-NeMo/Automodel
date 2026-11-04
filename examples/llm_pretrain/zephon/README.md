@@ -38,19 +38,17 @@ select a `packing.pack_algorithm` to pack online or set it to `null` to preserve
 each supplied sequence. This supports online tokenization and packing, offline
 tokenization with online packing, and fully prepacked input.
 
-Choose a dataset config for the kind of documents you have, then use the Zephon
-dataloader config in your usual AutoModel recipe. For raw text:
+Choose a Zephon dataset config for the kind of documents you have. AutoModel's
+existing dataloader config delegates the complete stream construction to it.
+For raw text:
 
 ```yaml
 dataset:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig
+  _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
   text_field: text
   tokenize_special_tokens: eos
   tokenizer:
     pretrained_model_name_or_path: /path/to/model-or-tokenizer
-
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
   output_format: batched
   zephon:
     sources:
@@ -100,7 +98,7 @@ those settings affect delivery. Model, optimizer, and distributed settings stay
 in their usual AutoModel sections.
 
 You can also place the data settings in a TOML file and reference it with
-`dataloader.zephon.data_config`. Inline YAML values override that file; relative
+`dataset.zephon.data_config`. Inline YAML values override that file; relative
 source, cache, and checkpoint paths in TOML are resolved relative to the TOML file.
 
 ### Pretokenized and prepacked text
@@ -109,10 +107,10 @@ Tokenization and online packing are independent choices:
 
 | Supplied data | Dataset config | `packing.pack_algorithm` | Online preparation |
 | --- | --- | --- | --- |
-| Raw text | `ZephonTextSourceConfig` | `wrap`, `first_fit`, `best_fit`, or `best_fit_wrap` | Tokenize and pack |
-| Pretokenized documents | `ZephonPretokenizedTextSourceConfig` | A packing algorithm | Pack only |
-| Pretokenized, prepacked sequences | `ZephonPretokenizedTextSourceConfig` | `null` | Preserve supplied sequences |
-| Raw text | `ZephonTextSourceConfig` | `null` | Tokenize each document separately |
+| Raw text | `ZephonTextDatasetConfig` | `wrap`, `first_fit`, `best_fit`, or `best_fit_wrap` | Tokenize and pack |
+| Pretokenized documents | `ZephonPretokenizedTextDatasetConfig` | A packing algorithm | Pack only |
+| Pretokenized, prepacked sequences | `ZephonPretokenizedTextDatasetConfig` | `null` | Preserve supplied sequences |
+| Raw text | `ZephonTextDatasetConfig` | `null` | Tokenize each document separately |
 
 For pretokenized data, `tokens_field` defaults to `input_ids`, and the optional
 `loss_mask_field` defaults to `loss_mask`. Supply unshifted, unpadded token lists
@@ -125,10 +123,8 @@ For prepacked text, use the same source config and explicitly disable packing:
 
 ```yaml
 dataset:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonPretokenizedTextSourceConfig
+  _target_: nemo_automodel.components.datasets.zephon.ZephonPretokenizedTextDatasetConfig
   # Keep the model tokenizer configuration here for vocabulary validation.
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
   zephon:
     sources:
     - {name: offline-packs, path: /data/prepacked, fmt: jsonl}
@@ -156,20 +152,20 @@ shifted labels. The same `batched` and `thd` output formats remain available.
 ## How the integration works
 
 The dataset config selects raw text or pretokenized input. The Zephon
-pipeline reads and mixes sources, prepares documents, optionally packs them, and groups
+pipeline reads and mixes sources, prepares documents, packs them, and groups
 them into batches; online packing can be disabled. Zephon's `to_training()` handles shifting, padding, and
 collation. A small adapter then presents that result in the format expected by
 AutoModel's existing recipe and model.
 
-With Zephon selected, AutoModel's `dataset` section describes document
-preparation rather than constructing a native dataset object. The integration
-translates supported settings into Zephon pipeline options. Zephon
-reads `dataloader.zephon.sources` and owns mixing, tokenization, packing, and
-batching. Configure source traversal and packing under `dataloader.zephon`;
-arbitrary native dataset types and their sampling, truncation, or collator
-behavior are not automatically converted.
+With Zephon selected, AutoModel's `dataset` section holds the complete stream
+configuration. `zephon.io.Dataset` descriptors are created from
+`dataset.zephon.sources`; Zephon owns reading, mixing, tokenization, packing and
+batching. The ordinary AutoModel dataloader builder passes the runtime tokenizer,
+seed, batch size and rank information into the selected config's `build()`.
+Native sampling, worker, packing and collator settings cannot be combined with
+this stream; use the corresponding `dataset.zephon` options instead.
 
-`dataloader.output_format` selects the model input layout. The default,
+`dataset.output_format` selects the model input layout. The default,
 `batched`, uses ordinary `[batch, sequence]` inputs. `thd` supplies the sequence
 length metadata used by compatible native variable-length attention backends.
 These are output formats, separate from the packing algorithm. Batched output
@@ -178,7 +174,7 @@ attention backend.
 
 By default, subdocuments within a packed document cannot attend to one another,
 and positions reset at their boundaries. Set
-`dataloader.zephon.training.allow_cross_document_attention: true` to let them
+`dataset.zephon.training.allow_cross_document_attention: true` to let them
 attend across boundaries and use continuous positions within the packed
 document. Attention remains causal, and different packed documents in a batch
 remain independent. The separate `training.mask_segment_starts` option controls whether
@@ -188,10 +184,10 @@ next-token targets at subdocument boundaries contribute to the loss.
 
 Zephon's loader state is saved and restored with the AutoModel training
 checkpoint. Every training rank participates, including TP and PP peers.
-Use a unique `dataloader.zephon.checkpoint.run_id` for each independent run and
+Use a unique `dataset.zephon.checkpoint.run_id` for each independent run and
 keep it unchanged when resuming that run.
 
-To resume at different data-parallel sizes, set `checkpoint.canonical_replicas`
+To resume at different data-parallel sizes, set `dataset.zephon.checkpoint.canonical_replicas`
 to a common multiple of those sizes before starting. The number of local
 microbatches per optimizer step (`global_batch_size / local_batch_size`) must
 also be a multiple of that value. Preserve the data configuration, tokenizer,
