@@ -27,6 +27,9 @@ The recipe selects `ZephonVlmDatasetConfig` under `dataset`. AutoModel’s regul
 VLM dataloader configuration delegates construction to it; `dataset.zephon`
 configures the source, packing and runtime, while `processor` and
 `dataset.chat_template` select the processor and conversation template.
+The same single-source `path_or_dataset_id` and `paths` fields described in the
+integration guide are available. They select sources without performing a native
+dataset class's conversation/image transformations; input must use the format above.
 
 AutoModel’s processor applies the chat template and expands image placeholders
 before Zephon measures and bin-packs the documents. Training supervises assistant

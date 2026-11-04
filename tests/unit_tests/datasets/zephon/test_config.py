@@ -42,6 +42,7 @@ from nemo_automodel.components.datasets.zephon.config import (
 )
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
+from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
 _SETTINGS = {"sources": [{"name": "text", "path": "unused"}]}
 _CONTRACT = PackingCapabilities(packed_mask_type="block_causal", max_sequence_length=32)
@@ -111,7 +112,6 @@ def test_toml_inline_override_relative_paths_and_native_validation(tmp_path):
 @pytest.mark.parametrize(
     "override, message",
     [
-        ({"packed_sequence": {"packed_sequence_size": 16}}, "stream dataset owns packing"),
         ({"step_scheduler": {"max_steps": 0}}, "positive"),
         ({"step_scheduler": {"max_steps": True}}, "positive"),
     ],
@@ -536,3 +536,171 @@ def test_common_build_restores_rng_after_stream_construction(monkeypatch):
         loader.build(dp_rank=0, dp_world_size=1)
         assert torch.equal(torch.get_rng_state(), before)
     assert torch.equal(observed[0], observed[1])
+
+
+@pytest.mark.parametrize("field", ["path_or_dataset_id", "paths"])
+def test_native_source_path_normalizes_once_without_mutating_yaml(tmp_path, field):
+    root = tmp_path / "corpus.jsonl"
+    root.mkdir()
+    (root / "train.jsonl").write_text('{"text":"hello"}\n')
+    for supplied in (str(root), [str(root)]):
+        values = _recipe(dataset={"zephon": {"packing": {"seq_len": 17}}, field: supplied})
+        original = deepcopy(values)
+        config = RecipeConfig(ConfigNode(values)).dataloader.dataset_config
+        assert config.zephon.sources == (ZephonSource(name="source_0", path=str(root)),)
+        assert config.path_or_dataset_id is None and config.paths is None
+        assert config.split is None and config.name is None
+        assert (
+            replace(config, zephon=replace(config.zephon, packing=ZephonPackingOptions(seq_len=9))).zephon.sources
+            == config.zephon.sources
+        )
+        assert values == original
+    assert ZephonTextDatasetConfig(paths=root).zephon.sources[0].path == str(root)
+
+
+def test_native_hf_source_preserves_subset_and_named_split():
+    config = ZephonTextDatasetConfig(path_or_dataset_id="org/corpus", name="en", split="validation")
+    assert config.zephon.sources == (ZephonSource(name="source_0", path="hf://org/corpus/en/validation"),)
+    assert ZephonTextDatasetConfig(path_or_dataset_id="org/corpus").zephon.sources[0].path == "hf://org/corpus/train"
+    assert replace(config).zephon.sources == config.zephon.sources
+    # Native `paths` and one-element file lists do not treat org/name as an HF ID.
+    assert ZephonTextDatasetConfig(paths="org/corpus").zephon.sources[0].path == "org/corpus"
+    assert ZephonTextDatasetConfig(path_or_dataset_id=["org/corpus"]).zephon.sources[0].path == "org/corpus"
+
+
+def test_native_existing_relative_directory_is_not_reinterpreted_as_hf(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "org" / "corpus"
+    root.mkdir(parents=True)
+    assert ZephonTextDatasetConfig(path_or_dataset_id="org/corpus").zephon.sources[0].path == "org/corpus"
+
+
+@pytest.mark.parametrize("uri", ["s3://bucket/corpus", "hf://org/corpus@revision/en/train"])
+def test_native_source_alias_preserves_explicit_zephon_uri(uri):
+    assert ZephonTextDatasetConfig(paths=uri).zephon.sources[0].path == uri
+
+
+@pytest.mark.parametrize("selection", ["train[:10]", "train+validation", "900,50,50", "", 1])
+def test_native_hf_split_rejects_unimplemented_selection(selection):
+    with pytest.raises(ValueError, match="simple named HF split"):
+        ZephonTextDatasetConfig(path_or_dataset_id="org/corpus", split=selection)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"path_or_dataset_id": "/data/a", "paths": "/data/a"}, "only one source declaration"),
+        ({"paths": []}, "must not be empty"),
+        ({"paths": ["/data/a", "/data/b"]}, "equal-weight Zephon mixtures"),
+        ({"paths": ["0.2", "/data/a", "0.8", "/data/b"]}, "equal-weight Zephon mixtures"),
+        ({"paths": {"train": ["/data/a"], "validation": ["/data/b"]}}, "split-specific blend mappings"),
+        ({"paths": "/data/blend.json"}, "blend JSON file"),
+        ({"paths": "/data/train.jsonl"}, "individual file"),
+        ({"paths": "/data/train.parquet"}, "individual file"),
+        ({"paths": "/data/train*.jsonl"}, "file glob"),
+        ({"paths": "/data/train.bin"}, "Megatron .bin/.idx"),
+        ({"paths": "/data/train.idx"}, "Megatron .bin/.idx"),
+        ({"paths": 7}, "one nonempty path"),
+        ({"path_or_dataset_id": ""}, "one nonempty path"),
+        ({"paths": "/data/a", "split": "validation"}, "bare HF dataset ID"),
+        ({"paths": "/data/a", "name": "subset"}, "bare HF dataset ID"),
+        ({"split": "train"}, "require path_or_dataset_id"),
+    ],
+)
+def test_native_source_forms_fail_clearly_before_io(kwargs, message):
+    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_source_pipeline") as create:
+        with pytest.raises(ValueError, match=message):
+            ZephonTextDatasetConfig(**kwargs)
+        create.assert_not_called()
+
+
+def test_native_source_alias_rejects_canonical_sources_including_toml(tmp_path):
+    for field in ("path_or_dataset_id", "paths"):
+        with pytest.raises(ValueError, match="only one source declaration"):
+            ZephonTextDatasetConfig(zephon=_SETTINGS, **{field: "/data/text"})
+        toml = tmp_path / "data.toml"
+        toml.write_text('[[sources]]\nname="text"\npath="corpus"\n')
+        with pytest.raises(ValueError, match="including TOML"):
+            ZephonTextDatasetConfig(zephon={"data_config": str(toml)}, **{field: "/data/text"})
+    with pytest.raises(ValueError, match="Zephon needs sources"):
+        ZephonTextDatasetConfig()
+
+
+def test_native_megatron_prefix_and_unknown_source_file_are_not_reinterpreted(tmp_path):
+    prefix = tmp_path / "tokens"
+    prefix.with_suffix(".idx").touch()
+    with pytest.raises(ValueError, match="Megatron .bin/.idx"):
+        ZephonTextDatasetConfig(paths=prefix)
+    selected = tmp_path / "shard.data"
+    selected.touch()
+    with pytest.raises(ValueError, match="individual file"):
+        ZephonTextDatasetConfig(path_or_dataset_id=str(selected))
+
+
+@pytest.mark.parametrize("field", ["seq_length", "padding", "truncation", "limit_dataset_samples"])
+def test_unsupported_native_formatting_fields_are_rejected_not_ignored(field):
+    with pytest.raises(TypeError, match=f"unexpected dataset config field.*{field}"):
+        make_dataset_config(
+            "nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig",
+            {"paths": "/data/text", field: 10},
+        )
+
+
+def test_pretokenized_source_alias_keeps_encoding_settings():
+    config = ZephonPretokenizedTextDatasetConfig(path_or_dataset_id="org/corpus", tokens_field="tokens")
+    assert config.zephon.sources[0].path == "hf://org/corpus/train"
+    assert config.tokens_field == "tokens"
+    assert replace(config).zephon.sources == config.zephon.sources
+
+
+def test_instruction_source_alias_keeps_supervision_settings():
+    config = ZephonInstructionDatasetConfig(
+        path_or_dataset_id="org/corpus",
+        column_mapping={"question": "q", "answer": "a"},
+        answer_only_loss_mask=False,
+        use_hf_chat_template=True,
+    )
+    assert config.zephon.sources[0].path == "hf://org/corpus/train"
+    assert config.column_mapping == {"question": "q", "answer": "a"}
+    assert not config.answer_only_loss_mask and config.use_hf_chat_template
+    assert replace(config).zephon.sources == config.zephon.sources
+
+
+def test_native_directory_is_not_confused_with_binary_prefix(tmp_path):
+    for name in ("corpus", "corpus.bin"):
+        root = tmp_path / name
+        root.mkdir()
+        Path(str(root) + ".idx").touch()
+        config = ZephonTextDatasetConfig(paths=root)
+        assert config.zephon.sources[0].path == str(root)
+
+
+@pytest.mark.parametrize("packing", [{}, {"packed_sequence_size": 0}, {"packed_sequence_size": 16}])
+def test_native_packing_selection_is_never_silently_ignored(packing):
+    with pytest.raises(ValueError, match="Stream datasets own packing"):
+        RecipeConfig(ConfigNode(_recipe(packed_sequence=packing))).dataloader
+
+
+@pytest.mark.parametrize("subset", ["en/subset", "", 5])
+def test_native_hf_subset_requires_a_simple_name(subset):
+    with pytest.raises(ValueError, match="simple named HF name"):
+        ZephonTextDatasetConfig(path_or_dataset_id="org/corpus", name=subset)
+
+
+def test_native_source_survives_model_length_resolution_at_runtime(tmp_path, tokenizer):
+    root = tmp_path / "corpus"
+    root.mkdir()
+    config = DataloaderConfig(dataset_config=ZephonTextDatasetConfig(paths=root))
+    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_text_pipeline") as create:
+        loader = config.build(
+            dp_rank=0,
+            dp_world_size=1,
+            tokenizer=tokenizer,
+            packing_contract=_CONTRACT,
+            training_schedule=_schedule(),
+        )
+        resolved = create.call_args.args[0]
+        assert resolved.zephon.sources == config.dataset_config.zephon.sources
+        assert resolved.zephon.packing.seq_len == _CONTRACT.max_sequence_length
+        assert config.dataset_config.zephon.packing.seq_len is None
+        loader.close()

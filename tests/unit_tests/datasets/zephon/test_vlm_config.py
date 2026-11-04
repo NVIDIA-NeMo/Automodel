@@ -439,3 +439,17 @@ def test_native_vlm_recipe_retains_preprocessing_fields_and_shared_chat_template
     assert not config.pretokenization.inject_fake_images
     assert config.packing.pack_size == 128
     assert config.chat_template == "{{ messages }}"
+
+
+def test_image_source_alias_shares_normalization_and_preserves_template():
+    values = _recipe()
+    values["dataset"]["zephon"].pop("sources")
+    values["dataset"].update(
+        path_or_dataset_id="org/images", name="captions", split="validation", chat_template="custom"
+    )
+    config = RecipeConfig(ConfigNode(values)).vlm_dataloader
+    assert config.dataset_config.zephon.sources == (
+        ZephonSource(name="source_0", path="hf://org/images/captions/validation"),
+    )
+    assert config.chat_template == "custom"
+    assert replace(config.dataset_config).zephon.sources == config.dataset_config.zephon.sources
