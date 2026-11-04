@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     postprocess_output_for_attn,
@@ -36,6 +37,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import (
     flatten_packed_sequence_metadata,
@@ -46,6 +48,10 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import (
+    CudnnDsaPackedMetadata,
+    cudnn_indexer_topk,
+)
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
 from nemo_automodel.components.models.kimi_k3.cp import (
     KimiPackedContext,
@@ -501,7 +507,10 @@ class KimiDSAIndexer(nn.Module):
                 chunk_allowed = allowed[:, start:end]
                 # Score only up to the last key any query of this chunk can see (causality
                 # leaves the rest of the row masked), which halves the work of a causal sequence.
-                key_end = int(chunk_allowed.flatten(0, 1).any(0).nonzero().max()) + 1
+                visible_keys = chunk_allowed.flatten(0, 1).any(0).nonzero(as_tuple=True)[0]
+                if visible_keys.numel() == 0:
+                    continue
+                key_end = int(visible_keys[-1]) + 1
                 if key_end <= self.index_topk:
                     selected[:, start:end] = chunk_allowed
                     continue
@@ -515,6 +524,41 @@ class KimiDSAIndexer(nn.Module):
                 # Rows with fewer visible keys than index_topk also pick masked (-inf) keys; drop them.
                 selected[:, start:end, :key_end].scatter_(-1, topk.indices, topk.values.isfinite())
         return selected
+
+    @torch.no_grad()
+    def select_indices(
+        self,
+        hidden_states: torch.Tensor,
+        query_input: torch.Tensor,
+        index_keys: torch.Tensor,
+        metadata: CudnnDsaPackedMetadata,
+    ) -> torch.Tensor:
+        """Compute cuDNN top-k coordinates without materializing an attention mask.
+
+        Args:
+            hidden_states: Local query states [query_tokens, hidden].
+            query_input: Local query latent [query_tokens, q_lora_rank].
+            index_keys: Gathered indexer keys [key_tokens, index_head_dim].
+            metadata: Cached document layout for these local queries and global keys.
+
+        Returns:
+            Int32 global key indices [query_tokens, 1, index_topk], with -1 padding.
+        """
+        if metadata.max_seqlen_k <= self.index_topk:
+            positions = torch.arange(self.index_topk, dtype=torch.int32, device=query_input.device)
+            valid = metadata.query_valid[:, None] & (positions < metadata.causal_lengths[:, None])
+            indices = torch.where(valid, metadata.starts[:, None] + positions, -1)
+            return indices.unsqueeze(1).contiguous()
+        queries = self.wq_b(query_input).view(-1, self.num_heads, self.head_dim)
+        weights = self.weights_proj(hidden_states).float() * self.score_scale
+        return cudnn_indexer_topk(
+            queries,
+            index_keys,
+            weights,
+            metadata.segment_cu_k,
+            self.index_topk,
+            packed_metadata=metadata,
+        )
 
     @torch.no_grad()
     def init_weights(self, init_std: float) -> None:
@@ -599,7 +643,18 @@ class KimiMLAAttention(nn.Module):
         self.indexer = KimiDSAIndexer(config, dtype) if config.is_dsa_layer(layer_idx) else None
         self.attn_module = None
         self.attn_func = None
-        if backend.attn != "eager":
+        if backend.attn == "cudnn":
+            if self.indexer is None:
+                raise ValueError("Kimi cuDNN sparse attention requires a DSA indexer on every MLA layer.")
+            if self.kv_lora_rank != 512 or self.qk_rope_head_dim != 64:
+                raise ValueError("Kimi cuDNN sparse attention requires kv_lora_rank=512 and qk_rope_head_dim=64.")
+            if self.attention_dropout != 0.0:
+                raise ValueError("Kimi cuDNN sparse attention does not support attention dropout.")
+            if self.indexer.head_dim != 128 or self.indexer.num_heads not in (32, 64):
+                raise ValueError("Kimi cuDNN DSA requires index_head_dim=128 and index_num_heads in (32, 64).")
+            if self.indexer.index_topk > 2048:
+                raise ValueError("Kimi cuDNN DSA supports index_topk <= 2048.")
+        elif backend.attn != "eager":
             if backend.attn not in ("te", "sdpa"):
                 raise ValueError(f"Kimi K3 MLA does not support backend.attn={backend.attn!r}.")
             attention_kwargs = {"attention_dropout": self.attention_dropout} if backend.attn == "te" else {}
@@ -649,6 +704,15 @@ class KimiMLAAttention(nn.Module):
             Tensor of shape [batch, sequence, hidden].
         """
         del kwargs
+        if self.backend.attn == "cudnn":
+            if attention_mask is not None:
+                raise ValueError("Kimi cuDNN DSA consumes packed_context or padding_mask, not a dense attention mask.")
+            if packed_context is None:
+                doc_ids = torch.ones(hidden_states.shape[:2], dtype=torch.int32, device=hidden_states.device)
+                if padding_mask is not None:
+                    doc_ids.masked_fill_(padding_mask, 0)
+                packed_context = KimiPackedContext(doc_ids)
+            return self._forward_cudnn(hidden_states, packed_context)
         if packed_context is not None and packed_context.cp_enabled:
             return self._forward_with_cp(hidden_states, packed_context)
         batch_size, seq_length = hidden_states.shape[:-1]
@@ -745,6 +809,66 @@ class KimiMLAAttention(nn.Module):
         if self.use_output_gate:
             attn_output = attn_output * self.g_proj(hidden_states).sigmoid()
         return self.o_proj(attn_output)
+
+    def _forward_cudnn(self, hidden_states: torch.Tensor, packed_context: KimiPackedContext) -> torch.Tensor:
+        """Run the existing fused indexer and sparse latent MLA kernels.
+
+        Args:
+            hidden_states: Local query states [batch, local_sequence, hidden].
+            packed_context: Global document layout and this rank's contiguous query offset.
+
+        Returns:
+            Gated, projected attention values [batch, local_sequence, hidden].
+        """
+        batch_size, local_length = hidden_states.shape[:2]
+        query_input, queries = self._project_queries(hidden_states)
+        queries = queries.view(batch_size, local_length, self.num_heads, self.q_head_dim)
+        query_nope, query_shared = queries.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        latent, key_shared = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        latent_kv = torch.cat((self.kv_a_layernorm(latent), key_shared), dim=-1)
+        index_keys = self.indexer.project_keys(hidden_states)
+        if packed_context.cp_enabled:
+            if self._cp_mesh is None:
+                raise RuntimeError("Kimi cuDNN DSA context parallelism requires a configured CP mesh.")
+            group = self._cp_mesh.get_group()
+            latent_kv = all_gather_sequence(latent_kv, group, dim=1)
+            index_keys = all_gather_sequence(index_keys, group, dim=1)
+
+        # Absorb K's expansion into Q, attend to the shared latent, then expand V.
+        # Materialize the effective LoRA weight so both adapter factors receive gradients.
+        if isinstance(self.kv_b_proj, LinearLoRA) and self.kv_b_proj._lora_token_gate is not None:
+            raise ValueError("Kimi cuDNN DSA cannot absorb token-dependent kv_b_proj LoRA weights.")
+        weight = (
+            self.kv_b_proj.materialize_effective_weight()
+            if isinstance(self.kv_b_proj, LinearLoRA)
+            else self.kv_b_proj.weight
+        )
+        weight = weight.view(self.num_key_value_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+        if self.num_key_value_groups > 1:
+            weight = weight.repeat_interleave(self.num_key_value_groups, dim=0)
+        key_weight, value_weight = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        absorbed_query = torch.einsum("bqhd,hdc->bqhc", query_nope, key_weight.to(query_nope.dtype))
+        sparse_query = torch.cat((absorbed_query, query_shared), dim=-1).to(torch.bfloat16)
+        outputs = []
+        for row in range(batch_size):
+            metadata = packed_context.cudnn_dsa_metadata(row)
+            indices = self.indexer.select_indices(hidden_states[row], query_input[row], index_keys[row], metadata)
+            lengths = (indices[:, 0] >= 0).sum(-1, dtype=torch.int32).contiguous()
+            latent_output = cudnn_sparse_attention(
+                sparse_query[row].contiguous(),
+                latent_kv[row].unsqueeze(1).to(torch.bfloat16).contiguous(),
+                indices,
+                self.scaling,
+                topk_length=lengths,
+                all_rows_nonempty=metadata.all_rows_nonempty,
+                valid_row_indices=metadata.valid_row_indices,
+            )
+            outputs.append(torch.einsum("qhc,hvc->qhv", latent_output, value_weight.to(latent_output.dtype)))
+        attention_output = torch.stack(outputs).reshape(batch_size, local_length, -1)
+        if self.use_output_gate:
+            attention_output = attention_output * self.g_proj(hidden_states).sigmoid()
+        return self.o_proj(attention_output)
 
     def _project_queries(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Project MLA queries.
@@ -2054,17 +2178,26 @@ class KimiK3TextModel(nn.Module):
                         raise RuntimeError("Kimi KDA CP requires a configured process group.")
                     for row in range(packed_context.doc_ids.shape[0]):
                         build_fla_cp_context(packed_context, row, attention._cp_mesh.get_group(), attention.conv_size)
-                elif isinstance(attention, KimiMLAAttention):
+                elif isinstance(attention, KimiMLAAttention) and attention.backend.attn != "cudnn":
                     # Pipeline microbatches must not evict another microbatch's
                     # mask between forward and selective-AC recomputation.
                     _ = packed_context.mla_block_mask
 
+        if self.backend.attn == "cudnn":
+            if packed_context is None:
+                doc_ids = torch.ones(inputs_embeds.shape[:2], dtype=torch.int32, device=inputs_embeds.device)
+                if padding_mask is not None:
+                    doc_ids.masked_fill_(padding_mask, 0)
+                packed_context = KimiPackedContext(doc_ids)
+            # Prepare outside selective activation checkpointing, once per microbatch.
+            for row in range(packed_context.doc_ids.shape[0]):
+                packed_context.cudnn_dsa_metadata(row)
         if padding_mask is None and packed_context is not None:
             padding_mask = packed_context.local_doc_ids == 0
         linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
         causal_mask = (
             None
-            if packed_context is not None and packed_context.cp_enabled
+            if self.backend.attn == "cudnn" or (packed_context is not None and packed_context.cp_enabled)
             else _make_causal_mask(inputs_embeds, packed_context, dtype=inputs_embeds.dtype)
         )
         hidden_states = inputs_embeds

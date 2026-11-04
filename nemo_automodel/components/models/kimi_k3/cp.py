@@ -47,6 +47,10 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import (
+    CudnnDsaPackedMetadata,
+    prepare_cudnn_dsa_packed_metadata,
+)
 
 if TYPE_CHECKING:
     from fla.ops.cp import FLACPContext
@@ -85,6 +89,40 @@ class KimiPackedContext:
         self._has_multiple_documents: bool | None = None
         self._fla_contexts: dict[tuple[int, dist.ProcessGroup, int], FLACPContext] = {}
         self._mla_block_mask: BlockMask | None = None
+        self._cudnn_dsa_metadata: dict[int, CudnnDsaPackedMetadata] = {}
+
+    def cudnn_dsa_metadata(self, row: int) -> CudnnDsaPackedMetadata:
+        """Cache cuDNN metadata for one row's local queries and global keys.
+
+        Args:
+            row: Batch row in the document map of shape [batch, global_sequence].
+
+        Returns:
+            Segmented cuDNN metadata with row-local global key coordinates.
+            Padding runs are separate segments with no valid queries.
+        """
+        cached = self._cudnn_dsa_metadata.get(row)
+        if cached is None:
+            boundaries, _ = self.row_cu_seqlens(row)
+            run_ids = self.doc_ids[row].index_select(0, boundaries[:-1])
+            documents = run_ids[run_ids > 0]
+            if documents.unique().numel() != documents.numel():
+                raise ValueError(
+                    "Kimi cuDNN DSA requires contiguous documents without interior masked holes; "
+                    "use backend.attn='sdpa' for that mask layout."
+                )
+            local_length = self.local_doc_ids.shape[1]
+            positions = torch.arange(
+                self.seq_start, self.seq_start + local_length, device=self.doc_ids.device, dtype=torch.int64
+            )
+            cached = prepare_cudnn_dsa_packed_metadata(
+                boundaries.to(torch.int32),
+                self.doc_ids.shape[1],
+                query_indices=positions,
+                padding_mask=self.local_doc_ids[row].eq(0).contiguous(),
+            )
+            self._cudnn_dsa_metadata[row] = cached
+        return cached
 
     @property
     def mla_block_mask(self) -> BlockMask:

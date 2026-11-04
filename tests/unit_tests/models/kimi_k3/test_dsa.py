@@ -740,3 +740,80 @@ def test_indexer_lora_ddp_completes_two_optimizer_steps(tmp_path: Path, world_si
     torch.multiprocessing.spawn(
         _run_indexer_lora_ddp, args=(world_size, str(tmp_path / "gloo_init")), nprocs=world_size, join=True
     )
+
+
+@pytest.mark.parametrize("query_start", [0, 8])
+def test_indexer_all_padding_query_chunks(query_start: int) -> None:
+    """A trailing empty chunk or CP shard must select no padded keys."""
+    indexer = KimiDSAIndexer(_tiny_text_config(_tiny_dsa_config(index_topk=4)), torch.float32)
+    indexer._query_chunk_size = 4
+    x = torch.randn(1, 12, 32)
+    q = torch.randn(1, 12, 16)
+    positions = torch.arange(12)
+    allowed = (positions[:, None] >= positions[None, :]) & (positions[:, None] < 6) & (positions[None, :] < 6)
+    allowed = allowed[None, query_start:]
+    selected = indexer.select(x[:, query_start:], q[:, query_start:], indexer.project_keys(x), allowed)
+    assert not (selected & ~allowed).any()
+    torch.testing.assert_close(selected.sum(-1), allowed.sum(-1).clamp_max(4))
+
+
+def test_cudnn_metadata_rejects_interior_masked_holes() -> None:
+    """A masked hole must not silently split one document into two contexts."""
+    context = KimiPackedContext(torch.tensor([[1, 1, 0, 1, 1]], dtype=torch.int32))
+    with pytest.raises(ValueError, match="interior masked holes"):
+        context.cudnn_dsa_metadata(0)
+
+
+def test_cudnn_indexer_dense_prefix_skips_scoring() -> None:
+    """Keep all visible prefix keys without invoking a CUDA scoring kernel."""
+    from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import CudnnDsaPackedMetadata
+
+    metadata = CudnnDsaPackedMetadata(
+        starts=torch.zeros(4, dtype=torch.int32),
+        causal_lengths=torch.tensor([1, 2, 3, 0], dtype=torch.int32),
+        query_valid=torch.tensor([True, True, True, False]),
+        valid_row_indices=torch.tensor([0, 1, 2]),
+        segment_cu_q=torch.tensor([0, 4], dtype=torch.int32),
+        segment_cu_k=torch.tensor([0, 4], dtype=torch.int32),
+        q_causal_offsets=torch.zeros(1, dtype=torch.int32),
+        key_source_indices=None,
+        max_seqlen_q=4,
+        max_seqlen_k=4,
+        total_key_tokens=4,
+        all_rows_nonempty=False,
+    )
+    indexer = KimiDSAIndexer(_tiny_text_config(_tiny_dsa_config(index_topk=4)), torch.float32)
+    with mock.patch.object(indexer.wq_b, "forward", side_effect=AssertionError("scoring is unnecessary")):
+        actual = indexer.select_indices(torch.zeros(4, 32), torch.zeros(4, 16), torch.zeros(4, 8), metadata)
+    expected = torch.tensor(
+        [[[0, -1, -1, -1]], [[0, 1, -1, -1]], [[0, 1, 2, -1]], [[-1, -1, -1, -1]]], dtype=torch.int32
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("kv_lora_rank", 16, "kv_lora_rank"),
+        ("qk_rope_head_dim", 8, "qk_rope_head_dim"),
+        ("attention_dropout", 0.1, "dropout"),
+    ],
+)
+def test_cudnn_rejects_unsupported_attention_settings(field: str, value: int | float, message: str) -> None:
+    config = _tiny_text_config(_tiny_dsa_config(index_topk=64, index_head_dim=128, index_num_heads=32))
+    config.kv_lora_rank = 512
+    config.qk_rope_head_dim = 64
+    setattr(config, field, value)
+    with pytest.raises(ValueError, match=message):
+        KimiMLAAttention(config, 1, _backend("cudnn"))
+
+
+def test_cudnn_sparse_forward_head_padding_is_limited_to_validated_kimi_shape() -> None:
+    from nemo_automodel.components.models.common.cudnn_sparse_attention import _padded_head_count
+
+    assert _padded_head_count(96, 10) == 128
+    for heads in (3, 48, 80, 112):
+        with pytest.raises(ValueError, match="query-head count"):
+            _padded_head_count(heads, 10)
+    with pytest.raises(ValueError, match="query-head count"):
+        _padded_head_count(96, 9)
