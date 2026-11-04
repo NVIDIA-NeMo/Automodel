@@ -225,5 +225,3 @@ ci:
   env_vars:
     NCCL_NET_PLUGIN: none
     NCCL_NET: IB
-  perf_testing:
-    schedule: nightly

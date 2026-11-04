@@ -153,5 +153,3 @@ ci:
   nproc_per_node: 8
   recipe_owner: HuiyingLi
   time: 01:00:00
-  perf_testing:
-    schedule: nightly
