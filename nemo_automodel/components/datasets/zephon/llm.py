@@ -32,8 +32,8 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from nemo_automodel.components.datasets.zephon.config import (
-        ZephonInstructionSourceConfig,
-        ZephonPretokenizedTextSourceConfig,
+        ZephonInstructionDatasetConfig,
+        ZephonPretokenizedTextDatasetConfig,
     )
 
 
@@ -89,12 +89,10 @@ def resolve_token_ids(tokenizer: PreTrainedTokenizerBase, *, pad_token_id: int |
         return TokenIds(bos, eos, unknown)
     if eos is not None:
         return TokenIds(bos, eos, eos)
-    raise ValueError(
-        "No padding ID is available; set dataloader.zephon.packing.pad_token_id to an existing vocabulary ID"
-    )
+    raise ValueError("No padding ID is available; set dataset.zephon.packing.pad_token_id to an existing vocabulary ID")
 
 
-def map_instruction_fields(payload: Mapping[str, Any], config: ZephonInstructionSourceConfig) -> dict[str, str]:
+def map_instruction_fields(payload: Mapping[str, Any], config: ZephonInstructionDatasetConfig) -> dict[str, str]:
     """Map raw columns into the same logical fields as the native dataset."""
     mapped = {role: payload[column] for role, column in config.column_mapping.items()}
     if not all(isinstance(value, str) for value in mapped.values()):
@@ -102,7 +100,7 @@ def map_instruction_fields(payload: Mapping[str, Any], config: ZephonInstruction
     return mapped
 
 
-def normalize_instruction_chat(payload: Mapping[str, Any], *, config: ZephonInstructionSourceConfig) -> dict[str, Any]:
+def normalize_instruction_chat(payload: Mapping[str, Any], *, config: ZephonInstructionDatasetConfig) -> dict[str, Any]:
     """Normalize instruction columns into messages for Zephon's SFT tokenizer.
 
     Chat inputs retain the native system/user/assistant order. Plain
@@ -121,7 +119,7 @@ def normalize_instruction_chat(payload: Mapping[str, Any], *, config: ZephonInst
 def _validate_pretokenized_document(
     payload: Mapping[str, Any],
     *,
-    config: ZephonPretokenizedTextSourceConfig,
+    config: ZephonPretokenizedTextDatasetConfig,
     valid_token_ids: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Validate tokens and supervision without allocating the delivered payload.
@@ -179,7 +177,7 @@ def _validate_pretokenized_document(
 def normalize_pretokenized_document(
     payload: Mapping[str, Any],
     *,
-    config: ZephonPretokenizedTextSourceConfig,
+    config: ZephonPretokenizedTextDatasetConfig,
     valid_token_ids: np.ndarray,
     preserve_positions: bool = False,
 ) -> dict[str, np.ndarray]:
