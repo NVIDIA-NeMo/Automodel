@@ -111,7 +111,7 @@ uv run torchrun --nproc-per-node=8 \
 
 The baseline uses BF16 parameters and compute, whole Qwen transformer-block activation checkpointing, beta timestep sampling, and the distributed checkpoint manager. Consolidated model checkpoints are written in the Diffusers-compatible safetensors format (`checkpoint.diffusers_compatible: true`), matching the other diffusion recipes. Set `checkpoint.restore_from: LATEST` to resume the optimizer, scheduler, dataloader, sampler, and step state.
 
-### Checkpoint-Resume Smoke Test
+### Run a Checkpoint-Resume Smoke Test
 
 Use the 64-example correctness cache and a new checkpoint path. The first launch saves after 10 completed optimizer steps:
 
