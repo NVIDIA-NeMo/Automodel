@@ -1,0 +1,35 @@
+---
+title: "Kimi-K3.1-Pro"
+description: "Fine-tune Kimi-K3.1-Pro on nonpacked MedPix image-text examples with NeMo AutoModel, using its native processor and distributed checkpoint loading."
+slug: model-coverage/vision-language-models/moonshotai/Kimi-K3.1-Pro
+---
+
+[Kimi K3.1 Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro) extends the native Kimi K3 implementation with a learned indexer in each of its 24 gated MLA layers. The indexer selects up to 2048 causal keys per query. The other 69 layers use Kimi Delta Attention (KDA).
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| Task | Image-text-to-text |
+| Architecture | `KimiK31ForConditionalGeneration` |
+| Parameters | 2.8T total / 104B activated |
+| Layers | 93: 69 KDA and 24 gated DSA |
+| Checkpoint | `moonshotai/Kimi-K3.1-Pro` |
+| Context length | 1,048,576 tokens; dense-mask training memory limits apply |
+
+## Implementation Limits
+
+- Selection uses dense attention masks. Attention memory and compute remain quadratic in sequence length; this implementation does not provide the serving engines' sparse-kernel speedup.
+- Indexer scores use FP32 accumulation over the loaded BF16 projections, without the FP8 scoring path used by serving kernels.
+- The pretrained indexer stays frozen, including after LoRA injection. Hard top-k selection has no language-model-loss gradient into the indexer; indexer distillation training is not implemented.
+- A sequence of at most 2048 valid tokens exercises the dense path. Sparse-selection validation needs an individual sequence longer than 2048 tokens. Padding or packing short documents is insufficient.
+
+## Nonpacked MedPix
+
+Use [k31_medpix_nonpacked.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/k31_medpix_nonpacked.yaml) with `NeMoAutoModelForImageTextToText.from_pretrained`. The native `KimiK3Processor` expands the image tokens, and `default_collate_fn` passes images to that processor. The recipe uses CP1, EP32 and PP8, with FP32 AdamW parameters and BF16 compute on 128 GB200 nodes with four GPUs each.
+
+Allocate the recipe's resources through the [Slurm launcher](/job-launchers/slurm-cluster). This full 93-layer topology has not been validated for K3.1; initial native checkpoint validation uses four real language-model layers and the original vision tower on a single four-GPU GB200 node. Image packing and image context parallelism are outside this recipe's validated scope.
+
+See [text training and CP2](/model-coverage/large-language-models/moonshotai/Kimi-K3.1-Pro) for text-only workflows and benchmark YAMLs.

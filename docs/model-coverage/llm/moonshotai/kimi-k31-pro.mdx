@@ -1,0 +1,42 @@
+---
+title: "Kimi-K3.1-Pro"
+description: "Train Kimi-K3.1-Pro with NeMo AutoModel using text fine-tuning and context parallelism recipes, with explicit validation scope and attention limits."
+slug: model-coverage/large-language-models/moonshotai/Kimi-K3.1-Pro
+---
+
+[Kimi K3.1 Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro) extends the native Kimi K3 implementation with a learned indexer in each of its 24 gated MLA layers. The indexer selects up to 2048 causal keys per query. The other 69 layers use Kimi Delta Attention (KDA).
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| Task | Text generation |
+| Architecture | `KimiK3ForCausalLM` |
+| Parameters | 2.8T total / 104B activated |
+| Layers | 93: 69 KDA and 24 gated DSA |
+| Checkpoint | `moonshotai/Kimi-K3.1-Pro` |
+| Context length | 1,048,576 tokens; dense-mask training memory limits apply |
+
+## Implementation Limits
+
+- Selection uses dense attention masks. Attention memory and compute remain quadratic in sequence length; this implementation does not provide the serving engines' sparse-kernel speedup.
+- Indexer scores use FP32 accumulation over the loaded BF16 projections, without the FP8 scoring path used by serving kernels.
+- The pretrained indexer stays frozen, including after LoRA injection. Hard top-k selection has no language-model-loss gradient into the indexer; indexer distillation training is not implemented.
+- A sequence of at most 2048 valid tokens exercises the dense path. Sparse-selection validation needs an individual sequence longer than 2048 tokens. Padding or packing short documents is insufficient.
+
+## Text Recipes
+
+| Recipe | Configuration |
+|---|---|
+| [k31_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k31_hellaswag.yaml) | Full-parameter SFT, FP32 AdamW parameters with BF16 compute, EP32 and PP8; 128 GB200 nodes with four GPUs each |
+| [k31_tulu3_cp2_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k31_tulu3_cp2_lora.yaml) | Text-only, nonpacked 4096-token LoRA with CP2 and EP64; 16 GB200 nodes with four GPUs each |
+| [kimi_k31_gb200.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/kimi/kimi_k31_gb200.yaml) | Random-initialized benchmark counterpart of the K3 recipe |
+| [kimi_k31_gb200_2k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/kimi/kimi_k31_gb200_2k.yaml) | 2K benchmark counterpart; does not exercise sparse key selection |
+
+The text recipes select `KimiK3ForCausalLM` from the K3.1 checkpoint configuration while retaining its `dsa_config`. They load through AutoModel's distributed checkpoint flow with `dequantize_base_checkpoint: true`.
+
+Allocate the resources specified in the chosen YAML before launching through the [Slurm launcher](/job-launchers/slurm-cluster). The full 93-layer recipe topologies have not been validated for K3.1. Component validation includes a two-rank CUDA CP forward/backward comparison with a dense negative control. Native checkpoint validation uses the first four real checkpoint layers on four GB200 GPUs with FSDP2 and EP4; it does not establish full-depth parity against an official K3.1 model.
+
+See [vision-language training](/model-coverage/vision-language-models/moonshotai/Kimi-K3.1-Pro) for nonpacked MedPix.
