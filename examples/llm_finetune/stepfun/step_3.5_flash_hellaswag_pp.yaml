@@ -120,3 +120,5 @@ ci:
   node_multiplier: true
   nodes: 16
   time: "00:30:00"
+  perf_testing:
+    schedule: weekly
