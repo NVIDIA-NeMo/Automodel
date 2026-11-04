@@ -251,6 +251,7 @@ class RecipeConfig:
             DataloaderConfig,
             DatasetBuildSchedule,
             ScheduledDatasetConfig,
+            StreamDatasetConfig,
             make_collate_fn,
             make_dataset_config,
         )
@@ -258,6 +259,10 @@ class RecipeConfig:
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
         dataset_kwargs.pop("tokenizer", None)
         dataset_config = make_dataset_config(target, dataset_kwargs)
+        # Preserve an explicit native packing choice even when disabled; stream
+        # backends own packing and must not silently replace that choice.
+        if isinstance(dataset_config, StreamDatasetConfig) and self._raw.get("packed_sequence", None) is not None:
+            raise ValueError("Stream datasets own packing; remove native packed_sequence configuration")
 
         loader_kwargs = _as_dict(dataloader_node)
         loader_target = loader_kwargs.pop("_target_", None)

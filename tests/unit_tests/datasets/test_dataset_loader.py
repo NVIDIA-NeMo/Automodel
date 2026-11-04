@@ -430,6 +430,39 @@ def test_rank_ordering_context_wraps_only_dataset_construction():
     assert events == ["enter", "dataset", "exit", "packing"]
 
 
+def test_native_thd_packing_build_preserves_dataset_and_collator(monkeypatch):
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    documents = [{"input_ids": [2, 3]}]
+    observed = []
+
+    def pack(dataset, **kwargs):
+        observed.append(kwargs)
+        return dataset
+
+    monkeypatch.setattr("nemo_automodel.components.datasets.llm.packed_sequence.pack_dataset", pack)
+    dataset, collator = ThdPackingConfig(packed_sequence_size=8).build(documents, cp_size=2)
+    assert dataset is documents
+    assert collator is packed_sequence_thd_collater
+    assert observed[0]["cp_size"] == 2
+
+
+def test_native_packing_uses_model_owned_cp_alignment(monkeypatch):
+    observed = []
+
+    def pack(dataset, **kwargs):
+        observed.append(kwargs["cp_size"])
+        return dataset
+
+    monkeypatch.setattr("nemo_automodel.components.datasets.llm.packed_sequence.pack_dataset", pack)
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.loader.ParallelAwareDataloader", lambda *args, **kwargs: kwargs
+    )
+    config = DataloaderConfig(dataset_config=StaticDatasetConfig([]), packing=ThdPackingConfig(packed_sequence_size=8))
+    config.build(dp_rank=0, dp_world_size=1, cp_size=2, packing_cp_size=1)
+    assert observed == [1]
+
+
 def test_thd_rejects_unsupported_model_instead_of_silently_disabling_packing():
     with pytest.raises(ValueError, match="THD packing requires a model that consumes seq_lens"):
         ThdPackingConfig(packed_sequence_size=8).build([], supports_seq_lens=False)
@@ -526,3 +559,129 @@ def test_emits_thd_compatibility_alias_warns():
     config = DataloaderConfig(dataset_config=StaticDatasetConfig([]))
     with pytest.warns(FutureWarning, match="output_format"):
         assert config.emits_thd is False
+
+
+@pytest.mark.parametrize("output_format", ["batched", "thd"])
+def test_stream_builder_returns_its_loader_and_receives_runtime_inputs(output_format):
+    from nemo_automodel.components.datasets.loader import (
+        DatasetBuildSchedule,
+        StreamDatasetConfig,
+        TextStreamBuildContext,
+    )
+
+    contexts = []
+    stream_loader = iter(["batch"])
+
+    class StreamConfig(StreamDatasetConfig[TextStreamBuildContext, object]):
+        is_packed = True
+
+        @property
+        def packed_sequence_length(self) -> int:
+            return 17
+
+        def build(self, *, context: TextStreamBuildContext) -> object:
+            contexts.append(context)
+            return stream_loader
+
+    class NativeOnlyContext:
+        def __enter__(self):
+            raise AssertionError("A complete stream must bypass native dataset construction")
+
+        def __exit__(self, *_):
+            return False
+
+    source = StreamConfig()
+    source.output_format = output_format
+    config = DataloaderConfig(dataset_config=source, seed=91, batch_size=2)
+    tokenizer = object()
+    schedule = DatasetBuildSchedule(local_batch_size=2, global_batch_size=8, max_steps=10, val_check_interval=None)
+    result = config.build(
+        dp_rank=1,
+        dp_world_size=2,
+        tokenizer=tokenizer,
+        cp_size=3,
+        packing_cp_size=1,
+        training_schedule=schedule,
+        is_training=False,
+        ignore_index=-17,
+        dataset_build_context=NativeOnlyContext(),
+    )
+
+    assert result is stream_loader
+    assert len(contexts) == 1
+    context = contexts[0]
+    assert context.tokenizer is tokenizer
+    assert context.training_schedule is schedule
+    assert (context.seed, context.batch_size, context.dp_rank, context.dp_world_size) == (91, 2, 1, 2)
+    assert context.cp_size == 3
+    assert context.is_training is False
+    assert context.ignore_index == -17
+    assert config.is_packed
+    assert config.output_format == output_format
+    assert config.packed_sequence_length == 17
+    assert config.dataset_builds_on_all_ranks
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_stream_builder_scopes_ranked_rng_and_preserves_shared_seed(monkeypatch, fail):
+    from nemo_automodel.components.datasets.loader import StreamDatasetConfig, TextStreamBuildContext
+
+    observations = []
+    result = iter([])
+
+    class StreamConfig(StreamDatasetConfig[TextStreamBuildContext, object]):
+        def build(self, *, context: TextStreamBuildContext) -> object:
+            observations.append((context.seed, torch.rand(()).item()))
+            if fail:
+                raise ValueError("stream construction failed")
+            return result
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 4)
+    config = DataloaderConfig(dataset_config=StreamConfig(), seed=77)
+    before = torch.get_rng_state().clone()
+    expected = torch.rand((), generator=torch.Generator().manual_seed(81)).item()
+
+    if fail:
+        with pytest.raises(ValueError, match="stream construction failed"):
+            config.build(dp_rank=1, dp_world_size=2)
+    else:
+        assert config.build(dp_rank=1, dp_world_size=2) is result
+
+    assert observations == [(77, expected)]
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+@pytest.mark.parametrize(
+    "native_settings",
+    [
+        {"packing": ThdPackingConfig(packed_sequence_size=8)},
+        {"collate_fn": lambda batch: batch},
+        {"num_workers": 2},
+        {"shuffle": False},
+    ],
+)
+def test_stream_builder_rejects_native_settings_before_construction(native_settings):
+    from nemo_automodel.components.datasets.loader import StreamDatasetConfig, TextStreamBuildContext
+
+    class StreamConfig(StreamDatasetConfig[TextStreamBuildContext, object]):
+        def build(self, *, context: TextStreamBuildContext) -> object:
+            raise AssertionError("Invalid native settings must fail before the stream is built")
+
+    config = DataloaderConfig(dataset_config=StreamConfig(), **native_settings)
+    with pytest.raises(ValueError, match="stream dataset owns packing"):
+        config.build(dp_rank=0, dp_world_size=1)
+
+
+@pytest.mark.parametrize("packed_sequence", [{}, {"packed_sequence_size": 0}])
+def test_stream_config_rejects_explicit_native_packing_at_the_recipe_boundary(packed_sequence):
+    from nemo_automodel.components.datasets.loader import StreamDatasetConfig, TextStreamBuildContext
+
+    @dataclass
+    class StreamConfig(StreamDatasetConfig[TextStreamBuildContext, object]):
+        def build(self, *, context: TextStreamBuildContext) -> object:
+            raise AssertionError("Config resolution must not build a stream")
+
+    raw = ConfigNode({"dataset": {"_target_": StreamConfig}, "packed_sequence": packed_sequence})
+    with pytest.raises(ValueError, match="Stream datasets own packing"):
+        RecipeConfig(raw).dataloader
