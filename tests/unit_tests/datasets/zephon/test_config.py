@@ -32,6 +32,7 @@ from nemo_automodel.components.datasets.loader import (
     make_dataset_config,
 )
 from nemo_automodel.components.datasets.zephon.config import (
+    ZephonInstructionDatasetConfig,
     ZephonOptions,
     ZephonPackingOptions,
     ZephonPretokenizedTextDatasetConfig,
@@ -137,6 +138,33 @@ def test_shipped_yaml_resolves(recipe_name):
     assert config.dataloader.batch_size == config.get("step_scheduler.local_batch_size")
 
 
+def test_explicit_instruction_config_selects_sft_without_native_translation():
+    from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+        ColumnMappedTextInstructionDatasetConfig,
+    )
+
+    values = _recipe(
+        dataset_type="ZephonInstructionDatasetConfig",
+        dataset={
+            "column_mapping": {"question": "prompt", "answer": "response"},
+            "use_hf_chat_template": True,
+            "zephon": {**_SETTINGS, "workers": {"map_parallelism": 3}},
+        },
+    )
+    resolved = RecipeConfig(ConfigNode(values)).dataloader
+    assert isinstance(resolved.dataset_config, ZephonInstructionDatasetConfig)
+    assert resolved.dataset_config.use_hf_chat_template
+    assert resolved.dataset_config.zephon.workers.map_parallelism == 3
+    values["dataset"] = {
+        "_target_": "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDatasetConfig",
+        "path_or_dataset_id": "unused",
+        "column_mapping": {"question": "prompt", "answer": "response"},
+    }
+    assert isinstance(
+        RecipeConfig(ConfigNode(values)).dataloader.dataset_config, ColumnMappedTextInstructionDatasetConfig
+    )
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -190,20 +218,40 @@ def test_special_token_policy_is_explicit_on_the_dataset_without_warnings(policy
         ZephonTextDatasetConfig(zephon={**_SETTINGS, "tokenize_special_tokens": policy})
 
 
-def test_numeric_token_overrides_require_corresponding_explicit_insertion():
+def test_instruction_special_tokens_validate_template_ownership():
+    for policy in ("assistant_eos", "tokenizer_default"):
+        with pytest.raises(ValueError, match="require use_hf_chat_template=false"):
+            ZephonInstructionDatasetConfig(
+                zephon=_SETTINGS,
+                column_mapping={"question": "q", "answer": "a"},
+                use_hf_chat_template=True,
+                special_tokens=policy,
+            )
     assert (
-        ZephonTextDatasetConfig(
-            zephon=_SETTINGS, tokenize_special_tokens="bos_eos", bos_token_id=0, eos_token_id=7
-        ).bos_token_id
-        == 0
+        ZephonInstructionDatasetConfig(
+            zephon=_SETTINGS,
+            column_mapping={"question": "q", "answer": "a"},
+            use_hf_chat_template=True,
+            special_tokens="eos",
+        ).special_tokens
+        == "eos"
     )
+
+
+@pytest.mark.parametrize("instruction", [False, True])
+def test_numeric_token_overrides_require_corresponding_explicit_insertion(instruction):
+    config_type = ZephonInstructionDatasetConfig if instruction else ZephonTextDatasetConfig
+    fields = {"zephon": _SETTINGS, **({"column_mapping": {"question": "q", "answer": "a"}} if instruction else {})}
+    policy_field = "special_tokens" if instruction else "tokenize_special_tokens"
+    assert config_type(**fields, **{policy_field: "bos_eos", "bos_token_id": 0, "eos_token_id": 7}).bos_token_id == 0
     for invalid_id in (True, -1, 1.5, "7"):
         with pytest.raises(ValueError, match="nonnegative integer"):
-            ZephonTextDatasetConfig(zephon=_SETTINGS, tokenize_special_tokens="bos_eos", eos_token_id=invalid_id)
+            config_type(**fields, **{policy_field: "bos_eos", "eos_token_id": invalid_id})
     for token_name, opposite_policy in (("bos_token_id", "eos"), ("eos_token_id", "bos")):
-        for policy in (opposite_policy, "none", "tokenizer_default"):
+        policies = [opposite_policy, "none", "tokenizer_default"] + (["assistant_eos", None] if instruction else [])
+        for policy in policies:
             with pytest.raises(ValueError, match=f"{token_name} requires an explicit"):
-                ZephonTextDatasetConfig(zephon=_SETTINGS, tokenize_special_tokens=policy, **{token_name: 7})
+                config_type(**fields, **{policy_field: policy, token_name: 7})
 
 
 @pytest.mark.parametrize(
@@ -222,6 +270,7 @@ def test_packing_defaults_are_resolved_once(algorithm, expected):
     [
         ("ZephonTextDatasetConfig", {}),
         ("ZephonPretokenizedTextDatasetConfig", {}),
+        ("ZephonInstructionDatasetConfig", {"column_mapping": {"question": "q", "answer": "a"}}),
     ],
 )
 def test_unknown_dataset_fields_are_actionable(target, kwargs):
@@ -601,6 +650,19 @@ def test_pretokenized_source_alias_keeps_encoding_settings():
     config = ZephonPretokenizedTextDatasetConfig(path_or_dataset_id="org/corpus", tokens_field="tokens")
     assert config.zephon.sources[0].path == "hf://org/corpus/train"
     assert config.tokens_field == "tokens"
+    assert replace(config).zephon.sources == config.zephon.sources
+
+
+def test_instruction_source_alias_keeps_supervision_settings():
+    config = ZephonInstructionDatasetConfig(
+        path_or_dataset_id="org/corpus",
+        column_mapping={"question": "q", "answer": "a"},
+        answer_only_loss_mask=False,
+        use_hf_chat_template=True,
+    )
+    assert config.zephon.sources[0].path == "hf://org/corpus/train"
+    assert config.column_mapping == {"question": "q", "answer": "a"}
+    assert not config.answer_only_loss_mask and config.use_hf_chat_template
     assert replace(config).zephon.sources == config.zephon.sources
 
 

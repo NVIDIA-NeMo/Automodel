@@ -46,7 +46,7 @@ def create_source_pipeline(
     """Create the shared source/runtime backbone before objective-specific stages.
 
     ``measure`` is an adapter-owned token counter for pretokenized or multimodal
-    documents. Raw text uses Zephon's built-in tokenizer counting.
+    documents. Raw text and SFT use Zephon's built-in tokenizer counting.
     """
     available, zephon = safe_import("zephon")
     if not available:

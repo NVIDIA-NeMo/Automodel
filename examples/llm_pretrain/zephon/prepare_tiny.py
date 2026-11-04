@@ -36,6 +36,16 @@ def main() -> None:
     PreTrainedTokenizerFast(
         tokenizer_object=tokenizer, unk_token="[UNK]", eos_token="[EOS]", pad_token="[EOS]"
     ).save_pretrained(args.output / "tokenizer")
+    instructions = args.output / "instructions"
+    instructions.mkdir(parents=True, exist_ok=True)
+    with (instructions / "train.jsonl").open("w") as stream:
+        for i in range(256):
+            stream.write(
+                json.dumps(
+                    {"question": f"w{i % 62} w{(i + 1) % 62}", "answer": f"w{(i + 2) % 62} w{(i + 3) % 62} [EOS]"}
+                )
+                + "\n"
+            )
     with (corpus / "train.jsonl").open("w") as stream:
         for i in range(256):
             stream.write(json.dumps({"text": " ".join(f"w{(i + j) % 62}" for j in range(31))}) + "\n")

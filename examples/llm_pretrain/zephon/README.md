@@ -32,7 +32,7 @@ are dropped.
 
 ## Configuring your data
 
-The source config chooses tokenization: raw text is tokenized
+The source config chooses tokenization: raw text or instructions are tokenized
 online, while pretokenized input keeps its supplied token IDs. Independently,
 select a `packing.pack_algorithm` to pack online or set it to `null` to preserve
 each supplied sequence. This supports online tokenization and packing, offline
@@ -126,9 +126,10 @@ Tokenization and online packing are independent choices:
 | Supplied data | Dataset config | `packing.pack_algorithm` | Online preparation |
 | --- | --- | --- | --- |
 | Raw text | `ZephonTextDatasetConfig` | `wrap`, `first_fit`, `best_fit`, or `best_fit_wrap` | Tokenize and pack |
+| Raw instructions | `ZephonInstructionDatasetConfig` | A packing algorithm | Chat tokenize and pack |
 | Pretokenized documents | `ZephonPretokenizedTextDatasetConfig` | A packing algorithm | Pack only |
 | Pretokenized, prepacked sequences | `ZephonPretokenizedTextDatasetConfig` | `null` | Preserve supplied sequences |
-| Raw text | `ZephonTextDatasetConfig` | `null` | Tokenize each document separately |
+| Raw text or instructions | The matching raw dataset config | `null` | Tokenize each document separately |
 
 For pretokenized data, `tokens_field` defaults to `input_ids`, and the optional
 `loss_mask_field` defaults to `loss_mask`. Supply unshifted, unpadded token lists
@@ -167,9 +168,48 @@ boundary-target masking. This is a flat token-sequence format, not an importer
 for framework cache files, source padding, cumulative-length tensors, or already
 shifted labels. The same `batched` and `thd` output formats remain available.
 
+### Instruction tuning
+
+For question/answer data, select `ZephonInstructionDatasetConfig`:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonInstructionDatasetConfig
+  path_or_dataset_id: your-org/instructions
+  split: train
+  column_mapping: {question: prompt, answer: completion}
+  answer_only_loss_mask: true
+  use_hf_chat_template: true
+  tokenizer:
+    pretrained_model_name_or_path: /path/to/model-or-tokenizer
+```
+
+This example reads the `prompt` and `completion` fields of each document.
+AutoModel normalizes the columns, and Zephon's `tokenize_chat()` performs chat
+tokenization and loss masking. The tokenizer's chat template supplies the
+conversation format. Set `use_hf_chat_template: false` for plain prompt/completion
+formatting.
+
+Select `ZephonInstructionDatasetConfig` directly for a Zephon instruction
+pipeline. Native dataset configs, such as
+`ColumnMappedTextInstructionDatasetConfig`, continue using their native loaders;
+they are not converted into Zephon configs. Use the source fields above for a
+single dataset, or `dataset.zephon.sources` for an explicit mixture. Other Zephon
+options stay under `dataset.zephon`, as in the text example above.
+
+The local example uses plain formatting and Flash Attention:
+
+```bash
+uv run python examples/llm_pretrain/zephon/prepare_tiny.py
+uv run automodel examples/llm_pretrain/zephon/sft.yaml --nproc-per-node 1
+```
+
+Install the matching Flash Attention dependencies, or select SDPA with
+`--model.attn_implementation sdpa`.
+
 ## How the integration works
 
-The dataset config selects raw text or pretokenized input. The Zephon
+The dataset config selects text, chat, or pretokenized input. The Zephon
 pipeline reads and mixes sources, prepares documents, packs them, and groups
 them into batches; online packing can be disabled. Zephon's `to_training()` handles shifting, padding, and
 collation. A small adapter then presents that result in the format expected by

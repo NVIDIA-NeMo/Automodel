@@ -14,20 +14,51 @@
 
 """Local token resolution and source normalization contracts."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from nemo_automodel.components.datasets.zephon.config import (
+    ZephonInstructionDatasetConfig,
     ZephonPretokenizedTextDatasetConfig,
 )
 from nemo_automodel.components.datasets.zephon.llm import (
     measure_pretokenized_document,
+    normalize_instruction_chat,
     normalize_pretokenized_document,
     resolve_token_ids,
 )
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
 _SETTINGS = {"sources": [{"name": "text", "path": "unused"}]}
+
+
+def test_instruction_normalization_retains_native_messages_and_whitespace():
+    config = ZephonInstructionDatasetConfig(
+        zephon=_SETTINGS, column_mapping={"context": "c", "question": "q", "answer": "a"}
+    )
+    payload = {"c": "w0", "q": "w1", "a": "w2 w3"}
+    assert normalize_instruction_chat(payload, config=config) == {
+        "messages": [
+            {"role": "user", "content": "w0 w1 "},
+            {"role": "assistant", "content": "w2 w3"},
+        ]
+    }
+    assert normalize_instruction_chat(payload, config=replace(config, use_hf_chat_template=True)) == {
+        "messages": [
+            {"role": "system", "content": "w0"},
+            {"role": "user", "content": "w1"},
+            {"role": "assistant", "content": "w2 w3"},
+        ]
+    }
+    assert payload == {"c": "w0", "q": "w1", "a": "w2 w3"}
+
+
+def test_instruction_normalization_rejects_nontext_columns():
+    config = ZephonInstructionDatasetConfig(zephon=_SETTINGS, column_mapping={"question": "q", "answer": "a"})
+    with pytest.raises(ValueError, match="must contain strings"):
+        normalize_instruction_chat({"q": ["w0"], "a": "w1"}, config=config)
 
 
 def test_pretokenized_schema_preserves_unshifted_tokens_and_masks():
@@ -102,6 +133,24 @@ def test_pretokenized_short_and_unsupervised_documents_are_retained():
         assert measure_pretokenized_document(payload, tokens_field="tokens") == len(payload["tokens"])
     with pytest.raises(ValueError, match="binary"):
         normalize_pretokenized_document({"tokens": [2, 3], "loss_mask": [0, 2]}, config=config, valid_token_ids=valid)
+
+
+def test_native_named_template_uses_selected_string_for_masks_and_every_render(tokenizer):
+    from nemo_automodel.components.datasets.llm.formatting_utils import format_chat_template
+
+    template = "{% for m in messages %}{{ m['content'] }} {% endfor %}"
+    messages = [{"role": "user", "content": "w0 w1"}, {"role": "assistant", "content": "w2 w3"}]
+    tokenizer.chat_template = template
+    expected = format_chat_template(tokenizer, messages, eos_token_id=1, pad_token_id=1, answer_only_loss_mask=True)
+    tokenizer.chat_template = {"named_only": template}
+    actual = format_chat_template(tokenizer, messages, eos_token_id=1, pad_token_id=1, answer_only_loss_mask=True)
+    assert actual == expected
+    # Tool-use selection must match what HF actually renders, including auxiliary masks.
+    tokenizer.chat_template = {"default": "{% generation %}unused{% endgeneration %}", "tool_use": template}
+    assert (
+        format_chat_template(tokenizer, messages, eos_token_id=1, pad_token_id=1, tools=[], answer_only_loss_mask=True)
+        == expected
+    )
 
 
 def test_pretokenized_positions_preserve_only_valid_offline_boundaries() -> None:

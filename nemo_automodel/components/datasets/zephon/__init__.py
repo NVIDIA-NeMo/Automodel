@@ -15,11 +15,13 @@
 """Zephon data backend for AutoModel recipes."""
 
 from nemo_automodel.components.datasets.zephon.config import (
+    ZephonInstructionDatasetConfig,
     ZephonPretokenizedTextDatasetConfig,
     ZephonTextDatasetConfig,
 )
 
 __all__ = [
+    "ZephonInstructionDatasetConfig",
     "ZephonPretokenizedTextDatasetConfig",
     "ZephonTextDatasetConfig",
 ]

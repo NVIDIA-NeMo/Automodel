@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Text tokenizer IDs and pretokenized-document validation."""
+"""Text tokenizer IDs, instruction preparation and pretokenized-document validation."""
 
 from __future__ import annotations
 
@@ -23,10 +23,16 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+    instruction_messages,
+    instruction_prompt_completion,
+)
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from nemo_automodel.components.datasets.zephon.config import (
+        ZephonInstructionDatasetConfig,
         ZephonPretokenizedTextDatasetConfig,
     )
 
@@ -84,6 +90,30 @@ def resolve_token_ids(tokenizer: PreTrainedTokenizerBase, *, pad_token_id: int |
     if eos is not None:
         return TokenIds(bos, eos, eos)
     raise ValueError("No padding ID is available; set dataset.zephon.packing.pad_token_id to an existing vocabulary ID")
+
+
+def map_instruction_fields(payload: Mapping[str, Any], config: ZephonInstructionDatasetConfig) -> dict[str, str]:
+    """Map raw columns into the same logical fields as the native dataset."""
+    mapped = {role: payload[column] for role, column in config.column_mapping.items()}
+    if not all(isinstance(value, str) for value in mapped.values()):
+        raise ValueError("Instruction context/question/answer columns must contain strings")
+    return mapped
+
+
+def normalize_instruction_chat(payload: Mapping[str, Any], *, config: ZephonInstructionDatasetConfig) -> dict[str, Any]:
+    """Normalize instruction columns into messages for Zephon's SFT tokenizer.
+
+    Chat inputs retain the native system/user/assistant order. Plain
+    prompt-completion inputs retain native prompt whitespace and carry the
+    complete prompt in one user message. No tokenization or masking occurs here.
+    """
+    mapped = map_instruction_fields(payload, config)
+    if config.use_hf_chat_template:
+        messages = instruction_messages(mapped)
+    else:
+        prompt, answer = instruction_prompt_completion(mapped)
+        messages = [{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}]
+    return {"messages": messages}
 
 
 def _validate_pretokenized_document(

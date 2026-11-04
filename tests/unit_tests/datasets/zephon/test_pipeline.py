@@ -24,6 +24,7 @@ from zephon.work import StaticMixtureWorkSource, TokenEstimation
 
 from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
+    ZephonInstructionDatasetConfig,
     ZephonPretokenizedTextDatasetConfig,
     ZephonTextDatasetConfig,
 )
@@ -32,10 +33,12 @@ from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
 
-@pytest.mark.parametrize("source_kind", ["text", "pretokenized"])
+@pytest.mark.parametrize("source_kind", ["text", "instruction", "pretokenized"])
 def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, source_kind):
     config = config.dataset_config
-    if source_kind == "pretokenized":
+    if source_kind == "instruction":
+        config = ZephonInstructionDatasetConfig(zephon=config.zephon, column_mapping={"question": "q", "answer": "a"})
+    elif source_kind == "pretokenized":
         config = ZephonPretokenizedTextDatasetConfig(zephon=config.zephon)
     config = replace(
         config,
@@ -88,16 +91,50 @@ def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, so
         else:
             assert normalize.call_args.kwargs["parallelism"] == 4
             text.assert_not_called()
-            chat.assert_not_called()
+            if source_kind == "instruction":
+                assert chat.call_args.kwargs["parallelism"] == 5
+                assert chat.call_args.kwargs["special_tokens"] == "tokenizer_default"
+                assert "add_special_tokens" not in chat.call_args.kwargs
+                assert "append_eos" not in chat.call_args.kwargs
+            else:
+                chat.assert_not_called()
 
 
+@pytest.mark.parametrize("instruction", [False, True])
 def test_numeric_overrides_reject_unknown_vocabulary_ids_before_source_start(
-    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast
+    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast, instruction: bool
 ) -> None:
-    source = ZephonTextDatasetConfig(
-        zephon=config.dataset_config.zephon, tokenize_special_tokens="eos", eos_token_id=9999
+    source_config = (
+        ZephonInstructionDatasetConfig(
+            zephon=config.dataset_config.zephon,
+            column_mapping={"question": "q", "answer": "a"},
+            special_tokens="eos",
+            eos_token_id=9999,
+        )
+        if instruction
+        else ZephonTextDatasetConfig(
+            zephon=config.dataset_config.zephon, tokenize_special_tokens="eos", eos_token_id=9999
+        )
     )
+    config = source_config
     with patch("nemo_automodel.components.datasets.zephon.pipeline.create_source_pipeline") as create_source:
         with pytest.raises(ValueError, match="eos_token_id=9999 is not an existing tokenizer vocabulary ID"):
-            create_text_pipeline(source, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
+            create_text_pipeline(config, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
         create_source.assert_not_called()
+
+
+@pytest.mark.parametrize("answer_only", [False, True])
+def test_chat_header_supervision_only_applies_to_assistant_loss(
+    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast, answer_only: bool
+) -> None:
+    tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    config = ZephonInstructionDatasetConfig(
+        zephon=config.dataset_config.zephon,
+        column_mapping={"question": "q", "answer": "a"},
+        use_hf_chat_template=True,
+        answer_only_loss_mask=answer_only,
+    )
+    with patch.object(Pipeline, "tokenize_chat", autospec=True, side_effect=Pipeline.tokenize_chat) as chat:
+        create_text_pipeline(config, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
+    assert chat.call_args.kwargs["supervise_assistant_header"] is answer_only
+    assert chat.call_args.kwargs["loss_scope"] == ("all_assistant" if answer_only else "all_tokens")

@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.datasets.zephon.loader import ZephonDataLoader
 
 TextSpecialTokens = Literal["bos_eos", "bos", "eos", "none", "tokenizer_default"]
+ChatSpecialTokens = Literal["bos_eos", "bos", "eos", "none", "tokenizer_default", "assistant_eos"]
 
 
 def _validate_insertion_overrides(
@@ -684,6 +685,96 @@ class ZephonTextDatasetConfig(ZephonLanguageDatasetConfig):
             special_tokens=self.tokenize_special_tokens,
             bos_token_id=bos_token_id if self.tokenize_special_tokens in ("bos", "bos_eos") else None,
             eos_token_id=eos_token_id if self.tokenize_special_tokens in ("eos", "bos_eos") else None,
+            parallelism=options.workers.tokenize_parallelism,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class ZephonInstructionDatasetConfig(ZephonLanguageDatasetConfig):
+    """Normalize instruction columns and delegate tokenization to Zephon.
+
+    ``special_tokens`` selects conversation-level BOS/EOS insertion, tokenizer
+    postprocessing, or the plain-chat per-assistant EOS policy. Its
+    default preserves the native formatting policy: templates own their
+    special tokens; plain prompt/completion uses tokenizer postprocessing.
+    Explicit ``bos``, ``eos`` and ``bos_eos`` use the same resolved tokenizer
+    IDs as raw text unless overridden by ``bos_token_id`` or ``eos_token_id``.
+    Overrides must exist in the vocabulary and require the corresponding
+    explicit insertion policy. They never rewrite template markers or
+    postprocessors.
+    """
+
+    column_mapping: dict[str, str]
+    answer_only_loss_mask: bool = True
+    use_hf_chat_template: bool = False
+    special_tokens: ChatSpecialTokens | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        roles = set(self.column_mapping)
+        if "answer" not in roles or not roles <= {"context", "question", "answer"} or len(roles) not in (2, 3):
+            raise ValueError("Instruction column_mapping needs answer and context and/or question")
+        if not all(isinstance(value, str) and value for value in self.column_mapping.values()):
+            raise ValueError("Instruction column names must be nonempty strings")
+        if self.special_tokens not in (None, "bos_eos", "bos", "eos", "none", "tokenizer_default", "assistant_eos"):
+            raise ValueError("Unknown instruction special_tokens policy")
+        if self.use_hf_chat_template and self.special_tokens in ("assistant_eos", "tokenizer_default"):
+            raise ValueError("assistant_eos and tokenizer_default require use_hf_chat_template=false")
+        _validate_insertion_overrides(
+            self.special_tokens, bos_token_id=self.bos_token_id, eos_token_id=self.eos_token_id
+        )
+
+    def tokenize(
+        self,
+        *,
+        tokenizer: PreTrainedTokenizerBase,
+        options: ZephonOptions,
+        ids: TokenIds,
+        seed: int,
+        dp_rank: int,
+        dp_world_size: int,
+    ) -> Pipeline:
+        """Build normalization and chat encoding with the raw-text token IDs.
+
+        Numeric IDs are supplied only for explicit conversation-level
+        insertion. A template or tokenizer-default policy retains its own
+        token choices instead of receiving an unused ID override.
+        """
+        from nemo_automodel.components.datasets.llm.formatting_utils import resolve_chat_template_string
+        from nemo_automodel.components.datasets.zephon.llm import normalize_instruction_chat
+        from nemo_automodel.components.datasets.zephon.pipeline import create_source_pipeline
+
+        if self.use_hf_chat_template and not tokenizer.chat_template:
+            raise ValueError("use_hf_chat_template requires a tokenizer chat template")
+        template = None
+        if (
+            self.use_hf_chat_template
+            and isinstance(tokenizer.chat_template, dict)
+            and "default" not in tokenizer.chat_template
+        ):
+            # Native AutoModel permits a named-only template; select its fallback explicitly.
+            template = resolve_chat_template_string(tokenizer.chat_template)
+        policy = self.special_tokens or ("none" if self.use_hf_chat_template else "tokenizer_default")
+        _validate_insertion_overrides(
+            policy, bos_token_id=self.bos_token_id, eos_token_id=self.eos_token_id, tokenizer=tokenizer
+        )
+        bos_token_id = self.bos_token_id if self.bos_token_id is not None else ids.bos
+        eos_token_id = self.eos_token_id if self.eos_token_id is not None else ids.eos
+        pipeline = create_source_pipeline(options, seed=seed, dp_rank=dp_rank, dp_world_size=dp_world_size)
+        pipeline.map_transform(
+            partial(normalize_instruction_chat, config=self), parallelism=options.workers.map_parallelism
+        )
+        return pipeline.tokenize_chat(
+            tokenizer=tokenizer,
+            chat_template=template,
+            apply_chat_template=self.use_hf_chat_template,
+            special_tokens=policy,
+            bos_token_id=bos_token_id if policy in ("bos", "bos_eos") else None,
+            eos_token_id=eos_token_id if policy in ("eos", "bos_eos") else None,
+            supervise_assistant_header=self.use_hf_chat_template and self.answer_only_loss_mask,
+            loss_scope="all_assistant" if self.answer_only_loss_mask else "all_tokens",
             parallelism=options.workers.tokenize_parallelism,
         )
 
