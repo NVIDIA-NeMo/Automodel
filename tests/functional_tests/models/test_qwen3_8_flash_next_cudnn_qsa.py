@@ -83,7 +83,7 @@ def _assert_parity(actual: torch.Tensor, reference: torch.Tensor) -> None:
     """
     assert actual.shape == reference.shape and torch.isfinite(actual).all()
     # Same independent-FP64 BF16 bound as the existing FA4 attention test.
-    # This is not a relaxation of the separate full-model Flex comparison gate.
+    # FP64 is the numerical acceptance reference; Flex comparisons are diagnostic.
     error = (actual.double() - reference).norm()
     assert error <= 0.004 * reference.norm() + 1e-8, (float(error), float(reference.norm()))
 

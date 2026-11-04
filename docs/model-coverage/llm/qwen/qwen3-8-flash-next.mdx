@@ -147,8 +147,11 @@ setup.
   First-order autograd saves cuDNN's original FP32 output and natural-log LSE;
   backward uses atomic accumulation and is not bitwise deterministic.
   This adapter explicitly uses the general backward path; the specialized
-  `causal_topk` backward is not enabled. Strict BF16 agreement with Flex at
-  sequence length 4096 has not been established.
+  `causal_topk` backward is not enabled. Numerical tests compare output and
+  gradients against independent FP64 attention using the existing BF16
+  relative-L2 bound of 0.004. Small-shape GB200 tests pass; target-length FP64
+  validation remains untested. Differences from Flex are diagnostic and are
+  not an additional numerical acceptance criterion.
   Deterministic training requests and CP>1 are rejected explicitly. Use `flex`
   for context parallelism. Kernel support does not establish full-model MFU or
   training-convergence parity; validate those for the intended recipe before
