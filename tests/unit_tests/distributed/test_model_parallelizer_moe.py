@@ -32,7 +32,6 @@ def test_parallelize_moe_forwards_the_moe_checkpointing_mode() -> None:
         moe_parallel_config=moe,
         strategy_config=None,
         activation_checkpointing="moe",
-        reapply_trainability=None,
         parallelize_axis_kwargs=lambda: {},
     )
     parallelizer = SimpleNamespace(_customizes_moe_fsdp=False)

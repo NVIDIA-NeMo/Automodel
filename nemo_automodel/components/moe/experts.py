@@ -1872,6 +1872,31 @@ def _torch_mm_experts_fwd(
     return output2
 
 
+def _grouped_linear_requires_grad(linear: nn.Module) -> bool | None:
+    """Return the ``requires_grad`` flag shared by every parameter of a grouped projection.
+
+    Expert-parallel regrouping replaces the projection with one sized for the
+    local experts, so only a module-wide flag can carry over.
+
+    Args:
+        linear: TE ``GroupedLinear`` holding one weight (and optional bias) per expert.
+
+    Returns:
+        The common ``requires_grad`` of the projection's parameters, or ``None`` if it
+        has no parameters.
+
+    Raises:
+        ValueError: If the projection mixes trainable and frozen parameters.
+    """
+    flags = {parameter.requires_grad for parameter in linear.parameters()}
+    if len(flags) > 1:
+        raise ValueError(
+            "TE grouped experts keep trainability through expert-parallel regrouping only per projection; "
+            f"found requires_grad values {sorted(flags)}. Freeze or unfreeze the whole experts module."
+        )
+    return flags.pop() if flags else None
+
+
 class GroupedExpertsTE(nn.Module):
     """
     MoE experts using TE's GroupedLinear module directly.
@@ -2249,7 +2274,15 @@ class GroupedExpertsTE(nn.Module):
         )
         self.num_local_experts = self.config.n_routed_experts // self.ep_size
 
+        # Regrouping builds new projections for the local experts; keep the
+        # trainability that was resolved before sharding.
+        gate_up_requires_grad = _grouped_linear_requires_grad(self.gate_up_linear)
+        down_requires_grad = _grouped_linear_requires_grad(self.down_linear)
         self._init_grouped_layers(self.num_local_experts)
+        if gate_up_requires_grad is not None:
+            self.gate_up_linear.requires_grad_(gate_up_requires_grad)
+        if down_requires_grad is not None:
+            self.down_linear.requires_grad_(down_requires_grad)
 
         token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,

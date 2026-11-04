@@ -365,7 +365,7 @@ def mock_distributed_env(monkeypatch):
         "nemo_automodel.components.distributed.parallelizer.fully_shard", fsdp_mock.fully_shard, raising=False
     )
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer.parallelize_module",
+        "nemo_automodel.components.distributed.parallelizer.parallelize_module_preserving_trainability",
         tp_parallel_mock.parallelize_module,
         raising=False,
     )
@@ -496,7 +496,7 @@ class TestMegatronFSDPStrategyParallelize:
         # Mock parallelize_module
         parallelize_module_mock = MagicMock()
         monkeypatch.setattr(
-            "nemo_automodel.components.distributed.parallelizer.parallelize_module",
+            "nemo_automodel.components.distributed.parallelizer.parallelize_module_preserving_trainability",
             parallelize_module_mock,
             raising=False,
         )
@@ -2698,7 +2698,6 @@ class TestSingleGpuActivationCheckpointing:
             ep_size=1,
             strategy_config=config,
             activation_checkpointing=activation_checkpointing,
-            reapply_trainability=None,
         )
         return ModelParallelizer(), context
 

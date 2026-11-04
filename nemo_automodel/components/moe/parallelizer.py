@@ -30,7 +30,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
 from torch.distributed.tensor import Replicate, Shard, distribute_module, distribute_tensor
-from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
+from torch.distributed.tensor.parallel import ParallelStyle
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed import parallelizer_utils
@@ -50,6 +50,7 @@ from nemo_automodel.components.distributed.multimodal_fsdp import (
     normalize_frozen_multimodal_sharding,
     shard_multimodal_module,
 )
+from nemo_automodel.components.distributed.parallel_styles import parallelize_module_preserving_trainability
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
@@ -405,7 +406,7 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
 
             exclude_from_tp_replica_sync(moe_module.experts)
         else:
-            parallelize_module(
+            parallelize_module_preserving_trainability(
                 module=moe_module.experts,
                 device_mesh=ep_mesh,
                 parallelize_plan=ExpertParallel(),
@@ -1274,17 +1275,11 @@ def parallelize_model(
     sequence_parallel: bool = False,
     enable_async_tensor_parallel: bool = False,
     frozen_multimodal_sharding: FrozenMultimodalSharding = "root",
-    reapply_trainability: Callable[[nn.Module], None] | None = None,
     model_parallelizer: "ModelParallelizer | None" = None,
 ) -> None:
-    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism.
+    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism."""
 
-    Args:
-        reapply_trainability: Optional callback that re-resolves parameter
-            trainability after TP/EP/AC surgery and immediately before FSDP
-            construction.
-    """
-
+    trainability = parallelizer_utils.trainability_by_name(model)
     tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
     if tp_enabled:
         if enable_async_tensor_parallel:
@@ -1321,7 +1316,7 @@ def parallelize_model(
             len(model_parallel_plan),
             ", ".join(sorted(model_parallel_plan)),
         )
-        parallelize_module(model, tp_mesh, model_parallel_plan)
+        parallelize_module_preserving_trainability(model, tp_mesh, model_parallel_plan)
         ensure_tied_lm_head(model)
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
@@ -1347,8 +1342,7 @@ def parallelize_model(
             moe_only=_is_moe_only_ac(activation_checkpointing),
         )
 
-    if reapply_trainability is not None:
-        reapply_trainability(model)
+    parallelizer_utils.assert_trainability_unchanged(model, trainability)
 
     if ep_shard_axis_names is not None:
         ep_shard_mesh = moe_mesh[ep_shard_axis_names]

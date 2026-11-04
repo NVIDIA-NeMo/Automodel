@@ -14,7 +14,6 @@
 
 import logging
 import warnings
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -51,7 +50,6 @@ def parallelize_megatron_fsdp(
     device_mesh: DeviceMesh,
     *,
     optimizer: torch.optim.Optimizer | None = None,
-    reapply_trainability: Callable[[nn.Module], None] | None = None,
 ) -> tuple[nn.Module, torch.optim.Optimizer | None]:
     """Apply Megatron-FSDP and tensor parallelism from a typed config."""
     if dist.get_world_size() == 1:
@@ -62,8 +60,6 @@ def parallelize_megatron_fsdp(
                 model.gradient_checkpointing_enable()
             else:
                 logger.error("Model does not support gradient checkpointing. Skipping.")
-        if reapply_trainability is not None:
-            reapply_trainability(model)
         return model, optimizer
 
     if config.activation_checkpointing:
@@ -114,7 +110,6 @@ def parallelize_megatron_fsdp(
         fsdp_double_buffer=config.fsdp_double_buffer,
         dp_shard_dim=dp_shard_dim,
         tp_dim="tp",
-        reapply_trainability=reapply_trainability,
     )
 
 
@@ -158,7 +153,6 @@ class MegatronFSDPManager:
         self,
         model: nn.Module,
         optimizer: torch.optim.Optimizer | None = None,
-        reapply_trainability: Callable[[nn.Module], None] | None = None,
     ) -> tuple[nn.Module, torch.optim.Optimizer | None]:
         """
         Parallelizes the given model using MegatronFSDP and TP sharding strategies.
@@ -169,8 +163,6 @@ class MegatronFSDPManager:
                 model.finish_grad_sync() before optimizer.step(),
                 model.install_optimized_model_weights() and model.zero_grad_buffer()
                 after optimizer.zero_grad().
-            reapply_trainability: Optional callback that re-resolves parameter
-                trainability after model surgery and before FSDP construction.
 
         Returns:
             tuple: (parallelized_model, optimizer)
@@ -180,7 +172,6 @@ class MegatronFSDPManager:
             self.config,
             self.device_mesh,
             optimizer=optimizer,
-            reapply_trainability=reapply_trainability,
         )
 
 

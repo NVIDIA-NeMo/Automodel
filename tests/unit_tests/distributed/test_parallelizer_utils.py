@@ -34,12 +34,14 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _group_params_by_dtype,
     _make_compute_dtype_fn,
     _mp_policy_with_param_dtype,
+    assert_trainability_unchanged,
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
     get_internal_fsdp_mp_policy,
     iter_maximal_uniform_dtype_subtrees,
     reject_unsupported_mtp_cp,
     reject_unsupported_mtp_cp_pp,
+    trainability_by_name,
 )
 
 
@@ -1416,3 +1418,27 @@ def test_compute_dtype_pins_logical_names_through_activation_checkpointing():
     assert compute_dtype_of(attention.sinks_param.weight) == torch.float32
     assert compute_dtype_of(attention.sinks_param.scale) == torch.float32
     assert compute_dtype_of(attention.proj.weight) == torch.bfloat16
+
+
+def test_trainability_check_ignores_checkpoint_wrappers_and_new_parameters():
+    """Wrapping a layer renames its parameters; the canonical names still match."""
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    model[0].requires_grad_(False)
+    before = trainability_by_name(model)
+
+    model[1] = checkpoint_wrapper(model[1])
+    model.register_parameter("added", nn.Parameter(torch.zeros(1), requires_grad=False))
+
+    assert_trainability_unchanged(model, before)
+
+
+def test_trainability_check_reports_a_replaced_frozen_parameter():
+    """A fresh nn.Parameter defaults to requires_grad=True, which FSDP would then capture."""
+    model = nn.Sequential(nn.Linear(2, 2))
+    model[0].weight.requires_grad_(False)
+    before = trainability_by_name(model)
+
+    model[0].weight = nn.Parameter(model[0].weight.detach().clone())
+
+    with pytest.raises(RuntimeError, match=r"0\.weight"):
+        assert_trainability_unchanged(model, before)

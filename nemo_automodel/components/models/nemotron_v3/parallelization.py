@@ -15,7 +15,6 @@
 """Model-owned distributed parallelization for Nemotron-H and Nemotron-V3."""
 
 import logging
-from collections.abc import Callable
 from typing import Dict, Union
 
 import torch
@@ -23,13 +22,20 @@ from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
-from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, parallelize_module
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
 from torch.distributed.tensor.placement_types import Shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
-from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
-from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
+from nemo_automodel.components.distributed.parallel_styles import (
+    parallelize_module_preserving_trainability,
+    translate_to_lora,
+)
+from nemo_automodel.components.distributed.parallelizer_utils import (
+    assert_trainability_unchanged,
+    fully_shard_by_dtype,
+    trainability_by_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +64,11 @@ class NemotronHModelParallelizer(ModelParallelizer):
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
         reshard_after_forward: bool | None = None,
-        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         """Apply every requested parallelism to a Nemotron-H model."""
         del tp_shard_plan, kwargs
+        trainability = trainability_by_name(model)
         if sequence_parallel:
             raise ValueError("Sequence parallelism is not supported for NemotronHForCausalLM")
         logger.info("Using the Nemotron-H model-owned parallelization policy.")
@@ -70,7 +76,7 @@ class NemotronHModelParallelizer(ModelParallelizer):
         block_container, layers = _decoder_blocks(model)
         tp_mesh = device_mesh[tp_mesh_name]
         if tp_mesh.size() > 1:
-            parallelize_module(
+            parallelize_module_preserving_trainability(
                 model,
                 tp_mesh,
                 {"lm_head": translate_to_lora(ColwiseParallel(output_layouts=Shard(-1), use_local_output=False))},
@@ -81,7 +87,7 @@ class NemotronHModelParallelizer(ModelParallelizer):
             }
             for layer in layers:
                 if layer.block_type == "mlp":
-                    parallelize_module(layer, tp_mesh, mlp_plan)
+                    parallelize_module_preserving_trainability(layer, tp_mesh, mlp_plan)
 
         cp_mesh = device_mesh["cp"] if "cp" in device_mesh.mesh_dim_names else None
         if cp_mesh is not None and cp_mesh.size() > 1:
@@ -129,8 +135,7 @@ class NemotronHModelParallelizer(ModelParallelizer):
                     block_container[key] = checkpoint_wrapper(layer)
             _, layers = _decoder_blocks(model)
 
-        if reapply_trainability is not None:
-            reapply_trainability(model)
+        assert_trainability_unchanged(model, trainability)
 
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
         fp32_module_names = tuple(getattr(model, "_keep_in_fp32_modules_strict", None) or ())

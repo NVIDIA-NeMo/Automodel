@@ -15,7 +15,6 @@
 """Diffusers-owned adapters for model parallelization sidecars."""
 
 import logging
-from collections.abc import Callable
 from typing import Dict, Union
 
 import torch
@@ -27,11 +26,16 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
-from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel, parallelize_module
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
 
 from nemo_automodel.components.distributed import ModelParallelizer
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.components.distributed.parallel_styles import parallelize_module_preserving_trainability
 from nemo_automodel.components.distributed.parallelizer import apply_fsdp2_sharding_recursively
+from nemo_automodel.components.distributed.parallelizer_utils import (
+    assert_trainability_unchanged,
+    trainability_by_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +55,11 @@ class WanModelParallelizer(ModelParallelizer):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
-        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         """Parallelize a Wan transformer."""
         del sequence_parallel, tp_shard_plan
+        trainability = trainability_by_name(model)
         tp_mesh = device_mesh[tp_mesh_name]
         dp_mesh = get_fsdp_dp_mesh(device_mesh, dp_replicate_mesh_name, dp_shard_cp_mesh_name)
 
@@ -63,32 +67,36 @@ class WanModelParallelizer(ModelParallelizer):
             try:
                 condition = getattr(model, "condition_embedder", None)
                 if condition is not None and hasattr(condition, "text_embedder"):
-                    condition.text_embedder = parallelize_module(
+                    condition.text_embedder = parallelize_module_preserving_trainability(
                         condition.text_embedder,
                         tp_mesh,
                         {"linear_1": ColwiseParallel(), "linear_2": RowwiseParallel()},
                     )
                 if condition is not None and hasattr(condition, "time_embedder"):
-                    condition.time_embedder = parallelize_module(
+                    condition.time_embedder = parallelize_module_preserving_trainability(
                         condition.time_embedder,
                         tp_mesh,
                         {"linear_1": ColwiseParallel(), "linear_2": RowwiseParallel()},
                     )
                 if condition is not None and hasattr(condition, "time_proj"):
-                    condition.time_proj = parallelize_module(condition.time_proj, tp_mesh, {"": ColwiseParallel()})
+                    condition.time_proj = parallelize_module_preserving_trainability(
+                        condition.time_proj, tp_mesh, {"": ColwiseParallel()}
+                    )
             except Exception as error:
                 logger.warning("Wan strategy: failed to TP condition embedders: %s", error)
 
             try:
                 for block in getattr(model, "blocks", ()):
                     if hasattr(block, "ffn"):
-                        block.ffn = parallelize_module(
+                        block.ffn = parallelize_module_preserving_trainability(
                             block.ffn,
                             tp_mesh,
                             {"net.0.proj": ColwiseParallel(), "net.2": RowwiseParallel()},
                         )
                 if hasattr(model, "proj_out"):
-                    model.proj_out = parallelize_module(model.proj_out, tp_mesh, {"": RowwiseParallel()})
+                    model.proj_out = parallelize_module_preserving_trainability(
+                        model.proj_out, tp_mesh, {"": RowwiseParallel()}
+                    )
             except Exception as error:
                 logger.warning("Wan strategy: failed to TP blocks/proj_out: %s", error)
 
@@ -106,8 +114,7 @@ class WanModelParallelizer(ModelParallelizer):
                 output_dtype=None,
                 cast_forward_inputs=False,
             )
-        if reapply_trainability is not None:
-            reapply_trainability(model)
+        assert_trainability_unchanged(model, trainability)
         apply_fsdp2_sharding_recursively(
             model,
             dp_mesh,
@@ -141,7 +148,6 @@ class HunyuanModelParallelizer(ModelParallelizer):
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
-        reapply_trainability: Callable[[nn.Module], None] | None = None,
         **kwargs,
     ) -> nn.Module:
         """Parallelize a Hunyuan-style transformer."""
@@ -160,8 +166,6 @@ class HunyuanModelParallelizer(ModelParallelizer):
                     model.transformer_blocks[index],
                     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
                 )
-        if reapply_trainability is not None:
-            reapply_trainability(model)
         apply_fsdp2_sharding_recursively(
             model,
             dp_mesh,

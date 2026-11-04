@@ -25,12 +25,47 @@ from torch.distributed.tensor.parallel import (
     ParallelStyle,
     RowwiseParallel,
     SequenceParallel,
+    parallelize_module,
 )
 
 from nemo_automodel.components.distributed.tp_replicas import mark_tp_replica_gradient_reduction
 from nemo_automodel.shared.tp_linear import tp_linear_forward
 
-__all__ = ["ReplicatedWithGradAllReduce", "translate_to_lora"]
+__all__ = ["ReplicatedWithGradAllReduce", "parallelize_module_preserving_trainability", "translate_to_lora"]
+
+
+def parallelize_module_preserving_trainability(
+    module: nn.Module,
+    device_mesh: DeviceMesh,
+    parallelize_plan: ParallelStyle | dict[str, ParallelStyle],
+) -> nn.Module:
+    """Apply ``parallelize_module`` without changing which parameters train.
+
+    PyTorch's stock tensor-parallel styles re-register every parameter as
+    ``nn.Parameter(distribute_tensor(...))``, which defaults to
+    ``requires_grad=True``, so frozen weights come back trainable. The styles
+    keep parameter names, so frozen flags are restored by name. Trainability is
+    resolved once before sharding, and FSDP/DDP capture the flags they see.
+    Automodel's own styles already pass ``requires_grad`` (``_distribute_param``).
+
+    Args:
+        module: Module to parallelize in place.
+        device_mesh: One-dimensional tensor-parallel mesh.
+        parallelize_plan: Style for ``module`` or a map from submodule FQN to style.
+
+    Returns:
+        The module returned by ``parallelize_module`` (``module`` itself).
+    """
+    frozen = {
+        name for name, parameter in module.named_parameters(remove_duplicate=False) if not parameter.requires_grad
+    }
+    try:
+        return parallelize_module(module, device_mesh, parallelize_plan)
+    finally:
+        # Restore even when a style fails part-way, since some callers log and continue.
+        for name, parameter in module.named_parameters(remove_duplicate=False):
+            if name in frozen:
+                parameter.requires_grad_(False)
 
 
 class ReplicatedWithGradAllReduce(ParallelStyle):

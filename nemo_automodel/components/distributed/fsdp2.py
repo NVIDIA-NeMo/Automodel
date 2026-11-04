@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import warnings
-from collections.abc import Callable
 
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -123,15 +122,12 @@ class FSDP2Manager:
     def parallelize(
         self,
         model: nn.Module,
-        reapply_trainability: Callable[[nn.Module], None] | None = None,
     ) -> nn.Module:
         """
         Parallelizes the given model using FSDP2 and TP sharding strategies.
 
         Args:
             model (nn.Module): The model to be parallelized.
-            reapply_trainability: Optional callback that re-resolves parameter
-                trainability after model surgery and before FSDP construction.
 
         Returns:
             The parallelized model.
@@ -142,7 +138,6 @@ class FSDP2Manager:
             strategy_config=self.config,
             moe_parallel_config=self.moe_config,
             activation_checkpointing=self.activation_checkpointing,
-            reapply_trainability=reapply_trainability,
         )
         model = parallelize_model(
             model,

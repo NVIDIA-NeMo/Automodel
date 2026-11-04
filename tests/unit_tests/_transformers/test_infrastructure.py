@@ -172,20 +172,18 @@ def test_mesh_context_includes_moe_policy():
     assert context.moe_parallel_config is moe_config
 
 
-def test_pipeline_parallelizer_forwards_trainability_rebind():
-    """Each PP stage receives the same pre-wrapper trainability policy."""
+def test_pipeline_parallelizer_uses_the_shared_mesh_context():
+    """Each PP stage is parallelized with the recipe's context, not a per-stage copy."""
     from nemo_automodel._transformers import infrastructure
     from nemo_automodel.components.distributed import FSDP2Config, MeshContext
 
     model = torch.nn.Linear(2, 2)
-    callback = MagicMock()
     context = MeshContext(strategy_config=FSDP2Config())
 
     with patch.object(infrastructure, "parallelize_model", return_value=model) as parallelize:
-        assert infrastructure.parallelize_for_pp(model, mesh_context=context, reapply_trainability=callback) is model
+        assert infrastructure.parallelize_for_pp(model, mesh_context=context) is model
 
-    forwarded_context = parallelize.call_args.args[1]
-    assert forwarded_context.reapply_trainability is callback
+    assert parallelize.call_args.args[1] is context
 
 
 # =============================================================================
@@ -319,14 +317,8 @@ def _run_trainability_infrastructure(model, freeze_config, peft_config=None):
     class _ReplacingWrapper:
         mp_policy = None
 
-        def parallelize(self, model, reapply_trainability=None):
-            model = _replace_and_wrap_parameters(model)
-            assert reapply_trainability is not None
-            reapply_trainability(model)
-            model.trainability_at_wrapper_construction = {
-                name: param.requires_grad for name, param in model.named_parameters(remove_duplicate=False)
-            }
-            return model
+        def parallelize(self, model):
+            return _replace_and_wrap_parameters(model)
 
     freeze_kwargs = {"freeze_config": freeze_config} if freeze_config is not None else {}
     with (
@@ -375,9 +367,6 @@ def test_peft_freeze_config_survives_name_changing_parameter_replacement(
     assert model.lora_weight.requires_grad
     assert model.vision_adapter.lora_weight.requires_grad is vision_lora_trainable
     assert not model.parallel_parameter.requires_grad
-    assert model.trainability_at_wrapper_construction["extension.0.weight"] is extension_trainable
-    assert model.trainability_at_wrapper_construction["vision_adapter.lora_weight"] is vision_lora_trainable
-    assert not model.trainability_at_wrapper_construction["parallel_parameter"]
 
 
 def test_freeze_config_rebinds_after_name_changing_replacement_under_full_finetuning():
@@ -395,10 +384,6 @@ def test_freeze_config_rebinds_after_name_changing_replacement_under_full_finetu
     # Parameters the policy does not select retain their model-owned trainability.
     assert not model.model_constant.requires_grad
     assert model.parallel_parameter.requires_grad
-    assert not model.trainability_at_wrapper_construction["base.weight"]
-    assert model.trainability_at_wrapper_construction["extension.0.weight"]
-    assert not model.trainability_at_wrapper_construction["model_constant"]
-    assert model.trainability_at_wrapper_construction["parallel_parameter"]
 
 
 def test_freeze_config_unfreeze_keeps_parameter_storage_dtype():

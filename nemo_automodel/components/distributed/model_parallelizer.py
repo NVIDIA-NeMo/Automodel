@@ -119,7 +119,6 @@ def _parallelize_fsdp2(
         reshard_after_forward=config.reshard_after_forward,
         activation_checkpointing_scope=config.activation_checkpointing_scope,
         frozen_multimodal_sharding=config.multimodal.frozen_sharding,
-        reapply_trainability=mesh_context.reapply_trainability,
     )
 
 
@@ -170,8 +169,6 @@ def _parallelize_unsharded_fsdp2(
                 apply_full_layer_checkpointing_to_layers(model, layers)
             else:
                 apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
-    if mesh_context.reapply_trainability is not None:
-        mesh_context.reapply_trainability(model)
     # No fully_shard hooks run on this path, so its mixed-precision policy
     # cannot provide compute casts. Autocast preserves resident/master weights
     # and precision-sensitive buffers, including during checkpoint recomputation.
@@ -200,7 +197,6 @@ def _parallelize_ddp(model: nn.Module, mesh_context: MeshContext) -> nn.Module:
         model,
         config,
         device=mesh_context.ddp_device,
-        reapply_trainability=mesh_context.reapply_trainability,
     )
 
 
@@ -215,7 +211,6 @@ def _parallelize_megatron_fsdp(model: nn.Module, mesh_context: MeshContext) -> n
         model,
         config,
         mesh_context.device_mesh,
-        reapply_trainability=mesh_context.reapply_trainability,
     )[0]
 
 
@@ -282,7 +277,6 @@ def _parallelize_moe(
         sequence_parallel=sequence_parallel,
         enable_async_tensor_parallel=enable_async_tensor_parallel,
         frozen_multimodal_sharding=frozen_multimodal_sharding,
-        reapply_trainability=mesh_context.reapply_trainability,
         model_parallelizer=parallelizer if parallelizer._customizes_moe_fsdp else None,
         **mesh_context.parallelize_axis_kwargs(),
     )

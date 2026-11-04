@@ -2411,6 +2411,39 @@ def test_te_construction_ep_rebuild_and_routing_gradients(moe_config, fake_nativ
     assert fake_native_te.supported.call_count == int(native)
 
 
+@pytest.mark.parametrize("frozen", [False, True])
+def test_te_expert_parallel_regrouping_keeps_projection_trainability(moe_config, fake_native_te, frozen):
+    """EP regrouping rebuilds both projections for the local experts without changing which of them train."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    experts = GroupedExpertsTE(moe_config, backend=BackendConfig(experts="te", dispatcher="deepep"))
+    experts.requires_grad_(not frozen)
+    projections_before = (experts.gate_up_linear, experts.down_linear)
+    mesh = Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 1
+    mesh.mesh_dim_names = ("ep",)
+
+    experts.init_token_dispatcher(mesh)
+
+    assert experts.gate_up_linear is not projections_before[0]
+    assert experts.down_linear is not projections_before[1]
+    assert experts.gate_up_linear.num_gemms == moe_config.n_routed_experts // 2
+    for projection in (experts.gate_up_linear, experts.down_linear):
+        assert all(parameter.requires_grad is not frozen for parameter in projection.parameters())
+
+
+def test_te_expert_regrouping_rejects_mixed_projection_trainability():
+    """Per-parameter trainability cannot be mapped onto the regrouped local experts."""
+    from nemo_automodel.components.moe.experts import _grouped_linear_requires_grad
+
+    projection = torch.nn.Linear(2, 2)
+    assert _grouped_linear_requires_grad(projection) is True
+    projection.weight.requires_grad_(False)
+    with pytest.raises(ValueError, match="whole experts module"):
+        _grouped_linear_requires_grad(projection)
+
+
 @pytest.mark.parametrize("with_post", [False, True])
 @pytest.mark.parametrize("train_router", [False, True])
 def test_te_router_weight_after_down_scales_post_expert_output(moe_config, fake_native_te, with_post, train_router):

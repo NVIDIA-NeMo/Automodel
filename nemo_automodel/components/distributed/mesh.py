@@ -28,7 +28,6 @@ YAML / dict parsing belongs in the recipe layer — see
 ``nemo_automodel.recipes._dist_utils``.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple
@@ -37,7 +36,7 @@ from nemo_automodel.components.distributed.config import ActivationCheckpointing
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 
 if TYPE_CHECKING:
-    from torch import device, nn
+    from torch import device
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -115,8 +114,6 @@ class MeshContext:
         strategy_config: Resolved DDP, FSDP2, or Megatron-FSDP policy.
         moe_parallel_config: Optional MoE-specific parallelization policy.
         activation_checkpointing: Resolved activation-checkpointing mode.
-        reapply_trainability: Optional callback run after model surgery and before
-            distributed wrapping.
         cp_ring_degree: Ring-attention factor of the context-parallel axis.
         cp_ulysses_degree: Ulysses factor of the context-parallel axis. ``None``
             lets the consumer use the full context-parallel axis.
@@ -133,7 +130,6 @@ class MeshContext:
     strategy_config: DistributedStrategyConfig | None = None
     moe_parallel_config: "MoEParallelizerConfig | None" = None
     activation_checkpointing: ActivationCheckpointingMode = False
-    reapply_trainability: "Callable[[nn.Module], None] | None" = field(default=None, repr=False)
 
     # Optional decomposition of the CP axis for runtimes that distinguish ring
     # and Ulysses dimensions. ``None`` means pure Ulysses over the full CP axis.
@@ -225,7 +221,6 @@ class MeshContext:
         *,
         moe_parallel_config: "MoEParallelizerConfig | None" = None,
         activation_checkpointing: ActivationCheckpointingMode = False,
-        reapply_trainability: "Callable[[nn.Module], None] | None" = None,
         cp_ring_degree: int = 1,
         cp_ulysses_degree: int | None = None,
         world_size: int | None = None,
@@ -242,8 +237,6 @@ class MeshContext:
             moe_parallel_config: Optional MoE-specific parallelization policy.
             activation_checkpointing: Activation-checkpointing mode applied by
                 the model sidecar.
-            reapply_trainability: Optional callback run after model surgery and
-                before distributed wrapping.
             cp_ring_degree: Ring-attention factor of the context-parallel axis.
             cp_ulysses_degree: Ulysses factor of the context-parallel axis.
             world_size: Total process count. If ``None``, inferred from the
@@ -273,7 +266,6 @@ class MeshContext:
             strategy_config=strategy_config,
             moe_parallel_config=moe_parallel_config,
             activation_checkpointing=activation_checkpointing,
-            reapply_trainability=reapply_trainability,
             cp_ring_degree=cp_ring_degree,
             cp_ulysses_degree=cp_ulysses_degree,
         )
@@ -288,7 +280,6 @@ class MeshContext:
         strategy_config: DistributedStrategyConfig | None = None,
         moe_parallel_config: "MoEParallelizerConfig | None" = None,
         activation_checkpointing: ActivationCheckpointingMode = False,
-        reapply_trainability: "Callable[[nn.Module], None] | None" = None,
         cp_ring_degree: int = 1,
         cp_ulysses_degree: int | None = None,
     ) -> "MeshContext":
@@ -305,8 +296,6 @@ class MeshContext:
             moe_parallel_config: Optional MoE-specific parallelization policy.
             activation_checkpointing: Activation-checkpointing mode applied by
                 the model sidecar.
-            reapply_trainability: Optional callback run after model surgery and
-                before distributed wrapping.
             cp_ring_degree: Ring-attention factor of the context-parallel axis.
             cp_ulysses_degree: Ulysses factor of the context-parallel axis.
         """
@@ -316,7 +305,6 @@ class MeshContext:
             strategy_config=strategy_config,
             moe_parallel_config=moe_parallel_config,
             activation_checkpointing=activation_checkpointing,
-            reapply_trainability=reapply_trainability,
             cp_ring_degree=cp_ring_degree,
             cp_ulysses_degree=cp_ulysses_degree,
         )

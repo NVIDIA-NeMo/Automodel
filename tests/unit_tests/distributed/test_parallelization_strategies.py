@@ -215,7 +215,9 @@ def mock_distributed_env(monkeypatch):
     # Mock tensor parallel functions
     parallelize_module_mock = MagicMock()
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer.parallelize_module", parallelize_module_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer.parallelize_module_preserving_trainability",
+        parallelize_module_mock,
+        raising=False,
     )
 
     # Mock checkpoint wrapper. Sub-module/whole-block wrapping now lives in
@@ -304,7 +306,6 @@ class TestModelParallelizer:
             "dp_shard_cp_mesh_name",
             "tp_mesh_name",
             "frozen_multimodal_sharding",
-            "reapply_trainability",
         ]
 
         for param in required_params:
@@ -479,23 +480,23 @@ class TestModelParallelizer:
         mock_distributed_env["get_plan"].assert_called_once()
         mock_distributed_env["parallelize_module"].assert_called_once()
 
-    def test_trainability_rebind_runs_after_tp_and_before_fsdp(self, strategy, mock_device_mesh, mock_distributed_env):
-        """FSDP captures the selector result on the post-TP hierarchy."""
+    def test_surgery_that_changes_trainability_fails_before_fsdp(
+        self, strategy, mock_device_mesh, mock_distributed_env
+    ):
+        """FSDP must capture the trainability resolved before parallelization."""
         mesh, _, _, tp_mesh = mock_device_mesh
         tp_mesh.size.return_value = 2
         model = MockModel()
-        events = []
+        frozen = model.model.layers[0].mlp.weight
+        frozen.requires_grad_(False)
 
-        mock_distributed_env["parallelize_module"].side_effect = lambda *_args, **_kwargs: events.append("tp")
-        mock_distributed_env["apply_fsdp"].side_effect = lambda *_args, **_kwargs: events.append("fsdp")
+        # A TP step that re-creates the weight without its flag, like PyTorch's stock styles.
+        mock_distributed_env["parallelize_module"].side_effect = lambda *_args, **_kwargs: frozen.requires_grad_(True)
 
-        strategy._apply(
-            model=model,
-            device_mesh=mesh,
-            reapply_trainability=lambda _model: events.append("trainability"),
-        )
+        with pytest.raises(RuntimeError, match=r"model\.layers\.0\.mlp\.weight"):
+            strategy._apply(model=model, device_mesh=mesh)
 
-        assert events == ["tp", "trainability", "fsdp"]
+        mock_distributed_env["apply_fsdp"].assert_not_called()
 
     def test_parallelize_with_activation_checkpointing(self, strategy, mock_device_mesh, mock_distributed_env):
         """Test parallelization with activation checkpointing enabled."""
@@ -845,7 +846,7 @@ class TestNemotronHModelParallelizer:
             logger.setLevel(old_level)
 
     @pytest.mark.parametrize("tp_size", [1, 2])
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module_preserving_trainability")
     @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
     @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
     def test_nemotron_specific_parallelization(
@@ -912,7 +913,7 @@ class TestNemotronHModelParallelizer:
     @patch("nemo_automodel.components.models.nemotron_v3.parallelization.checkpoint_wrapper")
     @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
     @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module_preserving_trainability")
     def test_activation_checkpointing(
         self,
         mock_parallelize,
@@ -1181,7 +1182,7 @@ class TestWanModelParallelizer:
 
         parallelize_module_mock = MagicMock(side_effect=lambda module, *_args, **_kwargs: module)
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.parallelize_module",
+            "nemo_automodel._diffusers.parallelization.parallelize_module_preserving_trainability",
             parallelize_module_mock,
             raising=False,
         )
@@ -1238,7 +1239,7 @@ class TestWanModelParallelizer:
 
         flaky_mock = MagicMock(side_effect=flaky_parallelize)
         monkeypatch.setattr(
-            "nemo_automodel._diffusers.parallelization.parallelize_module",
+            "nemo_automodel._diffusers.parallelization.parallelize_module_preserving_trainability",
             flaky_mock,
             raising=False,
         )
@@ -1358,7 +1359,7 @@ class TestFsdp2StrategyParallelizeIntegration:
         # Verify that default strategy functions were called
         mock_distributed_env["extract_layer_groups"].assert_called_once_with(model)
 
-    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module")
+    @patch("nemo_automodel.components.models.nemotron_v3.parallelization.parallelize_module_preserving_trainability")
     @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard")
     @patch("nemo_automodel.components.models.nemotron_v3.parallelization.fully_shard_by_dtype")
     def test_delegates_to_nemotron_strategy(
@@ -1431,7 +1432,6 @@ class TestFsdp2StrategyParallelizeIntegration:
             "dp_shard_cp_mesh_name",
             "tp_mesh_name",
             "frozen_multimodal_sharding",
-            "reapply_trainability",
         ]
 
         for param in expected_params:

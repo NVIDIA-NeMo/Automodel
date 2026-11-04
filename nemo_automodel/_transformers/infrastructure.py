@@ -24,7 +24,6 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
-from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
 from functools import partial
@@ -204,7 +203,7 @@ def _apply_runtime_compatibility_fixes(model):
 
 
 #  Sharding helpers
-def _shard_pp(autopipeline, model, loss_fn, parallelize_fn, reapply_trainability):
+def _shard_pp(autopipeline, model, loss_fn, parallelize_fn):
     trainable_params, total_params = count_model_parameters(model)
     # Store param info on autopipeline before splitting so it can be accessed later
     # This captures the full model's param counts before PP shards it across ranks
@@ -213,27 +212,24 @@ def _shard_pp(autopipeline, model, loss_fn, parallelize_fn, reapply_trainability
     if get_world_size_safe() == 1:
         logger.info("World size is 1, skipping autopipeline.")
     else:
-        if parallelize_fn is not None:
-            parallelize_fn = partial(parallelize_fn, reapply_trainability=reapply_trainability)
         autopipeline.build(model, loss_fn=loss_fn, parallelize_fn=parallelize_fn)
         model = autopipeline
     return model
 
 
-def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext, reapply_trainability):
+def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext):
     """Apply EP + FSDP sharding (non-PP path)."""
     if parallelize_fn is not None and get_world_size_safe() > 1:
         parallelize_fn(
             model,
             world_mesh=mesh.device_mesh,
             moe_mesh=mesh.moe_mesh,
-            reapply_trainability=reapply_trainability,
             **mesh.parallelize_axis_kwargs(),
         )
     elif isinstance(model_wrapper, MeshContext):
-        model = parallelize_model(model, replace(model_wrapper, reapply_trainability=reapply_trainability))
+        model = parallelize_model(model, model_wrapper)
     elif callable(getattr(model_wrapper, "parallelize", None)):
-        model = model_wrapper.parallelize(model, reapply_trainability=reapply_trainability)
+        model = model_wrapper.parallelize(model)
         model = (
             model[0] if isinstance(model, tuple) else model
         )  # MegatronFSDP will return (model, None) since we don't pass optimizer here
@@ -343,7 +339,6 @@ def parallelize_for_pp(
     model: torch.nn.Module,
     *,
     mesh_context: MeshContext | None = None,
-    reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
     **kwargs,
 ) -> torch.nn.Module:
     """Adapt pipeline/EP call sites to the model parallelizer contract.
@@ -353,8 +348,6 @@ def parallelize_for_pp(
     Args:
         model: The model to parallelize.
         mesh_context: Runtime topology and distributed strategy.
-        reapply_trainability: Callback that re-resolves the trainability policy
-            after pipeline-stage surgery and immediately before wrapping.
         **kwargs: Additional arguments (world_mesh, moe_mesh, axis names) passed by
             AutoPipeline but unused for non-MoE parallelization.
 
@@ -363,7 +356,7 @@ def parallelize_for_pp(
     """
     if mesh_context is None:
         return model
-    return parallelize_model(model, replace(mesh_context, reapply_trainability=reapply_trainability))
+    return parallelize_model(model, mesh_context)
 
 
 def instantiate_infrastructure(
@@ -745,16 +738,11 @@ def apply_model_infrastructure(
             if not key.endswith("_extra_state")
         ]
 
-    # Rebind trainability after model surgery and before DDP/FSDP capture.
+    # Trainability was resolved above. Parallelization must keep each parameter's
+    # requires_grad; strategies whose surgery replaces parameters check this before
+    # DDP/FSDP capture.
     if isinstance(strategy_config, FSDP2Config) and peft_config is not None and quantization_config is None:
         prepare_frozen_parameters_for_sharding(model, _get_frozen_storage_compute_dtype(strategy_config, mesh))
-    reapply_trainability = partial(
-        _prepare_trainability_before_sharding,
-        peft_enabled=peft_config is not None,
-        freeze_config=freeze_config,
-        frozen_compute_dtype=frozen_compute_dtype,
-        strict=False,
-    )
 
     # NemotronOmni RADIO: opt into the fused SDPA path on ViT attention blocks.
     enable_radio_vit_fused_attn(model)
@@ -767,11 +755,11 @@ def apply_model_infrastructure(
     # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
     mfsdp_param_attrs = None
     if autopipeline is not None:
-        model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn, reapply_trainability)
+        model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
         for part in model.parts:
             setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
-        model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh, reapply_trainability)
+        model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh)
         # Megatron-FSDP stamps load-bearing per-parameter state (owning-model back-ref,
         # tied-weight ``_is_shared`` marker, ``orig_param`` and friends) during wrapping.
         # The lm-head re-tie and post-wrap checkpoint reload below rebuild Parameter

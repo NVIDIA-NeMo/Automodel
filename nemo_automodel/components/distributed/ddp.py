@@ -14,7 +14,6 @@
 
 import logging
 import warnings
-from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
@@ -60,7 +59,6 @@ def parallelize_ddp(
     config: DDPConfig,
     *,
     device: torch.device | None = None,
-    reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
 ) -> torch.nn.Module:
     """Apply activation checkpointing and PyTorch DDP from a typed config."""
     if device is None:
@@ -87,8 +85,6 @@ def parallelize_ddp(
                     model.gradient_checkpointing_enable()
                 else:
                     apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
-        if reapply_trainability is not None:
-            reapply_trainability(model)
         return model
 
     if config.activation_checkpointing:
@@ -118,8 +114,6 @@ def parallelize_ddp(
         ddp_kwargs["bucket_cap_mb"] = config.bucket_cap_mb
 
     model = model.to(device)
-    if reapply_trainability is not None:
-        reapply_trainability(model)
     return DDP(model, **ddp_kwargs)
 
 
@@ -165,7 +159,6 @@ class DDPManager:
     def parallelize(
         self,
         model: torch.nn.Module,
-        reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
     ) -> torch.nn.Module:
         """
         Wraps the given model with DistributedDataParallel (DDP).
@@ -175,8 +168,6 @@ class DDPManager:
 
         Args:
             model (torch.nn.Module): The PyTorch model to be wrapped.
-            reapply_trainability: Optional callback that re-resolves parameter
-                trainability after model surgery and before DDP construction.
 
         Returns:
             torch.nn.parallel.DistributedDataParallel: The DDP-wrapped model.
@@ -185,5 +176,4 @@ class DDPManager:
             model,
             self.config,
             device=self.device,
-            reapply_trainability=reapply_trainability,
         )
