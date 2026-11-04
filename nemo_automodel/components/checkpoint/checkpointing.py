@@ -2045,8 +2045,12 @@ set -euo pipefail
 # Slurm example:
 #   sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/consolidate.sh'
 # Optional: set CAST_DTYPE=bf16 to request a floating-point dtype cast during export.
+# TIMEOUT_MINUTES caps the distributed barrier wait (default 30). With imbalanced
+# shard sizes ranks finish minutes apart; keep it comfortably above the slowest
+# rank's runtime or fast ranks time out and the run tears down.
 NPROC_PER_NODE="${{NPROC_PER_NODE:-1}}"
 NUM_THREADS="${{NUM_THREADS:-5}}"
+TIMEOUT_MINUTES="${{TIMEOUT_MINUTES:-30}}"
 CAST_DTYPE="${{CAST_DTYPE:-}}"
 PYTHON="${{PYTHON:-python3}}"
 TORCHRUN="${{TORCHRUN:-torchrun}}"
@@ -2065,6 +2069,7 @@ if [[ "${{NPROC_PER_NODE}}" -gt 1 ]]; then
   "${{TORCHRUN}}" --nproc-per-node="${{NPROC_PER_NODE}}" "${{CONSOLIDATION_TOOL}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
+    --timeout-minutes "${{TIMEOUT_MINUTES}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
     --output-dir "{output_dir}"{diffusers_arg} \\
@@ -2073,6 +2078,7 @@ else
   "${{PYTHON}}" "${{CONSOLIDATION_TOOL}}" \\
     --backend gloo \\
     --num-threads "${{NUM_THREADS}}" \\
+    --timeout-minutes "${{TIMEOUT_MINUTES}}" \\
     --model-name "{self.config.model_repo_id}" \\
     --input-dir "{model_dir}" \\
     --output-dir "{output_dir}"{diffusers_arg} \\
