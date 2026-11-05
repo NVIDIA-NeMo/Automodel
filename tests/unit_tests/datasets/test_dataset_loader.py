@@ -30,12 +30,14 @@ from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
     NeatPackingConfig,
     ParallelAwareDataloader,
+    StreamDatasetConfig,
+    TextStreamBuildContext,
     ThdPackingConfig,
     _resolve_target,
     make_collate_fn,
     make_packing_config,
 )
-from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT, BatchOutputFormat
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
@@ -57,6 +59,27 @@ class StaticDatasetConfig:
 
     def build(self) -> object:
         return self.values
+
+
+@dataclass
+class StreamDataloaderConfig(DataloaderConfig):
+    dataset_config: StreamDatasetConfig[TextStreamBuildContext, object]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dataset_config, StreamDatasetConfig):
+            raise TypeError("This loader requires a stream dataset")
+
+    @property
+    def is_packed(self) -> bool:
+        return self.dataset_config.is_packed
+
+    @property
+    def packed_sequence_length(self) -> int:
+        return self.dataset_config.packed_sequence_length
+
+    @property
+    def output_format(self) -> BatchOutputFormat:
+        return self.dataset_config.output_format
 
 
 @pytest.mark.parametrize(("legacy_target", "config_target"), _DATASET_CONFIGS.items())
@@ -592,7 +615,7 @@ def test_stream_builder_returns_its_loader_and_receives_runtime_inputs(output_fo
 
     source = StreamConfig()
     source.output_format = output_format
-    config = DataloaderConfig(dataset_config=source, seed=91, batch_size=2)
+    config = StreamDataloaderConfig(dataset_config=source, seed=91, batch_size=2)
     tokenizer = object()
     schedule = DatasetBuildSchedule(local_batch_size=2, global_batch_size=8, max_steps=10, val_check_interval=None)
     result = config.build(
@@ -638,7 +661,7 @@ def test_stream_builder_scopes_ranked_rng_and_preserves_shared_seed(monkeypatch,
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 4)
-    config = DataloaderConfig(dataset_config=StreamConfig(), seed=77)
+    config = StreamDataloaderConfig(dataset_config=StreamConfig(), seed=77)
     before = torch.get_rng_state().clone()
     expected = torch.rand((), generator=torch.Generator().manual_seed(81)).item()
 
@@ -668,7 +691,7 @@ def test_stream_builder_rejects_native_settings_before_construction(native_setti
         def build(self, *, context: TextStreamBuildContext) -> object:
             raise AssertionError("Invalid native settings must fail before the stream is built")
 
-    config = DataloaderConfig(dataset_config=StreamConfig(), **native_settings)
+    config = StreamDataloaderConfig(dataset_config=StreamConfig(), **native_settings)
     with pytest.raises(ValueError, match="stream dataset owns packing"):
         config.build(dp_rank=0, dp_world_size=1)
 
@@ -684,4 +707,59 @@ def test_stream_config_rejects_explicit_native_packing_at_the_recipe_boundary(pa
 
     raw = ConfigNode({"dataset": {"_target_": StreamConfig}, "packed_sequence": packed_sequence})
     with pytest.raises(ValueError, match="Stream datasets own packing"):
+        RecipeConfig(raw).dataloader
+
+
+@pytest.mark.parametrize(
+    "loader_target",
+    [StreamDataloaderConfig, f"{__name__}.StreamDataloaderConfig"],
+)
+def test_recipe_selects_explicit_stream_loader_subclass(loader_target):
+    @dataclass
+    class StreamConfig(StreamDatasetConfig[TextStreamBuildContext, object]):
+        output_format = "thd"
+        is_packed = True
+
+        @property
+        def packed_sequence_length(self) -> int:
+            return 17
+
+        def build(self, *, context: TextStreamBuildContext) -> object:
+            raise AssertionError("Config resolution must not construct the stream")
+
+    raw = ConfigNode(
+        {
+            "dataset": {"_target_": StreamConfig},
+            "dataloader": {"_target_": loader_target},
+            "seed": 71,
+            "step_scheduler": {"local_batch_size": 3},
+        }
+    )
+    config = RecipeConfig(raw).dataloader
+    assert isinstance(config, StreamDataloaderConfig)
+    assert config.seed == 71 and config.batch_size == 3
+    assert config.output_format == "thd" and config.is_packed
+    assert config.packed_sequence_length == 17
+
+
+def test_native_loader_rejects_a_stream_without_a_compatible_config():
+    @dataclass
+    class StreamConfig(StreamDatasetConfig[TextStreamBuildContext, object]):
+        def build(self, *, context: TextStreamBuildContext) -> object:
+            raise AssertionError("Invalid pairing must fail before construction")
+
+    with pytest.raises(TypeError, match="compatible DataloaderConfig subclass"):
+        DataloaderConfig(dataset_config=StreamConfig())
+    with pytest.raises(TypeError, match="compatible DataloaderConfig subclass"):
+        RecipeConfig(ConfigNode({"dataset": {"_target_": StreamConfig}})).dataloader
+
+
+def test_recipe_rejects_a_loader_target_that_is_not_a_config_subclass():
+    raw = ConfigNode(
+        {
+            "dataset": {"_target_": StaticDatasetConfig, "values": []},
+            "dataloader": {"_target_": list},
+        }
+    )
+    with pytest.raises(ValueError, match="DataloaderConfig subclass"):
         RecipeConfig(raw).dataloader
