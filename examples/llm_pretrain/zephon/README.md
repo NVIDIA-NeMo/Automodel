@@ -1,4 +1,4 @@
-# Zephon + NeMo AutoModel
+# Zephon and NeMo AutoModel
 
 [Zephon](https://zephon.io/) is a data loader for training at scale. It reads
 and mixes datasets, prepares and packs documents, and keeps data delivery
@@ -10,7 +10,7 @@ Zephon concepts, pipeline operations, and API questions, see the
 [Zephon User Guide](https://docs.zephon.io/) and
 [API reference](https://docs.zephon.io/api/pipeline.html).
 
-## Getting started
+## Get Started
 
 Start with an AutoModel checkout and a CUDA training environment, following the
 [AutoModel installation instructions](../../../README.md#getting-started).
@@ -30,7 +30,7 @@ and stops when it runs out. `step_scheduler.max_steps` is an upper bound, so
 there is no need to repeat a dataset to reach it. Incomplete final microbatches
 are dropped.
 
-## Configuring your data
+## Configure Your Data
 
 The source config chooses tokenization: raw text is tokenized
 online, while pretokenized input keeps its supplied token IDs. Independently,
@@ -87,8 +87,8 @@ calibration and sampling behavior.
 model config's input-token limit. Set it explicitly for shorter training inputs
 or when the model has no known limit. A length above a known model limit is
 rejected, including when positions reset between subdocuments. Zephon prepares
-one extra token for next-token prediction and handles the input/target shift. `wrap` can split long
-text documents; `first_fit` and `best_fit` keep documents whole. With bin packing,
+one extra token for next-token prediction and handles the shift between input and target.
+`wrap` can split long text documents; `first_fit` and `best_fit` keep documents whole. With bin packing,
 oversized documents are dropped by default; `drop_oversized: false` raises an
 error instead. See the [packing guide](https://docs.zephon.io/pipelines/packing.html)
 for the algorithms and their options.
@@ -123,7 +123,7 @@ and token estimation for mixtures. Source declarations cannot be combined,
 including sources imported from TOML. Unsupported native formatting, truncation
 and sample-limit fields raise rather than being ignored.
 
-### Pretokenized and prepacked text
+### Use Pretokenized and Prepacked Text
 
 Tokenization and online packing are independent choices:
 
@@ -171,7 +171,7 @@ boundary-target masking. This is a flat token-sequence format, not an importer
 for framework cache files, source padding, cumulative-length tensors, or already
 shifted labels. The same `batched` and `thd` output formats remain available.
 
-## How the integration works
+## How the Integration Works
 
 The dataset config selects raw text or pretokenized input. The Zephon
 pipeline reads and mixes sources, prepares documents, packs them, and groups
@@ -188,8 +188,8 @@ Native sampling, worker, packing and collator settings cannot be combined with
 this stream; use the corresponding `dataset.zephon` options instead.
 
 `dataset.output_format` selects the model input layout. The default,
-`batched`, uses ordinary `[batch, sequence]` inputs. `thd` supplies the sequence
-length metadata used by compatible native variable-length attention backends.
+`batched`, uses ordinary `[batch, sequence]` inputs. `thd` supplies the sequence-length
+metadata used by compatible native variable-length attention backends.
 These are output formats, separate from the packing algorithm. Batched output
 can also use Flash Attention; choose the format supported by your model and
 attention backend.
@@ -202,15 +202,16 @@ document. Attention remains causal, and different packed documents in a batch
 remain independent. The separate `training.mask_segment_starts` option controls whether
 next-token targets at subdocument boundaries contribute to the loss.
 
-## Checkpointing and distributed training
+## Configure Checkpoints for Distributed Training
 
 Zephon's loader state is saved and restored with the AutoModel training
-checkpoint. Every training rank participates, including TP and PP peers.
+checkpoint. Every training rank participates, including tensor parallelism (TP)
+and pipeline parallelism (PP) peers.
 Use a unique `dataset.zephon.checkpoint.run_id` for each independent run and
 keep it unchanged when resuming that run.
 
 To resume at different data-parallel sizes, set `dataset.zephon.checkpoint.canonical_replicas`
-to a common multiple of those sizes before starting. The number of local
+to a common multiple of those sizes before starting. The global number of
 microbatches per optimizer step (`global_batch_size / local_batch_size`) must
 also be a multiple of that value. Preserve the data configuration, tokenizer,
 seed, and global batch size across resumes. See
@@ -218,6 +219,6 @@ seed, and global batch size across resumes. See
 and [checkpointing and resuming](https://docs.zephon.io/pipelines/checkpointing_and_resuming.html)
 for the underlying Zephon guarantees.
 
-DP, TP, and PP follow AutoModel's model and backend capabilities. Context
+Data parallelism (DP), TP, and PP follow AutoModel's model and backend capabilities. Context
 parallelism is not supported by this integration. Zephon currently supplies
 training data only; AutoModel's existing validation loaders remain available.
