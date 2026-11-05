@@ -23,9 +23,9 @@ import torch
 from PIL import Image
 
 from nemo_automodel._transformers.registry import resolve_image_position_state
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 from nemo_automodel.components.datasets.vlm.datasets import encode_vlm_document
 from nemo_automodel.components.datasets.zephon.config import (
-    ZephonOptions,
     ZephonPackingOptions,
     ZephonRuntimeOptions,
     ZephonSource,
@@ -35,7 +35,8 @@ from nemo_automodel.components.datasets.zephon.config import (
 )
 from nemo_automodel.components.datasets.zephon.vlm_config import (
     ZephonVlmDataloaderConfig,
-    ZephonVlmSourceConfig,
+    ZephonVlmDatasetConfig,
+    ZephonVlmOptions,
 )
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     validate_hf_model_for_pipeline_support,
@@ -97,23 +98,25 @@ def _model(backend="sdpa"):
 def _loader(source, model, *, runner="inline", fake=False, max_documents=2, xdoc=False):
     directory, _, _ = source
     config = ZephonVlmDataloaderConfig(
-        dataset_config=ZephonVlmSourceConfig(inject_fake_images=fake),
-        zephon=ZephonOptions(
-            sources=(ZephonSource(name="images", path=str(directory / "corpus"), fmt="jsonl"),),
-            packing=ZephonPackingOptions(
-                seq_len=255,
-                pack_algorithm="first_fit",
-                pack_num_bins=1,
-                max_num_documents=max_documents,
-                max_num_documents_scope="bin",
-                shuffle_after_pack=False,
-            ),
-            source=ZephonSourceOptions(
-                chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
-            ),
-            training=ZephonTrainingOptions(mask_segment_starts=True, allow_cross_document_attention=xdoc),
-            workers=ZephonWorkerOptions(tokenize_parallelism=1),
-            runtime=ZephonRuntimeOptions(runner=runner, mtp_mode=False),
+        dataset_config=ZephonVlmDatasetConfig(
+            zephon=ZephonVlmOptions(
+                sources=(ZephonSource(name="images", path=str(directory / "corpus"), fmt="jsonl"),),
+                packing=ZephonPackingOptions(
+                    seq_len=255,
+                    pack_algorithm="first_fit",
+                    pack_num_bins=1,
+                    max_num_documents=max_documents,
+                    max_num_documents_scope="bin",
+                    shuffle_after_pack=False,
+                ),
+                source=ZephonSourceOptions(
+                    chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                ),
+                training=ZephonTrainingOptions(mask_segment_starts=True, allow_cross_document_attention=xdoc),
+                workers=ZephonWorkerOptions(tokenize_parallelism=1),
+                runtime=ZephonRuntimeOptions(runner=runner, mtp_mode=False),
+                inject_fake_images=fake,
+            )
         ),
     )
     return config.build(
@@ -123,6 +126,7 @@ def _loader(source, model, *, runner="inline", fake=False, max_documents=2, xdoc
         batch_size=1,
         position_state_factory=lambda: resolve_image_position_state(model),
         packing_contract=configure_packing_for_models([model]),
+        training_schedule=DatasetBuildSchedule(1, 1, 100, None),
     ).dataloader
 
 

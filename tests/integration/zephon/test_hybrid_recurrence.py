@@ -20,6 +20,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 from nemo_automodel.components.models.common.packing import configure_packing_for_models
 from nemo_automodel.components.training.batch import move_batch_to_device
 from tests.utils.zephon_text_fixtures import config as config
@@ -101,13 +102,24 @@ def test_real_recurrence_matches_selected_document_layout(config, tokenizer, fam
     config = replace(
         config,
         batch_size=1,
-        zephon=replace(
-            config.zephon,
-            packing=replace(config.zephon.packing, seq_len=10, pack_algorithm="first_fit"),
-            training=replace(config.zephon.training, allow_cross_document_attention=xdoc),
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(config.dataset_config.zephon.packing, seq_len=10, pack_algorithm="first_fit"),
+                training=replace(config.dataset_config.zephon.training, allow_cross_document_attention=xdoc),
+            ),
         ),
     )
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, packing_contract=contract)) as loader:
+    with closing(
+        config.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            packing_contract=contract,
+            training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+        )
+    ) as loader:
         batch = move_batch_to_device(next(loader), torch.device("cuda"))
     assert batch["_packed_seq_ids"].tolist() == [[1] * 8 + [0] * 2 if xdoc else [1] * 4 + [2] * 4 + [0] * 2]
     batch.pop("labels")

@@ -28,6 +28,7 @@ from transformers import AutoConfig, Mistral3ForConditionalGeneration
 
 from nemo_automodel._transformers.registry import resolve_image_position_state
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 from nemo_automodel.components.datasets.vlm.datasets import encode_vlm_document
 from nemo_automodel.components.datasets.vlm.pp_media import (
     VLM_PP_MEDIA_KEY,
@@ -35,7 +36,6 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
 )
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonCheckpointOptions,
-    ZephonOptions,
     ZephonPackingOptions,
     ZephonRuntimeOptions,
     ZephonSource,
@@ -45,7 +45,8 @@ from nemo_automodel.components.datasets.zephon.config import (
 )
 from nemo_automodel.components.datasets.zephon.vlm_config import (
     ZephonVlmDataloaderConfig,
-    ZephonVlmSourceConfig,
+    ZephonVlmDatasetConfig,
+    ZephonVlmOptions,
 )
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.models.common.packing import (
@@ -89,27 +90,29 @@ def _loader(
     packing_contract=PackingCapabilities("block_causal"),
 ):
     config = ZephonVlmDataloaderConfig(
-        dataset_config=ZephonVlmSourceConfig(inject_fake_images=fake),
-        zephon=ZephonOptions(
-            sources=(ZephonSource(name="images", path=str(Path(source) / "corpus"), fmt="jsonl"),),
-            packing=ZephonPackingOptions(
-                seq_len=63,
-                pack_algorithm="first_fit",
-                pack_num_bins=1,
-                max_num_documents=max_documents,
-                max_num_documents_scope="bin",
-                shuffle_after_pack=False,
-            ),
-            source=ZephonSourceOptions(
-                chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
-            ),
-            workers=ZephonWorkerOptions(tokenize_parallelism=1),
-            runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
-            training=ZephonTrainingOptions(allow_cross_document_attention=xdoc),
-            checkpoint=ZephonCheckpointOptions(
-                aggregate_dir=str(Path(source) / "aggregate") if distributed else None,
-                run_id=f"mistral3-{pp}-{max_documents}-{xdoc}-{fake}" if distributed else None,
-            ),
+        dataset_config=ZephonVlmDatasetConfig(
+            zephon=ZephonVlmOptions(
+                sources=(ZephonSource(name="images", path=str(Path(source) / "corpus"), fmt="jsonl"),),
+                packing=ZephonPackingOptions(
+                    seq_len=63,
+                    pack_algorithm="first_fit",
+                    pack_num_bins=1,
+                    max_num_documents=max_documents,
+                    max_num_documents_scope="bin",
+                    shuffle_after_pack=False,
+                ),
+                source=ZephonSourceOptions(
+                    chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                ),
+                workers=ZephonWorkerOptions(tokenize_parallelism=1),
+                runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
+                training=ZephonTrainingOptions(allow_cross_document_attention=xdoc),
+                checkpoint=ZephonCheckpointOptions(
+                    aggregate_dir=str(Path(source) / "aggregate") if distributed else None,
+                    run_id=f"mistral3-{pp}-{max_documents}-{xdoc}-{fake}" if distributed else None,
+                ),
+                inject_fake_images=fake,
+            )
         ),
     )
     return config.build(
@@ -120,6 +123,7 @@ def _loader(
         position_state_factory=lambda: resolve_image_position_state(model),
         pp_n_microbatches=2 if pp else None,
         packing_contract=packing_contract,
+        training_schedule=DatasetBuildSchedule(2, 2, 100, None),
     ).dataloader
 
 
@@ -142,7 +146,7 @@ def test_training_recipe_uses_local_processor_and_preserves_expanded_images(sour
         "_target_": "transformers.AutoProcessor.from_pretrained",
         "pretrained_model_name_or_path": str(source / "processor"),
     }
-    settings = values["dataloader"]["zephon"]
+    settings = values["dataset"]["zephon"]
     settings["sources"] = [{"name": "images", "path": str(source / "corpus")}]
     settings["packing"]["seq_len"] = 63
     settings.setdefault("runtime", {}).update(runner="inline", mtp_mode=False)
@@ -158,6 +162,7 @@ def test_training_recipe_uses_local_processor_and_preserves_expanded_images(sour
             dp_world_size=1,
             batch_size=2,
             position_state_factory=lambda: resolve_image_position_state(model),
+            training_schedule=DatasetBuildSchedule(2, 2, 100, None),
         ).dataloader
     ) as loader:
         batch = next(loader)

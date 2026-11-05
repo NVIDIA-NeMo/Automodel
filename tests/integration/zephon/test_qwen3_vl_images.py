@@ -25,8 +25,8 @@ from nemo_automodel._transformers.registry import (
     ModelRegistry,
     resolve_image_position_state,
 )
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 from nemo_automodel.components.datasets.zephon.config import (
-    ZephonOptions,
     ZephonPackingOptions,
     ZephonRuntimeOptions,
     ZephonSource,
@@ -35,7 +35,8 @@ from nemo_automodel.components.datasets.zephon.config import (
 )
 from nemo_automodel.components.datasets.zephon.vlm_config import (
     ZephonVlmDataloaderConfig,
-    ZephonVlmSourceConfig,
+    ZephonVlmDatasetConfig,
+    ZephonVlmOptions,
 )
 from nemo_automodel.components.models.common.packing import (
     PackingCapabilities,
@@ -58,22 +59,24 @@ def config(tmp_path, inputs):
     directory.mkdir()
     (directory / "images.jsonl").write_text("".join(json.dumps(document) + "\n" for document in inputs[1] * 3))
     return ZephonVlmDataloaderConfig(
-        dataset_config=ZephonVlmSourceConfig(inject_fake_images=False),
-        zephon=ZephonOptions(
-            sources=(ZephonSource(name="images", path=str(directory), fmt="jsonl"),),
-            packing=ZephonPackingOptions(
-                seq_len=63,
-                pack_algorithm="first_fit",
-                pack_num_bins=1,
-                max_num_documents=2,
-                max_num_documents_scope="bin",
-                shuffle_after_pack=False,
-            ),
-            source=ZephonSourceOptions(
-                chunk_size=3, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
-            ),
-            workers=ZephonWorkerOptions(tokenize_parallelism=1),
-            runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
+        dataset_config=ZephonVlmDatasetConfig(
+            zephon=ZephonVlmOptions(
+                sources=(ZephonSource(name="images", path=str(directory), fmt="jsonl"),),
+                packing=ZephonPackingOptions(
+                    seq_len=63,
+                    pack_algorithm="first_fit",
+                    pack_num_bins=1,
+                    max_num_documents=2,
+                    max_num_documents_scope="bin",
+                    shuffle_after_pack=False,
+                ),
+                source=ZephonSourceOptions(
+                    chunk_size=3, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                ),
+                workers=ZephonWorkerOptions(tokenize_parallelism=1),
+                runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
+                inject_fake_images=False,
+            )
         ),
     )
 
@@ -94,6 +97,7 @@ def _loader(config, inputs, model, *, packing_contract=PackingCapabilities("bloc
         batch_size=2,
         position_state_factory=lambda: resolve_image_position_state(model),
         packing_contract=packing_contract,
+        training_schedule=DatasetBuildSchedule(2, 2, 100, None),
     ).dataloader
 
 
@@ -112,7 +116,16 @@ def test_native_deepstack_packed_matches_separate_logits_loss_and_gradients(conf
     separate_model = deepcopy(packed_model)
     packed_loader = _loader(config, inputs, packed_model)
     separate_loader = _loader(
-        replace(config, zephon=replace(config.zephon, packing=replace(config.zephon.packing, max_num_documents=1))),
+        replace(
+            config,
+            dataset_config=replace(
+                config.dataset_config,
+                zephon=replace(
+                    config.dataset_config.zephon,
+                    packing=replace(config.dataset_config.zephon.packing, max_num_documents=1),
+                ),
+            ),
+        ),
         inputs,
         separate_model,
     )
@@ -159,13 +172,22 @@ def test_native_deepstack_packed_matches_separate_logits_loss_and_gradients(conf
 def test_xdoc_joins_coordinates_and_preserves_native_deepstack(config, inputs, backend):
     torch.manual_seed(85)
     model = _model(backend)
-    config = replace(config, dataset_config=ZephonVlmSourceConfig(inject_fake_images=True))
+    config = replace(
+        config,
+        dataset_config=replace(
+            config.dataset_config, zephon=replace(config.dataset_config.zephon, inject_fake_images=True)
+        ),
+    )
     off_loader = _loader(config, inputs, model)
     on_loader = _loader(
         replace(
             config,
-            zephon=replace(
-                config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=True)
+            dataset_config=replace(
+                config.dataset_config,
+                zephon=replace(
+                    config.dataset_config.zephon,
+                    training=replace(config.dataset_config.zephon.training, allow_cross_document_attention=True),
+                ),
             ),
         ),
         inputs,
@@ -200,10 +222,13 @@ def test_process_worker_checkpoint_replays_expanded_qwen3_documents(config, inpu
     model = _model()
     config = replace(
         config,
-        zephon=replace(
-            config.zephon,
-            runtime=replace(config.zephon.runtime, runner="process"),
-            packing=replace(config.zephon.packing, pack_algorithm="best_fit"),
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                runtime=replace(config.dataset_config.zephon.runtime, runner="process"),
+                packing=replace(config.dataset_config.zephon.packing, pack_algorithm="best_fit"),
+            ),
         ),
     )
     original, restored = _loader(config, inputs, model), _loader(config, inputs, model)
@@ -232,8 +257,12 @@ def test_native_deepstack_flash_metadata_matches_dense_attention(config, inputs,
     for xdoc in (False, True):
         selected = replace(
             config,
-            zephon=replace(
-                config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=xdoc)
+            dataset_config=replace(
+                config.dataset_config,
+                zephon=replace(
+                    config.dataset_config.zephon,
+                    training=replace(config.dataset_config.zephon.training, allow_cross_document_attention=xdoc),
+                ),
             ),
         )
         loaders = [

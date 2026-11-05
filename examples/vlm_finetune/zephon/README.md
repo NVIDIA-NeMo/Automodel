@@ -1,4 +1,4 @@
-# VLM fine-tuning with Zephon
+# Fine-Tune a VLM with Zephon
 
 [Zephon](https://zephon.io/) reads image conversations and packs whole documents
 for AutoModel’s `FinetuneRecipeForVLM`.
@@ -6,7 +6,7 @@ for AutoModel’s `FinetuneRecipeForVLM`.
 ## Train
 
 Install AutoModel with its [VLM dependencies](../../../README.md#getting-started).
-In [train.yaml](train.yaml), set `dataloader.zephon.sources[0].path` to your
+In [train.yaml](train.yaml), set `dataset.zephon.sources[0].path` to your
 JSONL shard directory, then run from the repository root:
 
 ```bash
@@ -21,17 +21,27 @@ conversation format, with image paths accessible to every training rank:
 {"conversation": [{"role": "user", "content": [{"type": "image", "image": "/data/photo.png"}, {"type": "text", "text": "Describe the image."}]}, {"role": "assistant", "content": [{"type": "text", "text": "A blue square."}]}]}
 ```
 
-## How it works
+## How It Works
+
+The recipe selects `ZephonVlmDatasetConfig` under `dataset`. When
+`dataloader._target_` is omitted, AutoModel selects the matching
+`ZephonVlmDataloaderConfig` automatically. This thin metadata adapter uses
+AutoModel’s shared VLM construction path; `dataset.zephon`
+configures the source, packing and runtime, while `processor` and
+`dataset.chat_template` select the processor and conversation template.
+The same single-source `path_or_dataset_id` and `paths` fields described in the
+integration guide are available. They select sources without performing a native
+dataset class's conversation/image transformations; input must use the format above.
 
 AutoModel’s processor applies the chat template and expands image placeholders
 before Zephon measures and bin-packs the documents. Training supervises assistant
 tokens. Image documents stay whole; oversized documents are dropped by default.
 The finite source is read once, and `max_steps` caps training.
 
-Qwen2.5-VL, dense Qwen3-VL, non-sliding Mistral3 and dense Gemma4 image paths are
-supported, subject to their model/backend restrictions. Video, audio and context
+Qwen2.5-VL, dense Qwen3-VL, non-sliding Mistral3, and dense Gemma4 image paths are
+supported, subject to their model or backend restrictions. Video, audio, and context
 parallelism are unsupported.
 
 See the [integration guide](../../llm_pretrain/zephon/README.md) for configuration,
-output formats, cross-document attention and checkpointing. Zephon pipeline
+output formats, cross-document attention, and checkpointing. Zephon pipeline
 options and APIs are covered in the [Zephon User Guide](https://docs.zephon.io/).

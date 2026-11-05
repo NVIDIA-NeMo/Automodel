@@ -57,10 +57,9 @@ from nemo_automodel._transformers import (
 from nemo_automodel._transformers.registry import resolve_image_position_state
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.loader import close_dataloader
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule, close_dataloader
 from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
-from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -414,8 +413,6 @@ def build_dataloader(
         processor_node=cfg_processor,
         packed_sequence_node=cfg_ps,
     )
-    if isinstance(config, ZephonVlmDataloaderConfig):
-        raise ValueError("Zephon VLM requires typed recipe construction with model-owned position state")
     dp_rank = 0
     dp_world_size = 1
     cp_size = 1
@@ -447,18 +444,18 @@ def build_dataloader(
             model=model,
         )
 
-    with ScopedRNG(seed=seed, ranked=True):
-        result = config.build(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            batch_size=local_batch_size,
-            dataset_build_context=FirstRankPerNode(),
-            get_rope_index=get_rope_index,
-            packing_contract=packing_contract,
-            pp_n_microbatches=pp_n_microbatches,
-            cp_size=cp_size,
-        )
+    result = config.build(
+        seed=seed,
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        batch_size=local_batch_size,
+        dataset_build_context=FirstRankPerNode(),
+        get_rope_index=get_rope_index,
+        packing_contract=packing_contract,
+        pp_n_microbatches=pp_n_microbatches,
+        cp_size=cp_size,
+    )
     return result.dataloader, result.processor
 
 
@@ -542,9 +539,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         dataloader_config = self.cfg.vlm_dataloader
         if dataloader_config is None:
             raise ValueError("VLM training requires a dataset config")
-        validate_parallelism = getattr(dataloader_config, "validate_parallelism", None)
-        if callable(validate_parallelism):
-            validate_parallelism(cp_size=self.mesh_context.cp_size)
 
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
@@ -711,20 +705,27 @@ class FinetuneRecipeForVLM(BaseRecipe):
             configure_packing_for_models(self.model_parts)
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
-        with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
-            dataloader_build = dataloader_config.build(
-                pretrained_model_name_or_path=_get_model_name(self.cfg.model),
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-                batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                dataset_build_context=dataset_build_context,
-                get_rope_index=get_rope_index,
-                position_state_factory=partial(resolve_image_position_state, self.model_parts[0]),
-                packing_contract=packing_contract,
-                ignore_index=_get_loss_ignore_index(self.loss_fn),
-                pp_n_microbatches=pp_n_microbatches,
-                cp_size=self.mesh_context.cp_size,
-            )
+        dataloader_build = dataloader_config.build(
+            seed=self.cfg.get("seed", 42),
+            training_schedule=DatasetBuildSchedule(
+                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                global_batch_size=self.cfg.step_scheduler.global_batch_size,
+                max_steps=self.cfg.get("step_scheduler.max_steps", None),
+                val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
+            ),
+            domain_mixture=self.cfg.get("domain_mixture", None),
+            pretrained_model_name_or_path=_get_model_name(self.cfg.model),
+            dp_rank=self._get_dp_rank(),
+            dp_world_size=self._get_dp_group_size(),
+            batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            dataset_build_context=dataset_build_context,
+            get_rope_index=get_rope_index,
+            position_state_factory=partial(resolve_image_position_state, self.model_parts[0]),
+            packing_contract=packing_contract,
+            ignore_index=_get_loss_ignore_index(self.loss_fn),
+            pp_n_microbatches=pp_n_microbatches,
+            cp_size=self.mesh_context.cp_size,
+        )
         self.dataloader = dataloader_build.dataloader
         self.processor = dataloader_build.processor
 
@@ -733,17 +734,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
         validation_config = self.cfg.vlm_validation_dataloader
         if validation_config is not None:
             validation_build_context = FirstRankPerNode(group=process_group)
-            with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
-                validation_build = validation_config.build(
-                    pretrained_model_name_or_path=_get_model_name(self.cfg.model),
-                    dp_rank=self._get_dp_rank(),
-                    dp_world_size=self._get_dp_group_size(),
-                    batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                    dataset_build_context=validation_build_context,
-                    get_rope_index=get_rope_index,
-                    packing_contract=packing_contract,
-                    cp_size=self.mesh_context.cp_size,
-                )
+            validation_build = validation_config.build(
+                seed=self.cfg.get("seed", 42),
+                is_training=False,
+                pretrained_model_name_or_path=_get_model_name(self.cfg.model),
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+                batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                dataset_build_context=validation_build_context,
+                get_rope_index=get_rope_index,
+                packing_contract=packing_contract,
+                cp_size=self.mesh_context.cp_size,
+            )
             self.val_dataloader = validation_build.dataloader
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")

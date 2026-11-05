@@ -20,6 +20,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 from nemo_automodel.components.models.common.packing import (
     PackingCapabilities,
     configure_packing_for_models,
@@ -33,14 +34,25 @@ from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 def test_gathered_metadata_follows_selected_boundaries_after_shift(config, tokenizer, xdoc):
     config = replace(
         config,
-        zephon=replace(
-            config.zephon,
-            packing=replace(config.zephon.packing, seq_len=10, pack_algorithm="first_fit"),
-            training=replace(config.zephon.training, allow_cross_document_attention=xdoc),
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(config.dataset_config.zephon.packing, seq_len=10, pack_algorithm="first_fit"),
+                training=replace(config.dataset_config.zephon.training, allow_cross_document_attention=xdoc),
+            ),
         ),
     )
     contract = PackingCapabilities("document_ids", return_packed_sequence_metadata=True)
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, packing_contract=contract)) as loader:
+    with closing(
+        config.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            packing_contract=contract,
+            training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+        )
+    ) as loader:
         batch = next(loader)
     selected = batch["_packed_seq_ids"]
     assert selected[0].tolist() == ([1] * 8 + [0, 0] if xdoc else [1] * 4 + [2] * 4 + [0, 0])
@@ -70,10 +82,24 @@ def test_kimi_full_attention_honors_selected_ids_with_original_boundaries(config
     config = replace(
         config,
         batch_size=1,
-        zephon=replace(config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=xdoc)),
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                training=replace(config.dataset_config.zephon.training, allow_cross_document_attention=xdoc),
+            ),
+        ),
     )
     contract = configure_packing_for_models([model])
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, packing_contract=contract)) as loader:
+    with closing(
+        config.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            packing_contract=contract,
+            training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+        )
+    ) as loader:
         batch = next(loader)
     perturbed = batch["input_ids"].clone()
     perturbed[:, :4] += 10
