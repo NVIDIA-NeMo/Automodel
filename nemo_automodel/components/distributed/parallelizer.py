@@ -1460,7 +1460,7 @@ def _get_parallel_plan(
                     model_cls.__name__,
                     tp_size,
                 )
-            base_model_tp_plan = {
+            base_model_tp_plan: dict[str, ParallelStyle] = {
                 "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.k_proj": ColwiseParallel(),

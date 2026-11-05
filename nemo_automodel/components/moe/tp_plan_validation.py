@@ -25,14 +25,11 @@ share it without importing each other.
 from __future__ import annotations
 
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch.nn as nn
     from torch.distributed.tensor.parallel import ParallelStyle
-
-
-_ParallelStyleT = TypeVar("_ParallelStyleT", bound="ParallelStyle")
 
 
 def _is_unsafe_moe_tp_module_path(module_path: str) -> bool:
@@ -49,9 +46,7 @@ def _is_unsafe_moe_tp_module_path(module_path: str) -> bool:
     )
 
 
-def _validate_moe_tp_plan(
-    plan: dict[str, _ParallelStyleT], model: nn.Module | None = None
-) -> dict[str, _ParallelStyleT]:
+def _validate_moe_tp_plan(plan: dict[str, ParallelStyle], model: nn.Module | None = None) -> dict[str, ParallelStyle]:
     """Validate that a TP plan cannot shard routed-expert parameters.
 
     Routed experts are owned by expert parallelism and, when configured, the
