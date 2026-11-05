@@ -20,7 +20,7 @@ from safetensors.torch import save_file
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41DSparkConfig, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone, DeepseekV41DSparkModel
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 
@@ -63,6 +63,30 @@ def _model(attn: str = "eager") -> DeepseekV41DSparkBackbone:
     model = DeepseekV41DSparkBackbone(_config(), backend)
     model.initialize_weights(torch.device("cpu"))
     return model
+
+
+@pytest.mark.parametrize("backward_impl", ["atomic", "deterministic"])
+def test_dense_draft_does_not_inherit_sparse_backward(backward_impl: str) -> None:
+    """Building the dense draft must preserve the target's sparse selection."""
+    target = _config()
+    target.sparse_attention_backward = backward_impl
+    draft = DeepseekV41DSparkConfig(
+        text_config=target,
+        num_draft_layers=3,
+        target_layer_ids=(0, 1),
+        block_size=5,
+        num_anchors=1,
+        mask_token_id=31,
+        markov_rank=4,
+        markov_head_type="vanilla",
+        confidence_head_alpha=1.0,
+        confidence_head_with_markov=True,
+    ).build()
+    assert target.sparse_attention_backward == backward_impl
+    assert draft.config.sparse_attention_backward == "atomic"
+    assert len(draft.mtp) == 3
+    assert all(layer.attn.backend.attn == "sdpa" for layer in draft.mtp)
+    assert all(layer.attn.sparse_attention_backward == "atomic" for layer in draft.mtp)
 
 
 def _official_attention_reference(
