@@ -29,7 +29,7 @@ two locations:
   `nemo-automodel-model-onboarding`, `nemo-automodel-recipe-development`)
 - `.agents/contributor-skills/` -- contributor-facing development guidelines
   (`build-and-dependency`, `cicd`, `fern-docs`, `linting-and-formatting`,
-  `parity-testing`, `testing`)
+  `parity-testing`, `testing`, `train-inference-consistency`)
 
 All skills are symlinked into `.claude/skills/` for unified discovery.
 Contributor skills are intentionally kept outside the public `skills/` catalog
@@ -357,6 +357,7 @@ catalog skills live in `skills/`; contributor workflow skills live in
 | 8 | cicd                     | `.agents/contributor-skills/cicd`             | Commit/PR workflow, CI trigger mechanism, failure investigation |
 | 9 | testing                  | `.agents/contributor-skills/testing`          | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
 | 10 | fern-docs               | `.agents/contributor-skills/fern-docs`        | Maintain the Fern docs site under `docs/` (MDX content) + `docs/fern/` (infra) — pages, slugs, redirects, version aliases, library reference |
+| 11 | train-inference-consistency | `.agents/contributor-skills/train-inference-consistency` | Build and verify an inference-aligned (bitwise) training forward against the rollout engine's kernels; not HF parity |
 
 **Always read the relevant `SKILL.md` before starting any task it covers —
 skills are mandatory context, not optional background reading.**
