@@ -117,7 +117,8 @@ _RECIPE_CASES = (
 
 
 def test_llm_kd_rejects_stream_datasets_before_model_loading(monkeypatch: pytest.MonkeyPatch) -> None:
-    from nemo_automodel.components.datasets.loader import DataloaderConfig, StreamDatasetConfig
+    from nemo_automodel.components.datasets.loader import StreamDatasetConfig
+    from tests.unit_tests.datasets.test_dataset_loader import StreamDataloaderConfig
 
     class StreamConfig(StreamDatasetConfig):
         def build(self, *, context):
@@ -126,7 +127,7 @@ def test_llm_kd_rejects_stream_datasets_before_model_loading(monkeypatch: pytest
     verify_tokenizers = Mock()
     monkeypatch.setattr(llm_kd, "_verify_tokenizer_compatibility", verify_tokenizers)
     recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
-    recipe.cfg = SimpleNamespace(dataloader=DataloaderConfig(dataset_config=StreamConfig()))
+    recipe.cfg = SimpleNamespace(dataloader=StreamDataloaderConfig(dataset_config=StreamConfig()))
 
     with pytest.raises(ValueError, match="Stream-loader knowledge distillation"):
         recipe.setup()

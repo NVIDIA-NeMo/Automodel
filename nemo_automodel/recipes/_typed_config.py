@@ -44,7 +44,7 @@ import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
@@ -69,6 +69,19 @@ if TYPE_CHECKING:
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
 _STEP_SCHEDULER_RUNTIME_KEYS = ("local_batch_size", "dp_size", "dataloader")
+_LoaderConfig = TypeVar("_LoaderConfig")
+
+
+def _loader_config_class(target: object, base: type[_LoaderConfig]) -> type[_LoaderConfig]:
+    """Resolve an explicit loader config subclass at the YAML boundary."""
+    from nemo_automodel.components.config.loader import ConfigNode
+
+    # ConfigNode restores dotted targets serialized by to_dict() using the same
+    # resolution rules as the recipe's other _target_ sections.
+    resolved = ConfigNode({"_target_": target})._target_
+    if not isinstance(resolved, type) or not issubclass(resolved, base):
+        raise ValueError(f"Unsupported dataloader _target_ {target!r}; expected a {base.__name__} subclass")
+    return resolved
 
 
 def _section_kwargs(node: Any) -> dict[str, Any]:
@@ -273,10 +286,11 @@ class RecipeConfig:
             DataLoader,
             StatefulDataLoader,
         }
-        if loader_target not in supported_loader_targets:
-            raise ValueError(
-                f"Unsupported dataloader _target_ {loader_target!r}; typed recipes use ParallelAwareDataloader"
-            )
+        config_class = (
+            DataloaderConfig
+            if loader_target in supported_loader_targets
+            else _loader_config_class(loader_target, DataloaderConfig)
+        )
         collate = make_collate_fn(*_target_kwargs(loader_kwargs.pop("collate_fn", None)))
 
         schedule = DatasetBuildSchedule(
@@ -315,7 +329,7 @@ class RecipeConfig:
         if unknown:
             raise TypeError(f"Unexpected dataloader config field(s): {', '.join(unknown)}")
 
-        return DataloaderConfig(
+        return config_class(
             dataset_config=dataset_config,
             packing=self._packing_config(),
             batch_sampler_config=batch_sampler_config,
