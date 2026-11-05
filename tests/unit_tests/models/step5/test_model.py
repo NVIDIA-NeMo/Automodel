@@ -471,7 +471,7 @@ def test_native_vlm_packing_contract() -> None:
         )
     packing = configure_packing_for_models([model])
     assert packing.packed_mask_type == "document_ids"
-    assert not packing.requires_packed_sequence_metadata  # Model uses reset positions directly.
+    assert not packing.return_packed_sequence_metadata  # Model uses reset positions directly.
 
 
 def test_native_vlm_packing_preserves_crops() -> None:
