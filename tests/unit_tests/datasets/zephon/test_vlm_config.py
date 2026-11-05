@@ -34,6 +34,7 @@ from nemo_automodel.components.datasets.vlm.loader import (
     VlmDataloaderConfig,
     VlmProcessorConfig,
     VlmStreamBuildContext,
+    VlmVideoProcessorConfig,
 )
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonPackingOptions,
@@ -510,3 +511,27 @@ def test_dataset_loader_default_rejects_the_wrong_recipe_family():
     }
     with pytest.raises(ValueError, match="expected a VlmDataloaderConfig subclass"):
         RecipeConfig(ConfigNode(values)).vlm_dataloader
+
+
+def test_video_processor_is_rejected_before_loading_or_source_work(monkeypatch):
+    from unittest.mock import Mock
+
+    config = RecipeConfig(ConfigNode(_recipe())).vlm_dataloader
+    processor_factory = Mock()
+    video_factory = Mock()
+    positions = Mock()
+    source = Mock()
+    monkeypatch.setattr("nemo_automodel.components.datasets.zephon.pipeline.create_source_pipeline", source)
+    config = replace(
+        config,
+        processor_config=VlmProcessorConfig(
+            factory=processor_factory,
+            video_processor=VlmVideoProcessorConfig(factory=video_factory),
+        ),
+    )
+    with pytest.raises(ValueError, match="does not support video processors"):
+        _build(config, position_state_factory=positions)
+    processor_factory.assert_not_called()
+    video_factory.assert_not_called()
+    positions.assert_not_called()
+    source.assert_not_called()

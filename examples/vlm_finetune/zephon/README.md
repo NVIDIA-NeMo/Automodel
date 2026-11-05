@@ -1,4 +1,4 @@
-# VLM fine-tuning with Zephon
+# Fine-Tune a VLM with Zephon
 
 [Zephon](https://zephon.io/) reads image conversations and packs whole documents
 for AutoModel’s `FinetuneRecipeForVLM`.
@@ -21,7 +21,7 @@ conversation format, with image paths accessible to every training rank:
 {"conversation": [{"role": "user", "content": [{"type": "image", "image": "/data/photo.png"}, {"type": "text", "text": "Describe the image."}]}, {"role": "assistant", "content": [{"type": "text", "text": "A blue square."}]}]}
 ```
 
-## How it works
+## How It Works
 
 The recipe selects `ZephonVlmDatasetConfig` under `dataset`. When
 `dataloader._target_` is omitted, AutoModel selects the matching
@@ -38,10 +38,10 @@ before Zephon measures and bin-packs the documents. Training supervises assistan
 tokens. Image documents stay whole; oversized documents are dropped by default.
 The finite source is read once, and `max_steps` caps training.
 
-Qwen2.5-VL, dense Qwen3-VL, non-sliding Mistral3 and dense Gemma4 image paths are
-supported, subject to their model/backend restrictions. Video, audio and context
+Qwen2.5-VL, dense Qwen3-VL, non-sliding Mistral3, and dense Gemma4 image paths are
+supported, subject to their model or backend restrictions. Video, audio, and context
 parallelism are unsupported.
 
 See the [integration guide](../../llm_pretrain/zephon/README.md) for configuration,
-output formats, cross-document attention and checkpointing. Zephon pipeline
+output formats, cross-document attention, and checkpointing. Zephon pipeline
 options and APIs are covered in the [Zephon User Guide](https://docs.zephon.io/).
