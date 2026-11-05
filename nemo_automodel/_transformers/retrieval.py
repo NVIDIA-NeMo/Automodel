@@ -18,7 +18,6 @@ import inspect
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from copy import copy
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
@@ -58,17 +57,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
-
-
-# Dictionary-backed configs contain serialized Hugging Face configuration values.
-_ConfigValue = str | int | float | bool | None | list["_ConfigValue"] | dict[str, "_ConfigValue"]
-_TextConfig = PretrainedConfig | SimpleNamespace | dict[str, _ConfigValue]
-
-
-class _TextConfigProvider(Protocol):
-    """Composite configuration declaring its decoder configuration."""
-
-    def get_text_config(self, decoder: bool = False) -> _TextConfig: ...
 
 
 _BI_ENCODER_DEFAULT_POOLING = "avg"
@@ -183,14 +171,14 @@ def _move_to_extracted_dtype(model: nn.Module, extracted_model: nn.Module) -> nn
     return model
 
 
-def _get_config_value(config: _TextConfig | _TextConfigProvider, attribute: str, default: Any = None) -> Any:
+def _get_config_value(config: object, attribute: str, default: Any = None) -> Any:
     """Read a stored configuration value without invoking dynamic attribute fallbacks."""
     if isinstance(config, dict):
         return config.get(attribute, default)
     return vars(config).get(attribute, default) if hasattr(config, "__dict__") else default
 
 
-def _get_text_config(config: _TextConfig | _TextConfigProvider) -> _TextConfig | _TextConfigProvider:
+def _get_text_config(config: object) -> object:
     """Return the decoder config declared by a composite config, or the config itself."""
     get_text_config = getattr(config, "get_text_config", None)
     text_config = get_text_config(decoder=True) if callable(get_text_config) else config
@@ -199,9 +187,7 @@ def _get_text_config(config: _TextConfig | _TextConfigProvider) -> _TextConfig |
     return text_config
 
 
-def _resolve_is_causal(
-    config: _TextConfig | _TextConfigProvider, is_causal: bool | None, *, default: bool = False
-) -> bool:
+def _resolve_is_causal(config: object, is_causal: bool | None, *, default: bool = False) -> bool:
     """Resolve an explicit policy, then a saved policy, then the caller's default."""
     if is_causal is not None:
         if not isinstance(is_causal, bool):
@@ -213,7 +199,7 @@ def _resolve_is_causal(
     return saved_policy if saved_policy is not None else default
 
 
-def _get_text_backbone(model: PreTrainedModel) -> tuple[nn.Module, _TextConfig | _TextConfigProvider]:
+def _get_text_backbone(model: PreTrainedModel) -> tuple[nn.Module, object]:
     """Return the declared decoder and its config, or the whole text model."""
     root_config = model.config
     text_config = _get_text_config(root_config)
@@ -260,7 +246,7 @@ def _get_native_text_backbone_is_causal(model: PreTrainedModel) -> bool:
 
 def _resolve_text_backbone_is_causal(
     model: PreTrainedModel,
-    config: _TextConfig | _TextConfigProvider,
+    config: object,
     is_causal: bool | None,
     *,
     default: bool | None = None,

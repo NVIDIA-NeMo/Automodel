@@ -84,7 +84,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
         interpolate_pos: bool = False,
         use_flex: bool = False,
         data_status: Mapping[str, list[int | list[int] | None]] | None = None,
-        dataset_info: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
+        dataset_info: Mapping[str, object] | None = None,
         global_seed: int | None = None,
     ) -> None:
         """Initialize the packed BAGEL data stream.
