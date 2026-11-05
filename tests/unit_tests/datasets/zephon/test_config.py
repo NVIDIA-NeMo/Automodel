@@ -34,6 +34,30 @@ from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
+@pytest.mark.parametrize(
+    "source, expected, local",
+    [
+        ("org/corpus", "hf://org/corpus/train", False),
+        ("org/corpus", "org/corpus", True),
+        ("hf://org/corpus/validation", "hf://org/corpus/validation", False),
+    ],
+)
+def test_single_native_source_preserves_hf_and_local_selection(tmp_path, monkeypatch, source, expected, local):
+    monkeypatch.chdir(tmp_path)
+    if local:
+        Path(source).mkdir(parents=True)
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "dataset": {"_target_": ZephonTextSourceConfig, "path_or_dataset_id": source},
+                "dataloader": {"_target_": ZephonDataloaderConfig, "zephon": {"seq_len": 32}},
+                "step_scheduler": {"max_steps": 2, "local_batch_size": 1},
+            }
+        )
+    ).dataloader
+    assert config.zephon.sources == (ZephonSource(name="source_0", path=expected),)
+
+
 def test_toml_inline_override_relative_paths_and_native_validation(tmp_path):
     (tmp_path / "recipe.toml").write_text('seq_len = 17\nrepeat = false\n[[sources]]\nname="text"\npath="text.jsonl"\n')
     raw = ConfigNode(
