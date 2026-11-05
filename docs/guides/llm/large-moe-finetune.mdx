@@ -5,7 +5,7 @@ position: 5
 ---
 ## Introduction
 
-Mixture-of-Experts (MoE) architectures have become the dominant design for frontier language models, activating only a fraction of their total parameters per token to deliver strong performance at reduced compute cost. This guide walks through fine-tuning four example MoE LLMs with NVIDIA NeMo AutoModel. For a full list of supported architectures, see the [LLM model coverage](/model-coverage/large-language-models/overview) page.
+Mixture-of-Experts (MoE) architectures have become the dominant design for frontier language models, activating only a fraction of their total parameters per token to deliver strong performance at reduced compute cost. This guide shows you how to fine-tune four example MoE LLMs with NVIDIA NeMo AutoModel. For a full list of supported architectures, see the [LLM model coverage](/model-coverage/large-language-models/overview) page.
 
 | Model | Hugging Face Checkpoint | Validated Using |
 |-------|--------------|-----------------|
@@ -32,7 +32,7 @@ For details on how to swap in your own dataset, see the [LLM Dataset Guide](/dat
 
 ### MiniMax-M2.5
 
-[`examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml). Validated using **64 H100 GPUs** (8 nodes x 8).
+[`examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) is validated using **64 H100 GPUs** (8 nodes x 8).
 
 Key distributed settings:
 
@@ -48,7 +48,7 @@ distributed:
 
 ### GLM-5
 
-[`examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml). Validated using **256 H100 GPUs** (32 nodes x 8).
+[`examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) is validated using **256 H100 GPUs** (32 nodes x 8).
 
 Key distributed settings:
 
@@ -65,7 +65,7 @@ distributed:
 
 ### Step-3.5 Flash (StepFun)
 
-[`examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml). Validated using **64 H100 GPUs** (8 nodes x 8).
+[`examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml) is validated using **64 H100 GPUs** (8 nodes x 8).
 
 Key distributed settings:
 
@@ -81,7 +81,7 @@ distributed:
 
 ### DeepSeek-V3.2
 
-[`examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml). Validated using **256 H100 GPUs** (32 nodes x 8).
+[`examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml) is validated using **256 H100 GPUs** (32 nodes x 8).
 
 Key distributed settings:
 
@@ -130,7 +130,7 @@ The following advanced settings apply only when `dispatcher: hybridep`:
 |---|---:|---|
 | `dispatcher_hybridep_compact_routing` | `false` | Pass top-k expert indices instead of a dense Boolean routing map. |
 | `dispatcher_hybridep_permute_fusion` | `false` | Fuse token permutation into dispatch and unpermutation into combine. |
-| `dispatcher_hybridep_num_sms_preprocessing` | `null` | Override the number of SMs used for routing-metadata preprocessing. |
+| `dispatcher_hybridep_num_sms_preprocessing` | `null` | Override the number of streaming multiprocessors (SMs) used for routing-metadata preprocessing. |
 | `dispatcher_hybridep_num_blocks_permute` | `null` | Override the number of dispatch permutation blocks. |
 | `dispatcher_hybridep_num_blocks_unpermute` | `null` | Override the number of combine unpermutation blocks. |
 | `dispatcher_capacity_factor` | `null` | Capacity mode for dynamic routing: size the dispatch buffers once from the first real batch times this factor and run later dispatches non-blocking; an overflow trips a device-side assert. Not for experts with `expert_bias`. |
@@ -153,7 +153,7 @@ model:
       max_tokens_per_rank: 4096
 ```
 
-Use the same bound on all EP ranks and layers. Include masked tokens and account
+Use the same bound on all expert parallelism (EP) ranks and layers. Include masked tokens and account
 for local batch size and sequence parallelism when choosing it. The transport
 rounds the bound up to a multiple of 64 and accepts any shorter input without
 padding; receive buffers are sized from the actual routing counts, so tokens are
@@ -213,7 +213,7 @@ uv run automodel your_single_node_config.yaml --nproc-per-node 8
 
 The CLI takes the recipe config as its positional argument. Use this form only
 with a config whose distributed topology fits one node; the four configs above
-use multi-node PP/EP sizes and should be launched through Slurm or external
+use multi-node pipeline parallelism (PP) and EP sizes and should be launched through Slurm or external
 `torchrun` as shown below.
 
 ### Torchrun
