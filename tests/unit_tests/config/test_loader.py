@@ -108,6 +108,17 @@ def test_resolve_target_error():
         _resolve_target("surely.does.not.exist")
 
 
+def test_resolve_target_reports_missing_dependency_of_existing_module(tmp_path: Path, monkeypatch):
+    """A dependency missing inside an existing module surfaces as itself, not as a missing attribute."""
+    (tmp_path / "needs_missing_dep.py").write_text(
+        "import nemo_automodel_missing_dependency_for_test  # noqa: F401\n\nclass Target:\n    pass\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with pytest.raises(ModuleNotFoundError, match="nemo_automodel_missing_dependency_for_test"):
+        _resolve_target("needs_missing_dep.Target")
+
+
 def test_confignode_wrap_and_fn_resolution(tmp_module):
     """
     * Scalar values must be translated.
@@ -143,6 +154,35 @@ def test_dotted_get_set_contains():
     cfg.set_by_dotted("arr.values", ["a", "b", "c"])
     assert cfg.get("arr.values.1") == "b"
     assert cfg.get("non.existent", default="sentinel") == "sentinel"
+
+
+def test_set_by_dotted_indexes_into_lists():
+    cfg = ConfigNode({"optimizer": {"betas": [0.9, 0.95]}, "ds": [{"path": "a"}, {"path": "b"}]})
+
+    cfg.set_by_dotted("optimizer.betas.1", "0.98")
+    cfg.set_by_dotted("ds.1.path", "z")
+    cfg.set_by_dotted("ds.0", {"path": "y", "split": "train"})
+
+    assert cfg.optimizer.betas == [0.9, 0.98]
+    assert isinstance(cfg.ds, list) and len(cfg.ds) == 2
+    assert cfg.get("ds.1.path") == "z"
+    assert isinstance(cfg.ds[0], ConfigNode) and cfg.ds[0].to_dict() == {"path": "y", "split": "train"}
+    with pytest.raises(IndexError):
+        cfg.set_by_dotted("ds.2.path", "w")
+    with pytest.raises(IndexError):
+        cfg.set_by_dotted("optimizer.betas.x", 0.5)
+    assert cfg.optimizer.betas == [0.9, 0.98]
+
+
+def test_cli_override_of_list_element_keeps_the_list(tmp_path: Path):
+    from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text("optimizer:\n  lr: 1.0e-5\n  betas: [0.9, 0.95]\n")
+
+    cfg = parse_args_and_load_config(argv=["--config", str(cfg_path), "--optimizer.betas.1", "0.98"])
+
+    assert cfg.optimizer.betas == [0.9, 0.98]
 
 
 def test_instantiate_simple(tmp_module):
