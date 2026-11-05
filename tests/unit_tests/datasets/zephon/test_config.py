@@ -56,7 +56,7 @@ def _recipe(*, dataset_type="ZephonTextDatasetConfig", dataset=None, loader=None
             "zephon": deepcopy(_SETTINGS),
             **(dataset or {}),
         },
-        "dataloader": {"_target_": ZephonDataloaderConfig, **(loader or {})},
+        "dataloader": loader or {},
         "step_scheduler": {"max_steps": 10, "local_batch_size": 1, "global_batch_size": 1},
         **recipe,
     }
@@ -736,6 +736,22 @@ def test_text_stream_requires_its_loader_config_and_rejects_native_datasets():
     with pytest.raises(TypeError, match="Zephon text dataset config"):
         ZephonDataloaderConfig(dataset_config=MockUnpackedDatasetConfig())
     values = _recipe()
-    del values["dataloader"]["_target_"]
+    values["dataloader"]["_target_"] = "torch.utils.data.DataLoader"
     with pytest.raises(TypeError, match="compatible DataloaderConfig subclass"):
         RecipeConfig(ConfigNode(values)).dataloader
+
+
+@pytest.mark.parametrize(
+    "target", [None, ZephonDataloaderConfig, "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig"]
+)
+def test_text_loader_target_is_optional_and_explicit_targets_still_work(target):
+    values = _recipe()
+    if target is None:
+        values.pop("dataloader")
+    else:
+        values["dataloader"]["_target_"] = target
+    original = deepcopy(values)
+    loader = RecipeConfig(ConfigNode(values)).dataloader
+    assert isinstance(loader, ZephonDataloaderConfig)
+    assert isinstance(loader.dataset_config, ZephonTextDatasetConfig)
+    assert values == original
