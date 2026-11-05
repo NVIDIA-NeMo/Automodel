@@ -42,6 +42,8 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
         topk_idxs: torch.Tensor,
         sm_scale: float | None = None,
         reference_rounding: bool = False,
+        backward_impl: str = "atomic",
+        backward_workspace_bytes: int = 2 * 1024**3,
     ) -> torch.Tensor:
         """Run the vendored sparse attention forward kernel.
 
@@ -53,6 +55,8 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
             topk_idxs: Contiguous CUDA integer indices [batch, sequence, slots],
                 with -1 for masked slots.
             sm_scale: Score multiplier, defaulting to head_dim**-0.5.
+            backward_impl: Atomic or deterministic gradient reduction.
+            backward_workspace_bytes: Partial-KV workspace cap in bytes.
             reference_rounding: Use scaled-logit exponent arithmetic matching
                 the released inference kernel.
 
@@ -64,6 +68,8 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
         )
         ctx.save_for_backward(q, kv, attn_sink, topk_idxs, output, lse)
         ctx.sm_scale = sm_scale
+        ctx.backward_impl = backward_impl
+        ctx.backward_workspace_bytes = backward_workspace_bytes
         return output
 
     @staticmethod
@@ -85,17 +91,32 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
         """
         q, kv, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        grad_q, grad_kv, grad_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
-            q,
-            kv,
-            attn_sink,
-            output.contiguous(),
-            grad_output,
-            topk_idxs,
-            lse,
-            sm_scale=ctx.sm_scale,
-        )
-        gradients = (grad_q, grad_kv, grad_attn_sink, None, None, None)
+        if ctx.backward_impl == "deterministic":
+            from nemo_automodel.components.models.deepseek_v4.kernels.fixed_order_sparse_mla import fixed_order_backward
+
+            grad_q, grad_kv, grad_attn_sink = fixed_order_backward(
+                q,
+                kv,
+                attn_sink,
+                output.contiguous(),
+                grad_output,
+                topk_idxs,
+                lse,
+                sm_scale=ctx.sm_scale,
+                workspace_bytes=ctx.backward_workspace_bytes,
+            )
+        else:
+            grad_q, grad_kv, grad_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
+                q,
+                kv,
+                attn_sink,
+                output.contiguous(),
+                grad_output,
+                topk_idxs,
+                lse,
+                sm_scale=ctx.sm_scale,
+            )
+        gradients = (grad_q, grad_kv, grad_attn_sink, None, None, None, None, None)
         # Direct .apply callers may omit optional arguments. Autograd requires
         # one entry per argument actually supplied, including optional flags.
         return gradients[: len(ctx.needs_input_grad)]
@@ -108,6 +129,8 @@ def sparse_attn_tilelang(
     topk_idxs: torch.Tensor,
     sm_scale: float | None = None,
     reference_rounding: bool = False,
+    backward_impl: str = "atomic",
+    backward_workspace_bytes: int = 2 * 1024**3,
 ) -> torch.Tensor:
     """Run vendored Miles DeepSeek V4 TileLang sparse attention.
 
@@ -118,13 +141,19 @@ def sparse_attn_tilelang(
         topk_idxs: Contiguous CUDA integer indices [batch, sequence, slots],
             with -1 for masked slots.
         sm_scale: Score multiplier, defaulting to head_dim**-0.5.
+        backward_impl: Atomic or fixed-order deterministic gradient reduction.
+        backward_workspace_bytes: Maximum partial-KV workspace; auxiliary buffers are extra.
         reference_rounding: Select released-inference forward exponent arithmetic.
 
     Returns:
         Independent BF16 tensor [batch, sequence, heads, head_dim], with the
         existing custom backward for queries, shared KV and sink parameters.
     """
-    return DeepSeekV4SparseAttention.apply(q, kv, attn_sink, topk_idxs, sm_scale, reference_rounding)
+    if backward_impl not in ("atomic", "deterministic") or backward_workspace_bytes <= 0:
+        raise ValueError("invalid sparse attention backward implementation or workspace")
+    return DeepSeekV4SparseAttention.apply(
+        q, kv, attn_sink, topk_idxs, sm_scale, reference_rounding, backward_impl, backward_workspace_bytes
+    )
 
 
 class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
@@ -140,6 +169,8 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
         max_heads_per_kernel: int,
         sm_scale: float | None = None,
         reference_rounding: bool = False,
+        backward_impl: str = "atomic",
+        backward_workspace_bytes: int = 2 * 1024**3,
     ) -> torch.Tensor:
         """Run forward over head chunks while preserving backward chunk size.
 
@@ -153,6 +184,8 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
             max_heads_per_kernel: Maximum heads per backward kernel. Forward
                 uses the same count unless reference mode requires at least 64.
             sm_scale: Score multiplier, defaulting to head_dim**-0.5.
+            backward_impl: Atomic or deterministic gradient reduction.
+            backward_workspace_bytes: Partial-KV workspace cap in bytes.
             reference_rounding: Preserve the original 64-head forward layout
                 and scaled-logit exponent arithmetic.
 
@@ -179,6 +212,8 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
         ctx.save_for_backward(q, kv, attn_sink, topk_idxs, output, lse)
         ctx.max_heads_per_kernel = max_heads_per_kernel
         ctx.sm_scale = sm_scale
+        ctx.backward_impl = backward_impl
+        ctx.backward_workspace_bytes = backward_workspace_bytes
         return output
 
     @staticmethod
@@ -206,17 +241,35 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
         max_heads = ctx.max_heads_per_kernel
         for start in range(0, q.shape[2], max_heads):
             end = min(start + max_heads, q.shape[2])
-            grad_q_chunk, grad_kv_chunk, grad_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
-                q[:, :, start:end, :].contiguous(),
-                kv,
-                attn_sink[start:end].contiguous(),
-                output[:, :, start:end, :].contiguous(),
-                grad_output[:, :, start:end, :].contiguous(),
-                topk_idxs,
-                lse[:, :, start:end].contiguous(),
-                sm_scale=ctx.sm_scale,
-                return_dkv_accum_dtype=True,
-            )
+            if ctx.backward_impl == "deterministic":
+                from nemo_automodel.components.models.deepseek_v4.kernels.fixed_order_sparse_mla import (
+                    fixed_order_backward,
+                )
+
+                grad_q_chunk, grad_kv_chunk, grad_attn_sink = fixed_order_backward(
+                    q[:, :, start:end, :].contiguous(),
+                    kv,
+                    attn_sink[start:end].contiguous(),
+                    output[:, :, start:end, :].contiguous(),
+                    grad_output[:, :, start:end, :].contiguous(),
+                    topk_idxs,
+                    lse[:, :, start:end].contiguous(),
+                    sm_scale=ctx.sm_scale,
+                    workspace_bytes=ctx.backward_workspace_bytes,
+                    return_dkv_accum_dtype=True,
+                )
+            else:
+                grad_q_chunk, grad_kv_chunk, grad_attn_sink = sparse_mla_bwd.sparse_mqa_bwd_interface(
+                    q[:, :, start:end, :].contiguous(),
+                    kv,
+                    attn_sink[start:end].contiguous(),
+                    output[:, :, start:end, :].contiguous(),
+                    grad_output[:, :, start:end, :].contiguous(),
+                    topk_idxs,
+                    lse[:, :, start:end].contiguous(),
+                    sm_scale=ctx.sm_scale,
+                    return_dkv_accum_dtype=True,
+                )
             grad_q_full[:, :, start:end, :].copy_(grad_q_chunk)
             grad_kv += grad_kv_chunk
             grad_attn_sink_full[start:end].copy_(grad_attn_sink)
@@ -224,6 +277,8 @@ class DeepSeekV4SparseAttentionHeadChunked(torch.autograd.Function):
             grad_q_full,
             grad_kv.to(kv.dtype),
             grad_attn_sink_full,
+            None,
+            None,
             None,
             None,
             None,
@@ -240,6 +295,8 @@ def sparse_attn_tilelang_head_chunked(
     max_heads_per_kernel: int,
     sm_scale: float | None = None,
     reference_rounding: bool = False,
+    backward_impl: str = "atomic",
+    backward_workspace_bytes: int = 2 * 1024**3,
 ) -> torch.Tensor:
     """Run vendored sparse attention with bounded backward head chunks.
 
@@ -252,12 +309,24 @@ def sparse_attn_tilelang_head_chunked(
         max_heads_per_kernel: Backward head chunk size; forward uses at least
             64 heads per chunk when reference_rounding is enabled.
         sm_scale: Score multiplier, defaulting to head_dim**-0.5.
+        backward_impl: Atomic or fixed-order deterministic gradient reduction.
+        backward_workspace_bytes: Maximum partial-KV workspace; auxiliary buffers are extra.
         reference_rounding: Select original-inference forward rounding while
             retaining smaller backward chunks and FP32 shared-KV accumulation.
 
     Returns:
         Independent CUDA BF16 tensor [batch, sequence, heads, head_dim].
     """
+    if backward_impl not in ("atomic", "deterministic") or backward_workspace_bytes <= 0:
+        raise ValueError("invalid sparse attention backward implementation or workspace")
     return DeepSeekV4SparseAttentionHeadChunked.apply(
-        q, kv, attn_sink, topk_idxs, max_heads_per_kernel, sm_scale, reference_rounding
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        max_heads_per_kernel,
+        sm_scale,
+        reference_rounding,
+        backward_impl,
+        backward_workspace_bytes,
     )
