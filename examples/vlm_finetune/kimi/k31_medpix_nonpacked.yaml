@@ -53,7 +53,7 @@ model:
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
     dispatcher_num_sms: 32
-  revision: 6d0a0202956796543364d666ab19c6ad1a494ee1
+  revision: 6d0a0202956796543364d666ab19c6ad1a494ee1  # pragma: allowlist secret (public model commit SHA)
   torch_dtype: bfloat16
   text_config:
     kda_chunk_impl: fla
@@ -123,7 +123,7 @@ prewarm:
 processor:
   _target_: nemo_automodel.components.models.kimi_k3.processing.KimiK3Processor.from_pretrained
   pretrained_model_name_or_path: moonshotai/Kimi-K3.1-Pro
-  revision: 6d0a0202956796543364d666ab19c6ad1a494ee1
+  revision: 6d0a0202956796543364d666ab19c6ad1a494ee1  # pragma: allowlist secret (public model commit SHA)
 freeze_config:
   freeze_vision_tower: false
   freeze_language_model: false
