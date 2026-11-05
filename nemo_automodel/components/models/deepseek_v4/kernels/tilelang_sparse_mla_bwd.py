@@ -43,6 +43,10 @@ def preprocess(
 ):
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
+    # None selects runtime dimensions for the fixed-order caller; existing
+    # static callers retain their original specialization.
+    B = T.dynamic("batch") if B is None else B
+    S = T.dynamic("queries") if S is None else S
     shape = [B, S, H, D]
 
     @T.prim_func
@@ -117,6 +121,7 @@ def bwd(
     indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
+    deterministic: bool = False,
 ):
     assert topk % block_size == 0, f"topk ({topk}) must be divisible by block_size ({block_size})"
     assert dtype == T.bfloat16
@@ -125,6 +130,10 @@ def bwd(
     if sm_scale is None:
         sm_scale = D ** (-0.5)
     sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
+
+    B = T.dynamic("batch") if B is None else B
+    S = T.dynamic("queries") if S is None else S
+    S_kv = T.dynamic("keys") if S_kv is None else S_kv
 
     q_shape = [B, S, H, D]
     kv_shape = [B, S_kv, D]
@@ -143,6 +152,8 @@ def bwd(
     NS = tilelang.cdiv(topk, block_size)
 
     split_store = 2
+    dkv_output_shape = [B, S, NH, topk, D] if deterministic else kv_shape
+    sink_output_shape = [B, S, H] if deterministic else attn_sink_shape
 
     @T.prim_func
     def sparse_mqa_bwd_kernel(
@@ -155,8 +166,8 @@ def bwd(
         Lse: T.Tensor(lse_shape, accum_dtype),
         Delta: T.Tensor(delta_shape, accum_dtype),
         dQ: T.Tensor(q_shape, dtype),
-        dKV: T.Tensor(kv_shape, accum_dtype),
-        dAttnSink: T.Tensor(attn_sink_shape, accum_dtype),
+        dKV: T.Tensor(dkv_output_shape, accum_dtype),
+        dAttnSink: T.Tensor(sink_output_shape, accum_dtype),
     ):
         with T.Kernel(S, B, NH, threads=threads) as (s_i, by, bz):
             Q_shared = T.alloc_shared([block_H, D], dtype)
@@ -254,14 +265,20 @@ def bwd(
 
                         for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
                             if ValidMask[by, s_i, i_i * BS + bi_i + s * (BS // split_store)] != 0:
-                                T.atomic_addx4(
-                                    dKV[
-                                        by,
-                                        Indices[by, s_i, i_i * BS + bi_i + s * (BS // split_store)],
-                                        d_i * 4,
-                                    ],
-                                    acc_dkv_shared[bi_i, d_i * 4],
-                                )
+                                if deterministic:
+                                    for lane in T.serial(4):
+                                        dKV[by, s_i, bz, i_i * BS + bi_i + s * (BS // split_store), d_i * 4 + lane] = (
+                                            acc_dkv_shared[bi_i, d_i * 4 + lane]
+                                        )
+                                else:
+                                    T.atomic_addx4(
+                                        dKV[
+                                            by,
+                                            Indices[by, s_i, i_i * BS + bi_i + s * (BS // split_store)],
+                                            d_i * 4,
+                                        ],
+                                        acc_dkv_shared[bi_i, d_i * 4],
+                                    )
 
             # Store dQ
             T.copy(acc_dq, dQ_shared)
@@ -271,11 +288,16 @@ def bwd(
             # where p_sink = exp(attn_sink[h]) / Z = exp2(attn_sink[h]*log2e - LSE)
             # attn_sink is a pre-scaled logit, so only convert to log2 base (no sm_scale)
             for h_i in T.Parallel(block_H):
-                T.atomic_add(
-                    dAttnSink[bz * block_H + h_i],
-                    -Delta[by, s_i, bz * block_H + h_i]
-                    * T.exp2(AttnSink[bz * block_H + h_i] * 1.44269504 - Lse[by, s_i, bz * block_H + h_i]),
-                )
+                if deterministic:
+                    dAttnSink[by, s_i, bz * block_H + h_i] = -Delta[by, s_i, bz * block_H + h_i] * T.exp2(
+                        AttnSink[bz * block_H + h_i] * 1.44269504 - Lse[by, s_i, bz * block_H + h_i]
+                    )
+                else:
+                    T.atomic_add(
+                        dAttnSink[bz * block_H + h_i],
+                        -Delta[by, s_i, bz * block_H + h_i]
+                        * T.exp2(AttnSink[bz * block_H + h_i] * 1.44269504 - Lse[by, s_i, bz * block_H + h_i]),
+                    )
 
     return sparse_mqa_bwd_kernel
 
