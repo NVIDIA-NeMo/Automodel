@@ -65,7 +65,7 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
-from nemo_automodel.components.datasets.loader import DataloaderConfig, TextDataloaderConfig, close_dataloader
+from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetBuildSchedule, close_dataloader
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -148,7 +148,7 @@ def _get_model_name(cfg_model):
 
 
 def _should_pack_validation(
-    training_dataloader: TextDataloaderConfig | None,
+    training_dataloader: DataloaderConfig | None,
     validation_dataloader: DataloaderConfig,
     model: nn.Module,
 ) -> bool:
@@ -600,9 +600,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             return
 
         dataloader_config = self.cfg.dataloader
-        validate_parallelism = getattr(dataloader_config, "validate_parallelism", None)
-        if callable(validate_parallelism):
-            validate_parallelism(cp_size=self.mesh_context.cp_size)
         packed_input_length = dataloader_config.packed_sequence_length
 
         # MagiAttention (FFA / context-parallel) backend, enabled via
@@ -667,10 +664,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
             if self.cfg.dataloader is None:
                 raise ValueError("domain_mixture requires a dataset/dataloader configuration")
-            # output_format describes the selected representation: a config selecting
-            # packed_sequence_thd_collater directly has packing=None but still
-            # produces packed batches (and drops dataset_id).
-            if self.cfg.dataloader.output_format == "thd" or self.cfg.dataloader.packing is not None:
+            # Packed provenance is a loader capability, including prepacked and stream input.
+            if self.cfg.dataloader.is_packed:
                 raise ValueError(
                     "domain_mixture does not support sequence packing because packed batches do not preserve "
                     "per-token dataset_id provenance"
@@ -872,7 +867,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             configure_packing_for_models(self.model_parts)
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
-        def materialize_loader(config: TextDataloaderConfig):
+        def materialize_loader(config: DataloaderConfig, *, is_training: bool = True):
             process_group = getattr(self.mesh_context, "process_group", None)
             build_context = (
                 nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode(group=process_group)
@@ -886,7 +881,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
                 # Models and backends that own their CP dispatch do not need
                 # TE's per-document ``2 * cp_size`` packing alignment.
-                cp_size=(
+                cp_size=self.mesh_context.cp_size,
+                packing_cp_size=(
                     1
                     if (
                         getattr(self.model_parts[0], "_owns_cp_attention", False)
@@ -897,6 +893,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 packing_contract=packing_contract,
                 collate_wrapper=collate_wrapper,
                 ignore_index=_get_loss_ignore_index(self.loss_fn),
+                training_schedule=DatasetBuildSchedule(
+                    local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                    global_batch_size=self.cfg.step_scheduler.global_batch_size,
+                    max_steps=self.cfg.get("step_scheduler.max_steps", None),
+                    val_check_interval=self.cfg.get("step_scheduler.val_every_steps", None),
+                ),
+                domain_mixture=self.cfg.get("domain_mixture", None),
+                is_training=is_training,
             )
 
         self.dataloader = materialize_loader(dataloader_config)
@@ -904,7 +908,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             name: materialize_loader(
                 dl_config
                 if _should_pack_validation(self.cfg.dataloader, dl_config, self.model_parts[0])
-                else replace(dl_config, packing=None)
+                else replace(dl_config, packing=None),
+                is_training=False,
             )
             for name, dl_config in self.cfg.validation_dataloaders.items()
         }

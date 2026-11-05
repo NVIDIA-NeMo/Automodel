@@ -22,14 +22,14 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
+from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonOptions,
     ZephonPackingOptions,
     ZephonRuntimeOptions,
     ZephonSource,
     ZephonSourceOptions,
-    ZephonTextSourceConfig,
+    ZephonTextDatasetConfig,
 )
 
 
@@ -52,14 +52,16 @@ def config(tmp_path):
         "".join(json.dumps({"text": f"w{i % 30} w{(i + 1) % 30} w{(i + 2) % 30}"}) + "\n" for i in range(36))
     )
     return ZephonDataloaderConfig(
-        dataset_config=ZephonTextSourceConfig(tokenize_special_tokens="eos"),
-        zephon=ZephonOptions(
-            sources=(ZephonSource(name="text", path=str(directory), fmt="jsonl"),),
-            packing=ZephonPackingOptions(seq_len=7, shuffle_after_pack=False),
-            source=ZephonSourceOptions(
-                chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+        dataset_config=ZephonTextDatasetConfig(
+            tokenize_special_tokens="eos",
+            zephon=ZephonOptions(
+                sources=(ZephonSource(name="text", path=str(directory), fmt="jsonl"),),
+                packing=ZephonPackingOptions(seq_len=7, shuffle_after_pack=False),
+                source=ZephonSourceOptions(
+                    chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                ),
+                runtime=ZephonRuntimeOptions(runner="threads", mtp_mode=False),
             ),
-            runtime=ZephonRuntimeOptions(runner="threads", mtp_mode=False),
         ),
         batch_size=2,
     )
