@@ -27,6 +27,7 @@ import logging
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -98,6 +99,24 @@ def test_model_config():
     return config, model
 
 
+@pytest.fixture(scope="module")
+def _tiny_config_and_model():
+    """Build the tiny config/model pair once, as ``main()`` does for script runs."""
+    return test_model_config()
+
+
+@pytest.fixture
+def config(_tiny_config_and_model):
+    """Tiny ``Llavaonevision1_5Config`` shared by the forward-pass tests."""
+    return _tiny_config_and_model[0]
+
+
+@pytest.fixture
+def model(_tiny_config_and_model):
+    """Eval-mode LLaVA-OneVision-1.5 model built from the tiny config."""
+    return _tiny_config_and_model[1]
+
+
 def test_forward_pass_shape(config, model):
     """Test 2: Verify forward pass returns correct tensor shapes."""
     logger.info("")
@@ -146,6 +165,8 @@ def test_forward_pass_with_image(config, model):
 
     # Create input with image token
     input_ids = torch.randint(0, config.text_config.vocab_size, (batch_size, seq_len))
+    # Random filler can draw image_token_id; the model requires one placeholder per image feature.
+    input_ids.masked_fill_(input_ids == config.image_token_id, 0)
     # Insert image token at a specific position
     input_ids[0, 5] = config.image_token_id
     attention_mask = torch.ones_like(input_ids)
@@ -201,6 +222,8 @@ def test_forward_pass_with_multiple_images(config, model):
     pixel_values = torch.randn(total_patches, 3 * 14 * 14)
 
     input_ids = torch.randint(0, config.text_config.vocab_size, (batch_size, seq_len))
+    # Random filler can draw image_token_id; the model requires one placeholder per image feature.
+    input_ids.masked_fill_(input_ids == config.image_token_id, 0)
     input_ids[0, 5] = config.image_token_id  # first image placeholder
     input_ids[0, 15] = config.image_token_id  # second image placeholder
     attention_mask = torch.ones_like(input_ids)
