@@ -62,13 +62,12 @@ not yet comply; use these guidelines to guide changes within your task's scope.
 - **Run both type gates.** Use `uv run --group linting python tools/check_types.py`.
   CI uses the same entry point. `ty.toml` owns checker settings and the opt-in
   module list; `tools/annotation_policy.toml` owns the separate annotation policy.
-- **New `object` annotations require review.** The policy checker rejects direct,
+- **All `object` annotations require review.** The policy checker rejects direct,
   nested, quoted, and locally aliased `object` annotations across `nemo_automodel`
   and `examples`, including type comments. Use a precise contract when operations
   or a schema are known. For genuinely opaque values, add an exact path, symbol,
   and annotation-slot exception with a reason in `tools/annotation_policy.toml`.
-  The legacy inventory is migration debt tracked by #4607, not an approved-use
-  list: never expand it, and remove entries as their annotations are fixed.
+  Existing annotations are checked under the same policy; there are no legacy allowances.
   This is a syntax check, not type inference or cross-module alias resolution;
   `ty` and caller/implementation review remain necessary. Runtime `object()`
   sentinels and `Literal`/`Annotated` metadata are unaffected.

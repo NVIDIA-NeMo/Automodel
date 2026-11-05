@@ -38,10 +38,8 @@ class TestAnnotationPolicy(unittest.TestCase):
             shutil.copyfile(_ROOT / "tools" / script, self.root / "tools" / script)
         self.configure()
 
-    def configure(self, legacy: str = "", exceptions: str = "") -> None:
-        (self.root / "tools/annotation_policy.toml").write_text(
-            f'paths = ["src"]\n[exceptions]\n{exceptions}\n[legacy]\n{legacy}\n'
-        )
+    def configure(self, exceptions: str = "") -> None:
+        (self.root / "tools/annotation_policy.toml").write_text(f'paths = ["src"]\n[exceptions]\n{exceptions}\n')
 
     def run_policy(self, source: str, script: str = "check_annotation_policy.py") -> subprocess.CompletedProcess[str]:
         (self.root / "src/example.py").write_text(textwrap.dedent(source))
@@ -142,16 +140,19 @@ class TestAnnotationPolicy(unittest.TestCase):
         """)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_legacy_allowance_is_per_slot_and_stale_entries_fail(self) -> None:
-        self.configure(legacy='"src/example.py:f:x" = 1')
+    def test_legacy_allowances_are_rejected(self) -> None:
+        (self.root / "tools/annotation_policy.toml").write_text(
+            'paths = ["src"]\n[exceptions]\n[legacy]\n"src/example.py:f:x" = 1\n'
+        )
         result = self.run_policy("def f(x: object): pass")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        result = self.run_policy("def f(x: object, y: object): pass")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("f:y", result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Legacy allowances are not supported", result.stderr)
+
+    def test_stale_exception_fails(self) -> None:
+        self.configure(exceptions='"src/example.py:f:x" = "Opaque serializer input"')
         result = self.run_policy("def f(x: int): pass")
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("stale allowance", result.stderr)
+        self.assertIn("stale exception", result.stderr)
 
     def test_reviewed_exception_requires_reason_and_is_narrow(self) -> None:
         self.configure(exceptions='"src/example.py:f:x" = "Opaque serializer input"')
@@ -164,7 +165,7 @@ class TestAnnotationPolicy(unittest.TestCase):
 
     def test_syntax_errors_and_missing_roots_fail_closed(self) -> None:
         self.assertNotEqual(self.run_policy("def broken(").returncode, 0)
-        (self.root / "tools/annotation_policy.toml").write_text('paths = ["missing"]\n[legacy]\n[exceptions]')
+        (self.root / "tools/annotation_policy.toml").write_text('paths = ["missing"]\n[exceptions]')
         result = self.run_policy("def f(x: int): pass")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must exist", result.stderr)

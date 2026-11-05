@@ -14,8 +14,8 @@
 
 """Reject unapproved object annotations without importing the checked code.
 
-Run from the repository root with Python 3.11+. Configuration and the legacy
-inventory live in tools/annotation_policy.toml. This syntax gate complements ty;
+Run from the repository root with Python 3.11+. Configuration and reviewed
+exceptions live in tools/annotation_policy.toml. This syntax gate complements ty;
 it does not infer types or resolve aliases imported from other source modules.
 """
 
@@ -176,14 +176,11 @@ def check_file(path: Path) -> list[tuple[str, int]]:
 
 
 def main() -> int:
-    """Check the configured source tree and reject new or stale allowances."""
+    """Check the configured source tree and reject unapproved annotations and stale exceptions."""
     config = tomllib.loads(Path("tools/annotation_policy.toml").read_text())
-    legacy = config["legacy"]
+    if "legacy" in config:
+        raise ValueError("Legacy allowances are not supported; existing annotations must satisfy the policy")
     exceptions = config["exceptions"]
-    if set(legacy) & set(exceptions):
-        raise ValueError("An annotation cannot have both a legacy allowance and an exception")
-    if any(type(count) is not int or count < 1 for count in legacy.values()):
-        raise ValueError("Legacy counts must be positive integers")
     if any(not isinstance(reason, str) or not reason.strip() for reason in exceptions.values()):
         raise ValueError("Every exception must explain why the value is opaque")
     observed: Counter[str] = Counter()
@@ -201,19 +198,18 @@ def main() -> int:
         for slot, line in findings:
             key = f"{path.as_posix()}:{slot}"
             observed[key] += 1
-            allowance = legacy.get(key, 1 if key in exceptions else 0)
+            allowance = 1 if key in exceptions else 0
             if observed[key] > allowance:
                 _LOG.error(
                     "%s:%s: object annotation (%s): use a precise contract or a reviewed exception", path, line, slot
                 )
                 failed = True
-    for key in legacy.keys() | exceptions.keys():
-        expected = legacy.get(key, 1)
-        if observed[key] < expected:
-            _LOG.error("%s: stale allowance; remove it or reduce its legacy count", key)
+    for key in exceptions:
+        if observed[key] == 0:
+            _LOG.error("%s: stale exception; remove it", key)
             failed = True
     _LOG.info(
-        "Annotation policy: checked %s files, %s existing/approved object annotations",
+        "Annotation policy: checked %s files, %s object annotations",
         len(files),
         sum(observed.values()),
     )
