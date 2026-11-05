@@ -172,9 +172,9 @@ boundary-target masking. This is a flat token-sequence format, not an importer
 for framework cache files, source padding, cumulative-length tensors, or already
 shifted labels. The same `batched` and `thd` output formats remain available.
 
-### Instruction tuning
+### Configure Instruction Tuning
 
-For question/answer data, select `ZephonInstructionDatasetConfig`:
+For question and answer data, select `ZephonInstructionDatasetConfig`:
 
 ```yaml
 dataset:
@@ -191,7 +191,7 @@ dataset:
 This example reads the `prompt` and `completion` fields of each document.
 AutoModel normalizes the columns, and Zephon's `tokenize_chat()` performs chat
 tokenization and loss masking. The tokenizer's chat template supplies the
-conversation format. Set `use_hf_chat_template: false` for plain prompt/completion
+conversation format. Set `use_hf_chat_template: false` for plain prompt and completion
 formatting.
 
 Native dataset configs keep their native loader by default. Explicitly setting
@@ -217,7 +217,7 @@ uv run python examples/llm_pretrain/zephon/prepare_tiny.py
 uv run automodel examples/llm_pretrain/zephon/sft.yaml --nproc-per-node 1
 ```
 
-Install the matching Flash Attention dependencies, or select SDPA with
+Install the matching Flash Attention dependencies, or select Scaled Dot-Product Attention (SDPA) with
 `--model.attn_implementation sdpa`.
 
 ## How the Integration Works
