@@ -17,11 +17,13 @@
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import yaml
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig, VlmVideoProcessorConfig
 from nemo_automodel.components.datasets.zephon import ZephonVlmDataloaderConfig, ZephonVlmSourceConfig
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonOptions,
@@ -134,6 +136,24 @@ def test_cheap_vlm_build_validation_precedes_position_factory(batch_size, pp_n_m
             pp_n_microbatches=pp_n_microbatches,
             position_state_factory=must_not_run,
         )
+
+
+def test_video_processor_is_rejected_before_processor_loading():
+    processor_factory = Mock()
+    video_factory = Mock()
+    with pytest.raises(ValueError, match="does not support video processors"):
+        ZephonVlmDataloaderConfig(
+            processor_config=VlmProcessorConfig(
+                factory=processor_factory,
+                video_processor=VlmVideoProcessorConfig(factory=video_factory),
+            ),
+            zephon=ZephonOptions(
+                sources=(ZephonSource(name="images", path="unused"),),
+                packing=ZephonPackingOptions(pack_algorithm="first_fit"),
+            ),
+        )
+    processor_factory.assert_not_called()
+    video_factory.assert_not_called()
 
 
 @pytest.mark.parametrize("allow_xdoc", [False, True])

@@ -21,6 +21,8 @@ from torch import nn
 
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.zephon.config import ZephonOptions, ZephonPackingOptions, ZephonSource
+from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
 
@@ -238,3 +240,25 @@ def test_separate_teacher_setup_forwards_load_metadata_transport(monkeypatch, en
     recipe.setup()
     assert build.call_args.kwargs["load_metadata_with_gloo"] is enabled
     recipe.kd_mesh_bridge.synchronize.assert_called_once_with()
+
+
+@pytest.mark.cuda(False)
+def test_setup_rejects_zephon_before_tokenizer_or_model_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    verify_tokenizers = Mock()
+    setup_student = Mock()
+    monkeypatch.setattr(vlm_kd, "_verify_tokenizer_compatibility", verify_tokenizers)
+    monkeypatch.setattr(vlm_kd.FinetuneRecipeForVLM, "setup", setup_student)
+    recipe = vlm_kd.KnowledgeDistillationRecipeForVLM.__new__(vlm_kd.KnowledgeDistillationRecipeForVLM)
+    recipe.cfg = _Cfg()
+    recipe.cfg.vlm_dataloader = ZephonVlmDataloaderConfig(
+        zephon=ZephonOptions(
+            sources=(ZephonSource(name="images", path="unused"),),
+            packing=ZephonPackingOptions(pack_algorithm="first_fit"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="knowledge distillation does not support Zephon"):
+        recipe.setup()
+
+    verify_tokenizers.assert_not_called()
+    setup_student.assert_not_called()
