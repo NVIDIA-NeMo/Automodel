@@ -16,12 +16,12 @@
 
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonDataloaderConfig,
-    ZephonPretokenizedTextSourceConfig,
-    ZephonTextSourceConfig,
+    ZephonPretokenizedTextDatasetConfig,
+    ZephonTextDatasetConfig,
 )
 
 __all__ = [
     "ZephonDataloaderConfig",
-    "ZephonPretokenizedTextSourceConfig",
-    "ZephonTextSourceConfig",
+    "ZephonPretokenizedTextDatasetConfig",
+    "ZephonTextDatasetConfig",
 ]

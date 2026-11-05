@@ -44,7 +44,7 @@ import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
-    from nemo_automodel.components.datasets.loader import DataloaderConfig, TextDataloaderConfig
+    from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetConfig
     from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
     from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
     from nemo_automodel.components.loss.loss import LossConfig
@@ -69,6 +69,29 @@ if TYPE_CHECKING:
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
 _STEP_SCHEDULER_RUNTIME_KEYS = ("local_batch_size", "dp_size", "dataloader")
+_LoaderConfig = TypeVar("_LoaderConfig")
+
+
+def _loader_config_class(
+    target: object, base: type[_LoaderConfig], *, dataset_config: DatasetConfig
+) -> type[_LoaderConfig]:
+    """Resolve an explicit loader target or its dataset-owned default."""
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.datasets.loader import StreamDatasetConfig
+
+    if target is None:
+        if not isinstance(dataset_config, StreamDatasetConfig):
+            return base
+        target = dataset_config.dataloader_config_type
+        if target is None:
+            return base
+
+    # ConfigNode restores dotted targets serialized by to_dict() using the same
+    # resolution rules as the recipe's other _target_ sections.
+    resolved = ConfigNode({"_target_": target})._target_
+    if not isinstance(resolved, type) or not issubclass(resolved, base):
+        raise ValueError(f"Unsupported dataloader _target_ {target!r}; expected a {base.__name__} subclass")
+    return resolved
 
 
 def _section_kwargs(node: Any) -> dict[str, Any]:
@@ -206,7 +229,7 @@ class RecipeConfig:
         return self._optimizer_config("head_optimizer")
 
     @cached_property
-    def dataloader(self) -> TextDataloaderConfig | None:
+    def dataloader(self) -> "DataloaderConfig" | None:
         dataset_node, dataloader_node = self._dataset_and_dataloader_nodes()
         if dataset_node is None:
             return None
@@ -241,7 +264,7 @@ class RecipeConfig:
             return make_packing_config(ps.pop("packing_strategy", "thd"), ps)
         return None
 
-    def _resolve_dataloader(self, dataset_node: Any, dataloader_node: Any) -> TextDataloaderConfig:
+    def _resolve_dataloader(self, dataset_node: Any, dataloader_node: Any) -> "DataloaderConfig":
         """Resolve YAML dataset/loader blocks into one typed dataloader config."""
         from torch.utils.data import DataLoader
         from torchdata.stateful_dataloader import StatefulDataLoader
@@ -251,50 +274,32 @@ class RecipeConfig:
             DataloaderConfig,
             DatasetBuildSchedule,
             ScheduledDatasetConfig,
+            StreamDatasetConfig,
             make_collate_fn,
             make_dataset_config,
         )
-        from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
-
-        loader_values = _as_dict(dataloader_node)
-        if loader_values.get("_target_") in (
-            ZephonDataloaderConfig,
-            "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
-        ):
-            target, dataset_values = _callable_and_kwargs(dataset_node)
-            resolved = ZephonDataloaderConfig.from_recipe(
-                target,
-                dataset_values,
-                loader_values,
-                seed=self._raw.get("seed", 42),
-                batch_size=self._raw.get("step_scheduler.local_batch_size", 1),
-                packing=_as_dict(self._raw.get("packed_sequence", None)),
-            )
-            resolved.validate_training(
-                max_steps=self._raw.get("step_scheduler.max_steps", None),
-                global_batch_size=self.step_scheduler.global_batch_size,
-                local_batch_size=resolved.batch_size,
-                domain_mixture=self._raw.get("domain_mixture", None),
-            )
-            return resolved
 
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
         dataset_kwargs.pop("tokenizer", None)
         dataset_config = make_dataset_config(target, dataset_kwargs)
-
         loader_kwargs = _as_dict(dataloader_node)
         loader_target = loader_kwargs.pop("_target_", None)
         supported_loader_targets = {
-            None,
             "torch.utils.data.DataLoader",
             "torchdata.stateful_dataloader.StatefulDataLoader",
             DataLoader,
             StatefulDataLoader,
         }
-        if loader_target not in supported_loader_targets:
-            raise ValueError(
-                f"Unsupported dataloader _target_ {loader_target!r}; typed recipes use ParallelAwareDataloader"
-            )
+        config_class = (
+            DataloaderConfig
+            if loader_target in supported_loader_targets
+            else _loader_config_class(loader_target, DataloaderConfig, dataset_config=dataset_config)
+        )
+        dataset_config = config_class.adapt_dataset_config(dataset_config)
+        # Validate the adapted config too: selecting a stream backend cannot
+        # silently replace native packing, even when it was explicitly disabled.
+        if isinstance(dataset_config, StreamDatasetConfig) and self._raw.get("packed_sequence", None) is not None:
+            raise ValueError("Stream datasets own packing; remove native packed_sequence configuration")
         collate = make_collate_fn(*_target_kwargs(loader_kwargs.pop("collate_fn", None)))
 
         schedule = DatasetBuildSchedule(
@@ -333,7 +338,7 @@ class RecipeConfig:
         if unknown:
             raise TypeError(f"Unexpected dataloader config field(s): {', '.join(unknown)}")
 
-        return DataloaderConfig(
+        return config_class(
             dataset_config=dataset_config,
             packing=self._packing_config(),
             batch_sampler_config=batch_sampler_config,
@@ -371,12 +376,7 @@ class RecipeConfig:
             if node is None:
                 continue
             dataset_nodes[_name(key)] = node
-        from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
-
-        resolved = {name: self._resolve_dataloader(node, val_dl_node) for name, node in dataset_nodes.items()}
-        if any(isinstance(loader, ZephonDataloaderConfig) for loader in resolved.values()):
-            raise ValueError("Zephon validation is not supported yet; select a native validation_dataloader")
-        return resolved
+        return {name: self._resolve_dataloader(node, val_dl_node) for name, node in dataset_nodes.items()}
 
     @staticmethod
     def _resolve_vlm_processor(node: Any) -> "VlmProcessorConfig":
