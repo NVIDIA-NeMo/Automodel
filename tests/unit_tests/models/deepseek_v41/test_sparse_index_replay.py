@@ -37,9 +37,42 @@ from tests.unit_tests.models.deepseek_v41.test_model import _build_model
 
 
 def reference_sparse_kernel(
-    q, kv, sinks, topk_idxs, sm_scale, *, backend, reference_rounding=False, all_rows_nonempty=False, plan=None
-):
-    """Torch stand-in for the sparse kernels that understands a prepared plan (flat cuDNN or TileLang layout)."""
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    sinks: torch.Tensor,
+    topk_idxs: torch.Tensor | None,
+    sm_scale: float,
+    *,
+    backend: str,
+    reference_rounding: bool = False,
+    all_rows_nonempty: bool = False,
+    plan: kernels.SparseIndexPlan | None = None,
+    backward_impl: str = "atomic",
+    backward_workspace_bytes: int = 2 * 1024**3,
+) -> torch.Tensor:
+    """Evaluate a prepared sparse plan with the eager CPU reference.
+
+    Args:
+        q: Queries [batch, sequence, heads, head_dim].
+        kv: Shared keys/values [batch, kv_sequence, head_dim].
+        sinks: Denominator biases [heads].
+        topk_idxs: Local indices [batch, sequence, slots], or None with a plan.
+        sm_scale: Query/key score multiplier.
+        backend: Layout backend, tilelang or cudnn.
+        reference_rounding: Accepted for API parity; unused by this reference.
+        all_rows_nonempty: Whether cuDNN's optional valid_rows must be absent.
+        plan: Optional prepared indices replacing topk_idxs. TileLang uses
+            int32 [batch, sequence, slots]. cuDNN uses global int32 indices
+            [batch * sequence, 1, padded_slots], lengths [batch * sequence],
+            and optional int64 valid_rows [nonempty_rows].
+        backward_impl: Must be atomic; this reference does not test CUDA reductions.
+        backward_workspace_bytes: Accepted for API parity; unused by this reference.
+
+    Returns:
+        Independent attention output [batch, sequence, heads, head_dim] in q's
+        dtype. Inputs and the prepared plan remain unchanged.
+    """
+    assert backward_impl == "atomic", "CPU reference does not exercise deterministic CUDA backward"
     batch, sequence = q.shape[:2]
     if plan is not None:
         assert plan.backend == backend and plan.kv_sequence == kv.shape[1]
