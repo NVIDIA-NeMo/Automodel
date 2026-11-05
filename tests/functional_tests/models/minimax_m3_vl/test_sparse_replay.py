@@ -132,7 +132,7 @@ def test_fa4_sparse_replay(monkeypatch: pytest.MonkeyPatch, length: int, selecti
             kwargs: Selector settings and query positions [S].
 
         Returns:
-            Selected blocks [B,H,S,blocks].
+            Packed selected blocks [B,H,S,ceil(blocks/8)].
         """
         result = select(*args, **kwargs)
         selected.append(result)
@@ -152,7 +152,9 @@ def test_fa4_sparse_replay(monkeypatch: pytest.MonkeyPatch, length: int, selecti
     assert len(selected) == len(inputs)
     for got, reference in zip(selected, expected_selection):
         torch.testing.assert_close(got, reference, rtol=0, atol=0)
-        assert bool((got[..., -1, :-1].sum(-1) < got.shape[-1] - 1).all())
+        blocks = torch.arange((length + 127) // 128, device=got.device)
+        unpacked = ((got[..., blocks // 8].int() >> (blocks % 8)) & 1).bool()
+        assert bool((unpacked[..., -1, :-1].sum(-1) < unpacked.shape[-1] - 1).all())
     if len(selected) == 2:
         assert not torch.equal(selected[0], selected[1])
     errors = {}

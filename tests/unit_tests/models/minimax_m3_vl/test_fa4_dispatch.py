@@ -236,7 +236,7 @@ def test_sparse_execution_tiles_preserve_selected_keys(
         torch.zeros(1, length, 4, 64),
         torch.zeros(1, length, 2, 64),
         torch.zeros(1, length, 2, 64),
-        block_sel=selected,
+        block_sel=(selected.to(torch.uint8) * (1 << torch.arange(key_blocks))).sum(-1, keepdim=True).to(torch.uint8),
         q_positions=positions,
         keep_mask=keep,
         rescue_pad_queries=rescue,

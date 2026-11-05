@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM90 QSA using PyTorch preprocessing and FlashAttention 4.
+"""SM90 QSA using packed membership and FlashAttention 4.
 
-Optional FA4/CuTe dependencies are loaded on the first CUDA call. The only
-CuTe code owned here is the mask callback compiled into FA4's kernels.
+Optional kernel dependencies are loaded on the first CUDA call. Triton packs
+the route set; the CuTe mask callback is compiled into FA4's kernels.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.models.common.route_bitset import build_route_bitset
 from nemo_automodel.shared.import_utils import safe_import
 
 
@@ -60,8 +61,8 @@ def _load_fa4() -> tuple[Callable, type, Callable]:
             query_idx: Scalar SSA query position.
             key_idx: Scalar SSA physical K/V position.
             seqlen_info: FA4 query/key sequence lengths.
-            aux_tensors: One uint8 tensor [batch, queries, keys], with padded
-                row strides; one means selected and zero means excluded.
+            aux_tensors: One uint8 tensor [batch, queries, ceil(keys/8)],
+                with padded row strides. Bit k%8 in byte k//8 selects key k.
 
         Returns:
             Scalar boolean SSA membership, false outside the logical sequences.
@@ -69,13 +70,16 @@ def _load_fa4() -> tuple[Callable, type, Callable]:
         membership = aux_tensors[0]
         qi = cutlass.min(query_idx[0], seqlen_info.seqlen_q - 1)
         ki = cutlass.min(key_idx[0], seqlen_info.seqlen_k - 1)
-        selected = membership[batch[0], qi, ki] != 0
+        selected = ((membership[batch[0], qi, ki // 8].to(cutlass.Int32) >> (ki % 8)) & 1) != 0
         valid = selected & (query_idx[0] < seqlen_info.seqlen_q) & (key_idx[0] < seqlen_info.seqlen_k)
         return utils.scalar_to_ssa(valid, cutlass.Boolean)
 
     return interface.flash_attn_func, sparsity.BlockSparseTensorsTorch, mask_mod
 
 
+# Compile list compaction separately from the packed-mask tile reductions.
+# Fusing both stages causes pathological Inductor compile times at 8K.
+@torch.compile(dynamic=False)
 def _compact_blocks(kinds: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """Compact partial/full block columns for each row.
 
@@ -95,32 +99,57 @@ def _compact_blocks(kinds: torch.Tensor) -> tuple[torch.Tensor, ...]:
     fc = full.sum(-1, dtype=torch.int32).unsqueeze(1)
     pi = torch.where(partial, columns, kinds.shape[-1]).sort(-1).values.unsqueeze(1)
     fi = torch.where(full, columns, kinds.shape[-1]).sort(-1).values.unsqueeze(1)
-    return tuple(t.contiguous() for t in (pc, pi, fc, fi))
+    # PyTorch ignores singleton-axis strides in is_contiguous; FA4 requires
+    # an actual unit final stride even when there is only one block column.
+    return tuple(
+        t.clone(memory_format=torch.contiguous_format) if t.stride(-1) != 1 else t.contiguous()
+        for t in (pc, pi, fc, fi)
+    )
 
 
 def _block_kinds(membership: torch.Tensor, block_keys: int) -> torch.Tensor:
-    """Classify query/key blocks without host synchronization.
+    """Classify FA4 tiles directly from packed membership, without unpacking.
 
     Args:
-        membership: Uint8 tensor [batch, queries, keys].
-        block_keys: Number of physical keys in one block; queries use 128.
+        membership: Uint8 tensor [batch, queries, ceil(keys/8)]. Bit k%8
+            in byte k//8 selects key k; unused bits in the last byte are zero.
+        block_keys: Physical keys per tile, a multiple of eight; queries use 128.
 
     Returns:
         Int32 [batch, ceil(queries/128), ceil(keys/block_keys)] tile classes:
         absent=0, partial=1, full=2. Tail padding is never classified as full.
     """
-    batch, queries, keys = membership.shape
-    nq, nk = (queries + 127) // 128, (keys + block_keys - 1) // block_keys
-    padded = F.pad(membership, (0, nk * block_keys - keys, 0, nq * 128 - queries))
-    tiles = padded.reshape(batch, nq, 128, nk, block_keys)
+    batch, queries, key_bytes = membership.shape
+    block_bytes = block_keys // 8
+    nq, nk = (queries + 127) // 128, (key_bytes + block_bytes - 1) // block_bytes
+    padded = F.pad(membership, (0, nk * block_bytes - key_bytes, 0, nq * 128 - queries))
+    tiles = padded.reshape(batch, nq, 128, nk, block_bytes)
     present = (tiles != 0).any(dim=(2, 4))
-    full = (tiles == 1).all(dim=(2, 4))
+    full = (tiles == 255).all(dim=(2, 4))
     return present.to(torch.int32) + full.to(torch.int32)
 
 
 @torch.compile(dynamic=False)
+def _prepare_membership(routes: torch.Tensor, kv_length: int) -> tuple[torch.Tensor, ...]:
+    """Pack routes and classify forward/backward tiles.
+
+    Args:
+        routes: Signed int32/int64 [batch, queries, routes_per_query] IDs.
+        kv_length: Positive physical key count.
+
+    Returns:
+        Uint8 membership [batch, queries, ceil(kv_length/8)] with 32-byte
+        row alignment, forward int32 tile kinds [batch, ceil(queries/128),
+        ceil(kv_length/80)], and backward kinds [batch, ceil(kv_length/64),
+        ceil(queries/128)]. Membership and kinds have independent storage;
+        the backward tensor is transposed. No input is mutated.
+    """
+    membership = build_route_bitset(routes, kv_length, row_alignment=32)
+    return membership, _block_kinds(membership, 80), _block_kinds(membership, 64).transpose(1, 2)
+
+
 def _preprocess(routes: torch.Tensor, kv_length: int) -> tuple[torch.Tensor, ...]:
-    """Build a byte membership table and FA4 forward/reverse block lists.
+    """Build packed membership and FA4 forward/reverse block lists.
 
     Args:
         routes: Signed int32/int64 tensor [batch, queries, routes_per_query].
@@ -129,24 +158,16 @@ def _preprocess(routes: torch.Tensor, kv_length: int) -> tuple[torch.Tensor, ...
         kv_length: Positive number of physical key/value positions.
 
     Returns:
-        Uint8 membership [batch, queries, kv_length], with each row padded to
-        a multiple of 32 bytes, followed by four forward and four reverse
-        tensors in the layout documented by _compact_blocks. Forward rows are
-        ceil(queries/128) and columns ceil(kv_length/80); reverse rows are
-        ceil(kv_length/64) and columns ceil(queries/128).
-        No input is mutated, and no device scalar is read on the host.
+        Uint8 membership [batch, queries, ceil(kv_length/8)], with each row
+        padded to a multiple of 32 bytes. Bit k%8 of byte k//8 selects key k.
+        Four forward and four reverse tensors follow in the layout documented
+        by _compact_blocks. Forward rows are ceil(queries/128) and columns
+        ceil(kv_length/80); reverse rows are ceil(kv_length/64) and columns
+        ceil(queries/128). No input is mutated or device scalar read on the host.
     """
-    batch, queries, _ = routes.shape
-    valid = (routes >= 0) & (routes < kv_length)
-    indices = torch.where(valid, routes, kv_length).long()
-    width = ((kv_length + 1 + 31) // 32) * 32
-    storage = torch.zeros((batch, queries, width), device=routes.device, dtype=torch.uint8)
-    # All duplicate writes store one. Invalid IDs write a separate padding
-    # column, so they cannot overwrite a real token's membership.
-    storage.scatter_(-1, indices, 1)
-    membership = storage[..., :kv_length]
-    forward = _compact_blocks(_block_kinds(membership, 80))
-    backward = _compact_blocks(_block_kinds(membership, 64).transpose(1, 2))
+    membership, forward_kinds, backward_kinds = _prepare_membership(routes, kv_length)
+    forward = _compact_blocks(forward_kinds)
+    backward = _compact_blocks(backward_kinds)
     return membership, *forward, *backward
 
 
@@ -164,7 +185,7 @@ def fa4_sparse_gqa_attention(
     rows have zero output and query gradients. Routes encode causality,
     documents and padding; no additional triangular mask is imposed.
     FA4 owns first-order autograd; higher-order gradients and deterministic
-    backward are unsupported. Only discrete preprocessing is torch-compiled.
+    backward are unsupported. Only discrete block-list preprocessing is torch-compiled.
 
     Args:
         query: BF16 CUDA tensor [batch, queries, query_heads, 256].
@@ -204,9 +225,9 @@ def fa4_sparse_gqa_attention(
         raise ValueError("FA4 QSA requires Q/K/V/routes on the same CUDA device")
     if torch.cuda.get_device_capability(query.device) != (9, 0):
         raise RuntimeError("FA4 QSA currently supports SM90 GPUs only")
-    padded_keys = ((key.shape[1] + 32) // 32) * 32
-    if query.shape[0] * query.shape[1] * padded_keys >= 2**31:
-        raise ValueError("FA4 QSA byte mask exceeds int32 indexing limits")
+    padded_mask_bytes = (((key.shape[1] + 7) // 8 + 31) // 32) * 32
+    if key.shape[1] >= 2**31 or query.shape[0] * query.shape[1] * padded_mask_bytes >= 2**31:
+        raise ValueError("FA4 QSA bitset exceeds int32 indexing limits")
     scale = 256**-0.5 if softmax_scale is None else float(softmax_scale)
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("FA4 QSA softmax_scale must be finite and positive")

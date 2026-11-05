@@ -17,7 +17,7 @@
 One code path serves every training layout: dense right-padded batches,
 packed (THD) rows, and context parallelism (local queries against gathered
 global K/V) all reduce to "each query row attends exactly to its route IDs".
-The routes are scattered into a boolean membership table, FlexAttention's
+The routes are scattered into a packed membership table, FlexAttention's
 BlockMask skips fully-masked 128x128 tiles, and the kernel avoids materializing
 dense attention scores. Rows whose routes are all ``-1`` (padding queries)
 produce exactly zero output and zero gradients.
@@ -30,6 +30,8 @@ from dataclasses import dataclass
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+from nemo_automodel.components.models.common.route_bitset import build_route_bitset
 
 
 @dataclass(frozen=True)
@@ -64,7 +66,7 @@ def _routes_to_membership(
     selected_token_ids: torch.Tensor,
     kv_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scatter route IDs into a boolean membership table.
+    """Scatter route IDs into a packed membership table.
 
     Args:
         selected_token_ids: Global route IDs ``[B, S_q, K]``; negative or
@@ -72,25 +74,15 @@ def _routes_to_membership(
         kv_length: Number of physical K/V rows.
 
     Returns:
-        Kernel-safe boolean membership ``[B, S_q, kv_length]`` and a boolean
+        Kernel-safe uint8 membership ``[B, S_q, ceil(kv_length/8)]`` and a boolean
         ``[B, S_q]`` marking rows that selected at least one real token. Rows
         without a real route select K/V row zero solely to keep the kernel's
         softmax finite; the caller erases their output afterward.
     """
-    batch_size, query_length, _ = selected_token_ids.shape
-    valid = (selected_token_ids >= 0) & (selected_token_ids < kv_length)
-    # scatter_ resolves duplicate indices nondeterministically, and every
-    # padding slot clamps onto index zero, so a padding False could evict a
-    # genuine True at token zero. scatter_add_ sums duplicates instead.
-    hit_counts = torch.zeros(batch_size, query_length, kv_length, dtype=torch.int32, device=selected_token_ids.device)
-    safe_ids = selected_token_ids.long().clamp(min=0, max=kv_length - 1)
-    hit_counts.scatter_add_(-1, safe_ids, valid.to(torch.int32))
-    membership = hit_counts > 0
-    has_routes = valid.any(dim=-1)
-    # FlexAttention's behavior for a fully-masked softmax row is not a stable
-    # contract. Route empty query rows to one finite score so neither forward
-    # nor backward can form 0/0; their result is masked out below.
-    membership[..., 0] |= ~has_routes
+    membership = build_route_bitset(selected_token_ids, kv_length)
+    has_routes = membership.any(dim=-1).bool()
+    # Keep empty-row softmax finite; erase the dummy output and its gradients.
+    membership[..., 0] |= (~has_routes).to(torch.uint8)
     return membership, has_routes
 
 
@@ -135,9 +127,8 @@ def build_flex_qsa_mask(
 ) -> FlexQSAMask:
     """Build the FlexAttention mask for a set of routed token IDs.
 
-    Building the mask is the CPU-heavy part of the flex QSA path (a scatter into a
-    ``[B, S_q, kv_length]`` table followed by ``create_block_mask``). Callers that
-    evaluate the same routes twice, checkpoint forward and recompute, build it once
+    Membership is packed directly from route IDs, then reduced to tile metadata.
+    Callers that evaluate the same routes twice, checkpoint forward and recompute, build it once
     and hand it to :func:`flex_sparse_gqa_attention`.
 
     Args:
@@ -157,6 +148,7 @@ def build_flex_qsa_mask(
     # the inlined mask_mod indexes this table in int32, which overflows for
     # long sequences. See _membership_flat_offset.
     membership_flat = membership.reshape(-1)
+    key_bytes = membership.shape[-1]
 
     def mask_mod(b, h, q_idx, kv_idx):
         # FlexAttention pads Q/KV to block multiples and probes the padded
@@ -165,10 +157,10 @@ def build_flex_qsa_mask(
         in_range = (q_idx < query_length) & (kv_idx < kv_length)
         safe_q = torch.clamp(q_idx, max=query_length - 1)
         safe_kv = torch.clamp(kv_idx, max=kv_length - 1)
-        offset = _membership_flat_offset(b, safe_q, safe_kv, query_length, kv_length)
-        return in_range & membership_flat[offset]
+        offset = _membership_flat_offset(b, safe_q, safe_kv // 8, query_length, key_bytes)
+        return in_range & (((membership_flat[offset].to(torch.int32) >> (safe_kv % 8)) & 1) != 0)
 
-    block_mask = _block_mask_from_membership(membership, mask_mod)
+    block_mask = _block_mask_from_membership(membership, mask_mod, kv_length=kv_length)
     return FlexQSAMask(block_mask=block_mask, has_routes=has_routes, query_length=query_length, kv_length=kv_length)
 
 
@@ -193,8 +185,10 @@ def _block_mask_from_membership(
     membership: torch.Tensor,
     mask_mod,
     block_size: int = _FLEX_BLOCK_SIZE,
+    *,
+    kv_length: int,
 ) -> BlockMask:
-    """Build the FlexAttention ``BlockMask`` directly from the dense membership table.
+    """Build the FlexAttention ``BlockMask`` directly from packed membership bytes.
 
     ``create_block_mask`` would evaluate ``mask_mod`` through vmap at every
     ``[B, S_q, KV]`` coordinate only to recover the membership table this module
@@ -205,25 +199,24 @@ def _block_mask_from_membership(
     partial blocks element-wise.
 
     Args:
-        membership: Boolean ``[B, S_q, KV]`` table; ``True`` where a query may
-            attend a K/V row. ``S_q`` and ``KV`` need not be block multiples.
+        membership: Uint8 ``[B, S_q, ceil(KV/8)]`` table, one bit per key.
+            Unused bits in the last byte must be zero.
         mask_mod: Element-wise FlexAttention mask function consistent with
             ``membership`` inside ``[0, S_q) x [0, KV)`` and ``False`` outside.
-        block_size: Square sparse block size of the BlockMask.
+        block_size: Square sparse block size, a multiple of eight.
+        kv_length: Logical number of keys, excluding packed byte padding.
 
     Returns:
         A ``BlockMask`` over ``[B, S_q, KV]`` with heads broadcast (``H = 1``),
         equal to ``create_block_mask(mask_mod, B, None, S_q, KV)``.
     """
-    batch_size, query_length, kv_length = membership.shape
+    batch_size, query_length, key_bytes = membership.shape
     padded_q = -(-query_length // block_size) * block_size
     padded_kv = -(-kv_length // block_size) * block_size
-    padded = torch.nn.functional.pad(membership, (0, padded_kv - kv_length, 0, padded_q - query_length))
-    tiles = padded.view(batch_size, 1, padded_q // block_size, block_size, padded_kv // block_size, block_size)
-    tile_counts = tiles.permute(0, 1, 2, 4, 3, 5).sum(dim=(-2, -1))
-    full_tile = block_size * block_size
-    full_blocks = tile_counts == full_tile
-    partial_blocks = (tile_counts > 0) & ~full_blocks
+    padded = torch.nn.functional.pad(membership, (0, padded_kv // 8 - key_bytes, 0, padded_q - query_length))
+    tiles = padded.view(batch_size, 1, padded_q // block_size, block_size, padded_kv // block_size, block_size // 8)
+    full_blocks = (tiles == 255).all(dim=(3, 5))
+    partial_blocks = (tiles != 0).any(dim=(3, 5)) & ~full_blocks
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(partial_blocks)
     full_kv_num_blocks, full_kv_indices = _dense_blocks_to_ordered(full_blocks)
     return BlockMask.from_kv_blocks(
