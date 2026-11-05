@@ -22,8 +22,9 @@ from torch import nn
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.loader import StreamDatasetConfig
-from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderBuild, VlmDataloaderConfig, VlmStreamBuildContext
+from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderBuild, VlmStreamBuildContext
 from nemo_automodel.recipes.vlm import kd as vlm_kd
+from tests.unit_tests.datasets.vlm.test_vlm_loader import StreamVlmDataloaderConfig
 
 
 class _Output:
@@ -254,7 +255,7 @@ def test_setup_rejects_stream_datasets_before_tokenizer_or_model_loading(monkeyp
     monkeypatch.setattr(vlm_kd.FinetuneRecipeForVLM, "setup", setup_student)
     recipe = vlm_kd.KnowledgeDistillationRecipeForVLM.__new__(vlm_kd.KnowledgeDistillationRecipeForVLM)
     recipe.cfg = _Cfg()
-    recipe.cfg.vlm_dataloader = VlmDataloaderConfig(dataset_config=StreamConfig())
+    recipe.cfg.vlm_dataloader = StreamVlmDataloaderConfig(dataset_config=StreamConfig())
 
     with pytest.raises(ValueError, match="knowledge distillation does not support stream datasets"):
         recipe.setup()
