@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import ClassVar, TypeAlias, TypedDict
+from typing import ClassVar
 
 import torch
 import torch.utils.data
@@ -35,38 +35,13 @@ from PIL import Image
 from transformers import ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
     _lmdb_env_cache,
     _preload_media,
     json2token,
 )
-
-# Conversation content includes JSON media metadata and lazily decoded images.
-_MediaValue: TypeAlias = (
-    str
-    | int
-    | float
-    | bool
-    | None
-    | bytes
-    | Image.Image
-    | torch.Tensor
-    | list["_MediaValue"]
-    | dict[str, "_MediaValue"]
-)
-
-
-class _ConversationMessage(TypedDict):
-    role: str
-    content: list[dict[str, _MediaValue]]
-
-
-class _ConversationSample(TypedDict, total=False):
-    conversation: list[_ConversationMessage]
-    mm_inputs_meta: dict[str, _MediaValue]
-    _text_tokens: int
-
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +70,7 @@ class RdrDatasetConfig:
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    def build(self) -> list[_ConversationSample]:
+    def build(self) -> list[ConversationSample]:
         """Build the RDR dataset from this config."""
         return make_rdr_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -145,7 +120,7 @@ class CordV2DatasetConfig:
     limit_dataset_samples: int | None = None
     """Optional maximum number of samples to load."""
 
-    def build(self) -> list[_ConversationSample]:
+    def build(self) -> list[ConversationSample]:
         """Build the CORD-V2 dataset from this config."""
         return make_cord_v2_dataset(
             path_or_dataset=self.path_or_dataset,
@@ -264,7 +239,7 @@ class LlavaOnevisionDatasetConfig:
     split: str = "train"
     """Dataset split to load."""
 
-    def build(self) -> list[_ConversationSample]:
+    def build(self) -> list[ConversationSample]:
         """Build the LLaVA-OneVision conversation dataset."""
         return make_llava_onevision_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -339,7 +314,7 @@ class Tulu3MagicoderTextMixDatasetConfig:
     limit_total: int | None = None
     """Optional cap on the merged row count."""
 
-    def build(self) -> list[_ConversationSample]:
+    def build(self) -> list[ConversationSample]:
         """Build the text-only Tulu-3/Magicoder mixture."""
         return make_tulu3_magicoder_text_mix_dataset(
             tulu_split=self.tulu_split,
@@ -606,7 +581,7 @@ class UnimmChatDatasetConfig:
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    def build(self) -> list[_ConversationSample]:
+    def build(self) -> list[ConversationSample]:
         """Build the UniMM-Chat dataset from this config."""
         return make_unimm_chat_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -1187,7 +1162,7 @@ class MetaDatasetConfig:
     shard_data: bool = False
     """If ``True``, each rank loads only its ``1/world_size`` slice."""
 
-    def build(self, *, rank: int | None = None, world_size: int | None = None) -> list[_ConversationSample]:
+    def build(self, *, rank: int | None = None, world_size: int | None = None) -> list[ConversationSample]:
         """Build the meta VLM dataset from this config.
 
         Args:
@@ -1539,7 +1514,7 @@ class PreTokenizedDatasetWrapperConfig:
     def build(
         self,
         *,
-        dataset: torch.utils.data.Dataset | Sequence[_ConversationSample],
+        dataset: Dataset | torch.utils.data.Dataset | Sequence[ConversationSample],
         processor: "ProcessorMixin",
     ) -> "PreTokenizedDatasetWrapper":
         """Build a :class:`PreTokenizedDatasetWrapper` from this config.

@@ -111,6 +111,61 @@ class TestAnnotationPolicy(unittest.TestCase):
         """)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_runtime_alias_chains_pass(self) -> None:
+        result = self.run_policy("""
+            MISSING = object()
+            DEFAULT = MISSING
+            CHAINED = DEFAULT
+            text = "object"
+            copy = text
+        """)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for value in ("object", "list[object]", 'list["object"]'):
+            with self.subTest(value=value):
+                result = self.run_policy(f"Alias = {value}\nChained = Alias")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("alias[Chained]", result.stderr)
+
+    def test_remaining_native_type_comments(self) -> None:
+        templates = (
+            "def f(\n    value,  # type: {annotation}\n):\n    pass",
+            "for value in []:  # type: {annotation}\n    pass",
+            "with manager() as value:  # type: {annotation}\n    pass",
+            "async def f():\n    async for value in source:  # type: {annotation}\n        pass",
+            "async def f():\n    async with manager() as value:  # type: {annotation}\n        pass",
+        )
+        for template in templates:
+            for annotation in ("object", "int", 'Literal["object"]'):
+                with self.subTest(template=template, annotation=annotation):
+                    source = "from typing import Literal\n" + template.format(annotation=annotation)
+                    result = self.run_policy(source)
+                    self.assertEqual(result.returncode, int(annotation == "object"), result.stderr)
+                    self.assertEqual(result.stderr.count("object annotation ("), int(annotation == "object"))
+                    if annotation == "object":
+                        self.assertIn("comment[value]", result.stderr)
+        result = self.run_policy("for value in []:  # type: int\n    nested: object")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("<module>:nested", result.stderr)
+
+    def test_class_namespaces_are_not_method_closures(self) -> None:
+        result = self.run_policy("""
+            class C(list[object]):
+                object = int
+                def method(self, x: object):
+                    def inner(y: object): pass
+            def outer():
+                from builtins import object as Opaque
+                class Nested:
+                    Opaque = int
+                    def method(self, x: Opaque):
+                        def inner(y: Opaque): pass
+        """)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for slot in ("C:base[0]", "C.method.inner:y", "outer.Nested.method.inner:y"):
+            self.assertIn(slot, result.stderr)
+        for slot in ("C.method:x", "outer.Nested.method:x"):
+            self.assertNotIn(slot, result.stderr)
+
     def test_local_aliases_and_sibling_scopes(self) -> None:
         result = self.run_policy("""
             def outer():

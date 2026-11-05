@@ -37,11 +37,14 @@ import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Callable, Literal, NamedTuple
 
 import torch
 import torch.utils.data
+from datasets import Dataset as HfDataset
 from PIL import Image
+
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
@@ -55,19 +58,6 @@ from nemo_automodel.components.datasets.vlm.samplers import (
     LengthGroupedSampler,
     _smart_resize_image,
     _smart_resize_video,
-)
-
-_ConversationValue: TypeAlias = (
-    str
-    | int
-    | float
-    | bool
-    | None
-    | bytes
-    | Image.Image
-    | torch.Tensor
-    | list["_ConversationValue"]
-    | dict[str, "_ConversationValue"]
 )
 
 logger = logging.getLogger(__name__)
@@ -781,7 +771,7 @@ class NeatPackConfig:
         *,
         dataset: "PreTokenizedDatasetWrapper",
         padding_idx: int,
-        ds_raw: torch.utils.data.Dataset | Sequence[dict[str, _ConversationValue]] | None = None,
+        ds_raw: HfDataset | torch.utils.data.Dataset | Sequence[ConversationSample] | None = None,
         get_rope_index: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
         processor: "ProcessorMixin | None" = None,
         cp_size: int = 1,
