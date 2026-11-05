@@ -78,9 +78,11 @@ def _make_omni_stub(*, with_sound_encoder: bool = True):
     CP path touches. Vision/video/sound encoders are stubs producing constants."""
     self = object.__new__(NemotronOmniForConditionalGeneration)
     nn.Module.__init__(self)
+    self._native_transformers = False
     self.img_context_token_id = IMG_TOKEN_ID
     self.sound_context_token_id = SOUND_TOKEN_ID
     self.language_model = _StubLanguageModel()
+    self.language_model.config = SimpleNamespace(output_hidden_states=False)
 
     # extract_feature returns a tensor of constant 9.0 with shape [N_tiles, K, H]
     # where the model will reshape to (-1, H) and scatter onto img positions.
@@ -344,3 +346,13 @@ def test_forward_inputs_embeds_skips_multimodal_scatter_block():
     )
     # extract_feature must NOT have been called
     assert sentinel == [], "extract_feature should be skipped when inputs_embeds is supplied"
+
+
+def test_native_packed_images_scatter_before_cp_sharding():
+    model = _make_omni_stub()
+    model.cp_mesh = _FakeCPMesh(2)
+    model.extract_feature_packed = lambda pixels, grids: torch.full((2, HIDDEN), 6.0)
+    ids = torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4, 5, 6, 7, 8]])
+    out = _forward_embeds(model, input_ids=ids, pixel_values=torch.zeros(8, 12), image_grid_hw=torch.tensor([[4, 2]]))
+    assert out.shape == (1, 4, HIDDEN)
+    torch.testing.assert_close(out[0, 1], torch.full((HIDDEN,), 6.0))

@@ -42,6 +42,7 @@ def adapter():
     a.moe_config = MagicMock()
     a.backend = MagicMock()
     a.dtype = torch.bfloat16
+    a.native_transformers = False
     a.vision_uses_native_radio = False
     # Echo input keys through unchanged — lets us verify *only* the
     # NemotronOmni-side key handling without depending on NemotronV3 internals.
@@ -251,6 +252,7 @@ def native_adapter():
     a.moe_config = MagicMock()
     a.backend = MagicMock()
     a.dtype = torch.bfloat16
+    a.native_transformers = False
     a.vision_uses_native_radio = True
     a._llm_adapter = MagicMock()
     a._llm_adapter.from_hf.side_effect = lambda sd, **kwargs: dict(sd)
@@ -680,8 +682,10 @@ def test_production_save_and_hf_peft_reload(tmp_path, monkeypatch):
     from peft import PeftModel, get_peft_model_state_dict
     from safetensors.torch import load_file
     from torch import nn
+
     monkeypatch.setattr(peft.import_utils, "is_torchao_available", lambda: False, raising=False)
     import peft.tuners.lora.torchao
+
     monkeypatch.setattr(peft.tuners.lora.torchao, "is_torchao_available", lambda: False, raising=False)
 
     from nemo_automodel.components._peft.lora import PeftConfig
@@ -800,10 +804,12 @@ def test_production_save_and_hf_peft_reload(tmp_path, monkeypatch):
             layer = nn.Module()
             layer.mixer = nn.Module()
             layer.mixer.in_proj = nn.Linear(16, 16)
-            layer.mixer.experts = nn.ModuleList([
-                nn.Module(),
-                nn.Module(),
-            ])
+            layer.mixer.experts = nn.ModuleList(
+                [
+                    nn.Module(),
+                    nn.Module(),
+                ]
+            )
             layer.mixer.experts[0].gate_proj = nn.Linear(16, 8)
             layer.mixer.experts[0].up_proj = nn.Linear(16, 8)
             layer.mixer.experts[0].down_proj = nn.Linear(8, 16)
