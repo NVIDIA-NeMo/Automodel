@@ -202,6 +202,8 @@ adapter translates the source, column mapping and formatting choices into
 `ZephonInstructionDatasetConfig` without building the native dataset. Native
 padding, truncation and sample limits must remain disabled; they are not
 equivalent to Zephon packing or source limits. Unsupported datasets are rejected.
+With `use_hf_chat_template: true`, the tokenizer must provide a chat template;
+Zephon does not fall back to plain formatting when it is missing.
 
 Use `ZephonInstructionDatasetConfig` directly to customize the Zephon pipeline.
 Its loader is selected automatically, and options live under `dataset.zephon`.
