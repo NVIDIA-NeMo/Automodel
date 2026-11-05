@@ -142,6 +142,8 @@ class ZephonVlmDataloaderConfig(ZephonLoaderConfig):
         initialization, validation and checkpoint activity happens after it exits.
         """
         del get_rope_index
+        if self.processor_config.video_processor is not None:
+            raise ValueError("The Zephon image VLM path does not support video processors")
         if self.output_format == "thd" and pp_n_microbatches is not None:
             raise ValueError("THD VLM pipeline media/mRoPE chunking is unsupported; use batched output for VLM PP")
         self.validate_build(batch_size=batch_size, cp_size=cp_size, packing_contract=packing_contract)

@@ -58,6 +58,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
@@ -212,6 +213,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
     def setup(self):
         """Build student & teacher, dataloaders, optimizers, etc."""
+        if isinstance(self.cfg.vlm_dataloader, ZephonVlmDataloaderConfig):
+            raise ValueError("VLM knowledge distillation does not support Zephon; select a native VLM dataset")
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
 
         super().setup()
