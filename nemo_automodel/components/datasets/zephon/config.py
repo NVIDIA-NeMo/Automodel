@@ -574,6 +574,11 @@ def zephon_options_from_values(
 class ZephonLanguageDatasetConfig(ZephonStreamDatasetConfig[TextStreamBuildContext, "ZephonDataLoader"]):
     """Complete text stream construction shared by explicit encoding configs."""
 
+    @property
+    def dataloader_config_type(self) -> type[ZephonDataloaderConfig]:
+        """Select the text metadata adapter when the loader target is omitted."""
+        return ZephonDataloaderConfig
+
     @abstractmethod
     def tokenize(
         self,

@@ -38,15 +38,15 @@ select a `packing.pack_algorithm` to pack online or set it to `null` to preserve
 each supplied sequence. This supports online tokenization and packing, offline
 tokenization with online packing, and fully prepacked input.
 
-Choose a Zephon dataset config for the kind of documents you have and select
-`ZephonDataloaderConfig` as the loader. This thin adapter supplies Zephon's
-packing metadata through AutoModel's existing dataloader interface; the shared
-build path delegates complete stream construction to the dataset config.
+Choose a Zephon dataset config for the kind of documents you have. AutoModel
+selects its matching `ZephonDataloaderConfig` automatically when
+`dataloader._target_` is omitted. This thin adapter supplies Zephon's packing
+metadata through the existing dataloader interface; the shared build path
+delegates complete stream construction to the dataset config. An explicit
+loader target takes precedence and must be compatible with the dataset.
 For raw text:
 
 ```yaml
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
   text_field: text
@@ -144,8 +144,6 @@ the supplied tokens, including tokens excluded from loss, using `tokens_field`.
 For prepacked text, use the same source config and explicitly disable packing:
 
 ```yaml
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonPretokenizedTextDatasetConfig
   # Keep the model tokenizer configuration here for vocabulary validation.
