@@ -154,6 +154,10 @@ redirects:
   - source: "/nemo/automodel/nightly/model-coverage/vision-language-models/internlm/InternVL3-5-4B-hf"
     destination: "/nemo/automodel/nightly/model-coverage/vision-language-models/opengvlab/InternVL3_5-4B"
   # Exact checkpoint aliases for size-level model cards.
+  - source: "/nemo/automodel/model-coverage/large-language-models/qwen/Qwen3-4B-Base"
+    destination: "/nemo/automodel/model-coverage/large-language-models/qwen/Qwen3-4B"
+  - source: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen/Qwen3-4B-Base"
+    destination: "/nemo/automodel/nightly/model-coverage/large-language-models/qwen/Qwen3-4B"
   - source: "/nemo/automodel/model-coverage/diffusion/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p-t2v"
     destination: "/nemo/automodel/model-coverage/diffusion/hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
   - source: "/nemo/automodel/model-coverage/embedding-models/mistralai/Ministral-3-3B-Instruct-2512-BF16"

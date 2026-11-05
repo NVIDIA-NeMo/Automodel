@@ -27,6 +27,13 @@ uv run automodel --nproc-per-node=8 examples/llm_finetune/qwen/qwen3_next_te_dee
 | --- | --- |
 | Supervised fine-tuning (SFT) - Qwen3-Next with TE + DeepEP | Use [qwen3_next_te_deepep.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_next_te_deepep.yaml). |
 
+## Knowledge Distillation
+
+Use Qwen3-Next-80B-A3B-Instruct as a frozen teacher for Qwen3-30B-A3B with
+the [16-GPU MoE knowledge-distillation example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_kd/qwen3/qwen3_30b_a3b_kd_qwen3_next_80b_a3b_separate_mesh.yaml).
+The [knowledge-distillation guide](/recipes-e2e-examples/knowledge-distillation#moe-knowledge-distillation)
+documents the draft recipe, EP8 student and teacher meshes, and W&B logging.
+
 ## Model Reference
 
 ### Model Architecture

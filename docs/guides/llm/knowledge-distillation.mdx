@@ -1,6 +1,6 @@
 ---
 title: "Knowledge Distillation with NeMo AutoModel"
-description: ""
+description: "Distill LLMs with separate student and teacher meshes, Qwen MoE examples, expert-parallel guidance, and W&B training metrics."
 position: 4
 ---
 This guide walks through fine-tuning a **student** LLM with the help of a
@@ -174,6 +174,113 @@ covering all valid tokens retain full-token preprocessing.
 For VLM knowledge distillation, use the `KnowledgeDistillationRecipeForVLM`
 recipe and the checked-in
 `examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd.yaml` config.
+
+## MoE Knowledge Distillation
+
+The following examples use separate, non-overlapping student and teacher GPU
+meshes. They are draft configurations tracked in
+[issue #3299](https://github.com/NVIDIA-NeMo/Automodel/issues/3299).
+
+| Student | Teacher | GPUs | Example YAML |
+| --- | --- | --- | --- |
+| Qwen3-4B | Qwen3-30B-A3B | 8: student DP4, teacher DP4/EP4 | [Dense student with MoE teacher](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_kd/qwen3/qwen3_4b_kd_qwen3_30b_a3b_separate_mesh.yaml) |
+| Qwen3-30B-A3B | Qwen3-Next-80B-A3B-Instruct | 16: student DP8/EP8, teacher DP8/EP8 | [MoE student with MoE teacher](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_kd/qwen3/qwen3_30b_a3b_kd_qwen3_next_80b_a3b_separate_mesh.yaml) |
+
+Both examples use FSDP2, Transformer Engine attention, FP32 student master
+weights with AdamW, and a frozen BF16 teacher. The KD objective uses
+`temperature: 1.0` and `kd_ratio: 0.5`.
+
+### Choose the Student and Teacher Meshes
+
+Set `separate_meshes: true` and specify `dp_size` explicitly in both
+`distributed` (student) and `teacher_distributed` (teacher). The launch process
+count must equal the sum of the two mesh sizes:
+
+```text
+student dp_size * tp_size * cp_size * pp_size
++ teacher dp_size * tp_size * cp_size * pp_size
+```
+
+`ep_size` partitions experts over each model's DP/TP/CP ranks; it does not add
+another factor to the launch process count. Choose an EP degree that divides
+both the model's routed-expert count and `dp_size * tp_size * cp_size`.
+For each model and pipeline stage:
+
+```text
+ep_shard_size = (dp_size * tp_size * cp_size) / ep_size
+```
+
+When `ep_shard_size == 1`, expert parameters are not additionally FSDP-sharded,
+so an FSDP CPU `offload_policy` does not offload those parameters. Both examples
+keep expert weights resident. The separate whole-teacher option,
+`offload_teacher_model`, is unsupported with `separate_meshes: true` and must
+remain `false`.
+
+### Launch with W&B Logging
+
+Set `WANDB_API_KEY` and `WANDB_ENTITY` in the launch environment. Each YAML
+includes an opt-in `wandb` block and logs every optimizer step when enabled.
+For the 8-GPU example:
+
+```bash
+automodel examples/llm_kd/qwen3/qwen3_4b_kd_qwen3_30b_a3b_separate_mesh.yaml \
+  --nproc-per-node 8 --wandb.enable true
+```
+
+For the 16-GPU example, run the following on each of two 8-GPU nodes. Set
+`NODE_RANK` to `0` or `1` and `MASTER_ADDR` to the first node's hostname:
+
+```bash
+torchrun --nnodes 2 --nproc-per-node 8 --node-rank "$NODE_RANK" \
+  --master-addr "$MASTER_ADDR" --master-port 29500 \
+  nemo_automodel/recipes/llm/kd.py \
+  -c examples/llm_kd/qwen3/qwen3_30b_a3b_kd_qwen3_next_80b_a3b_separate_mesh.yaml \
+  --wandb.enable true
+```
+
+The main student rank prints the W&B run URL. Inspect `loss`, `ce_loss`,
+`kd_loss`, and `grad_norm` to verify that optimizer steps complete with finite
+values. At `kd_ratio: 0.5`, total loss should equal `0.5 * ce_loss + 0.5 * kd_loss`.
+Validation metrics use `val_<dataset_name>/` prefixes, such as
+`val_default/ce_loss`, so validation does not overwrite training values at the
+same optimizer step.
+
+### Recorded GPU Validation
+
+The following runs completed on October 14, 2026 with the full pretrained
+checkpoints and implementation commit
+[`51d132298`](https://github.com/NVIDIA-NeMo/Automodel/commit/51d132298dc5df77f437f7aed71baaf188dad234).
+Each W&B run includes per-step metrics, the Slurm log, and `validation.json`
+with the resolved configuration and checks. W&B reports both runs as `finished`;
+Slurm reported both jobs as `COMPLETED` with exit code `0:0`.
+
+| Student / teacher | Hardware | Optimizer steps | Final training loss / CE / KD | W&B log |
+| --- | --- | --- | --- | --- |
+| Qwen3-4B / Qwen3-30B-A3B | 1 node, 8 H100 80GB GPUs | 10 | 0.6425 / 0.7202 / 0.5648 | [Dense-to-MoE run](https://wandb.ai/Nemo-automodel/automodel-moe-kd/runs/pr4351_dense_20214053) |
+| Qwen3-30B-A3B / Qwen3-Next-80B-A3B-Instruct | 2 nodes, 16 H100 80GB GPUs | 10 | 1.0489 / 0.8514 / 1.2464 | [MoE-to-MoE run](https://wandb.ai/Nemo-automodel/automodel-moe-kd/runs/pr4351_moe_20214073) |
+
+Every recorded training step has finite losses and a finite, nonzero gradient
+norm. The total loss matches `0.5 * ce_loss + 0.5 * kd_loss`, including the final
+step that also logs validation. The environment used PyTorch
+`2.13.0a0+8145d630e8.nv26.6.54250401`, Transformers `5.18.0`, and Transformer
+Engine `2.14.1+366798ef`.
+
+### Reproduce a Short Validation Run
+
+Add the following overrides to either launch command to run ten optimizer
+steps, validate on eight SQuAD examples, and skip checkpoint writes:
+
+```bash
+  --step_scheduler.max_steps 10 \
+  --checkpoint.enabled false \
+  --validation_dataset.limit_dataset_samples 8
+```
+
+These overrides retain the full pretrained models, training dataset, sequence
+lengths, and global batch sizes (32 for the dense student and 64 for the MoE
+student). Short runs check training execution and finite losses and gradients;
+they do not establish convergence, output quality, or checkpoint/resume
+correctness.
 
 ## Launch Training
 

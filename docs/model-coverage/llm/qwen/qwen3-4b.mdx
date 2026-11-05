@@ -1,0 +1,77 @@
+---
+title: "Qwen3-4B"
+description: "Run Qwen3-4B knowledge distillation with a Qwen3-30B-A3B teacher or fine-tune Qwen3-4B-Base using checked-in NeMo AutoModel recipes."
+slug: model-coverage/large-language-models/qwen/Qwen3-4B
+---
+
+The [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) checkpoint is the dense
+student in the draft [MoE knowledge-distillation example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_kd/qwen3/qwen3_4b_kd_qwen3_30b_a3b_separate_mesh.yaml).
+The teacher is Qwen3-30B-A3B. See the
+[knowledge-distillation guide](/recipes-e2e-examples/knowledge-distillation#moe-knowledge-distillation)
+for validation status, EP sizing, and offload constraints.
+
+## Run Knowledge Distillation
+
+Follow the [installation instructions](/get-started/installation), then run
+from the repository root on an 8-GPU node:
+
+```bash
+automodel examples/llm_kd/qwen3/qwen3_4b_kd_qwen3_30b_a3b_separate_mesh.yaml \
+  --nproc-per-node 8
+```
+
+| Setting | Configuration |
+| --- | --- |
+| Student | Qwen/Qwen3-4B; ranks 0-3; FSDP2 with DP4 |
+| Teacher | Qwen/Qwen3-30B-A3B; ranks 4-7; FSDP2 with DP4/EP4 |
+| Precision | FP32 student master weights, BF16 compute and teacher weights |
+| Attention | Transformer Engine |
+| Objective | Equal CE and forward-KL weights, temperature 1.0 |
+| Logging | Add `--wandb.enable true` after setting `WANDB_API_KEY` and `WANDB_ENTITY` |
+
+## Fine-Tune Qwen3-4B-Base
+
+The distillation recipe above uses `Qwen/Qwen3-4B`. The fine-tuning recipes
+below use the different `Qwen/Qwen3-4B-Base` checkpoint. Review the checked-in
+recipe and its declared topology before choosing a local or cluster launcher.
+
+### Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Run the primary Qwen3-4B-Base recipe | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_flashoptim.yaml). |
+| Try another Qwen3-4B-Base recipe | Use the [alternate recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_te_fusedadam.yaml). |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, pp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true) |
+| Advanced | sequence length 2048 |
+
+### More Recipes for Qwen3-4B-Base
+
+- [`qwen3_4b_cp1_te_fusedadam.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp1_te_fusedadam.yaml)
+- [`qwen3_4b_cp2_flashoptim.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/convergence/tulu3/models/qwen3-4b/qwen3_4b_cp2_flashoptim.yaml)
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Qwen3ForCausalLM` |
+
+### Available Models
+
+- [`Qwen/Qwen3-4B`](https://huggingface.co/Qwen/Qwen3-4B)
+- [`Qwen/Qwen3-4B-Base`](https://huggingface.co/Qwen/Qwen3-4B-Base)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
+- [Knowledge-distillation guide](/recipes-e2e-examples/knowledge-distillation#moe-knowledge-distillation)

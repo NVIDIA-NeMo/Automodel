@@ -397,8 +397,8 @@ navigation:
                 path: ../../model-coverage/llm/qwen/qwen3-moe.mdx
               - page: "Qwen3-32B"
                 path: ../../model-coverage/llm/qwen/qwen3-32b.mdx
-              - page: "Qwen3-4B-Base"
-                path: ../../model-coverage/llm/qwen/qwen3-4b-base.mdx
+              - page: "Qwen3-4B"
+                path: ../../model-coverage/llm/qwen/qwen3-4b.mdx
               - page: "Qwen3-8B"
                 path: ../../model-coverage/llm/qwen/qwen3-8b.mdx
               - page: "Qwen3-Next-80B-A3B-Instruct"
