@@ -37,7 +37,7 @@ import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Literal, NamedTuple
+from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, TypeAlias
 
 import torch
 import torch.utils.data
@@ -55,6 +55,19 @@ from nemo_automodel.components.datasets.vlm.samplers import (
     LengthGroupedSampler,
     _smart_resize_image,
     _smart_resize_video,
+)
+
+_ConversationValue: TypeAlias = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | bytes
+    | Image.Image
+    | torch.Tensor
+    | list["_ConversationValue"]
+    | dict[str, "_ConversationValue"]
 )
 
 logger = logging.getLogger(__name__)
@@ -169,7 +182,9 @@ class _SampleLengthEstimate(NamedTuple):
     unsized_media: int
 
 
-def _image_height_width(image: object) -> tuple[int, int] | None:
+def _image_height_width(
+    image: Image.Image | io.BytesIO | bytes | str | dict[str, bytes | str | None] | None,
+) -> tuple[int, int] | None:
     """Read the ``(height, width)`` of a conversation image without decoding its pixels.
 
     Handles the forms VLM datasets put in conversations: PIL images (including lazy
@@ -592,7 +607,7 @@ class PackedDatasetWrapperConfig:
         inner_dataset: "PreTokenizedDatasetWrapper",
         bins: list[list[int]],
         padding_idx: int,
-        get_rope_index: Callable[..., object] | None = None,
+        get_rope_index: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> "PackedDatasetWrapper":
         """Build a :class:`PackedDatasetWrapper` from this config.
 
@@ -766,8 +781,8 @@ class NeatPackConfig:
         *,
         dataset: "PreTokenizedDatasetWrapper",
         padding_idx: int,
-        ds_raw: torch.utils.data.Dataset | Sequence[dict[str, object]] | None = None,
-        get_rope_index: Callable[..., object] | None = None,
+        ds_raw: torch.utils.data.Dataset | Sequence[dict[str, _ConversationValue]] | None = None,
+        get_rope_index: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
         processor: "ProcessorMixin | None" = None,
         cp_size: int = 1,
     ) -> "PackedDatasetWrapper":
