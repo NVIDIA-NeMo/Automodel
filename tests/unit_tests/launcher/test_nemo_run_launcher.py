@@ -243,7 +243,7 @@ class TestLaunch:
         call_kwargs = mock_run.Script.call_args.kwargs
         assert call_kwargs["m"] is True
         assert call_kwargs["entrypoint"] == "python"
-        assert call_kwargs["path"] == "nemo_automodel.recipes.llm.train_ft"
+        assert call_kwargs["path"] == "nemo_automodel.cli.app"
 
     def test_launch_passes_config_path_in_args(self, tmp_path, monkeypatch):
         mock_run = _make_mock_nemo_run()
@@ -259,8 +259,7 @@ class TestLaunch:
         )
 
         call_kwargs = mock_run.Script.call_args.kwargs
-        assert "-c" in call_kwargs["args"]
-        assert "/nemo_run/code/automodel_config.yaml" in call_kwargs["args"]
+        assert call_kwargs["args"] == ["/nemo_run/code/automodel_config.yaml"]
 
     def test_launch_configures_torchrun_on_executor(self, tmp_path, monkeypatch):
         mock_run = _make_mock_nemo_run()

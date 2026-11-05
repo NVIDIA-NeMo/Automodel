@@ -28,8 +28,8 @@ from nemo_automodel.components.speculative.dflash.draft_kimi_k3 import (
     build_kimi_k3_dflash_target_kwargs,
 )
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
-from nemo_automodel.recipes.llm import train_dflash
-from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms import dflash
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
 
 VOCAB = 64
 HIDDEN = 32
@@ -144,13 +144,13 @@ def test_context_parallel_is_rejected_before_the_generic_cp_gates(monkeypatch):
     """
     cp_mesh = SimpleNamespace(size=lambda: 2)
     dist_setup = SimpleNamespace(mesh_context=SimpleNamespace(device_mesh=object()))
-    monkeypatch.setattr(train_dflash, "create_distributed_setup_from_config", lambda cfg, world_size: dist_setup)
-    monkeypatch.setattr(train_dflash, "_submesh_or_none", lambda mesh, name: cp_mesh if name == "cp" else object())
+    monkeypatch.setattr(dflash, "create_distributed_setup_from_config", lambda cfg, world_size: dist_setup)
+    monkeypatch.setattr(dflash, "submesh_or_none", lambda mesh, name: cp_mesh if name == "cp" else object())
 
     def _must_not_load(*args, **kwargs):
         raise AssertionError("the target must not be loaded before the CP gate rejects the config")
 
-    monkeypatch.setattr(train_dflash, "NeMoAutoModelForCausalLM", SimpleNamespace(from_pretrained=_must_not_load))
+    monkeypatch.setattr(dflash, "NeMoAutoModelForCausalLM", SimpleNamespace(from_pretrained=_must_not_load))
 
     recipe = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
     recipe.cfg = {"distributed": {"cp_size": 2}}

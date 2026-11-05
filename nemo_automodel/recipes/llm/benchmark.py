@@ -322,6 +322,15 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             return flops / (10**12)
         return 0.0
 
+    def run_train_validation_loop(self) -> None:
+        """Run the benchmark through the shared CLI recipe entry point."""
+        try:
+            self.run_benchmark()
+        finally:
+            if self.partial_cuda_graph_manager is not None:
+                self.partial_cuda_graph_manager.close()
+                self.partial_cuda_graph_manager = None
+
     def run_benchmark(self):
         """Run the benchmarking loop.
 

@@ -105,7 +105,7 @@ def build_cache_manifest(
     """Assemble the DSpark cache manifest.
 
     Single source of the manifest schema: both precompute entry points call this, and
-    ``train_dspark`` validates cached training against these fields, so adding or
+    ``TrainDSparkRecipe`` validates cached training against these fields, so adding or
     renaming a field here is the one place the contract changes.
 
     Beyond the tensor-shaping target/cache settings, the manifest records the

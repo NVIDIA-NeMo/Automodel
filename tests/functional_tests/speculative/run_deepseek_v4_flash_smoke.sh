@@ -58,7 +58,7 @@ PY
 echo "### 4/4  8-GPU real-weight training smoke"
 LOG="$WORK/smoke.log"
 torchrun --standalone --nproc_per_node=8 \
-  -m nemo_automodel.recipes.llm.train_dspark -c "$RUN_YAML" 2>&1 | tee "$LOG"
+  -m nemo_automodel.cli.app "$RUN_YAML" 2>&1 | tee "$LOG"
 
 echo "### assert: loss logged, finite, and trended down"
 python - "$WORK/out/dspark_train_metrics.jsonl" <<'PY'
