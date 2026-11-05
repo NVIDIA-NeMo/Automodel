@@ -22,7 +22,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from nemo_automodel.components.datasets.loader import DataloaderConfig
+from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonOptions,
     ZephonPackingOptions,
@@ -51,7 +51,7 @@ def config(tmp_path):
     path.write_text(
         "".join(json.dumps({"text": f"w{i % 30} w{(i + 1) % 30} w{(i + 2) % 30}"}) + "\n" for i in range(36))
     )
-    return DataloaderConfig(
+    return ZephonDataloaderConfig(
         dataset_config=ZephonTextDatasetConfig(
             tokenize_special_tokens="eos",
             zephon=ZephonOptions(

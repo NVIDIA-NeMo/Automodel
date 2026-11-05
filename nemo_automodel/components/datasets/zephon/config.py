@@ -25,7 +25,12 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, TypedDict, TypeVar
 
-from nemo_automodel.components.datasets.loader import StreamBuildContext, StreamDatasetConfig, TextStreamBuildContext
+from nemo_automodel.components.datasets.loader import (
+    DataloaderConfig,
+    StreamBuildContext,
+    StreamDatasetConfig,
+    TextStreamBuildContext,
+)
 from nemo_automodel.components.datasets.packing import (
     BatchOutputFormat,
     PackedSequenceContract,
@@ -625,6 +630,37 @@ class ZephonLanguageDatasetConfig(ZephonStreamDatasetConfig[TextStreamBuildConte
             ),
             output_format=self.output_format,
         )
+
+
+@dataclass
+class ZephonDataloaderConfig(DataloaderConfig):
+    """Adapt Zephon text metadata while reusing common stream construction.
+
+    Pipeline settings remain on ``dataset_config.zephon``. The inherited build
+    method supplies runtime inputs and returns the actual Zephon loader.
+    """
+
+    dataset_config: ZephonLanguageDatasetConfig
+
+    def __post_init__(self) -> None:
+        """Reject a native or image dataset before model preparation or source I/O."""
+        if not isinstance(self.dataset_config, ZephonLanguageDatasetConfig):
+            raise TypeError("ZephonDataloaderConfig requires a Zephon text dataset config")
+
+    @property
+    def is_packed(self) -> bool:
+        """Whether the Zephon text stream reports packed inputs."""
+        return self.dataset_config.is_packed
+
+    @property
+    def packed_sequence_length(self) -> int:
+        """Input length configured on the Zephon dataset, or zero until resolved."""
+        return self.dataset_config.packed_sequence_length
+
+    @property
+    def output_format(self) -> BatchOutputFormat:
+        """Batched or THD output selected on the Zephon dataset."""
+        return self.dataset_config.output_format
 
 
 @dataclass(frozen=True, kw_only=True)
