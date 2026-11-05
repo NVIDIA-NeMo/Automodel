@@ -21,21 +21,23 @@ slug: model-coverage/vision-language-models/moonshotai/Kimi-K3.1-Pro
 
 ## Implementation Limits
 
-- The recipes select `backend.attn: cudnn`: the existing fused cuDNN indexer produces top-k coordinates, and the shared FlashMLA/cuDNN kernels attend directly to selected latent KV. This requires the optional cuDNN Frontend and FlashMLA dependencies and has been exercised on GB200. The `eager`/`sdpa` paths remain dense-mask references.
+- The `backend.attn: cudnn` path uses the fused cuDNN indexer to produce top-k coordinates, and the shared FlashMLA/cuDNN kernels attend directly to selected latent KV. This requires the optional cuDNN Frontend and FlashMLA dependencies and has been exercised on GB200. The `eager`/`sdpa` paths remain dense-mask references.
 - Indexer projections use BF16 with FP32 score accumulation; this is not the FP8 indexer used by some serving kernels. The indexer still scans all causal keys and its score buffer remains quadratic. Sparse MLA avoids expanding all per-head K/V and avoids dense attention over unselected keys.
 - The pretrained indexer stays frozen, including after LoRA injection. Hard top-k selection has no language-model-loss gradient into the indexer; indexer distillation training is not implemented.
 - A sequence of at most 2048 valid tokens keeps every causal key. Sparse-selection validation needs an individual sequence longer than 2048 tokens. Padding or packing short documents is insufficient.
 
-On GB200, FlashMLA forward pads the 96 query heads to 128, while cuDNN backward runs the native 96 heads. Direct API tests with cuDNN Frontend 1.27.0 and 1.32.1 confirmed native-96 backward support; the 1.32.1 forward API rejects the checkpoint's (96, 576) shape.
+On GB200, FlashMLA forward pads the 96 query heads to 128, while cuDNN backward runs the native 96 heads. Native-96 backward training is validated with cuDNN Frontend 1.30.0.
 
 The cuDNN path preserves the output gate and supports contiguous documents and padding. Interior masked holes within one document require the `sdpa` path.
 
 ## Nonpacked MedPix
 
-Use [k31_medpix_nonpacked.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/k31_medpix_nonpacked.yaml) with `NeMoAutoModelForImageTextToText.from_pretrained`. The native `KimiK3Processor` expands the image tokens, and `default_collate_fn` passes images to that processor. The recipe uses CP2, EP32 and PP8 on 64 GB200 nodes with four GPUs each. KDA uses FLA because the optional fused KDA implementation does not support CP. Expert routing uses the pretrained router with HybridEP; benchmark-only fake and static routing are disabled. The recipe enables projection-cross-entropy and fused PyTorch AdamW. Model compile islands are disabled because the native nonpacked validation encountered activation-checkpoint recomputation mismatches with them. Parameters and AdamW moments are BF16, matching the earlier K3 nonpacked setup; this has a different update precision from FP32 master-weight training.
+Use [k31_medpix_nonpacked.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/kimi/k31_medpix_nonpacked.yaml) with `NeMoAutoModelForImageTextToText.from_pretrained`. The native `KimiK3Processor` expands the image tokens, and `default_collate_fn` passes images to that processor. The recipe uses CP1, EP32 and PP8 on 64 GB200 nodes with four GPUs each. KDA uses FLA. Expert routing uses the pretrained router with HybridEP. The recipe uses `ChunkedCrossEntropy` with 512-token chunks and fused PyTorch AdamW, with BF16 model parameters and optimizer moments. Model compile islands are disabled.
 
 Set `FLA_DISABLE_TENSOR_CACHE=1` before launching PP training, as the recipe launcher environment does. This prevents FLA metadata-cache hits and misses from changing the operation sequence during activation-checkpoint recomputation across microbatches.
 
-Allocate the recipe's resources through the [Slurm launcher](/job-launchers/slurm-cluster). This full 93-layer topology has not been validated for K3.1; initial native checkpoint validation uses four real language-model layers and the original vision tower on a single four-GPU GB200 node. Packed image CP is outside this recipe's validation scope. Nonpacked CP keeps image processing in the native model and shards the language sequence.
+Allocate the recipe's resources through the [Slurm launcher](/job-launchers/slurm-cluster). The full 93-layer model completed 100 optimizer steps on nonpacked MedPix with 4,096-token padded sequences and global batch size 256, using cuDNN Frontend 1.30.0 and AutoModel's native distributed checkpoint loading. All 256 ranks completed every update with finite gradients before and after clipping. Training loss was 1.7097 at step 0 and 0.5750 at step 99.
 
-See [text training and CP2](/model-coverage/large-language-models/moonshotai/Kimi-K3.1-Pro) for text-only workflows and benchmark YAMLs.
+This full-model validation covers nonpacked CP1 training. Packed image CP and full-model CP2 training are outside its scope.
+
+See [text-model architecture and validation](/model-coverage/large-language-models/moonshotai/Kimi-K3.1-Pro) for text-only coverage.

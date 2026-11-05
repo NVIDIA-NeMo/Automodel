@@ -1,6 +1,6 @@
 ---
 title: "Kimi-K3.1-Pro"
-description: "Train Kimi-K3.1-Pro with NeMo AutoModel using text fine-tuning and context parallelism recipes, with explicit validation scope and attention limits."
+description: "Kimi-K3.1-Pro text-generation architecture, sparse-attention support, and real-checkpoint validation coverage in NVIDIA NeMo AutoModel."
 slug: model-coverage/large-language-models/moonshotai/Kimi-K3.1-Pro
 ---
 
@@ -21,26 +21,17 @@ slug: model-coverage/large-language-models/moonshotai/Kimi-K3.1-Pro
 
 ## Implementation Limits
 
-- The recipes select `backend.attn: cudnn`: the existing fused cuDNN indexer produces top-k coordinates, and the shared FlashMLA/cuDNN kernels attend directly to selected latent KV. This requires the optional cuDNN Frontend and FlashMLA dependencies and has been exercised on GB200. The `eager`/`sdpa` paths remain dense-mask references.
+- The `backend.attn: cudnn` path uses the fused cuDNN indexer to produce top-k coordinates, and the shared FlashMLA/cuDNN kernels attend directly to selected latent KV. This requires the optional cuDNN Frontend and FlashMLA dependencies and has been exercised on GB200. The `eager`/`sdpa` paths remain dense-mask references.
 - Indexer projections use BF16 with FP32 score accumulation; this is not the FP8 indexer used by some serving kernels. The indexer still scans all causal keys and its score buffer remains quadratic. Sparse MLA avoids expanding all per-head K/V and avoids dense attention over unselected keys.
 - The pretrained indexer stays frozen, including after LoRA injection. Hard top-k selection has no language-model-loss gradient into the indexer; indexer distillation training is not implemented.
 - A sequence of at most 2048 valid tokens keeps every causal key. Sparse-selection validation needs an individual sequence longer than 2048 tokens. Padding or packing short documents is insufficient.
 
-On GB200, FlashMLA forward pads the 96 query heads to 128, while cuDNN backward runs the native 96 heads. Direct API tests with cuDNN Frontend 1.27.0 and 1.32.1 confirmed native-96 backward support; the 1.32.1 forward API rejects the checkpoint's (96, 576) shape.
+On GB200, FlashMLA forward pads the 96 query heads to 128, while cuDNN backward runs the native 96 heads. Native-96 backward training is validated with cuDNN Frontend 1.30.0.
 
 The cuDNN path preserves the output gate and supports `kv_b_proj` LoRA through its effective weight. That projection requires zero LoRA dropout and does not support DoRA. Packed documents must be contiguous: interior masked holes within one document require the `sdpa` path.
 
-## Text Recipes
+## Validation and Training
 
-| Recipe | Configuration |
-|---|---|
-| [k31_hellaswag.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k31_hellaswag.yaml) | Full-parameter SFT, FP32 AdamW parameters with BF16 compute, EP32 and PP8; 128 GB200 nodes with four GPUs each |
-| [k31_tulu3_cp2_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/kimi/k31_tulu3_cp2_lora.yaml) | Text-only, nonpacked 4096-token LoRA with CP2 and EP64; 16 GB200 nodes with four GPUs each |
-| [kimi_k31_gb200.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/kimi/kimi_k31_gb200.yaml) | Random-initialized benchmark counterpart of the K3 recipe |
-| [kimi_k31_gb200_2k.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_benchmark/kimi/kimi_k31_gb200_2k.yaml) | 2K benchmark counterpart; does not exercise sparse key selection |
+Text forward-logit validation covers the first four real checkpoint layers with 4,096-token and 8,192-token single-document inputs against vLLM. This establishes four-layer forward coverage, not full-depth logits parity. Context-parallel forward/backward has component-level coverage.
 
-The text recipes select `KimiK3ForCausalLM` from the K3.1 checkpoint configuration while retaining its `dsa_config`. They load through AutoModel's distributed checkpoint flow with `dequantize_base_checkpoint: true`.
-
-Allocate the resources specified in the chosen YAML before launching through the [Slurm launcher](/job-launchers/slurm-cluster). The full 93-layer recipe topologies have not been validated for K3.1. Component validation includes a two-rank CUDA CP forward/backward comparison with a dense negative control. Native checkpoint validation uses the first four real checkpoint layers on four GB200 GPUs with FSDP2 and EP4; it does not establish full-depth parity against an official K3.1 model.
-
-See [vision-language training](/model-coverage/vision-language-models/moonshotai/Kimi-K3.1-Pro) for nonpacked MedPix.
+For a full-model training recipe and its 100-step validation results, see [nonpacked MedPix training](/model-coverage/vision-language-models/moonshotai/Kimi-K3.1-Pro).
