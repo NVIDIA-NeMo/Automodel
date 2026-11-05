@@ -33,7 +33,7 @@ sequence.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, TypedDict
 
 import numpy as np
 from PIL import Image
@@ -65,6 +65,21 @@ def _generate_response(rng: np.random.Generator, num_words: int) -> str:
     return " ".join(words)
 
 
+class _MockContent(TypedDict, total=False):
+    type: str
+    text: str
+    image: Image.Image
+
+
+class _MockMessage(TypedDict):
+    role: str
+    content: list[_MockContent]
+
+
+class _MockSample(TypedDict):
+    conversation: list[_MockMessage]
+
+
 @dataclass
 class MockVlmDatasetConfig:
     """Construction-time configuration for the mock VLM dataset."""
@@ -84,7 +99,7 @@ class MockVlmDatasetConfig:
     seed: int = 0
     """Random seed for reproducibility."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[_MockSample]:
         """Build the mock VLM dataset from this config."""
         return build_mock_vlm_dataset(
             num_samples=self.num_samples,
