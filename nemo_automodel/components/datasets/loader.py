@@ -50,6 +50,8 @@ from nemo_automodel.shared.rng import ScopedRNG
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
+    from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -166,6 +168,16 @@ class StreamDatasetConfig(Generic[_StreamContext, _StreamResult], ABC):
     builds_on_all_ranks: ClassVar[bool] = True
     is_packed: ClassVar[bool] = False
     output_format: BatchOutputFormat = "batched"
+
+    @property
+    def dataloader_config_type(self) -> type[DataloaderConfig] | type[VlmDataloaderConfig] | None:
+        """Compatible loader config when YAML omits ``dataloader._target_``.
+
+        ``None`` retains the recipe's native default. A stream that requires a
+        specialized loader config can declare it without coupling recipes to
+        its implementation.
+        """
+        return None
 
     @property
     def packed_sequence_length(self) -> int:
@@ -681,6 +693,16 @@ class DataloaderConfig:
     persistent_workers: bool = False
     prefetch_factor: int | None = None
     drop_last: bool = False
+
+    @classmethod
+    def adapt_dataset_config(cls, dataset_config: DatasetConfig) -> DatasetConfig:
+        """Adapt a typed dataset for this loader at the recipe config boundary.
+
+        Native loaders retain the supplied dataset. Specialized loaders may
+        translate supported dataset descriptions into their own typed configs.
+        No data is loaded or tokenized during adaptation.
+        """
+        return dataset_config
 
     def __post_init__(self) -> None:
         """Require a stream-specific metadata adapter for complete stream datasets."""
