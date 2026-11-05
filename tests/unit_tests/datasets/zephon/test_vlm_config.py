@@ -138,31 +138,22 @@ def test_cheap_vlm_build_validation_precedes_position_factory(batch_size, pp_n_m
         )
 
 
-def test_video_processor_is_rejected_before_position_state_or_processor_loading():
+def test_video_processor_is_rejected_before_processor_loading():
     processor_factory = Mock()
     video_factory = Mock()
-    position_factory = Mock()
-    config = ZephonVlmDataloaderConfig(
-        processor_config=VlmProcessorConfig(
-            factory=processor_factory,
-            video_processor=VlmVideoProcessorConfig(factory=video_factory),
-        ),
-        zephon=ZephonOptions(
-            sources=(ZephonSource(name="images", path="unused"),),
-            packing=ZephonPackingOptions(pack_algorithm="first_fit"),
-        ),
-    )
     with pytest.raises(ValueError, match="does not support video processors"):
-        config.build(
-            pretrained_model_name_or_path="unused",
-            dp_rank=0,
-            dp_world_size=1,
-            batch_size=1,
-            position_state_factory=position_factory,
+        ZephonVlmDataloaderConfig(
+            processor_config=VlmProcessorConfig(
+                factory=processor_factory,
+                video_processor=VlmVideoProcessorConfig(factory=video_factory),
+            ),
+            zephon=ZephonOptions(
+                sources=(ZephonSource(name="images", path="unused"),),
+                packing=ZephonPackingOptions(pack_algorithm="first_fit"),
+            ),
         )
     processor_factory.assert_not_called()
     video_factory.assert_not_called()
-    position_factory.assert_not_called()
 
 
 @pytest.mark.parametrize("allow_xdoc", [False, True])
