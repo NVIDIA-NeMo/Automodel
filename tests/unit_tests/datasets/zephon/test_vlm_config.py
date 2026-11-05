@@ -61,7 +61,7 @@ def _recipe():
                 "packing": {"pack_algorithm": "first_fit"},
             },
         },
-        "dataloader": {"_target_": ZephonVlmDataloaderConfig},
+        "dataloader": {},
     }
 
 
@@ -464,13 +464,17 @@ def test_image_source_alias_shares_normalization_and_preserves_template():
 @pytest.mark.parametrize(
     "target",
     [
+        None,
         ZephonVlmDataloaderConfig,
         "nemo_automodel.components.datasets.zephon.vlm_config.ZephonVlmDataloaderConfig",
     ],
 )
 def test_image_loader_subclass_reports_the_dataset_output_format(target):
     values = _recipe()
-    values["dataloader"]["_target_"] = target
+    if target is None:
+        values.pop("dataloader")
+    else:
+        values["dataloader"]["_target_"] = target
     values["dataset"]["output_format"] = "thd"
     values["dataset"]["zephon"]["inject_fake_images"] = False
     config = RecipeConfig(ConfigNode(values)).vlm_dataloader
@@ -491,6 +495,18 @@ def test_image_and_text_loaders_reject_incompatible_dataset_configs():
     with pytest.raises(TypeError, match="Zephon text dataset config"):
         ZephonDataloaderConfig(dataset_config=image_dataset)
     values = _recipe()
-    values["dataloader"] = {}
+    values["dataloader"] = {"_target_": "torchdata.stateful_dataloader.StatefulDataLoader"}
     with pytest.raises(TypeError, match="compatible VlmDataloaderConfig subclass"):
+        RecipeConfig(ConfigNode(values)).vlm_dataloader
+
+
+def test_dataset_loader_default_rejects_the_wrong_recipe_family():
+    with pytest.raises(ValueError, match="expected a DataloaderConfig subclass"):
+        RecipeConfig(ConfigNode(_recipe())).dataloader
+    values = _recipe()
+    values["dataset"] = {
+        "_target_": "nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig",
+        "zephon": {"sources": [{"name": "text", "path": "unused"}]},
+    }
+    with pytest.raises(ValueError, match="expected a VlmDataloaderConfig subclass"):
         RecipeConfig(ConfigNode(values)).vlm_dataloader

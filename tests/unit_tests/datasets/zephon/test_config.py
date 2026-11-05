@@ -56,7 +56,7 @@ def _recipe(*, dataset_type="ZephonTextDatasetConfig", dataset=None, loader=None
             "zephon": deepcopy(_SETTINGS),
             **(dataset or {}),
         },
-        "dataloader": {"_target_": ZephonDataloaderConfig, **(loader or {})},
+        "dataloader": loader or {},
         "step_scheduler": {"max_steps": 10, "local_batch_size": 1, "global_batch_size": 1},
         **recipe,
     }
@@ -169,6 +169,90 @@ def test_explicit_instruction_config_selects_sft_without_native_translation():
     assert isinstance(
         RecipeConfig(ConfigNode(values)).dataloader.dataset_config, ColumnMappedTextInstructionDatasetConfig
     )
+
+
+@pytest.mark.parametrize(
+    "dataset_name", ["ColumnMappedTextInstructionDataset", "ColumnMappedTextInstructionDatasetConfig"]
+)
+def test_explicit_zephon_loader_translates_native_instructions(dataset_name):
+    values = {
+        "dataset": {
+            "_target_": f"nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.{dataset_name}",
+            "path_or_dataset_id": "org/instructions",
+            "split": "train",
+            "name": "english",
+            "column_mapping": {"question": "prompt", "answer": "response"},
+            "answer_only_loss_mask": False,
+            "use_hf_chat_template": True,
+        },
+        "dataloader": {"_target_": ZephonDataloaderConfig},
+    }
+    original = deepcopy(values)
+    loader = RecipeConfig(ConfigNode(values)).dataloader
+    dataset = loader.dataset_config
+    assert isinstance(loader, ZephonDataloaderConfig)
+    assert isinstance(dataset, ZephonInstructionDatasetConfig)
+    assert dataset.zephon.sources == (ZephonSource(name="source_0", path="hf://org/instructions/english/train"),)
+    assert dataset.column_mapping == {"question": "prompt", "answer": "response"}
+    assert dataset.use_hf_chat_template and not dataset.answer_only_loss_mask
+    assert values == original
+
+
+@pytest.mark.parametrize(
+    "field, value", [("seq_length", 32), ("padding", "max_length"), ("truncation", True), ("limit_dataset_samples", 2)]
+)
+def test_native_instruction_translation_rejects_non_equivalent_settings(field, value):
+    values = {
+        "dataset": {
+            "_target_": "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDatasetConfig",
+            "path_or_dataset_id": "org/instructions",
+            "column_mapping": {"question": "prompt", "answer": "response"},
+            field: value,
+        },
+        "dataloader": {"_target_": ZephonDataloaderConfig},
+    }
+    with pytest.raises(ValueError, match=field):
+        RecipeConfig(ConfigNode(values)).dataloader
+
+
+def test_native_instruction_translation_still_rejects_native_packing():
+    values = {
+        "dataset": {
+            "_target_": "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDatasetConfig",
+            "path_or_dataset_id": "org/instructions",
+            "column_mapping": {"question": "prompt", "answer": "response"},
+        },
+        "dataloader": {"_target_": ZephonDataloaderConfig},
+        "packed_sequence": {},
+    }
+    with pytest.raises(ValueError, match="Stream datasets own packing"):
+        RecipeConfig(ConfigNode(values)).dataloader
+
+
+def test_translated_instructions_require_a_template_when_requested(tokenizer):
+    from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+        ColumnMappedTextInstructionDatasetConfig,
+    )
+    from nemo_automodel.components.datasets.zephon.llm import resolve_token_ids
+
+    dataset = ZephonDataloaderConfig.adapt_dataset_config(
+        ColumnMappedTextInstructionDatasetConfig(
+            path_or_dataset_id="org/instructions",
+            column_mapping={"question": "prompt", "answer": "response"},
+            use_hf_chat_template=True,
+        )
+    )
+    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_source_pipeline") as create:
+        with pytest.raises(ValueError, match="requires a tokenizer chat template"):
+            dataset.tokenize(
+                tokenizer=tokenizer,
+                options=dataset.zephon,
+                ids=resolve_token_ids(tokenizer, pad_token_id=None),
+                seed=42,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+        create.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -736,6 +820,22 @@ def test_text_stream_requires_its_loader_config_and_rejects_native_datasets():
     with pytest.raises(TypeError, match="Zephon text dataset config"):
         ZephonDataloaderConfig(dataset_config=MockUnpackedDatasetConfig())
     values = _recipe()
-    del values["dataloader"]["_target_"]
+    values["dataloader"]["_target_"] = "torch.utils.data.DataLoader"
     with pytest.raises(TypeError, match="compatible DataloaderConfig subclass"):
         RecipeConfig(ConfigNode(values)).dataloader
+
+
+@pytest.mark.parametrize(
+    "target", [None, ZephonDataloaderConfig, "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig"]
+)
+def test_text_loader_target_is_optional_and_explicit_targets_still_work(target):
+    values = _recipe()
+    if target is None:
+        values.pop("dataloader")
+    else:
+        values["dataloader"]["_target_"] = target
+    original = deepcopy(values)
+    loader = RecipeConfig(ConfigNode(values)).dataloader
+    assert isinstance(loader, ZephonDataloaderConfig)
+    assert isinstance(loader.dataset_config, ZephonTextDatasetConfig)
+    assert values == original
