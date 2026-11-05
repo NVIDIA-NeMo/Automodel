@@ -278,6 +278,42 @@ def test_compiled_path_zero_rows_fall_back_to_eager(restore_rw_cores):
     assert x.grad.shape == x.shape
 
 
+@pytest.mark.parametrize("min_numel, takes_cores", [(64, True), (65, False)])
+def test_compiled_cores_take_inputs_from_min_numel(restore_rw_cores, monkeypatch, min_numel, takes_cores):
+    """Below the chunk threshold, compiled cores take inputs of at least ``_RW_COMPILED_MIN_NUMEL`` elements."""
+    calls: list[str] = []
+
+    def _fwd(x: torch.Tensor, probs: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        """Record the call and run the forward core.
+
+        Args:
+            x: Expert outputs of shape [tokens, hidden].
+            probs: Routing probabilities of shape [tokens, 1].
+            out_dtype: Output dtype.
+
+        Returns:
+            Tensor of shape [tokens, hidden] and dtype ``out_dtype``.
+        """
+        calls.append("fwd")
+        return _rw_fwd_core(x, probs, out_dtype)
+
+    experts_mod._rw_fwd_dispatch = _fwd
+    experts_mod._rw_bwd_x_dispatch = _rw_bwd_x_core
+    experts_mod._rw_bwd_probs_dispatch = _rw_bwd_probs_core
+    experts_mod._RW_CORES_COMPILED = True
+    monkeypatch.setattr(experts_mod, "_RW_COMPILED_MIN_NUMEL", min_numel)
+
+    torch.manual_seed(13)
+    x = torch.randn(8, 8, dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.rand(8, 1, dtype=torch.float32)
+
+    out = _apply_router_weight_fp32(x, probs, torch.bfloat16)
+
+    assert type(out.grad_fn).__name__.startswith("_RouterWeightMulFunction") is takes_cores
+    assert calls == (["fwd"] if takes_cores else [])
+    assert torch.equal(out, _eager_reference(x.detach(), probs, torch.bfloat16))
+
+
 def test_compile_router_weight_cores_wraps_once(restore_rw_cores):
     experts_mod._RW_CORES_COMPILED = False
     experts_mod._rw_fwd_dispatch = _rw_fwd_core
