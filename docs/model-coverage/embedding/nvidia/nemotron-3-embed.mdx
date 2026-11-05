@@ -1,0 +1,49 @@
+---
+title: "Nemotron-3-Embed"
+description: "Explore Nemotron-3-Embed text embedding models in NeMo AutoModel, including released checkpoints, embedding dimensions, and fine-tuning with distillation."
+slug: model-coverage/embedding-models/nvidia/Nemotron-3-Embed
+checkpoints:
+  - nvidia/Nemotron-3-Embed-1B-BF16
+  - nvidia/Nemotron-3-Embed-8B-BF16
+---
+
+Nemotron 3 Embed models encode multilingual text queries and documents for dense
+retrieval. They use Ministral3 with bidirectional attention and average pooling.
+
+## Released Checkpoints
+
+Choose the checkpoint for your workflow. The linked model cards document inference,
+query and passage prefixes, training data, and evaluation.
+
+| Variant | Hugging Face Checkpoint | Embedding Dimensions | Example Role |
+| --- | --- | --- | --- |
+| 1B | [nvidia/Nemotron-3-Embed-1B-BF16](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16) | 2,048 | Trainable student in text distillation |
+| 8B | [nvidia/Nemotron-3-Embed-8B-BF16](https://huggingface.co/nvidia/Nemotron-3-Embed-8B-BF16) | 4,096 | Frozen teacher in text distillation |
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Ministral3Model` |
+| Task | Text embedding and dense retrieval |
+| AutoModel Wrapper | `NeMoAutoModelBiEncoder` |
+| Inputs | Text queries and text documents |
+
+## Fine-Tuning Resources
+
+For contrastive fine-tuning and data preparation, follow the
+[retrieval fine-tuning guide](/recipes-e2e-examples/retrieval-finetune).
+Preserve the model's average pooling, normalization, and query and passage prefixes.
+
+The [text distillation example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/distillation/nemotron3_embed_1b_distill.yaml)
+continues training the released 1B student with the frozen 8B teacher. A trainable
+projection maps student embeddings to the teacher's 4,096-dimensional space for
+the distillation losses. The example does not perform the pruning stages used to
+create the 1B checkpoint. Follow the
+[example README](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/distillation/README.md)
+for dataset requirements and launch instructions.
+
+For image and text documents, refer to
+[Nemotron 3.5 Embed](/model-coverage/embedding-models/nvidia/Nemotron-3.5-Embed).
