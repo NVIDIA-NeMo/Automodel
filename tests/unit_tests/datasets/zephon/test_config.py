@@ -229,6 +229,32 @@ def test_native_instruction_translation_still_rejects_native_packing():
         RecipeConfig(ConfigNode(values)).dataloader
 
 
+def test_translated_instructions_require_a_template_when_requested(tokenizer):
+    from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+        ColumnMappedTextInstructionDatasetConfig,
+    )
+    from nemo_automodel.components.datasets.zephon.llm import resolve_token_ids
+
+    dataset = ZephonDataloaderConfig.adapt_dataset_config(
+        ColumnMappedTextInstructionDatasetConfig(
+            path_or_dataset_id="org/instructions",
+            column_mapping={"question": "prompt", "answer": "response"},
+            use_hf_chat_template=True,
+        )
+    )
+    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_source_pipeline") as create:
+        with pytest.raises(ValueError, match="requires a tokenizer chat template"):
+            dataset.tokenize(
+                tokenizer=tokenizer,
+                options=dataset.zephon,
+                ids=resolve_token_ids(tokenizer, pad_token_id=None),
+                seed=42,
+                dp_rank=0,
+                dp_world_size=1,
+            )
+        create.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "name",
     [
