@@ -754,6 +754,34 @@ def test_native_loader_rejects_a_stream_without_a_compatible_config():
         RecipeConfig(ConfigNode({"dataset": {"_target_": StreamConfig}})).dataloader
 
 
+@pytest.mark.parametrize("explicit_native", [False, True])
+def test_recipe_uses_dataset_loader_default_only_when_target_is_omitted(explicit_native):
+    @dataclass
+    class StreamConfig(StreamDatasetConfig[TextStreamBuildContext, object]):
+        @property
+        def dataloader_config_type(self) -> type[StreamDataloaderConfig]:
+            return StreamDataloaderConfig
+
+        def build(self, *, context: TextStreamBuildContext) -> object:
+            raise AssertionError("Config resolution must not construct the stream")
+
+    raw = ConfigNode(
+        {
+            "dataset": {"_target_": StreamConfig},
+            "dataloader": {"_target_": "torch.utils.data.DataLoader"} if explicit_native else {},
+            "seed": 71,
+            "step_scheduler": {"local_batch_size": 3},
+        }
+    )
+    if explicit_native:
+        with pytest.raises(TypeError, match="compatible DataloaderConfig subclass"):
+            RecipeConfig(raw).dataloader
+    else:
+        config = RecipeConfig(raw).dataloader
+        assert isinstance(config, StreamDataloaderConfig)
+        assert config.seed == 71 and config.batch_size == 3
+
+
 def test_recipe_rejects_a_loader_target_that_is_not_a_config_subclass():
     raw = ConfigNode(
         {

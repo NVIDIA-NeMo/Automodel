@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
-    from nemo_automodel.components.datasets.loader import DataloaderConfig
+    from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetConfig
     from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
     from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
     from nemo_automodel.components.loss.loss import LossConfig
@@ -72,9 +72,19 @@ _STEP_SCHEDULER_RUNTIME_KEYS = ("local_batch_size", "dp_size", "dataloader")
 _LoaderConfig = TypeVar("_LoaderConfig")
 
 
-def _loader_config_class(target: object, base: type[_LoaderConfig]) -> type[_LoaderConfig]:
-    """Resolve an explicit loader config subclass at the YAML boundary."""
+def _loader_config_class(
+    target: object, base: type[_LoaderConfig], *, dataset_config: DatasetConfig
+) -> type[_LoaderConfig]:
+    """Resolve an explicit loader target or its dataset-owned default."""
     from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.datasets.loader import StreamDatasetConfig
+
+    if target is None:
+        if not isinstance(dataset_config, StreamDatasetConfig):
+            return base
+        target = dataset_config.dataloader_config_type
+        if target is None:
+            return base
 
     # ConfigNode restores dotted targets serialized by to_dict() using the same
     # resolution rules as the recipe's other _target_ sections.
@@ -272,15 +282,9 @@ class RecipeConfig:
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
         dataset_kwargs.pop("tokenizer", None)
         dataset_config = make_dataset_config(target, dataset_kwargs)
-        # Preserve an explicit native packing choice even when disabled; stream
-        # backends own packing and must not silently replace that choice.
-        if isinstance(dataset_config, StreamDatasetConfig) and self._raw.get("packed_sequence", None) is not None:
-            raise ValueError("Stream datasets own packing; remove native packed_sequence configuration")
-
         loader_kwargs = _as_dict(dataloader_node)
         loader_target = loader_kwargs.pop("_target_", None)
         supported_loader_targets = {
-            None,
             "torch.utils.data.DataLoader",
             "torchdata.stateful_dataloader.StatefulDataLoader",
             DataLoader,
@@ -289,8 +293,13 @@ class RecipeConfig:
         config_class = (
             DataloaderConfig
             if loader_target in supported_loader_targets
-            else _loader_config_class(loader_target, DataloaderConfig)
+            else _loader_config_class(loader_target, DataloaderConfig, dataset_config=dataset_config)
         )
+        dataset_config = config_class.adapt_dataset_config(dataset_config)
+        # Validate the adapted config too: selecting a stream backend cannot
+        # silently replace native packing, even when it was explicitly disabled.
+        if isinstance(dataset_config, StreamDatasetConfig) and self._raw.get("packed_sequence", None) is not None:
+            raise ValueError("Stream datasets own packing; remove native packed_sequence configuration")
         collate = make_collate_fn(*_target_kwargs(loader_kwargs.pop("collate_fn", None)))
 
         schedule = DatasetBuildSchedule(
