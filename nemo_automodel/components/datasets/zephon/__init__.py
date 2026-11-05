@@ -18,33 +18,31 @@ from typing import TYPE_CHECKING
 
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonDataloaderConfig,
-    ZephonInstructionSourceConfig,
-    ZephonPretokenizedTextSourceConfig,
-    ZephonTextSourceConfig,
+    ZephonInstructionDatasetConfig,
+    ZephonPretokenizedTextDatasetConfig,
+    ZephonTextDatasetConfig,
 )
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig, ZephonVlmSourceConfig
+    from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDatasetConfig, ZephonVlmOptions
 
 __all__ = [
     "ZephonDataloaderConfig",
-    "ZephonPretokenizedTextSourceConfig",
-    "ZephonInstructionSourceConfig",
-    "ZephonTextSourceConfig",
-    "ZephonVlmDataloaderConfig",
-    "ZephonVlmSourceConfig",
+    "ZephonInstructionDatasetConfig",
+    "ZephonPretokenizedTextDatasetConfig",
+    "ZephonTextDatasetConfig",
+    "ZephonVlmDatasetConfig",
+    "ZephonVlmOptions",
 ]
 
 
 def __getattr__(name: str) -> object:
     """Load image configuration only when a VLM caller requests it."""
-    if name in ("ZephonVlmDataloaderConfig", "ZephonVlmSourceConfig"):
+    if name in ("ZephonVlmDatasetConfig", "ZephonVlmOptions"):
         from nemo_automodel.components.datasets.zephon.vlm_config import (
-            ZephonVlmDataloaderConfig,
-            ZephonVlmSourceConfig,
+            ZephonVlmDatasetConfig,
+            ZephonVlmOptions,
         )
 
-        return {"ZephonVlmDataloaderConfig": ZephonVlmDataloaderConfig, "ZephonVlmSourceConfig": ZephonVlmSourceConfig}[
-            name
-        ]
+        return {"ZephonVlmDatasetConfig": ZephonVlmDatasetConfig, "ZephonVlmOptions": ZephonVlmOptions}[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
