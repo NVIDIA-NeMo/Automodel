@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, TypedDict, Ty
 
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
+    DatasetConfig,
     StreamBuildContext,
     StreamDatasetConfig,
     TextStreamBuildContext,
@@ -647,6 +648,46 @@ class ZephonDataloaderConfig(DataloaderConfig):
     """
 
     dataset_config: ZephonLanguageDatasetConfig
+
+    @classmethod
+    def adapt_dataset_config(cls, dataset_config: DatasetConfig) -> ZephonLanguageDatasetConfig:
+        """Translate supported native instruction descriptions without loading data.
+
+        Native padding, truncation and sample limits are not equivalent to
+        Zephon packing or source limits, so non-default choices are rejected.
+        Use a Zephon dataset config to customize its pipeline settings.
+        """
+        from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+            ColumnMappedTextInstructionDatasetConfig,
+        )
+
+        if isinstance(dataset_config, ZephonLanguageDatasetConfig):
+            return dataset_config
+        if not isinstance(dataset_config, ColumnMappedTextInstructionDatasetConfig):
+            raise TypeError("ZephonDataloaderConfig requires a Zephon text or column-mapped instruction dataset config")
+        unsupported = [
+            name
+            for name, value, allowed in (
+                ("seq_length", dataset_config.seq_length, (None,)),
+                ("padding", dataset_config.padding, ("do_not_pad", False)),
+                ("truncation", dataset_config.truncation, ("do_not_truncate", False)),
+                ("limit_dataset_samples", dataset_config.limit_dataset_samples, (None,)),
+            )
+            if value not in allowed
+        ]
+        if unsupported:
+            raise ValueError(
+                f"Zephon cannot translate native instruction setting(s): {', '.join(unsupported)}; "
+                "use ZephonInstructionDatasetConfig with Zephon source and packing settings"
+            )
+        return ZephonInstructionDatasetConfig(
+            path_or_dataset_id=dataset_config.path_or_dataset_id,
+            split=dataset_config.split,
+            name=dataset_config.name,
+            column_mapping=dict(dataset_config.column_mapping),
+            answer_only_loss_mask=dataset_config.answer_only_loss_mask,
+            use_hf_chat_template=dataset_config.use_hf_chat_template,
+        )
 
     def __post_init__(self) -> None:
         """Reject a native or image dataset before model preparation or source I/O."""

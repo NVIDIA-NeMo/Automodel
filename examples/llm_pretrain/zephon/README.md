@@ -177,8 +177,6 @@ shifted labels. The same `batched` and `thd` output formats remain available.
 For question/answer data, select `ZephonInstructionDatasetConfig`:
 
 ```yaml
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonInstructionDatasetConfig
   path_or_dataset_id: your-org/instructions
@@ -196,12 +194,19 @@ tokenization and loss masking. The tokenizer's chat template supplies the
 conversation format. Set `use_hf_chat_template: false` for plain prompt/completion
 formatting.
 
-Select `ZephonInstructionDatasetConfig` directly for a Zephon instruction
-pipeline. Native dataset configs, such as
-`ColumnMappedTextInstructionDatasetConfig`, continue using their native loaders;
-they are not converted into Zephon configs. Use the source fields above for a
-single dataset, or `dataset.zephon.sources` for an explicit mixture. Other Zephon
-options stay under `dataset.zephon`, as in the text example above.
+Native dataset configs keep their native loader by default. Explicitly setting
+`dataloader._target_` to
+`nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig` also accepts
+`ColumnMappedTextInstructionDatasetConfig` and its dataset-class target. The
+adapter translates the source, column mapping and formatting choices into
+`ZephonInstructionDatasetConfig` without building the native dataset. Native
+padding, truncation and sample limits must remain disabled; they are not
+equivalent to Zephon packing or source limits. Unsupported datasets are rejected.
+
+Use `ZephonInstructionDatasetConfig` directly to customize the Zephon pipeline.
+Its loader is selected automatically, and options live under `dataset.zephon`.
+Use the source fields above for a single dataset, or `dataset.zephon.sources`
+for an explicit mixture.
 
 The local example uses plain formatting and Flash Attention:
 

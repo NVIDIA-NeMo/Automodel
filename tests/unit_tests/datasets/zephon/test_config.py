@@ -172,6 +172,64 @@ def test_explicit_instruction_config_selects_sft_without_native_translation():
 
 
 @pytest.mark.parametrize(
+    "dataset_name", ["ColumnMappedTextInstructionDataset", "ColumnMappedTextInstructionDatasetConfig"]
+)
+def test_explicit_zephon_loader_translates_native_instructions(dataset_name):
+    values = {
+        "dataset": {
+            "_target_": f"nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.{dataset_name}",
+            "path_or_dataset_id": "org/instructions",
+            "split": "train",
+            "name": "english",
+            "column_mapping": {"question": "prompt", "answer": "response"},
+            "answer_only_loss_mask": False,
+            "use_hf_chat_template": True,
+        },
+        "dataloader": {"_target_": ZephonDataloaderConfig},
+    }
+    original = deepcopy(values)
+    loader = RecipeConfig(ConfigNode(values)).dataloader
+    dataset = loader.dataset_config
+    assert isinstance(loader, ZephonDataloaderConfig)
+    assert isinstance(dataset, ZephonInstructionDatasetConfig)
+    assert dataset.zephon.sources == (ZephonSource(name="source_0", path="hf://org/instructions/english/train"),)
+    assert dataset.column_mapping == {"question": "prompt", "answer": "response"}
+    assert dataset.use_hf_chat_template and not dataset.answer_only_loss_mask
+    assert values == original
+
+
+@pytest.mark.parametrize(
+    "field, value", [("seq_length", 32), ("padding", "max_length"), ("truncation", True), ("limit_dataset_samples", 2)]
+)
+def test_native_instruction_translation_rejects_non_equivalent_settings(field, value):
+    values = {
+        "dataset": {
+            "_target_": "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDatasetConfig",
+            "path_or_dataset_id": "org/instructions",
+            "column_mapping": {"question": "prompt", "answer": "response"},
+            field: value,
+        },
+        "dataloader": {"_target_": ZephonDataloaderConfig},
+    }
+    with pytest.raises(ValueError, match=field):
+        RecipeConfig(ConfigNode(values)).dataloader
+
+
+def test_native_instruction_translation_still_rejects_native_packing():
+    values = {
+        "dataset": {
+            "_target_": "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDatasetConfig",
+            "path_or_dataset_id": "org/instructions",
+            "column_mapping": {"question": "prompt", "answer": "response"},
+        },
+        "dataloader": {"_target_": ZephonDataloaderConfig},
+        "packed_sequence": {},
+    }
+    with pytest.raises(ValueError, match="Stream datasets own packing"):
+        RecipeConfig(ConfigNode(values)).dataloader
+
+
+@pytest.mark.parametrize(
     "name",
     [
         "fetch_parallelism",
