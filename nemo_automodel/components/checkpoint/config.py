@@ -136,6 +136,10 @@ class CheckpointingConfig:
     diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
+    # If True, a larger best_metric_key value is better (e.g. accuracy); the LOWEST_VAL
+    # pointer and retention then track the maximum instead of the minimum. Keep False for
+    # loss-like metrics, where a smaller value is better.
+    greater_is_better: bool = False
     consolidation_timeout_minutes: int = 30  # Timeout for inline consolidated-export synchronization.
     # Retain this many recent checkpoint directories. Preserve checkpoints targeted by checkpoint-root pointers,
     # such as `LATEST` and `LOWEST_VAL`, in addition to the recent window. `None` keeps all checkpoints.

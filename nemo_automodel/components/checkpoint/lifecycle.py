@@ -78,7 +78,7 @@ class CheckpointLifecycle:
     ) -> None:
         self.config = config
         self.process_group = process_group
-        self._best_val_loss = float("inf")
+        self._best_val_loss: float | None = None
         self._pending_checkpoint_dir: str | None = None
         self._pending_best_checkpoint: _PendingBestCheckpoint | None = None
 
@@ -387,7 +387,7 @@ class CheckpointLifecycle:
 
     def _initialize_best_val_loss_from_pointer(self, metric_key: str | None) -> None:
         """Initialize best-metric state from the current complete ``LOWEST_VAL`` target."""
-        if self._best_val_loss != float("inf"):
+        if self._best_val_loss is not None:
             return
         target = read_checkpoint_pointer(self.config.checkpoint_dir, "LOWEST_VAL")
         if target is None or not target.is_dir() or is_checkpoint_incomplete(target):
@@ -396,18 +396,30 @@ class CheckpointLifecycle:
         if existing_best is not None:
             self._best_val_loss = existing_best
 
+    def _is_improvement(self, val_loss: float) -> bool:
+        """Return whether ``val_loss`` improves on the current best, honoring direction."""
+        if self._best_val_loss is None:
+            return True
+        if self.config.greater_is_better:
+            return val_loss > self._best_val_loss
+        return val_loss < self._best_val_loss
+
     def _update_best_checkpoint(
         self,
         target_dir: str,
         val_loss: float,
         metric_key: str | None,
     ) -> None:
-        """Update ``LOWEST_VAL`` when a finite validation metric improves."""
+        """Update ``LOWEST_VAL`` when a finite validation metric improves.
+
+        "Improves" honors ``self.config.greater_is_better``: a larger value is
+        better when set, otherwise (the default) a smaller value is better.
+        """
         if not math.isfinite(val_loss):
             logger.warning("Ignoring non-finite validation metric for checkpoint %s: %s", target_dir, val_loss)
             return
         self._initialize_best_val_loss_from_pointer(metric_key)
-        if val_loss < self._best_val_loss:
+        if self._is_improvement(val_loss):
             self._best_val_loss = val_loss
             self._update_checkpoint_pointer("LOWEST_VAL", target_dir)
             logger.info(
