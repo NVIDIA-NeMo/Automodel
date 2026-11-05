@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from zephon import Pipeline
 
-    from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig, ZephonOptions
+    from nemo_automodel.components.datasets.zephon.config import ZephonLanguageDatasetConfig, ZephonOptions
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 def create_source_pipeline(
     options: ZephonOptions,
     *,
+    seed: int,
     dp_rank: int,
     dp_world_size: int,
     measure: Callable[[Any], int] | None = None,
@@ -77,7 +78,7 @@ def create_source_pipeline(
         mixture=work.MixtureSpec({source.name: source.weight for source in options.sources}),
         chunk_size=options.source.chunk_size,
         token_estimation=token_estimation,
-        seed=options.seed,
+        seed=seed,
         shuffle_shards=options.source.shuffle_shards,
         shuffle_within_shard=options.source.shuffle_within_shard,
         shuffle_block_size=options.source.shuffle_block_size,
@@ -105,6 +106,7 @@ def finalize_pipeline(
     options: ZephonOptions,
     *,
     batch_size: int,
+    seed: int,
     dp_rank: int,
     dp_world_size: int,
 ) -> None:
@@ -122,7 +124,7 @@ def finalize_pipeline(
     )
     if options.packing.shuffle_after_pack:
         pipeline.shuffle(
-            seed=options.seed,
+            seed=seed,
             buffer_size=options.packing.shuffle_buffer_size,
             parallelism=options.workers.shuffle_parallelism,
         )
@@ -160,9 +162,11 @@ def finalize_pipeline(
 
 
 def create_text_pipeline(
-    config: ZephonDataloaderConfig,
+    config: ZephonLanguageDatasetConfig,
     *,
+    batch_size: int,
     tokenizer: PreTrainedTokenizerBase,
+    seed: int,
     dp_rank: int,
     dp_world_size: int,
 ) -> Pipeline:
@@ -176,13 +180,13 @@ def create_text_pipeline(
     ids = resolve_token_ids(tokenizer, pad_token_id=options.packing.pad_token_id)
     max_documents = options.packing.max_num_documents
     if max_documents is not None and options.packing.max_num_documents_scope == "batch":
-        max_documents //= config.batch_size
+        max_documents //= batch_size
         if not max_documents:
             raise ValueError("max_num_documents must be at least local_batch_size when scoped to the batch")
     wrapping = options.packing.pack_algorithm in ("wrap", "best_fit_wrap")
     num_bins = (options.packing.pack_num_bins or 64) if not wrapping else None
-    pipeline = config.dataset_config.build(
-        tokenizer=tokenizer, options=options, ids=ids, dp_rank=dp_rank, dp_world_size=dp_world_size
+    pipeline = config.tokenize(
+        tokenizer=tokenizer, options=options, ids=ids, seed=seed, dp_rank=dp_rank, dp_world_size=dp_world_size
     )
     if options.packing.pack_algorithm is not None:
         pipeline.pack_flat(
@@ -200,13 +204,13 @@ def create_text_pipeline(
             partial(prepare_text_document_without_packing, max_length=sequence_length + 1),
             parallelism=options.workers.map_parallelism,
         )
-    finalize_pipeline(pipeline, options, batch_size=config.batch_size, dp_rank=dp_rank, dp_world_size=dp_world_size)
+    finalize_pipeline(pipeline, options, seed=seed, batch_size=batch_size, dp_rank=dp_rank, dp_world_size=dp_world_size)
     logger.info(
         "Zephon stages: %s -> packing=%s (seq_len=%s) -> batch(%s); token_estimation=%s; sources=%s",
-        type(config.dataset_config).__name__,
+        type(config).__name__,
         options.packing.pack_algorithm,
         sequence_length,
-        config.batch_size,
+        batch_size,
         options.source.token_estimation,
         [(source.name, source.weight) for source in options.sources],
     )

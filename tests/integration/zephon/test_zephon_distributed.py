@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from transformers import PreTrainedTokenizerFast
 
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 from tests.utils.zephon_distributed import distributed_environment as distributed_environment
 from tests.utils.zephon_distributed import run_ranks
 from tests.utils.zephon_text_fixtures import config as config
@@ -38,18 +39,31 @@ def _dcp_worker(rank, directory, source_config, tokenizer_path):
     config = replace(
         source_config,
         batch_size=1,
-        zephon=replace(
-            source_config.zephon,
-            checkpoint=replace(
-                source_config.zephon.checkpoint,
-                aggregate_dir=f"{directory}/aggregate",
-                run_id="dcp-test",
-                canonical_replicas=2,
+        dataset_config=replace(
+            source_config.dataset_config,
+            zephon=replace(
+                source_config.dataset_config.zephon,
+                checkpoint=replace(
+                    source_config.dataset_config.zephon.checkpoint,
+                    aggregate_dir=f"{directory}/aggregate",
+                    run_id="dcp-test",
+                    canonical_replicas=2,
+                ),
             ),
         ),
     )
-    loader = config.build(tokenizer=tokenizer, dp_rank=rank, dp_world_size=2)
-    restored = config.build(tokenizer=tokenizer, dp_rank=rank, dp_world_size=2)
+    loader = config.build(
+        tokenizer=tokenizer,
+        dp_rank=rank,
+        dp_world_size=2,
+        training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size * 2, 100, None),
+    )
+    restored = config.build(
+        tokenizer=tokenizer,
+        dp_rank=rank,
+        dp_world_size=2,
+        training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size * 2, 100, None),
+    )
     try:
         first = next(loader)
         # This test's source gives each document a unique repeated word token.
@@ -71,7 +85,7 @@ def _dcp_worker(rank, directory, source_config, tokenizer_path):
 
 
 def test_two_rank_dcp_into_fresh_loaders(config, tokenizer, tmp_path, distributed_environment):
-    Path(config.zephon.sources[0].path, "text.jsonl").write_text(
+    Path(config.dataset_config.zephon.sources[0].path, "text.jsonl").write_text(
         "".join(json.dumps({"text": f"w{i} w{i}"}) + "\n" for i in range(36))
     )
     run_ranks(_dcp_worker, (str(tmp_path), config, tokenizer.name_or_path))
@@ -92,13 +106,23 @@ def _finite_worker(rank, directory, source_config, tokenizer_path):
     config = replace(
         source_config,
         batch_size=1,
-        zephon=replace(
-            source_config.zephon,
-            checkpoint=replace(source_config.zephon.checkpoint, run_id="finite-test", canonical_replicas=2),
-            runtime=replace(source_config.zephon.runtime, mtp_mode=False),
+        dataset_config=replace(
+            source_config.dataset_config,
+            zephon=replace(
+                source_config.dataset_config.zephon,
+                checkpoint=replace(
+                    source_config.dataset_config.zephon.checkpoint, run_id="finite-test", canonical_replicas=2
+                ),
+                runtime=replace(source_config.dataset_config.zephon.runtime, mtp_mode=False),
+            ),
         ),
     )
-    loader = config.build(tokenizer=tokenizer, dp_rank=rank, dp_world_size=2)
+    loader = config.build(
+        tokenizer=tokenizer,
+        dp_rank=rank,
+        dp_world_size=2,
+        training_schedule=DatasetBuildSchedule(config.batch_size, 4, 100, None),
+    )
     try:
         scheduler = StepSchedulerConfig(global_batch_size=4, max_steps=100, preemption_signal=None).build(loader, 2, 1)
         steps = 0

@@ -1,4 +1,4 @@
-# Set dataloader.zephon.sources[0].path to your image-conversation JSONL directory.
+# Set dataset.zephon.sources[0].path to your image-conversation JSONL directory.
 # Run: uv run automodel examples/vlm_finetune/zephon/train.yaml --nproc-per-node 1
 recipe: FinetuneRecipeForVLM
 seed: 42
@@ -16,9 +16,7 @@ processor:
   min_pixels: 3136
   max_pixels: 200704
 dataset:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonVlmSourceConfig
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonVlmDataloaderConfig
+  _target_: nemo_automodel.components.datasets.zephon.ZephonVlmDatasetConfig
   zephon:
     sources:
     - name: images
@@ -37,6 +35,8 @@ dataloader:
       run_id: zephon-vlm
     training:
       allow_cross_document_attention: false
+dataloader:
+  _target_: nemo_automodel.components.datasets.zephon.vlm_config.ZephonVlmDataloaderConfig
 distributed:
   strategy: fsdp2
   dp_size: none

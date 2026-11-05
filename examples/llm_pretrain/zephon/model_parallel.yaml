@@ -25,12 +25,10 @@ model:
   attn_implementation: sdpa
   use_liger_kernel: false
 dataset:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig
+  _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
   tokenize_special_tokens: eos
   tokenizer:
     pretrained_model_name_or_path: work/zephon-tiny/tokenizer
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
   zephon:
     sources:
     - name: text
@@ -44,6 +42,8 @@ dataloader:
     checkpoint:
       aggregate_store: torch://
       run_id: zephon-model-parallel
+dataloader:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
 distributed:
   strategy: fsdp2
   dp_size: none

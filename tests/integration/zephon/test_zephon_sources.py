@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.datasets.loader import DataloaderConfig
+from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetBuildSchedule
 from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonOptions,
@@ -31,7 +31,7 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonRuntimeOptions,
     ZephonSource,
     ZephonSourceOptions,
-    ZephonTextSourceConfig,
+    ZephonTextDatasetConfig,
 )
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from tests.utils.zephon_text_fixtures import config as config
@@ -40,9 +40,23 @@ from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
 def test_process_worker_tokenization(config, tokenizer):
     config = replace(
-        config, zephon=replace(config.zephon, runtime=replace(config.zephon.runtime, runner="process", mtp_mode=True))
+        config,
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                runtime=replace(config.dataset_config.zephon.runtime, runner="process", mtp_mode=True),
+            ),
+        ),
     )
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+        )
+    ) as loader:
         assert next(loader)["labels"].tolist()[0] == [3, 4, 1, 3, 4, 5, 1]
 
 
@@ -54,19 +68,21 @@ def _mixture_config(tmp_path, *, estimation, policy="repeat"):
         (path / "data.jsonl").write_text((json.dumps({"text": text}) + "\n") * 100)
         sources.append(ZephonSource(name=name, path=str(path), fmt="jsonl"))
     return ZephonDataloaderConfig(
-        dataset_config=ZephonTextSourceConfig(tokenize_special_tokens="eos"),
-        zephon=ZephonOptions(
-            sources=tuple(sources),
-            packing=ZephonPackingOptions(seq_len=31),
-            source=ZephonSourceOptions(
-                chunk_size=16,
-                shuffle_shards=False,
-                shuffle_within_shard=False,
-                shuffle_block_size=None,
-                token_estimation=estimation,
-                exhausted_policy=policy,
+        dataset_config=ZephonTextDatasetConfig(
+            tokenize_special_tokens="eos",
+            zephon=ZephonOptions(
+                sources=tuple(sources),
+                packing=ZephonPackingOptions(seq_len=31),
+                source=ZephonSourceOptions(
+                    chunk_size=16,
+                    shuffle_shards=False,
+                    shuffle_within_shard=False,
+                    shuffle_block_size=None,
+                    token_estimation=estimation,
+                    exhausted_policy=policy,
+                ),
+                runtime=ZephonRuntimeOptions(runner="threads", mtp_mode=False),
             ),
-            runtime=ZephonRuntimeOptions(runner="threads", mtp_mode=False),
         ),
     )
 
@@ -86,16 +102,33 @@ def test_token_aware_mixture_uses_tokens_not_document_counts(tmp_path, tokenizer
     sample_config = _mixture_config(tmp_path, estimation=False)
     token_config = replace(
         sample_config,
-        zephon=replace(
-            sample_config.zephon,
-            source=replace(
-                sample_config.zephon.source,
-                token_estimation={"calibration_samples": 16, "calibration_shards_min": 1, "calibration_shards_max": 1},
+        dataset_config=replace(
+            sample_config.dataset_config,
+            zephon=replace(
+                sample_config.dataset_config.zephon,
+                source=replace(
+                    sample_config.dataset_config.zephon.source,
+                    token_estimation={
+                        "calibration_samples": 16,
+                        "calibration_shards_min": 1,
+                        "calibration_shards_max": 1,
+                    },
+                ),
             ),
         ),
     )
-    sample_loader = sample_config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
-    token_loader = token_config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+    sample_loader = sample_config.build(
+        tokenizer=tokenizer,
+        dp_rank=0,
+        dp_world_size=1,
+        training_schedule=DatasetBuildSchedule(sample_config.batch_size, sample_config.batch_size, 100, None),
+    )
+    token_loader = token_config.build(
+        tokenizer=tokenizer,
+        dp_rank=0,
+        dp_world_size=1,
+        training_schedule=DatasetBuildSchedule(token_config.batch_size, token_config.batch_size, 100, None),
+    )
     try:
         assert 0.15 < _short_token_share(sample_loader) < 0.25
         assert 0.43 < _short_token_share(token_loader) < 0.57
@@ -105,16 +138,29 @@ def test_token_aware_mixture_uses_tokens_not_document_counts(tmp_path, tokenizer
 
 
 def test_token_mixture_checkpoint_preserves_calibration_and_replay(tmp_path, tokenizer):
-
     config = _mixture_config(tmp_path, estimation={"primer": {"short": 0.1, "long": 0.2}})
     config = replace(
         config,
-        zephon=replace(
-            config.zephon, packing=replace(config.zephon.packing, pack_algorithm="best_fit", pack_num_bins=8)
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(config.dataset_config.zephon.packing, pack_algorithm="best_fit", pack_num_bins=8),
+            ),
         ),
     )
-    original = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
-    resumed = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+    original = config.build(
+        tokenizer=tokenizer,
+        dp_rank=0,
+        dp_world_size=1,
+        training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+    )
+    resumed = config.build(
+        tokenizer=tokenizer,
+        dp_rank=0,
+        dp_world_size=1,
+        training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+    )
     try:
         next(original)
         checkpoint = original.state_dict()
@@ -133,17 +179,28 @@ def test_padding_algorithms_preserve_real_eos_and_mask_padding(config, tokenizer
     config = replace(
         config,
         batch_size=1,
-        zephon=replace(
-            config.zephon,
-            packing=replace(
-                config.zephon.packing,
-                seq_len=10,
-                pack_algorithm=algorithm,
-                pack_num_bins=8 if algorithm != "best_fit_wrap" else None,
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(
+                    config.dataset_config.zephon.packing,
+                    seq_len=10,
+                    pack_algorithm=algorithm,
+                    pack_num_bins=8 if algorithm != "best_fit_wrap" else None,
+                ),
             ),
         ),
     )
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1, ignore_index=-7)) as loader:
+    with closing(
+        config.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            ignore_index=-7,
+            training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+        )
+    ) as loader:
         batches = list(loader)
         assert batches
         assert any(batch["padding_mask"].any() for batch in batches)
@@ -156,35 +213,67 @@ def test_padding_algorithms_preserve_real_eos_and_mask_padding(config, tokenizer
 @pytest.mark.parametrize("policy", ["stop", "redistribute"])
 def test_finite_mixture_policies(tmp_path, tokenizer, policy):
     config = _mixture_config(tmp_path, estimation=False, policy=policy)
-    with closing(config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as loader:
+    with closing(
+        config.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+        )
+    ) as loader:
         assert 0 < len(list(loader)) < 100
 
 
 def test_first_fit_drop_and_reject_oversized_documents(config, tokenizer):
-    path = Path(config.zephon.sources[0].path)
+    path = Path(config.dataset_config.zephon.sources[0].path)
     (path / "text.jsonl").write_text(
         "\n".join(json.dumps({"text": text}) for text in ("w0 w1", " ".join(["w2"] * 30), "w3 w4")) + "\n"
     )
     dropped_config = replace(
         config,
         batch_size=1,
-        zephon=replace(
-            config.zephon,
-            packing=replace(
-                config.zephon.packing, seq_len=8, pack_algorithm="first_fit", pack_num_bins=2, drop_oversized=True
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(
+                    config.dataset_config.zephon.packing,
+                    seq_len=8,
+                    pack_algorithm="first_fit",
+                    pack_num_bins=2,
+                    drop_oversized=True,
+                ),
+                source=replace(config.dataset_config.zephon.source, chunk_size=1),
             ),
-            source=replace(config.zephon.source, chunk_size=1),
         ),
     )
-    with closing(dropped_config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as dropped:
+    with closing(
+        dropped_config.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            training_schedule=DatasetBuildSchedule(dropped_config.batch_size, dropped_config.batch_size, 100, None),
+        )
+    ) as dropped:
         batches = list(dropped)
         assert batches
         assert not any(batch["input_ids"].eq(4).any() for batch in batches)
     with closing(
         replace(
             dropped_config,
-            zephon=replace(dropped_config.zephon, packing=replace(dropped_config.zephon.packing, drop_oversized=False)),
-        ).build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+            dataset_config=replace(
+                dropped_config.dataset_config,
+                zephon=replace(
+                    dropped_config.dataset_config.zephon,
+                    packing=replace(dropped_config.dataset_config.zephon.packing, drop_oversized=False),
+                ),
+            ),
+        ).build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            training_schedule=DatasetBuildSchedule(dropped_config.batch_size, dropped_config.batch_size, 100, None),
+        )
     ) as rejected:
         with pytest.raises((ValueError, RuntimeError), match="[Oo]versize|exceed|length"):
             list(rejected)
@@ -194,13 +283,30 @@ def test_raw_text_process_workers_use_effective_unsaved_tokenizer(config, tokeni
     tokenizer.add_tokens(["unsaved-vocabulary-token"])
     token_id = tokenizer.convert_tokens_to_ids("unsaved-vocabulary-token")
     tokenizer.name_or_path = ""
-    path = Path(config.zephon.sources[0].path)
+    path = Path(config.dataset_config.zephon.sources[0].path)
     (path / "text.jsonl").write_text((json.dumps({"text": "unsaved-vocabulary-token w0 w1"}) + "\n") * 36)
     config = replace(
-        config, zephon=replace(config.zephon, runtime=replace(config.zephon.runtime, runner="process", mtp_mode=True))
+        config,
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                runtime=replace(config.dataset_config.zephon.runtime, runner="process", mtp_mode=True),
+            ),
+        ),
     )
-    loader = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
-    restored = config.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+    loader = config.build(
+        tokenizer=tokenizer,
+        dp_rank=0,
+        dp_world_size=1,
+        training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+    )
+    restored = config.build(
+        tokenizer=tokenizer,
+        dp_rank=0,
+        dp_world_size=1,
+        training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+    )
     try:
         assert next(loader)["input_ids"].eq(token_id).any()
         checkpoint = loader.state_dict()
@@ -216,12 +322,14 @@ def test_native_validation_remains_a_separate_finite_loader(tmp_path: Path) -> N
     config = RecipeConfig(
         ConfigNode(
             {
-                "dataset": {"_target_": "nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig"},
-                "dataloader": {
-                    "_target_": "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig",
                     "zephon": {
                         "sources": [{"name": "training", "path": str(tmp_path)}],
                     },
+                },
+                "dataloader": {
+                    "_target_": "nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig",
                 },
                 "step_scheduler": {"max_steps": 100, "local_batch_size": 1},
                 "validation_dataset": {

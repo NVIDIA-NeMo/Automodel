@@ -3925,19 +3925,21 @@ def test_build_dataloader_forwards_inject_fake_images_false():
 def test_zephon_setup_preserves_requested_attention_backend(monkeypatch, tmp_path, attention_backend):
     """Zephon setup preserves the configured SDPA or eager attention backend."""
     from nemo_automodel._transformers.kernel_patches import _apply_preload_overrides
+    from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig
     from nemo_automodel.components.datasets.zephon.config import (
-        ZephonOptions,
         ZephonPackingOptions,
         ZephonSource,
     )
-    from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig
+    from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDatasetConfig, ZephonVlmOptions
     from nemo_automodel.recipes._typed_config import RecipeConfig
 
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
-    config = ZephonVlmDataloaderConfig(
-        zephon=ZephonOptions(
-            sources=(ZephonSource(name="images", path=str(tmp_path)),),
-            packing=ZephonPackingOptions(pack_algorithm="first_fit", pack_num_bins=2),
+    config = VlmDataloaderConfig(
+        dataset_config=ZephonVlmDatasetConfig(
+            zephon=ZephonVlmOptions(
+                sources=(ZephonSource(name="images", path=str(tmp_path)),),
+                packing=ZephonPackingOptions(pack_algorithm="first_fit", pack_num_bins=2),
+            )
         )
     )
     monkeypatch.setattr(RecipeConfig, "vlm_dataloader", property(lambda self: config))

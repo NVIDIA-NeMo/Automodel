@@ -22,7 +22,8 @@ import torch
 from transformers import Qwen2_5_VLForConditionalGeneration
 
 from nemo_automodel._transformers.registry import resolve_image_position_state
-from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmSourceConfig
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
+from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from tests.integration.zephon.test_mistral3_images import _loader as mistral_loader
 from tests.integration.zephon.test_mistral3_images import _model as mistral_model
@@ -65,14 +66,16 @@ def test_vlm_configured_backend_reaches_packed_loader(config, inputs, backend, m
     )
     assert model.config._attn_implementation == backend
     position_model = Qwen2_5_VLForConditionalGeneration(tiny_vlm_config())
+    loader_config = ZephonVlmDataloaderConfig(dataset_config=config)
     with closing(
-        config.build(
+        loader_config.build(
             pretrained_model_name_or_path=inputs[0],
             dp_rank=0,
             dp_world_size=1,
             batch_size=2,
             position_state_factory=lambda: resolve_image_position_state(position_model),
             packing_contract=configure_packing_for_models([model]),
+            training_schedule=DatasetBuildSchedule(2, 2, 100, None),
         ).dataloader
     ) as loader:
         batch = next(loader)
@@ -95,19 +98,22 @@ def test_qwen_mrope_and_media_reach_flash_decoder_unchanged(config, inputs, monk
     for xdoc in (False, True):
         selected = replace(
             config,
-            dataset_config=ZephonVlmSourceConfig(inject_fake_images=False),
             zephon=replace(
-                config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=xdoc)
+                config.zephon,
+                inject_fake_images=False,
+                training=replace(config.zephon.training, allow_cross_document_attention=xdoc),
             ),
         )
+        loader_config = ZephonVlmDataloaderConfig(dataset_config=selected)
         loaders = [
-            selected.build(
+            loader_config.build(
                 pretrained_model_name_or_path=inputs[0],
                 dp_rank=0,
                 dp_world_size=1,
                 batch_size=2,
                 position_state_factory=lambda: resolve_image_position_state(model),
                 packing_contract=PackingCapabilities(kind),
+                training_schedule=DatasetBuildSchedule(2, 2, 100, None),
             ).dataloader
             for kind in ("block_causal", "flash_varlen")
         ]
@@ -148,14 +154,16 @@ def test_flash_accepts_default_fake_policy_for_mixed_documents(config, inputs, x
         zephon=replace(config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=xdoc)),
     )
     model = Qwen2_5_VLForConditionalGeneration(tiny_vlm_config())
+    loader_config = ZephonVlmDataloaderConfig(dataset_config=config)
     with closing(
-        config.build(
+        loader_config.build(
             pretrained_model_name_or_path=inputs[0],
             dp_rank=0,
             dp_world_size=1,
             batch_size=2,
             position_state_factory=lambda: resolve_image_position_state(model),
             packing_contract=PackingCapabilities("flash_varlen"),
+            training_schedule=DatasetBuildSchedule(2, 2, 100, None),
         ).dataloader
     ) as loader:
         batches = list(loader)

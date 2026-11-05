@@ -30,8 +30,9 @@ from transformers import (
 
 from nemo_automodel._transformers.registry import resolve_image_position_state
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
+from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
-    ZephonOptions,
     ZephonPackingOptions,
     ZephonRuntimeOptions,
     ZephonSource,
@@ -40,7 +41,8 @@ from nemo_automodel.components.datasets.zephon.config import (
 )
 from nemo_automodel.components.datasets.zephon.vlm_config import (
     ZephonVlmDataloaderConfig,
-    ZephonVlmSourceConfig,
+    ZephonVlmDatasetConfig,
+    ZephonVlmOptions,
 )
 from nemo_automodel.components.models.common.packing import (
     configure_packing,
@@ -58,8 +60,8 @@ def config(tmp_path, inputs):
     directory = tmp_path / "corpus"
     directory.mkdir()
     (directory / "images.jsonl").write_text("".join(json.dumps(document) + "\n" for document in documents * 3))
-    return ZephonVlmDataloaderConfig(
-        zephon=ZephonOptions(
+    return ZephonVlmDatasetConfig(
+        zephon=ZephonVlmOptions(
             sources=(ZephonSource(name="images", path=str(directory), fmt="jsonl"),),
             packing=ZephonPackingOptions(
                 seq_len=63, pack_algorithm="first_fit", pack_num_bins=2, shuffle_after_pack=False
@@ -76,7 +78,10 @@ def config(tmp_path, inputs):
 def _build(config, inputs, *, pp_n_microbatches=None):
     model_config = tiny_vlm_config()
     model = Qwen2_5_VLForConditionalGeneration(model_config)
+    if isinstance(config, ZephonVlmDatasetConfig):
+        config = ZephonVlmDataloaderConfig(dataset_config=config)
     return config.build(
+        training_schedule=DatasetBuildSchedule(2, 2, 10, None),
         pretrained_model_name_or_path=inputs[0],
         dp_rank=0,
         dp_world_size=1,
@@ -91,12 +96,14 @@ def test_example_yaml_route_reads_actual_local_image_source(config, inputs):
     values = yaml.safe_load(path.read_text())
     values["model"]["pretrained_model_name_or_path"] = inputs[0]
     values["processor"] = {}
-    settings = values["dataloader"]["zephon"]
+    settings = values["dataset"]["zephon"]
     settings["sources"] = [asdict(source) for source in config.zephon.sources]
     settings["packing"].update(seq_len=40, pack_num_bins=2)
     settings.setdefault("runtime", {}).update(runner="inline", mtp_mode=False)
     resolved = RecipeConfig(ConfigNode(values)).vlm_dataloader
+    assert isinstance(resolved, VlmDataloaderConfig)
     assert isinstance(resolved, ZephonVlmDataloaderConfig)
+    assert isinstance(resolved.dataset_config, ZephonVlmDatasetConfig)
     with closing(_build(resolved, inputs)) as loader:
         batch = next(loader)
         assert batch["input_ids"].shape == (2, 40)
@@ -220,8 +227,11 @@ def test_text_only_without_fake_images_omits_media(config, inputs, tmp_path):
     (directory / "text.jsonl").write_text("".join(json.dumps(document) + "\n" for _ in range(12)))
     config = replace(
         config,
-        dataset_config=ZephonVlmSourceConfig(inject_fake_images=False),
-        zephon=replace(config.zephon, sources=(ZephonSource(name="text", path=str(directory), fmt="jsonl"),)),
+        zephon=replace(
+            config.zephon,
+            inject_fake_images=False,
+            sources=(ZephonSource(name="text", path=str(directory), fmt="jsonl"),),
+        ),
     )
     with closing(_build(config, inputs)) as loader:
         batch = next(loader)
@@ -285,7 +295,8 @@ def test_parent_position_factory_and_processor_context_do_not_enter_workers(conf
         return create_source(*args, **kwargs)
 
     monkeypatch.setattr(pipeline_module, "create_source_pipeline", create_source_after_context)
-    result = config.build(
+    result = ZephonVlmDataloaderConfig(dataset_config=config).build(
+        training_schedule=DatasetBuildSchedule(2, 2, 10, None),
         pretrained_model_name_or_path=inputs[0],
         dp_rank=0,
         dp_world_size=1,
@@ -304,13 +315,20 @@ def test_parent_position_factory_and_processor_context_do_not_enter_workers(conf
         result.dataloader.close()
 
     with pytest.raises(ValueError, match="context parallel"):
-        config.build(pretrained_model_name_or_path=inputs[0], dp_rank=0, dp_world_size=1, batch_size=2, cp_size=2)
+        ZephonVlmDataloaderConfig(dataset_config=config).build(
+            pretrained_model_name_or_path=inputs[0],
+            dp_rank=0,
+            dp_world_size=1,
+            batch_size=2,
+            cp_size=2,
+            training_schedule=DatasetBuildSchedule(2, 2, 10, None),
+        )
 
 
 def test_thd_image_pipeline_keeps_expanded_positions_pixels_and_shifted_labels(config, inputs):
     from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
 
-    config = replace(config, dataset_config=replace(config.dataset_config, inject_fake_images=False))
+    config = replace(config, zephon=replace(config.zephon, inject_fake_images=False))
     with (
         closing(_build(config, inputs)) as batched,
         closing(_build(replace(config, output_format="thd"), inputs)) as thd,

@@ -32,6 +32,7 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import PreTrainedTokenizerFast
 
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 from tests.utils.zephon_distributed import distributed_environment as distributed_environment
 from tests.utils.zephon_distributed import run_ranks
 from tests.utils.zephon_text_fixtures import config as config
@@ -87,15 +88,18 @@ def _model_parallel_worker(rank, directory, source_config, tokenizer_path, aggre
         tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
         config = replace(
             source_config,
-            zephon=replace(
-                source_config.zephon,
-                checkpoint=replace(
-                    source_config.zephon.checkpoint,
-                    aggregate_store=aggregate_store,
-                    run_id="tp-pp-checkpoint",
-                    canonical_replicas=1,
+            dataset_config=replace(
+                source_config.dataset_config,
+                zephon=replace(
+                    source_config.dataset_config.zephon,
+                    checkpoint=replace(
+                        source_config.dataset_config.zephon.checkpoint,
+                        aggregate_store=aggregate_store,
+                        run_id="tp-pp-checkpoint",
+                        canonical_replicas=1,
+                    ),
+                    runtime=replace(source_config.dataset_config.zephon.runtime, mtp_mode=True),
                 ),
-                runtime=replace(source_config.zephon.runtime, mtp_mode=True),
             ),
         )
         # Ambient global-rank RNG state must not alter Zephon's DP-owned stream.
@@ -109,6 +113,7 @@ def _model_parallel_worker(rank, directory, source_config, tokenizer_path, aggre
             pp_enabled=True,
             supports_seq_lens=False,
             cp_size=1,
+            training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size * dp.size(), 100, None),
         )
         _assert_peer_batches(next(loader))
 
@@ -126,7 +131,12 @@ def _model_parallel_worker(rank, directory, source_config, tokenizer_path, aggre
             expected.append(batch)
         loader.close()
 
-        restored = config.build(tokenizer=tokenizer, dp_rank=dp.get_local_rank(), dp_world_size=dp.size())
+        restored = config.build(
+            tokenizer=tokenizer,
+            dp_rank=dp.get_local_rank(),
+            dp_world_size=dp.size(),
+            training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size * dp.size(), 100, None),
+        )
         loaded = _CheckpointWitness(restored)
         dcp.load({"dataloader": loaded}, checkpoint_id=f"{directory}/checkpoint")
         assert loaded.checkpoint_calls > 0 and loaded.restore_calls == 1

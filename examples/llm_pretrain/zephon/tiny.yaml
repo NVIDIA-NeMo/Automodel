@@ -25,17 +25,12 @@ model:
   attn_implementation: sdpa
   use_liger_kernel: false
 dataset:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonTextSourceConfig
+  _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
+  paths: work/zephon-tiny/corpus
   tokenize_special_tokens: eos
   tokenizer:
     pretrained_model_name_or_path: work/zephon-tiny/tokenizer
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
   zephon:
-    sources:
-    - name: text
-      path: work/zephon-tiny/corpus
-      fmt: jsonl
     packing:
       seq_len: 63
     source:
@@ -44,6 +39,8 @@ dataloader:
     checkpoint:
       aggregate_store: torch://
       run_id: zephon-tiny
+dataloader:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
 distributed:
   strategy: fsdp2
   dp_size: none

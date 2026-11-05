@@ -16,18 +16,34 @@
 
 import subprocess
 import sys
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.datasets.zephon import ZephonVlmDataloaderConfig, ZephonVlmSourceConfig
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT, PackedSequenceContract
+from nemo_automodel.components.datasets.vlm.loader import (
+    ImagePositionState,
+    VlmDataloaderBuild,
+    VlmDataloaderConfig,
+    VlmProcessorConfig,
+    VlmStreamBuildContext,
+)
 from nemo_automodel.components.datasets.zephon.config import (
-    ZephonOptions,
     ZephonPackingOptions,
     ZephonSource,
     ZephonTrainingOptions,
+)
+from nemo_automodel.components.datasets.zephon.vlm_config import (
+    ZephonVlmDataloaderConfig,
+    ZephonVlmDatasetConfig,
+    ZephonVlmOptions,
 )
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -38,41 +54,89 @@ def _recipe():
     return {
         "seed": 17,
         "step_scheduler": {"max_steps": 10, "local_batch_size": 2, "global_batch_size": 2},
-        "dataset": {"_target_": ZephonVlmSourceConfig},
-        "dataloader": {
-            "_target_": ZephonVlmDataloaderConfig,
+        "dataset": {
+            "_target_": ZephonVlmDatasetConfig,
             "zephon": {
                 "sources": [{"name": "images", "path": "data/images", "fmt": "jsonl"}],
-                "pack_algorithm": "first_fit",
+                "packing": {"pack_algorithm": "first_fit"},
             },
         },
+        "dataloader": {"_target_": ZephonVlmDataloaderConfig},
     }
+
+
+def _build(
+    config: ZephonVlmDatasetConfig | VlmDataloaderConfig,
+    *,
+    pretrained_model_name_or_path: str = "unused",
+    dp_rank: int = 0,
+    dp_world_size: int = 1,
+    batch_size: int = 2,
+    training_schedule: DatasetBuildSchedule | None = None,
+    pp_n_microbatches: int | None = None,
+    position_state_factory: Callable[[], ImagePositionState] | None = None,
+    packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    dataset_build_context: AbstractContextManager[object] | None = None,
+    is_training: bool = True,
+    seed: int = 17,
+) -> VlmDataloaderBuild:
+    if isinstance(config, ZephonVlmDatasetConfig):
+        config = ZephonVlmDataloaderConfig(dataset_config=config)
+    return config.build(
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        batch_size=batch_size,
+        training_schedule=training_schedule or DatasetBuildSchedule(batch_size, 2, 10, None),
+        pp_n_microbatches=pp_n_microbatches,
+        position_state_factory=position_state_factory,
+        packing_contract=packing_contract,
+        dataset_build_context=dataset_build_context,
+        is_training=is_training,
+        seed=seed,
+    )
+
+
+def _context(**overrides: object) -> VlmStreamBuildContext:
+    return replace(
+        VlmStreamBuildContext(
+            seed=17,
+            batch_size=2,
+            dp_rank=0,
+            dp_world_size=1,
+            pretrained_model_name_or_path="unused",
+            processor_config=VlmProcessorConfig(),
+            training_schedule=DatasetBuildSchedule(2, 2, 10, None),
+        ),
+        **overrides,
+    )
 
 
 def test_recipe_routes_images_and_inherits_processor_settings():
     values = _recipe()
     values["processor"] = {"max_pixels": 1003520}
-    values["dataset"]["inject_fake_images"] = False
+    values["dataset"]["zephon"]["inject_fake_images"] = False
     config = RecipeConfig(ConfigNode(values)).vlm_dataloader
+    assert isinstance(config, VlmDataloaderConfig)
     assert isinstance(config, ZephonVlmDataloaderConfig)
-    assert config.zephon.seed == 17
+    assert isinstance(config.dataset_config, ZephonVlmDatasetConfig)
+    assert "seed" not in values["dataset"]["zephon"]
     assert config.processor_config.kwargs == {"max_pixels": 1003520}
-    assert not config.dataset_config.inject_fake_images
+    assert not config.dataset_config.zephon.inject_fake_images
 
 
-def test_image_recipe_defaults_to_whole_document_packing_without_mutating_input():
+def test_image_recipe_requires_explicit_whole_document_packing_without_mutating_input():
     values = _recipe()
-    del values["dataloader"]["zephon"]["pack_algorithm"]
-    config = RecipeConfig(ConfigNode(values)).vlm_dataloader
-    assert config.zephon.packing.pack_algorithm == "first_fit"
-    assert "packing" not in values["dataloader"]["zephon"]
-    assert "pack_algorithm" not in values["dataloader"]["zephon"]
+    del values["dataset"]["zephon"]["packing"]["pack_algorithm"]
+    with pytest.raises(ValueError, match="first_fit or best_fit"):
+        RecipeConfig(ConfigNode(values)).vlm_dataloader
+    assert values["dataset"]["zephon"]["packing"] == {}
 
 
 @pytest.mark.parametrize("algorithm", [None, "wrap", "best_fit_wrap"])
 def test_image_recipe_rejects_explicit_non_image_packing(algorithm):
     values = _recipe()
-    values["dataloader"]["zephon"]["pack_algorithm"] = algorithm
+    values["dataset"]["zephon"]["packing"]["pack_algorithm"] = algorithm
     with pytest.raises(ValueError, match="first_fit or best_fit"):
         RecipeConfig(ConfigNode(values)).vlm_dataloader
 
@@ -81,9 +145,11 @@ def test_image_example_config_resolves():
     path = Path(__file__).resolve().parents[4] / "examples/vlm_finetune/zephon/train.yaml"
     recipe = RecipeConfig(ConfigNode(yaml.safe_load(path.read_text())))
     config = recipe.vlm_dataloader
+    assert isinstance(config, VlmDataloaderConfig)
     assert isinstance(config, ZephonVlmDataloaderConfig)
-    assert config.zephon.source.stop_after_passes == 1
-    assert config.zephon.packing.pack_algorithm == "first_fit"
+    assert isinstance(config.dataset_config, ZephonVlmDatasetConfig)
+    assert config.dataset_config.zephon.source.stop_after_passes == 1
+    assert config.dataset_config.zephon.packing.pack_algorithm == "first_fit"
 
 
 def test_vlm_toml_paths_and_inline_overrides_share_llm_rules(tmp_path):
@@ -92,31 +158,37 @@ def test_vlm_toml_paths_and_inline_overrides_share_llm_rules(tmp_path):
         'pack_algorithm="best_fit"\nseq_len=128\n[[sources]]\nname="images"\npath="corpus"\nfmt="jsonl"\n'
     )
     values = _recipe()
-    values["dataloader"]["zephon"] = {"data_config": str(data_config), "seq_len": 256}
+    values["dataset"]["zephon"] = {"data_config": str(data_config), "seq_len": 256}
     config = RecipeConfig(ConfigNode(values)).vlm_dataloader
-    assert config.zephon.sources[0].path == str(tmp_path / "corpus")
-    assert config.zephon.packing.seq_len == 256
-    assert config.zephon.packing.pack_algorithm == "best_fit"
+    assert config.dataset_config.zephon.sources[0].path == str(tmp_path / "corpus")
+    assert config.dataset_config.zephon.packing.seq_len == 256
+    assert config.dataset_config.zephon.packing.pack_algorithm == "best_fit"
 
 
 def test_vlm_source_rejects_unknown_fields_and_shares_lane_alignment():
     values = _recipe()
     values["dataset"]["typo"] = True
-    with pytest.raises(ValueError, match="Unexpected ZephonVlmSourceConfig dataset fields.*typo"):
+    with pytest.raises(TypeError, match="unexpected dataset config field.*typo"):
         RecipeConfig(ConfigNode(values)).vlm_dataloader
     del values["dataset"]["typo"]
-    values["dataloader"]["zephon"]["canonical_replicas"] = 4
+    values["dataset"]["zephon"]["canonical_replicas"] = 4
     values["step_scheduler"]["global_batch_size"] = 12
     with pytest.raises(ValueError, match="canonical_replicas.*lane windows"):
-        RecipeConfig(ConfigNode(values)).vlm_dataloader
+        _build(
+            RecipeConfig(ConfigNode(values)).vlm_dataloader,
+            training_schedule=DatasetBuildSchedule(2, 12, 10, None),
+        )
     values["step_scheduler"]["global_batch_size"] = 16
-    assert RecipeConfig(ConfigNode(values)).vlm_dataloader.zephon.checkpoint.canonical_replicas == 4
+    config = RecipeConfig(ConfigNode(values)).vlm_dataloader
+    assert config.dataset_config.zephon.checkpoint.canonical_replicas == 4
+    # A later build can use a valid schedule without changing the declarative config.
+    config.dataset_config.validate_context(_context(training_schedule=DatasetBuildSchedule(2, 16, 10, None)))
 
 
 @pytest.mark.parametrize("batch_size,pp_n_microbatches,message", [(0, None, "batch_size"), (3, 2, "microbatches")])
 def test_cheap_vlm_build_validation_precedes_position_factory(batch_size, pp_n_microbatches, message):
-    config = ZephonVlmDataloaderConfig(
-        zephon=ZephonOptions(
+    config = ZephonVlmDatasetConfig(
+        zephon=ZephonVlmOptions(
             sources=(ZephonSource(name="images", path="unused"),),
             packing=ZephonPackingOptions(pack_algorithm="first_fit"),
         )
@@ -126,7 +198,8 @@ def test_cheap_vlm_build_validation_precedes_position_factory(batch_size, pp_n_m
         raise AssertionError("position factory ran before cheap validation")
 
     with pytest.raises(ValueError, match=message):
-        config.build(
+        _build(
+            config,
             pretrained_model_name_or_path="unused",
             dp_rank=0,
             dp_world_size=1,
@@ -138,8 +211,8 @@ def test_cheap_vlm_build_validation_precedes_position_factory(batch_size, pp_n_m
 
 @pytest.mark.parametrize("allow_xdoc", [False, True])
 def test_vlm_input_limit_is_checked_before_position_state_and_processor(allow_xdoc):
-    config = ZephonVlmDataloaderConfig(
-        zephon=ZephonOptions(
+    config = ZephonVlmDatasetConfig(
+        zephon=ZephonVlmOptions(
             sources=(ZephonSource(name="images", path="unused"),),
             packing=ZephonPackingOptions(seq_len=129, pack_algorithm="first_fit"),
             training=ZephonTrainingOptions(allow_cross_document_attention=allow_xdoc),
@@ -150,7 +223,8 @@ def test_vlm_input_limit_is_checked_before_position_state_and_processor(allow_xd
         raise AssertionError("position factory ran before input-limit validation")
 
     with pytest.raises(ValueError, match="seq_len=129 exceeds.*128"):
-        config.build(
+        _build(
+            config,
             pretrained_model_name_or_path="unused",
             dp_rank=0,
             dp_world_size=1,
@@ -161,8 +235,8 @@ def test_vlm_input_limit_is_checked_before_position_state_and_processor(allow_xd
 
 
 def test_vlm_requires_explicit_length_when_model_limit_is_unknown():
-    config = ZephonVlmDataloaderConfig(
-        zephon=ZephonOptions(
+    config = ZephonVlmDatasetConfig(
+        zephon=ZephonVlmOptions(
             sources=(ZephonSource(name="images", path="unused"),),
             packing=ZephonPackingOptions(pack_algorithm="first_fit"),
         )
@@ -171,8 +245,9 @@ def test_vlm_requires_explicit_length_when_model_limit_is_unknown():
     def must_not_run():
         raise AssertionError("position factory ran before length resolution")
 
-    with pytest.raises(ValueError, match="Set dataloader.zephon.packing.seq_len"):
-        config.build(
+    with pytest.raises(ValueError, match="Set dataset.zephon.packing.seq_len"):
+        _build(
+            config,
             pretrained_model_name_or_path="unused",
             dp_rank=0,
             dp_world_size=1,
@@ -191,15 +266,16 @@ def test_inferred_vlm_length_reserves_expanded_fake_image_segment(tmp_path, proc
     positions = Qwen2_5_VLPositionState(tiny_vlm_config())
     fake_length = len(prepare_fake_image_document(processor, positions)["input_ids"])
     model_limit = fake_length - 1
-    config = ZephonVlmDataloaderConfig(
-        zephon=ZephonOptions(
+    config = ZephonVlmDatasetConfig(
+        zephon=ZephonVlmOptions(
             sources=(ZephonSource(name="images", path="unused"),),
             packing=ZephonPackingOptions(pack_algorithm="first_fit"),
         )
     )
 
     with pytest.raises(ValueError, match=f"reserved fake-image segment length.*got seq_len={model_limit}"):
-        config.build(
+        _build(
+            config,
             pretrained_model_name_or_path=str(tmp_path),
             dp_rank=0,
             dp_world_size=1,
@@ -213,24 +289,27 @@ def test_inferred_vlm_length_reserves_expanded_fake_image_segment(tmp_path, proc
 def test_vlm_rejects_native_packing_and_unsized_run_without_cap():
     values = _recipe()
     values["packed_sequence"] = {"pack_size": 128}
-    with pytest.raises(ValueError, match="Native VLM packing"):
-        RecipeConfig(ConfigNode(values)).vlm_dataloader
+    with pytest.raises(ValueError, match="Stream datasets own packing"):
+        _build(RecipeConfig(ConfigNode(values)).vlm_dataloader)
     del values["packed_sequence"]
     del values["step_scheduler"]["max_steps"]
     with pytest.raises(ValueError, match="positive step_scheduler.max_steps"):
-        RecipeConfig(ConfigNode(values)).vlm_dataloader
+        _build(
+            RecipeConfig(ConfigNode(values)).vlm_dataloader,
+            training_schedule=DatasetBuildSchedule(2, 2, None, None),
+        )
 
 
 def test_vlm_rejects_collator_override_and_zephon_validation():
     values = _recipe()
     values["dataloader"]["collate_fn"] = {"_target_": "builtins.list"}
-    with pytest.raises(ValueError, match="Unexpected Zephon loader"):
-        RecipeConfig(ConfigNode(values)).vlm_dataloader
+    with pytest.raises(ValueError, match="Stream datasets own packing"):
+        _build(RecipeConfig(ConfigNode(values)).vlm_dataloader)
     del values["dataloader"]["collate_fn"]
     values["validation_dataset"] = values["dataset"]
     values["validation_dataloader"] = values["dataloader"]
-    with pytest.raises(ValueError, match="training backend"):
-        RecipeConfig(ConfigNode(values)).vlm_validation_dataloader
+    with pytest.raises(ValueError, match="Zephon validation"):
+        _build(RecipeConfig(ConfigNode(values)).vlm_validation_dataloader, is_training=False)
 
 
 def test_native_llm_import_does_not_require_zephon_or_vlm_loader():
@@ -238,7 +317,7 @@ def test_native_llm_import_does_not_require_zephon_or_vlm_loader():
 import sys
 sys.modules['zephon'] = None
 sys.modules['nemo_automodel.components.datasets.vlm.loader'] = None
-from nemo_automodel.components.datasets.zephon import ZephonDataloaderConfig, ZephonTextSourceConfig
+from nemo_automodel.components.datasets.zephon import ZephonTextDatasetConfig
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 assert 'nemo_automodel.components.datasets.zephon.vlm' not in sys.modules
 """
@@ -246,18 +325,172 @@ assert 'nemo_automodel.components.datasets.zephon.vlm' not in sys.modules
 
 
 def test_thd_vlm_rejects_fake_exclusions_and_pp_before_loading_processors():
-    from nemo_automodel.components.datasets.zephon.config import ZephonOptions
-    from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmSourceConfig
-
-    options = ZephonOptions(
+    options = ZephonVlmOptions(
         sources=(ZephonSource(name="images", path="unused"),), packing=ZephonPackingOptions(pack_algorithm="first_fit")
     )
     with pytest.raises(ValueError, match="inject_fake_images=false"):
-        ZephonVlmDataloaderConfig(zephon=options, output_format="thd")
-    config = ZephonVlmDataloaderConfig(
-        zephon=options, output_format="thd", dataset_config=ZephonVlmSourceConfig(inject_fake_images=False)
-    )
+        ZephonVlmDatasetConfig(zephon=options, output_format="thd")
+    config = ZephonVlmDatasetConfig(zephon=replace(options, inject_fake_images=False), output_format="thd")
     with pytest.raises(ValueError, match="VLM pipeline"):
-        config.build(
-            pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=2, pp_n_microbatches=2
+        _build(
+            config,
+            pretrained_model_name_or_path="unused",
+            dp_rank=0,
+            dp_world_size=1,
+            batch_size=2,
+            pp_n_microbatches=2,
         )
+
+
+def test_outer_template_and_processor_settings_reach_parent_and_worker_config(monkeypatch):
+    from nemo_automodel.components.datasets.zephon import llm, pipeline, vlm
+
+    events = []
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=None), chat_template=None)
+    positions = object()
+    encoder_configs = []
+
+    class ProcessorContext:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *_):
+            events.append("exit")
+
+    def make_processor():
+        events.append("processor")
+        return processor
+
+    def encoder_build(config, *, pretrained_model_name_or_path, positions):
+        assert events == ["enter", "processor", "exit"]
+        encoder_configs.append((config, pretrained_model_name_or_path, positions))
+        return object()
+
+    class SourceReached(Exception):
+        pass
+
+    def source_build(options, *, seed, dp_rank, dp_world_size):
+        assert events == ["enter", "processor", "exit"]
+        assert seed == 17 and dp_rank == 0 and dp_world_size == 1
+        raise SourceReached
+
+    monkeypatch.setattr(llm, "resolve_token_ids", lambda *args, **kwargs: SimpleNamespace(pad=0))
+    monkeypatch.setattr(vlm.VlmEncoderConfig, "build", encoder_build)
+    monkeypatch.setattr(pipeline, "create_source_pipeline", source_build)
+    config = ZephonVlmDataloaderConfig(
+        dataset_config=ZephonVlmDatasetConfig(
+            zephon=ZephonVlmOptions(
+                sources=(ZephonSource(name="images", path="unused"),),
+                packing=ZephonPackingOptions(seq_len=16, pack_algorithm="first_fit"),
+                inject_fake_images=False,
+            )
+        ),
+        processor_config=VlmProcessorConfig(factory=make_processor),
+        chat_template="{{ messages }}",
+    )
+    with pytest.raises(SourceReached):
+        _build(config, dataset_build_context=ProcessorContext(), position_state_factory=lambda: positions, seed=17)
+    assert processor.chat_template == processor.tokenizer.chat_template == "{{ messages }}"
+    encoder, processor_path, encoder_positions = encoder_configs[0]
+    assert encoder.processor is config.processor_config
+    assert encoder.chat_template == config.chat_template
+    assert processor_path == "unused" and encoder_positions is positions
+    assert config.dataset_config.zephon.packing.seq_len == 16
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("inject_fake_images", False),
+        ("truncate", False),
+        ("pretokenize", False),
+        ("packing", {"enabled": False}),
+    ],
+)
+def test_stream_recipe_rejects_consumed_native_preprocessing_fields(name, value):
+    values = _recipe()
+    values["dataset"][name] = value
+    with pytest.raises(TypeError, match=f"native VLM preprocessing fields: {name}"):
+        RecipeConfig(ConfigNode(values)).vlm_dataloader
+
+
+@pytest.mark.parametrize("packing", [{}, {"pack_size": 0}, {"pack_size": 0, "pretokenize": False}])
+def test_stream_recipe_rejects_explicit_disabled_native_packing(packing):
+    values = _recipe()
+    values["packed_sequence"] = packing
+    with pytest.raises(ValueError, match="Stream datasets own packing"):
+        RecipeConfig(ConfigNode(values)).vlm_dataloader
+
+
+def test_native_vlm_recipe_retains_preprocessing_fields_and_shared_chat_template():
+    from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
+
+    config = RecipeConfig.resolve_vlm_dataloader(
+        {
+            "_target_": MockVlmDatasetConfig,
+            "max_length": 128,
+            "pretokenize": True,
+            "truncate": False,
+            "inject_fake_images": False,
+            "packing": {"enabled": False},
+            "chat_template": "{{ messages }}",
+        },
+        {},
+        packed_sequence_node={"pack_size": 128},
+    )
+    assert isinstance(config.dataset_config, MockVlmDatasetConfig)
+    assert config.dataset_config.max_length == 128
+    assert config.pretokenization.max_length == 128
+    assert not config.pretokenization.truncate
+    assert not config.pretokenization.inject_fake_images
+    assert config.packing.pack_size == 128
+    assert config.chat_template == "{{ messages }}"
+
+
+def test_image_source_alias_shares_normalization_and_preserves_template():
+    values = _recipe()
+    values["dataset"]["zephon"].pop("sources")
+    values["dataset"].update(
+        path_or_dataset_id="org/images", name="captions", split="validation", chat_template="custom"
+    )
+    config = RecipeConfig(ConfigNode(values)).vlm_dataloader
+    assert config.dataset_config.zephon.sources == (
+        ZephonSource(name="source_0", path="hf://org/images/captions/validation"),
+    )
+    assert config.chat_template == "custom"
+    assert replace(config.dataset_config).zephon.sources == config.dataset_config.zephon.sources
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        ZephonVlmDataloaderConfig,
+        "nemo_automodel.components.datasets.zephon.vlm_config.ZephonVlmDataloaderConfig",
+    ],
+)
+def test_image_loader_subclass_reports_the_dataset_output_format(target):
+    values = _recipe()
+    values["dataloader"]["_target_"] = target
+    values["dataset"]["output_format"] = "thd"
+    values["dataset"]["zephon"]["inject_fake_images"] = False
+    config = RecipeConfig(ConfigNode(values)).vlm_dataloader
+    assert isinstance(config, ZephonVlmDataloaderConfig)
+    assert config.output_format == "thd" and config.is_packed
+    assert config.packing is None
+
+
+def test_image_and_text_loaders_reject_incompatible_dataset_configs():
+    from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig, ZephonTextDatasetConfig
+
+    image_dataset = RecipeConfig(ConfigNode(_recipe())).vlm_dataloader.dataset_config
+    text_dataset = ZephonTextDatasetConfig(zephon={"sources": [{"name": "text", "path": "unused"}]})
+    with pytest.raises(TypeError, match="compatible VlmDataloaderConfig subclass"):
+        VlmDataloaderConfig(dataset_config=image_dataset)
+    with pytest.raises(TypeError, match="Zephon image dataset config"):
+        ZephonVlmDataloaderConfig(dataset_config=text_dataset)
+    with pytest.raises(TypeError, match="Zephon text dataset config"):
+        ZephonDataloaderConfig(dataset_config=image_dataset)
+    values = _recipe()
+    values["dataloader"] = {}
+    with pytest.raises(TypeError, match="compatible VlmDataloaderConfig subclass"):
+        RecipeConfig(ConfigNode(values)).vlm_dataloader

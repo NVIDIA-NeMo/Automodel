@@ -19,6 +19,7 @@ from dataclasses import replace
 
 import torch
 
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
 from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
@@ -28,14 +29,30 @@ def test_real_thd_pipeline_preserves_packing_shifting_xdoc_and_checkpoint(config
     for xdoc in (False, True):
         selected = replace(
             config,
-            zephon=replace(
-                config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=xdoc)
+            dataset_config=replace(
+                config.dataset_config,
+                zephon=replace(
+                    config.dataset_config.zephon,
+                    training=replace(config.dataset_config.zephon.training, allow_cross_document_attention=xdoc),
+                ),
             ),
         )
         with (
-            closing(selected.build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)) as batched,
             closing(
-                replace(selected, output_format="thd").build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+                selected.build(
+                    tokenizer=tokenizer,
+                    dp_rank=0,
+                    dp_world_size=1,
+                    training_schedule=DatasetBuildSchedule(selected.batch_size, selected.batch_size, 100, None),
+                )
+            ) as batched,
+            closing(
+                replace(selected, dataset_config=replace(selected.dataset_config, output_format="thd")).build(
+                    tokenizer=tokenizer,
+                    dp_rank=0,
+                    dp_world_size=1,
+                    training_schedule=DatasetBuildSchedule(selected.batch_size, selected.batch_size, 100, None),
+                )
             ) as thd,
         ):
             expected, actual = next(batched), next(thd)
@@ -50,7 +67,12 @@ def test_real_thd_pipeline_preserves_packing_shifting_xdoc_and_checkpoint(config
             checkpoint = thd.state_dict()
             following = next(thd)
         with closing(
-            replace(selected, output_format="thd").build(tokenizer=tokenizer, dp_rank=0, dp_world_size=1)
+            replace(selected, dataset_config=replace(selected.dataset_config, output_format="thd")).build(
+                tokenizer=tokenizer,
+                dp_rank=0,
+                dp_world_size=1,
+                training_schedule=DatasetBuildSchedule(selected.batch_size, selected.batch_size, 100, None),
+            )
         ) as restored:
             restored.load_state_dict(checkpoint)
             replay = next(restored)

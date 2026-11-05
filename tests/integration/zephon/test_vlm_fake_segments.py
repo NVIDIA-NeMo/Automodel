@@ -24,9 +24,9 @@ from PIL import Image
 from transformers import Mistral3ForConditionalGeneration, Qwen2_5_VLForConditionalGeneration, Qwen3VLProcessor
 
 from nemo_automodel._transformers.registry import resolve_image_position_state
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 from nemo_automodel.components.datasets.vlm.datasets import encode_vlm_document
 from nemo_automodel.components.datasets.zephon.config import (
-    ZephonOptions,
     ZephonPackingOptions,
     ZephonRuntimeOptions,
     ZephonSource,
@@ -34,7 +34,11 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonWorkerOptions,
 )
 from nemo_automodel.components.datasets.zephon.vlm import prepare_fake_image_document
-from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDataloaderConfig, ZephonVlmSourceConfig
+from nemo_automodel.components.datasets.zephon.vlm_config import (
+    ZephonVlmDataloaderConfig,
+    ZephonVlmDatasetConfig,
+    ZephonVlmOptions,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import configure_packing
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
@@ -102,21 +106,23 @@ def _source(tmp_path, processor):
     corpus.mkdir()
     (corpus / "images.jsonl").write_text("".join(json.dumps(item) + "\n" for item in documents * 2))
     return documents, ZephonVlmDataloaderConfig(
-        zephon=ZephonOptions(
-            sources=(ZephonSource(name="images", path=str(corpus), fmt="jsonl"),),
-            packing=ZephonPackingOptions(
-                seq_len=255,
-                pack_algorithm="first_fit",
-                pack_num_bins=1,
-                max_num_documents=2,
-                max_num_documents_scope="bin",
-                shuffle_after_pack=False,
-            ),
-            source=ZephonSourceOptions(
-                chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
-            ),
-            workers=ZephonWorkerOptions(fetch_parallelism=1, tokenize_parallelism=1),
-            runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
+        dataset_config=ZephonVlmDatasetConfig(
+            zephon=ZephonVlmOptions(
+                sources=(ZephonSource(name="images", path=str(corpus), fmt="jsonl"),),
+                packing=ZephonPackingOptions(
+                    seq_len=255,
+                    pack_algorithm="first_fit",
+                    pack_num_bins=1,
+                    max_num_documents=2,
+                    max_num_documents_scope="bin",
+                    shuffle_after_pack=False,
+                ),
+                source=ZephonSourceOptions(
+                    chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                ),
+                workers=ZephonWorkerOptions(fetch_parallelism=1, tokenize_parallelism=1),
+                runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
+            )
         )
     )
 
@@ -129,6 +135,7 @@ def _loader(config, tmp_path, model, *, kind="block_causal"):
         batch_size=2,
         position_state_factory=lambda: resolve_image_position_state(model),
         packing_contract=configure_packing("flash_attention_2" if kind == "flash_varlen" else "sdpa", model=model),
+        training_schedule=DatasetBuildSchedule(2, 2, 100, None),
     ).dataloader
 
 
@@ -162,7 +169,14 @@ def test_leading_fake_only_for_all_text_packs_preserves_source_accounting_and_ou
     monkeypatch.setattr(vlm_module, "convert_image_batch", capture_batch)
     loader = _loader(config, tmp_path, model)
     baseline_loader = _loader(
-        replace(config, dataset_config=ZephonVlmSourceConfig(inject_fake_images=False)), tmp_path, model
+        replace(
+            config,
+            dataset_config=replace(
+                config.dataset_config, zephon=replace(config.dataset_config.zephon, inject_fake_images=False)
+            ),
+        ),
+        tmp_path,
+        model,
     )
     try:
         actual = next(loader)
@@ -178,7 +192,7 @@ def test_leading_fake_only_for_all_text_packs_preserves_source_accounting_and_ou
             assert record.meta.component_sample_counts == {0: 2}
             assert sum(record.meta.component_token_counts.values()) == source_tokens
             assert len(payload["input_ids"]) == source_tokens + prefix
-            assert source_tokens <= config.zephon.packing.seq_len + 1 - fake_length
+            assert source_tokens <= config.dataset_config.zephon.packing.seq_len + 1 - fake_length
             assert payload["n_images_per_sample"] == 1
         first_payload = first.payload["packed_samples"]
         assert not first_payload["processor_attention_mask"][:fake_length].any()
@@ -215,8 +229,12 @@ def test_default_fake_segments_match_flash_metadata_for_both_xdoc_modes(family, 
     for xdoc in (False, True):
         selected = replace(
             config,
-            zephon=replace(
-                config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=xdoc)
+            dataset_config=replace(
+                config.dataset_config,
+                zephon=replace(
+                    config.dataset_config.zephon,
+                    training=replace(config.dataset_config.zephon.training, allow_cross_document_attention=xdoc),
+                ),
             ),
         )
         dense_loader = _loader(selected, tmp_path, model)
@@ -237,7 +255,14 @@ def test_reserved_fake_capacity_validation_oversized_policy_and_process_resume(f
     _, config = _source(tmp_path, processor)
     fake_length = len(prepare_fake_image_document(processor, resolve_image_position_state(model))["input_ids"])
     too_small = replace(
-        config, zephon=replace(config.zephon, packing=replace(config.zephon.packing, seq_len=fake_length - 1))
+        config,
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                packing=replace(config.dataset_config.zephon.packing, seq_len=fake_length - 1),
+            ),
+        ),
     )
     with pytest.raises(ValueError, match="reserved fake-image segment length"):
         _loader(too_small, tmp_path, model)
@@ -257,10 +282,13 @@ def test_reserved_fake_capacity_validation_oversized_policy_and_process_resume(f
     (corpus / "images.jsonl").write_text("".join(json.dumps(oversized) + "\n" for _ in range(4)))
     selected = replace(
         config,
-        zephon=replace(
-            config.zephon,
-            sources=(ZephonSource(name="images", path=str(corpus), fmt="jsonl"),),
-            packing=replace(config.zephon.packing, seq_len=full_capacity - 1, drop_oversized=False),
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon,
+                sources=(ZephonSource(name="images", path=str(corpus), fmt="jsonl"),),
+                packing=replace(config.dataset_config.zephon.packing, seq_len=full_capacity - 1, drop_oversized=False),
+            ),
         ),
     )
     with closing(_loader(selected, tmp_path, model)) as loader:
@@ -269,7 +297,14 @@ def test_reserved_fake_capacity_validation_oversized_policy_and_process_resume(f
     with closing(
         _loader(
             replace(
-                selected, zephon=replace(selected.zephon, packing=replace(selected.zephon.packing, drop_oversized=True))
+                selected,
+                dataset_config=replace(
+                    selected.dataset_config,
+                    zephon=replace(
+                        selected.dataset_config.zephon,
+                        packing=replace(selected.dataset_config.zephon.packing, drop_oversized=True),
+                    ),
+                ),
             ),
             tmp_path,
             model,
@@ -278,7 +313,13 @@ def test_reserved_fake_capacity_validation_oversized_policy_and_process_resume(f
         assert list(loader) == []
 
     process_config = replace(
-        config, zephon=replace(config.zephon, runtime=replace(config.zephon.runtime, runner="process"))
+        config,
+        dataset_config=replace(
+            config.dataset_config,
+            zephon=replace(
+                config.dataset_config.zephon, runtime=replace(config.dataset_config.zephon.runtime, runner="process")
+            ),
+        ),
     )
     original, restored = _loader(process_config, tmp_path, model), _loader(process_config, tmp_path, model)
     try:
