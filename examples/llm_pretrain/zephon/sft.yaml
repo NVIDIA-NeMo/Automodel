@@ -46,8 +46,6 @@ dataset:
     checkpoint:
       aggregate_store: torch://
       run_id: zephon-tiny-sft
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.ZephonDataloaderConfig
 distributed:
   strategy: fsdp2
   dp_size: none
