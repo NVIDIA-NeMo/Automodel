@@ -732,7 +732,7 @@ def test_vlm_dataloader_neat_packing_uses_default_contract(monkeypatch):
 
 
 @pytest.mark.parametrize("microbatches", [None, 2])
-def test_native_vlm_loader_selects_flash_deferral_from_pipeline_runtime(monkeypatch, microbatches):
+def test_native_vlm_loader_keeps_flash_ids_with_or_without_pipeline(monkeypatch, microbatches):
     from nemo_automodel.components.models.common.packing import PackingCapabilities
 
     monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
@@ -756,7 +756,7 @@ def test_native_vlm_loader_selects_flash_deferral_from_pipeline_runtime(monkeypa
     document = {"input_ids": [1, 2, 3], "labels": [2, 3, 4], "position_ids": [0, 1, 0], "attention_mask": [1, 1, 2]}
     batch = result.dataloader.collate_fn([document, document])
     assert "_packed_seq_ids" in batch
-    assert ("cu_seq_lens_q" in batch) is (microbatches is None)
+    assert "cu_seq_lens_q" not in batch
 
 
 def test_vlm_dataloader_preserves_deprecated_python_packing_backend(monkeypatch):

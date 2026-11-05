@@ -123,6 +123,28 @@ def test_rejects_non_2d():
         packed_seq_params_from_doc_ids(torch.tensor([1, 1, 2, 2]))
 
 
+@pytest.mark.parametrize("strided", [False, True])
+def test_offsets_match_document_runs_in_each_batch_document(strided):
+    """Padding gaps and reused IDs split runs, including for noncontiguous inputs."""
+    generator = torch.Generator().manual_seed(48)
+    for batch_size, sequence_length in ((1, 1), (1, 32), (2, 17), (4, 9)):
+        for _ in range(8):
+            storage = torch.randint(0, 4, (batch_size, sequence_length * 2), generator=generator)
+            ids = storage[:, ::2] if strided else storage[:, :sequence_length].contiguous()
+            expected = []
+            for batch_index, document in enumerate(ids.tolist()):
+                for token_index, document_id in enumerate(document):
+                    if token_index == 0 or document_id != document[token_index - 1]:
+                        expected.append(batch_index * sequence_length + token_index)
+            expected.append(batch_size * sequence_length)
+
+            params = packed_seq_params_from_doc_ids(ids)
+            assert params.cu_seqlens.tolist() == expected
+            assert params.cu_seqlens.dtype == torch.int32
+            assert params.max_seqlen == max(end - start for start, end in zip(expected, expected[1:]))
+            assert params.doc_ids is ids
+
+
 def test_returns_typed_params():
     params = packed_seq_params_from_doc_ids(torch.tensor([[1, 1, 0]]))
     assert isinstance(params, PackedSeqParams)

@@ -192,7 +192,6 @@ class PackingConfig:
         cp_size: int = 1,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
-        defer_flash_metadata: bool = False,
     ) -> tuple[object, CollateFn | None]:
         """Pack ``dataset`` and return ``(dataset, collate_fn)``."""
         raise NotImplementedError
@@ -219,7 +218,6 @@ class ThdPackingConfig(PackingConfig):
         cp_size: int = 1,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
-        defer_flash_metadata: bool = False,
     ) -> tuple[object, CollateFn | None]:
         """Pack with THD, rejecting models that cannot consume sequence lengths."""
         resolve_packing_contract(packing_contract, attn_implementation)
@@ -261,13 +259,8 @@ class NeatPackingConfig(PackingConfig):
         cp_size: int = 1,
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
-        defer_flash_metadata: bool = False,
     ) -> tuple[object, CollateFn]:
-        """Pack with NEAT and select the model input format.
-
-        ``defer_flash_metadata`` is runtime-only: PP keeps document boundaries
-        batch-major until decoder entry; the default emits public Flash offsets.
-        """
+        """Pack with NEAT and select the model input format."""
         del supports_seq_lens, cp_size
         packing_contract = resolve_packing_contract(packing_contract, attn_implementation)
         from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
@@ -285,9 +278,7 @@ class NeatPackingConfig(PackingConfig):
             padding_idx=pad_token_id,
             drop_long_samples=self.drop_long_samples,
         )
-        return dataset, partial(
-            neat_packed_collater, packing=packing_contract, defer_flash_metadata=defer_flash_metadata
-        )
+        return dataset, partial(neat_packed_collater, packing=packing_contract)
 
 
 _PACKING_CONFIGS: dict[str, type[PackingConfig]] = {
@@ -692,8 +683,8 @@ class DataloaderConfig:
             attn_implementation: Deprecated attention-backend name retained for
                 Python-call compatibility during the packing-contract migration.
             packing_contract: Structural model contract used by NEAT packing.
-                Native mask/Flash collation requires a model-derived contract supplying
-            the attention conversion; recipes provide it automatically.
+                Native mask collation requires a model-derived attention conversion;
+                recipes provide it automatically. Flash offsets are built at model entry.
             collate_wrapper: Optional recipe-owned wrapper around the resolved collator.
 
         Returns:
@@ -712,7 +703,6 @@ class DataloaderConfig:
                 pad_token_id=getattr(tokenizer, "pad_token_id", 0),
                 cp_size=cp_size,
                 packing_contract=packing_contract,
-                defer_flash_metadata=pp_enabled,
             )
         elif self.packing is not None:
             logger.info(

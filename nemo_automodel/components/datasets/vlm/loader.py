@@ -356,8 +356,8 @@ class VlmDataloaderConfig:
             packing_attn_implementation: Deprecated attention-backend name
                 retained for Python-call compatibility.
             packing_contract: Structural model contract used for packed-mask construction.
-                Native mask/Flash collation requires a model-derived contract supplying
-            the attention conversion; recipes provide it automatically.
+                Native mask collation requires a model-derived attention conversion;
+                recipes provide it automatically. Flash offsets are built at model entry.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
                 compact document IDs instead of a dense quadratic attention mask;
@@ -417,7 +417,6 @@ class VlmDataloaderConfig:
                     max_length=self.packing.collate_max_length,
                     packing=packing_contract,
                     materialize_4d_mask=materialize_4d_mask,
-                    defer_flash_metadata=pp_n_microbatches is not None,
                 )
         elif self.collator is not None:
             collate_fn = self.collator.build(processor=processor)

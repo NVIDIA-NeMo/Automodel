@@ -88,22 +88,15 @@ def packed_seq_params_from_doc_ids(doc_ids: torch.Tensor) -> PackedSeqParams:
         raise ValueError(f"doc_ids must be 2D [batch, sequence], got shape {tuple(doc_ids.shape)}")
 
     batch, seq = doc_ids.shape
-    total = batch * seq
-    flat = doc_ids.reshape(-1)
-    device = doc_ids.device
-
-    # A segment starts at position 0, at every row boundary (so a row-filling
-    # document cannot merge with the next row's first document once flattened),
-    # and wherever the document index changes within a row.
-    is_start = torch.zeros(total, dtype=torch.bool, device=device)
-    is_start[0] = True
-    is_start[1:] = flat[1:] != flat[:-1]
-    is_start |= (torch.arange(total, device=device) % seq) == 0
-
-    starts = torch.nonzero(is_start, as_tuple=False).flatten()
+    # Comparing within each row leaves its first token as a boundary, even when
+    # adjacent batch documents use the same ID. Scan these flags without an
+    # integer index/modulo tensor over the flattened batch.
+    is_start = torch.ones_like(doc_ids, dtype=torch.bool)
+    torch.ne(doc_ids[:, 1:], doc_ids[:, :-1], out=is_start[:, 1:])
+    starts = torch.nonzero(is_start.reshape(-1), as_tuple=False).flatten()
     # cu_seqlens is the segment start offsets with the flattened total appended;
     # starts[0] is already 0, so this begins at 0 and ends at batch * sequence.
-    cu_seqlens = torch.cat([starts, starts.new_tensor([total])]).to(torch.int32)
+    cu_seqlens = torch.cat([starts, starts.new_tensor([batch * seq])]).to(torch.int32)
     seglens = cu_seqlens[1:] - cu_seqlens[:-1]
     max_seqlen = int(seglens.max().item()) if seglens.numel() > 0 else 0
 

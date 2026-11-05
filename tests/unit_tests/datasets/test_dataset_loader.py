@@ -298,7 +298,7 @@ def test_neat_packing_uses_default_contract(monkeypatch):
 
 
 @pytest.mark.parametrize("pp_enabled", [False, True])
-def test_native_loader_selects_flash_deferral_from_pipeline_runtime(monkeypatch, pp_enabled):
+def test_native_loader_keeps_flash_ids_with_or_without_pipeline(monkeypatch, pp_enabled):
     from nemo_automodel.components.models.common.packing import PackingCapabilities
 
     monkeypatch.setattr(
@@ -319,7 +319,7 @@ def test_native_loader_selects_flash_deferral_from_pipeline_runtime(monkeypatch,
         )
     )
     assert "_packed_seq_ids" in batch
-    assert ("cu_seq_lens_q" in batch) is not pp_enabled
+    assert "cu_seq_lens_q" not in batch
 
 
 def test_packing_config_build_preserves_deprecated_attention_keyword(monkeypatch):

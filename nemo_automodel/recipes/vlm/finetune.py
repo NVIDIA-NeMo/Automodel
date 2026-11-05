@@ -616,6 +616,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         dataloader_config = self.cfg.vlm_dataloader
         if dataloader_config is None:
             raise ValueError("VLM training requires a dataset config")
+        validation_config = self.cfg.vlm_validation_dataloader
 
         model = build_model(
             self.cfg.model,
@@ -627,7 +628,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
             load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
-            has_packed_sequence=dataloader_config.is_packed,
+            has_packed_sequence=dataloader_config.is_packed
+            or (validation_config is not None and validation_config.is_packed),
         )
         capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
         _validate_cp_vision_frame_sharding_support(capability_model, self.cp_vision_frame_sharding)
@@ -688,18 +690,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
-        _validate_cp_packing_support(
-            self.model_parts[0],
-            packing_enabled=dataloader_config.is_packed,
-            cp_size=self.mesh_context.cp_size,
-        )
         # Every loader receives model return requests; only packed batched input
         # configures mask/Flash/gather adapters. THD owns its length-based route.
         packing_contract = self._packing_contract
-        if dataloader_config.output_format == "thd":
-            validate_thd_packing_support(self.model_parts)
-        elif dataloader_config.is_packed:
-            configure_packing_for_models(self.model_parts)
+        # Validation can be packed independently of training and needs the same
+        # model-entry adapters, even when the training loader is unpacked.
+        for loader_config in (dataloader_config, validation_config):
+            if loader_config is None:
+                continue
+            _validate_cp_packing_support(
+                self.model_parts[0],
+                packing_enabled=loader_config.is_packed,
+                cp_size=self.mesh_context.cp_size,
+            )
+            if loader_config.output_format == "thd":
+                validate_thd_packing_support(self.model_parts)
+            elif loader_config.is_packed:
+                configure_packing_for_models(self.model_parts)
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
@@ -719,7 +726,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
-        validation_config = self.cfg.vlm_validation_dataloader
         if validation_config is not None:
             validation_build_context = FirstRankPerNode(group=process_group)
             with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):

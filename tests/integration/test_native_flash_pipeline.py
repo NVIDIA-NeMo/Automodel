@@ -93,7 +93,7 @@ def _flash_handoff_worker(rank, directory):
             )
         ]
         documents[0]["labels"][-1] = -100
-        batch = neat_packed_collater(documents, packing=contract, defer_flash_metadata=True)
+        batch = neat_packed_collater(documents, packing=contract)
         assert batch["_packed_seq_ids"].shape == ids.shape
         assert "cu_seq_lens_q" not in batch
         seen = []

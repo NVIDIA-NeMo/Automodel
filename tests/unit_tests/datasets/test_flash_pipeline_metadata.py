@@ -27,7 +27,7 @@ from nemo_automodel.components.models.common.packing import (
 
 
 @pytest.mark.parametrize("collater", [neat_packed_collater, neat_packed_vlm_collater])
-def test_deferred_native_offsets_match_direct_microbatch_collation(collater):
+def test_flash_offsets_are_built_for_the_batch_reaching_model_entry(collater):
     documents = [
         {
             "input_ids": [2, 3, 4, 5, 0],
@@ -43,13 +43,12 @@ def test_deferred_native_offsets_match_direct_microbatch_collation(collater):
         },
     ]
     contract = PackingCapabilities("flash_varlen")
-    direct = collater(documents, packing=contract)
-    assert direct["cu_seq_lens_q"].tolist() == [0, 2, 4, 5, 6, 10]
-    assert "_packed_seq_ids" in direct
-    deferred = collater(documents, packing=contract, defer_flash_metadata=True)
-    assert "cu_seq_lens_q" not in deferred
-    assert "attention_mask" not in deferred
-    torch.testing.assert_close(deferred["_packed_seq_ids"], torch.tensor([[1, 1, 2, 2, 0], [1, 2, 2, 2, 2]]))
+    batch = collater(documents, packing=contract)
+    assert "cu_seq_lens_q" not in batch
+    assert "cu_seq_lens_k" not in batch
+    assert "attention_mask" not in batch
+    assert all(value.shape[0] == 2 for value in batch.values() if isinstance(value, torch.Tensor))
+    torch.testing.assert_close(batch["_packed_seq_ids"], torch.tensor([[1, 1, 2, 2, 0], [1, 2, 2, 2, 2]]))
 
     class Decoder(torch.nn.Module):
         def forward(self, input_ids, **kwargs):
@@ -58,25 +57,29 @@ def test_deferred_native_offsets_match_direct_microbatch_collation(collater):
 
     decoder = Decoder()
     configure_packing("flash_attention_2", model=decoder)
-    for index in range(2):
-        expected = collater(documents[index : index + 1], packing=contract)
+    # The whole non-PP batch and each PP microbatch use the same entry path.
+    for selection, offsets, maximum in (
+        (slice(None), [0, 2, 4, 5, 6, 10], 4),
+        (slice(0, 1), [0, 2, 4, 5], 2),
+        (slice(1, 2), [0, 1, 5], 4),
+    ):
         actual = decoder(
-            deferred["input_ids"][index : index + 1],
-            _packed_seq_ids=deferred["_packed_seq_ids"][index : index + 1],
+            batch["input_ids"][selection],
+            position_ids=batch["position_ids"][selection],
+            _packed_seq_ids=batch["_packed_seq_ids"][selection],
         )
-        for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
-            torch.testing.assert_close(actual[key], expected[key])
-    for key in ("input_ids", "labels", "position_ids", "_packed_seq_ids"):
-        torch.testing.assert_close(direct[key], deferred[key])
+        assert actual["cu_seq_lens_q"].tolist() == offsets
+        torch.testing.assert_close(actual["cu_seq_lens_k"], actual["cu_seq_lens_q"])
+        assert actual["max_length_q"] == actual["max_length_k"] == maximum
+        torch.testing.assert_close(actual["position_ids"], batch["position_ids"][selection])
 
 
-def test_deferral_does_not_change_dense_native_mask():
+def test_flash_and_dense_collation_preserve_the_same_training_tensors():
     document = {"input_ids": [1, 2], "labels": [2, 3], "position_ids": [0, 1], "attention_mask": [1, 1]}
     ordinary = neat_packed_collater([document], packing=get_packing_capabilities("sdpa"))
-    deferred = neat_packed_collater([document], defer_flash_metadata=True, packing=get_packing_capabilities("sdpa"))
-    assert ordinary.keys() == deferred.keys()
-    for key in ordinary:
-        torch.testing.assert_close(ordinary[key], deferred[key])
+    flash = neat_packed_collater([document], packing=get_packing_capabilities("flash_attention_2"))
+    for key in ("input_ids", "labels", "position_ids", "_packed_seq_ids"):
+        torch.testing.assert_close(ordinary[key], flash[key])
 
 
 def test_text_collater_keeps_single_document_boundaries():

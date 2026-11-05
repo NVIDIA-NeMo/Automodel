@@ -377,7 +377,7 @@ class TestNeatPackedVlmCollater:
         # n_images_per_sample
         assert result["n_images_per_sample"].tolist() == [1, 2]
 
-    def test_flash_emits_varlen_kwargs_and_no_mask(self):
+    def test_flash_emits_document_ids_and_no_mask(self):
         batch = [
             {
                 "input_ids": torch.tensor([1, 2, 3, 0]),
@@ -398,10 +398,12 @@ class TestNeatPackedVlmCollater:
 
         # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
         assert "attention_mask" not in result
+        assert "cu_seq_lens_q" not in result
+        flash = get_packing_capabilities("flash_attention_2").prepare_attention_inputs(result["_packed_seq_ids"])
         # row0: doc1(2), doc2(1), pad(1); row1: doc1(4) over the flattened 8 tokens.
-        assert result["cu_seq_lens_q"].tolist() == [0, 2, 3, 4, 8]
-        assert torch.equal(result["cu_seq_lens_q"], result["cu_seq_lens_k"])
-        assert result["max_length_q"] == result["max_length_k"] == 4
+        assert flash["cu_seq_lens_q"].tolist() == [0, 2, 3, 4, 8]
+        assert torch.equal(flash["cu_seq_lens_q"], flash["cu_seq_lens_k"])
+        assert flash["max_length_q"] == flash["max_length_k"] == 4
         # Per-document ids preserved for loss / context-parallel consumers.
         assert result["_packed_seq_ids"].tolist() == [[1, 1, 2, 0], [1, 1, 1, 1]]
 

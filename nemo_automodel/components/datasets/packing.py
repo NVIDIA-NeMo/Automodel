@@ -78,8 +78,9 @@ class PackedSequenceContract(Protocol):
         an attention mask [batch, 1, sequence, sequence], compact IDs of shape
         [batch, sequence], or HF Flash offsets [segments + 1] and integer maxima.
         It preserves the input device and does not mutate the IDs. It must be
-        serializable without capturing a model or GPU state. Deferred PP and
-        THD inputs do not invoke this conversion.
+        serializable without capturing a model or GPU state. Native Flash
+        collation keeps batch-major IDs instead: the configured model builds
+        offsets after any microbatch split. THD inputs do not invoke this conversion.
         """
         ...
 
@@ -98,7 +99,7 @@ class _DefaultPackedSequenceContract:
     return_document_ids: bool = False
     max_sequence_length: int | None = None
     # Model-independent defaults serve unpacked/THD and compact streaming paths.
-    # Native mask/Flash collation requires the model-derived runtime contract.
+    # Native mask collation requires the model-derived runtime contract.
     prepare_attention_inputs: Callable[[torch.Tensor], dict[str, torch.Tensor | int]] | None = None
 
 
