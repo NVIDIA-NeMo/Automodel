@@ -35,8 +35,6 @@ dataset:
       run_id: zephon-vlm
     training:
       allow_cross_document_attention: false
-dataloader:
-  _target_: nemo_automodel.components.datasets.zephon.vlm_config.ZephonVlmDataloaderConfig
 distributed:
   strategy: fsdp2
   dp_size: none

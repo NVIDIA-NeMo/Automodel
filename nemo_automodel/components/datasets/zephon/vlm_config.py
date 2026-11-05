@@ -65,6 +65,11 @@ class ZephonVlmDatasetConfig(ZephonStreamDatasetConfig[VlmStreamBuildContext, Vl
     zephon: ZephonVlmOptions = field(default_factory=ZephonVlmOptions)
     options_type: ClassVar[type[ZephonOptions]] = ZephonVlmOptions
 
+    @property
+    def dataloader_config_type(self) -> type[ZephonVlmDataloaderConfig]:
+        """Select the image metadata adapter when the loader target is omitted."""
+        return ZephonVlmDataloaderConfig
+
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.output_format == "thd" and self.zephon.inject_fake_images:

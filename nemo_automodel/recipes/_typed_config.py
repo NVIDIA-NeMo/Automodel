@@ -522,8 +522,8 @@ class RecipeConfig:
         loader_target = loader_kwargs.pop("_target_", None)
         config_class = (
             VlmDataloaderConfig
-            if loader_target in (None, "torchdata.stateful_dataloader.StatefulDataLoader", StatefulDataLoader)
-            else _loader_config_class(loader_target, VlmDataloaderConfig)
+            if loader_target in ("torchdata.stateful_dataloader.StatefulDataLoader", StatefulDataLoader)
+            else _loader_config_class(loader_target, VlmDataloaderConfig, dataset_config=dataset_config)
         )
         collate_node = loader_kwargs.pop("collate_fn", None)
         collator = None
