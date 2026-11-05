@@ -1,6 +1,6 @@
 ---
 name: testing
-description: NeMo AutoModel tests: unit and functional layout, L0/L1/L2 tiers, running, adding, or disabling tests, and flaky tests. Use when adding, running, or debugging tests or choosing a tier.
+description: "NeMo AutoModel tests: unit and functional layout, L0/L1/L2 tiers, running, adding, or disabling tests, and flaky tests. Use when adding, running, or debugging tests or choosing a tier."
 ---
 
 # Testing

@@ -1,6 +1,6 @@
 ---
 name: linting-and-formatting
-description: NeMo AutoModel code style: ruff config, naming, type hints, docstrings, copyright headers, and the review checklist. Use for style questions, ruff errors, or pre-commit failures.
+description: "NeMo AutoModel code style: ruff config, naming, type hints, docstrings, copyright headers, and the review checklist. Use for style questions, ruff errors, or pre-commit failures."
 ---
 
 # Linting and Formatting

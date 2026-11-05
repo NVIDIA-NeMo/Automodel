@@ -1,6 +1,6 @@
 ---
 name: build-and-dependency
-description: NeMo AutoModel dev environment: containers, uv dependency management, env vars, and build pitfalls. Use when uv sync fails, imports break, TransformerEngine mismatches, or .venv is stale.
+description: "NeMo AutoModel dev environment: containers, uv dependency management, env vars, and build pitfalls. Use when uv sync fails, imports break, TransformerEngine mismatches, or .venv is stale."
 ---
 
 # Build and Dependency

@@ -1,6 +1,6 @@
 ---
 name: fern-docs
-description: Edit or validate the NeMo AutoModel Fern docs (docs/*.mdx, docs/fern/): page edits, new, moved or removed pages, slugs, redirects, version cuts, fern check or preview failures.
+description: "Edit or validate the NeMo AutoModel Fern docs (docs/*.mdx, docs/fern/): page edits, new, moved or removed pages, slugs, redirects, version cuts, fern check or preview failures."
 ---
 
 # Fern Docs — NeMo AutoModel
@@ -28,7 +28,10 @@ live on the `docs-archive` branch, not on `main`.
    takes a minute or two, and cleans up after itself. Report its result when
    you hand off. CI runs the same script on PRs and posts a Fern preview link.
 
-A wording change to an existing page needs nothing else from this skill.
+A wording change to an existing page needs no other reference. One exception:
+model-card files that share a frontmatter `slug:` are compatibility copies and
+must stay byte-identical, so apply a body-only edit to every copy
+(`check_docs.py` rejects copies that differ).
 
 ## Other tasks
 
