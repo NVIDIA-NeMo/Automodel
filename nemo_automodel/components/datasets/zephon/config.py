@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import re
 import tomllib
 from collections.abc import Callable
 from contextlib import AbstractContextManager
@@ -592,6 +593,13 @@ class ZephonDataloaderConfig(ZephonLoaderConfig):
         if source_path is not None:
             if values.get("sources"):
                 raise ValueError("Choose dataset.path_or_dataset_id or dataloader.zephon.sources, not both")
+            # Native instruction configs accept bare HF IDs; Zephon paths need a URI.
+            if (
+                isinstance(source_path, str)
+                and re.fullmatch(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", source_path) is not None
+                and not Path(source_path).exists()
+            ):
+                source_path = f"hf://{source_path}/train"
             paths = [source_path] if isinstance(source_path, str) else source_path
             values["sources"] = [{"name": f"source_{index}", "path": path} for index, path in enumerate(paths)]
         if dataset_target in (
