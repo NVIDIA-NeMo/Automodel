@@ -44,6 +44,35 @@ from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
+
+@pytest.mark.parametrize(
+    "source, expected, local",
+    [
+        ("org/corpus", "hf://org/corpus/train", False),
+        ("org/corpus", "org/corpus", True),
+        ("hf://org/corpus/validation", "hf://org/corpus/validation", False),
+    ],
+)
+def test_single_native_source_preserves_hf_and_local_selection(tmp_path, monkeypatch, source, expected, local):
+    monkeypatch.chdir(tmp_path)
+    if local:
+        Path(source).mkdir(parents=True)
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "dataset": {
+                    "_target_": ZephonTextDatasetConfig,
+                    "path_or_dataset_id": source,
+                    "zephon": {"packing": {"seq_len": 32}},
+                },
+                "dataloader": {"_target_": ZephonDataloaderConfig},
+                "step_scheduler": {"max_steps": 2, "local_batch_size": 1},
+            }
+        )
+    ).dataloader
+    assert config.dataset_config.zephon.sources == (ZephonSource(name="source_0", path=expected),)
+
+
 _SETTINGS = {"sources": [{"name": "text", "path": "unused"}]}
 _CONTRACT = PackingCapabilities(packed_mask_type="block_causal", max_sequence_length=32)
 
