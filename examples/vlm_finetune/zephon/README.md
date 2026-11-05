@@ -23,8 +23,9 @@ conversation format, with image paths accessible to every training rank:
 
 ## How it works
 
-The recipe selects `ZephonVlmDatasetConfig` under `dataset`. AutoModel’s regular
-VLM dataloader configuration delegates construction to it; `dataset.zephon`
+The recipe selects `ZephonVlmDatasetConfig` under `dataset` and
+`ZephonVlmDataloaderConfig` under `dataloader`. This thin metadata adapter uses
+AutoModel’s shared VLM construction path; `dataset.zephon`
 configures the source, packing and runtime, while `processor` and
 `dataset.chat_template` select the processor and conversation template.
 The same single-source `path_or_dataset_id` and `paths` fields described in the

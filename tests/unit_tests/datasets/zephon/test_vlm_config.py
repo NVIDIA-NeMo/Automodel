@@ -40,7 +40,11 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonSource,
     ZephonTrainingOptions,
 )
-from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDatasetConfig, ZephonVlmOptions
+from nemo_automodel.components.datasets.zephon.vlm_config import (
+    ZephonVlmDataloaderConfig,
+    ZephonVlmDatasetConfig,
+    ZephonVlmOptions,
+)
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from tests.utils.vlm_fixtures import processor as processor
@@ -57,7 +61,7 @@ def _recipe():
                 "packing": {"pack_algorithm": "first_fit"},
             },
         },
-        "dataloader": {},
+        "dataloader": {"_target_": ZephonVlmDataloaderConfig},
     }
 
 
@@ -77,7 +81,7 @@ def _build(
     seed: int = 17,
 ) -> VlmDataloaderBuild:
     if isinstance(config, ZephonVlmDatasetConfig):
-        config = VlmDataloaderConfig(dataset_config=config)
+        config = ZephonVlmDataloaderConfig(dataset_config=config)
     return config.build(
         pretrained_model_name_or_path=pretrained_model_name_or_path,
         dp_rank=dp_rank,
@@ -114,6 +118,7 @@ def test_recipe_routes_images_and_inherits_processor_settings():
     values["dataset"]["zephon"]["inject_fake_images"] = False
     config = RecipeConfig(ConfigNode(values)).vlm_dataloader
     assert isinstance(config, VlmDataloaderConfig)
+    assert isinstance(config, ZephonVlmDataloaderConfig)
     assert isinstance(config.dataset_config, ZephonVlmDatasetConfig)
     assert "seed" not in values["dataset"]["zephon"]
     assert config.processor_config.kwargs == {"max_pixels": 1003520}
@@ -141,6 +146,7 @@ def test_image_example_config_resolves():
     recipe = RecipeConfig(ConfigNode(yaml.safe_load(path.read_text())))
     config = recipe.vlm_dataloader
     assert isinstance(config, VlmDataloaderConfig)
+    assert isinstance(config, ZephonVlmDataloaderConfig)
     assert isinstance(config.dataset_config, ZephonVlmDatasetConfig)
     assert config.dataset_config.zephon.source.stop_after_passes == 1
     assert config.dataset_config.zephon.packing.pack_algorithm == "first_fit"
@@ -371,7 +377,7 @@ def test_outer_template_and_processor_settings_reach_parent_and_worker_config(mo
     monkeypatch.setattr(llm, "resolve_token_ids", lambda *args, **kwargs: SimpleNamespace(pad=0))
     monkeypatch.setattr(vlm.VlmEncoderConfig, "build", encoder_build)
     monkeypatch.setattr(pipeline, "create_source_pipeline", source_build)
-    config = VlmDataloaderConfig(
+    config = ZephonVlmDataloaderConfig(
         dataset_config=ZephonVlmDatasetConfig(
             zephon=ZephonVlmOptions(
                 sources=(ZephonSource(name="images", path="unused"),),
@@ -453,3 +459,38 @@ def test_image_source_alias_shares_normalization_and_preserves_template():
     )
     assert config.chat_template == "custom"
     assert replace(config.dataset_config).zephon.sources == config.dataset_config.zephon.sources
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        ZephonVlmDataloaderConfig,
+        "nemo_automodel.components.datasets.zephon.vlm_config.ZephonVlmDataloaderConfig",
+    ],
+)
+def test_image_loader_subclass_reports_the_dataset_output_format(target):
+    values = _recipe()
+    values["dataloader"]["_target_"] = target
+    values["dataset"]["output_format"] = "thd"
+    values["dataset"]["zephon"]["inject_fake_images"] = False
+    config = RecipeConfig(ConfigNode(values)).vlm_dataloader
+    assert isinstance(config, ZephonVlmDataloaderConfig)
+    assert config.output_format == "thd" and config.is_packed
+    assert config.packing is None
+
+
+def test_image_and_text_loaders_reject_incompatible_dataset_configs():
+    from nemo_automodel.components.datasets.zephon.config import ZephonDataloaderConfig, ZephonTextDatasetConfig
+
+    image_dataset = RecipeConfig(ConfigNode(_recipe())).vlm_dataloader.dataset_config
+    text_dataset = ZephonTextDatasetConfig(zephon={"sources": [{"name": "text", "path": "unused"}]})
+    with pytest.raises(TypeError, match="compatible VlmDataloaderConfig subclass"):
+        VlmDataloaderConfig(dataset_config=image_dataset)
+    with pytest.raises(TypeError, match="Zephon image dataset config"):
+        ZephonVlmDataloaderConfig(dataset_config=text_dataset)
+    with pytest.raises(TypeError, match="Zephon text dataset config"):
+        ZephonDataloaderConfig(dataset_config=image_dataset)
+    values = _recipe()
+    values["dataloader"] = {}
+    with pytest.raises(TypeError, match="compatible VlmDataloaderConfig subclass"):
+        RecipeConfig(ConfigNode(values)).vlm_dataloader

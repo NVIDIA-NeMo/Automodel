@@ -22,8 +22,10 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import ClassVar, Literal
 
+from nemo_automodel.components.datasets.packing import BatchOutputFormat
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmDataloaderBuild,
+    VlmDataloaderConfig,
     VlmStreamBuildContext,
     apply_vlm_chat_template,
 )
@@ -197,3 +199,29 @@ class ZephonVlmDatasetConfig(ZephonStreamDatasetConfig[VlmStreamBuildContext, Vl
             context.batch_size,
         )
         return VlmDataloaderBuild(dataloader=loader, processor=processor)
+
+
+@dataclass
+class ZephonVlmDataloaderConfig(VlmDataloaderConfig):
+    """Adapt Zephon image metadata through the shared VLM construction path.
+
+    Source, packing and worker options remain on ``dataset_config.zephon``.
+    The inherited build method passes the processor/runtime context to it.
+    """
+
+    dataset_config: ZephonVlmDatasetConfig
+
+    def __post_init__(self) -> None:
+        """Reject native or text dataset configs before processor construction."""
+        if not isinstance(self.dataset_config, ZephonVlmDatasetConfig):
+            raise TypeError("ZephonVlmDataloaderConfig requires a Zephon image dataset config")
+
+    @property
+    def is_packed(self) -> bool:
+        """Whether the Zephon image pipeline reports packed inputs."""
+        return self.dataset_config.is_packed
+
+    @property
+    def output_format(self) -> BatchOutputFormat:
+        """Batched or THD output selected on the Zephon image dataset."""
+        return self.dataset_config.output_format

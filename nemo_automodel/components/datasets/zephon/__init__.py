@@ -17,6 +17,7 @@
 from typing import TYPE_CHECKING
 
 from nemo_automodel.components.datasets.zephon.config import (
+    ZephonDataloaderConfig,
     ZephonInstructionDatasetConfig,
     ZephonPretokenizedTextDatasetConfig,
     ZephonTextDatasetConfig,
@@ -26,8 +27,9 @@ if TYPE_CHECKING:
     from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDatasetConfig, ZephonVlmOptions
 
 __all__ = [
-    "ZephonPretokenizedTextDatasetConfig",
+    "ZephonDataloaderConfig",
     "ZephonInstructionDatasetConfig",
+    "ZephonPretokenizedTextDatasetConfig",
     "ZephonTextDatasetConfig",
     "ZephonVlmDatasetConfig",
     "ZephonVlmOptions",

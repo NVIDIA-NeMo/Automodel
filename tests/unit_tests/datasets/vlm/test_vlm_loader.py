@@ -28,7 +28,7 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDatasetConfig
 from nemo_automodel.components.datasets.loader import DatasetBuildSchedule, StreamDatasetConfig
-from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT, BatchOutputFormat
 from nemo_automodel.components.datasets.vlm import loader as vlm_loader
 from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
@@ -50,6 +50,23 @@ from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 pytestmark = pytest.mark.cpu_only
+
+
+@dataclass
+class StreamVlmDataloaderConfig(VlmDataloaderConfig):
+    dataset_config: StreamDatasetConfig[VlmStreamBuildContext, VlmDataloaderBuild]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dataset_config, StreamDatasetConfig):
+            raise TypeError("This loader requires a VLM stream dataset")
+
+    @property
+    def is_packed(self) -> bool:
+        return self.dataset_config.is_packed
+
+    @property
+    def output_format(self) -> BatchOutputFormat:
+        return self.dataset_config.output_format
 
 
 @pytest.fixture(autouse=True)
@@ -920,7 +937,7 @@ def test_stream_build_delegates_runtime_context_and_restores_rng(is_training):
     def must_not_run():
         raise AssertionError("The outer loader constructed a stream-owned processor or position state")
 
-    config = VlmDataloaderConfig(
+    config = StreamVlmDataloaderConfig(
         dataset_config=StreamConfig(),
         processor_config=VlmProcessorConfig(factory=must_not_run),
         chat_template="template text",
@@ -968,7 +985,7 @@ def test_stream_build_failure_restores_rng():
             torch.rand(1)
             raise ValueError("source construction failed")
 
-    config = VlmDataloaderConfig(dataset_config=FailingStream())
+    config = StreamVlmDataloaderConfig(dataset_config=FailingStream())
     rng_state = torch.get_rng_state().clone()
     with pytest.raises(ValueError, match="source construction failed"):
         config.build(pretrained_model_name_or_path="unused", batch_size=2, dp_rank=0, dp_world_size=1, seed=17)
@@ -994,6 +1011,6 @@ def test_stream_rejects_ignored_native_settings_before_build(loader_settings):
         def build(self, *, context: VlmStreamBuildContext) -> VlmDataloaderBuild:
             raise AssertionError("Invalid native settings reached stream construction")
 
-    config = VlmDataloaderConfig(dataset_config=StreamConfig(), **loader_settings)
+    config = StreamVlmDataloaderConfig(dataset_config=StreamConfig(), **loader_settings)
     with pytest.raises(ValueError, match="Stream datasets"):
         config.build(pretrained_model_name_or_path="unused", batch_size=2, dp_rank=0, dp_world_size=1)

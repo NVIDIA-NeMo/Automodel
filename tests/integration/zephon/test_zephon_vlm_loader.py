@@ -40,6 +40,7 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonWorkerOptions,
 )
 from nemo_automodel.components.datasets.zephon.vlm_config import (
+    ZephonVlmDataloaderConfig,
     ZephonVlmDatasetConfig,
     ZephonVlmOptions,
 )
@@ -78,7 +79,7 @@ def _build(config, inputs, *, pp_n_microbatches=None):
     model_config = tiny_vlm_config()
     model = Qwen2_5_VLForConditionalGeneration(model_config)
     if isinstance(config, ZephonVlmDatasetConfig):
-        config = VlmDataloaderConfig(dataset_config=config)
+        config = ZephonVlmDataloaderConfig(dataset_config=config)
     return config.build(
         training_schedule=DatasetBuildSchedule(2, 2, 10, None),
         pretrained_model_name_or_path=inputs[0],
@@ -293,7 +294,7 @@ def test_parent_position_factory_and_processor_context_do_not_enter_workers(conf
         return create_source(*args, **kwargs)
 
     monkeypatch.setattr(pipeline_module, "create_source_pipeline", create_source_after_context)
-    result = VlmDataloaderConfig(dataset_config=config).build(
+    result = ZephonVlmDataloaderConfig(dataset_config=config).build(
         training_schedule=DatasetBuildSchedule(2, 2, 10, None),
         pretrained_model_name_or_path=inputs[0],
         dp_rank=0,
@@ -313,7 +314,7 @@ def test_parent_position_factory_and_processor_context_do_not_enter_workers(conf
         result.dataloader.close()
 
     with pytest.raises(ValueError, match="context parallel"):
-        VlmDataloaderConfig(dataset_config=config).build(
+        ZephonVlmDataloaderConfig(dataset_config=config).build(
             pretrained_model_name_or_path=inputs[0],
             dp_rank=0,
             dp_world_size=1,

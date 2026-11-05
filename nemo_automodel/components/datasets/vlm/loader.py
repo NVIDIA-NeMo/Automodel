@@ -348,18 +348,21 @@ class VlmDataloaderConfig:
     prefetch_factor: int | None = None
     drop_last: bool = False
 
+    def __post_init__(self) -> None:
+        """Require a compatible metadata adapter for complete VLM streams."""
+        if isinstance(self.dataset_config, StreamDatasetConfig):
+            raise TypeError(
+                "Stream datasets require a compatible VlmDataloaderConfig subclass; select it with dataloader._target_"
+            )
+
     @property
     def is_packed(self) -> bool:
         """Whether this loader emits packed multimodal inputs."""
-        if isinstance(self.dataset_config, StreamDatasetConfig):
-            return self.dataset_config.is_packed
         return self.packing is not None
 
     @property
     def output_format(self) -> BatchOutputFormat:
         """Selected batch representation, independent of the packing algorithm."""
-        if isinstance(self.dataset_config, StreamDatasetConfig):
-            return self.dataset_config.output_format
         return "thd" if self.packing is not None and self.packing.packing_format == "thd" else "batched"
 
     def _build_source(

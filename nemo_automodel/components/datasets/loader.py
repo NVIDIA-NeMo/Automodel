@@ -662,7 +662,8 @@ class DataloaderConfig:
     ``dataset_config`` is a typed per-dataset config (for example ``ChatDatasetConfig`` or
     ``GLUE_MRPCConfig``); the dataset's declarative arguments live there. Runtime dependencies are explicit
     :meth:`build` arguments, while native ``DataLoader`` settings are named fields on this config.
-    A :class:`StreamDatasetConfig` owns its complete loader and rejects native-only settings.
+    A :class:`StreamDatasetConfig` owns its complete loader. Its compatible dataloader config subclass
+    supplies the stream metadata; the shared build path rejects native-only settings.
     """
 
     dataset_config: DatasetConfig
@@ -681,18 +682,21 @@ class DataloaderConfig:
     prefetch_factor: int | None = None
     drop_last: bool = False
 
+    def __post_init__(self) -> None:
+        """Require a stream-specific metadata adapter for complete stream datasets."""
+        if isinstance(self.dataset_config, StreamDatasetConfig):
+            raise TypeError(
+                "Stream datasets require a compatible DataloaderConfig subclass; select it with dataloader._target_"
+            )
+
     @property
     def is_packed(self) -> bool:
         """Whether the loader emits packed inputs, including prepacked THD data."""
-        if isinstance(self.dataset_config, StreamDatasetConfig):
-            return self.dataset_config.is_packed
         return self.packing is not None or self.output_format == "thd"
 
     @property
     def packed_sequence_length(self) -> int:
         """Configured packed input length, or zero for ordinary examples."""
-        if isinstance(self.dataset_config, StreamDatasetConfig):
-            return self.dataset_config.packed_sequence_length
         return self.packing.packed_sequence_size if self.packing is not None else 0
 
     @property
@@ -702,9 +706,7 @@ class DataloaderConfig:
 
     @property
     def output_format(self) -> BatchOutputFormat:
-        """Selected input format, owned by the stream or native packing/collator config."""
-        if isinstance(self.dataset_config, StreamDatasetConfig):
-            return self.dataset_config.output_format
+        """Selected native packing/collator format; stream subclasses supply their own."""
         from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
         return (
