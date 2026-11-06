@@ -982,6 +982,8 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
         else:
             self.linear_attn.dt_bias.fill_(1.0)
             self.linear_attn.A_log.uniform_(0, 16).log_()
+            # Match HF's PreTrainedModel._init_weights for this nn.Conv1d (normal), not torch's default
+            nn.init.normal_(self.linear_attn.conv1d.weight, mean=0.0, std=init_std)
             for linear in (
                 self.linear_attn.in_proj_qkv,
                 self.linear_attn.in_proj_z,

@@ -181,3 +181,21 @@ def test_iterable_dataset_mapping_checks_invalid_num_columns(tmp_path: Path):
             column_mapping={"answer": "a"},  # only 1 key
             tokenizer=_DummyTokenizer(),
         )
+
+
+@pytest.mark.timeout(30)
+def test_iterable_dataset_raises_when_every_row_is_filtered(tmp_path: Path):
+    # The answer column does not exist in the data, so every row is skipped. Without a guard
+    # the repeat-on-exhaustion loop spins forever without yielding.
+    jsonl_path = tmp_path / "toy_no_answer_column.jsonl"
+    _write_jsonl(jsonl_path, [{"q": "Q0?", "a": "A0"}, {"q": "Q1?", "a": "A1"}])
+
+    ds = ColumnMappedTextInstructionIterableDataset(
+        path_or_dataset_id=str(jsonl_path),
+        column_mapping={"question": "q", "answer": "missing"},
+        tokenizer=_DummyTokenizer(),
+        answer_only_loss_mask=False,
+    )
+
+    with pytest.raises(ValueError, match="No valid samples"):
+        next(iter(ds))
