@@ -879,7 +879,7 @@ class HybridEPPipelineRuntimeInitializer:
         return (HybridEPPipelineRuntimeInitializer, "process_global_buffer")
 
     @property
-    def signature(self) -> tuple[object, ...]:
+    def signature(self) -> tuple[int | torch.dtype | None, ...]:
         """Return the immutable configuration served by the global buffer."""
         return (
             id(self.manager.group),

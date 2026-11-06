@@ -569,6 +569,10 @@ class DeepseekV41Attention(nn.Module):
         if backend.linear != "torch" or backend.rms_norm not in ("torch_fp32", "te"):
             raise ValueError("DeepSeek V4.1 attention requires torch linear layers and torch_fp32 or te RMSNorm")
         self.backend = backend
+        self.sparse_attention_backward = config.sparse_attention_backward
+        self.sparse_attention_backward_workspace_bytes = config.sparse_attention_backward_workspace_bytes
+        if self.sparse_attention_backward == "deterministic" and backend.attn != "tilelang":
+            raise ValueError("deterministic sparse attention backward requires TileLang")
         self.cp_group: dist.ProcessGroup | None = None
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
@@ -884,6 +888,8 @@ class DeepseekV41Attention(nn.Module):
                 self.head_dim**-0.5,
                 backend=self.backend.attn,
                 reference_rounding=True,
+                backward_impl=self.sparse_attention_backward,
+                backward_workspace_bytes=self.sparse_attention_backward_workspace_bytes,
                 all_rows_nonempty=attention_mask is None,
                 plan=plan,
             )

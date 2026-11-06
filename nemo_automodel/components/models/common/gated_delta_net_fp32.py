@@ -30,10 +30,14 @@ params to fp32 when checkpoint tensors arrive in a lower precision.
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 import torch
 
 HOLDER_NAME = "_fp32_params"
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 # Intrinsically-fp32 GatedDeltaNet bare params routed through the holder.
 FP32_GDN_PARAM_NAMES = ("A_log", "dt_bias")
@@ -81,7 +85,7 @@ def is_gated_delta_net_fp32_param_key(key: str, param_names: tuple[str, ...] = F
     return key.endswith(param_names) and ".linear_attn." in key
 
 
-def has_gated_delta_net_fp32_checkpoint_contract(hf_config: object) -> bool:
+def has_gated_delta_net_fp32_checkpoint_contract(hf_config: PretrainedConfig) -> bool:
     """Return whether ``hf_config`` belongs to an architecture with fp32 GDN params."""
     architectures = getattr(hf_config, "architectures", None) or ()
     return any(arch in GDN_FP32_CHECKPOINT_ARCHITECTURES for arch in architectures)
