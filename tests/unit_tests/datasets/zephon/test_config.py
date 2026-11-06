@@ -37,6 +37,7 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonOptions,
     ZephonPackingOptions,
     ZephonPretokenizedTextDatasetConfig,
+    ZephonRuntimeOptions,
     ZephonSource,
     ZephonTextDatasetConfig,
     ZephonWorkerOptions,
@@ -885,3 +886,41 @@ def test_whole_document_packing_owns_its_default_bin_count(algorithm):
 @pytest.mark.parametrize("algorithm", [None, "wrap", "best_fit_wrap"])
 def test_non_bin_packing_has_no_bin_count(algorithm):
     assert ZephonPackingOptions(pack_algorithm=algorithm).pack_num_bins is None
+
+
+@pytest.mark.parametrize(
+    "name,allows_zero",
+    [
+        ("prefetch_batches", True),
+        ("default_stage_prefetch", True),
+        ("op_queue_capacity", False),
+        ("mtp_buffer", False),
+        ("mtp_prefetch", True),
+    ],
+)
+def test_runtime_buffer_controls_keep_zephon_defaults_and_validate_capacities(name: str, allows_zero: bool) -> None:
+    assert getattr(ZephonRuntimeOptions(), name) is None
+    for value in (None, 1, 8):
+        assert getattr(ZephonRuntimeOptions(**{name: value}), name) == value
+    if allows_zero:
+        assert getattr(ZephonRuntimeOptions(**{name: 0}), name) == 0
+    invalid = [-1, True, 1.5, "8"] + ([] if allows_zero else [0])
+    for value in invalid:
+        with pytest.raises(ValueError, match=f"{name} must be a .* integer or None"):
+            ZephonRuntimeOptions(**{name: value})
+
+
+def test_runtime_buffers_follow_toml_and_inline_override_precedence(tmp_path: Path) -> None:
+    path = tmp_path / "runtime.toml"
+    path.write_text(
+        '[[sources]]\nname="text"\npath="unused"\n'
+        "[runtime]\nprefetch_batches=40\ndefault_stage_prefetch=12\nop_queue_capacity=20\nmtp_buffer=10\nmtp_prefetch=2\n"
+    )
+    dataset = ZephonTextDatasetConfig(
+        zephon={"data_config": str(path), "runtime": {"prefetch_batches": 32, "mtp_prefetch": 0}}
+    )
+    assert dataset.zephon.runtime.prefetch_batches == 32
+    assert dataset.zephon.runtime.default_stage_prefetch == 12
+    assert dataset.zephon.runtime.op_queue_capacity == 20
+    assert dataset.zephon.runtime.mtp_buffer == 10
+    assert dataset.zephon.runtime.mtp_prefetch == 0
