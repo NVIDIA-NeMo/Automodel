@@ -14,16 +14,16 @@
 
 """Zephon data backend for AutoModel recipes."""
 
+import importlib
 from typing import TYPE_CHECKING
 
-from nemo_automodel.components.datasets.zephon.config import (
-    ZephonDataloaderConfig,
-    ZephonInstructionDatasetConfig,
-    ZephonPretokenizedTextDatasetConfig,
-    ZephonTextDatasetConfig,
-)
-
 if TYPE_CHECKING:
+    from nemo_automodel.components.datasets.zephon.config import (
+        ZephonDataloaderConfig,
+        ZephonInstructionDatasetConfig,
+        ZephonPretokenizedTextDatasetConfig,
+        ZephonTextDatasetConfig,
+    )
     from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDatasetConfig, ZephonVlmOptions
 
 __all__ = [
@@ -37,12 +37,16 @@ __all__ = [
 
 
 def __getattr__(name: str) -> object:
-    """Load image configuration only when a VLM caller requests it."""
-    if name in ("ZephonVlmDatasetConfig", "ZephonVlmOptions"):
-        from nemo_automodel.components.datasets.zephon.vlm_config import (
-            ZephonVlmDatasetConfig,
-            ZephonVlmOptions,
-        )
+    """Load configuration only when requested, keeping worker helpers lightweight."""
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name = ".vlm_config" if name in ("ZephonVlmDatasetConfig", "ZephonVlmOptions") else ".config"
+    module = importlib.import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
 
-        return {"ZephonVlmDatasetConfig": ZephonVlmDatasetConfig, "ZephonVlmOptions": ZephonVlmOptions}[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+def __dir__() -> list[str]:
+    """Expose the public configuration classes before loading them."""
+    return sorted(__all__)
