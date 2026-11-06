@@ -180,3 +180,17 @@ def test_explicit_pass_limit_reaches_zephon(config):
     with patch("zephon.work.StaticMixtureWorkSource", wraps=StaticMixtureWorkSource) as source:
         create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
     assert source.call_args.kwargs["stop_after_passes"] == 2
+
+
+@pytest.mark.parametrize("apply_template,expected", [(False, "tokenizer_default"), (True, "none")])
+def test_instruction_default_special_tokens_follow_template_ownership(config, tokenizer, apply_template, expected):
+    tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    dataset = ZephonInstructionDatasetConfig(
+        zephon=config.dataset_config.zephon,
+        column_mapping={"question": "q", "answer": "a"},
+        use_hf_chat_template=apply_template,
+    )
+    with patch.object(Pipeline, "tokenize_chat", autospec=True, side_effect=Pipeline.tokenize_chat) as chat:
+        create_text_pipeline(dataset, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
+    assert chat.call_args.kwargs["special_tokens"] == expected
+    assert dataset.special_tokens is None

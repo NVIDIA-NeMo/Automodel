@@ -74,7 +74,7 @@ its dataset URI syntax. Text token estimation defaults to `auto`: it is enabled
 when there are multiple sources, so weights describe token proportions rather
 than document proportions. Set `source.token_estimation: false` to disable it,
 `true` or a settings mapping to enable it explicitly, or `null` to use Zephon's
-sample-based default. This applies to raw text and pretokenized input. See
+sample-based default. This applies to raw text, instructions, and pretokenized input. See
 [mixing datasets](https://docs.zephon.io/worksources/mixing_datasets.html) for
 calibration and sampling behavior.
 
@@ -183,7 +183,6 @@ dataset:
   path_or_dataset_id: your-org/instructions
   split: train
   column_mapping: {question: prompt, answer: completion}
-  answer_only_loss_mask: true
   use_hf_chat_template: true
   tokenizer:
     pretrained_model_name_or_path: /path/to/model-or-tokenizer

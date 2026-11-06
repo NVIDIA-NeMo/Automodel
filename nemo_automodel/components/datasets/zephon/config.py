@@ -808,6 +808,8 @@ class ZephonInstructionDatasetConfig(ZephonLanguageDatasetConfig):
     column_mapping: dict[str, str]
     answer_only_loss_mask: bool = True
     use_hf_chat_template: bool = False
+    # None is an AutoModel choice: a chat template owns its special tokens;
+    # plain instructions use tokenizer_default. Explicit policies take priority.
     special_tokens: ChatSpecialTokens | None = None
     bos_token_id: int | None = None
     eos_token_id: int | None = None
