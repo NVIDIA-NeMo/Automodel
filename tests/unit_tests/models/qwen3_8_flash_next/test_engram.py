@@ -324,7 +324,6 @@ def test_local_engram_table_matches_torch_embedding_forward_and_backward() -> No
     ).build(process_group=None, dtype=torch.float32)
     assert table.global_row_start == table.local_row_start == 0
     assert table.global_row_end == table.local_row_end == 12
-    assert not hasattr(table.weight, "_nemo_model_owned_grad_divisor")
     reference_weight = torch.arange(36, dtype=torch.float32).view(12, 3) / 10
     table.weight.detach().copy_(reference_weight)
     global_ids = torch.tensor([[0, 7, 7], [11, 1, 6]])
@@ -382,7 +381,11 @@ def _owner_sharded_gradient_worker(rank: int, world_size: int, store_path: str) 
 
         actual.backward(upstream)
         expected.backward(upstream)
+        # The owner holds the mean of the per-rank contributions: the value
+        # route's backward divides by the owner-group size, so the table needs
+        # no further scaling in the training loop.
         dist.all_reduce(expected_weight.grad, group=dist.group.WORLD)
+        expected_weight.grad.div_(world_size)
         expected_local_grad = expected_weight.grad[table.vocab_start_index : table.vocab_end_index]
         assert isinstance(table.weight.grad, DTensor)
         torch.testing.assert_close(table.weight.grad.to_local(), expected_local_grad, rtol=0, atol=0)
@@ -436,11 +439,8 @@ def _engram_meta_dtensor_lifecycle_worker(rank: int, world_size: int, store_path
         assert table.weight.to_local().device.type == "cpu"
         assert tuple(table.weight.shape) == (12, 3)
         assert tuple(table.weight.placements) == (Shard(0),)
-        assert not hasattr(table.weight, "_nemo_model_owned_grad_divisor")
         table.reset_parameters()
-        table.mark_sharding_contract()
         assert torch.isfinite(table.weight.to_local()).all()
-        assert hasattr(table.weight, "_nemo_model_owned_grad_divisor")
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -1021,6 +1021,7 @@ def _owner_sharded_empty_requester_worker(rank: int, world_size: int, store_path
                 expected_weight = full_weight.clone().requires_grad_(True)
                 F.embedding(ids, expected_weight).backward(upstream)
                 dist.all_reduce(expected_weight.grad, group=dist.group.WORLD)
+                expected_weight.grad.div_(world_size)  # owner rows hold the owner-group mean
                 torch.testing.assert_close(
                     table.weight.grad.to_local(),
                     expected_weight.grad[table.vocab_start_index : table.vocab_end_index],

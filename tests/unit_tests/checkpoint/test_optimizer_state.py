@@ -57,7 +57,6 @@ class _ModelOwnedDTensorOptimizerModel(nn.Module):
             stride=(2, 1),
         )
         self.weight = nn.Parameter(weight)
-        self.weight._nemo_model_owned_grad_divisor = float(world_size)
 
 
 def _make_distributed_checkpointer(rank: int, checkpoint_dir: str) -> Checkpointer:
