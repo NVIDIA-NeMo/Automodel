@@ -35,7 +35,9 @@ dataset class's conversation/image transformations; input must use the format ab
 
 AutoModel’s processor applies the chat template and expands image placeholders
 before Zephon measures and bin-packs the documents. Training supervises assistant
-tokens. Image documents stay whole; oversized documents are dropped by default.
+tokens. Packing defaults to `first_fit` with 64 bins; image documents stay whole,
+and oversized documents are dropped by default. Unlike text mixtures, image
+mixtures use sample-based weights: media-aware token estimation is unsupported.
 The finite source is read once, and `max_steps` caps training.
 
 Qwen2.5-VL, dense Qwen3-VL, non-sliding Mistral3, and dense Gemma4 image paths are

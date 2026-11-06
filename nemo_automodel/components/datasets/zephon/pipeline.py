@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import torch.distributed as dist
 
@@ -33,6 +33,10 @@ if TYPE_CHECKING:
     from nemo_automodel.components.datasets.zephon.config import ZephonLanguageDatasetConfig, ZephonOptions
 
 logger = logging.getLogger(__name__)
+
+
+class _SourceOverrides(TypedDict, total=False):
+    stop_after_passes: int
 
 
 def create_source_pipeline(
@@ -56,16 +60,15 @@ def create_source_pipeline(
     if not 0 <= dp_rank < dp_world_size:
         raise ValueError("Invalid Zephon data-parallel rank/world size")
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    canonical = (
-        options.checkpoint.canonical_replicas if options.checkpoint.canonical_replicas is not None else dp_world_size
-    )
-    if canonical <= 0 or canonical % dp_world_size:
+    canonical = options.checkpoint.canonical_replicas
+    if canonical is not None and canonical % dp_world_size:
         raise ValueError("canonical_replicas must be a positive multiple of the DP world size")
     if world_size > 1 and not options.checkpoint.run_id:
         raise ValueError("Distributed Zephon checkpointing requires an explicit run_id")
     datasets = [io.Dataset.from_path(name=source.name, path=source.path, fmt=source.fmt) for source in options.sources]
     estimation = options.source.token_estimation
-    if estimation is None:
+    if estimation == "auto":
+        # This is the integration's text mixing policy, not Zephon's default.
         estimation = len(options.sources) > 1
     if isinstance(estimation, dict):
         token_estimation = work.TokenEstimation(measure=measure, **estimation)
@@ -73,6 +76,15 @@ def create_source_pipeline(
         token_estimation = work.TokenEstimation(measure=measure)
     else:
         token_estimation = None
+    overrides: _SourceOverrides = {}
+    if options.source.stop_after_passes is not None:
+        overrides["stop_after_passes"] = options.source.stop_after_passes
+    logger.info(
+        "Zephon token estimation: configured=%s, enabled=%s",
+        options.source.token_estimation,
+        token_estimation is not None,
+    )
+    # Omit an unset pass limit so Zephon owns its default and resume semantics.
     source = work.StaticMixtureWorkSource(
         datasets=datasets,
         mixture=work.MixtureSpec({source.name: source.weight for source in options.sources}),
@@ -85,11 +97,7 @@ def create_source_pipeline(
         exhausted_policy=options.source.exhausted_policy,
         reshuffle_on_repeat=options.source.reshuffle_on_repeat,
         max_repeats=options.source.max_repeats,
-        stop_after_passes=(
-            options.source.stop_after_passes
-            if options.source.stop_after_passes is not None
-            else (1 if options.source.exhausted_policy is None and options.source.max_repeats is None else None)
-        ),
+        **overrides,
     )
     pipeline = zephon.Pipeline(source)
     if options.runtime.prefetch_buffer_size:
@@ -183,8 +191,6 @@ def create_text_pipeline(
         max_documents //= batch_size
         if not max_documents:
             raise ValueError("max_num_documents must be at least local_batch_size when scoped to the batch")
-    wrapping = options.packing.pack_algorithm in ("wrap", "best_fit_wrap")
-    num_bins = (options.packing.pack_num_bins or 64) if not wrapping else None
     pipeline = config.tokenize(
         tokenizer=tokenizer, options=options, ids=ids, seed=seed, dp_rank=dp_rank, dp_world_size=dp_world_size
     )
@@ -192,7 +198,7 @@ def create_text_pipeline(
         pipeline.pack_flat(
             max_length=sequence_length + 1,
             algorithm=options.packing.pack_algorithm,
-            num_bins=num_bins,
+            num_bins=options.packing.pack_num_bins,
             max_sequences_per_bin=max_documents,
             pad_token_id=ids.pad,
             drop_oversized=options.packing.drop_oversized,

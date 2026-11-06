@@ -126,12 +126,16 @@ def test_recipe_routes_images_and_inherits_processor_settings():
     assert not config.dataset_config.zephon.inject_fake_images
 
 
-def test_image_recipe_requires_explicit_whole_document_packing_without_mutating_input():
+@pytest.mark.parametrize("groups", [{}, {"packing": {}}, {"packing": {"seq_len": 128}, "source": {"chunk_size": 4}}])
+def test_image_recipe_defaults_keep_documents_whole_without_mutating_input(groups):
     values = _recipe()
-    del values["dataset"]["zephon"]["packing"]["pack_algorithm"]
-    with pytest.raises(ValueError, match="first_fit or best_fit"):
-        RecipeConfig(ConfigNode(values)).vlm_dataloader
-    assert values["dataset"]["zephon"]["packing"] == {}
+    values["dataset"]["zephon"] = {"sources": values["dataset"]["zephon"]["sources"], **groups}
+    options = RecipeConfig(ConfigNode(values)).vlm_dataloader.dataset_config.zephon
+    assert options.packing.pack_algorithm == "first_fit"
+    assert options.packing.pack_num_bins == 64
+    assert options.packing.drop_oversized and options.packing.shuffle_after_pack
+    assert options.source.token_estimation is None
+    assert values["dataset"]["zephon"].get("packing", {}) == groups.get("packing", {})
 
 
 @pytest.mark.parametrize("algorithm", [None, "wrap", "best_fit_wrap"])
@@ -149,7 +153,7 @@ def test_image_example_config_resolves():
     assert isinstance(config, VlmDataloaderConfig)
     assert isinstance(config, ZephonVlmDataloaderConfig)
     assert isinstance(config.dataset_config, ZephonVlmDatasetConfig)
-    assert config.dataset_config.zephon.source.stop_after_passes == 1
+    assert config.dataset_config.zephon.source.stop_after_passes is None
     assert config.dataset_config.zephon.packing.pack_algorithm == "first_fit"
 
 
@@ -535,3 +539,35 @@ def test_video_processor_is_rejected_before_loading_or_source_work(monkeypatch):
     video_factory.assert_not_called()
     positions.assert_not_called()
     source.assert_not_called()
+
+
+def test_image_python_and_toml_partial_groups_keep_image_defaults(tmp_path):
+    sources = (ZephonSource(name="images", path="unused"), ZephonSource(name="text", path="unused-text"))
+    defaults = ZephonVlmOptions(sources=sources)
+    direct = ZephonVlmDatasetConfig(zephon=replace(defaults, source=replace(defaults.source, chunk_size=4)))
+    assert direct.zephon.source.chunk_size == 4
+    assert direct.zephon.packing.pack_algorithm == "first_fit"
+    assert direct.zephon.source.token_estimation is None
+    data_config = tmp_path / "images.toml"
+    data_config.write_text(
+        "[source]\nchunk_size=4\n[packing]\nseq_len=128\n"
+        '[[sources]]\nname="images"\npath="unused"\n[[sources]]\nname="text"\npath="unused-text"\n'
+    )
+    values = _recipe()
+    values["dataset"]["zephon"] = {
+        "data_config": str(data_config),
+        "packing": {"seq_len": 256},
+        "source": {"chunk_size": 8},
+    }
+    options = RecipeConfig(ConfigNode(values)).vlm_dataloader.dataset_config.zephon
+    assert options.packing.pack_algorithm == direct.zephon.packing.pack_algorithm
+    assert options.packing.seq_len == 256 and options.packing.pack_num_bins == 64
+    assert options.source.chunk_size == 8 and options.source.token_estimation is None
+
+
+@pytest.mark.parametrize("estimation", ["auto", True, {}])
+def test_image_recipe_rejects_unsupported_token_estimation(estimation):
+    values = _recipe()
+    values["dataset"]["zephon"]["source"] = {"token_estimation": estimation}
+    with pytest.raises(ValueError, match="media-aware estimator"):
+        RecipeConfig(ConfigNode(values)).vlm_dataloader

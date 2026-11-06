@@ -111,14 +111,18 @@ class ZephonSourceOptions:
     exhausted_policy: str | dict[str, str] | None = None
     reshuffle_on_repeat: bool | dict[str, bool] = True
     max_repeats: int | dict[str, int | None] | None = None
+    # None omits this argument: Zephon chooses one finite pass unless another
+    # exhaustion/repeat policy is set. It is not an explicit unlimited-pass value.
     stop_after_passes: int | None = None
-    token_estimation: bool | TokenEstimationSettings | None = None
+    # AutoModel policy: estimate tokens for multi-source text (including SFT and
+    # pretokenized input). None delegates to Zephon's sample-based default.
+    token_estimation: bool | TokenEstimationSettings | Literal["auto"] | None = "auto"
 
     def __post_init__(self) -> None:
         if self.chunk_size <= 0:
             raise ValueError("Zephon chunk_size must be positive")
-        if not isinstance(self.token_estimation, (bool, dict, type(None))):
-            raise ValueError("token_estimation must be a boolean or existing TokenEstimation settings")
+        if not isinstance(self.token_estimation, (bool, dict, type(None))) and self.token_estimation != "auto":
+            raise ValueError("token_estimation must be 'auto', a boolean, None or existing TokenEstimation settings")
         if isinstance(self.token_estimation, dict):
             unknown = self.token_estimation.keys() - TokenEstimationSettings.__annotations__.keys()
             if unknown:
@@ -133,15 +137,17 @@ class ZephonPackingOptions:
     keeps supplied documents separate and lets to_training pad shorter inputs.
     """
 
-    seq_len: int | None = None
+    seq_len: int | None = None  # None uses the model input-token limit at build time.
     pack_algorithm: Literal["wrap", "first_fit", "best_fit", "best_fit_wrap"] | None = "wrap"
-    pack_num_bins: int | None = None
+    pack_num_bins: int | None = None  # None selects 64 bins for first_fit/best_fit; unused by wrapping.
     max_num_documents: int | None = None
     max_num_documents_scope: Literal["batch", "bin"] = "batch"
+    # AutoModel defaults: whole-document packing drops oversized documents and
+    # shuffles its output; wrapping and unpacked input do neither by default.
     drop_oversized: bool | None = None
-    pad_token_id: int | None = None
+    pad_token_id: int | None = None  # None derives an existing ID from the runtime tokenizer.
     shuffle_after_pack: bool | None = None
-    shuffle_buffer_size: int | None = None
+    shuffle_buffer_size: int | None = None  # None uses Zephon's shuffle buffer default.
 
     def __post_init__(self) -> None:
         if self.seq_len is not None and (
@@ -158,6 +164,8 @@ class ZephonPackingOptions:
         ):
             raise ValueError("pack_num_bins, max_num_documents and drop_oversized require online packing")
         wrapping = self.pack_algorithm in ("wrap", "best_fit_wrap")
+        if self.pack_num_bins is None and packing_enabled and not wrapping:
+            object.__setattr__(self, "pack_num_bins", 64)
         if self.drop_oversized is None:
             object.__setattr__(self, "drop_oversized", packing_enabled and not wrapping)
         if self.shuffle_after_pack is None:
@@ -184,7 +192,11 @@ class ZephonTrainingOptions:
 
 @dataclass(frozen=True, kw_only=True)
 class ZephonWorkerOptions:
-    """Per-stage operator parallelism; None uses the Zephon operator default."""
+    """Per-stage operator parallelism.
+
+    Concrete values are integration tuning defaults. None uses each Zephon
+    operator's default, including the image encoder's advertised traits.
+    """
 
     tokenize_parallelism: int | None = 3
     map_parallelism: int | None = None
@@ -225,8 +237,10 @@ class ZephonCacheOptions:
 class ZephonCheckpointOptions:
     """Canonical lane layout and all-rank checkpoint aggregation."""
 
-    canonical_replicas: int | None = None
+    canonical_replicas: int | None = None  # None uses the runtime DP world size.
     aggregate_dir: str | None = None
+    # None selects torch:// when distributed and no aggregate_dir was supplied;
+    # otherwise the pipeline keeps Zephon's local checkpoint storage default.
     aggregate_store: str | None = None
     run_id: str | None = None
 
@@ -246,7 +260,9 @@ class ZephonOptions:
     """Grouped settings nested under ``dataset.zephon``.
 
     Dataset adapters select encoding. These groups configure the shared source,
-    packing and delivery backbone for both text and image pipelines.
+    packing and delivery backbone for both text and image pipelines. Concrete
+    values are integration defaults. Field comments document automatic choices
+    and values delegated to Zephon; these remain declarative until build time.
     """
 
     sources: tuple[ZephonSource, ...] = ()
@@ -566,9 +582,12 @@ def zephon_options_from_values(
             raise ValueError(f"Zephon source {source.get('name', index)!r} needs a nonempty name and path")
         sources.append(ZephonSource(**source))
     values["sources"] = tuple(sources)
-    for name, config_type in _OPTION_GROUPS.items():
+    # A partial group must inherit its declared factory's defaults, including
+    # image-specific source/packing defaults on an options subtype.
+    group_fields = {item.name: item for item in fields(options_type) if item.name in _OPTION_GROUPS}
+    for name, item in group_fields.items():
         if name in values:
-            values[name] = config_type(**values[name])
+            values[name] = item.default_factory(**values[name])
     return options_type(**values)
 
 
@@ -789,6 +808,8 @@ class ZephonInstructionDatasetConfig(ZephonLanguageDatasetConfig):
     column_mapping: dict[str, str]
     answer_only_loss_mask: bool = True
     use_hf_chat_template: bool = False
+    # None is an AutoModel choice: a chat template owns its special tokens;
+    # plain instructions use tokenizer_default. Explicit policies take priority.
     special_tokens: ChatSpecialTokens | None = None
     bos_token_id: int | None = None
     eos_token_id: int | None = None
