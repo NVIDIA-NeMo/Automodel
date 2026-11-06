@@ -4491,3 +4491,42 @@ def test_setup_always_passes_return_contract_and_only_configures_packed_batched_
     assert queries == [True]
     assert configured == ([True] if is_packed and output_format == "batched" else [])
     assert thd_validated == ([True] if output_format == "thd" else [])
+
+
+@pytest.mark.parametrize("document_ids", [[[1, 1, 2, 2, 0], [1, 2, 2, 2, 0]], [[1, 1, 1, 1, 0], [1, 1, 1, 0, 0]]])
+def test_neat_flash_pp_rebuilds_offsets_for_each_microbatch(document_ids: list[list[int]]) -> None:
+    """Real PP splitting must deliver rebased offsets covering each microbatch."""
+    from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
+    from transformers import LlamaConfig
+
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common.packing import PackingCapabilities, configure_packing
+    from nemo_automodel.recipes.llm.train_ft import _build_pp_collate_wrapper
+
+    class Capture(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor, **kwargs):
+            return input_ids, kwargs
+
+    packing = PackingCapabilities(packed_mask_type="flash_varlen")
+    samples = [
+        {"input_ids": [1] * 5, "labels": [1] * 5, "position_ids": [0] * 5, "attention_mask": ids}
+        for ids in document_ids
+    ]
+    config = LlamaConfig()
+    config._attn_implementation = "flash_attention_2"
+    with patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=config):
+        wrapper = _build_pp_collate_wrapper(ConfigNode({"pretrained_model_name_or_path": "test"}), True)
+    batch = wrapper(lambda rows: neat_packed_collater(rows, packing=packing))(samples)
+    _, chunks = split_args_kwargs_into_chunks((), batch, chunks=2)
+    model = Capture()
+    configure_packing("flash_attention_2", model=model)
+    for sample, chunk in zip(samples, chunks):
+        tokens, prepared = model(**chunk)
+        expected = neat_packed_collater([sample], packing=packing)
+        offsets = prepared["cu_seq_lens_q"]
+        assert tokens.shape == (1, 5)
+        assert offsets[0].item() == 0
+        assert offsets[-1].item() == tokens.numel()
+        torch.testing.assert_close(offsets, expected["cu_seq_lens_q"])
+        torch.testing.assert_close(prepared["cu_seq_lens_k"], expected["cu_seq_lens_k"])
+        assert prepared["max_length_q"] == expected["max_length_q"]
