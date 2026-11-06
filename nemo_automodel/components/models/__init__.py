@@ -20,8 +20,10 @@ Currently includes:
 import importlib.abc
 import pathlib
 import sys
+from typing import TYPE_CHECKING
 
-from .gpt2 import build_gpt2_model  # noqa: F401
+if TYPE_CHECKING:
+    from .gpt2 import build_gpt2_model
 
 __all__ = [
     "build_gpt2_model",
@@ -53,8 +55,19 @@ def _make_upgrade_message(name: str) -> str:
     )
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> object:
+    """Load the public builder on demand, preserving model-upgrade diagnostics."""
+    if name == "build_gpt2_model":
+        from .gpt2 import build_gpt2_model
+
+        globals()[name] = build_gpt2_model
+        return build_gpt2_model
     raise ModuleNotFoundError(_make_upgrade_message(name))
+
+
+def __dir__() -> list[str]:
+    """Expose the public builder before it is imported."""
+    return sorted(__all__)
 
 
 class _MissingModelFinder(importlib.abc.MetaPathFinder):
