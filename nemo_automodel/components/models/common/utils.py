@@ -553,7 +553,9 @@ class BackendConfig:
             run; with ``dispatcher_share_token_dispatcher=True`` (default) that is one calibration,
             taken on the first local MoE layer's first microbatch, for every layer, so choose a factor
             that covers the largest routing skew expected across layers and batches. Not supported
-            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination).
+            for experts with ``expert_bias`` (``GroupedExpertsDeepEP`` rejects the combination) or by
+            ``GroupedExpertsTE``, which HybridEP uses for every ``experts`` value other than
+            ``torch_mm``, ``gmm`` and ``torch_mm_mxfp8``.
         dispatcher_equal_token_counts: HybridEP only. Declare that every EP rank dispatches the
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
