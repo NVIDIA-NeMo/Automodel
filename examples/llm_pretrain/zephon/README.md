@@ -102,6 +102,12 @@ uses `torch://` automatically unless a store or directory is supplied; choose a
 unique `checkpoint.run_id` for each distributed job. Model, optimizer, and
 distributed settings stay in their usual AutoModel sections.
 
+Runtime buffering uses Zephon's automatic defaults. Set `runtime.prefetch_batches`,
+`runtime.default_stage_prefetch`, or `runtime.op_queue_capacity` to tune pipeline
+queues, and `runtime.mtp_buffer` or `runtime.mtp_prefetch` for MTP buffering.
+Leaving a value unset delegates its sizing to Zephon; `mtp_prefetch: 0` disables
+the background receiver thread.
+
 You can also place the data settings in a TOML file and reference it with
 `dataset.zephon.data_config`. Inline YAML values override that file; relative
 source, cache, and checkpoint paths in TOML are resolved relative to the TOML file.

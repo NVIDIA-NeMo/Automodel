@@ -143,6 +143,13 @@ def finalize_pipeline(
         dp_group_id=dp_rank,
         canonical_replicas=canonical,
         mtp_mode=options.runtime.mtp_mode,
+        # Forward None unchanged: Zephon owns automatic sizing. Explicit zero
+        # disables optional prefetch buffers and must not be replaced by a default.
+        prefetch_batches=options.runtime.prefetch_batches,
+        default_stage_prefetch=options.runtime.default_stage_prefetch,
+        op_queue_capacity=options.runtime.op_queue_capacity,
+        mtp_buffer=options.runtime.mtp_buffer,
+        mtp_prefetch=options.runtime.mtp_prefetch,
     )
     if options.cache.cache_dir is not None:
         pipeline.options(
