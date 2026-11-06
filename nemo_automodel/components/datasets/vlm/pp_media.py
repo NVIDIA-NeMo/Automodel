@@ -52,9 +52,9 @@ def chunk_vlm_media(
 
     Args:
         pixel_values: Image-major pixels [images, channels, height, width],
-            padded patches [images, max_patches, features], or flat patches
-            [total_patches, features] / [total_patches, channels, patch_h, patch_w],
-            or a list of [channels, height, width]
+            padded patches [images, max_patches, features], flat patches
+            [total_patches, features] or [total_patches, channels, patch_height,
+            patch_width], or a list of [channels, height, width]
             tensors with possibly different image sizes.
         image_grid: Per-image metadata [images, coordinates]. For flat patches,
             the product of each grid gives the corresponding patch count.
@@ -117,7 +117,8 @@ def chunk_vlm_media(
             pixel_values_chunks.append(pixel_values[img_start:img_end])
             image_grid_chunks.append(image_grid[img_start:img_end])
     elif n_images_per_sample is not None:
-        # Flat patches, including Kimi's 4D patches: map samples -> images -> patches.
+        # General flat-patch layout: map samples -> media entries -> patches.
+        # Four-dimensional Kimi pixels also have patches, not images, on axis 0.
         patch_counts = image_grid.prod(dim=1)
         cumsum_patches = torch.cumsum(patch_counts, dim=0)
         cumsum_images = torch.cumsum(n_images_per_sample, dim=0)

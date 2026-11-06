@@ -56,3 +56,20 @@ def test_four_dimensional_flat_patches_follow_image_grids(counts: list[int], pat
     torch.testing.assert_close(chunks[1], pixels[patch_cut:])
     torch.testing.assert_close(grid_chunks[0], grids[:image_cut])
     torch.testing.assert_close(grid_chunks[1], grids[image_cut:])
+
+
+@pytest.mark.parametrize("counts", [[1, 1], [0, 2], [0, 1, 1, 0]])
+def test_four_dimensional_patches_follow_grid_products(counts):
+    pixels = torch.arange(12 * 3 * 14 * 14).reshape(12, 3, 14, 14)
+    grids = torch.tensor([[2, 4], [2, 2]])
+    first_patches = 0 if counts == [0, 2] else 8
+    first_images = 0 if counts == [0, 2] else 1
+
+    chunks, grid_chunks = chunk_vlm_media(
+        pixels, grids, batch_size=len(counts), n_microbatches=2, n_images_per_sample=torch.tensor(counts)
+    )
+
+    torch.testing.assert_close(chunks[0], pixels[:first_patches])
+    torch.testing.assert_close(chunks[1], pixels[first_patches:])
+    torch.testing.assert_close(grid_chunks[0], grids[:first_images])
+    torch.testing.assert_close(grid_chunks[1], grids[first_images:])
