@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 import os
 import sys
 import warnings
 from functools import partial
 from logging import Filter, LogRecord
-from typing import Callable, Union
+from typing import Callable
 
 # Pydantic v2 emits UnsupportedFieldAttributeWarning for Field(repr=...) /
 # Field(frozen=...) used inside 3.12-style `type` aliases in third-party libs.
@@ -76,7 +78,7 @@ class ColorFormatter(logging.Formatter):
     Colors can be disabled by setting the NO_COLOR env var, or forced with FORCE_COLOR.
     """
 
-    def __init__(self, fmt: str | None = None, datefmt: str | None = None, use_color: bool = True):
+    def __init__(self, fmt: str | None = None, datefmt: str | None = None, use_color: bool = True) -> None:
         if fmt is None:
             fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
         if datefmt is None:
@@ -126,7 +128,7 @@ def module_filter(record: LogRecord, modules_to_filter: list[str]) -> bool:
     return True
 
 
-def add_filter_to_all_loggers(filter: Union[Filter, Callable[[LogRecord], bool]]) -> None:
+def add_filter_to_all_loggers(filter: Filter | Callable[[LogRecord], bool]) -> None:
     """
     Add a filter to the root logger and all existing loggers.
 
