@@ -58,6 +58,18 @@ def test_process_worker_tokenization(config, tokenizer):
         )
     ) as loader:
         assert next(loader)["labels"].tolist()[0] == [3, 4, 1, 3, 4, 5, 1]
+        checkpoint = loader.state_dict()
+        expected = next(loader)
+    with closing(
+        config.build(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            training_schedule=DatasetBuildSchedule(config.batch_size, config.batch_size, 100, None),
+        )
+    ) as restored:
+        restored.load_state_dict(checkpoint)
+        torch.testing.assert_close(next(restored), expected)
 
 
 def _mixture_config(tmp_path, *, estimation, policy="repeat"):
