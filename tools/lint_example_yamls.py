@@ -155,11 +155,9 @@ def _lint_ci_cluster_tag(path: Path, data: dict, key_lines: list[tuple[str, int]
     ]
 
 
-PERF_TESTING_KEYS = ("schedule", "time", "config_overrides")
+PERF_TESTING_KEYS = ("schedule", "time", "fake_balanced_gate")
 PERF_TESTING_SCHEDULES = ("nightly", "weekly", "disabled")
 CI_TIME_FORMAT = "%H:%M:%S"  # Same format that tests/ci_tests/utils/generate_ci_tests.py parses for `ci.time`.
-# Config keys are Python identifiers joined by dots, as `--key value` CLI overrides expect.
-_DOTTED_CONFIG_KEY = re.compile(r"\w+(\.\w+)*", re.ASCII)
 
 
 def _lint_ci_perf_testing(
@@ -171,7 +169,7 @@ def _lint_ci_perf_testing(
 
     - ``schedule``: required, one of ``PERF_TESTING_SCHEDULES``. ``disabled`` keeps the settings but pauses the runs.
     - ``time``: ``HH:MM:SS`` wall time of the run, parsed like ``ci.time``.
-    - ``config_overrides``: mapping from dotted config keys to non-null scalar values.
+    - ``fake_balanced_gate``: optional boolean; the only performance-specific model override.
 
     ``ci.deprecated: true`` applies to the section as well: a deprecated recipe runs no tests.
 
@@ -218,26 +216,8 @@ def _lint_ci_perf_testing(
         error(f"`schedule` must be one of {', '.join(PERF_TESTING_SCHEDULES)}.", section_lines.get("schedule"))
     if "time" in section and not _is_ci_time(section["time"]):
         error('`time` must be a "HH:MM:SS" string, the same format as `ci.time`.', section_lines.get("time"))
-    if "config_overrides" in section:
-        overrides = section["config_overrides"]
-        overrides_node = _child_node(section_node, "config_overrides")
-        override_lines = _mapping_key_lines(overrides_node)
-        if not isinstance(overrides, dict):
-            error(
-                "`config_overrides` must be a mapping of dotted keys to values.", section_lines.get("config_overrides")
-            )
-        else:
-            errors.extend(_lint_duplicate_keys(path, overrides_node, "ci.perf_testing.config_overrides"))
-            for key, value in overrides.items():
-                line = override_lines.get(str(key))
-                if not isinstance(key, str):
-                    error(f"override key `{key}` must be a string.", line)
-                elif not _DOTTED_CONFIG_KEY.fullmatch(key):
-                    error(
-                        f"override key `{key}` must be a dotted config path such as `step_scheduler.max_steps`.", line
-                    )
-                if value is None or isinstance(value, (dict, list)):
-                    error(f"override `{key}` must be a non-null scalar value.", line)
+    if "fake_balanced_gate" in section and not isinstance(section["fake_balanced_gate"], bool):
+        error("`fake_balanced_gate` must be a boolean.", section_lines.get("fake_balanced_gate"))
     return errors
 
 

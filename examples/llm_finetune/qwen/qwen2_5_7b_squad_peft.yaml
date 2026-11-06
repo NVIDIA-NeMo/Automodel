@@ -120,56 +120,5 @@ ci:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-  # Synthetic performance settings migrated from examples/llm_benchmark/qwen/qwen2_5_7b_peft_benchmark.yaml.
-  # Reset changed components before setting leaves; "none" is the CLI null token.
   perf_testing:
     schedule: nightly
-    time: 00:10:00
-    config_overrides:
-      step_scheduler: none
-      step_scheduler.global_batch_size: 32
-      step_scheduler.local_batch_size: 2
-      step_scheduler.ckpt_every_steps: 50
-      step_scheduler.val_every_steps: 1000
-      step_scheduler.max_steps: 10
-      model: none
-      model._target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-      model.pretrained_model_name_or_path: Qwen/Qwen2.5-7B
-      model.torch_dtype: bf16
-      model.force_hf: true
-      checkpoint: none
-      peft: none
-      peft._target_: nemo_automodel.components._peft.lora.PeftConfig
-      peft.target_modules: '*_proj'
-      peft.dim: 16
-      peft.alpha: 32
-      peft.dropout: 0.0
-      peft.use_memory_efficient_lora: false
-      peft.use_triton: true
-      dataset: none
-      dataset._target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-      dataset.vocab_size: 100
-      dataset.seq_len: 4096
-      dataset.num_samples: 1000000
-      dataset.batch_size: 2
-      packed_sequence: none
-      dataloader: none
-      dataloader._target_: torch.utils.data.DataLoader
-      dataloader.batch_size: none
-      validation_dataset: none
-      validation_dataloader: none
-      optimizer: none
-      optimizer._target_: torch.optim.AdamW
-      optimizer.betas: '[0.9, 0.999]'
-      optimizer.eps: 1e-8
-      optimizer.lr: 1.0e-05
-      optimizer.weight_decay: 0.01
-      seed: 1111
-      benchmark: none
-      benchmark.warmup_steps: 5
-      benchmark.peak_tflops: 989
-      benchmark.nsys_start: -1
-      benchmark.nsys_end: -1
-      benchmark.nsys_ranks: '[]'
-      benchmark.num_nodes: 1
-      ci.nodes: 1

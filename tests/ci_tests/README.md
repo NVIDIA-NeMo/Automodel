@@ -81,25 +81,22 @@ ci:
     # skip_resume: true           # Exceptional: skip native-checkpoint resume (Phase 4)
     # See checkpoint robustness section for all options
   perf_testing:                   # Optional. Performance measurements run automatically from this section
-                                  # Without it, none run. ci.deprecated: true also disables them. Other ci settings (e.g. ep_size) apply
+                                  # Without it, none run. ci.deprecated: true also disables them.
     schedule: weekly              # Required. nightly, weekly, or disabled (keeps the settings, pauses the runs)
     time: "00:40:00"              # Optional. Wall time of the performance run (HH:MM:SS, same format as ci.time)
-    config_overrides:             # Optional. Dotted config keys with non-null scalar values, passed as --key value
-      step_scheduler.max_steps: 10
+    fake_balanced_gate: false     # Optional boolean. Omit to use the recipe's own MoE routing setting
 ```
 
-Performance overrides can replace a training workload with its synthetic benchmark without changing the default
-training configuration. Set `recipe: BenchmarkingRecipeForNextTokenPrediction` in `config_overrides` and include
-the source benchmark's input shapes, model/backend, optimizer, parallelism, and timing settings. The JET generator
-must select its entrypoint and metrics from this effective configuration; the benchmark uses the
-`nemo_automodel.recipes.llm.benchmark` entrypoint rather than the interactive training loop.
+Performance runs use the training recipe as their single source of truth: the same recipe class, dataset,
+sequence packing, batch sizes, model/backend settings, precision, optimizer, and parallelism. Change those
+settings in the recipe itself when changing the workload users should run. Generic `config_overrides` are
+not supported in `ci.perf_testing`.
 
-Overrides are applied in insertion order. To replace a component's constructor without retaining training-only
-arguments, first set its root to the string `"none"`, then set its dotted child keys. The CLI also parses strings
-such as `"[0.9, 0.999]"` and `"[]"` as lists. A root key such as `recipe` is a valid config path. Preserve the
-source benchmark's effective settings, including CI topology overrides, rather than comparing similarly named
-recipes with different token counts. Fixed-length mock inputs do not imply packed sequences; copy a positive
-`packed_sequence.packed_sequence_size` into the training config only when its benchmark actually enables packing.
+The only optional model change is `fake_balanced_gate`, which maps to `model.backend.fake_balanced_gate`.
+Omitting it preserves the recipe's setting. Results with a fake gate must be identified as balanced-routing
+measurements, not presented as the throughput of real routing. The runner can bound the measurement duration
+and disable validation/checkpoint work; these controls do not change the workload's batching or parallelism.
+Synthetic `llm_benchmark` results are a separate workload and are not performance targets for real-data recipes.
 
 ## Checkpoint Robustness
 

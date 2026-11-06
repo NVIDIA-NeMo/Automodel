@@ -226,10 +226,7 @@ def _perf_errors(block: str, *, default_schedule: bool = True):
 
 
 def test_linter_accepts_valid_perf_testing():
-    errors = _perf_errors(
-        '    time: "00:40:00"\n    schedule: weekly\n'
-        "    config_overrides:\n      distributed.ep_size: 4\n      step_scheduler.max_steps: 10\n"
-    )
+    errors = _perf_errors('    time: "00:40:00"\n    schedule: weekly\n    fake_balanced_gate: false\n')
 
     assert errors == []
 
@@ -256,17 +253,13 @@ def test_linter_requires_perf_testing_schedule():
         ('    time: "40 minutes"\n', "`time` must be"),
         ('    time: "25:00"\n', "`time` must be"),
         ('    time: "24:00:00"\n', "`time` must be"),
-        ("    config_overrides: [a, b]\n", "`config_overrides` must be a mapping"),
-        ("    config_overrides:\n      a.: 1\n", "must be a dotted config path"),
-        ("    config_overrides:\n      a..b: 1\n", "must be a dotted config path"),
-        ("    config_overrides:\n      .a: 1\n", "must be a dotted config path"),
-        ("    config_overrides:\n      step scheduler.max_steps: 1\n", "must be a dotted config path"),
-        (
-            "    config_overrides:\n      step_scheduler.max_steps: [1, 2]\n",
-            "must be a non-null scalar",
-        ),
-        ("    config_overrides:\n      step_scheduler.max_steps:\n", "must be a non-null scalar"),
-        ("    config_overrides:\n      1: 2\n", "override key `1` must be a string"),
+        ("    config_overrides: {}\n", "unknown key `config_overrides`"),
+        ("    fake_balanced_gate: 1\n", "`fake_balanced_gate` must be a boolean"),
+        ("    fake_balanced_gate: 'true'\n", "`fake_balanced_gate` must be a boolean"),
+        ("    fake_balanced_gate: null\n", "`fake_balanced_gate` must be a boolean"),
+        ("    fake_balanced_gate: []\n", "`fake_balanced_gate` must be a boolean"),
+        ("    fake_balanced_gate: {}\n", "`fake_balanced_gate` must be a boolean"),
+        ("    parallelism: {}\n", "unknown key `parallelism`"),
         ("    nightly: true\n", "unknown key `nightly`"),
         ("    2: true\n", "key `2` must be a string"),
     ],
@@ -293,14 +286,20 @@ def test_linter_rejects_duplicate_perf_testing_keys_with_line_numbers():
     assert errors[0].line == 6
 
 
-def test_linter_rejects_duplicate_override_keys():
-    errors = _perf_errors(
-        "    config_overrides:\n      step_scheduler.max_steps: 1\n      step_scheduler.max_steps: 2\n"
-    )
+def test_linter_rejects_duplicate_fake_gate_keys():
+    errors = _perf_errors("    fake_balanced_gate: true\n    fake_balanced_gate: false\n")
 
     assert len(errors) == 1
-    assert "Duplicate key `step_scheduler.max_steps`" in errors[0].message
-    assert errors[0].line == 7
+    assert "Duplicate key `fake_balanced_gate`" in errors[0].message
+    assert errors[0].line == 6
+
+
+@pytest.mark.parametrize("key", ["recipe", "dataset.seq_len", "step_scheduler.local_batch_size", "distributed.ep_size"])
+def test_linter_rejects_workload_changes_in_perf_testing(key: str) -> None:
+    errors = _perf_errors(f"    config_overrides:\n      {key}: 4\n")
+
+    assert len(errors) == 1
+    assert "unknown key `config_overrides`" in errors[0].message
 
 
 def test_linter_reports_perf_testing_error_on_offending_line():
