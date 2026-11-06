@@ -190,28 +190,14 @@ jobs:
 
           uv sync --link-mode copy --locked --group linting
 
-      - name: Run ty
+      - name: Test annotation policy
+        run: python -m unittest discover -s tests/unit_tests/tools -p test_annotation_policy.py
+
+      - name: Run annotation policy and ty
         run: |
           source ./venv/bin/activate
           uv run --active ty --version
-
-          uv pip install -q tomli
-          TY_DIRS=$(python3 -c "
-          try:
-              import tomllib
-          except ModuleNotFoundError:
-              import tomli as tomllib
-          from pathlib import Path
-          data = tomllib.loads(Path('pyproject.toml').read_text())
-          dirs = set()
-          for override in data.get('tool', {}).get('ty', {}).get('overrides', []):
-              for pattern in override.get('include', []):
-                  dirs.add(pattern.replace('/**', ''))
-          print(' '.join(sorted(dirs)))
-          ")
-
-          echo "ty check targets: $TY_DIRS"
-          uv run --active ty check --verbose $TY_DIRS
+          uv run --active python tools/check_types.py
 
   Nemo_Linting_Test:
     needs: [pre-flight, linting, import_linting, type_checking]
@@ -580,9 +566,10 @@ jobs:
           # sets the stage floor. A 40-minute timeout leaves more than 2x headroom
           # over the measured merged runtime while bounding timeout retries.
           # Kimi Linear FA4 parity is also collected here; its kernel compilation
-          # is not included in the historical timings above.
+          # is not included in the historical timings above. tests/integration holds
+          # CPU-only end-to-end checks that no other job collects; they run here once.
           - test-name: L2_HF_Transformer
-            test-folder: hf_transformer,hf_transformer_llm,data,models/gemma4,models/kimi_linear
+            test-folder: hf_transformer,hf_transformer_llm,data,models/gemma4,models/kimi_linear,integration
             timeout: 40
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}

@@ -70,7 +70,7 @@ def _slice_thd_chunk_for_cp(
     total_tokens = int(chunk["input_ids"].shape[0])
     query_indices = contiguous_local_indices(cp_mesh, total_tokens, chunk["input_ids"].device)
 
-    out: dict[str, torch.Tensor | int | str | object] = {
+    out: dict[str, torch.Tensor | int | str | dist.ProcessGroup] = {
         "input_ids": chunk["input_ids"].index_select(0, query_indices).to(torch.int64).contiguous(),
         "labels": chunk["labels"].index_select(0, query_indices).to(torch.int64).contiguous(),
         "position_ids": chunk["position_ids"].index_select(0, query_indices).to(torch.int64).contiguous(),
@@ -162,7 +162,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
             )
         )
 
-    stacked: dict[str, torch.Tensor | int | str | object] = {}
+    stacked: dict[str, torch.Tensor | int | str | dist.ProcessGroup] = {}
     for key, value in chunks[0].items():
         if isinstance(value, torch.Tensor):
             stacked[key] = torch.stack([chunk[key] for chunk in chunks])  # type: ignore[list-item]

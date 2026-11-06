@@ -560,11 +560,11 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
-_hybrid_ep_runtime_signature: tuple[object, ...] | None = None
+_hybrid_ep_runtime_signature: tuple[int | torch.dtype | torch.device | None, ...] | None = None
 _hybrid_ep_initialized_capacity = 0
 
 
-def get_hybrid_ep_initialized_capacity(signature: tuple[object, ...]) -> int:
+def get_hybrid_ep_initialized_capacity(signature: tuple[int | torch.dtype | torch.device | None, ...]) -> int:
     """Return process-global initialized capacity after validating the resource signature.
 
     Args:
@@ -581,7 +581,9 @@ def get_hybrid_ep_initialized_capacity(signature: tuple[object, ...]) -> int:
     return _hybrid_ep_initialized_capacity
 
 
-def publish_hybrid_ep_initialized_capacity(signature: tuple[object, ...], capacity: int) -> None:
+def publish_hybrid_ep_initialized_capacity(
+    signature: tuple[int | torch.dtype | torch.device | None, ...], capacity: int
+) -> None:
     """Publish a successfully initialized process-global HybridEP capacity.
 
     Args:

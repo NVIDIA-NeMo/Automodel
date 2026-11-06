@@ -71,7 +71,7 @@ class Gemma4UnifiedForConditionalGeneration(
         self.state_dict_adapter = Gemma4UnifiedStateDictAdapter()
         apply_gemma4_cp_attention_backend_policy(self, Gemma4UnifiedTextAttention)
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie the output head to Gemma4 Unified's text input embedding."""
         self.lm_head.weight = self.model.language_model.embed_tokens.weight
 

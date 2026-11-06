@@ -579,169 +579,45 @@ class TestKimiVLStateDictAdapter:
 
 
 class TestKimiVLPipelineParallelismChunking:
-    """Tests for VLM chunking logic used in pipeline parallelism.
+    """Exercise the actual wrapper, with its decoder replaced by a local probe."""
 
-    These tests verify the chunking logic directly without instantiating
-    the full model to avoid CUDA code in MoE layers.
-    """
+    def test_text_then_image_consumes_staged_media_in_schedule_order(self):
+        from types import SimpleNamespace
 
-    def _simulate_pp_chunking_logic(
-        self,
-        pixel_values,
-        input_ids,
-        media_placeholder_token_id,
-        vlm_pixel_values_chunks,
-        vlm_image_grid_hws_chunks,
-        vlm_chunk_idx,
-    ):
-        """Simulate the PP chunking logic from KimiVLForConditionalGeneration.forward.
+        class RecordingBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = torch.nn.Module()
+                self.language_model.lm_head = torch.nn.Linear(3, 5, bias=False)
+                self.calls = []
 
-        Returns (pixel_values, image_grid_hws, new_chunk_idx).
-        """
-        image_grid_hws = None
+            def forward(self, **kwargs):
+                self.calls.append(kwargs)
+                return torch.zeros((*kwargs["input_ids"].shape, 3))
 
-        if (
-            pixel_values is None
-            and vlm_pixel_values_chunks is not None
-        ):
-            has_media_tokens = (
-                input_ids is not None
-                and media_placeholder_token_id is not None
-                and (input_ids == media_placeholder_token_id).any()
-            )
-            if has_media_tokens:
-                if vlm_chunk_idx < len(vlm_pixel_values_chunks):
-                    pixel_values = vlm_pixel_values_chunks[vlm_chunk_idx]
-                    image_grid_hws = vlm_image_grid_hws_chunks[vlm_chunk_idx]
-                    vlm_chunk_idx = vlm_chunk_idx + 1
+        model = KimiVLForConditionalGeneration.__new__(KimiVLForConditionalGeneration)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(text_config=SimpleNamespace(output_hidden_states=False))
+        model.model = RecordingBackbone()
+        pixels = torch.randn(4, 3, 2, 2)
+        grid = torch.tensor([[2, 2]])
+        model._vlm_pixel_values_chunks = [pixels[:0], pixels]
+        model._vlm_image_grid_hws_chunks = [grid[:0], grid]
+        model._vlm_chunk_idx = 0
+        ids = torch.tensor([[1, 2, 3]])
 
-        return pixel_values, image_grid_hws, vlm_chunk_idx
-
-    def test_pp_chunking_retrieves_when_media_tokens_present(self):
-        """Test chunking retrieves pixel_values when input has media tokens."""
-        chunk1 = torch.randn(1, 3, 56, 56)
-        chunk2 = torch.randn(1, 3, 56, 56)
-        grid1 = torch.tensor([[4, 4]])
-        grid2 = torch.tensor([[4, 4]])
-
-        input_ids = torch.tensor([[1, 2, 99, 3, 4]])  # 99 is media token
-
-        pixel_values, grid_hws, new_idx = self._simulate_pp_chunking_logic(
-            pixel_values=None,
-            input_ids=input_ids,
-            media_placeholder_token_id=99,
-            vlm_pixel_values_chunks=[chunk1, chunk2],
-            vlm_image_grid_hws_chunks=[grid1, grid2],
-            vlm_chunk_idx=0,
-        )
-
-        assert pixel_values is chunk1
-        assert grid_hws is grid1
-        assert new_idx == 1
-
-    def test_pp_chunking_increments_idx_per_call(self):
-        """Test chunk_idx increments with each simulated forward."""
-        chunks = [torch.randn(1, 3, 56, 56) for _ in range(3)]
-        grids = [torch.tensor([[4, 4]]) for _ in range(3)]
-        input_ids = torch.tensor([[1, 99, 2]])
-
-        idx = 0
-        for i in range(3):
-            _, _, idx = self._simulate_pp_chunking_logic(
-                pixel_values=None,
-                input_ids=input_ids,
-                media_placeholder_token_id=99,
-                vlm_pixel_values_chunks=chunks,
-                vlm_image_grid_hws_chunks=grids,
-                vlm_chunk_idx=idx,
-            )
-            assert idx == i + 1
-
-    def test_pp_chunking_skipped_when_no_media_tokens(self):
-        """Test chunking is skipped when input has no media tokens."""
-        chunk1 = torch.randn(1, 3, 56, 56)
-        grid1 = torch.tensor([[4, 4]])
-        input_ids = torch.tensor([[1, 2, 3, 4, 5]])  # No 99
-
-        pixel_values, grid_hws, new_idx = self._simulate_pp_chunking_logic(
-            pixel_values=None,
-            input_ids=input_ids,
-            media_placeholder_token_id=99,
-            vlm_pixel_values_chunks=[chunk1],
-            vlm_image_grid_hws_chunks=[grid1],
-            vlm_chunk_idx=0,
-        )
-
-        assert pixel_values is None
-        assert grid_hws is None
-        assert new_idx == 0
-
-    def test_pp_chunking_bypassed_when_pixel_values_provided(self):
-        """Test explicit pixel_values bypasses chunking logic."""
-        chunk1 = torch.randn(1, 3, 56, 56)
-        grid1 = torch.tensor([[4, 4]])
-        explicit_pv = torch.randn(1, 3, 56, 56)
-        input_ids = torch.tensor([[1, 99, 2]])
-
-        pixel_values, grid_hws, new_idx = self._simulate_pp_chunking_logic(
-            pixel_values=explicit_pv,  # Explicit pixel_values provided
-            input_ids=input_ids,
-            media_placeholder_token_id=99,
-            vlm_pixel_values_chunks=[chunk1],
-            vlm_image_grid_hws_chunks=[grid1],
-            vlm_chunk_idx=0,
-        )
-
-        # Should return the explicit pixel_values, not from chunks
-        assert pixel_values is explicit_pv
-        assert grid_hws is None
-        assert new_idx == 0
-
-    def test_pp_chunking_stops_at_end_of_chunks(self):
-        """Test chunking stops incrementing when all chunks consumed."""
-        chunk1 = torch.randn(1, 3, 56, 56)
-        grid1 = torch.tensor([[4, 4]])
-        input_ids = torch.tensor([[1, 99, 2]])
-
-        # First call
-        _, _, idx = self._simulate_pp_chunking_logic(
-            pixel_values=None,
-            input_ids=input_ids,
-            media_placeholder_token_id=99,
-            vlm_pixel_values_chunks=[chunk1],
-            vlm_image_grid_hws_chunks=[grid1],
-            vlm_chunk_idx=0,
-        )
-        assert idx == 1
-
-        # Second call - no more chunks
-        pixel_values, _, idx = self._simulate_pp_chunking_logic(
-            pixel_values=None,
-            input_ids=input_ids,
-            media_placeholder_token_id=99,
-            vlm_pixel_values_chunks=[chunk1],
-            vlm_image_grid_hws_chunks=[grid1],
-            vlm_chunk_idx=1,  # Already at end
-        )
-        assert pixel_values is None  # No chunk available
-        assert idx == 1  # Stays at 1
-
-    def test_pp_chunking_not_triggered_without_chunks(self):
-        """Test chunking not triggered when chunks is None."""
-        input_ids = torch.tensor([[1, 99, 2]])
-
-        pixel_values, grid_hws, new_idx = self._simulate_pp_chunking_logic(
-            pixel_values=None,
-            input_ids=input_ids,
-            media_placeholder_token_id=99,
-            vlm_pixel_values_chunks=None,  # No chunks set
-            vlm_image_grid_hws_chunks=None,
-            vlm_chunk_idx=0,
-        )
-
-        assert pixel_values is None
-        assert grid_hws is None
-        assert new_idx == 0
+        model(ids)
+        assert model.model.calls[-1]["pixel_values"] is None
+        assert model._vlm_chunk_idx == 1
+        model(ids)
+        assert model.model.calls[-1]["pixel_values"] is pixels
+        assert model.model.calls[-1]["image_grid_hws"] is grid
+        assert model._vlm_chunk_idx == 2
+        # Explicit media bypasses the side channel and leaves its frontier intact.
+        model(ids, pixel_values=pixels, image_grid_hws=grid)
+        assert model._vlm_chunk_idx == 2
+        with pytest.raises(ValueError, match="chunks exhausted"):
+            model(ids)
 
 
 class TestKimiVLRegistration:
