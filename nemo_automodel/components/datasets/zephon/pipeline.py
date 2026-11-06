@@ -39,6 +39,11 @@ class _SourceOverrides(TypedDict, total=False):
     stop_after_passes: int
 
 
+class _PrefetchOverrides(TypedDict, total=False):
+    buffer_size: int
+    parallelism: int
+
+
 def create_source_pipeline(
     options: ZephonOptions,
     *,
@@ -100,10 +105,16 @@ def create_source_pipeline(
         **overrides,
     )
     pipeline = zephon.Pipeline(source)
-    if options.runtime.prefetch_buffer_size:
-        pipeline.prefetch(
-            buffer_size=options.runtime.prefetch_buffer_size, parallelism=options.workers.prefetch_parallelism
-        )
+    prefetch = options.source.prefetch
+    if prefetch is not None:
+        # Presence inserts cache warmup before Fetch; unset fields leave the
+        # operator's defaults to Zephon, independently of runtime queue sizing.
+        prefetch_overrides: _PrefetchOverrides = {}
+        if prefetch.buffer_size is not None:
+            prefetch_overrides["buffer_size"] = prefetch.buffer_size
+        if prefetch.parallelism is not None:
+            prefetch_overrides["parallelism"] = prefetch.parallelism
+        pipeline.prefetch(**prefetch_overrides)
     if options.workers.fetch_parallelism is not None:
         pipeline.fetch_parallelism(options.workers.fetch_parallelism)
     return pipeline

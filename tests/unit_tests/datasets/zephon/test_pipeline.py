@@ -25,6 +25,7 @@ from zephon.work import StaticMixtureWorkSource, TokenEstimation
 from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonInstructionDatasetConfig,
+    ZephonPrefetchOptions,
     ZephonPretokenizedTextDatasetConfig,
     ZephonTextDatasetConfig,
 )
@@ -47,14 +48,16 @@ def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, so
             workers=replace(
                 config.zephon.workers,
                 fetch_parallelism=2,
-                prefetch_parallelism=3,
                 map_parallelism=4,
                 tokenize_parallelism=5,
                 pack_parallelism=6,
                 shuffle_parallelism=7,
             ),
-            runtime=replace(config.zephon.runtime, prefetch_buffer_size=8),
-            source=replace(config.zephon.source, token_estimation={"calibration_samples": 4}),
+            source=replace(
+                config.zephon.source,
+                token_estimation={"calibration_samples": 4},
+                prefetch=ZephonPrefetchOptions(buffer_size=8, parallelism=3),
+            ),
             packing=replace(config.zephon.packing, shuffle_after_pack=True, shuffle_buffer_size=8),
         ),
     )
@@ -82,6 +85,7 @@ def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, so
         assert preflight.call_args.kwargs["strict"] is True
         assert fetch.call_args.args[1] == 2
         assert prefetch.call_args.kwargs["parallelism"] == 3
+        assert prefetch.call_args.kwargs["buffer_size"] == 8
         assert pack.call_args.kwargs["parallelism"] == 6
         assert shuffle.call_args.kwargs["parallelism"] == 7
         if source_kind == "text":
@@ -220,3 +224,27 @@ def test_runtime_buffers_reach_zephon_without_replacing_none_or_zero(
     forwarded = next(call.kwargs for call in options.call_args_list if "mtp_mode" in call.kwargs)
     for name in ("prefetch_batches", "default_stage_prefetch", "op_queue_capacity", "mtp_buffer", "mtp_prefetch"):
         assert forwarded[name] == overrides.get(name)
+
+
+@pytest.mark.parametrize(
+    "prefetch,expected",
+    [
+        (None, None),
+        (ZephonPrefetchOptions(), {}),
+        (ZephonPrefetchOptions(buffer_size=8), {"buffer_size": 8}),
+        (ZephonPrefetchOptions(parallelism=3), {"parallelism": 3}),
+        (ZephonPrefetchOptions(buffer_size=8, parallelism=3), {"buffer_size": 8, "parallelism": 3}),
+    ],
+)
+def test_source_prefetch_inserts_only_when_enabled_and_delegates_unset_options(
+    config: DataloaderConfig, prefetch: ZephonPrefetchOptions | None, expected: dict[str, int] | None
+) -> None:
+    options = config.dataset_config.zephon
+    options = replace(options, source=replace(options.source, prefetch=prefetch))
+    with patch.object(Pipeline, "prefetch", autospec=True, side_effect=Pipeline.prefetch) as warm_cache:
+        create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
+    if expected is None:
+        warm_cache.assert_not_called()
+    else:
+        assert warm_cache.call_count == 1
+        assert warm_cache.call_args.kwargs == expected
