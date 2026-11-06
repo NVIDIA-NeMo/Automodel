@@ -261,10 +261,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            with self._autocast_context():
-                out = model(**batch)
-                logits = getattr(out, "logits", out)
-                loss = self.loss_fn(logits, labels.view(-1))
+            out = model(**batch)
+            logits = getattr(out, "logits", out)
+            loss = self.loss_fn(logits.float(), labels.view(-1))
             # Keep the summed loss, not the per-microbatch mean: means cannot be
             # added back together, and the reported metric is normalized by the
             # same global label count the gradient uses.
@@ -389,10 +388,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             }
             labels = batch.pop("labels")
             batch = filter_forward_kwargs(model, batch)
-            with self._autocast_context():
-                out = model(**batch)
-                logits = getattr(out, "logits", out)
-                loss = self.loss_fn(logits, labels.view(-1))
+            out = model(**batch)
+            logits = getattr(out, "logits", out)
+            loss = self.loss_fn(logits.float(), labels.view(-1))
             # Summed, not the batch mean: the last batch of a shard is usually
             # short, so batch means cannot be averaged with equal weight. In FP32,
             # so a half-precision loss cannot overflow while the sum grows.

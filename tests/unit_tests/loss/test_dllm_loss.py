@@ -237,6 +237,22 @@ class TestComputePerTokenNLL:
         ref = F.cross_entropy(logits.reshape(-1, 32), targets.reshape(-1), reduction="none").reshape(2, 8)
         assert torch.allclose(nll, ref)
 
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, torch.float64])
+    def test_precision_and_gradients_without_recipe_autocast(self, dtype):
+        torch.manual_seed(42)
+        logits = torch.randn(2, 8, 32, dtype=dtype, requires_grad=True)
+        targets = torch.randint(0, 32, (2, 8))
+        reference = logits.detach().to(torch.float64 if dtype == torch.float64 else torch.float32).requires_grad_()
+        expected = torch.logsumexp(reference, -1) - reference.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        actual = _compute_per_token_nll(logits, targets)
+        assert actual.dtype == reference.dtype
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        upstream = torch.randn_like(expected)
+        actual.backward(upstream)
+        expected.backward(upstream)
+        assert logits.grad is not None and reference.grad is not None
+        torch.testing.assert_close(logits.grad, reference.grad.to(dtype), rtol=1e-5, atol=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # DFlashDecayLoss
