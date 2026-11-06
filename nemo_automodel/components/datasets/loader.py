@@ -32,7 +32,7 @@ from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from dataclasses import dataclass, field, fields, is_dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypedDict, TypeVar, cast, runtime_checkable
 
 from torch.utils.data import Dataset, IterableDataset
 from torch.utils.data.sampler import Sampler
