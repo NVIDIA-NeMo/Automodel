@@ -14,12 +14,16 @@
 
 """Zephon data backend for AutoModel recipes."""
 
-from nemo_automodel.components.datasets.zephon.config import (
-    ZephonDataloaderConfig,
-    ZephonInstructionDatasetConfig,
-    ZephonPretokenizedTextDatasetConfig,
-    ZephonTextDatasetConfig,
-)
+import importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.datasets.zephon.config import (
+        ZephonDataloaderConfig,
+        ZephonInstructionDatasetConfig,
+        ZephonPretokenizedTextDatasetConfig,
+        ZephonTextDatasetConfig,
+    )
 
 __all__ = [
     "ZephonDataloaderConfig",
@@ -27,3 +31,18 @@ __all__ = [
     "ZephonPretokenizedTextDatasetConfig",
     "ZephonTextDatasetConfig",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """Load configuration only when requested, keeping worker helpers lightweight."""
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(".config", __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose the public configuration classes before loading them."""
+    return sorted(__all__)

@@ -23,11 +23,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
-    instruction_messages,
-    instruction_prompt_completion,
-)
-
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
@@ -107,6 +102,12 @@ def normalize_instruction_chat(payload: Mapping[str, Any], *, config: ZephonInst
     prompt-completion inputs retain native prompt whitespace and carry the
     complete prompt in one user message. No tokenization or masking occurs here.
     """
+    # Raw-text and pretokenized workers do not need instruction formatting.
+    from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+        instruction_messages,
+        instruction_prompt_completion,
+    )
+
     mapped = map_instruction_fields(payload, config)
     if config.use_hf_chat_template:
         messages = instruction_messages(mapped)
