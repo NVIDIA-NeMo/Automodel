@@ -35,7 +35,7 @@ from nemo_automodel.components.moe.state_dict_mixin import (
     _PARAMWRAPPER_LAYOUT_MODERN,
     MoESplitExpertsStateDictMixin,
 )
-from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn, owns_packed_expert_storage
 from nemo_automodel.shared.peft_config import PeftConfig as _AutomodelPeftConfig
 
 if TYPE_CHECKING:
@@ -145,6 +145,32 @@ class _ConsolidatedHFMetadataExporter(Protocol):
         ...
 
 
+def _require_no_packed_expert_storage(model_state) -> None:
+    """Refuse consolidated HF saves of models whose experts live in packed (mxfp4 / nvfp4) storage.
+
+    Their state dicts carry packed codes and scales under non-HF names that no loader reads; the PEFT adapter
+    is the supported artifact for such runs.
+
+    Raises:
+        ValueError: If any model part keeps packed expert storage.
+    """
+    model = getattr(model_state, "model", None)
+    parts = model if isinstance(model, (list, tuple)) else [model] if model is not None else []
+    packed = [
+        name
+        for part in parts
+        if part is not None
+        for name, module in part.named_modules()
+        if owns_packed_expert_storage(module)
+    ]
+    if packed:
+        raise ValueError(
+            "checkpoint.save_consolidated is not supported with packed-expert storage (PeftConfig.expert_weight_format "
+            f"mxfp4 / nvfp4; modules: {packed[:3]}{'...' if len(packed) > 3 else ''}); set "
+            "checkpoint.save_consolidated: false and save the PEFT adapter."
+        )
+
+
 class ConsolidatedHFAddon:
     """
     Addon that writes consolidated Hugging Face metadata alongside sharded weights.
@@ -167,6 +193,7 @@ class ConsolidatedHFAddon:
             v4_compatible (bool): Preserve the source config beside the generated v5 config when available.
         """
         model_state = kwargs["model_state"]
+        _require_no_packed_expert_storage(model_state)
         hf_metadata_dir = kwargs["hf_metadata_dir"]
         fqn_to_file_index_mapping = kwargs["fqn_to_file_index_mapping"]
         fqn_to_dtype_mapping = kwargs.get("fqn_to_dtype_mapping", None)

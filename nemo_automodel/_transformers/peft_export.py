@@ -27,6 +27,25 @@ from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+from nemo_automodel.shared.parameter_names import owns_packed_expert_storage
+
+
+def _require_no_packed_expert_storage(model: nn.Module, what: str) -> None:
+    """Refuse exports that would need the floating-point expert weights of packed-expert modules.
+
+    The mxfp4 / nvfp4 storage replaces ``gate_and_up_projs`` / ``down_projs`` with packed codes and
+    scales; folding adapters into them or writing them as HF weights is not implemented.
+
+    Raises:
+        ValueError: If any module keeps its experts in a packed format.
+    """
+    packed = [name for name, module in model.named_modules() if owns_packed_expert_storage(module)]
+    if packed:
+        raise ValueError(
+            f"{what} is not supported for packed-expert storage (PeftConfig.expert_weight_format mxfp4 / nvfp4; "
+            f"modules: {packed[:3]}{'...' if len(packed) > 3 else ''}). Save the PEFT adapter instead "
+            "(checkpoint.save_consolidated: false) and merge it into a floating-point base offline."
+        )
 
 
 def _is_lora_state_key(key: str) -> bool:
@@ -49,6 +68,7 @@ def _merge_and_get_hf_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         the corresponding model weight; model-family adapters may split grouped
         tensors into canonical per-expert tensors.
     """
+    _require_no_packed_expert_storage(model, "Merged PEFT export")
     state_dict = dict(model.state_dict())
     dtensor_keys = [key for key, tensor in state_dict.items() if isinstance(tensor, DTensor)]
     if dtensor_keys:

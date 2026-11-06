@@ -24,6 +24,7 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
@@ -71,7 +72,12 @@ from nemo_automodel.components.models.common.utils import (
     prepare_frozen_parameters_for_sharding,
 )
 from nemo_automodel.components.moe.experts import GroupedExpertsTE
-from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
+from nemo_automodel.components.moe.quantized_experts import (
+    apply_mxfp4_to_moe_experts,
+    apply_nvfp4_to_moe_experts,
+    validate_nvfp4_checkpoint_config,
+    validate_packed_expert_topology,
+)
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.compile_utils import compile_model
@@ -155,6 +161,23 @@ def _verify_safe_moe_tp_weights_loaded(model, *, checkpoint_loaded: bool) -> Non
 
 
 #  PEFT / quantization helpers
+def _validate_nvfp4_checkpoint(pretrained_model_name_or_path: str, cache_dir: str | None) -> None:
+    """Check a pretrained checkpoint's quantization metadata before its NVFP4 experts are loaded packed.
+
+    A local directory is read in place; a Hub repository contributes only its ``hf_quant_config.json`` /
+    ``config.json`` (the base load fetches the weights later).
+    """
+    if os.path.isdir(pretrained_model_name_or_path):
+        checkpoint_dir = pretrained_model_name_or_path
+    else:
+        from huggingface_hub import snapshot_download
+
+        checkpoint_dir = snapshot_download(
+            pretrained_model_name_or_path, cache_dir=cache_dir, allow_patterns=["hf_quant_config.json", "config.json"]
+        )
+    validate_nvfp4_checkpoint_config(checkpoint_dir)
+
+
 def _apply_peft_and_lower_precision(
     model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
 ):
@@ -170,6 +193,8 @@ def _apply_peft_and_lower_precision(
         apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
         if peft_config.expert_weight_format == "mxfp4":
             model = apply_mxfp4_to_moe_experts(model)
+        elif peft_config.expert_weight_format == "nvfp4":
+            model = apply_nvfp4_to_moe_experts(model)
 
     # FP8
     if fp8_config is not None:
@@ -664,6 +689,20 @@ def apply_model_infrastructure(
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
     # This allows copy operations between meta tensors to succeed (they're no-ops)
+    if peft_config is not None:
+        # Packed-expert storage (mxfp4 / nvfp4) is sharded along the expert axis only: refuse the layouts
+        # FSDP would otherwise apply to the packed tensors before any module is replaced.
+        expert_weight_format = getattr(peft_config, "expert_weight_format", "unquantized")
+        validate_packed_expert_topology(
+            expert_weight_format,
+            world_size=get_world_size_safe(),
+            ep_size=mesh.ep_size,
+            pp_size=mesh.pp_size,
+        )
+        if expert_weight_format == "nvfp4" and pretrained_model_name_or_path and load_base_model:
+            # The packed experts are filled by the base load through the state-dict adapter; only a ModelOpt
+            # NVFP4 (16-column block) export has the layout the adapter maps onto them.
+            _validate_nvfp4_checkpoint(pretrained_model_name_or_path, cache_dir)
     peft_ctx = init_empty_weights() if is_meta_device else nullcontext()
     with peft_ctx:
         model = _apply_peft_and_lower_precision(

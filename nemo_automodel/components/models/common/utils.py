@@ -33,7 +33,10 @@ from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
-from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.parameter_names import (
+    canonical_parameter_fqn,
+    packed_expert_parameter_names,
+)
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -1605,6 +1608,10 @@ def compute_lm_head_logits(
 def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
     """Drop FP32 master storage for frozen parameters before distributed wrapping.
 
+    The packed parameters of packed-expert modules (mxfp4 / nvfp4) keep their storage dtype: the integer codes
+    and the e4m3 / e8m0 / fp32 scales are the weight format, so a later whole-model cast must leave them alone.
+    Other parameters of such modules (adapters, biases) follow the ordinary rules.
+
     Trainable parameters retain their configured storage. Model-declared FP32
     precision requirements and checkpoint FP32 compute hints remain authoritative.
     Record the resulting parameter dtypes so model initialization does not undo
@@ -1615,6 +1622,18 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
             parameters may be on the meta device. Call before optimizer creation.
         compute_dtype: Reduced compute dtype, or None to retain existing storage.
     """
+    _reduce_frozen_parameter_storage(model, compute_dtype)
+    for module in model.modules():
+        packed_names = packed_expert_parameter_names(module)
+        if packed_names:
+            module._preserve_parameter_dtypes = {
+                **(getattr(module, "_preserve_parameter_dtypes", None) or {}),
+                **{name: getattr(module, name).dtype for name in packed_names},
+            }
+
+
+def _reduce_frozen_parameter_storage(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
+    """Cast frozen fp32 parameters to the compute dtype and record the dtypes later casts must keep."""
     has_frozen_parameters = any(not parameter.requires_grad for parameter in model.parameters())
     has_trainable_parameters = any(parameter.requires_grad for parameter in model.parameters())
 
@@ -1644,11 +1663,19 @@ def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torc
         for name, parameter in model.named_parameters(remove_duplicate=False)
         if any(keyword in name for keyword in fp32_keywords)
     }
+    # Packed-expert storage (mxfp4 / nvfp4): the codes, block scales and the fp32 row scales are the weight format,
+    # not fp32 master weights. Identified by the names the storage mixins publish, because the per-parameter dtype
+    # hint does not survive ``init_empty_weights`` (it re-creates every registered parameter).
+    packed_parameter_ids = {
+        id(getattr(module, name)) for module in model.modules() for name in packed_expert_parameter_names(module)
+    }
     preserve_storage = False
     for parameter in model.parameters():
         if parameter.requires_grad or parameter.dtype not in (torch.float32, compute_dtype):
             continue
         if id(parameter) in pinned_ids or getattr(parameter, "_hf_compute_dtype", None) == torch.float32:
+            continue
+        if id(parameter) in packed_parameter_ids:
             continue
         # Initialization-only storage change: no autograd graph, optimizer, or
         # distributed wrapper owns these plain parameters yet. Preserve identity.
@@ -1703,9 +1730,20 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
         DTensor = ()
 
     fp32_keywords = _get_fp32_module_keywords(model)
+    # Packed-expert storage (mxfp4 / nvfp4): integer codes plus e4m3 / e8m0 / fp32 scale tensors whose
+    # storage dtype is part of the format; casting the scales would change the frozen base.
+    packed_parameter_fqns = {
+        f"{module_name}.{name}" if module_name else name
+        for module_name, module in model.named_modules()
+        for name in packed_expert_parameter_names(module)
+    }
 
     def _is_fp32_pinned(name: str) -> bool:
         return any(kw in name for kw in fp32_keywords)
+
+    def _is_packed_storage(name: str) -> bool:
+        """Whether the parameter named ``name`` is a packed code or scale tensor of a packed-expert module."""
+        return name in packed_parameter_fqns
 
     # A LoRA-style module directly owns frozen base params and registers trainable adapter
     # descendants. On a one-rank run FSDP is skipped, so cast the whole mixed subtree to keep
@@ -1730,7 +1768,12 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
                 if not subtree:
                     break
                 subtree, _, _ = subtree.rpartition(".")
-        elif param.is_floating_point() and not _is_fp32_pinned(name) and not (DTensor and isinstance(param, DTensor)):
+        elif (
+            param.is_floating_point()
+            and not _is_fp32_pinned(name)
+            and not _is_packed_storage(name)
+            and not (DTensor and isinstance(param, DTensor))
+        ):
             frozen_param_owners.add(owner_name)
 
     mixed_subtrees = frozen_param_owners & trainable_subtrees
@@ -1749,7 +1792,7 @@ def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.
     for name, param in named_params:
         if (param.requires_grad and not _is_in_subtrees(name, mixed_subtrees)) or _is_fp32_pinned(name):
             continue
-        if DTensor and isinstance(param, DTensor):
+        if _is_packed_storage(name) or (DTensor and isinstance(param, DTensor)):
             continue
         if param.is_floating_point() and param.dtype != compute_dtype:
             param.data = param.data.to(compute_dtype)
