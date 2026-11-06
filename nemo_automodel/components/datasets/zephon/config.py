@@ -214,11 +214,35 @@ class ZephonWorkerOptions:
 
 @dataclass(frozen=True, kw_only=True)
 class ZephonRuntimeOptions:
-    """Pipeline runner, shared-memory transport and prefetch buffering."""
+    """Pipeline execution and queue capacities; None uses Zephon's automatic sizing."""
 
     runner: Literal["process", "threads", "inline"] = "process"
     mtp_mode: bool = True
+    prefetch_batches: int | None = None
+    """Pipeline-output prefetch depth in batches; zero disables this prefetch buffer."""
+    default_stage_prefetch: int | None = None
+    """Prefetch depth between stages; zero disables the optional stage prefetch buffer."""
+    op_queue_capacity: int | None = None
+    """Positive queue capacity between operators within a stage."""
+    mtp_buffer: int | None = None
+    """Positive capacity of the MTP engine-to-consumer IPC queue."""
+    mtp_prefetch: int | None = None
+    """Consumer-side MTP prefetch depth; zero disables the background receiver thread."""
+    # Optional source/cache lookahead via Pipeline.prefetch(), not batch or stage
+    # buffering. Zero omits that operator; the runtime queues above still apply.
     prefetch_buffer_size: int = 0
+
+    def __post_init__(self) -> None:
+        for name, value, minimum in (
+            ("prefetch_batches", self.prefetch_batches, 0),
+            ("default_stage_prefetch", self.default_stage_prefetch, 0),
+            ("op_queue_capacity", self.op_queue_capacity, 1),
+            ("mtp_buffer", self.mtp_buffer, 1),
+            ("mtp_prefetch", self.mtp_prefetch, 0),
+        ):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < minimum):
+                requirement = "positive" if minimum else "nonnegative"
+                raise ValueError(f"{name} must be a {requirement} integer or None")
 
 
 @dataclass(frozen=True, kw_only=True)
