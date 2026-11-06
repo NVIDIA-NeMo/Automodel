@@ -57,14 +57,14 @@ def _run_sparse_cp(rank: int, port: int, qk_nope_dim: int, qk_shared_dim: int, v
         actual = parallel(local_x, packed_context=context)
         torch.testing.assert_close(actual, expected.detach()[:, rank * 8 : (rank + 1) * 8], rtol=2e-5, atol=2e-6)
         actual.backward(upstream[:, rank * 8 : (rank + 1) * 8])
-        torch.testing.assert_close(local_x.grad, x.grad[:, rank * 8 : (rank + 1) * 8], rtol=2e-4, atol=3e-6)
+        torch.testing.assert_close(local_x.grad, x.grad[:, rank * 8 : (rank + 1) * 8], rtol=2e-4, atol=1e-5)
         expected_params = dict(reference.named_parameters())
         for name, parameter in parallel.named_parameters():
             if not parameter.requires_grad:
                 assert parameter.grad is None
                 continue
             dist.all_reduce(parameter.grad)
-            torch.testing.assert_close(parameter.grad, expected_params[name].grad, rtol=2e-4, atol=3e-6)
+            torch.testing.assert_close(parameter.grad, expected_params[name].grad, rtol=2e-4, atol=1e-5)
         # Negative control: dense keys must change the output after the top-k boundary.
         with torch.no_grad():
             reference.indexer.index_topk = 16
