@@ -334,3 +334,31 @@ def test_kda_short_sequences_use_the_configured_chunk_kernel(monkeypatch):
         for seq_len in (32, 128):
             attn._kda_core(torch.randn(1, seq_len, config.hidden_size))
     assert calls == [32, 128, 32, 128]
+
+
+@pytest.mark.parametrize("enable_xdoc_attention", [False, True])
+def test_attention_document_ids_control_attention_and_gradients(enable_xdoc_attention):
+    """The selected document boundaries govern attention and gradients."""
+    torch.manual_seed(7)
+    config = _tiny_kimi_config()
+    config.first_k_dense_replace = config.num_hidden_layers
+    model = KimiLinear48BForCausalLM(config, backend=_backend_config())
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    model.eval()
+    tokens = torch.tensor([[3, 4, 5, 6, 7, 8]])
+    original_ids = torch.tensor([[1, 1, 1, 2, 2, 2]])
+    selected_ids = torch.ones_like(original_ids) if enable_xdoc_attention else original_ids
+
+    output = model(
+        input_ids=tokens,
+        attention_mask=selected_ids,
+        _packed_seq_ids=selected_ids,
+    ).logits
+    reference = model(input_ids=tokens, attention_mask=selected_ids).logits
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    output[:, 3:].square().sum().backward()
+    gradient = model.model.embed_tokens.weight.grad
+    assert torch.isfinite(gradient).all()
+    assert bool(gradient[tokens[0, :3]].abs().max() > 0) == enable_xdoc_attention
+    assert gradient[tokens[0, 3:]].abs().max() > 0
+    assert original_ids.tolist() == [[1, 1, 1, 2, 2, 2]]
