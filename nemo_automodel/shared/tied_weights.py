@@ -13,9 +13,13 @@
 # limitations under the License.
 
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
@@ -35,7 +39,7 @@ class TieSupport(Enum):
     UNTIED_ONLY = "untied_only"
 
 
-def get_controlling_tie_word_embeddings(config: object) -> bool:
+def get_controlling_tie_word_embeddings(config: "PretrainedConfig") -> bool:
     """Resolve the ``tie_word_embeddings`` flag that actually controls LM-head tying.
 
     Hugging Face ties ``lm_head`` based on the top-level config flag. Full Omni

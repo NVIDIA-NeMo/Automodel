@@ -150,6 +150,9 @@ def plan_sparse_indices(indices: torch.Tensor, key_count: int) -> tuple[torch.Te
 def _padded_head_count(num_heads: int, major: int) -> int:
     """Return the FlashMLA-supported query-head count for one SM generation."""
     if major >= 10:
+        # FlashMLA rejects H96, but accepts its zero-padded H128 forward.
+        if num_heads == 96:
+            return 128
         for padded in (64, 128):
             if num_heads == padded or (num_heads < padded and padded % num_heads == 0):
                 return padded
@@ -308,7 +311,9 @@ class _CudnnSparseAttention(torch.autograd.Function):
                 used_dummy = True
                 q_input = torch.zeros_like(q[:1])
                 out_input = torch.zeros_like(out[:1])
-                grad_input = torch.zeros_like(grad_output[:1])
+                # zeros_like preserves a head-major gradient's ambiguous size-one stride;
+                # cuDNN's CuTe conversion requires a canonical contiguous dummy layout.
+                grad_input = grad_output.new_zeros((1, *grad_output.shape[1:]))
                 lse_input = torch.zeros_like(lse[:1])
                 indices_kernel = torch.zeros_like(indices[:1])
                 topk_length_kernel = torch.ones_like(topk_length[:1])
@@ -320,17 +325,19 @@ class _CudnnSparseAttention(torch.autograd.Function):
                 indices_kernel = indices.index_select(0, valid_row_indices)
                 topk_length_kernel = topk_length.index_select(0, valid_row_indices)
 
-        q_kernel, sink_kernel = _pad_attention_heads(q_input, attn_sink, ctx.padded_heads)
-        if ctx.padded_heads == q.shape[1]:
+        # cuDNN supports native H96 (including D576); only FlashMLA forward needs head padding.
+        backward_heads = 96 if q.shape[1] == 96 else ctx.padded_heads
+        q_kernel, sink_kernel = _pad_attention_heads(q_input, attn_sink, backward_heads)
+        if backward_heads == q.shape[1]:
             out_kernel = out_input
             grad_kernel = grad_input.contiguous()
             lse_kernel = lse_input
         else:
-            out_kernel = out_input.new_zeros((out_input.shape[0], ctx.padded_heads, out_input.shape[2]))
+            out_kernel = out_input.new_zeros((out_input.shape[0], backward_heads, out_input.shape[2]))
             out_kernel[:, : out_input.shape[1]] = out_input
-            grad_kernel = grad_input.new_zeros((grad_input.shape[0], ctx.padded_heads, grad_input.shape[2]))
+            grad_kernel = grad_input.new_zeros((grad_input.shape[0], backward_heads, grad_input.shape[2]))
             grad_kernel[:, : grad_input.shape[1]] = grad_input
-            lse_kernel = lse_input.new_zeros((lse_input.shape[0], ctx.padded_heads))
+            lse_kernel = lse_input.new_zeros((lse_input.shape[0], backward_heads))
             lse_kernel[:, : lse_input.shape[1]] = lse_input
 
         result = _CUDNN_DSA.sparse_attention_backward_wrapper(
