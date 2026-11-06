@@ -58,7 +58,7 @@ model:
     experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
-    enable_hf_state_dict_adapter: false
+    enable_hf_state_dict_adapter: true
 checkpoint:
   enabled: true
   checkpoint_dir: /tmp/checkpoints/

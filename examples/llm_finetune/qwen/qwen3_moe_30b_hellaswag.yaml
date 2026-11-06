@@ -38,7 +38,7 @@ model:
     experts: torch
     dispatcher: torch
     fake_balanced_gate: false
-    enable_hf_state_dict_adapter: false
+    enable_hf_state_dict_adapter: true
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_sft

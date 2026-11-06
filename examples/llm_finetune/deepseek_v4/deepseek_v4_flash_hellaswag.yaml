@@ -86,7 +86,7 @@ model:
     dispatcher_hybridep_permute_fusion: true
     dispatcher_recompute_cache: moe_tail
     enable_fsdp_optimizations: true
-    enable_hf_state_dict_adapter: false
+    enable_hf_state_dict_adapter: true
     experts: torch_mm
     fake_balanced_gate: false
     fake_gate_noise: 0.0

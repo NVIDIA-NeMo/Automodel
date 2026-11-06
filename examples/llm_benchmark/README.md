@@ -6,6 +6,7 @@ They are retained for now for historical comparisons and for variants that do no
 
 For the migrated pairs below, the canonical `llm_finetune` recipe owns the runtime tuning:
 parallelism, backend/kernel selection, activation checkpointing, compile options, and global/local batch sizes.
+Pretrained weight-loading adapters remain enabled; random-initialization benchmark load flags are not runtime tuning.
 Run that training config to measure performance on its real dataset. `ci.perf_testing` selects the schedule and walltime;
 it does not duplicate the workload or permit generic configuration overrides. Its sole optional model override is the
 boolean `fake_balanced_gate`; omit it to measure the recipe's real routing. Label any explicit balanced-routing result.
