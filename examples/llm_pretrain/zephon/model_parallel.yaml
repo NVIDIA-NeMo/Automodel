@@ -38,9 +38,7 @@ dataset:
       seq_len: 63
     source:
       chunk_size: 32
-      stop_after_passes: 1
     checkpoint:
-      aggregate_store: torch://
       run_id: zephon-model-parallel
 distributed:
   strategy: fsdp2
