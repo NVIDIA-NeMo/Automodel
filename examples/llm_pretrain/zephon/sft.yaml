@@ -27,8 +27,6 @@ model:
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonInstructionDatasetConfig
   column_mapping: {question: question, answer: answer}
-  answer_only_loss_mask: true
-  use_hf_chat_template: false
   tokenizer:
     pretrained_model_name_or_path: work/zephon-tiny/tokenizer
   zephon:
@@ -39,12 +37,9 @@ dataset:
     packing:
       seq_len: 63
       pack_algorithm: best_fit
-      pack_num_bins: 8
     source:
       chunk_size: 32
-      stop_after_passes: 1
     checkpoint:
-      aggregate_store: torch://
       run_id: zephon-tiny-sft
 distributed:
   strategy: fsdp2
