@@ -40,6 +40,41 @@ canonical training settings first. Do not restore a second performance-only copy
 | [step/step_3.5_flash_te_deepep.yaml](step/step_3.5_flash_te_deepep.yaml) | [stepfun/step_3.5_flash_hellaswag_pp.yaml](../llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml) |
 | [step/step_5_preview_full92_mock_h100.yaml](step/step_5_preview_full92_mock_h100.yaml) | [stepfun/step_5_preview_tulu3_sft.yaml](../llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml) |
 
+## GB200 counterparts
+
+GB200 recipes use four GPUs per node and require an ARM64 runtime image on a GB200 cluster.
+They are scheduled separately from EOS/H100; an EOS result does not validate these configurations.
+
+| Retained legacy benchmark | Canonical GB200 training recipe | Nodes |
+|---|---|---:|
+| [deepseek/deepseek_v4_flash_mok_32gpu.yaml](deepseek/deepseek_v4_flash_mok_32gpu.yaml) | [deepseek_v4/deepseek_v4_flash_hellaswag_mok_gb200.yaml](../llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_mok_gb200.yaml) | 8 |
+| [glm/glm_4.7_flash_mok_4gpu.yaml](glm/glm_4.7_flash_mok_4gpu.yaml) | [glm/glm_4.7_flash_hellaswag_mok_gb200.yaml](../llm_finetune/glm/glm_4.7_flash_hellaswag_mok_gb200.yaml) | 1 |
+| [gpt_oss/gptoss_120b_te_deepep_gb200.yaml](gpt_oss/gptoss_120b_te_deepep_gb200.yaml) | [gpt_oss/gpt_oss_120b_te_deepep_gb200.yaml](../llm_finetune/gpt_oss/gpt_oss_120b_te_deepep_gb200.yaml) | 8 |
+| [gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml](gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml) | [gpt_oss/gpt_oss_120b_te_mxfp8_gb200.yaml](../llm_finetune/gpt_oss/gpt_oss_120b_te_mxfp8_gb200.yaml) | 8 |
+| [kimi/kimi_k3_gb200.yaml](kimi/kimi_k3_gb200.yaml) | [kimi/k3_hellaswag.yaml](../llm_finetune/kimi/k3_hellaswag.yaml) | 64 |
+| [kimi/kimi_k3_gb200_2k.yaml](kimi/kimi_k3_gb200_2k.yaml) | [kimi/k3_hellaswag_te_torchmm_gb200.yaml](../llm_finetune/kimi/k3_hellaswag_te_torchmm_gb200.yaml) | 64 |
+| [nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml](nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml) | [nemotron/nemotron_super_v3_hellaswag_te_hybridep_gb200.yaml](../llm_finetune/nemotron/nemotron_super_v3_hellaswag_te_hybridep_gb200.yaml) | 4 |
+| [qwen/qwen3_moe_30b_compile_attn_gb200.yaml](qwen/qwen3_moe_30b_compile_attn_gb200.yaml) | [qwen/qwen3_moe_30b_hellaswag_compile_attn_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_hellaswag_compile_attn_gb200.yaml) | 2 |
+| [qwen/qwen3_moe_30b_te_bf16_gb200.yaml](qwen/qwen3_moe_30b_te_bf16_gb200.yaml) | [qwen/qwen3_moe_30b_hellaswag_te_bf16_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_hellaswag_te_bf16_gb200.yaml) | 2 |
+| [qwen/qwen3_moe_30b_te_deepep_gb200.yaml](qwen/qwen3_moe_30b_te_deepep_gb200.yaml) | [qwen/qwen3_moe_30b_hellaswag_te_deepep_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_hellaswag_te_deepep_gb200.yaml) | 2 |
+| [qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml](qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml) | [qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml) | 2 |
+| [qwen/qwen3_moe_30b_torchmm_gb200.yaml](qwen/qwen3_moe_30b_torchmm_gb200.yaml) | [qwen/qwen3_moe_30b_hellaswag_torchmm_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_hellaswag_torchmm_gb200.yaml) | 2 |
+
+Both Kimi variants retain real routing; benchmark-only static routing is disabled because it requires fake gates.
+The existing packed Qwen MXFP8 training config retains unfused RoPE because fused RoPE is documented to produce NaN gradients with THD inputs.
+The two MoK variants require a Mixture-of-Kittens image build (`MOK_ARCH`); the standard image generator excludes them until that dependency is available.
+The Nemotron Super GB200 variant retains the existing AM-156 known-issue exclusion; scheduling metadata does not clear that issue.
+
+Nine GB200 benchmark variants still have no exact-model canonical training counterpart: the six DeepSeek-V3 variants,
+the two Qwen3-235B variants, and Mistral Large 4. They remain standalone benchmarks; this migration does not substitute
+a different model (such as DeepSeek-V3.2 or Qwen3-30B) and claim equivalence.
+
+The two Kimi variants retain their respective kernel and pipeline tuning on the same real HellaSwag dataset.
+The benchmark names `2k` and `8k` describe their historical synthetic input lengths; the canonical training data and packing determine actual sequence lengths.
+
+GPU validation results must distinguish scheduled, excluded, queued, failed, and successful recipes.
+A legacy synthetic TPS value is not a pass threshold for these real-data recipes.
+
 ## Retained synthetic counterpart
 
 `llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml` already uses `MockIterableDataset` despite its directory.

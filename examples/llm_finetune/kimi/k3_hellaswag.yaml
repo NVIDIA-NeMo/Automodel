@@ -20,8 +20,8 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 8
+  global_batch_size: 4096
+  local_batch_size: 128
   ckpt_every_steps: 100
   val_every_steps: 100
   max_steps: 100
@@ -51,10 +51,15 @@ model:
     attn: eager
     linear: torch
     rms_norm: torch_fp32
-    experts: torch_mm
-    dispatcher: torch
+    experts: te
+    dispatcher: hybridep
+    dispatcher_num_sms: 32
     rope_fusion: false
-    fake_balanced_gate: false
+    fake_balanced_gate: false  # benchmark only — see header
+    fake_gate_noise: 0.0
+    compile_situ: true
+    compile_norm: true
+    benchmark_static_routing: false  # requires fake_balanced_gate, noise 0.0
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
@@ -73,9 +78,10 @@ distributed:
   ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
+  enable_fsdp2_prefetch: true
   pipeline:
     pp_schedule: 1f1b
-    pp_microbatch_size: 1
+    pp_microbatch_size: 2
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
@@ -139,9 +145,18 @@ clip_grad_norm:
 
 prewarm:
   comm_groups: true
+  fla_gdn_autotune: true
+  cublas_backward: true
 
 ci:
   recipe_owner: huiyingl
   nodes: 64
   cluster_tag: gb200
-  time: "01:30:00"
+  time: "02:00:00"
+  nproc_per_node: 4
+  perf_testing:
+    schedule: weekly
+  env_vars:
+    # Keep each EP32 group within one NVLink block: 8 nodes x 4 GPUs.
+    SBATCH_SEGMENT_SIZE: "8"
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
