@@ -137,5 +137,82 @@ ci:
     trust_remote_code: true
     hf_device_map_auto: true
     dataset.num_samples_limit: 500
+  # Synthetic performance settings migrated from examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml.
+  # Reset changed components before setting leaves; "none" is the CLI null token.
   perf_testing:
     schedule: nightly
+    time: 00:25:00
+    config_overrides:
+      recipe: BenchmarkingRecipeForNextTokenPrediction
+      step_scheduler: none
+      step_scheduler.gc_every_steps: 10
+      step_scheduler.global_batch_size: 512
+      step_scheduler.local_batch_size: 4
+      step_scheduler.ckpt_every_steps: 1000
+      step_scheduler.val_every_steps: 1000
+      step_scheduler.num_epochs: 1
+      step_scheduler.max_steps: 30
+      rng: none
+      model: none
+      model._target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+      model.config._target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+      model.config.pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
+      model.trust_remote_code: true
+      model.backend._target_: nemo_automodel.components.models.common.BackendConfig
+      model.backend.attn: te
+      model.backend.linear: te
+      model.backend.rms_norm: te
+      model.backend.rope_fusion: true
+      model.backend.experts: torch_mm
+      model.backend.dispatcher: deepep
+      model.backend.fake_balanced_gate: true
+      model.backend.enable_hf_state_dict_adapter: true
+      model.backend.enable_fsdp_optimizations: true
+      checkpoint: none
+      checkpoint.enabled: false
+      distributed: none
+      distributed.strategy: fsdp2
+      distributed.tp_size: 1
+      distributed.cp_size: 1
+      distributed.pp_size: 1
+      distributed.ep_size: 8
+      distributed.sequence_parallel: false
+      distributed.activation_checkpointing: true
+      distributed.moe.reshard_after_forward: false
+      distributed.moe.ignore_router_for_ac: false
+      distributed.pipeline.pp_schedule: interleaved1f1b
+      distributed.pipeline.pp_microbatch_size: 2
+      distributed.pipeline.round_virtual_stages_to_pp_multiple: down
+      distributed.pipeline.scale_grads_in_schedule: false
+      distributed.pipeline.patch_inner_model: false
+      distributed.pipeline.patch_causal_lm_model: false
+      distributed.pipeline.layers_per_stage: 2
+      loss_fn: none
+      loss_fn._target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+      loss_fn.fp32_upcast: false
+      dataset: none
+      dataset._target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+      dataset.seq_len: 4096
+      dataset.num_samples: 100000
+      packed_sequence: none
+      dataloader: none
+      dataloader.batch_size: none
+      dataloader._target_: torch.utils.data.DataLoader
+      dataloader.num_workers: 0
+      validation_dataset: none
+      validation_dataloader: none
+      optimizer: none
+      optimizer._target_: torch.optim.Adam
+      optimizer.betas: '[0.9, 0.999]'
+      optimizer.eps: 1e-8
+      optimizer.lr: 0.0001
+      optimizer.weight_decay: 0
+      seed: 1234
+      benchmark: none
+      benchmark.warmup_steps: 10
+      benchmark.peak_tflops: 989
+      benchmark.nsys_start: -1
+      benchmark.nsys_end: -1
+      benchmark.nsys_ranks: '[]'
+      benchmark.num_nodes: 1
+      ci.nodes: 1

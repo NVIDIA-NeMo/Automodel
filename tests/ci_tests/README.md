@@ -88,6 +88,19 @@ ci:
       step_scheduler.max_steps: 10
 ```
 
+Performance overrides can replace a training workload with its synthetic benchmark without changing the default
+training configuration. Set `recipe: BenchmarkingRecipeForNextTokenPrediction` in `config_overrides` and include
+the source benchmark's input shapes, model/backend, optimizer, parallelism, and timing settings. The JET generator
+must select its entrypoint and metrics from this effective configuration; the benchmark uses the
+`nemo_automodel.recipes.llm.benchmark` entrypoint rather than the interactive training loop.
+
+Overrides are applied in insertion order. To replace a component's constructor without retaining training-only
+arguments, first set its root to the string `"none"`, then set its dotted child keys. The CLI also parses strings
+such as `"[0.9, 0.999]"` and `"[]"` as lists. A root key such as `recipe` is a valid config path. Preserve the
+source benchmark's effective settings, including CI topology overrides, rather than comparing similarly named
+recipes with different token counts. Fixed-length mock inputs do not imply packed sequences; copy a positive
+`packed_sequence.packed_sequence_size` into the training config only when its benchmark actually enables packing.
+
 ## Checkpoint Robustness
 
 When `checkpoint_robustness` is present, the robustness test runs after the finetune under the same SLURM allocation.

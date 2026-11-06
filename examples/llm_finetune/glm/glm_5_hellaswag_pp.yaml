@@ -118,3 +118,65 @@ ci:
   recipe_owner: hemildesai
   nodes: 32
   time: "00:45:00"
+  # Synthetic performance settings migrated from examples/llm_benchmark/glm/glm_5_te_deepep.yaml.
+  # Reset changed components before setting leaves; "none" is the CLI null token.
+  perf_testing:
+    schedule: weekly
+    time: 00:45:00
+    config_overrides:
+      recipe: BenchmarkingRecipeForNextTokenPrediction
+      step_scheduler: none
+      step_scheduler.gc_every_steps: 10
+      step_scheduler.global_batch_size: 1024
+      step_scheduler.local_batch_size: 4
+      step_scheduler.ckpt_every_steps: 1000
+      step_scheduler.val_every_steps: 1000
+      step_scheduler.num_epochs: 1
+      step_scheduler.max_steps: 12
+      model: none
+      model._target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+      model.config._target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+      model.config.pretrained_model_name_or_path: zai-org/GLM-5
+      model.trust_remote_code: true
+      model.backend._target_: nemo_automodel.components.models.common.BackendConfig
+      model.backend.attn: te
+      model.backend.linear: te
+      model.backend.rms_norm: te
+      model.backend.rope_fusion: false
+      model.backend.experts: torch_mm
+      model.backend.dispatcher: hybridep
+      model.backend.fake_balanced_gate: true
+      model.backend.enable_hf_state_dict_adapter: true
+      model.backend.enable_fsdp_optimizations: true
+      checkpoint: none
+      checkpoint.enabled: false
+      loss_fn: none
+      loss_fn._target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+      loss_fn.fp32_upcast: false
+      dataset: none
+      dataset._target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+      dataset.seq_len: 4096
+      dataset.num_samples: 100000
+      packed_sequence: none
+      dataloader: none
+      dataloader.batch_size: none
+      dataloader._target_: torch.utils.data.DataLoader
+      dataloader.num_workers: 0
+      validation_dataset: none
+      validation_dataloader: none
+      optimizer: none
+      optimizer._target_: torch.optim.Adam
+      optimizer.betas: '[0.9, 0.999]'
+      optimizer.eps: 1e-8
+      optimizer.lr: 0.0001
+      optimizer.weight_decay: 0
+      benchmark: none
+      benchmark.warmup_steps: 2
+      benchmark.peak_tflops: 989
+      benchmark.nsys_start: -1
+      benchmark.nsys_end: -1
+      benchmark.nsys_ranks: '[]'
+      benchmark.num_nodes: 128
+      ci.nodes: 128
+      ci.env_vars: none
+      ci.env_vars.PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True

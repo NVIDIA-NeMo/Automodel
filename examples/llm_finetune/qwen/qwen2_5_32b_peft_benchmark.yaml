@@ -102,3 +102,35 @@ ci:
   cluster_tag: h100
   recipe_owner: ZhiyuLi-Nvidia
   time: "00:30:00"
+  # Synthetic performance settings migrated from examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml.
+  # Reset changed components before setting leaves; "none" is the CLI null token.
+  perf_testing:
+    schedule: nightly
+    time: 00:30:00
+    config_overrides:
+      step_scheduler: none
+      step_scheduler.global_batch_size: 32
+      step_scheduler.local_batch_size: 2
+      step_scheduler.ckpt_every_steps: 50
+      step_scheduler.val_every_steps: 1000
+      step_scheduler.max_steps: 10
+      dist_env: none
+      dist_env.backend: nccl
+      dist_env.timeout_minutes: 10
+      model: none
+      model._target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+      model.pretrained_model_name_or_path: Qwen/Qwen2.5-32B-Instruct
+      model.torch_dtype: bf16
+      distributed: none
+      distributed.strategy: fsdp2
+      distributed.dp_size: none
+      distributed.tp_size: 2
+      distributed.cp_size: 1
+      distributed.pp_size: 1
+      distributed.sequence_parallel: false
+      distributed.activation_checkpointing: true
+      distributed.enable_async_tensor_parallel: false
+      distributed.enable_fsdp2_prefetch: true
+      distributed.enable_compile: true
+      distributed.patch_is_packed_sequence: true
+      ci.nodes: 1
