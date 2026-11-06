@@ -154,6 +154,8 @@ class _StubProcessor:
     tokenizer = _tokenizer()
 
     def apply_chat_template(self, conversations, *, tokenize=False, **kwargs):
+        if tokenize:
+            return self(text=["stub template text"])
         return "stub template text"
 
     def __call__(self, *, text, images=None, videos=None, return_tensors="pt", **kwargs):
@@ -278,10 +280,8 @@ class _MediaTruncationProcessor:
     image_processor = _image_processor()
 
     def apply_chat_template(self, conversations, *, tokenize=False, **kwargs):
-        for item in conversations[0][0]["content"]:
-            if item["type"] == "text":
-                return item["text"]
-        return "good"
+        text = next((item["text"] for item in conversations[0][0]["content"] if item["type"] == "text"), "good")
+        return self(text=[text]) if tokenize else text
 
     def __call__(self, *, text, images=None, videos=None, return_tensors="pt", **kwargs):
         seq_len = 64
