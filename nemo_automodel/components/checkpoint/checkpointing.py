@@ -2335,13 +2335,17 @@ fi
         # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
         # so prefer it for base-model HF loads. Mid-training DCP loads may
         # still use the faster upstream reader.
-        if key_mapping is None and not is_init_step:
+        # Base-model loads may use the upstream reader too when every dtype of the checkpoint is one the safetensors
+        # package decodes (bf16 / fp16 / fp32 / fp8-e4m3 / integer); only checkpoints with dtypes it does not know
+        # (DeepSeek V4's F8_E8M0 scales) stay on the backport. On this reader each read is a safetensors slice copy,
+        # which is several times faster than the backport's mmap page-fault path on network filesystems.
+        if key_mapping is None and (not is_init_step or _safetensors_decodes_checkpoint_dtypes(model_path)):
             try:
                 from torch.distributed.checkpoint.hf_storage import (
                     HuggingFaceStorageReader as _UpstreamHFReader,
                 )
 
-                return _UpstreamHFReader(path=model_path)
+                return _with_cached_metadata(_UpstreamHFReader(path=model_path))
             except ImportError:
                 pass
         return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
@@ -2370,6 +2374,83 @@ fi
         # fall back to the standard HF hub cache root.
         cache_dir = getattr(self.config, "original_model_root_dir", None) or HF_HUB_CACHE
         return _get_hf_safetensors_reference_path(cache_dir, pretrained_model_name_or_path)
+
+
+def _with_cached_metadata(reader: StorageReader) -> StorageReader:
+    """Make a reader parse the checkpoint metadata once per checkpoint path.
+
+    ``dcp.load`` calls ``read_metadata`` on every load, and torch's ``HuggingFaceStorageReader`` rescans every
+    shard header each time. The part-by-part base load issues one ``dcp.load`` per part with one reader, so it
+    relies on this cache (as it did on the backport reader's). The cache is dropped when ``reset`` moves the
+    reader to another checkpoint. Installed on the instance so the upstream class is left untouched.
+
+    Args:
+        reader: A freshly constructed storage reader bound to one checkpoint path.
+
+    Returns:
+        The same reader, with caching ``read_metadata`` and ``reset`` methods.
+    """
+    read_metadata = reader.read_metadata
+    reset = reader.reset
+    state: dict[str, Any] = {"path": str(reader.path), "metadata": None}
+
+    def cached_read_metadata() -> Metadata:
+        if state["metadata"] is None:
+            state["metadata"] = read_metadata()
+        elif getattr(state["metadata"], "storage_meta", None) is not None:
+            state["metadata"].storage_meta.load_id = reader.load_id
+        return state["metadata"]
+
+    def resetting(checkpoint_id: str | os.PathLike | None = None) -> None:
+        reset(checkpoint_id)
+        if checkpoint_id is not None and str(reader.path) != state["path"]:
+            state["path"] = str(reader.path)
+            state["metadata"] = None
+
+    reader.read_metadata = cached_read_metadata
+    reader.reset = resetting
+    return reader
+
+
+def _safetensors_decodes_checkpoint_dtypes(model_path: str) -> bool:
+    """Whether every tensor dtype in a local safetensors checkpoint is one the ``safetensors`` package decodes.
+
+    The upstream ``HuggingFaceStorageReader`` maps dtype strings with ``safetensors.torch._TYPES`` while reading the
+    metadata, so a checkpoint with a dtype outside that table (for example ``F8_E8M0`` block scales) must use the
+    in-tree backport reader, which extends the table. Only the safetensors headers are read.
+
+    Args:
+        model_path: Local checkpoint directory.
+
+    Returns:
+        True when the directory holds safetensors files whose dtypes are all decodable by the package. Remote paths,
+        directories without safetensors files, unreadable headers and integrated-GPU hosts (where the backport stages
+        reads through host memory) return False.
+    """
+    try:
+        from safetensors.torch import _TYPES as safetensors_dtypes
+    except ImportError:
+        return False
+    if not os.path.isdir(model_path):
+        return False
+    if torch.cuda.is_available() and _is_integrated_cuda_device(torch.device("cuda", torch.cuda.current_device())):
+        return False
+    files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not files:
+        return False
+    try:
+        for file_name in files:
+            with open(file_name, "rb") as stream:
+                header_size = int.from_bytes(stream.read(8), "little")
+                header = json.loads(stream.read(header_size))
+            for key, entry in header.items():
+                if key == "__metadata__":
+                    continue
+                if entry.get("dtype") not in safetensors_dtypes:
+                    return False
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
