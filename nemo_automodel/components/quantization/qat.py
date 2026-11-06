@@ -143,7 +143,7 @@ def get_enable_fake_quant_fn(mode: str) -> Callable | None:
     return _ENABLE_FN_BY_MODE.get(mode, None)
 
 
-def prepare_qat_model(model, quantizer) -> tuple[object, str | None]:
+def prepare_qat_model(model, quantizer) -> tuple[torch.nn.Module, str | None]:
     """Apply a torchao QAT quantizer to the given model.
 
     Returns the (possibly wrapped) model and a mode string if recognized.

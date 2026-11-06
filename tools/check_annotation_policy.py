@@ -14,8 +14,8 @@
 
 """Reject unapproved object annotations without importing the checked code.
 
-Run from the repository root with Python 3.11+. Configuration and the legacy
-inventory live in tools/annotation_policy.toml. This syntax gate complements ty;
+Run from the repository root with Python 3.11+. Configuration and reviewed
+exceptions live in tools/annotation_policy.toml. This syntax gate complements ty;
 it does not infer types or resolve aliases imported from other source modules.
 """
 
@@ -65,15 +65,21 @@ def _name(node: ast.expr, bindings: dict[str, ast.expr], seen: frozenset[str] = 
     return ""
 
 
-def _has_object(node: ast.expr, bindings: dict[str, ast.expr], seen: frozenset[str] = frozenset()) -> bool:
+def _has_object(
+    node: ast.expr, bindings: dict[str, ast.expr], seen: frozenset[str] = frozenset(), *, implicit_alias: bool = False
+) -> bool:
+    if implicit_alias and isinstance(node, ast.Call):
+        return False
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if implicit_alias:
+            return False
         try:
             parsed = ast.parse(node.value, mode="eval").body
         except SyntaxError:
             return False  # ty diagnoses invalid forward references.
         return _has_object(parsed, bindings, seen)
     if isinstance(node, ast.Name) and node.id in bindings and node.id not in seen:
-        return _has_object(bindings[node.id], bindings, seen | {node.id})
+        return _has_object(bindings[node.id], bindings, seen | {node.id}, implicit_alias=implicit_alias)
     if _name(node, bindings, seen) in {"object", "builtins.object"}:
         return True
     if isinstance(node, ast.Subscript):
@@ -83,21 +89,45 @@ def _has_object(node: ast.expr, bindings: dict[str, ast.expr], seen: frozenset[s
         elements = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
         if name in {"typing.Annotated", "typing_extensions.Annotated"}:
             elements = elements[:1]
-        return _has_object(node.value, bindings, seen) or any(_has_object(e, bindings, seen) for e in elements)
+        return _has_object(node.value, bindings, seen, implicit_alias=implicit_alias) or any(
+            _has_object(e, bindings, seen) for e in elements
+        )
     return any(
-        _has_object(child, bindings, seen) for child in ast.iter_child_nodes(node) if isinstance(child, ast.expr)
+        _has_object(child, bindings, seen, implicit_alias=implicit_alias)
+        for child in ast.iter_child_nodes(node)
+        if isinstance(child, ast.expr)
     )
 
 
 class _Visitor(ast.NodeVisitor):
     def __init__(self, tree: ast.Module) -> None:
         self.bindings = _bindings(tree.body)
+        self.lexical_bindings = self.bindings
         self.scope: list[str] = []
         self.findings: list[tuple[str, int]] = []
 
-    def _check(self, node: ast.expr | None, slot: str) -> None:
-        if node is not None and _has_object(node, self.bindings):
+    def _check(self, node: ast.expr | None, slot: str, *, implicit_alias: bool = False) -> None:
+        if node is not None and _has_object(node, self.bindings, implicit_alias=implicit_alias):
             self.findings.append((f"{'.'.join(self.scope) or '<module>'}:{slot}", node.lineno))
+
+    def _check_comment(self, text: str | None, line: int, slot: str) -> None:
+        if text:
+            annotation = ast.parse(text, mode="eval").body
+            ast.increment_lineno(annotation, line - 1)
+            self._check(annotation, slot)
+
+    def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
+        self._check_comment(node.type_comment, node.lineno, f"comment[{ast.unparse(node.target)}]")
+        self.generic_visit(node)
+
+    visit_AsyncFor = visit_For
+
+    def visit_With(self, node: ast.With | ast.AsyncWith) -> None:
+        targets = ", ".join(ast.unparse(item.optional_vars) for item in node.items if item.optional_vars is not None)
+        self._check_comment(node.type_comment, node.lineno, f"comment[{targets}]")
+        self.generic_visit(node)
+
+    visit_AsyncWith = visit_With
 
     def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         self.scope.append(node.name)
@@ -105,6 +135,7 @@ class _Visitor(ast.NodeVisitor):
         args += [a for a in (node.args.vararg, node.args.kwarg) if a is not None]
         for arg in args:
             self._check(arg.annotation, arg.arg)
+            self._check_comment(arg.type_comment, arg.lineno, f"comment[{arg.arg}]")
         self._check(node.returns, "return")
         if node.type_comment:
             comment = ast.parse(node.type_comment, mode="func_type")
@@ -113,10 +144,13 @@ class _Visitor(ast.NodeVisitor):
                 self._check(annotation, f"comment-arg[{index}]")
             self._check(comment.returns, "comment-return")
         previous = self.bindings
-        self.bindings = previous | {arg.arg: ast.Constant(None) for arg in args} | _bindings(node.body)
+        previous_lexical = self.lexical_bindings
+        self.bindings = previous_lexical | {arg.arg: ast.Constant(None) for arg in args} | _bindings(node.body)
+        self.lexical_bindings = self.bindings
         for statement in node.body:
             self.visit(statement)
         self.bindings = previous
+        self.lexical_bindings = previous_lexical
         self.scope.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef
@@ -124,11 +158,12 @@ class _Visitor(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.scope.append(node.name)
         previous = self.bindings
-        self.bindings = previous | _bindings(node.body)
         for index, base in enumerate(node.bases):
             # Inheriting from object is a runtime use, not an annotation.
             if isinstance(base, ast.Subscript):
                 self._check(base, f"base[{index}]")
+        # Class locals affect method signatures, but are not a closure for method bodies.
+        self.bindings = self.lexical_bindings | _bindings(node.body)
         for statement in node.body:
             self.visit(statement)
         self.bindings = previous
@@ -137,10 +172,7 @@ class _Visitor(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign) -> None:
         # Explicit alias expressions must not hide object from importing modules.
         # Strings and calls here are runtime values, not declared type aliases.
-        if node.type_comment:
-            annotation = ast.parse(node.type_comment, mode="eval").body
-            ast.increment_lineno(annotation, node.lineno - 1)
-            self._check(annotation, f"comment[{ast.unparse(node.targets[0])}]")
+        self._check_comment(node.type_comment, node.lineno, f"comment[{ast.unparse(node.targets[0])}]")
         value = node.value
         alias = (
             isinstance(value, (ast.Name, ast.Attribute))
@@ -158,7 +190,7 @@ class _Visitor(ast.NodeVisitor):
         if alias and not any(isinstance(child, ast.Call) for child in ast.walk(node.value)):
             for target in node.targets:
                 if isinstance(target, ast.Name):
-                    self._check(node.value, f"alias[{target.id}]")
+                    self._check(node.value, f"alias[{target.id}]", implicit_alias=True)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         slot = ast.unparse(node.target)
@@ -176,14 +208,11 @@ def check_file(path: Path) -> list[tuple[str, int]]:
 
 
 def main() -> int:
-    """Check the configured source tree and reject new or stale allowances."""
+    """Check the configured source tree and reject unapproved annotations and stale exceptions."""
     config = tomllib.loads(Path("tools/annotation_policy.toml").read_text())
-    legacy = config["legacy"]
+    if "legacy" in config:
+        raise ValueError("Legacy allowances are not supported; existing annotations must satisfy the policy")
     exceptions = config["exceptions"]
-    if set(legacy) & set(exceptions):
-        raise ValueError("An annotation cannot have both a legacy allowance and an exception")
-    if any(type(count) is not int or count < 1 for count in legacy.values()):
-        raise ValueError("Legacy counts must be positive integers")
     if any(not isinstance(reason, str) or not reason.strip() for reason in exceptions.values()):
         raise ValueError("Every exception must explain why the value is opaque")
     observed: Counter[str] = Counter()
@@ -201,19 +230,18 @@ def main() -> int:
         for slot, line in findings:
             key = f"{path.as_posix()}:{slot}"
             observed[key] += 1
-            allowance = legacy.get(key, 1 if key in exceptions else 0)
+            allowance = 1 if key in exceptions else 0
             if observed[key] > allowance:
                 _LOG.error(
                     "%s:%s: object annotation (%s): use a precise contract or a reviewed exception", path, line, slot
                 )
                 failed = True
-    for key in legacy.keys() | exceptions.keys():
-        expected = legacy.get(key, 1)
-        if observed[key] < expected:
-            _LOG.error("%s: stale allowance; remove it or reduce its legacy count", key)
+    for key in exceptions:
+        if observed[key] == 0:
+            _LOG.error("%s: stale exception; remove it", key)
             failed = True
     _LOG.info(
-        "Annotation policy: checked %s files, %s existing/approved object annotations",
+        "Annotation policy: checked %s files, %s object annotations",
         len(files),
         sum(observed.values()),
     )
