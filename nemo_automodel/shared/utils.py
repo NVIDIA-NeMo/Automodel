@@ -59,6 +59,7 @@ def dtype_from_str(val, default=torch.bfloat16):
         "torch.long": torch.long,
         "torch.bool": torch.bool,
         "bf16": torch.bfloat16,
+        "fp32": torch.float,
     }
 
     val_lower = val.lower()
