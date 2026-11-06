@@ -57,17 +57,17 @@ def _make_upgrade_message(name: str) -> str:
 
 def __getattr__(name: str) -> object:
     """Load the public builder on demand, preserving model-upgrade diagnostics."""
-    if name == "build_gpt2_model":
-        from .gpt2 import build_gpt2_model
-
-        globals()[name] = build_gpt2_model
-        return build_gpt2_model
+    if name in ("build_gpt2_model", "gpt2"):
+        module = importlib.import_module(".gpt2", __name__)
+        value = module if name == "gpt2" else module.build_gpt2_model
+        globals()[name] = value
+        return value
     raise ModuleNotFoundError(_make_upgrade_message(name))
 
 
 def __dir__() -> list[str]:
     """Expose the public builder before it is imported."""
-    return sorted(__all__)
+    return sorted([*__all__, "gpt2"])
 
 
 class _MissingModelFinder(importlib.abc.MetaPathFinder):
