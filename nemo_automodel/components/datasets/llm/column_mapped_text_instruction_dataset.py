@@ -21,7 +21,6 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Union
 
-from datasets import VerificationMode, load_dataset
 from torch.utils.data import Dataset
 
 if TYPE_CHECKING:
@@ -120,6 +119,9 @@ def _load_dataset(
     Returns:
         datasets.Dataset: The loaded dataset.
     """
+    # Formatting helpers are also used without the native HF dataset reader.
+    from datasets import VerificationMode, load_dataset
+
     if isinstance(path_or_dataset_id, str) and _str_is_hf_repo_id(path_or_dataset_id):
         return load_dataset(
             path_or_dataset_id,

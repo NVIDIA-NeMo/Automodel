@@ -14,7 +14,10 @@
 
 """Local token resolution and source normalization contracts."""
 
+import subprocess
+import sys
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -167,3 +170,29 @@ def test_pretokenized_positions_preserve_only_valid_offline_boundaries() -> None
     for positions in ([0], [1, 2, 3, 4], [0, 2, 3, 4], [0, 1, -1, 0], [0.0, 1.0, 0.0, 1.0]):
         with pytest.raises(ValueError, match="resetting at subdocument starts"):
             normalize_pretokenized_document({**payload, "positions": positions}, preserve_positions=True, **kwargs)
+
+
+def test_instruction_helpers_do_not_initialize_hf_dataset_reader():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
+    instruction_messages, instruction_prompt_completion,
+)
+assert "datasets" not in sys.modules
+assert "transformers" not in sys.modules
+sample = {"context": "context", "question": "question", "answer": "answer"}
+assert instruction_prompt_completion(sample) == ("context question ", "answer")
+assert instruction_messages(sample)[-1] == {"role": "assistant", "content": "answer"}
+assert "datasets" not in sys.modules
+""",
+        ],
+        cwd=Path(__file__).resolve().parents[4],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
