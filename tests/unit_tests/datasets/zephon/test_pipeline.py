@@ -194,3 +194,29 @@ def test_instruction_default_special_tokens_follow_template_ownership(config, to
         create_text_pipeline(dataset, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
     assert chat.call_args.kwargs["special_tokens"] == expected
     assert dataset.special_tokens is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {
+            "prefetch_batches": 24,
+            "default_stage_prefetch": 8,
+            "op_queue_capacity": 12,
+            "mtp_buffer": 6,
+            "mtp_prefetch": 2,
+        },
+        {"prefetch_batches": 0, "default_stage_prefetch": 0, "mtp_prefetch": 0},
+    ],
+)
+def test_runtime_buffers_reach_zephon_without_replacing_none_or_zero(
+    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast, overrides: dict[str, int]
+) -> None:
+    dataset = config.dataset_config
+    dataset = replace(dataset, zephon=replace(dataset.zephon, runtime=replace(dataset.zephon.runtime, **overrides)))
+    with patch.object(Pipeline, "options", autospec=True, side_effect=Pipeline.options) as options:
+        create_text_pipeline(dataset, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
+    forwarded = next(call.kwargs for call in options.call_args_list if "mtp_mode" in call.kwargs)
+    for name in ("prefetch_batches", "default_stage_prefetch", "op_queue_capacity", "mtp_buffer", "mtp_prefetch"):
+        assert forwarded[name] == overrides.get(name)
