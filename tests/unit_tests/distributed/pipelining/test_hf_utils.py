@@ -568,7 +568,7 @@ class TestValidateHfModelForPipelineSupport:
 
         class MockConfig:
             pretrained_model_name_or_path = "test/model"
-            tie_word_embeddings = True  # Needed to enable the tied-weights check
+            tie_word_embeddings = True
             is_encoder_decoder = False
 
         class _Inner(nn.Module):
@@ -588,6 +588,26 @@ class TestValidateHfModelForPipelineSupport:
         model = MockModel()
 
         with pytest.raises(ValueError, match="Pipeline parallelism does not support tie_word_embeddings=True"):
+            validate_hf_model_for_pipeline_support(model)
+
+    @pytest.mark.parametrize("tied", [False, True])
+    def test_validate_meta_alias_independent_of_nested_tie_flag(self, tied):
+        model = nn.Module()
+        model.config = SimpleNamespace(
+            model_type="mistral3",
+            tie_word_embeddings=True,
+            text_config=SimpleNamespace(tie_word_embeddings=False),
+        )
+        model.model = nn.Module()
+        model.model.language_model = nn.Module()
+        model.model.language_model.embed_tokens = nn.Embedding(4, 4, device="meta")
+        model.lm_head = nn.Linear(4, 4, bias=False, device="meta")
+        if tied:
+            model.lm_head.weight = model.model.language_model.embed_tokens.weight
+            with pytest.raises(ValueError, match="does not support tie_word_embeddings=True"):
+                validate_hf_model_for_pipeline_support(model)
+        else:
+            # Distinct meta parameters both have a null data pointer, but are not tied.
             validate_hf_model_for_pipeline_support(model)
 
     def test_validate_encoder_decoder_model(self):
