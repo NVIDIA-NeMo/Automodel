@@ -716,6 +716,8 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     hidden_states=get_final_hidden_states(student_out),
                     num_label_tokens=num_label_tokens,
                     grad_reduce_group=self._get_dp_group(include_cp=True) if is_train else None,
+                    # setup() validated linear losses against this head projection dtype.
+                    projection_dtype=self.lm_head_projection_dtype,
                 )
 
             # Reminder: kd_loss is normalized by num_label_tokens, which is typically
