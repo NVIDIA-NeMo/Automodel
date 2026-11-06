@@ -40,6 +40,12 @@ canonical training settings first. Do not restore a second performance-only copy
 | [step/step_3.5_flash_te_deepep.yaml](step/step_3.5_flash_te_deepep.yaml) | [stepfun/step_3.5_flash_hellaswag_pp.yaml](../llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml) |
 | [step/step_5_preview_full92_mock_h100.yaml](step/step_5_preview_full92_mock_h100.yaml) | [stepfun/step_5_preview_tulu3_sft.yaml](../llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml) |
 
+## Retained synthetic counterpart
+
+`llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml` already uses `MockIterableDataset` despite its directory.
+Its data is unchanged in this migration. Treat its throughput as a retained synthetic measurement, not as real-data
+finetuning performance. The other canonical counterparts in the table retain their existing real datasets.
+
 ## Sequence packing
 
 Fixed-length mock inputs are not packed real-data sequences. A positive
