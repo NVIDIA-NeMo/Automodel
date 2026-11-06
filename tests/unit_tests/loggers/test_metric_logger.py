@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import json
+import os
 import threading
+
+import pytest
 
 import nemo_automodel.components.loggers.metric_logger as metric_logger_mod
 from nemo_automodel.components.loggers.metric_logger import MetricLogger, MetricLoggerDist
@@ -218,3 +221,126 @@ def test_flush_on_an_empty_buffer_is_a_no_op(tmp_path):
         assert logfile.read_text() == ""
     finally:
         logger.close()
+
+
+class TestTensorBoardLoggerContracts:
+    """Factory buffer_size forwarding and the distributed flush rank guard.
+
+    Review findings: ``build_metric_logger`` passed ``buffer_size`` to
+    TensorBoard constructors that did not accept it (every factory caller
+    raised TypeError), and ``TensorBoardMetricLoggerDist`` inherited ``flush``
+    without a nonzero-rank guard — the retrieval recipe calls ``flush()`` on
+    every rank after checkpoints, so nonzero ranks crashed on the missing
+    ``_writer``/``_lock`` attributes.
+    """
+
+    def test_tensorboard_constructors_accept_buffer_size(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TENSORBOARD_LOG_DIR", str(tmp_path / "tb"))
+        logger = metric_logger_mod.TensorBoardMetricLogger(
+            str(tmp_path / "metrics.jsonl"), flush=False, append=True, buffer_size=4
+        )
+        try:
+            assert logger.buffer_size == 4, "buffer_size must be forwarded to the JSONL base"
+        finally:
+            logger.close()
+
+    def test_factory_tensorboard_path_accepts_buffer_size(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TENSORBOARD_LOG_DIR", str(tmp_path / "tb"))
+        logger = metric_logger_mod.build_metric_logger(str(tmp_path / "metrics.jsonl"), buffer_size=8)
+        try:
+            assert isinstance(logger, metric_logger_mod.TensorBoardMetricLogger)
+            assert logger.buffer_size == 8
+        finally:
+            logger.close()
+
+    def test_tensorboard_dist_flush_is_rank_guarded(self, tmp_path, monkeypatch):
+        """Nonzero ranks must no-op on flush (no _writer attribute access)."""
+        import torch.distributed as dist
+
+        if not dist.is_available():
+            pytest.skip("torch.distributed unavailable")
+        monkeypatch.setenv("TENSORBOARD_LOG_DIR", str(tmp_path / "tb"))
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29741")
+        try:
+            if not dist.is_initialized():
+                dist.init_process_group("gloo", rank=0, world_size=1)
+            logger = metric_logger_mod.TensorBoardMetricLoggerDist(str(tmp_path / "metrics.jsonl"))
+            try:
+                # rank 0 in this single-process group: the call must succeed;
+                # the guard only matters on nonzero ranks, which this also
+                # exercises via the rank check being hit first.
+                logger.flush()
+            finally:
+                # close() is itself rank-guarded; safe on any rank.
+                logger.close()
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+    def test_tensorboard_dist_flush_noop_without_writer(self, tmp_path, monkeypatch):
+        """A nonzero-rank instance never built the base: flush must not touch it."""
+        import torch.distributed as dist
+
+        if not dist.is_available():
+            pytest.skip("torch.distributed unavailable")
+        monkeypatch.setenv("TENSORBOARD_LOG_DIR", str(tmp_path / "tb"))
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29741")
+        try:
+            if not dist.is_initialized():
+                dist.init_process_group("gloo", rank=0, world_size=1)
+            logger = metric_logger_mod.TensorBoardMetricLoggerDist.__new__(
+                metric_logger_mod.TensorBoardMetricLoggerDist
+            )
+            logger.rank = 1  # simulate a nonzero rank: the base was never built
+            logger.flush()  # must not raise despite no _writer/_lock attributes
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+    def test_tensorboard_prefix_preserves_named_validation_streams(self, tmp_path, monkeypatch):
+        """``validation_<dataset>.jsonl`` streams must keep their dataset
+        identity in the tag prefix instead of collapsing onto one shared
+        ``validation`` curve (third-review finding)."""
+        monkeypatch.setenv("TENSORBOARD_LOG_DIR", str(tmp_path / "tb"))
+        loggers = []
+        try:
+            for name in ("validation_dsA.jsonl", "validation_dsB.jsonl", "validation.jsonl", "train.jsonl"):
+                loggers.append(metric_logger_mod.TensorBoardMetricLogger(str(tmp_path / name), append=False))
+            assert loggers[0]._tb_prefix == "validation_dsA"
+            assert loggers[1]._tb_prefix == "validation_dsB"
+            assert loggers[2]._tb_prefix == "validation"
+            assert loggers[3]._tb_prefix == "train"
+        finally:
+            for lg in loggers:
+                lg.close()
+
+    def test_tensorboard_named_streams_write_distinct_event_tags(self, tmp_path, monkeypatch):
+        """End-to-end through the real SummaryWriter/event reader: two named
+        validation streams stay two distinct scalar series."""
+        try:
+            from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        except ImportError:
+            pytest.skip("tensorboard not installed")
+
+        tb_dir = tmp_path / "tb"
+        monkeypatch.setenv("TENSORBOARD_LOG_DIR", str(tb_dir))
+        for dataset, loss in (("dsA", 1.25), ("dsB", 9.5)):
+            logger = metric_logger_mod.TensorBoardMetricLogger(
+                str(tmp_path / f"validation_{dataset}.jsonl"), append=False
+            )
+            try:
+                logger.log(metric_logger_mod.MetricsSample(step=7, epoch=0, metrics={"val_loss": loss}))
+            finally:
+                logger.close()
+
+        acc = EventAccumulator(str(tb_dir))
+        acc.Reload()
+        tags = acc.Tags()["scalars"]
+        assert "validation_dsA/val_loss" in tags
+        assert "validation_dsB/val_loss" in tags
+        # Each series carries only its own dataset's point.
+        a = [e.value for e in acc.Scalars("validation_dsA/val_loss")]
+        b = [e.value for e in acc.Scalars("validation_dsB/val_loss")]
+        assert a == [1.25] and b == [9.5]
