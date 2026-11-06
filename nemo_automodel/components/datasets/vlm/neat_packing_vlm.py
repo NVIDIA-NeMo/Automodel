@@ -66,6 +66,7 @@ MEDIA_KEYS = (
     "num_patches",
     "image_grid_thw",
     "image_position_ids",
+    "image_sizes",
     "pixel_values_videos",
     "video_grid_thw",
     "second_per_grid_ts",
