@@ -158,6 +158,35 @@ def test_pipeline_input_limit_uses_smallest_declared_stage_limit():
 
 
 class TestConfigurePacking:
+    def test_flash_offsets_are_prepared_before_ddp_style_input_transfer(self):
+        from torch.utils._pytree import tree_map_only
+
+        class Decoder(torch.nn.Module):
+            def forward(self, input_ids: torch.Tensor, **kwargs):
+                """Return metadata for input IDs [batch, sequence]."""
+                return kwargs
+
+        class DeviceTransfer(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, input_ids: torch.Tensor, **kwargs):
+                """Move IDs [batch, sequence] and nested metadata before the inner call."""
+                # DDP with device_ids transfers kwargs before the wrapped module's
+                # pre-hooks. Meta exercises that ordering without requiring CUDA.
+                transferred = tree_map_only(torch.Tensor, lambda tensor: tensor.to("meta"), kwargs)
+                return self.module(input_ids.to("meta"), **transferred)
+
+        wrapped = DeviceTransfer(Decoder())
+        configure_packing("flash_attention_2", model=wrapped)
+        configure_packing("flash_attention_2", model=wrapped)
+        output = wrapped(torch.ones(1, 5, dtype=torch.long), _packed_seq_ids=torch.tensor([[1, 1, 2, 2, 0]]))
+        assert output["cu_seq_lens_q"].device.type == "meta"
+        assert output["cu_seq_lens_q"].dtype == torch.int32
+        assert output["cu_seq_lens_q"].shape == output["cu_seq_lens_k"].shape == (4,)
+        assert output["max_length_q"] == output["max_length_k"] == 2
+
     def test_flash_metadata_precedes_root_input_transfer_inside_compiled_hf_model(self):
         from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -425,25 +454,36 @@ class TestValidateFlashPackingSupport:
         with pytest.raises(RuntimeError, match="_packed_seq_ids"):
             validate_flash_packing_support("flash_attention_2", model=_BlindModel())
 
-    def test_accepts_model_with_all_four_varlen_kwargs(self):
-        """A forward naming all four cumulative-length kwargs consumes the contract."""
+    def test_explicit_flash_kwargs_remain_supported_for_direct_calls(self):
+        """Public offsets work directly; compact-loader setup rejects incompatible signatures."""
 
-        class _VarlenModel:
+        class _VarlenModel(torch.nn.Module):
             def forward(self, input_ids, cu_seq_lens_q=None, cu_seq_lens_k=None, max_length_q=None, max_length_k=None):
-                """Names the full varlen kwarg set explicitly."""
+                """Return offsets [segments + 1] for tokens [batch, sequence]."""
+                return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
 
-        validate_flash_packing_support("flash_attention_2", model=_VarlenModel())  # must not raise
+        from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+
+        model = _VarlenModel()
+        ids = torch.tensor([[1, 1, 2, 2, 0]])
+        public_kwargs = get_packing_capabilities("flash_attention_2").prepare_attention_inputs(ids)
+        batch = {"input_ids": torch.ones_like(ids), "_packed_seq_ids": ids, **public_kwargs}
+        offsets_q, offsets_k, maximum_q, maximum_k = model(**filter_forward_kwargs(model, batch))
+        assert offsets_q.tolist() == [0, 2, 4, 5]
+        torch.testing.assert_close(offsets_q, offsets_k)
+        assert maximum_q == maximum_k == 2
+        with pytest.raises(RuntimeError, match="Native Flash collation requires compact document IDs"):
+            configure_packing("flash_attention_2", model=model)
+        assert not model._forward_pre_hooks
 
     def test_rejects_model_with_partial_varlen_kwargs(self):
-        """A forward exposing only some varlen kwargs must be rejected: HF needs all four,
-        and filter_forward_kwargs would drop the rest, so the packing would silently break.
-        """
+        """Explicit offsets without compact-ID support cannot receive native collation."""
 
         class _PartialModel:
             def forward(self, input_ids, cu_seq_lens_q=None):
                 """Names one of four varlen kwargs; the other three would be dropped."""
 
-        with pytest.raises(RuntimeError, match="all four varlen"):
+        with pytest.raises(RuntimeError, match="_packed_seq_ids"):
             validate_flash_packing_support("flash_attention_2", model=_PartialModel())
 
 

@@ -3280,17 +3280,18 @@ class TestNeatPackedVlmCollaterPackingContract:
             return_packed_sequence_metadata=requires_metadata,
         )
 
-    def test_flash_attention_2_emits_varlen_kwargs_instead_of_mask(self):
+    def test_flash_attention_2_keeps_ids_for_model_entry(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
         result = neat_packed_vlm_collater(
             batch, attn_implementation="flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
         )
-        # Dropping the mask is what routes HF to flash_attn_varlen_func; the cumulative
-        # boundaries themselves are checked in test_neat_packing_vlm.py.
+        # Model entry converts these IDs to Flash offsets after any batch split;
+        # the cumulative boundaries are checked in test_flash_pipeline_metadata.py.
         assert "attention_mask" not in result
-        assert "cu_seq_lens_q" in result
+        assert "cu_seq_lens_q" not in result
+        assert result["_packed_seq_ids"].shape == result["input_ids"].shape
 
     def test_document_ids_contract_returns_2d_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
@@ -3313,7 +3314,8 @@ class TestNeatPackedVlmCollaterPackingContract:
             )
 
         assert "attention_mask" not in result
-        assert result["cu_seq_lens_q"].tolist() == [0, 8]
+        assert "cu_seq_lens_q" not in result
+        assert result["_packed_seq_ids"].tolist() == [[1] * 8]
 
     def test_block_causal_contract_returns_4d_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
@@ -3338,15 +3340,13 @@ class TestNeatPackedVlmCollaterPackingContract:
         assert torch.equal(result["_packed_seq_ids"], result["attention_mask"])
         assert result["_packed_seq_ids"][0, 16:].eq(0).all()
 
-    def test_single_sequence_omits_packed_seq_ids(self):
-        """A single (unpacked) sequence carries no ``_packed_seq_ids``; the all-gather
-        CP path synthesizes the trivial one-document map downstream (see
-        ``context_parallel.utils._synthesize_single_document_seq_ids``)."""
+    def test_single_document_retains_original_boundaries(self):
+        """Original boundaries do not depend on document count or the consumer."""
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(4, 0)]
         result = neat_packed_vlm_collater(batch, max_length=6, packing=self._packing())
-        assert "_packed_seq_ids" not in result
+        assert result["_packed_seq_ids"].tolist() == [[1, 1, 1, 1, 0, 0]]
 
     def test_fixed_max_length_pads_to_max(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
