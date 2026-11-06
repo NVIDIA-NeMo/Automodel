@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
@@ -84,7 +85,7 @@ def _qwen3_8_flash_next_backend(backend: BackendConfig | None = None) -> Backend
     return resolved
 
 
-def _resolve_model_dtype(config: object) -> torch.dtype:
+def _resolve_model_dtype(config: Qwen3_8_FlashNextTextConfig) -> torch.dtype:
     value = getattr(config, "dtype", None)
     if value is None:
         value = getattr(config, "torch_dtype", None)
@@ -255,7 +256,7 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        past_key_values: object | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
         _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
@@ -448,7 +449,7 @@ class Qwen3_8_FlashNextModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        past_key_values: object | None = None,
+        past_key_values: Cache | None = None,
         output_hidden_states: bool | None = None,
         _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
         **kwargs: Any,
@@ -674,7 +675,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
-        past_key_values: object | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,

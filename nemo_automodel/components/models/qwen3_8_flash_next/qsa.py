@@ -27,6 +27,7 @@ import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -44,6 +45,9 @@ from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import FlexQSA
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 
 # The gathered implementation is a numerical oracle and CPU fallback, not the
 # production CUDA path. Keep its workspace bounded without exposing a model or
@@ -551,7 +555,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
     ``[B, floor(S / c), 1, D_index]`` before K RMSNorm and group-start RoPE.
     """
 
-    def __init__(self, config: object, backend: BackendConfig) -> None:
+    def __init__(self, config: Qwen3_8_FlashNextTextConfig, backend: BackendConfig) -> None:
         super().__init__()
         self.hidden_size = int(getattr(config, "hidden_size"))
         self.num_query_heads = int(getattr(config, "indexer_n_heads"))

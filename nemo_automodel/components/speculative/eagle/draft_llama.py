@@ -111,6 +111,7 @@ EAGLE-3.1 layer and adds two config-driven structures, laid out like the
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Literal
 
 import torch
@@ -134,7 +135,10 @@ from nemo_automodel.shared.import_utils import safe_import_from
 logger = logging.getLogger(__name__)
 
 
-def _load_flash_attn_func() -> tuple[bool, object | None, object | None]:
+_FlashAttentionFn = Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+
+
+def _load_flash_attn_func() -> tuple[bool, _FlashAttentionFn | None, _FlashAttentionFn | None]:
     """Best-effort load of flash-attn without breaking eager-only users.
 
     ``safe_import_from`` already handles missing modules and missing symbols, but

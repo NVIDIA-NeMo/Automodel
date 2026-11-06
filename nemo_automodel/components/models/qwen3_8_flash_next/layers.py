@@ -24,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+from typing import TypedDict, Unpack
 
 import torch
 import torch.distributed as dist
@@ -36,6 +37,7 @@ from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelS
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
+from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
@@ -49,8 +51,29 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     qsa_route_selection_region,
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+class _AttentionKwargs(TypedDict, total=False):
+    """Packed attention metadata forwarded by the owning text model."""
+
+    cu_seqlens: torch.Tensor | None
+    cu_seqlens_q: torch.Tensor | None
+    cu_seqlens_kv: torch.Tensor | None
+    cu_seqlens_padded: torch.Tensor | None
+    cu_seqlens_q_padded: torch.Tensor | None
+    cu_seqlens_kv_padded: torch.Tensor | None
+    seq_lens: torch.Tensor | None
+    seq_lens_padded: torch.Tensor | None
+    packed_seq_ids: torch.Tensor | None
+    _packed_seq_ids: torch.Tensor | None
+    indices: torch.Tensor | None
+    max_seqlen: int | None
+    max_seqlen_q: int | None
+    max_seqlen_kv: int | None
+    qkv_format: str | None
 
 
 def _rms_norm_gated_fp32(
@@ -140,7 +163,7 @@ class Qwen3_8_FlashNextRMSNormGated(nn.Module):
 class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
     """CP-aware GatedDeltaNet with Qwen3.8-Flash-Next's sigmoid output gate."""
 
-    def __init__(self, config: object, layer_idx: int) -> None:
+    def __init__(self, config: Qwen3_8_FlashNextTextConfig, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
         output_gate_type = str(getattr(config, "output_gate_type", "sigmoid"))
         self._packed_global_cu_seqlens: torch.Tensor | None = None
@@ -540,7 +563,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     differentiable.
     """
 
-    def __init__(self, config: object, layer_idx: int, backend: BackendConfig) -> None:
+    def __init__(self, config: Qwen3_8_FlashNextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         # QSA owns its sparse-attention dispatch. The inherited constructor is
         # reused only for projections/norms, but its generic attention factory
         # does not implement ``flex`` or ``cute``. Give it an isolated SDPA
@@ -569,7 +592,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         cp_context: Qwen3_8_FlashNextCPContext | None = None,
-        **attn_kwargs: object,
+        **attn_kwargs: Unpack[_AttentionKwargs],
     ) -> torch.Tensor:
         """Select compressed blocks and run model-owned sparse GQA.
 
@@ -756,8 +779,8 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
     def __init__(
         self,
         layer_idx: int,
-        config: object,
-        moe_config: object,
+        config: Qwen3_8_FlashNextTextConfig,
+        moe_config: MoEConfig,
         backend: BackendConfig,
         *,
         ple: nn.Module | None = None,
@@ -850,7 +873,7 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
         padding_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         cp_context: Qwen3_8_FlashNextCPContext | None = None,
-        **attn_kwargs: object,
+        **attn_kwargs: Unpack[_AttentionKwargs],
     ) -> torch.Tensor:
         """Run PLE, attention/GDN, and top-10 MoE updates.
 
@@ -963,6 +986,8 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
         else:
             self.linear_attn.dt_bias.fill_(1.0)
             self.linear_attn.A_log.uniform_(0, 16).log_()
+            # Match HF's PreTrainedModel._init_weights for this nn.Conv1d (normal), not torch's default
+            nn.init.normal_(self.linear_attn.conv1d.weight, mean=0.0, std=init_std)
             for linear in (
                 self.linear_attn.in_proj_qkv,
                 self.linear_attn.in_proj_z,

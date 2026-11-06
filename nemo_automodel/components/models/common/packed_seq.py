@@ -33,7 +33,15 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["PackedSeqParams", "packed_seq_params_from_doc_ids", "to_flash_attention_kwargs"]
+FLASH_VARLEN_KWARGS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+
+__all__ = [
+    "FLASH_VARLEN_KWARGS",
+    "PackedSeqParams",
+    "indexed_mask_to_4d_block_causal",
+    "packed_seq_params_from_doc_ids",
+    "to_flash_attention_kwargs",
+]
 
 
 @dataclass
@@ -124,3 +132,36 @@ def to_flash_attention_kwargs(params: PackedSeqParams) -> dict[str, torch.Tensor
         "max_length_q": params.max_seqlen,
         "max_length_k": params.max_seqlen,
     }
+
+
+def indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Convert an indexed attention mask to a 4D block-causal mask.
+
+    Args:
+        attention_mask: Integer tensor of shape ``[B, S]`` where each
+            position contains the 1-based index of the sub-sequence it
+            belongs to (0 = padding).
+
+    Returns:
+        Bool tensor of shape ``[B, 1, S, S]`` for SDPA. ``True`` means
+        the position is **allowed** to attend. Eager consumers require an
+        additive floating-point conversion.
+    """
+    # attention_mask: [B, S]
+    B, S = attention_mask.shape
+
+    # same_doc[b, i, j] = True iff positions i and j belong to the same sub-sequence
+    mask_q = attention_mask.unsqueeze(2)  # [B, S, 1]
+    mask_k = attention_mask.unsqueeze(1)  # [B, 1, S]
+    same_doc = mask_q == mask_k  # [B, S, S]
+
+    # causal: position i can attend to position j only if j <= i
+    causal = torch.ones(S, S, dtype=torch.bool, device=attention_mask.device).tril()  # [S, S]
+
+    # not_padding: both positions must be non-padding (index > 0)
+    not_padding_q = (attention_mask > 0).unsqueeze(2)  # [B, S, 1]
+    not_padding_k = (attention_mask > 0).unsqueeze(1)  # [B, 1, S]
+
+    mask_4d = same_doc & causal.unsqueeze(0) & not_padding_q & not_padding_k  # [B, S, S]
+
+    return mask_4d.unsqueeze(1)  # [B, 1, S, S]

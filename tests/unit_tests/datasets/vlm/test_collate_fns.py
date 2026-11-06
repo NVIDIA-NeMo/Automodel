@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import importlib
 import sys
 import types
@@ -18,6 +19,8 @@ import types
 import pytest
 import torch
 from PIL import Image as PILImage
+
+from nemo_automodel.components.models.common.packing import PackingCapabilities, get_packing_capabilities
 
 CONVERSATION = [
     {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
@@ -3272,16 +3275,18 @@ class TestNeatPackedVlmCollaterPackingContract:
 
     @staticmethod
     def _packing(*, packed_mask_type="block_causal", requires_metadata=False):
-        return types.SimpleNamespace(
+        return PackingCapabilities(
             packed_mask_type=packed_mask_type,
-            requires_packed_sequence_metadata=requires_metadata,
+            return_packed_sequence_metadata=requires_metadata,
         )
 
     def test_flash_attention_2_emits_varlen_kwargs_instead_of_mask(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(16, 0), self._make_packed_sample(12, 0)]
-        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+        result = neat_packed_vlm_collater(
+            batch, attn_implementation="flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
+        )
         # Dropping the mask is what routes HF to flash_attn_varlen_func; the cumulative
         # boundaries themselves are checked in test_neat_packing_vlm.py.
         assert "attention_mask" not in result
@@ -3303,7 +3308,9 @@ class TestNeatPackedVlmCollaterPackingContract:
 
         batch = [self._make_packed_sample(8, 0)]
         with pytest.warns(FutureWarning, match="attn_implementation is deprecated"):
-            result = neat_packed_vlm_collater(batch, 0, None, "flash_attention_2")
+            result = neat_packed_vlm_collater(
+                batch, 0, None, "flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
+            )
 
         assert "attention_mask" not in result
         assert result["cu_seq_lens_q"].tolist() == [0, 8]

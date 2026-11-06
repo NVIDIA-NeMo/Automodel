@@ -112,6 +112,10 @@ def process_input_for_thd(
             - 'seq_lens_padded': Padded sequence lengths tensor of shape [batch_size, num_packs]
                 containing lengths including separator tokens. Values matching
                 seq_lens_padding_value indicate padding and are filtered out.
+            - Optional _packed_seq_ids: Selected subdocument IDs [batch_size, seq_len],
+                matching attention boundaries. Zero marks padding.
+            - Optional document_ids: Original membership [batch_size, seq_len] for
+                an explicit model consumer; it does not override attention or loss.
         seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
             tensors that should be filtered out (default: -1000)
         padding_token_id: Filler token id. The padding mask is derived from the pack
@@ -141,6 +145,9 @@ def process_input_for_thd(
                 after any absorption. Honors TE's contract that
                 ``max_seqlen_q >= max(cu_seqlens_q[i+1] - cu_seqlens_q[i])``.
             - 'padding_mask': Boolean tensor of shape [total_tokens] indicating padding positions
+            - Optional _packed_seq_ids: Selected IDs [total_tokens], made distinct across
+                batch documents while preserving zero-valued padding. Optional
+                document_ids are transformed independently to the same layout.
             - Non-tensor keys from input batch are preserved (e.g., 'qkv_format')
 
     Example:
@@ -262,6 +269,14 @@ def process_input_for_thd(
         "labels": labels_thd,
         "padding_mask": padding_mask,
     }
+    for key in ("_packed_seq_ids", "document_ids"):
+        document_ids = batch.get(key)
+        if document_ids is not None:
+            if document_ids.shape != labels.shape:
+                raise ValueError(f"THD {key} must match labels [batch, sequence]")
+            # IDs are local to each batch document; make them unique before flattening.
+            offsets = torch.cat([document_ids.new_zeros(1), document_ids.amax(dim=1).cumsum(0)[:-1]])
+            result[key] = torch.where(document_ids > 0, document_ids + offsets[:, None], 0).reshape(-1)
     # Physical boundaries are data, not a backend switch. Decide padding once
     # for this stream, comparing the entire arrays (including the final offset).
     if cu_seqlens_padded is not None:
@@ -398,6 +413,9 @@ def split_batch_into_thd_chunks(
         )
     if all("max_seqlen" in c for c in chunk_results):
         stacked["max_seqlen"] = torch.stack([c["max_seqlen"] for c in chunk_results])
+    for key in ("_packed_seq_ids", "document_ids"):
+        if all(key in c for c in chunk_results):
+            stacked[key] = torch.stack([c[key] for c in chunk_results])
     stacked.update(
         {k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor) and k != "pad_between_seqs"}
     )
