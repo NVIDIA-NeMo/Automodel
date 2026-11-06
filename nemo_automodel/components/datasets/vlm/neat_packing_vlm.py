@@ -41,8 +41,10 @@ from typing import TYPE_CHECKING, Callable, Literal, NamedTuple
 
 import torch
 import torch.utils.data
+from datasets import Dataset as HfDataset
 from PIL import Image
 
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 from nemo_automodel.components.datasets.vlm.media import pad_image_tensors
 
 if TYPE_CHECKING:
@@ -172,7 +174,9 @@ class _SampleLengthEstimate(NamedTuple):
     unsized_media: int
 
 
-def _image_height_width(image: object) -> tuple[int, int] | None:
+def _image_height_width(
+    image: Image.Image | io.BytesIO | bytes | str | dict[str, bytes | str | None] | None,
+) -> tuple[int, int] | None:
     """Read the ``(height, width)`` of a conversation image without decoding its pixels.
 
     Handles the forms VLM datasets put in conversations: PIL images (including lazy
@@ -608,7 +612,7 @@ class PackedDatasetWrapperConfig:
         inner_dataset: "PreTokenizedDatasetWrapper",
         bins: list[list[int]],
         padding_idx: int,
-        get_rope_index: Callable[..., object] | None = None,
+        get_rope_index: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> "PackedDatasetWrapper":
         """Build a :class:`PackedDatasetWrapper` from this config.
 
@@ -782,8 +786,8 @@ class NeatPackConfig:
         *,
         dataset: "PreTokenizedDatasetWrapper",
         padding_idx: int,
-        ds_raw: torch.utils.data.Dataset | Sequence[dict[str, object]] | None = None,
-        get_rope_index: Callable[..., object] | None = None,
+        ds_raw: HfDataset | torch.utils.data.Dataset | Sequence[ConversationSample] | None = None,
+        get_rope_index: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
         processor: "ProcessorMixin | None" = None,
         cp_size: int = 1,
     ) -> "PackedDatasetWrapper":

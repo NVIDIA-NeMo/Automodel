@@ -19,6 +19,7 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
+from types import ModuleType
 from typing import Dict, Tuple, Type, Union
 
 import torch.nn as nn
@@ -582,7 +583,7 @@ class _LazyArchMapping:
                 self._tags[key] = value[2]
         self._loaded: Dict[str, Type[nn.Module]] = {}
         self._extra: Dict[str, Type[nn.Module]] = {}
-        self._modules: Dict[str, object] = {}
+        self._modules: Dict[str, ModuleType] = {}
 
     def _load(self, key: str) -> Type[nn.Module]:
         if key in self._loaded:
