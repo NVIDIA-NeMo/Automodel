@@ -74,7 +74,7 @@ classifiers = [
 dependencies = [
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
-    "mistral-common[audio,hf-hub,sentencepiece]",
+    "mistral-common[audio,hf-hub,sentencepiece]>=1.13.0",
     "ninja",
     "pyyaml",
     "tiktoken",
@@ -161,7 +161,7 @@ mok = [
 ]
 vlm = [
     "backoff",
-    "mistral_common>=1.11.0",
+    "mistral_common>=1.13.0",
     "numpy",
     "numba",
     "open-clip-torch",
@@ -617,6 +617,7 @@ modules = [
     "nemo_automodel.components.config",
     "nemo_automodel.components.datasets",
     "nemo_automodel.components.distributed",
+    "nemo_automodel.components.eval.decision",
     "nemo_automodel.components.flow_matching",
     "nemo_automodel.components.launcher",
     "nemo_automodel.components.loggers",

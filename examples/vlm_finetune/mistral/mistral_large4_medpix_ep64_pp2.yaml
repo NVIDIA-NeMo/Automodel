@@ -38,8 +38,6 @@ model:
     experts: torch_mm
     dispatcher: hybridep
     enable_hf_state_dict_adapter: true
-  fp8_indexer: false
-  fp8_kv_cache: false
 distributed:
   strategy: fsdp2
   dp_size: none
