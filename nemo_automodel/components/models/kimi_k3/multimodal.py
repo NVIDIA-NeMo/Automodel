@@ -491,6 +491,9 @@ class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
     a sparse-attention indexer to the listed layers.
     """
 
+    # DSA only changes the attention kernel; parallelism support is the Kimi K3 profile.
+    ModelCapabilities = KimiK3ForConditionalGeneration.ModelCapabilities
+
     @classmethod
     def from_pretrained(
         cls,
