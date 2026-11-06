@@ -43,7 +43,7 @@ from nemo_automodel.components.datasets.vlm.loader import (
 from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
-from nemo_automodel.components.models.common.packing import PackingCapabilities
+from nemo_automodel.components.models.common.packing import PackingCapabilities, get_packing_capabilities
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -729,6 +729,58 @@ def test_vlm_dataloader_neat_packing_uses_default_contract(monkeypatch):
     )
 
     assert result.dataloader.collate_fn.keywords["packing"] is DEFAULT_PACKED_SEQUENCE_CONTRACT
+
+
+@pytest.mark.parametrize("pp_n_microbatches", [None, 2])
+def test_vlm_dataloader_invokes_native_packed_collator(
+    monkeypatch: pytest.MonkeyPatch, pp_n_microbatches: int | None
+) -> None:
+    """Invoke the configured collator, including optional PP media preparation."""
+    from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY
+
+    processor = DummyProcessor()
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+        pretokenization=PreTokenizedDatasetWrapperConfig(),
+        packing=NeatPackConfig(),
+        num_workers=1,
+        shuffle=False,
+    )
+    result = config.build(
+        pretrained_model_name_or_path="unused",
+        dp_rank=0,
+        dp_world_size=1,
+        batch_size=2,
+        pp_n_microbatches=pp_n_microbatches,
+        packing_contract=get_packing_capabilities("sdpa"),
+    )
+    document = {
+        "input_ids": torch.tensor([1, 2, 3]),
+        "labels": torch.tensor([2, -100, 4]),
+        "attention_mask": torch.tensor([1, 1, 2]),
+        "position_ids": torch.tensor([0, 1, 0]),
+        "seq_lens": [2, 1],
+        "pixel_values": torch.ones(1, 3, 2, 2),
+        "image_sizes": torch.tensor([[2, 2]]),
+        "n_images": 1,
+    }
+
+    batch = result.dataloader.collate_fn([document, document])
+
+    torch.testing.assert_close(batch["input_ids"], document["input_ids"].repeat(2, 1))
+    torch.testing.assert_close(batch["labels"], document["labels"].repeat(2, 1))
+    torch.testing.assert_close(batch["position_ids"], document["position_ids"].repeat(2, 1))
+    assert batch["attention_mask"].shape == (2, 1, 3, 3)
+    if pp_n_microbatches is None:
+        assert batch["pixel_values"].shape == (2, 3, 2, 2)
+        assert batch["image_sizes"].tolist() == [[2, 2], [2, 2]]
+    else:
+        media = batch[VLM_PP_MEDIA_KEY]
+        assert [values.shape[0] for values in media["pixel_values"]] == [1, 1]
+        assert [sizes.tolist() for sizes in media["image_grid_hws"]] == [[[2, 2]], [[2, 2]]]
 
 
 def test_vlm_dataloader_preserves_deprecated_python_packing_backend(monkeypatch):
