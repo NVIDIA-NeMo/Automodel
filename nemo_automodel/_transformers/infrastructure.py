@@ -70,6 +70,7 @@ from nemo_automodel.components.models.common.utils import (
     cast_frozen_modules_to_compute_dtype,
     prepare_frozen_parameters_for_sharding,
 )
+from nemo_automodel.components.models.kimi_k3.model import freeze_kimi_k3_indexer_params
 from nemo_automodel.components.moe.experts import GroupedExpertsTE
 from nemo_automodel.components.moe.quantized_experts import apply_mxfp4_to_moe_experts
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
@@ -483,6 +484,7 @@ def _apply_trainability_policy(
     freeze_unused_kv_sharing_params(model)
     freeze_deepseek_v4_indexer_params(model)
     freeze_minimax_m3_indexer_params(model)
+    freeze_kimi_k3_indexer_params(model)
 
 
 def _prepare_trainability_before_sharding(
