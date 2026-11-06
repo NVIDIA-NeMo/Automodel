@@ -63,7 +63,7 @@ class FlintConfig(PreTrainedConfig):
     rms_norm_eps: float = 1e-6
     use_cache: bool = False
     tie_word_embeddings: bool = False
-    rope_parameters: RopeParameters | dict[str, object] | None = None
+    rope_parameters: RopeParameters | dict[str, str | float | list[int] | list[float]] | None = None
     attention_bias: bool = False
     attention_dropout: float | int = 0.0
     use_sliding_window: bool = True
