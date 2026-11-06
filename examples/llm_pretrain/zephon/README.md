@@ -108,6 +108,11 @@ queues, and `runtime.mtp_buffer` or `runtime.mtp_prefetch` for MTP buffering.
 Leaving a value unset delegates its sizing to Zephon; `mtp_prefetch: 0` disables
 the background receiver thread.
 
+Source/cache lookahead is a separate optional operator. Set `source.prefetch: {}`
+to enable it with Zephon's defaults, or provide `buffer_size` and `parallelism`
+inside that mapping to tune it. Omit the group or set it to `null` to leave the
+operator out; runtime buffering remains enabled independently.
+
 You can also place the data settings in a TOML file and reference it with
 `dataset.zephon.data_config`. Inline YAML values override that file; relative
 source, cache, and checkpoint paths in TOML are resolved relative to the TOML file.

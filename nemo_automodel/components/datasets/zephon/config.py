@@ -99,6 +99,21 @@ class TokenEstimationSettings(TypedDict, total=False):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ZephonPrefetchOptions:
+    """Cache-warmup operator settings; None fields keep Zephon's defaults."""
+
+    buffer_size: int | None = None
+    """Number of samples to look ahead; None uses Zephon's operator default."""
+    parallelism: int | None = None
+    """Concurrent cache-warmup workers; None uses Zephon's operator default."""
+
+    def __post_init__(self) -> None:
+        for name, value in (("buffer_size", self.buffer_size), ("parallelism", self.parallelism)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"source.prefetch.{name} must be a positive integer or None")
+
+
+@dataclass(frozen=True, kw_only=True)
 class ZephonSourceOptions:
     """Source traversal, token-aware allocation and end-of-data policy."""
 
@@ -115,6 +130,9 @@ class ZephonSourceOptions:
     # AutoModel policy: estimate tokens for multi-source text (including SFT and
     # pretokenized input). None delegates to Zephon's sample-based default.
     token_estimation: bool | TokenEstimationSettings | Literal["auto"] | None = "auto"
+    # None omits the cache-warmup operator; an empty config enables it with
+    # Zephon's defaults. Runtime batch/stage/IPC buffering is independent.
+    prefetch: ZephonPrefetchOptions | None = None
 
     def __post_init__(self) -> None:
         if self.chunk_size <= 0:
@@ -200,7 +218,6 @@ class ZephonWorkerOptions:
     map_parallelism: int | None = None
     pack_parallelism: int | None = 1
     fetch_parallelism: int | None = 2
-    prefetch_parallelism: int | None = None
     shuffle_parallelism: int | None = None
 
     def __post_init__(self) -> None:
@@ -226,9 +243,6 @@ class ZephonRuntimeOptions:
     """Positive capacity of the MTP engine-to-consumer IPC queue."""
     mtp_prefetch: int | None = None
     """Consumer-side MTP prefetch depth; zero disables the background receiver thread."""
-    # Optional source/cache lookahead via Pipeline.prefetch(), not batch or stage
-    # buffering. Zero omits that operator; the runtime queues above still apply.
-    prefetch_buffer_size: int = 0
 
     def __post_init__(self) -> None:
         for name, value, minimum in (
@@ -543,6 +557,13 @@ def _group_recipe_options(values: dict[str, Any]) -> dict[str, Any]:
         unknown = group.keys() - {item.name for item in fields(config_type)}
         if unknown:
             raise ValueError(f"Unexpected Zephon {name} option(s): {sorted(unknown)}")
+        if name == "source" and group.get("prefetch") is not None:
+            prefetch = group["prefetch"]
+            if not isinstance(prefetch, dict):
+                raise ValueError("Zephon source.prefetch must be a mapping or None")
+            unknown = prefetch.keys() - {item.name for item in fields(ZephonPrefetchOptions)}
+            if unknown:
+                raise ValueError(f"Unexpected Zephon source.prefetch option(s): {sorted(unknown)}")
         if group:
             values[name] = group
     return values
@@ -574,7 +595,15 @@ def resolve_zephon_settings(values: dict[str, Any]) -> dict[str, Any]:
             if value is not None and not Path(value).is_absolute():
                 values[group][key] = str(recipe_path.parent / value)
     for key, value in _group_recipe_options(inline).items():
-        values[key] = {**values.get(key, {}), **value} if key in _OPTION_GROUPS else value
+        if key in _OPTION_GROUPS:
+            inherited = values.get(key, {})
+            if key == "source" and isinstance(value.get("prefetch"), dict):
+                # Override individual nested fields, while explicit null disables
+                # the operator even when the TOML file enabled it.
+                value = {**value, "prefetch": {**(inherited.get("prefetch") or {}), **value["prefetch"]}}
+            values[key] = {**inherited, **value}
+        else:
+            values[key] = value
     if "repeat" in values:
         source = values.setdefault("source", {})
         if any(key in source for key in ("exhausted_policy", "max_repeats", "stop_after_passes")):
@@ -604,6 +633,9 @@ def zephon_options_from_values(
             raise ValueError(f"Zephon source {source.get('name', index)!r} needs a nonempty name and path")
         sources.append(ZephonSource(**source))
     values["sources"] = tuple(sources)
+    prefetch = values.get("source", {}).get("prefetch")
+    if prefetch is not None:
+        values["source"]["prefetch"] = ZephonPrefetchOptions(**prefetch)
     # A partial group must inherit its declared factory's defaults, including
     # image-specific source/packing defaults on an options subtype.
     group_fields = {item.name: item for item in fields(options_type) if item.name in _OPTION_GROUPS}
