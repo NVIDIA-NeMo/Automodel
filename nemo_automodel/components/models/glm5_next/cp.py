@@ -12,11 +12,14 @@ that both KDA and KPool-DSA consume.
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
 from nemo_automodel.shared.import_utils import safe_import_from
@@ -53,6 +56,31 @@ class Glm5NextPackedContext:
         repr=False,
         compare=False,
     )
+
+    _document_ranges: dict[int, tuple[tuple[int, int], ...]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+
+    def row_document_ranges(self, row: int) -> tuple[tuple[int, int], ...]:
+        """Return cached non-padding document ranges in global row coordinates.
+
+        Document ids are immutable for the lifetime of this per-step context.
+        Materialize the cache before decoder FSDP hooks rebuild the dataclass.
+        """
+        cached = self._document_ranges.get(row)
+        if cached is None:
+            device_boundaries, cpu_boundaries = self.row_cu_seqlens(row)
+            boundaries = cpu_boundaries.tolist()
+            document_ids = self.doc_ids[row].index_select(0, device_boundaries[:-1]).cpu().tolist()
+            cached = tuple(
+                (start, end)
+                for start, end, document_id in zip(boundaries[:-1], boundaries[1:], document_ids, strict=True)
+                if document_id > 0
+            )
+            self._document_ranges[row] = cached
+        return cached
 
     @property
     def cp_enabled(self) -> bool:
@@ -132,7 +160,11 @@ def build_fla_cp_context(
     """Build FLA's KDA context for one batch row.
 
     Args:
-        packed_context: Global document layout.
+        packed_context: Global document layout whose ``doc_ids`` tensor has
+            shape [batch, padded_global_sequence]. Its cached device and CPU
+            boundaries, each an integer tensor of shape [segments + 1] where
+            segments are consecutive equal-id runs including padding, are
+            read; FLA receives a fresh clone of the device boundaries.
         row: Batch row being executed.
         cp_group: Context-parallel process group.
         conv_kernel_size: Short-convolution width used for the left halo.
@@ -145,7 +177,9 @@ def build_fla_cp_context(
 
     cu_seqlens, cu_seqlens_cpu = packed_context.row_cu_seqlens(row)
     return _build_cp_context(
-        cu_seqlens=cu_seqlens,
+        # Keep FLA's identity cache cold in forward and checkpoint replay,
+        # independent of which PP microbatch ran immediately before this one.
+        cu_seqlens=cu_seqlens.clone(),
         group=cp_group,
         conv1d_kernel_size=conv_kernel_size,
         cu_seqlens_cpu=cu_seqlens_cpu,
@@ -157,18 +191,47 @@ class _AllGatherSequence(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, local_tensor: torch.Tensor, group: Any, dim: int) -> torch.Tensor:
+        """Concatenate every rank's sequence shard in rank order.
+
+        Args:
+            ctx: Autograd context; stores the group, dimension, rank and
+                local shard length for backward.
+            local_tensor: Tensor of arbitrary rank whose ``dim`` axis is this
+                rank's local_sequence shard. Every rank must pass the same
+                shape and dtype.
+            group: Context-parallel process group of size cp_size.
+            dim: Sequence axis; negative values count from the end.
+
+        Returns:
+            Contiguous tensor with ``local_tensor``'s shape except that axis
+            ``dim`` has length cp_size * local_sequence. It owns new storage
+            and does not alias ``local_tensor``.
+        """
         dim = dim if dim >= 0 else local_tensor.ndim + dim
-        gathered = [torch.empty_like(local_tensor) for _ in range(dist.get_world_size(group))]
-        dist.all_gather(gathered, local_tensor.contiguous(), group=group)
+        gathered = local_tensor.new_empty((dist.get_world_size(group), *local_tensor.shape))
+        dist.all_gather_into_tensor(gathered.flatten(0, 1), local_tensor.contiguous(), group=group)
         ctx.group = group
         ctx.dim = dim
         ctx.rank = dist.get_rank(group)
         ctx.local_size = local_tensor.shape[dim]
-        return torch.cat(gathered, dim=dim)
+        return gathered.movedim(0, dim).flatten(dim, dim + 1).contiguous()
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        grad_output = grad_output.contiguous()
+        """Reduce a private copy of the full-sequence gradient.
+
+        Args:
+            ctx: Autograd context saved by forward.
+            grad_output: Tensor with the forward output's shape, global
+                sequence on ctx.dim. Its dtype matches the forward input, and its storage
+                may still be owned by the caller or another autograd branch.
+
+        Returns:
+            Local sequence-gradient tensor, followed by two None entries for
+            the process group and dimension. The gradient aliases a private
+            reduction buffer, never the caller's upstream-gradient storage.
+        """
+        grad_output = grad_output.clone(memory_format=torch.contiguous_format)
         dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
         start = ctx.rank * ctx.local_size
         return grad_output.narrow(ctx.dim, start, ctx.local_size).contiguous(), None, None
@@ -179,11 +242,32 @@ class _AllGatherBackwardAnchor(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, gathered: torch.Tensor) -> torch.Tensor:
+        """Return a broadcastable zero tied to ``gathered``.
+
+        Args:
+            ctx: Autograd context; stores the input shape for backward.
+            gathered: Tensor of shape [batch, global_sequence, hidden], the
+                all-gathered sequence.
+
+        Returns:
+            Zero tensor of shape [batch, 1, 1] in ``gathered``'s dtype and
+            device, broadcastable onto [batch, local_sequence, hidden].
+        """
         ctx.input_shape = gathered.shape
         return gathered.new_zeros((gathered.shape[0], 1, 1))
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        """Send a zero gradient to the gathered tensor.
+
+        Args:
+            ctx: Autograd context saved by forward.
+            grad_output: Tensor of shape [batch, 1, 1].
+
+        Returns:
+            Zero tensor with the forward input's shape [batch,
+            global_sequence, hidden], so the gather backward still runs.
+        """
         return grad_output.new_zeros(ctx.input_shape)
 
 
@@ -256,14 +340,15 @@ def _global_doc_ids_from_batch(batch: dict[str, Any], seq_len: int) -> torch.Ten
 
 
 def shard_batch_for_glm5_next_cp(
-    cp_mesh,
-    tp_mesh,
+    cp_mesh: DeviceMesh | None,
+    tp_mesh: DeviceMesh | None,
     batch: dict[str, Any],
     *,
-    loss_mask=None,
+    loss_mask: torch.Tensor | None = None,
     padding_token_id: int = 0,
     shard_primary: bool = False,
-):
+    num_chunks: int = 1,
+) -> tuple[Callable[[], AbstractContextManager[None]], dict[str, Any], ShardLayout]:
     """Contiguously shard packed GLM-5.3 token streams.
 
     The top-level VLM uses ``shard_primary=False``: image features must be
@@ -274,13 +359,30 @@ def shard_batch_for_glm5_next_cp(
     Args:
         cp_mesh: One-dimensional CP mesh or ``None``.
         tp_mesh: Unused tensor-parallel mesh, accepted by the sharder protocol.
-        batch: Batch containing token tensors with shape ``[batch, sequence]``.
-        loss_mask: Optional loss mask ``[batch, sequence]``.
+        batch: Batch mutated in place. Token tensors such as ``input_ids``,
+            ``labels``, ``position_ids`` and ``padding_mask`` have shape
+            [batch, sequence] (a 1-D THD row gains a batch axis). Packing
+            metadata (``_packed_seq_ids`` or ``attention_mask`` of shape
+            [batch, sequence], ``seq_lens``/``seq_lens_padded`` of shape
+            [batch, documents], or ``cu_seqlens`` of shape [documents + 1])
+            is consumed and removed.
+        loss_mask: Optional tensor of shape [batch, sequence].
         padding_token_id: Fill value for padded token ids.
         shard_primary: Whether to shard ``input_ids`` in this function.
+        num_chunks: PP microbatches. With multiple chunks, expose the document
+            map as a tensor in a tuple so Torch splits its batch axis too.
 
     Returns:
         Context factory, mutated local batch, and the global shard layout.
+        In the batch, ``labels``, ``position_ids``, ``padding_mask`` (True at
+        padding), ``loss_mask`` and, with ``shard_primary``, ``input_ids``
+        become contiguous [batch, local_sequence] slices of the CP-padded
+        sequence. Otherwise ``input_ids`` stays global and unpadded.
+        ``glm5_next_packed_context`` holds int32 ``doc_ids`` of shape [batch,
+        padded_global_sequence], replicated on every CP rank, plus
+        ``seq_start``, ``cp_size`` and the unpadded length: a
+        ``Glm5NextPackedContext``, or the equivalent tuple when
+        ``num_chunks > 1``.
     """
     del tp_mesh
     _normalize_batch_axis(batch)
@@ -319,11 +421,13 @@ def shard_batch_for_glm5_next_cp(
 
     batch.setdefault("padding_mask", doc_ids <= _PAD_DOC_ID)
     seq_start = 0 if cp_mesh is None else cp_mesh.get_local_rank() * (padded_seq_len // cp_size)
-    batch["glm5_next_packed_context"] = Glm5NextPackedContext(
-        doc_ids=doc_ids,
-        seq_start=seq_start,
-        cp_size=cp_size,
-        original_seq_len=seq_len,
+    # The PP kwargs splitter treats dataclasses as opaque (replicated) values.
+    # A tuple lets it split doc_ids alongside input_ids and labels, while the
+    # Python scalar offsets remain shared. Forward creates each chunk's cache.
+    batch["glm5_next_packed_context"] = (
+        (doc_ids, seq_start, cp_size, seq_len)
+        if num_chunks > 1
+        else Glm5NextPackedContext(doc_ids, seq_start, cp_size, seq_len)
     )
 
     local_seq_len = padded_seq_len // cp_size
