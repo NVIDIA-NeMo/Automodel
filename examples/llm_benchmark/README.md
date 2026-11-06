@@ -182,6 +182,8 @@ The following recipes remain unpacked pending support or data-size validation:
   packed document mask.
 - DeepSeek V4 with cudnn/torch attention: the selected packing paths require
   capability and document-mask validation before enabling them.
+- GLM5: all 39,905 HellaSwag examples yield only 784 packs at 4,096 tokens,
+  below the 1,024 packs required by one canonical distributed microbatch.
 - Kimi K3: the capped 25,600-example HellaSwag dataset yields only 1,649
   packs at 1,024 tokens or 824 at 2,048 tokens, below the 4,096 packs required
   by one canonical distributed microbatch. Increasing epoch count cannot fix
