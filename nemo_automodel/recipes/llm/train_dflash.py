@@ -166,6 +166,16 @@ def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
     return bool(flag.item())
 
 
+def _average_unsynced_ddp_grads(ddp_module: DistributedDataParallel) -> None:
+    """Average locally accumulated grads over the DDP group, as DDP's synced backward would (sum / size)."""
+    group = ddp_module.process_group
+    world_size = dist.get_world_size(group)
+    for param in ddp_module.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad, group=group)
+            param.grad.div_(world_size)
+
+
 def _submesh_or_none(device_mesh, name: str):
     """Return the named (flattened) submesh, or None if absent / no mesh.
 
@@ -1065,6 +1075,9 @@ class TrainDFlashRecipe(BaseRecipe):
                 epoch_loss = 0.0
                 micro_step = 0
                 pending_micro_batches = 0
+                # Whether the accumulated gradients were all-reduced by DDP, i.e.
+                # the window's latest backward ran outside ``no_sync()``.
+                window_grads_synced = True
                 completed_steps = 0
                 last_batch_idx = -1
                 num_batches = len(self.train_dataloader)
@@ -1102,6 +1115,7 @@ class TrainDFlashRecipe(BaseRecipe):
                         all_have_valid = _all_ranks_have_valid(local_has_valid, is_ddp, self.device)
                         if all_have_valid:
                             loss.backward()
+                            window_grads_synced = sync_grads
                     if not all_have_valid:
                         self._skipped_micro_batches += 1
                         continue
@@ -1194,6 +1208,11 @@ class TrainDFlashRecipe(BaseRecipe):
                 # Flush the trailing partial accumulation window (see EAGLE recipes
                 # for the rescale rationale).
                 if pending_micro_batches > 0:
+                    if is_ddp and not window_grads_synced:
+                        # The epoch's last micro-batch, which would have carried DDP's
+                        # all-reduce, was skipped on every rank (no valid anchors), so
+                        # each rank still holds only its own grads for this window.
+                        _average_unsynced_ddp_grads(self.trainer_module)
                     synchronize_tp_replica_gradients(
                         [self.trainer_module],
                         getattr(self, "device_mesh", None),

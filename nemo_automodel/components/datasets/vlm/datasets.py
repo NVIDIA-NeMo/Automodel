@@ -1711,6 +1711,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     "video_grid_thw",
                     "second_per_grid_ts",
                     "image_position_ids",
+                    "image_sizes",
                     "mm_token_type_ids",
                 ):
                     if key in result and result[key] is not None:
