@@ -69,10 +69,12 @@ checkpoint:
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
-  exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
-  dim: 8
+  # Mamba kernels use out_proj.weight directly and cannot apply its LoRA adapter.
+  exclude_modules: ['*.out_proj']
+  dim: 32
   alpha: 32
-  use_triton: true
+  dropout: 0.0
+  moe_rank_scaling: true
 
 distributed:
   strategy: fsdp2
@@ -86,6 +88,7 @@ distributed:
     reshard_after_forward: true
     ignore_router_for_ac: false
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -152,5 +155,6 @@ ci:
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
   perf_testing:
+    fake_balanced_gate: true
     schedule: nightly
   nodes: 8

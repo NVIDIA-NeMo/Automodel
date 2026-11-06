@@ -51,13 +51,12 @@ checkpoint:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: '*_proj'
-  dim: 8
+  dim: 16
   alpha: 32
-  use_triton: true
-  # dtype needs a fix to resolve to type instead of string
-  # lora_dtype: torch.bfloat16
-
+  dropout: 0.0
   use_memory_efficient_lora: false
+  use_triton: true
+
 distributed:
   strategy: fsdp2
   dp_size: none

@@ -80,6 +80,7 @@ distributed:
     layers_per_stage: 2
 
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -129,5 +130,6 @@ ci:
   recipe_owner: hemildesai
   nproc_per_node: 4
   perf_testing:
+    fake_balanced_gate: true
     schedule: nightly
   time: "00:40:00"

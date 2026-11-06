@@ -64,6 +64,7 @@ distributed:
   ep_size: 8
   activation_checkpointing: true
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -123,5 +124,6 @@ ci:
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
   perf_testing:
+    fake_balanced_gate: true
     schedule: nightly
   nodes: 1

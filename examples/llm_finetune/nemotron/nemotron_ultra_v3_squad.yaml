@@ -139,4 +139,5 @@ ci:
 #   entity: my-entity
 #   name: ultra-full-sft
   perf_testing:
+    fake_balanced_gate: true
     schedule: weekly

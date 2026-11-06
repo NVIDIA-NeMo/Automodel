@@ -51,10 +51,9 @@ checkpoint:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: '*_proj'
-  dim: 8
+  dim: 16
   alpha: 32
   use_triton: true
-
 
 distributed:
   strategy: fsdp2

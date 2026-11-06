@@ -483,7 +483,10 @@ def preprocess_args_and_kwargs_for_attn(
         if attention_mask is not None:
             if attention_mask.dim() <= 2:
                 key_mask = attention_mask.to(device=q.device, dtype=torch.bool)
-                has_padding_mask = not bool(key_mask.all().item())
+                # Tensor-value branches cannot be captured by fullgraph compilation.
+                # Preserve the supplied mask in compiled attention; eager all-valid
+                # batches can still use SDPA's implicit causal fast path.
+                has_padding_mask = torch.compiler.is_compiling() or not bool(key_mask.all().item())
             else:
                 explicit_mask = attention_mask.to(device=q.device)
                 has_padding_mask = False

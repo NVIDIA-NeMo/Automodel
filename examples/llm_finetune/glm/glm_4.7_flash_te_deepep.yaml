@@ -87,6 +87,7 @@ distributed_config:
   _target_: nemo_automodel.components.distributed.config.FSDP2Config
 
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -153,4 +154,5 @@ ci:
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
   perf_testing:
+    fake_balanced_gate: true
     schedule: nightly

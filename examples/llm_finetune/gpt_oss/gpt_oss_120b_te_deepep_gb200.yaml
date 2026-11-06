@@ -68,7 +68,7 @@ distributed:
     reshard_after_forward: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -117,6 +117,7 @@ ci:
   nodes: 8
   time: "00:40:00"
   perf_testing:
+    fake_balanced_gate: true
     schedule: nightly
   nproc_per_node: 4
   env_vars:

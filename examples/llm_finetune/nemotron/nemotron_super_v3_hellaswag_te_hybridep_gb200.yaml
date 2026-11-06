@@ -56,6 +56,7 @@ distributed:
   moe:
     reshard_after_forward: true
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -83,13 +84,19 @@ validation_dataloader:
 
 optimizer:
   _target_: torch.optim.Adam
-  betas: [0.9, 0.999]
+  betas:
+  - 0.9
+  - 0.999
   eps: 1e-8
-  lr: 1.0e-5
+  lr: 1.0e-05
   weight_decay: 0
-
   fused: true
   foreach: false
+  param_group_overrides:
+  - pattern: (?:^|\.)experts\.(?:gate_up_linear|down_linear)\.
+    lr_mult: 1
+    wd_mult: 1
+
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 1.0e-6
@@ -119,6 +126,7 @@ ci:
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
   perf_testing:
+    fake_balanced_gate: true
     schedule: nightly
   nproc_per_node: 4
   env_vars:

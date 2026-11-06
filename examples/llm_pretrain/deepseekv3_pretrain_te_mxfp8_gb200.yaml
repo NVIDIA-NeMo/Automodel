@@ -1,30 +1,35 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# GB200 DeepSeek V3 pretraining variant. Runtime tuning migrated from
-# examples/llm_benchmark/deepseek/deepseek_v3_te_mxfp8_gb200.yaml.
-# Set the real FineWeb data and index-mapping paths in both dataset sections.
-# Performance scheduling remains disabled until those cluster-specific paths are supplied.
+#
+# Real-text pretraining counterpart of examples/llm_benchmark/deepseek/deepseek_v3_te_mxfp8_gb200.yaml
+# Fixed-length causal chunks; runtime tuning is canonical. GPU validation is pending.
+
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:
+  gc_every_steps: 10
   global_batch_size: 128
   local_batch_size: 2
-  ckpt_every_steps: 500
-  val_every_steps: 100
-  num_epochs: 1
-  max_steps: 9500
-  gc_every_steps: 10
+  ckpt_every_steps: 1000
+  val_every_steps: null
+  num_epochs: null
+  max_steps: 1000
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
 dist_env:
   backend: nccl
   timeout_minutes: 10
-rng:
-  _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1111
-  ranked: true
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
+  trust_remote_code: true
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
@@ -38,74 +43,48 @@ model:
     enable_fsdp_optimizations: true
     te_fp8:
       recipe: mxfp8
-  trust_remote_code: true
 checkpoint:
-  enabled: true
-  checkpoint_dir: checkpoints/
-  model_save_format: torch_save
-  save_consolidated: false
-distributed:
-  strategy: fsdp2
-  tp_size: 1
-  cp_size: 1
-  pp_size: 1
-  ep_size: 64
-  sequence_parallel: false
-  activation_checkpointing: true
+  enabled: false
 loss_fn:
-  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: /path/to/fineweb_edu/processed_data_*_text_document*
-  index_mapping_dir: /path/to/fineweb_edu/mapping_dir
+  _target_: nemo_automodel.components.datasets.llm.streaming_text.StreamingTextConfig
+  path: HuggingFaceFW/fineweb-edu
+  name: sample-10BT
+  revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
+  seq_length: 4096
   tokenizer:
-    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
     trust_remote_code: true
-  seq_length: 1024
-  split: 0.99, 0.01, 0.00
-  splits_to_build: train
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: torch.utils.data.default_collate
-  dataloader_type: single
-validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
-  paths: /path/to/fineweb_edu/processed_data_*_text_document*
-  index_mapping_dir: /path/to/fineweb_edu/mapping_dir
-  tokenizer:
-    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V3
-    trust_remote_code: true
-  seq_length: 1024
-  split: 0.99, 0.01, 0.00
-  splits_to_build: validation
-  num_val_samples: 1024
-validation_dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: torch.utils.data.default_collate
-  dataloader_type: single
+  num_workers: 4
+  pin_memory: true
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: torch.optim.Adam
   betas:
   - 0.9
-  - 0.95
-  eps: 1.0e-05
-  lr: 0.00042
-  weight_decay: 0.1
+  - 0.999
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
   foreach: false
-lr_scheduler:
-  lr_decay_style: cosine
-  lr_warmup_steps: 500
-  min_lr: 0.0
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
 ci:
-  cluster_tag: gb200
-  nodes: 16
-  nproc_per_node: 4
-  recipe_owner: hemildesai
   time: 04:00:00
-  perf_testing:
-    schedule: disabled
+  nodes: 16
+  cluster_tag: gb200
   env_vars:
     RDZV_TIMEOUT: '900'
     TORCHRUN_NUMA_BINDING: node
+  recipe_owner: akoumpa
+  nproc_per_node: 4
+  perf_testing:
+    schedule: weekly
+    fake_balanced_gate: true

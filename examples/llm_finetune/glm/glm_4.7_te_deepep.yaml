@@ -75,6 +75,7 @@ distributed:
     reshard_after_forward: true
     wrap_outer_model: false
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -131,4 +132,5 @@ ci:
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   perf_testing:
+    fake_balanced_gate: true
     schedule: weekly

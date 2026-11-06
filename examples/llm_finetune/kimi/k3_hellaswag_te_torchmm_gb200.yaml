@@ -84,7 +84,8 @@ distributed:
     wrap_outer_model: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  impl: torch_compile
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -151,6 +152,7 @@ ci:
   time: "01:00:00"
   nproc_per_node: 4
   perf_testing:
+    fake_balanced_gate: true
     schedule: weekly
   env_vars:
     # Keep each EP32 group within one NVLink block: 8 nodes x 4 GPUs.

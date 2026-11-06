@@ -102,7 +102,8 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+  chunk_len: 512
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -140,18 +141,17 @@ validation_dataloader:
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.FusedAdam
-  fused: true
   betas:
   - 0.9
   - 0.95
   eps: 1e-8
   lr: 1e-5
   weight_decay: 0.1
-
   store_param_remainders: true
   exp_avg_sq_dtype: torch.bfloat16
   exp_avg_dtype: torch.bfloat16
   master_weights: true
+
 prewarm:
   comm_groups: true
 ci:
@@ -162,5 +162,6 @@ ci:
   # Cold multi-node start + TileLang JIT runs past the 00:10:00 default.
   time: "00:30:00"
   perf_testing:
+    fake_balanced_gate: true
     schedule: nightly
   nproc_per_node: 8

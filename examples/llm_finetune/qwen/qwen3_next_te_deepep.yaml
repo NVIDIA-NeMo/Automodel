@@ -76,6 +76,7 @@ distributed:
     reshard_after_forward: false
     ignore_router_for_ac: false
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -124,4 +125,5 @@ ci:
   nodes: 8
   time: "00:30:00"
   perf_testing:
+    fake_balanced_gate: true
     schedule: nightly

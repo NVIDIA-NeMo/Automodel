@@ -1,6 +1,4 @@
-# Custom Qwen2.5-72B with combined projections for benchmarking
-# Based on Qwen2_72B_peft_benchmark.yaml but using custom model implementation
-# Similar to custom_llama3_3_70b_instruct_peft_benchmark.yaml
+# Qwen2.5-32B LoRA finetuning on SQuAD with performance coverage in ci.perf_testing.
 
 # To run this recipe:
 #   automodel examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml --nproc-per-node 8
@@ -9,15 +7,6 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 42
-
-# Benchmark section
-benchmark:
-  warmup_steps: 5
-  peak_tflops: 989  # H100: 989, A100: 312
-  nsys_start: -1    # Set to step number to profile (e.g., 10)
-  nsys_end: -1      # Set to end step (e.g., 15)
-  nsys_ranks: []    # e.g., [0] to profile rank 0
-  num_nodes: 1
 
 step_scheduler:
   global_batch_size: 32
@@ -39,7 +28,6 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-32B-Instruct
   torch_dtype: bf16
-  force_hf: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -69,17 +57,18 @@ distributed:
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
-# Use MockIterableDataset for benchmarking (faster, no I/O)
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  vocab_size: 100
-  seq_len: 4096
-  num_samples: 1000000
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 0
 
 dataloader:
-  _target_: torch.utils.data.DataLoader
-  batch_size:       # Dataset already yields batches
-  # Note: model_config will be auto-injected by train_ft.py for PP models
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
 
 optimizer:
   _target_: torch.optim.Adam

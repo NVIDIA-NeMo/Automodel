@@ -68,6 +68,7 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 # Data configuration from llama finetuning
@@ -114,4 +115,5 @@ ci:
   nodes: 128
   time: "00:45:00"
   perf_testing:
+    fake_balanced_gate: true
     schedule: weekly
