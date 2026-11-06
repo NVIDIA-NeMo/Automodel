@@ -65,9 +65,18 @@ The existing packed Qwen MXFP8 training config retains unfused RoPE because fuse
 The two MoK variants require a Mixture-of-Kittens image build (`MOK_ARCH`); the standard image generator excludes them until that dependency is available.
 The Nemotron Super GB200 variant retains the existing AM-156 known-issue exclusion; scheduling metadata does not clear that issue.
 
-Nine GB200 benchmark variants still have no exact-model canonical training counterpart: the six DeepSeek-V3 variants,
-the two Qwen3-235B variants, and Mistral Large 4. They remain standalone benchmarks; this migration does not substitute
-a different model (such as DeepSeek-V3.2 or Qwen3-30B) and claim equivalence.
+The six DeepSeek-V3 GB200 variants also have canonical `llm_pretrain` counterparts below. Their original FineWeb dataset and index-mapping paths are placeholders. Performance scheduling is disabled until real cluster-mounted paths are configured in the canonical dataset sections. Random initialization is intentional pretraining behavior. The pretraining optimizer remains AdamW so its existing nonzero weight decay keeps decoupled semantics.
+
+| Retained legacy benchmark | Canonical GB200 pretraining recipe |
+|---|---|
+| [deepseek/deepseek_v3_sdpa_compile_gb200.yaml](deepseek/deepseek_v3_sdpa_compile_gb200.yaml) | [deepseekv3_pretrain_sdpa_compile_gb200.yaml](../llm_pretrain/deepseekv3_pretrain_sdpa_compile_gb200.yaml) |
+| [deepseek/deepseek_v3_sdpa_compile_mxfp8_gb200.yaml](deepseek/deepseek_v3_sdpa_compile_mxfp8_gb200.yaml) | [deepseekv3_pretrain_sdpa_compile_mxfp8_gb200.yaml](../llm_pretrain/deepseekv3_pretrain_sdpa_compile_mxfp8_gb200.yaml) |
+| [deepseek/deepseek_v3_sdpa_compile_te_gb200.yaml](deepseek/deepseek_v3_sdpa_compile_te_gb200.yaml) | [deepseekv3_pretrain_sdpa_compile_te_gb200.yaml](../llm_pretrain/deepseekv3_pretrain_sdpa_compile_te_gb200.yaml) |
+| [deepseek/deepseek_v3_sdpa_compile_torchmm_gb200.yaml](deepseek/deepseek_v3_sdpa_compile_torchmm_gb200.yaml) | [deepseekv3_pretrain_sdpa_compile_torchmm_gb200.yaml](../llm_pretrain/deepseekv3_pretrain_sdpa_compile_torchmm_gb200.yaml) |
+| [deepseek/deepseek_v3_te_deepep_gb200.yaml](deepseek/deepseek_v3_te_deepep_gb200.yaml) | [deepseekv3_pretrain_te_deepep_gb200.yaml](../llm_pretrain/deepseekv3_pretrain_te_deepep_gb200.yaml) |
+| [deepseek/deepseek_v3_te_mxfp8_gb200.yaml](deepseek/deepseek_v3_te_mxfp8_gb200.yaml) | [deepseekv3_pretrain_te_mxfp8_gb200.yaml](../llm_pretrain/deepseekv3_pretrain_te_mxfp8_gb200.yaml) |
+
+Three GB200 benchmarks remain standalone: the two Qwen3-235B variants have no exact-model training counterpart; Mistral Large 4 has VLM training examples but no direct text-only LLM recipe. They are not claimed as migrated or GPU-validated.
 
 The two Kimi variants retain their respective kernel and pipeline tuning on the same real HellaSwag dataset.
 The benchmark names `2k` and `8k` describe their historical synthetic input lengths; the canonical training data and packing determine actual sequence lengths.
