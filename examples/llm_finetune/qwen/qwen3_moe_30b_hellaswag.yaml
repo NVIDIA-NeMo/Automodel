@@ -1,4 +1,3 @@
-
 # ------------------------------------------------------------------------------------------------
 # WARNING: HARDWARE REQUIREMENTS
 # ------------------------------------------------------------------------------------------------
@@ -10,8 +9,8 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 1024
-  local_batch_size: 64
+  global_batch_size: 256
+  local_batch_size: 4
   ckpt_every_steps: 100
   val_every_steps: 50
   num_epochs: 2
@@ -33,15 +32,13 @@ model:
   torch_dtype: bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: sdpa
     linear: torch
-    rms_norm: torch_fp32
-    experts: torch_mm
-    dispatcher: deepep
+    rms_norm: torch
+    experts: torch
+    dispatcher: torch
     fake_balanced_gate: false
-    enable_hf_state_dict_adapter: true
-    enable_fsdp_optimizations: true
-
+    enable_hf_state_dict_adapter: false
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_sft
@@ -54,10 +51,19 @@ distributed:
   cp_size: 1
   pp_size: 1
   ep_size: 8
-  activation_checkpointing: true
-
   sequence_parallel: false
-
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    ignore_router_for_ac: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
@@ -84,7 +90,7 @@ validation_dataloader:
   num_workers: 4
 
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: torch.optim.Adam
   lr: 1.0e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
@@ -104,3 +110,4 @@ ci:
     validation_dataset.num_samples_limit: 500
   perf_testing:
     schedule: nightly
+  nodes: 1

@@ -23,8 +23,8 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   num_epochs: 1
-  global_batch_size: 256
-  local_batch_size: 8
+  global_batch_size: 512
+  local_batch_size: 2
   ckpt_every_steps: 100
   val_every_steps: 100  # will run every x number of gradient steps
 
@@ -43,12 +43,23 @@ model:
   mtp_loss_scaling_factor: 0.1
 
 # torch.compile configuration
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 compile:
   enabled: false
   mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
   fullgraph: false
   dynamic: true  # Set to false for better performance with fixed shapes
-  backend: null  # Use default backend (inductor)
+  backend:       # Use default backend (inductor)
 
 checkpoint:
   enabled: true
@@ -61,15 +72,19 @@ peft:
   exclude_modules: ["*.out_proj"]  # mamba layers use custom kernels that take in the out_proj.weight directly, thus lora doesn't work here.
   dim: 8
   alpha: 32
-  use_triton: True
+  use_triton: true
 
 distributed:
   strategy: fsdp2
-  dp_size: none
   tp_size: 1
   cp_size: 1
-  ep_size: 8
-
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    ignore_router_for_ac: false
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
@@ -84,7 +99,7 @@ packed_sequence:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: True
+  shuffle: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -138,3 +153,4 @@ ci:
 #   save_dir: <your_wandb_save_dir>
   perf_testing:
     schedule: nightly
+  nodes: 8

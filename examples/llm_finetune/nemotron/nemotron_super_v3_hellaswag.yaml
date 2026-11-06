@@ -23,8 +23,8 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   num_epochs: 1
-  global_batch_size: 32
-  local_batch_size: 1
+  global_batch_size: 512
+  local_batch_size: 2
   ckpt_every_steps: 100
   val_every_steps: 100  # will run every x number of gradient steps
 
@@ -42,6 +42,14 @@ model:
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
   mtp_loss_scaling_factor: 0.1
 
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    linear: te
+    rms_norm: te
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
@@ -50,12 +58,13 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
-  dp_size: none
   tp_size: 1
   cp_size: 1
-  ep_size: 32
-  defer_fsdp_grad_sync: false
-
+  pp_size: 1
+  ep_size: 64
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
@@ -70,7 +79,7 @@ packed_sequence:
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
-  shuffle: True
+  shuffle: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -101,7 +110,7 @@ lr_scheduler:
 
 ci:
   cluster_tag: h100
-  nodes: 4
+  nodes: 8
   vllm_deploy: true
   vllm_smoke_test: true
   vllm_deploy_gpus: 8  # the 120B BF16 model requires TP=8 for vLLM deployment

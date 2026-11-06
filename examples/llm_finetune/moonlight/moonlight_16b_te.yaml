@@ -21,8 +21,8 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 512
-  local_batch_size: 32
+  global_batch_size: 256
+  local_batch_size: 4
   ckpt_every_steps: 500
   val_every_steps: 500  # will run every x number of gradient steps
   num_epochs: 2
@@ -43,13 +43,13 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
-    rms_norm: torch_fp32
-    experts: te
+    rms_norm: te
+    rope_fusion: true
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
-
 checkpoint:
   enabled: false
   checkpoint_dir: checkpoints/
@@ -62,7 +62,7 @@ distributed:
   cp_size: 1
   pp_size: 1
   ep_size: 8
-
+  sequence_parallel: false
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 4
@@ -71,11 +71,8 @@ distributed:
     patch_inner_model: false
     patch_causal_lm_model: false
     layers_per_stage: 2
-
-
   moe:
     reshard_after_forward: false
-
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
@@ -136,3 +133,4 @@ ci:
   perf_testing:
     schedule: nightly
     time: 00:10:00
+  nodes: 1
