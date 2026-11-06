@@ -2034,7 +2034,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {} | num_tokens_per_step {} | mfu {}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
@@ -2044,6 +2044,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_data.metrics["tps"],
                 log_data.metrics["tps_per_gpu"],
                 log_data.metrics["num_label_tokens"],
+                log_data.metrics["num_tokens_per_step"],
+                log_data.metrics["mfu"],
             )
         )
         torch.cuda.reset_peak_memory_stats()

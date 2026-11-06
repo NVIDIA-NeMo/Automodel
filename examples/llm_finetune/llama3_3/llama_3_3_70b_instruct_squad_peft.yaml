@@ -79,23 +79,27 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
 
+  padding: false
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 4096
 
 # StatefulDataLoader with default collate
+  packing_strategy: neat
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   shuffle: true
 
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
 
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
 
 optimizer:
   _target_: torch.optim.Adam
@@ -111,7 +115,7 @@ lr_scheduler:
 ci:
   cluster_tag: h100
   recipe_owner: akoumpa
-  time: "00:30:00"
+  time: "00:40:00"
   perf_testing:
     schedule: nightly
   nodes: 1

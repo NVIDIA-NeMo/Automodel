@@ -62,14 +62,17 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
 
+  padding: false
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 4096
 
+  packing_strategy: neat
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   shuffle: false
 
+  drop_last: true
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
@@ -84,7 +87,7 @@ lr_scheduler:
 ci:
   cluster_tag: h100
   recipe_owner: ZhiyuLi-Nvidia
-  time: "00:30:00"
+  time: "00:40:00"
   perf_testing:
     schedule: nightly
   nodes: 1

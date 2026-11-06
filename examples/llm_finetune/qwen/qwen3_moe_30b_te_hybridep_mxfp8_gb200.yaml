@@ -91,13 +91,15 @@ dataset:
 
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 1024
+  packed_sequence_size: 4096
 
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag

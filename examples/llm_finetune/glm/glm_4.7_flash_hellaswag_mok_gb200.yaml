@@ -30,7 +30,7 @@ model:
     attn: te
     linear: te
     rms_norm: te
-    rope_fusion: true
+    rope_fusion: false # Use unfused RoPE for packed THD inputs, matching the existing packed recipes.
     experts: torch_mm  # Ignored by MoK; retained for parity with HybridEP recipes.
     dispatcher: mok
     gate_precision: float32
@@ -73,24 +73,28 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
 
+  pad_to_max_length: false
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 0
+  packed_sequence_size: 4096
 
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
   num_samples_limit: 64
 
+  pad_to_max_length: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   batch_size: 8
 
 optimizer:
@@ -112,7 +116,7 @@ ci:
   cluster_tag: gb200
   recipe_owner: hemildesai
   nodes: 1
-  time: "00:25:00"
+  time: "00:40:00"
   checkpoint_robustness:
     # The released checkpoint is near a numerically critical point: small
     # kernel-order and rounding differences are amplified through its routed

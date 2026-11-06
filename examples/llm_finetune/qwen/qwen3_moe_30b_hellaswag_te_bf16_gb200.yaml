@@ -34,7 +34,7 @@ model:
     attn: te
     linear: te
     rms_norm: te
-    rope_fusion: true
+    rope_fusion: false # THD fused RoPE has documented NaN gradients; use the existing packed-recipe setting.
     experts: te  # WAVE 11: TE GroupedLinear bf16 (no fp8); vs torch_mm
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: false
@@ -75,24 +75,28 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
 
+  pad_to_max_length: false
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 0
+  packed_sequence_size: 4096
 
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
   num_samples_limit: 64
 
+  pad_to_max_length: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   batch_size: 8
 
 optimizer:

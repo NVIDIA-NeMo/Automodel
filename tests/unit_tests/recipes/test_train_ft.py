@@ -2198,14 +2198,20 @@ def _make_trainer_for_trackio(monkeypatch):
     return trainer
 
 
-def test_log_train_metrics_sends_metrics_and_moe_loads_to_trackio(monkeypatch):
+def test_log_train_metrics_sends_metrics_and_moe_loads_to_trackio(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     from nemo_automodel.components.loggers.metric_logger import MetricsSample
 
     trainer = _make_trainer_for_trackio(monkeypatch)
     metrics = {"loss": 1.5, "grad_norm": 0.5, "lr": 1e-4, "mem": 1.0, "tps": 10.0, "tps_per_gpu": 10.0}
-    log_data = MetricsSample(step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8})
+    log_data = MetricsSample(
+        step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8, "num_tokens_per_step": 10, "mfu": 0.25}
+    )
 
-    trainer.log_train_metrics(log_data)
+    with caplog.at_level(logging.INFO):
+        trainer.log_train_metrics(log_data)
+    assert "num_tokens_per_step 10 | mfu 0.25" in caplog.text
 
     first, second = trainer.trackio_logger.log_metrics.call_args_list
     assert first.args[0] == log_data.to_dict() and first.kwargs == {"step": 7}

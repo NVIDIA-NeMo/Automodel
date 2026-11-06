@@ -163,3 +163,31 @@ The performance generator requests 50 steps and derives the required epoch count
 so a short supervised dataset cannot silently truncate that measurement window.
 Normal training and the legacy benchmark also have different timing boundaries;
 report wall time and tokens per step alongside TPS when diagnosing a remaining gap.
+
+## Packed finetuning comparison
+
+The compatible migrated finetuning configs pack real supervised examples to the
+sequence length of their corresponding pretraining config (or the retained
+synthetic reference for LoRA). HellaSwag padding is disabled before packing.
+TE attention uses THD packing; supported SDPA/HF paths use NEAT packing. Packing
+preserves document boundaries and prompt/answer labels. Full local microbatches
+are retained with `dataloader.drop_last: true`; global and local batch sizes and
+parallelism stay in the canonical configuration. THD configs use unfused RoPE to
+avoid the fused packed-input gradient issue documented by existing packed recipes.
+
+The following recipes remain unpacked pending support or data-size validation:
+
+- Qwen3-Next: recurrent state is not reset at packed document boundaries.
+- GPT-OSS 20B with flex attention: the current flex path does not consume the
+  packed document mask.
+- DeepSeek V4 with cudnn/torch attention: the selected packing paths require
+  capability and document-mask validation before enabling them.
+- Kimi K3: the capped 25,600-example HellaSwag dataset yields only 1,649
+  packs at 1,024 tokens or 824 at 2,048 tokens, below the 4,096 packs required
+  by one canonical distributed microbatch. Increasing epoch count cannot fix
+  this empty loader.
+
+These exceptions must be labeled in performance reports. Do not interpret them
+as measured packed-finetuning results. Console training metrics now also include
+`num_tokens_per_step` and the trainer's `mfu` value so reports can distinguish
+padding/partial-batch effects and retain MFU without checkpoint artifacts.

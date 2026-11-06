@@ -61,7 +61,7 @@ model:
     attn: te
     linear: te
     rms_norm: te
-    rope_fusion: true
+    rope_fusion: false  # Use unfused RoPE for packed THD inputs, matching the existing packed recipes.
     experts: torch_mm
     dispatcher: hybridep
     fake_balanced_gate: false
@@ -79,26 +79,26 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
 
+  pad_to_max_length: false
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 4096
 
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 160
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
 
+  pad_to_max_length: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 160
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
   drop_last: true
 
@@ -116,7 +116,7 @@ ci:
   recipe_owner: hemildesai
   node_multiplier: true
   nodes: 8
-  time: "00:30:00"
+  time: "00:40:00"
   perf_testing:
     fake_balanced_gate: true
     schedule: nightly

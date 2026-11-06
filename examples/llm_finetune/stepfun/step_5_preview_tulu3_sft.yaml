@@ -105,9 +105,7 @@ dataset:
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 4096
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   shuffle: false
   drop_last: true
   num_workers: 2
@@ -129,6 +127,9 @@ optimizer:
 #   name: <your_wandb_exp_name>
 #   dir: <your_wandb_save_dir>
 
+packed_sequence:
+  packed_sequence_size: 8192
+  packing_strategy: neat
 ci:
   recipe_owner: HuiyingLi
   nodes: 16

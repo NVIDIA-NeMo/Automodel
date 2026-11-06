@@ -74,23 +74,27 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
 
+  pad_to_max_length: false
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 4096
 
+  packing_strategy: neat
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   shuffle: true
 
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
   num_samples_limit: 64
 
+  pad_to_max_length: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
 
 optimizer:
   _target_: torch.optim.Adam
@@ -117,7 +121,7 @@ ci:
   vllm_deploy_gpus: 8  # the 120B BF16 model requires TP=8 for vLLM deployment
   vllm_enable_expert_parallel: true  # shard MoE experts across the vLLM TP group
   recipe_owner: adil-a
-  time: "00:25:00"
+  time: "00:40:00"
   known_issue_id: AM-156
   checkpoint_robustness:
     experts_implementation: grouped_mm

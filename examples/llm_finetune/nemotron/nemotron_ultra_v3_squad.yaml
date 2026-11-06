@@ -91,6 +91,7 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
 
+  padding: false
 packed_sequence:
   packed_sequence_size: 4096
   packing_strategy: thd
@@ -100,11 +101,13 @@ dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
 
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
@@ -127,7 +130,7 @@ ci:
   # pp_size(4) * ep_size(64) = 256 GPUs => 32 nodes (8 H100/node).
   recipe_owner: adil-a
   nodes: 16
-  time: "00:30:00"
+  time: "00:40:00"
   max_steps: 17
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
