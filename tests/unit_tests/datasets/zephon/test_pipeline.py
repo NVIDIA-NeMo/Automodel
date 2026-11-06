@@ -27,7 +27,7 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonPretokenizedTextDatasetConfig,
     ZephonTextDatasetConfig,
 )
-from nemo_automodel.components.datasets.zephon.pipeline import create_text_pipeline
+from nemo_automodel.components.datasets.zephon.pipeline import create_source_pipeline, create_text_pipeline
 from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
@@ -101,3 +101,45 @@ def test_numeric_overrides_reject_unknown_vocabulary_ids_before_source_start(
         with pytest.raises(ValueError, match="eos_token_id=9999 is not an existing tokenizer vocabulary ID"):
             create_text_pipeline(source, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
         create_source.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "setting,source_count,enabled",
+    [("auto", 1, False), ("auto", 2, True), (False, 2, False), (None, 2, False), (True, 1, True), ({}, 1, True)],
+)
+def test_token_estimation_policy(config, setting, source_count, enabled):
+    options = config.dataset_config.zephon
+    options = replace(
+        options,
+        sources=tuple(replace(options.sources[0], name=f"source_{i}") for i in range(source_count)),
+        source=replace(options.source, token_estimation=setting),
+    )
+    with (
+        patch("zephon.work.StaticMixtureWorkSource", wraps=StaticMixtureWorkSource) as source,
+        patch("zephon.work.TokenEstimation", wraps=TokenEstimation) as estimation,
+    ):
+        create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
+    assert estimation.called is enabled
+    assert (source.call_args.kwargs["token_estimation"] is not None) is enabled
+    # Resolving an automatic choice must not mutate the reusable config.
+    assert options.source.token_estimation == setting
+
+
+@pytest.mark.parametrize("policy,passes", [(None, 1), ("repeat", None)])
+def test_unset_pass_limit_uses_zephon_exhaustion_policy(config, policy, passes):
+    options = config.dataset_config.zephon
+    options = replace(options, source=replace(options.source, exhausted_policy=policy))
+    with patch("zephon.work.StaticMixtureWorkSource", wraps=StaticMixtureWorkSource) as source:
+        create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
+    kwargs = source.call_args.kwargs
+    assert "stop_after_passes" not in kwargs
+    actual = StaticMixtureWorkSource(**kwargs)
+    assert actual.state_dict()["stop_after_passes"] == passes
+
+
+def test_explicit_pass_limit_reaches_zephon(config):
+    options = config.dataset_config.zephon
+    options = replace(options, source=replace(options.source, stop_after_passes=2))
+    with patch("zephon.work.StaticMixtureWorkSource", wraps=StaticMixtureWorkSource) as source:
+        create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
+    assert source.call_args.kwargs["stop_after_passes"] == 2

@@ -166,7 +166,7 @@ def test_shipped_yaml_resolves(recipe_name):
     assert isinstance(config.dataloader, DataloaderConfig)
     assert isinstance(config.dataloader, ZephonDataloaderConfig)
     assert config.dataloader.dataset_config.zephon.packing.seq_len == 63
-    assert config.dataloader.dataset_config.zephon.source.stop_after_passes == 1
+    assert config.dataloader.dataset_config.zephon.source.stop_after_passes is None
     assert config.dataloader.batch_size == config.get("step_scheduler.local_batch_size")
 
 
@@ -720,3 +720,20 @@ def test_text_loader_target_is_optional_and_explicit_targets_still_work(target):
     assert isinstance(loader, ZephonDataloaderConfig)
     assert isinstance(loader.dataset_config, ZephonTextDatasetConfig)
     assert values == original
+
+
+@pytest.mark.parametrize("algorithm", ["first_fit", "best_fit"])
+def test_whole_document_packing_owns_its_default_bin_count(algorithm):
+    options = ZephonPackingOptions(pack_algorithm=algorithm)
+    assert options.pack_num_bins == 64
+    assert options.drop_oversized is True and options.shuffle_after_pack is True
+    explicit = ZephonPackingOptions(
+        pack_algorithm=algorithm, pack_num_bins=8, drop_oversized=False, shuffle_after_pack=False
+    )
+    assert explicit.pack_num_bins == 8
+    assert explicit.drop_oversized is False and explicit.shuffle_after_pack is False
+
+
+@pytest.mark.parametrize("algorithm", [None, "wrap", "best_fit_wrap"])
+def test_non_bin_packing_has_no_bin_count(algorithm):
+    assert ZephonPackingOptions(pack_algorithm=algorithm).pack_num_bins is None

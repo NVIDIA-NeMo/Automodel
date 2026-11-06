@@ -49,11 +49,9 @@ For raw text:
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
-  text_field: text
   tokenize_special_tokens: eos
   tokenizer:
     pretrained_model_name_or_path: /path/to/model-or-tokenizer
-  output_format: batched
   zephon:
     sources:
     - name: books
@@ -64,22 +62,19 @@ dataset:
       path: /data/web
       fmt: jsonl
       weight: 0.3
-    source:
-      token_estimation: true
-      stop_after_passes: 1
     packing:
       seq_len: 2048
-      pack_algorithm: wrap
-    training:
-      allow_cross_document_attention: false
     checkpoint:
       run_id: my-training-run
 ```
 
 Here each source is a directory of JSONL shards containing documents such as
 `{"text": "Some training text."}`. Zephon also accepts cloud sources through
-its dataset URI syntax. With token estimation enabled, the source weights
-describe token proportions rather than document proportions. See
+its dataset URI syntax. Text token estimation defaults to `auto`: it is enabled
+when there are multiple sources, so weights describe token proportions rather
+than document proportions. Set `source.token_estimation: false` to disable it,
+`true` or a settings mapping to enable it explicitly, or `null` to use Zephon's
+sample-based default. This applies to raw text and pretokenized input. See
 [mixing datasets](https://docs.zephon.io/worksources/mixing_datasets.html) for
 calibration and sampling behavior.
 
@@ -98,8 +93,14 @@ groups keep related options together. For example, `workers.tokenize_parallelism
 controls tokenization workers, while `source.stop_after_passes` controls when
 reading ends. Options mostly map to the corresponding Zephon pipeline settings;
 the [pipeline guide](https://docs.zephon.io/pipelines/index.html) explains how
-those settings affect delivery. Model, optimizer, and distributed settings stay
-in their usual AutoModel sections.
+those settings affect delivery. Concrete config values are integration defaults;
+unset values follow the field's documented policy. For example, omitted packing
+lengths use the model limit, omitted checkpoint lane counts use the DP world size,
+and worker counts set to `null` use the Zephon operator default. With no exhaustion
+overrides, Zephon reads a finite source once. Distributed checkpoint aggregation
+uses `torch://` automatically unless a store or directory is supplied; choose a
+unique `checkpoint.run_id` for each distributed job. Model, optimizer, and
+distributed settings stay in their usual AutoModel sections.
 
 You can also place the data settings in a TOML file and reference it with
 `dataset.zephon.data_config`. Inline YAML values override that file; relative
