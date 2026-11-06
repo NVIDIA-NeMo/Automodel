@@ -14,8 +14,11 @@
 
 """Unit tests for lazy import __init__.py patterns in datasets.diffusion, flow_matching, and _diffusers."""
 
-import pytest
+import subprocess
+import sys
+from pathlib import Path
 
+import pytest
 
 # =============================================================================
 # TestDatasetsLazyImports
@@ -132,3 +135,75 @@ class TestDiffusersLazyImports:
 
         with pytest.raises(AttributeError, match="has no attribute"):
             getattr(mod, "NonExistentPipeline12345")
+
+
+def _run_in_fresh_python(script: str) -> None:
+    """Check import boundaries without modules cached by test collection."""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_text_worker_imports_remain_lightweight():
+    _run_in_fresh_python(
+        """
+import importlib
+import sys
+
+models = importlib.import_module("nemo_automodel.components.models")
+llm = importlib.import_module("nemo_automodel.components.datasets.llm")
+zephon = importlib.import_module("nemo_automodel.components.datasets.zephon")
+assert "build_gpt2_model" in dir(models)
+assert "neat_pack_dataset" in dir(llm)
+assert set(zephon.__all__) <= set(dir(zephon))
+assert "nemo_automodel.components.datasets.zephon.config" not in sys.modules
+importlib.import_module("nemo_automodel.components.datasets.zephon.llm")
+for module in ("transformers", "datasets",
+               "nemo_automodel.components.models.gpt2",
+               "nemo_automodel.components.datasets.llm.retrieval_dataset",
+               "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset"):
+    assert module not in sys.modules, module
+"""
+    )
+
+
+def test_text_package_exports_keep_their_original_owners():
+    _run_in_fresh_python(
+        """
+import importlib
+
+for package in ("nemo_automodel.components.models",
+                "nemo_automodel.components.datasets.llm",
+                "nemo_automodel.components.datasets.zephon"):
+    module = importlib.import_module(package)
+    for name in module.__all__:
+        value = getattr(module, name)
+        owner = importlib.import_module(value.__module__)
+        assert value is getattr(owner, name), (package, name)
+        assert value is getattr(module, name), (package, name)
+    try:
+        getattr(module, "unavailable_export")
+    except ModuleNotFoundError as exc:
+        assert package.endswith(".models") and "Upgrade with" in str(exc)
+    except AttributeError:
+        assert not package.endswith(".models")
+    else:
+        raise AssertionError(package)
+
+llm = importlib.import_module("nemo_automodel.components.datasets.llm")
+packing = importlib.import_module("nemo_automodel.components.datasets.llm.neat_packing")
+assert llm.neat_pack_dataset is packing.neat_pack_dataset
+assert "neat_pack_dataset" not in llm.__all__
+try:
+    importlib.import_module("nemo_automodel.components.models.unavailable_model")
+except ModuleNotFoundError as exc:
+    assert "Available model submodules" in str(exc)
+else:
+    raise AssertionError("Missing-model diagnostic was lost")
+"""
+    )
