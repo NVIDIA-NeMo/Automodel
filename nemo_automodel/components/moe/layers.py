@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Copyright 2018- The Hugging Face team. All rights reserved.
+# Group-exclusion masking adapted from Hugging Face Transformers (Apache-2.0):
+# https://github.com/huggingface/transformers/pull/45441
+# Revision: cb0adddc36827c1a662211c069f05e75fd1ff27c
+# Source: src/transformers/models/deepseek_v3/modular_deepseek_v3.py
 import warnings
 from functools import partial
 
@@ -470,7 +476,7 @@ class Gate(nn.Module):
 
                 group_idx = group_scores.topk(self.topk_groups, dim=-1)[1]
                 mask = torch.zeros_like(scores_for_choice[..., 0]).scatter_(1, group_idx, True)
-                scores_for_choice = (scores_for_choice * mask.unsqueeze(-1)).flatten(1)
+                scores_for_choice = scores_for_choice.masked_fill(~mask.bool().unsqueeze(-1), float("-inf")).flatten(1)
 
             indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
             indices = replay_selection(self.router_replay, indices)
@@ -532,7 +538,7 @@ class Gate(nn.Module):
 
                 indices = group_scores.topk(self.topk_groups, dim=-1)[1]
                 mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-                scores = (scores * mask.unsqueeze(-1)).flatten(1)
+                scores = scores.masked_fill(~mask.bool().unsqueeze(-1), float("-inf")).flatten(1)
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
             indices = replay_selection(self.router_replay, indices)
