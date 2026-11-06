@@ -108,6 +108,7 @@ class NeMoAutoTokenizer:
         force_hf: bool = False,
         tokenizer_backend: Literal["nemo_auto", "nemo_wrapped_auto", "transformers_auto", "tokenizers"] | None = None,
         trust_remote_code: bool = False,
+        use_gigatoken: bool = False,
         **kwargs,
     ) -> "PreTrainedTokenizerBase":
         """
@@ -124,6 +125,9 @@ class NeMoAutoTokenizer:
                 bypassing registered tokenizers, ``"transformers_auto"`` uses Transformers AutoTokenizer directly,
                 and ``"tokenizers"`` loads ``tokenizer.json`` directly through Transformers TokenizersBackend.
             trust_remote_code: Whether to trust remote code when loading config
+            use_gigatoken: If True, accelerate the default tokenizer's encode path with the
+                optional gigatoken backend (BPE tokenizers only). Falls back to the HF
+                tokenizer when gigatoken is not installed or does not support the tokenizer.
             **kwargs: Additional arguments passed to the tokenizer's from_pretrained
 
         Returns:
@@ -195,9 +199,14 @@ class NeMoAutoTokenizer:
         # is enabled only when callers opt in via add_bos_token/add_eos_token.
         from nemo_automodel._transformers.tokenization.nemo_auto_tokenizer import NeMoAutoTokenizerWithBosEosEnforced
 
-        return NeMoAutoTokenizerWithBosEosEnforced.from_pretrained(
+        tokenizer = NeMoAutoTokenizerWithBosEosEnforced.from_pretrained(
             pretrained_model_name_or_path, *args, trust_remote_code=trust_remote_code, **kwargs
         )
+        if use_gigatoken:
+            from nemo_automodel._transformers.tokenization.gigatoken import maybe_wrap_with_gigatoken
+
+            tokenizer = maybe_wrap_with_gigatoken(tokenizer)
+        return tokenizer
 
 
 __all__ = [
