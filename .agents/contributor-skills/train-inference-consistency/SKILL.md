@@ -1,6 +1,6 @@
 ---
 name: train-inference-consistency
-description: Build and verify an inference-aligned training forward for a NeMo AutoModel model so the trainer recomputes the rollout engine's per-token logprobs bitwise (true on-policy RL). Use for "bitwise", "batch-invariant", "aligned kernels", "train/inference mismatch", "mismatch/bitwise_frac is not 0", "vllm_kl is not 0", or when adding the aligned forward for a new model family. Not for HuggingFace parity of the default path (use parity-testing).
+description: Make a model's training forward match the rollout engine's logprobs bitwise (batch-invariant, aligned kernels) for on-policy RL, e.g. when vllm_kl or bitwise_frac is nonzero. Not HF parity.
 ---
 
 <!-- Adapted from NVIDIA-NeMo/labs-molt, .agents/skills/train-inference-consistency/ at commit

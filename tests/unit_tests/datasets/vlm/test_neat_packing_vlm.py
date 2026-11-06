@@ -21,7 +21,10 @@ import pytest
 import torch
 from PIL import Image
 
-from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+from nemo_automodel.components.datasets.vlm.collate_fns import (
+    neat_packed_vlm_collater,
+    packed_sequence_thd_vlm_collater,
+)
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     NeatPackConfig,
     _compute_mrope_position_ids,
@@ -650,6 +653,49 @@ class TestVariableResolutionImagePacking:
         result = merge_vlm_documents(samples, padding_idx=0)
         assert isinstance(result["pixel_values"], torch.Tensor)
         assert tuple(result["pixel_values"].shape) == (3, 3, 8, 8)
+
+
+@pytest.mark.parametrize("packing_format", ["neat", "thd"])
+def test_image_sizes_and_ownership_survive_native_packing_and_collation(packing_format: str) -> None:
+    from nemo_automodel.components.datasets.vlm.neat_packing_vlm import PackedDatasetWrapper
+    from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, prepare_vlm_media_for_pp
+
+    documents = [
+        {
+            "input_ids": torch.tensor([1, 2, 3]),
+            "labels": torch.tensor([1, 2, 3]),
+            "attention_mask": torch.ones(3, dtype=torch.long),
+            "pixel_values": torch.ones(2, 3, 8, 8),
+            "image_sizes": torch.tensor([[8, 8], [8, 8]]),
+        },
+        {
+            "input_ids": torch.tensor([3, 4]),
+            "labels": torch.tensor([3, 4]),
+            "attention_mask": torch.ones(2, dtype=torch.long),
+            "pixel_values": torch.full((1, 3, 12, 4), 2.0),
+            "image_sizes": torch.tensor([[12, 4]]),
+        },
+    ]
+    packed = PackedDatasetWrapper(documents, bins=[[0, 1]], pack_size=4)[0]
+    assert packed["n_images"] == 3
+    assert packed["pixel_values"].shape == (3, 3, 12, 8)
+    torch.testing.assert_close(packed["image_sizes"], torch.tensor([[8, 8], [8, 8], [12, 4]]))
+    separate = PackedDatasetWrapper(documents, bins=[[0], [1]], pack_size=4)
+    separate_packs = [separate[0], separate[1]]
+    if packing_format == "thd":
+        batch = packed_sequence_thd_vlm_collater(separate_packs, padding_idx=0)
+    else:
+        batch = neat_packed_vlm_collater(separate_packs, padding_idx=0, packing=get_packing_capabilities("sdpa"))
+    assert batch["pixel_values"].shape == (3, 3, 12, 8)
+    torch.testing.assert_close(batch["n_images_per_sample"], torch.tensor([2, 1]))
+    torch.testing.assert_close(batch["image_sizes"], packed["image_sizes"])
+    prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
+    media = batch[VLM_PP_MEDIA_KEY]
+    assert [value.shape[0] for value in media["pixel_values"]] == [2, 1]
+    torch.testing.assert_close(media["image_grid_hws"][0], documents[0]["image_sizes"])
+    torch.testing.assert_close(media["image_grid_hws"][1], documents[1]["image_sizes"])
+    assert documents[0]["pixel_values"].shape == (2, 3, 8, 8)
+    assert documents[1]["pixel_values"].shape == (1, 3, 12, 4)
 
 
 # Qwen2-VL-style processor geometry: 14px patches merged 2x2, i.e. 28px per token side.
