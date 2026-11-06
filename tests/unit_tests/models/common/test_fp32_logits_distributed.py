@@ -18,6 +18,8 @@ Each case compares FP32 logits, input and weight gradients, and the parameters a
 one SGD step against an unsharded single-process reference that runs the same head.
 Tensor-parallel input gradients are summed from per-rank BF16 partials, so they are
 compared with the BF16 ``nn.Linear`` head under the same layout, bit for bit.
+Tensor parallelism also covers a vocabulary the mesh does not divide evenly, a
+regular-tensor input, and the weight layouts the projection rejects.
 """
 
 import os
@@ -31,10 +33,10 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 
-from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear, linear_with_fp32_logits
 
 pytestmark = pytest.mark.cpu_only
 
@@ -72,7 +74,7 @@ def _head(fp32_logits: bool, weight: torch.Tensor) -> nn.Linear:
     Returns:
         Head with weight of shape [vocab, hidden].
     """
-    head = nn.Linear(_HIDDEN, _VOCAB, bias=False, dtype=weight.dtype)
+    head = nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=weight.dtype)
     with torch.no_grad():
         head.weight.copy_(weight)
     return Float32LogitsLinear.from_linear(head) if fp32_logits else head
@@ -128,6 +130,43 @@ def _check_tensor_parallel(hidden: torch.Tensor, weight: torch.Tensor, upstream:
                 optimizer.step()
                 torch.testing.assert_close(_full(head.weight).detach(), reference_step, msg=name)
         torch.testing.assert_close(grads[True], grads[False], rtol=0, atol=0, msg=name)
+
+
+def _check_vocab_parallel_contract(hidden: torch.Tensor, weight: torch.Tensor, upstream: torch.Tensor) -> None:
+    """Check a regular-tensor input and the weight layouts the vocabulary-parallel projection rejects.
+
+    Args:
+        hidden: BF16 tensor of shape [batch, sequence, hidden], identical on every rank.
+        weight: BF16 tensor of shape [vocab, hidden], identical on every rank.
+        upstream: BF16-valued FP32 tensor of shape [batch, sequence, vocab].
+    """
+    mesh = init_device_mesh("cpu", (_WORLD_SIZE,), mesh_dim_names=("tp",))
+    reference_hidden = hidden.clone().requires_grad_()
+    reference_logits = linear_with_fp32_logits(reference_hidden, weight)
+    reference_logits.backward(upstream)
+
+    # A regular tensor is the replicated input; each rank's input gradient is a partial sum.
+    local_hidden = hidden.clone().requires_grad_()
+    logits = linear_with_fp32_logits(local_hidden, distribute_tensor(weight, mesh, [Shard(0)]))
+    assert logits.placements == (Shard(logits.ndim - 1),)
+    torch.testing.assert_close(logits.full_tensor(), reference_logits, rtol=1e-6, atol=1e-6)
+    logits.full_tensor().backward(upstream)
+    error = (local_hidden.grad.float() - reference_hidden.grad.float()).norm() / reference_hidden.grad.norm()
+    assert error < 1e-2, error
+
+    tp_mesh_2d = init_device_mesh("cpu", (1, _WORLD_SIZE), mesh_dim_names=("dp", "tp"))
+    unsupported = {
+        "replicated": distribute_tensor(weight, mesh, [Replicate()]),
+        "hidden-sharded": distribute_tensor(weight, mesh, [Shard(1)]),
+        "2-D mesh": distribute_tensor(weight, tp_mesh_2d, [Replicate(), Shard(0)]),
+    }
+    for name, unsupported_weight in unsupported.items():
+        try:
+            linear_with_fp32_logits(hidden, unsupported_weight)
+        except NotImplementedError as error:
+            assert "vocabulary-sharded" in str(error), (name, error)
+        else:
+            raise AssertionError(f"FP32 logits accepted a {name} weight")
 
 
 class _TinyLM(nn.Module):
@@ -207,7 +246,12 @@ def _worker(rank: int, port: int) -> None:
         upstream = torch.randn(2, 8, _VOCAB, generator=generator).bfloat16().float()
         input_ids = torch.randint(0, _VOCAB, (2, 8), generator=generator)
         labels = torch.randint(0, _VOCAB, (2, 8), generator=generator)
+        # The mesh splits this vocabulary unevenly, into 49 and 48 rows.
+        uneven_weight = torch.randn(_VOCAB + 1, _HIDDEN, generator=generator) * 0.1
+        uneven_upstream = torch.randn(2, 8, _VOCAB + 1, generator=generator).bfloat16().float()
         _check_tensor_parallel(hidden, weight.bfloat16(), upstream)
+        _check_tensor_parallel(hidden, uneven_weight.bfloat16(), uneven_upstream)
+        _check_vocab_parallel_contract(hidden, weight.bfloat16(), upstream)
         _check_fsdp(weight, input_ids, labels)
     finally:
         dist.destroy_process_group()

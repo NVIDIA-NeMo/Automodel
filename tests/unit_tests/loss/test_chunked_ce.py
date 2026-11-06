@@ -373,6 +373,28 @@ def test_fp32_projection_reproduces_the_fp32_logits_head(chunk_len):
     assert (actual.double() - reference).abs() * 10 < (bf16_projection.double() - reference).abs()
 
 
+def test_compiled_chunks_keep_the_fp32_projection():
+    # ChunkedCrossEntropy compiles its per-chunk loss by default.
+    torch.manual_seed(71)
+    weight = (torch.randn(53, 24) * 0.1).bfloat16().requires_grad_()
+    hidden = torch.randn(2, 9, 24, dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(53, (2, 9))
+    labels[0, 3] = -100
+    results = {}
+    for use_compile in (False, True):
+        loss = ChunkedCrossEntropy(4, compile=use_compile)(hidden, labels, weight, projection_dtype=torch.float32)
+        results[use_compile] = (loss, *torch.autograd.grad(loss, (hidden, weight)))
+
+    for compiled, eager in zip(results[True], results[False]):
+        assert compiled.dtype == eager.dtype
+        torch.testing.assert_close(compiled, eager)
+    reference = F.cross_entropy(
+        (hidden.double() @ weight.double().t()).flatten(0, 1), labels.flatten(), reduction="sum"
+    )
+    bf16_projection = ChunkedCrossEntropy(4, compile=False)(hidden, labels, weight)
+    assert (results[True][0].double() - reference).abs() * 10 < (bf16_projection.double() - reference).abs()
+
+
 def test_projection_dtype_must_match_the_head():
     from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 
