@@ -17,7 +17,7 @@
 import pytest
 import torch
 from transformers import Qwen2_5_VLForConditionalGeneration
-from zephon.ops import OpContext
+from zephon.ops import OpContext, OpTraits
 from zephon.types import SampleBatch, SampleMeta, SampleRecord
 
 from nemo_automodel.components.datasets.vlm.datasets import VlmMediaTokenMismatchError, encode_vlm_document
@@ -315,3 +315,11 @@ def test_image_batch_uses_gathered_metadata_request_only_for_batched_output(outp
     result = convert_batch_output(converted, output_format=output_format)
     assert ("seq_lens" in result) is (output_format == "thd")
     assert ("seq_lens_padded" in result) is (output_format == "thd")
+
+
+@pytest.mark.parametrize("parallelism", [None, 4])
+def test_encoder_parallelism_can_use_zephon_default(parallelism):
+    state = Qwen2_5_VLPositionState(tiny_vlm_config())
+    operator = VlmEncoderConfig(parallelism=parallelism).build(pretrained_model_name_or_path="unused", positions=state)
+    default_traits = OpTraits(preserves_cursor_order=True)
+    assert operator.traits().parallelism == (default_traits.parallelism if parallelism is None else parallelism)

@@ -31,6 +31,8 @@ from nemo_automodel.components.datasets.vlm.loader import (
 )
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonOptions,
+    ZephonPackingOptions,
+    ZephonSourceOptions,
     ZephonStreamDatasetConfig,
 )
 
@@ -45,6 +47,10 @@ class ZephonVlmOptions(ZephonOptions):
     image segments keep vision participation for text-only packed documents.
     """
 
+    # Image packing cannot split documents, and media-aware token estimation
+    # is unsupported. These factories also own defaults for partial YAML groups.
+    source: ZephonSourceOptions = field(default_factory=partial(ZephonSourceOptions, token_estimation=None))
+    packing: ZephonPackingOptions = field(default_factory=partial(ZephonPackingOptions, pack_algorithm="first_fit"))
     inject_fake_images: bool = True
     on_media_error: Literal["raise", "drop"] = "raise"
 
@@ -78,10 +84,6 @@ class ZephonVlmDatasetConfig(ZephonStreamDatasetConfig[VlmStreamBuildContext, Vl
             raise ValueError("Image VLM requires pack_algorithm=first_fit or best_fit; images cannot be split")
         if self.zephon.source.token_estimation not in (None, False):
             raise ValueError("Zephon VLM token-aware source mixing requires a media-aware estimator; use LLM mixing")
-        if len(self.zephon.sources) > 1 and self.zephon.source.token_estimation is None:
-            raise ValueError(
-                "Set token_estimation=false for VLM source mixing; media-aware calibration is not certified"
-            )
 
     def build(self, *, context: VlmStreamBuildContext) -> VlmDataloaderBuild:
         """Build the processor and an unsized checkpointable image training stream.
@@ -156,7 +158,7 @@ class ZephonVlmDatasetConfig(ZephonStreamDatasetConfig[VlmStreamBuildContext, Vl
             processor=context.processor_config,
             inject_fake_images=False,
             on_media_error=self.zephon.on_media_error,
-            parallelism=options.workers.tokenize_parallelism or 1,
+            parallelism=options.workers.tokenize_parallelism,
             chat_template=context.chat_template,
         ).build(pretrained_model_name_or_path=context.pretrained_model_name_or_path, positions=positions)
         pipeline = create_source_pipeline(
@@ -165,7 +167,7 @@ class ZephonVlmDatasetConfig(ZephonStreamDatasetConfig[VlmStreamBuildContext, Vl
         pipeline.add_op(operator).pack_sequences(
             max_length=pack_length,
             algorithm=options.packing.pack_algorithm,
-            num_bins=options.packing.pack_num_bins or 64,
+            num_bins=options.packing.pack_num_bins,
             max_sequences_per_bin=max_documents,
             tokens_field="input_ids",
             drop_oversized=options.packing.drop_oversized,

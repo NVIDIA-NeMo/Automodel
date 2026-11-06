@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, NotRequired, cast
 
 import torch
@@ -96,13 +96,13 @@ class VlmEncoderConfig:
 
     processor: VlmProcessorConfig = field(default_factory=VlmProcessorConfig)
     inject_fake_images: bool = True
-    parallelism: int = 1
+    parallelism: int | None = None  # None retains Zephon's OpTraits default.
     chat_template: str | None = None
     on_media_error: Literal["raise", "drop"] = "raise"
 
     def build(self, *, pretrained_model_name_or_path: str, positions: ImagePositionState) -> BaseOp:
         """Build a Zephon operator with worker-local processor state."""
-        if self.parallelism < 1:
+        if self.parallelism is not None and self.parallelism < 1:
             raise ValueError("VLM encoder parallelism must be positive.")
         if self.on_media_error not in ("raise", "drop"):
             raise ValueError("VLM on_media_error must be 'raise' or 'drop'.")
@@ -137,12 +137,12 @@ class _EncodeImageDocuments(BaseOp):
 
     def traits(self) -> OpTraits:
         """Encoding preserves record order; opt-in decode filtering is not indexable."""
-        return OpTraits(
+        traits = OpTraits(
             indexable=self._config.on_media_error == "raise",
             preserves_cursor_order=True,
             calibration_replayable=True,
-            parallelism=self._config.parallelism,
         )
+        return traits if self._config.parallelism is None else replace(traits, parallelism=self._config.parallelism)
 
     def process_many(self, elems: list[SampleRecord]) -> list[SampleRecord]:
         """Encode records while retaining metadata and bookkeeping records.

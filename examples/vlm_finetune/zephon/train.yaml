@@ -24,17 +24,10 @@ dataset:
       fmt: jsonl
     packing:
       seq_len: 1024
-      pack_algorithm: first_fit
-      pack_num_bins: 16
-      drop_oversized: true
     source:
       chunk_size: 16
-      stop_after_passes: 1
     checkpoint:
-      aggregate_store: torch://
       run_id: zephon-vlm
-    training:
-      allow_cross_document_attention: false
 distributed:
   strategy: fsdp2
   dp_size: none
