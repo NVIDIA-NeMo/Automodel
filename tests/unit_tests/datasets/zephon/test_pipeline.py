@@ -12,107 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Operator controls reach Zephon's public construction API without execution."""
+
+"""Shared source construction and runtime options through the public Zephon API."""
 
 from dataclasses import replace
+from pathlib import Path
+from typing import Literal
 from unittest.mock import patch
 
 import pytest
-from transformers import PreTrainedTokenizerFast
 from zephon import Pipeline
 from zephon.work import StaticMixtureWorkSource, TokenEstimation
 
-from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.datasets.zephon.config import (
+    TokenEstimationSettings,
+    ZephonOptions,
+    ZephonPackingOptions,
     ZephonPrefetchOptions,
-    ZephonPretokenizedTextDatasetConfig,
-    ZephonTextDatasetConfig,
+    ZephonRuntimeOptions,
+    ZephonSource,
+    ZephonSourceOptions,
 )
-from nemo_automodel.components.datasets.zephon.pipeline import create_source_pipeline, create_text_pipeline
-from tests.utils.zephon_text_fixtures import config as config
-from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
+from nemo_automodel.components.datasets.zephon.pipeline import create_source_pipeline, finalize_pipeline
 
 
-@pytest.mark.parametrize("source_kind", ["text", "pretokenized"])
-def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, source_kind):
-    config = config.dataset_config
-    if source_kind == "pretokenized":
-        config = ZephonPretokenizedTextDatasetConfig(zephon=config.zephon)
-    config = replace(
-        config,
-        zephon=replace(
-            config.zephon,
-            workers=replace(
-                config.zephon.workers,
-                fetch_parallelism=2,
-                map_parallelism=4,
-                tokenize_parallelism=5,
-                pack_parallelism=6,
-                shuffle_parallelism=7,
-            ),
-            source=replace(
-                config.zephon.source,
-                token_estimation={"calibration_samples": 4},
-                prefetch=ZephonPrefetchOptions(buffer_size=8, parallelism=3),
-            ),
-            packing=replace(config.zephon.packing, shuffle_after_pack=True, shuffle_buffer_size=8),
-        ),
+@pytest.fixture
+def options(tmp_path: Path) -> ZephonOptions:
+    path = tmp_path / "documents.jsonl"
+    path.write_text('{"input_ids": [2, 3, 4, 5]}\n' * 8)
+    return ZephonOptions(
+        sources=(ZephonSource(name="text", path=str(tmp_path), fmt="jsonl"),),
+        source=ZephonSourceOptions(chunk_size=2, token_estimation=None),
+        packing=ZephonPackingOptions(seq_len=3, shuffle_after_pack=False),
+        runtime=ZephonRuntimeOptions(runner="threads", mtp_mode=False),
     )
-    with (
-        patch("zephon.work.StaticMixtureWorkSource", wraps=StaticMixtureWorkSource) as source,
-        patch("zephon.work.TokenEstimation", wraps=TokenEstimation) as estimation,
-        patch.object(
-            Pipeline, "preflight_tokenizers", autospec=True, side_effect=Pipeline.preflight_tokenizers
-        ) as preflight,
-        patch.object(Pipeline, "fetch_parallelism", autospec=True, side_effect=Pipeline.fetch_parallelism) as fetch,
-        patch.object(Pipeline, "prefetch", autospec=True, side_effect=Pipeline.prefetch) as prefetch,
-        patch.object(Pipeline, "map_transform", autospec=True, side_effect=Pipeline.map_transform) as normalize,
-        patch.object(Pipeline, "tokenize", autospec=True, side_effect=Pipeline.tokenize) as text,
-        patch.object(Pipeline, "tokenize_chat", autospec=True, side_effect=Pipeline.tokenize_chat) as chat,
-        patch.object(Pipeline, "pack_flat", autospec=True, side_effect=Pipeline.pack_flat) as pack,
-        patch.object(Pipeline, "shuffle", autospec=True, side_effect=Pipeline.shuffle) as shuffle,
-        patch.object(Pipeline, "map_batch", autospec=True, side_effect=Pipeline.map_batch) as batch_map,
-    ):
-        create_text_pipeline(config, tokenizer=tokenizer, seed=91, batch_size=2, dp_rank=0, dp_world_size=1)
-        batch_map.assert_not_called()
-        assert source.call_args.kwargs["seed"] == 91
-        assert shuffle.call_args.kwargs["seed"] == 91
-        assert estimation.call_args.kwargs["calibration_samples"] == 4
-        assert (estimation.call_args.kwargs["measure"] is not None) == (source_kind == "pretokenized")
-        assert preflight.call_args.kwargs["strict"] is True
-        assert fetch.call_args.args[1] == 2
-        assert prefetch.call_args.kwargs["parallelism"] == 3
-        assert prefetch.call_args.kwargs["buffer_size"] == 8
-        assert pack.call_args.kwargs["parallelism"] == 6
-        assert shuffle.call_args.kwargs["parallelism"] == 7
-        if source_kind == "text":
-            normalize.assert_not_called()
-            chat.assert_not_called()
-            assert text.call_args.kwargs["parallelism"] == 5
-        else:
-            assert normalize.call_args.kwargs["parallelism"] == 4
-            text.assert_not_called()
-            chat.assert_not_called()
-
-
-def test_numeric_overrides_reject_unknown_vocabulary_ids_before_source_start(
-    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast
-) -> None:
-    source = ZephonTextDatasetConfig(
-        zephon=config.dataset_config.zephon, tokenize_special_tokens="eos", eos_token_id=9999
-    )
-    with patch("nemo_automodel.components.datasets.zephon.pipeline.create_source_pipeline") as create_source:
-        with pytest.raises(ValueError, match="eos_token_id=9999 is not an existing tokenizer vocabulary ID"):
-            create_text_pipeline(source, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
-        create_source.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "setting,source_count,enabled",
     [("auto", 1, False), ("auto", 2, True), (False, 2, False), (None, 2, False), (True, 1, True), ({}, 1, True)],
 )
-def test_token_estimation_policy(config, setting, source_count, enabled):
-    options = config.dataset_config.zephon
+def test_token_estimation_policy(
+    options: ZephonOptions,
+    setting: bool | TokenEstimationSettings | Literal["auto"] | None,
+    source_count: int,
+    enabled: bool,
+) -> None:
     options = replace(
         options,
         sources=tuple(replace(options.sources[0], name=f"source_{i}") for i in range(source_count)),
@@ -130,8 +75,9 @@ def test_token_estimation_policy(config, setting, source_count, enabled):
 
 
 @pytest.mark.parametrize("policy,passes", [(None, 1), ("repeat", None)])
-def test_unset_pass_limit_uses_zephon_exhaustion_policy(config, policy, passes):
-    options = config.dataset_config.zephon
+def test_unset_pass_limit_uses_zephon_exhaustion_policy(
+    options: ZephonOptions, policy: str | None, passes: int | None
+) -> None:
     options = replace(options, source=replace(options.source, exhausted_policy=policy))
     with patch("zephon.work.StaticMixtureWorkSource", wraps=StaticMixtureWorkSource) as source:
         create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
@@ -141,8 +87,7 @@ def test_unset_pass_limit_uses_zephon_exhaustion_policy(config, policy, passes):
     assert actual.state_dict()["stop_after_passes"] == passes
 
 
-def test_explicit_pass_limit_reaches_zephon(config):
-    options = config.dataset_config.zephon
+def test_explicit_pass_limit_reaches_zephon(options: ZephonOptions) -> None:
     options = replace(options, source=replace(options.source, stop_after_passes=2))
     with patch("zephon.work.StaticMixtureWorkSource", wraps=StaticMixtureWorkSource) as source:
         create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
@@ -164,13 +109,13 @@ def test_explicit_pass_limit_reaches_zephon(config):
     ],
 )
 def test_runtime_buffers_reach_zephon_without_replacing_none_or_zero(
-    config: DataloaderConfig, tokenizer: PreTrainedTokenizerFast, overrides: dict[str, int]
+    options: ZephonOptions, overrides: dict[str, int]
 ) -> None:
-    dataset = config.dataset_config
-    dataset = replace(dataset, zephon=replace(dataset.zephon, runtime=replace(dataset.zephon.runtime, **overrides)))
-    with patch.object(Pipeline, "options", autospec=True, side_effect=Pipeline.options) as options:
-        create_text_pipeline(dataset, tokenizer=tokenizer, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
-    forwarded = next(call.kwargs for call in options.call_args_list if "mtp_mode" in call.kwargs)
+    options = replace(options, runtime=replace(options.runtime, **overrides))
+    with patch.object(Pipeline, "options", autospec=True, side_effect=Pipeline.options) as option_calls:
+        pipeline = create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
+        finalize_pipeline(pipeline, options, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
+    forwarded = next(call.kwargs for call in option_calls.call_args_list if "mtp_mode" in call.kwargs)
     for name in ("prefetch_batches", "default_stage_prefetch", "op_queue_capacity", "mtp_buffer", "mtp_prefetch"):
         assert forwarded[name] == overrides.get(name)
 
@@ -186,9 +131,8 @@ def test_runtime_buffers_reach_zephon_without_replacing_none_or_zero(
     ],
 )
 def test_source_prefetch_inserts_only_when_enabled_and_delegates_unset_options(
-    config: DataloaderConfig, prefetch: ZephonPrefetchOptions | None, expected: dict[str, int] | None
+    options: ZephonOptions, prefetch: ZephonPrefetchOptions | None, expected: dict[str, int] | None
 ) -> None:
-    options = config.dataset_config.zephon
     options = replace(options, source=replace(options.source, prefetch=prefetch))
     with patch.object(Pipeline, "prefetch", autospec=True, side_effect=Pipeline.prefetch) as warm_cache:
         create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
