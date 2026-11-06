@@ -1736,6 +1736,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
 
         reporting_loss = torch.sum(torch.stack(loss_buffer))
+        if self.pp_enabled:
+            # The last stage's CE may be bf16, while other stages contribute
+            # fp32 zeros. Every PP broadcast participant needs the same dtype.
+            reporting_loss = reporting_loss.float()
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens

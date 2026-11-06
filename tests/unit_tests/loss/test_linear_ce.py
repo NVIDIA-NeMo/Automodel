@@ -419,3 +419,39 @@ def test_fused_weighted_cross_entropy_matches_pytorch_gradient(impl):
     reference.backward()
     torch.testing.assert_close(hidden.grad.float(), reference_hidden.grad, rtol=2.0e-2, atol=3.0e-3)
     torch.testing.assert_close(weight.grad.float(), reference_weight.grad, rtol=2.0e-2, atol=3.0e-3)
+
+
+@pytest.mark.parametrize("packed_shape", [(6, 8), (1, 6, 8)])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_fused_cross_entropy_thd_layout_matches_batched_targets(
+    monkeypatch: pytest.MonkeyPatch, packed_shape: tuple[int, ...], weighted: bool
+) -> None:
+    """THD activations keep label order and gradients across original packed rows."""
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    def strict_kernel(hidden, weight, *, targets, reduction, **kwargs):
+        # CCE checks this before flattening; the old THD path violated it.
+        assert hidden.shape[:-1] == targets.shape
+        logits = hidden @ weight.T
+        loss = F.cross_entropy(logits.reshape(-1, 13), targets.reshape(-1), reduction=reduction)
+        return loss.reshape_as(targets) if reduction == "none" else loss
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", strict_kernel, raising=False)
+    torch.manual_seed(3)
+    hidden = torch.randn(packed_shape, requires_grad=True)
+    weight = torch.randn(13, 8, requires_grad=True)
+    labels = torch.tensor([[1, 2, -100], [3, 4, 5]])
+    weights = torch.tensor([[0.5] * 3, [1.5] * 3]) if weighted else None
+    result = FusedLinearCrossEntropy()(hidden, labels, weight, num_label_tokens=5, loss_weights=weights)
+    actual_grads = torch.autograd.grad(result, (hidden, weight))
+    ref_hidden = hidden.detach().clone().requires_grad_()
+    ref_weight = weight.detach().clone().requires_grad_()
+    per_token = F.cross_entropy(
+        (ref_hidden.reshape(-1, 8) @ ref_weight.T), labels.reshape(-1), reduction="none"
+    ).reshape_as(labels)
+    reference = (per_token * weights if weighted else per_token).sum() / 5
+    expected_grads = torch.autograd.grad(reference, (ref_hidden, ref_weight))
+    torch.testing.assert_close(result, reference)
+    for actual, expected in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual, expected)

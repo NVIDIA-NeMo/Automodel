@@ -2444,6 +2444,37 @@ class TestRunTrainOptimStepSetsMoEScale:
         assert clip.call_args.kwargs["grad_norm_backend"] == (backend or "triton")
         assert sample.metrics["grad_norm"] == 1.0
 
+    @pytest.mark.parametrize("has_last_stage", [False, True])
+    def test_pp_bf16_loss_reporting_matches_broadcast_dtype(self, monkeypatch, has_last_stage):
+        """BF16 CE and FP32 placeholder ranks use identical reporting buffers."""
+        recipe = self._make_recipe(monkeypatch, pp_enabled=True, dp_group_size=1)
+        labels = torch.tensor([[0, 1, -100, 2]])
+        logits = torch.tensor([[[2, 0, -1], [0, 2, -1], [1, 1, 1], [-1, 0, 2]]], dtype=torch.bfloat16)
+        ce = MaskedCrossEntropy(fp32_upcast=False)(logits, labels)
+        assert ce.dtype == torch.bfloat16
+        expected_loss = ce.float() / 3
+        broadcast_inputs = []
+
+        def forward_backward_step(idx, batch, *, loss_buffer, **kwargs):
+            loss_buffer.append(ce.detach() if has_last_stage else torch.tensor(0.0))
+
+        def broadcast(tensor):
+            # NCCL requires matching element types on source and destination;
+            # broadcasting bf16 into an fp32 placeholder corrupts the metric.
+            assert tensor.dtype == torch.float32
+            broadcast_inputs.append(tensor.clone())
+            tensor.copy_(expected_loss)
+            return tensor
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
+        monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", broadcast)
+        sample = recipe._run_train_optim_step([{"input_ids": labels.clamp_min(0), "labels": labels}])
+
+        assert len(broadcast_inputs) == 1
+        torch.testing.assert_close(broadcast_inputs[0], expected_loss if has_last_stage else torch.tensor(0.0))
+        assert sample.metrics["loss"] == pytest.approx(expected_loss.item())
+        assert ce.dtype == torch.bfloat16
+
     @pytest.mark.parametrize("pp_enabled", [False, True])
     @pytest.mark.parametrize("accumulation_steps", [1, 3])
     @pytest.mark.parametrize("max_grad_norm", [None, 0.5])
