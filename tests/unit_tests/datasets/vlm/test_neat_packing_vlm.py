@@ -21,7 +21,10 @@ import pytest
 import torch
 from PIL import Image
 
-from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+from nemo_automodel.components.datasets.vlm.collate_fns import (
+    neat_packed_vlm_collater,
+    packed_sequence_thd_vlm_collater,
+)
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     NeatPackConfig,
     _compute_mrope_position_ids,
@@ -652,7 +655,8 @@ class TestVariableResolutionImagePacking:
         assert tuple(result["pixel_values"].shape) == (3, 3, 8, 8)
 
 
-def test_image_sizes_and_ownership_survive_native_packing_and_collation():
+@pytest.mark.parametrize("packing_format", ["neat", "thd"])
+def test_image_sizes_and_ownership_survive_native_packing_and_collation(packing_format: str) -> None:
     from nemo_automodel.components.datasets.vlm.neat_packing_vlm import PackedDatasetWrapper
     from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, prepare_vlm_media_for_pp
 
@@ -678,7 +682,10 @@ def test_image_sizes_and_ownership_survive_native_packing_and_collation():
     torch.testing.assert_close(packed["image_sizes"], torch.tensor([[8, 8], [8, 8], [12, 4]]))
     separate = PackedDatasetWrapper(documents, bins=[[0], [1]], pack_size=4)
     separate_packs = [separate[0], separate[1]]
-    batch = neat_packed_vlm_collater(separate_packs, padding_idx=0, packing=get_packing_capabilities("sdpa"))
+    if packing_format == "thd":
+        batch = packed_sequence_thd_vlm_collater(separate_packs, padding_idx=0)
+    else:
+        batch = neat_packed_vlm_collater(separate_packs, padding_idx=0, packing=get_packing_capabilities("sdpa"))
     assert batch["pixel_values"].shape == (3, 3, 12, 8)
     torch.testing.assert_close(batch["n_images_per_sample"], torch.tensor([2, 1]))
     torch.testing.assert_close(batch["image_sizes"], packed["image_sizes"])
