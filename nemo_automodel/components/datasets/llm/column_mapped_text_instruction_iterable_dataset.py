@@ -265,6 +265,7 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
 
     def __iter__(self) -> Iterator[Dict[str, List[int]]]:
         while True:
+            yielded_any = False
             for row in self.dataset:
                 mapped = {dest: row[src] for dest, src in self.column_mapping.items() if src in row}
                 # Skip rows missing required fields
@@ -276,10 +277,18 @@ class ColumnMappedTextInstructionIterableDataset(IterableDataset, ColumnMappedTe
                     continue
                 if not _check_all_values_equal_length(tokenized):
                     continue
+                yielded_any = True
                 yield tokenized
 
             if not self.repeat_on_exhaustion:
                 return
+            if not yielded_any:
+                # Looping again would never produce a sample and training would hang silently.
+                raise ValueError(
+                    "No valid samples were produced from a full pass over the dataset. Check that "
+                    "column_mapping refers to existing columns (including the answer column) and that "
+                    "samples are not all filtered out (empty labels or mismatched lengths)."
+                )
             # Wrap-around: advance epoch for deterministic reshuffle if supported and iterate again
             try:
                 self._current_epoch_for_repeat += 1
