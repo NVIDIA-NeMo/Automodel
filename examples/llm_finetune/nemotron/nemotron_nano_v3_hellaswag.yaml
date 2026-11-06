@@ -76,10 +76,10 @@ dataset:
 packed_sequence:
   packed_sequence_size: 4096
 
-  packing_strategy: neat
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
   drop_last: true
@@ -92,7 +92,7 @@ validation_dataset:
   pad_to_max_length: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
 
 optimizer:
   _target_: torch.optim.Adam

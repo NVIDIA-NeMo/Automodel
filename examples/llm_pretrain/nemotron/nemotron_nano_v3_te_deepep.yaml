@@ -72,7 +72,7 @@ rng:
   ranked: true
 ci:
   cluster_tag: h100
-  time: 00:15:00
+  time: 00:40:00
   nodes: 1
   recipe_owner: akoumpa
   nproc_per_node: 8

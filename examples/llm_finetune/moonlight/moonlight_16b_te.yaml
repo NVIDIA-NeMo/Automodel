@@ -138,6 +138,5 @@ ci:
   perf_testing:
     fake_balanced_gate: true
     schedule: nightly
-    time: 00:10:00
   nodes: 1
   time: 00:40:00
