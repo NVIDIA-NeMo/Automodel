@@ -36,6 +36,7 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonInstructionDatasetConfig,
     ZephonOptions,
     ZephonPackingOptions,
+    ZephonPrefetchOptions,
     ZephonPretokenizedTextDatasetConfig,
     ZephonRuntimeOptions,
     ZephonSource,
@@ -289,7 +290,6 @@ def test_translated_instructions_require_a_template_when_requested(tokenizer):
     "name",
     [
         "fetch_parallelism",
-        "prefetch_parallelism",
         "map_parallelism",
         "tokenize_parallelism",
         "pack_parallelism",
@@ -924,3 +924,64 @@ def test_runtime_buffers_follow_toml_and_inline_override_precedence(tmp_path: Pa
     assert dataset.zephon.runtime.op_queue_capacity == 20
     assert dataset.zephon.runtime.mtp_buffer == 10
     assert dataset.zephon.runtime.mtp_prefetch == 0
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        ({}, None),
+        ({"prefetch": None}, None),
+        ({"prefetch": {}}, ZephonPrefetchOptions()),
+        ({"prefetch": {"buffer_size": 8, "parallelism": 3}}, ZephonPrefetchOptions(buffer_size=8, parallelism=3)),
+        ({"prefetch": {"buffer_size": None, "parallelism": None}}, ZephonPrefetchOptions()),
+    ],
+)
+def test_source_prefetch_is_optional_and_typed_at_recipe_boundary(
+    source: dict[str, object], expected: ZephonPrefetchOptions | None
+) -> None:
+    values = _recipe(dataset={"zephon": {**_SETTINGS, "source": source}})
+    original = deepcopy(values)
+    loader = RecipeConfig(ConfigNode(values)).dataloader
+    assert loader.dataset_config.zephon.source.prefetch == expected
+    assert values == original
+
+
+@pytest.mark.parametrize("name", ["buffer_size", "parallelism"])
+def test_source_prefetch_accepts_operator_defaults_or_positive_values(name: str) -> None:
+    for value in (None, 1, 8):
+        assert getattr(ZephonPrefetchOptions(**{name: value}), name) == value
+    for invalid in (0, -1, True, 1.5, "8"):
+        with pytest.raises(ValueError, match=f"source.prefetch.{name} must be a positive integer or None"):
+            ZephonPrefetchOptions(**{name: invalid})
+
+
+@pytest.mark.parametrize("prefetch", [True, False, 8, [], {"unknown": 2}])
+def test_source_prefetch_rejects_invalid_recipe_settings(prefetch: object) -> None:
+    with pytest.raises(ValueError, match="Zephon source.prefetch"):
+        ZephonTextDatasetConfig(zephon={**_SETTINGS, "source": {"prefetch": prefetch}})
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [{"runtime": {"prefetch_buffer_size": 8}}, {"workers": {"prefetch_parallelism": 3}}],
+)
+def test_source_prefetch_is_not_a_runtime_or_worker_setting(settings: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="Unexpected Zephon"):
+        ZephonTextDatasetConfig(zephon={**_SETTINGS, **settings})
+
+
+def test_source_prefetch_toml_overrides_preserve_fields_and_allow_disabling(tmp_path: Path) -> None:
+    path = tmp_path / "prefetch.toml"
+    path.write_text('[[sources]]\nname="text"\npath="unused"\n[source.prefetch]\nbuffer_size=8\nparallelism=3\n')
+    for overrides, expected in (
+        ({}, ZephonPrefetchOptions(buffer_size=8, parallelism=3)),
+        ({"prefetch": {}}, ZephonPrefetchOptions(buffer_size=8, parallelism=3)),
+        ({"prefetch": {"parallelism": 5}}, ZephonPrefetchOptions(buffer_size=8, parallelism=5)),
+        ({"prefetch": {"buffer_size": None}}, ZephonPrefetchOptions(parallelism=3)),
+        ({"prefetch": None}, None),
+    ):
+        values = {"data_config": str(path), "source": overrides}
+        original = deepcopy(values)
+        dataset = ZephonTextDatasetConfig(zephon=values)
+        assert dataset.zephon.source.prefetch == expected
+        assert values == original
