@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Union
 
 import torch
 
+from nemo_automodel._transformers.capabilities import ModelSupports
 from nemo_automodel._transformers.utils import _should_load_before_shard
 from nemo_automodel._transformers.v4_patches.kv_sharing import (
     install_kv_sharing_holder,
@@ -66,6 +67,7 @@ from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPi
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.models.common.fp32_logits import Float32LogitsLinear
 from nemo_automodel.components.models.common.utils import (
     cast_frozen_modules_to_compute_dtype,
     prepare_frozen_parameters_for_sharding,
@@ -94,6 +96,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
+    from transformers import PreTrainedModel
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +426,38 @@ def instantiate_infrastructure(
     return resolved_mesh_context, autopipeline, parallelize_fn, qat_quantizer
 
 
+def _use_fp32_logits(
+    model: "PreTrainedModel", logits_dtype: torch.dtype | str, *, mesh: MeshContext, pipelined: bool
+) -> None:
+    """Make the LM head write FP32 logits, or reject a configuration that cannot.
+
+    The head is replaced by a :class:`Float32LogitsLinear` owning the same weight
+    Parameter, so parameter names, tied embeddings and checkpoints are unchanged.
+
+    Args:
+        model: Unsharded model after PEFT and lower-precision conversion.
+        logits_dtype: Requested logits dtype; only ``torch.float32`` or ``"float32"``.
+        mesh: Mesh context used to evaluate the model's capabilities.
+        pipelined: Whether pipeline parallelism will split the model.
+
+    Raises:
+        ValueError: If ``logits_dtype`` is not float32, or the head is not a plain bias-free ``nn.Linear``.
+        NotImplementedError: If the model does not declare ``supports_fp32_logits``, or with pipeline parallelism.
+    """
+    if isinstance(logits_dtype, str):
+        logits_dtype = dtype_from_str(logits_dtype)
+    if logits_dtype != torch.float32:
+        raise ValueError(f"logits_dtype must be float32 or unset; got {logits_dtype}.")
+    if not ModelSupports(model, mesh).supports_fp32_logits:
+        raise NotImplementedError(
+            f"logits_dtype=float32 is not validated for {type(model).__name__}: its class does not declare "
+            "ModelCapabilities.supports_fp32_logits (a forward that returns the LM head's logits uncast)."
+        )
+    if pipelined:
+        raise NotImplementedError("logits_dtype=float32 does not support pipeline parallelism.")
+    model.set_output_embeddings(Float32LogitsLinear.from_linear(model.get_output_embeddings()))
+
+
 def _uses_te_attention(model) -> bool:
     """Return True if any self_attn module uses TE's DotProductAttention."""
     try:
@@ -583,6 +618,7 @@ def apply_model_infrastructure(
     weights_already_loaded=False,
     inject_te_attention: bool = False,
     load_metadata_with_gloo: bool = False,
+    logits_dtype: torch.dtype | str | None = None,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -622,6 +658,9 @@ def apply_model_infrastructure(
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
         load_metadata_with_gloo: Use a CPU group for base-weight load planning. Default: False.
+        logits_dtype: ``torch.float32`` (or ``"float32"``) makes the LM-head GEMM write FP32
+            logits from BF16/FP16 operands, for models declaring ``supports_fp32_logits``.
+            Parameter storage and the FSDP policy are unchanged. Default: None (model default).
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -677,6 +716,11 @@ def apply_model_infrastructure(
         from nemo_automodel._transformers.te_attention import inject_te_attention as _inject_te
 
         _inject_te(model)
+
+    # After PEFT and FP8 so the head is final, and before sharding so tensor parallelism
+    # and FSDP wrap the FP32-logits head.
+    if logits_dtype is not None:
+        _use_fp32_logits(model, logits_dtype, mesh=mesh, pipelined=autopipeline is not None)
 
     # Resolve exact parameter names while the complete, unwrapped model is still present.
     # Storage must be prepared before either loading branch can copy checkpoint values.

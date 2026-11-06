@@ -173,6 +173,21 @@ def test_qwen3_vl_moe_does_not_declare_cp_vision_frame_sharding_support():
     assert caps.supports_cp_vision_frame_sharding is False
 
 
+@pytest.mark.parametrize("arch", ["LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"])
+def test_dense_llama_and_qwen_declare_fp32_logits_support(arch):
+    """Models whose forward returns compute_lm_head_logits(...).logits uncast opt into FP32 logits."""
+    caps = query_capabilities(ModelRegistry.get_model_cls_from_model_arch(arch))
+
+    assert caps.supports_fp32_logits is True
+
+
+def test_moe_model_does_not_declare_fp32_logits_support():
+    """FP32 logits stay unvalidated for models that have not opted in."""
+    caps = query_capabilities(ModelRegistry.get_model_cls_from_model_arch("Qwen3MoeForCausalLM"))
+
+    assert caps.supports_fp32_logits is False
+
+
 # ---------------------------------------------------------------------------
 # 3. query_capabilities canonical-type & dispatch behavior
 # ---------------------------------------------------------------------------
@@ -239,6 +254,7 @@ def test_query_returns_canonical_type_for_static_class():
     assert caps.supports_mtp_cp is False
     assert caps.supports_mtp_cp_pp is False
     assert caps.supports_cp_vision_frame_sharding is False
+    assert caps.supports_fp32_logits is False
 
 
 def test_query_static_class_from_instance():

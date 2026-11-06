@@ -246,6 +246,34 @@ The automatic warning about torch Adam/AdamW with trainable bf16 parameters curr
 
 </Warning>
 
+## FP32 Logits
+
+Set `model.logits_dtype: float32` to keep the language-model head's logits in fp32, for example to match vLLM's `head_dtype: float32` rollouts in reinforcement learning:
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-8B
+  logits_dtype: float32
+```
+
+The head GEMM reads the bf16 hidden states and the bf16 compute weight, accumulates in fp32 and writes fp32 logits, so no logit is rounded to bf16. This differs from `mp_policy.output_dtype: float32`, which upcasts logits that were already rounded to bf16. Parameter storage, master weights, optimizer state, gradient reduction and checkpoint keys are unchanged, and tied embeddings stay tied. In backward, the logits gradient is cast to bf16 and the head uses the same GEMMs as the default bf16 head.
+
+| Configuration | Status |
+| --- | --- |
+| NeMo AutoModel's Llama, Qwen2 and Qwen3 implementations | Supported. Other models, including Hugging Face implementations selected with `force_hf`, are rejected at setup. |
+| FSDP2, including a tied input embedding and head | Supported |
+| Tensor parallelism with a column-parallel head, with or without sequence parallelism | Supported |
+| HSDP, context parallelism, and FSDP2 combined with tensor parallelism | Not yet validated |
+| Pipeline parallelism | Rejected at setup |
+| LoRA, quantized, FP8 or QAT LM heads, or a head with a bias | Rejected at setup |
+| `MaskedCrossEntropy` and other logits-based losses | Supported; they consume the fp32 logits. |
+| `ChunkedCrossEntropy` | Supported; each chunk reproduces the fp32 projection. |
+| `FusedLinearCrossEntropy` with `impl: cce` | Supported; the kernel computes logits in fp32 internally. |
+| `FusedLinearCrossEntropy` with `impl: torch_compile` | Rejected at setup, because it rounds logits to bf16. |
+
+The fp32 logits tensor is twice the size of bf16 logits. Losses that upcast logits to fp32 already hold a tensor of that size, so measure end-to-end memory for your workload.
+
 ## Example Configs
 
 - [`examples/llm_pretrain/llama3_70b_pretrain.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_70b_pretrain.yaml): TE FusedAdam example. This keeps model storage and training checkpoints in bf16 while using fp32 master weights and optimizer state.
