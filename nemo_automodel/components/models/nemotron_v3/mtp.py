@@ -28,6 +28,8 @@ checkpoint, so the state-dict adapter performs an effectively 1-to-1 mapping.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 import torch.nn as nn
 
@@ -256,6 +258,17 @@ def build_nemotron_v3_mtp(
             has_final_norm=has_final_norm,
             dtype=dtype,
         )
+
+    mtp_moe_intermediate_size = getattr(config, "mtp_moe_intermediate_size", None)
+    if mtp_moe_intermediate_size is not None:
+        mtp_moe_intermediate_size = int(mtp_moe_intermediate_size)
+        if mtp_moe_intermediate_size <= 0:
+            raise ValueError(f"mtp_moe_intermediate_size must be positive when set, got {mtp_moe_intermediate_size}.")
+        if "moe" not in block_types_per_sublayer:
+            raise ValueError("mtp_moe_intermediate_size requires an MoE sublayer in the MTP pattern.")
+        if moe_config is None:
+            raise ValueError("mtp_moe_intermediate_size requires a backbone MoE configuration.")
+        moe_config = replace(moe_config, moe_inter_dim=mtp_moe_intermediate_size)
 
     return MTPModule(
         mtp_config=mtp_config,
