@@ -168,6 +168,12 @@ for module in ("transformers", "datasets",
                "nemo_automodel.components.datasets.llm.retrieval_dataset",
                "nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset"):
     assert module not in sys.modules, module
+
+# Eager builder loading previously also exposed this submodule. Resolve it
+# before requesting the builder to exercise the original import spelling.
+from nemo_automodel.components.models import gpt2
+assert gpt2 is importlib.import_module("nemo_automodel.models.gpt2")
+assert models.build_gpt2_model is gpt2.build_gpt2_model
 """
     )
 
