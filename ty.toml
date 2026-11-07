@@ -48,6 +48,8 @@ allowed-unresolved-imports = [
     "transformer_engine.**",
     "transformer_engine_torch",
     "transformers.tokenization_utils",
+    "triton",
+    "triton.**",
     "uccl",
     "uccl.**",
     "wandb",
@@ -67,6 +69,14 @@ include = [
     "nemo_automodel/components/launcher/**",
     "nemo_automodel/components/loggers/**",
     "nemo_automodel/components/optim/**",
+    "nemo_automodel/components/training/ema.py",
+    "nemo_automodel/components/training/garbage_collection.py",
+    "nemo_automodel/components/training/neftune.py",
+    "nemo_automodel/components/training/prewarm.py",
+    "nemo_automodel/components/training/step_scheduler.py",
+    "nemo_automodel/components/training/timers.py",
+    "nemo_automodel/components/training/triton/grad_norm.py",
+    "nemo_automodel/components/training/utils.py",
 ]
 
 [overrides.rules]
