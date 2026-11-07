@@ -484,8 +484,9 @@ def test_confignode_repr_uses_orig_value_for_oc_env(monkeypatch, tmp_path: Path)
     assert copied_value._orig_value == "${oc.env:SECRET_ENV}"
 
 
-def test_load_module_from_file(tmp_path):
-    """Module is imported, its globals are accessible, and it gets a unique name."""
+def test_load_module_from_file(tmp_path, monkeypatch):
+    """With user modules enabled, the file is imported, its globals are accessible, and it gets a unique name."""
+    monkeypatch.setattr("nemo_automodel.components.config.loader.ENABLE_USER_MODULES", True)
     py_file = tmp_path / "plugin.py"
     py_file.write_text(
         textwrap.dedent(
@@ -510,8 +511,9 @@ def test_resolve_target_non_string_passthrough():
     assert _resolve_target(42) == 42
 
 
-def test_resolve_target_file_colon(tmp_path):
-    """`path/to/file.py:object_name` is resolved correctly."""
+def test_resolve_target_file_colon(tmp_path, monkeypatch):
+    """With user modules enabled, `path/to/file.py:object_name` is resolved correctly."""
+    monkeypatch.setattr("nemo_automodel.components.config.loader.ENABLE_USER_MODULES", True)
     script = tmp_path / "tools.py"
     script.write_text(
         textwrap.dedent(
