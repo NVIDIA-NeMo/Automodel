@@ -29,7 +29,6 @@ from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import Deeps
 from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
-from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 
 
@@ -38,7 +37,7 @@ class DraftSpec:
     """How to build a DSpark draft model for a particular target architecture."""
 
     # Constructed as ``draft_cls(draft_config)``; some drafts are HF PreTrainedModel
-    # subclasses (Qwen3, Gemma4) while others are plain modules (V4, GLM, MiniMax M3).
+    # subclasses (Qwen3, Gemma4) while others are plain modules (V4, GLM).
     draft_cls: type[nn.Module]
 
 
@@ -90,9 +89,6 @@ DSPARK_DRAFT_REGISTRY["KimiK3ForConditionalGeneration"] = DraftSpec(draft_cls=Ki
 # text sub-config.
 DSPARK_DRAFT_REGISTRY["Gemma4ForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4DSparkModel)
 DSPARK_DRAFT_REGISTRY["Gemma4UnifiedForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4DSparkModel)
-# MiniMax M3 VL target (model_type "minimax_m3_vl"): a dense text-only draft built from
-# the target's text sub-config.
-DSPARK_DRAFT_REGISTRY["MiniMaxM3SparseForConditionalGeneration"] = DraftSpec(draft_cls=MiniMaxM3DSparkModel)
 
 
 def resolve_dspark_draft_spec(architectures: list[str]) -> DraftSpec:
