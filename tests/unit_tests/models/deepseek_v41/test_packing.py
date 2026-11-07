@@ -81,8 +81,8 @@ def test_packed_matches_independent_documents_and_optimizer(full_schedule):
     documents = _documents()
     ids = torch.cat(documents, dim=1)
     lengths = torch.tensor([[doc.shape[1] for doc in documents]])
-    result = model(ids, seq_lens=lengths, labels=ids, output_hidden_states=True)
-    expected_outputs = [reference(doc, output_hidden_states=True) for doc in documents]
+    result = model(ids, seq_lens=lengths, labels=ids, output_residual_streams=True)
+    expected_outputs = [reference(doc, output_residual_streams=True) for doc in documents]
     expected_logits = torch.cat([out.logits for out in expected_outputs], dim=1)
     torch.testing.assert_close(result.logits, expected_logits, atol=3e-6, rtol=3e-5)
     for layer, hidden in enumerate(result.hidden_states):

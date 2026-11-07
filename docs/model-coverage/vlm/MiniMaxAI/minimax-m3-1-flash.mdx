@@ -1,0 +1,53 @@
+---
+title: "MiniMax-M3.1-Flash"
+description: "Fine-tune MiniMax-M3.1-Flash on MedPix vision-language data with NeMo AutoModel, loading its NVFP4 and MXFP8 checkpoint directly."
+slug: model-coverage/vision-language-models/MiniMaxAI/MiniMax-M3.1-Flash
+---
+
+[MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) is an update of [MiniMax-M3](/model-coverage/vision-language-models/MiniMaxAI/MiniMax-M3), MiniMax AI's Mixture-of-Experts vision-language model, optimized for agentic coding. NeMo AutoModel loads its mixed-precision checkpoint directly and fine-tunes it with the same model implementation as MiniMax-M3.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| **Task** | Image-Text-to-Text |
+| **Architecture** | `MiniMaxM3SparseForConditionalGeneration` - MoE VLM, same implementation as MiniMax-M3 |
+| **Language Module** | 60 layers, routed experts, MiniMax Sparse Attention (MSA) |
+| **Checkpoint Precision** | NVFP4 routed experts, MXFP8 projections, BF16 elsewhere |
+| **HF Org** | [MiniMaxAI](https://huggingface.co/MiniMaxAI) |
+
+## Checkpoint Loading
+
+The released checkpoint stores routed-expert weights in packed NVFP4 (values, block scales, and global scales) and attention and indexer projections in MXFP8. With `checkpoint.dequantize_base_checkpoint: true`, AutoModel decodes these tensors into the training dtype while streaming them into sharded storage, so you do not need to convert the checkpoint first.
+
+The recipe trains with BF16 parameters, FP32 router state, and Transformer Engine FusedAdam with FP32 master weights and moments. This is BF16 fine-tuning of the dequantized model, not NVFP4 training.
+
+## Available Models
+
+- **MiniMax-M3.1-Flash** - registered through the `MiniMaxM3SparseForConditionalGeneration` model class.
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| MiniMax-M3.1-Flash | [`MiniMaxAI/MiniMax-M3.1-Flash`](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) |
+
+## Example Recipes
+
+| Recipe | Scope | Hardware | Steps |
+|---|---|---|---|
+| [Full SFT - MedPix, EP128](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/minimax_m3/minimax_m3_1_vl_sft_medpix_ep128_100steps.yaml) | All 60 language layers; frozen vision and audio towers | 16 nodes, 128 GPUs | 100 |
+
+The recipe uses FSDP2 with HybridEP expert dispatch, FA4 attention, and activation checkpointing (TP1, CP1, PP1), and runs final validation on `validation[:256]`. Checkpoint saving is disabled.
+
+The processor sets `size.shortest_edge: 3136` and `size.longest_edge: 451584`. These keep the checkpoint's image pixel-area bounds under Transformers 5.18 and are not a fixed image width and height.
+
+## Run the Recipe
+
+The recipe needs 16 nodes with 8 GPUs each. See [SLURM Cluster](/job-launchers/slurm-cluster) to submit it as a multi-node job. To log to Weights & Biases, set `wandb.enable: true` and fill in `wandb.project` and `wandb.entity`.
+
+## Hugging Face Model Cards
+
+- [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)

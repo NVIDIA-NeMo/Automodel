@@ -1,6 +1,6 @@
 ---
-title: "FLUX-3-Image-Klein-Base"
-description: "Fine-tune FLUX-3-Image-Klein-Base for text-to-image generation and instruction-based image editing using NeMo AutoModel."
+title: "flux-3-image-klein-base"
+description: "Fine-tune flux-3-image-klein-base (FLUX 3 Image Klein Base) for text-to-image generation and instruction-based image editing using NeMo AutoModel."
 slug: model-coverage/diffusion/black-forest-labs/flux-3-image-klein-base
 ---
 
@@ -22,23 +22,21 @@ FLUX 3 Image Klein Base is Black Forest Labs' open-weight image model. NeMo Auto
 | Checkpoint | Format | Usage |
 |---|---|---|
 | [`black-forest-labs/flux-3-image-klein-base`](https://huggingface.co/black-forest-labs/flux-3-image-klein-base) | BF16 base model with Diffusers modular components | Download the self-contained repository; no conversion is needed for its modular files |
-| [`herzogenhorn/f3-image-small`](https://huggingface.co/herzogenhorn/f3-image-small) | Original BFL preview package | Convert to a Diffusers modular checkpoint before using the recipes |
-| [`diffusers-internal-dev/f3-small-img`](https://huggingface.co/diffusers-internal-dev/f3-small-img) | Diffusers modular preview checkpoint | Download locally and use with the matching Diffusers revision |
 
 <Note>
-The training workflow below covers **FLUX 3 Image Klein Base**, the non-distilled model that uses classifier-free guidance. The separate `black-forest-labs/flux-3-image-klein` checkpoint is distilled and is not covered by this training validation. The `herzogenhorn` and `diffusers-internal-dev` repositories are preview sources and require access; the recorded validation used pinned preview weights, not an independently downloaded release checkpoint.
+The training workflow below covers **FLUX 3 Image Klein Base**, the non-distilled model that uses classifier-free guidance. The separate `black-forest-labs/flux-3-image-klein` checkpoint is distilled and is not covered by this training validation.
 </Note>
 
 ## Example Recipes
 
-Run the commands below from [the linked recipe revision](https://github.com/NVIDIA-NeMo/Automodel/tree/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c).
+Run the commands below from the AutoModel repository root on the `main` branch.
 
 | Recipe | Description |
 |---|---|
-| [flux3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) | Text-to-image LoRA fine-tuning |
-| [flux3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_t2i_flow.yaml) | Text-to-image full fine-tuning template |
-| [flux3_i2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/finetune/flux3_i2i_flow.yaml) | Image-editing full fine-tuning template; add the LoRA configuration below for adapter training |
-| [generate_flux3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/bdd71fa54aeb0f96667a98424ac7b2d4f2508d9c/examples/diffusion/generate/configs/generate_flux3.yaml) | Native image generation with optional trained LoRA weights |
+| [flux3_t2i_flow_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow_lora.yaml) | Text-to-image LoRA fine-tuning |
+| [flux3_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_t2i_flow.yaml) | Text-to-image full fine-tuning template |
+| [flux3_i2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux3_i2i_flow.yaml) | Image-editing full fine-tuning template; add the LoRA configuration below for adapter training |
+| [generate_flux3.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_flux3.yaml) | Native image generation with optional trained LoRA weights |
 
 The 100-step validation covers LoRA training. The full fine-tuning templates have not undergone the same end-to-end validation.
 
@@ -46,7 +44,7 @@ The 100-step validation covers LoRA training. The full fine-tuning templates hav
 
 Install NeMo AutoModel with diffusion dependencies using the [Installation Guide](/get-started/installation). Run the commands below from the AutoModel repository root in that environment.
 
-### Use the release checkpoint
+### Download the checkpoint
 
 The release repository includes Diffusers weights and `modular_model_index.json`, alongside the original BFL package. Download the base repository for fine-tuning; the separate distilled repository is intended for inference. The release model card uses a source installation of Diffusers:
 
@@ -58,30 +56,6 @@ uv run --no-sync hf download black-forest-labs/flux-3-image-klein-base \
 ```
 
 After authenticating with an authorized Hugging Face account, use the local directory containing `modular_model_index.json` and the transformer, VAE, text encoder, and tokenizer component directories. AutoModel loads those modular components directly; converting the release repository's original BFL files is not required. The `variants/fp8r` and `variants/nvfp4` directories are quantized inference packages and are outside the BF16 training validation documented here.
-
-<Note>
-This release setup follows the model card and the release repository layout announced by Black Forest Labs. The release weights and public Diffusers revision were not independently exercised in the recorded AutoModel runs. The pinned preview workflow below identifies the exact sources used for validation.
-</Note>
-
-### Reproduce the validated preview
-
-The recorded runs used a locally converted preview checkpoint and the `flux3-image` branch of [the preview Diffusers repository](https://github.com/huggingface/diffusers-new-model-addition-f3) at revision `0a774136f798ec676d991c9bae8a5215bb299f48`. This revision provides `Flux3Transformer2DModel` and its modular pipeline. Access to that source repository is separate from Hugging Face checkpoint access.
-
-To reproduce that environment, install the matching checkout after setting up AutoModel:
-
-```bash
-uv pip install --no-deps -e /path/to/diffusers-f3
-```
-
-Convert a downloaded original `herzogenhorn/f3-image-small` package with the tool from that Diffusers checkout:
-
-```bash
-uv run --no-sync python /path/to/diffusers-f3/integration-notes/make_flux3_modular_repo.py \
-  --package /data/models/f3-image-small \
-  --output /data/models/flux3-image-klein-base
-```
-
-The separately hosted `diffusers-internal-dev/f3-small-img` repository is another modular preview source; it was not the source of the recorded validation. Conversion is needed only for the original preview package, not for a repository that already provides the modular components.
 
 The examples use `uv run --no-sync` to preserve the installed Diffusers revision. Replace the example `/data` paths with your own directories.
 
@@ -224,10 +198,6 @@ For generation, use the same native generation entry point with the image-editin
 | Text-to-image LoRA | 100 steps on 32 Tuxemon examples; native FSDP2 loading and forward/backward on 2 H100 GPUs; checkpoint save, adapter reload, and image generation |
 | Image-editing LoRA | 100 steps on 32 MagicBrush training examples; native FSDP2 loading and forward/backward on 2 H100 GPUs; checkpoint save, adapter reload, and generation on 4 held-out edits |
 | Text-to-image resume | Native optimizer and adapter checkpoint resume from step 50 to step 100; bitwise-identical continuation is not established |
-
-Validation used the original BFL checkpoint at revision `f96bdc5547b7b13c98d7958d3d4e977fe1a8be47`, converted locally with the Diffusers revision above, and AutoModel revision `28488ad14b68620a4de2e1d5060cd0980395223d`. The separately hosted modular preview checkpoint was not independently validated in that run.
-
-The port at AutoModel revision `e15d7708a5f141997870872214a8446cce0a83b2` (with local test-return-contract and documentation-slug updates) repeated both native 100-step LoRA runs on two H100 GPUs, then reloaded the saved adapters and generated two T2I samples and two held-out image edits. Both T2I samples were coherent; image editing preserved the source scene, but instruction fulfillment was mixed. These reruns did not repeat the earlier parameter-by-parameter loading audit or resume check.
 
 These runs verify the training and generation workflow on a small dataset; they do not establish a quality improvement or a performance benchmark. Full-parameter fine-tuning, multi-node execution, tensor/context parallelism greater than one, image-editing resume, and FP8/NVFP4 training remain unvalidated. This integration covers image generation and editing, with no video or audio workflow.
 

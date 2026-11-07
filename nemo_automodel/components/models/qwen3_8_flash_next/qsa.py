@@ -27,22 +27,27 @@ import math
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from torch.utils._python_dispatch import _disable_current_modes
 
-from nemo_automodel.components.distributed.recompute_replay import RecomputeReplay
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
+from nemo_automodel.components.models.qwen3_8_flash_next.cudnn_qsa import cudnn_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import FlexQSAMask, flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
+from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 
 # The gathered implementation is a numerical oracle and CPU fallback, not the
 # production CUDA path. Keep its workspace bounded without exposing a model or
@@ -276,7 +281,8 @@ def select_qsa_token_ids(
                 sparse_start = min(max(first_sparse_position - first_position, 0), rows)
                 if sparse_start < rows:
                     sparse_queries = index_queries[batch_idx, query_start + sparse_start : query_end].float()
-                    scores = torch.einsum("qhd,pd->qhp", sparse_queries, keys)
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        scores = torch.einsum("qhd,pd->qhp", sparse_queries, keys)
                     scores = torch.relu(scores).sum(dim=1) / score_scale
                     block_ids = torch.arange(available_blocks, device=device)
                     sparse_visible = visible_blocks[sparse_start:]
@@ -341,11 +347,12 @@ def _gathered_qsa_gqa_attention_chunk(
     # [B, Q, K, Hkv, D] -> [B, Q, Hkv, K, D].
     gathered_key = key[batch_ids, safe_ids].permute(0, 1, 3, 2, 4)
     gathered_value = value[batch_ids, safe_ids].permute(0, 1, 3, 2, 4)
-    scores = torch.einsum(
-        "bqhgd,bqhkd->bqhgk",
-        grouped_query.float(),
-        gathered_key.float(),
-    )
+    with torch.autocast(device_type=grouped_query.device.type, enabled=False):
+        scores = torch.einsum(
+            "bqhgd,bqhkd->bqhgk",
+            grouped_query.float(),
+            gathered_key.float(),
+        )
     scores = scores * softmax_scale
     score_valid = valid[:, :, None, None, :]
     scores = scores.masked_fill(~score_valid, -torch.inf)
@@ -355,11 +362,12 @@ def _gathered_qsa_gqa_attention_chunk(
     has_tokens = valid.any(dim=-1)
     scores = torch.where(has_tokens[:, :, None, None, None], scores, torch.zeros_like(scores))
     probabilities = torch.softmax(scores, dim=-1).masked_fill(~score_valid, 0.0)
-    chunk_output = torch.einsum(
-        "bqhgk,bqhkd->bqhgd",
-        probabilities,
-        gathered_value.float(),
-    )
+    with torch.autocast(device_type=grouped_query.device.type, enabled=False):
+        chunk_output = torch.einsum(
+            "bqhgk,bqhkd->bqhgd",
+            probabilities,
+            gathered_value.float(),
+        )
     return chunk_output.flatten(2, 3).to(grouped_query.dtype)
 
 
@@ -469,11 +477,27 @@ def _fa4_qsa_attention(
     return fa4_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
 
 
+def _cudnn_qsa_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    selected_token_ids: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    flex_mask: FlexQSAMask | None = None,
+) -> torch.Tensor:
+    """Run :func:`cudnn_sparse_gqa_attention`; cuDNN consumes the routes directly and never takes a Flex mask."""
+    if flex_mask is not None:
+        raise ValueError("cuDNN QSA does not consume a FlexAttention mask; build one only for backend.attn='flex'")
+    return cudnn_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
+
+
 def select_qsa_cuda_kernel(backend: str) -> Callable[..., torch.Tensor] | None:
     """Return the CUDA QSA kernel selected by ``backend.attn``, resolved once at layer setup.
 
     Args:
-        backend: ``backend.attn`` value; "flex" and "fa4" have CUDA kernels. FA4 requires SM90 BF16 D256.
+        backend: ``backend.attn`` value; "flex", "fa4" and "cudnn" have CUDA kernels. FA4 requires SM90 BF16
+            D256; cuDNN requires SM100/SM103 BF16 D256 and equal Q/KV extents.
 
     Returns:
         The kernel, called as ``kernel(query, key, value, selected_token_ids, softmax_scale=..., flex_mask=...)``, or
@@ -481,6 +505,8 @@ def select_qsa_cuda_kernel(backend: str) -> Callable[..., torch.Tensor] | None:
     """
     if backend == "fa4":
         return _fa4_qsa_attention
+    if backend == "cudnn":
+        return _cudnn_qsa_attention
     if backend == "flex":
         return _bf16_flex_sparse_gqa_attention
     return None
@@ -508,7 +534,8 @@ def qsa_gqa_attention(
         key: Tensor [batch, global_keys, kv_heads, head_dim].
         value: Tensor with key's layout. Q/K/V share one dtype and device.
         selected_token_ids: Signed IDs [batch, local_queries, routes] in global
-            K/V coordinates; invalid CUDA IDs are padding and duplicates collapse.
+            K/V coordinates; invalid CUDA IDs are padding. Flex/FA4 collapse duplicates;
+            cuDNN requires the ratio-four indexer's distinct complete blocks and causal tails.
         cuda_kernel: Kernel from :func:`select_qsa_cuda_kernel`, or None when
             ``backend.attn`` has no CUDA QSA kernel.
         softmax_scale: Optional positive QK score multiplier.
@@ -529,7 +556,7 @@ def qsa_gqa_attention(
         )
     if cuda_kernel is None:
         raise RuntimeError(
-            "Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex' or 'fa4'; "
+            "Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex', 'fa4', or 'cudnn'; "
             "call gathered_qsa_gqa_attention directly for a numerical oracle"
         )
     return cuda_kernel(query, key, value, selected_token_ids, softmax_scale=softmax_scale, flex_mask=flex_mask)
@@ -587,7 +614,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
     ``[B, floor(S / c), 1, D_index]`` before K RMSNorm and group-start RoPE.
     """
 
-    def __init__(self, config: object, backend: BackendConfig) -> None:
+    def __init__(self, config: Qwen3_8_FlashNextTextConfig, backend: BackendConfig) -> None:
         super().__init__()
         self.hidden_size = int(getattr(config, "hidden_size"))
         self.num_query_heads = int(getattr(config, "indexer_n_heads"))

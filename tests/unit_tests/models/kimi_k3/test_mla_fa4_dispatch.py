@@ -58,7 +58,7 @@ class _FakeCPMesh:
 
 
 def _fake_attention(calls, name):
-    def attention(query, key, value, *, scale, q_doc_ids=None, kv_doc_ids=None, q_global_start=None):
+    def attention(query, key, value, *, scale, q_doc_ids=None, kv_doc_ids=None, q_global_start=None, block_mask=None):
         calls.append((name, None if q_doc_ids is None else tuple(q_doc_ids.shape), q_global_start))
         return torch.zeros(*query.shape[:-1], value.shape[-1], dtype=value.dtype)
 
@@ -79,7 +79,8 @@ def test_cp_forward_dispatches_on_backend_attn(monkeypatch, attn):
     output = module(hidden_states, packed_context=KimiPackedContext(doc_ids, seq_start=4, cp_size=2))
 
     assert output.shape == hidden_states.shape
-    assert calls == [("flex" if attn == "eager" else "fa4", (1, 4), 4)]
+    # The FA4 path receives the global offset; the Flex path receives a prebuilt block mask instead.
+    assert calls == [("fa4", (1, 4), 4) if attn == "fa4" else ("flex", (1, 4), None)]
 
 
 @pytest.mark.parametrize(

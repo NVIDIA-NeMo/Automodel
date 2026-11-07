@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
@@ -44,7 +45,12 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
 )
-from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.common.utils import (
+    cast_model_to_dtype,
+    compute_lm_head_logits,
+    generation_config_from_model_config,
+    restore_pretrained_generation_config,
+)
 from nemo_automodel.components.models.qwen3_5_moe.model import Fp32SafeQwen3_5MoeTextRotaryEmbedding
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -78,7 +84,7 @@ def _qwen3_8_flash_next_backend(backend: BackendConfig | None = None) -> Backend
     return resolved
 
 
-def _resolve_model_dtype(config: object) -> torch.dtype:
+def _resolve_model_dtype(config: Qwen3_8_FlashNextTextConfig) -> torch.dtype:
     value = getattr(config, "dtype", None)
     if value is None:
         value = getattr(config, "torch_dtype", None)
@@ -249,7 +255,7 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        past_key_values: object | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
         _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
@@ -442,7 +448,7 @@ class Qwen3_8_FlashNextModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        past_key_values: object | None = None,
+        past_key_values: Cache | None = None,
         output_hidden_states: bool | None = None,
         _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
         **kwargs: Any,
@@ -521,7 +527,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         """Construct architecture from a local/HF config before checkpoint load."""
         config = Qwen3_8_FlashNextConfig.from_pretrained(pretrained_model_name_or_path)
         config.language_model_only = True
-        return cls.from_config(config, *model_args, **kwargs)
+        model = cls.from_config(config, *model_args, **kwargs)
+        restore_pretrained_generation_config(model, pretrained_model_name_or_path)
+        return model
 
     def __init__(
         self,
@@ -565,6 +573,10 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         self.pad_token_id = config.text_config.pad_token_id if config.text_config.pad_token_id is not None else -1
         self.moe_config = self.model.language_model.moe_config
         self.mtp = None
+
+        # Match PreTrainedModel behavior so consolidated HF exports preserve
+        # generation defaults even for this native nn.Module implementation.
+        self.generation_config = generation_config_from_model_config(config)
 
         keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
         if "_fp32_params" not in keep_fp32:
@@ -662,7 +674,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
-        past_key_values: object | None = None,
+        past_key_values: Cache | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,

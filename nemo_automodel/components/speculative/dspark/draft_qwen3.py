@@ -190,6 +190,8 @@ class Qwen3DSparkDecoderLayer(GradientCheckpointingLayer):
 
 class Qwen3DSparkModel(Qwen3PreTrainedModel):
     _no_split_modules = ["Qwen3DSparkDecoderLayer"]
+    # forward accepts position_ids / seq_lens / doc_remaining for packed rows.
+    supports_sequence_packing = True
 
     def __init__(self, config) -> None:
         super().__init__(config)

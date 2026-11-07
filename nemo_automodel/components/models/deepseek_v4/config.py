@@ -14,9 +14,18 @@
 
 from __future__ import annotations
 
+from typing import TypeAlias
+
+import torch
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.models.deepseek_v4.flops import model_flops
+
+# Values forwarded to PretrainedConfig: parsed config.json entries plus HF
+# loader options such as ``dtype``.
+HFConfigValue: TypeAlias = (
+    str | int | float | bool | torch.dtype | list["HFConfigValue"] | dict[str, "HFConfigValue"] | None
+)
 
 
 class DeepseekV4Config(PretrainedConfig):
@@ -81,6 +90,10 @@ class DeepseekV4Config(PretrainedConfig):
         index_head_dim: int = 128,
         index_n_heads: int = 64,
         index_topk: int = 512,
+        reuse_sparse_selection_on_recompute: bool = False,
+        group_fp32_fsdp_units: bool = False,
+        group_compressor_fsdp_units: bool = False,
+        fuse_qnorm_rope: bool = False,
         # Optional DeepSeek-V4-Flash-Vision-Exp tower and image-token bridge.
         vision_n_layers: int = 0,
         vision_dim: int = 1024,
@@ -106,8 +119,8 @@ class DeepseekV4Config(PretrainedConfig):
         tie_word_embeddings: bool = False,
         initializer_range: float = 0.02,
         torch_dtype: str | None = None,
-        **kwargs,
-    ):
+        **kwargs: HFConfigValue,
+    ) -> None:
         dtype = kwargs.pop("dtype", None)
         resolved_dtype = dtype if dtype is not None else torch_dtype
         if resolved_dtype is None:
@@ -146,6 +159,10 @@ class DeepseekV4Config(PretrainedConfig):
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
         self.index_topk = index_topk
+        self.reuse_sparse_selection_on_recompute = reuse_sparse_selection_on_recompute
+        self.group_fp32_fsdp_units = group_fp32_fsdp_units
+        self.group_compressor_fsdp_units = group_compressor_fsdp_units
+        self.fuse_qnorm_rope = fuse_qnorm_rope
         self.vision_n_layers = vision_n_layers
         self.vision_dim = vision_dim
         self.vision_n_heads = vision_n_heads

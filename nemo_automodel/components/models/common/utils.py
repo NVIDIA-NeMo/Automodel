@@ -16,6 +16,7 @@ import importlib.util
 import logging
 import math
 import os
+import types
 import warnings
 from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
@@ -226,6 +227,27 @@ def is_tensor_unallocated(tensor: torch.Tensor) -> bool:
         return True
 
 
+_EXCLUDED_FORWARD_ATTR = "_te_fp8_excluded_forward"
+"""Instance attribute holding the forward a module had before :meth:`TEFp8Config.exclude_modules` wrapped it."""
+
+
+def _forward_outside_fp8(module: nn.Module, *args, **kwargs):
+    """Run ``module``'s forward with the Transformer Engine FP8 autocast disabled.
+
+    Bound per instance by :meth:`TEFp8Config.exclude_modules`. The forward the module had before the
+    exclusion (an instance-level one installed earlier by a tensor-parallel style, a pipeline wrapper or
+    CUDA-graph capture, else the class ``forward``) is looked up on the instance at call time, so the
+    binding stays valid after ``copy.deepcopy``.
+    """
+    from transformer_engine.pytorch.quantization import autocast as te_autocast
+
+    installed = vars(module).get(_EXCLUDED_FORWARD_ATTR)
+    with te_autocast(enabled=False):
+        if installed is not None:
+            return installed(*args, **kwargs)
+        return type(module).forward(module, *args, **kwargs)
+
+
 @dataclass(kw_only=True)
 class TEFp8Config:
     """Configuration for Transformer Engine FP8 quantization.
@@ -241,6 +263,59 @@ class TEFp8Config:
     """
 
     recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    exclude_fqns: tuple[str, ...] = ("lm_head",)
+    """Module names kept out of the FP8 autocast (their GEMMs run in the model dtype).
+
+    Same matching as the torchao ``fp8.filter_fqns`` block: a module is excluded when any entry is a
+    substring of its qualified name, so ``"lm_head"`` covers ``lm_head`` and
+    ``model.language_model.lm_head``. The default keeps the output head in high precision, as the
+    FP8 checkpoints' ``modules_to_not_convert`` lists do. The train recipe applies the exclusions to
+    every model part once the parts exist (:meth:`exclude_modules`).
+    """
+
+    def __post_init__(self) -> None:
+        """Normalize ``exclude_fqns`` from YAML lists or a single string into a tuple of names."""
+        if isinstance(self.exclude_fqns, str):
+            self.exclude_fqns = (self.exclude_fqns,)
+        self.exclude_fqns = tuple(self.exclude_fqns)
+        if any(not isinstance(fqn, str) or not fqn for fqn in self.exclude_fqns):
+            raise ValueError(f"te_fp8.exclude_fqns must be non-empty module-name strings, got {self.exclude_fqns!r}")
+
+    def module_excluded(self, name: str) -> bool:
+        """Whether the module with qualified name ``name`` stays out of the FP8 autocast."""
+        return any(fqn in name for fqn in self.exclude_fqns)
+
+    def exclude_modules(self, model: nn.Module) -> list[str]:
+        """Keep the modules matching :attr:`exclude_fqns` out of the FP8 autocast.
+
+        Each matching module gets an instance ``forward`` that runs the forward it had so far (an
+        instance-level forward installed earlier, e.g. by a tensor-parallel style, else the class
+        ``forward``) under ``te_autocast(enabled=False)``. Parameters, state-dict keys and FSDP/pipeline
+        wrapping are untouched; idempotent; the binding follows the instance through ``copy.deepcopy``.
+        Logs the excluded names.
+
+        Args:
+            model: Model (or pipeline stage) whose modules are inspected by qualified name.
+
+        Returns:
+            Qualified names of the modules now kept out of FP8, in ``named_modules`` order; empty
+            without Transformer Engine or without exclusions.
+        """
+        if not HAVE_TE or not self.exclude_fqns:
+            return []
+        excluded: list[str] = []
+        for name, module in model.named_modules():
+            if not name or not self.module_excluded(name):
+                continue
+            installed = vars(module).get("forward")
+            if not (isinstance(installed, types.MethodType) and installed.__func__ is _forward_outside_fp8):
+                if installed is not None:
+                    setattr(module, _EXCLUDED_FORWARD_ATTR, installed)
+                module.forward = types.MethodType(_forward_outside_fp8, module)
+            excluded.append(name)
+        if excluded:
+            logger.info("te_fp8: %d module(s) kept out of the FP8 autocast: %s", len(excluded), ", ".join(excluded))
+        return excluded
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
@@ -425,14 +500,17 @@ class BackendConfig:
             Inputs must use BSHD layout; pre-packed THD is unsupported. Packed
             Qwen3Next and DeepSeek V3.2 sparse attention do not support FA4.
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
-            indexer, and Sinkhorn kernels together. For GLM DSA, "tilelang" and
+            indexer, and Sinkhorn kernels together; "cudnn" keeps the TileLang
+            indexer/Sinkhorn and selects FlashMLA forward with cuDNN backward.
+            For GLM DSA, "tilelang" and
             "cudnn" select their respective packed sparse-attention kernels.
             For Qwen3.8-Flash-Next, "flex" selects FlexAttention sparse GQA on
-            CUDA BF16 and "fa4" selects FlashAttention 4 sparse GQA (SM90 BF16);
-            CPU execution retains the PyTorch numerical oracle. For Kimi K3,
-            "fa4" runs MLA through FlashAttention 4 (varlen, with and without
-            context parallelism). "fa4" requires the optional flash_attn.cute
-            package; models without an FA4 path reject it.
+            CUDA BF16, "fa4" selects FlashAttention 4 sparse GQA (SM90 BF16), and "cudnn"
+            selects cuDNN Frontend indexed QSA on SM100/SM103 with compression ratio four
+            and CP=1, preserving the existing indexer. CPU execution retains the PyTorch
+            numerical oracle. For Kimi K3, "fa4" runs MLA through FlashAttention 4 (varlen,
+            with and without context parallelism). "fa4" requires the optional
+            flash_attn.cute package; models without an FA4 path reject it.
         sparse_attn: Sparse-attention backend. "generic" preserves each model's
             existing sparse mask plus ``attn`` path; "msa" selects the optional
             SM100 MSA kernels a model provides for its sparse layers only.
@@ -440,7 +518,7 @@ class BackendConfig:
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch", "quack" or "triton"). QuACK is currently
             integrated for Llama-family rotary embeddings; "triton" selects the fused
-            Triton rotation of DeepSeek-V4.1 (other models keep the torch path).
+            Triton rotation of DeepSeek V4 / V4.1 (other models keep the torch path).
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "torch_mm" uses torch._grouped_mm,
@@ -448,6 +526,10 @@ class BackendConfig:
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
+        te_grouped_tensor: Prefer TE 2.19 native grouped-tensor GEMMs for ``experts="te"``.
+            Requires ``dispatcher="deepep"``, ``"hybridep"``, or ``"uccl_ep"``.
+            Device and precision support follows TE's ``GroupedLinear`` contract.
+            Parameters and checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
@@ -467,6 +549,13 @@ class BackendConfig:
             blocks. ``None`` preserves HybridEP's default.
         dispatcher_hybridep_num_blocks_unpermute: Optional number of combine
             unpermutation blocks. ``None`` preserves HybridEP's default.
+        dispatcher_hybridep_max_tokens_per_rank: HybridEP only. Allocate the process-global
+            HybridEP buffer for this many tokens per rank on the first dispatch instead of the
+            first micro-batch's token count. HybridEP grows the buffer when a later micro-batch
+            is larger; in multi-node mode that reallocation re-creates the RDMA queue pairs, is
+            slow and has been seen to abort (``Failed to create ... QP``). Set it to the largest
+            micro-batch token count (e.g. the dynamic-batching token cap). The buffer is resident
+            GPU memory for the whole run, so do not pad it. ``None`` keeps the lazy behaviour.
         dispatcher_capacity_factor: HybridEP only, dynamic routing. Run HybridEP dispatch in its
             non-blocking mode with output buffers sized to the first microbatch's permuted row
             count times this factor (EP-group max, 4-token aligned) instead of letting every
@@ -481,6 +570,16 @@ class BackendConfig:
             same row count, so the per-dispatch EP-group max all-reduce (and its host sync)
             that derives the pad size is skipped and the count is only aligned. Default False;
             keep it False for variable-length or in-batch-packed inputs.
+        dispatcher_recompute_cache: HybridEP only; effective under full-block activation checkpointing (not
+            installed for ``checkpoint_moe_only`` regions, which end at the combine the recompute never re-runs).
+            ``"none"`` (default) recomputes the whole MoE layer in the backward. ``"combine"`` keeps
+            a clone of every MoE layer's combine output ([tokens, hidden] in the activation dtype)
+            from the checkpoint forward and returns it in the recompute instead of re-running the
+            unpermute, the EP-group barrier and the combine all-to-all. ``"moe_tail"`` additionally
+            builds the down projection's autograd node in the recompute without running its GEMM
+            (its output only fed the skipped combine; torch_mm experts without expert bias and with
+            the router weight applied inside the activation) (a post-expert callback that reads the output keeps the GEMM). Costs one [tokens, hidden] activation
+            per MoE layer per in-flight microbatch; gradients are unchanged.
         enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
             and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
@@ -508,7 +607,7 @@ class BackendConfig:
             Same lazy once-per-process pattern as ``compile_situ``; numerics are
             allclose to eager but not bitwise-identical.
         compile_hc: torch.compile the mHC (hyper-connection) cores of models that opt in
-            (currently DeepSeek V4.1): coefficient projection, stream collapse and stream expand,
+            (currently DeepSeek V4 / V4.1): coefficient projection, stream collapse and stream expand,
             one fused kernel each, static shapes (a new sequence length compiles them again; past
             dynamo's recompile limit a core runs eager). Same lazy once-per-process pattern as
             ``compile_situ``; numerics are allclose to eager but not bitwise-identical.
@@ -516,7 +615,7 @@ class BackendConfig:
             on a side CUDA stream so their GEMMs overlap the expert-parallel dispatch / combine
             communication of the routed path; numerics unchanged. Default False.
         compile_router_weight: torch.compile the fp32 router-weight multiply applied to
-            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP``, all MoE models),
+            expert outputs (``GroupedExperts`` / ``GroupedExpertsDeepEP`` / ``GroupedExpertsTE``, all MoE models),
             so each pass is one fused kernel instead of the eager per-chunk cast/multiply/
             cast/slice-assign loop. Same lazy once-per-process pattern as ``compile_situ``;
             numerics are allclose to eager but not bitwise-identical.
@@ -547,6 +646,7 @@ class BackendConfig:
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
+    te_grouped_tensor: bool = False
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
@@ -564,12 +664,17 @@ class BackendConfig:
     # aligned. Leave False for variable-length inputs: with genuinely unequal aligned counts the
     # HybridEP collective hangs silently (no exception; the job sits until its time limit).
     dispatcher_equal_token_counts: bool = False
+    # HybridEP only, under block activation checkpointing: "none" | "combine" (serve each MoE layer's combine
+    # output from the checkpoint forward in the recompute) | "moe_tail" (also skip the down projection's GEMM
+    # in the recompute). One [tokens, hidden] activation per MoE layer per in-flight microbatch.
+    dispatcher_recompute_cache: str = "none"
     mok: MoKBackendConfig = field(default_factory=MoKBackendConfig)
     dispatcher_hybridep_permute_fusion: bool = False
     dispatcher_hybridep_compact_routing: bool = False
     dispatcher_hybridep_num_sms_preprocessing: int | None = None
     dispatcher_hybridep_num_blocks_permute: int | None = None
     dispatcher_hybridep_num_blocks_unpermute: int | None = None
+    dispatcher_hybridep_max_tokens_per_rank: int | None = None
     enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
@@ -595,7 +700,7 @@ class BackendConfig:
     # not bitwise-identical. Default False.
     compile_norm: bool = False
     # When True, torch.compile the mHC projection / collapse / expand cores of opted-in models
-    # (currently DeepSeek V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
+    # (currently DeepSeek V4 / V4.1), static shapes, same lazy once-per-process pattern as compile_situ.
     # Numerics are allclose to eager, not bitwise-identical. Default False.
     compile_hc: bool = False
     # When True, torch.compile DeepSeek V4.1's cache quantize/dequantize core (fp8 SWA KV, mxfp4 index
@@ -683,6 +788,15 @@ class BackendConfig:
                 )
             self.enable_deepep = None
 
+        if self.te_grouped_tensor:
+            if self.experts != "te":
+                raise ValueError("te_grouped_tensor=True requires experts='te'.")
+            if self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+                raise ValueError(
+                    "te_grouped_tensor=True requires dispatcher='deepep', 'hybridep', or 'uccl_ep'; "
+                    f"got dispatcher='{self.dispatcher}'."
+                )
+
         # TE grouped experts require a flex dispatcher. Keep the existing standard-
         # dispatcher fallback for the deprecated gmm alias as well.
         if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
@@ -736,6 +850,21 @@ class BackendConfig:
             raise ValueError(
                 f"dispatcher_capacity_factor must be >= 1.0 (a smaller buffer overflows on the first skewed batch), "
                 f"got {self.dispatcher_capacity_factor!r}"
+            )
+        if self.dispatcher_recompute_cache not in ("none", "combine", "moe_tail"):
+            raise ValueError(
+                "dispatcher_recompute_cache must be one of 'none', 'combine', 'moe_tail', "
+                f"got {self.dispatcher_recompute_cache!r}"
+            )
+        if self.dispatcher_recompute_cache != "none" and self.dispatcher != "hybridep":
+            raise ValueError(
+                "dispatcher_recompute_cache requires dispatcher='hybridep' (the cache is served by the HybridEP "
+                f"combine), got dispatcher='{self.dispatcher}'"
+            )
+        if self.dispatcher_recompute_cache == "moe_tail" and self.experts not in ("torch_mm", "gmm"):
+            raise ValueError(
+                "dispatcher_recompute_cache='moe_tail' requires experts='torch_mm' (the deferred down projection "
+                f"is the torch grouped-GEMM path), got experts='{self.experts}'"
             )
         if self.dispatcher_capacity_factor is not None and self.benchmark_static_routing:
             # Static routing already pins the dispatched count after the first dispatch, so the capacity
@@ -1056,12 +1185,21 @@ def get_rope_config(config) -> tuple[float, dict, float]:
 
 
 def cast_model_to_dtype(
-    model: nn.Module, dtype: torch.dtype = torch.bfloat16, skip_modules: tuple[str, ...] = ()
+    model: nn.Module,
+    dtype: torch.dtype = torch.bfloat16,
+    skip_modules: tuple[str, ...] = (),
+    *,
+    ignore_preserved_dtypes: bool = False,
 ) -> None:
     """Cast model parameters to the target dtype, keeping fp32 modules in full precision.
 
     Respects ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` on
     the model (the same attributes HuggingFace transformers uses).
+
+    Parameters listed in a module's ``_preserve_parameter_dtypes`` keep their
+    storage dtype selected before sharding, including frozen bases and adapters.
+    The storage policy is installed by ``prepare_frozen_parameters_for_sharding``
+    and remains active for the model lifetime unless ``ignore_preserved_dtypes`` is set.
 
     Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
     (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
@@ -1073,6 +1211,8 @@ def cast_model_to_dtype(
     Args:
         model: The model whose parameters should be cast.
         dtype: Target dtype (e.g. ``torch.bfloat16``).
+        ignore_preserved_dtypes: Temporarily ignore the per-parameter storage policy;
+            used when an initializer needs a uniform FP32 view before restoring storage.
         skip_modules: Names of immediate submodules to leave entirely untouched
             (kept at their current dtype). Unlike the ``_keep_in_fp32_modules``
             restore path, these are *detached* during the cast so ``model.to()``
@@ -1110,8 +1250,42 @@ def cast_model_to_dtype(
                     detached.append((parent, child_name, child))
                     parent._modules[child_name] = None
 
+    preserved_dtypes = (
+        {
+            id(parameter): storage_dtype
+            for module in model.modules()
+            for name, storage_dtype in getattr(module, "_preserve_parameter_dtypes", {}).items()
+            if (parameter := module._parameters.get(name)) is not None
+        }
+        if not ignore_preserved_dtypes
+        else {}
+    )
+    preserved_dtypes.update(
+        (id(parameter.grad), preserved_dtypes[id(parameter)])
+        for parameter in model.parameters()
+        if id(parameter) in preserved_dtypes and parameter.grad is not None
+    )
+
+    def convert(tensor: torch.Tensor) -> torch.Tensor:
+        """Cast an arbitrary-rank parameter/buffer unless its storage is preserved.
+
+        Args:
+            tensor: Parameter or buffer of arbitrary shape, including a DTensor
+                whose global shape and mesh placements must remain unchanged.
+
+        Returns:
+            Same-shaped tensor on the same device, aliasing the input if its dtype is unchanged.
+        """
+        if not (tensor.is_floating_point() or tensor.is_complex()):
+            return tensor
+        return tensor.to(dtype=preserved_dtypes.get(id(tensor), dtype))
+
     try:
-        model.to(dtype)
+        if preserved_dtypes:
+            # Keep parameters registered so FSDP's _apply refreshes its shard views.
+            model._apply(convert)
+        else:
+            model.to(dtype)
     finally:
         for parent, child_name, child in detached:
             parent._modules[child_name] = child
@@ -1164,9 +1338,9 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
     per-element perturbation that preserves the init statistics. Wrap the body of a model's
     ``initialize_weights`` to keep that round-trip in one place.
 
-    Works whether or not the model is already FSDP2-sharded: both casts are *uniform* whole-model
-    casts, so FSDP2's invariant that every parameter in a group shares one dtype is preserved. In
-    the AutoModel pipeline ``initialize_weights`` actually runs after sharding (via
+    Works whether or not the model is already FSDP2-sharded. A mixed frozen/trainable
+    storage policy is temporarily suspended for initialization and restored on exit.
+    In the AutoModel pipeline ``initialize_weights`` runs after sharding (via
     ``checkpointer.initialize_model_weights``), i.e. on DTensor params, which is supported.
 
     ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` handling is delegated to
@@ -1188,7 +1362,9 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
     """
     if restore_dtype is None:
         restore_dtype = next((p.dtype for p in model.parameters() if p.is_floating_point()), torch.float32)
-    cast_model_to_dtype(model, torch.float32)
+    # Initialization temporarily needs FP32 even when persistent frozen storage
+    # is reduced precision. Keep the policy metadata intact while bypassing it.
+    cast_model_to_dtype(model, torch.float32, ignore_preserved_dtypes=True)
     try:
         yield model
     finally:
@@ -1418,7 +1594,8 @@ def compute_lm_head_logits(
             else:
                 sliced = hidden_states[:, slice_indices, :]
         if fp32_lm_head:
-            logits = lm_head(sliced.float()).to(hidden_states.dtype)
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                logits = lm_head(sliced.float()).to(hidden_states.dtype)
         else:
             compute_dtype = None
             if isinstance(lm_head, FSDPModule):
@@ -1436,6 +1613,69 @@ def compute_lm_head_logits(
         hidden_out = hidden_states.unsqueeze(0) if is_thd and hidden_states.dim() == 2 else hidden_states
 
     return CausalLMOutputWithPast(logits=logits, hidden_states=hidden_out)
+
+
+def prepare_frozen_parameters_for_sharding(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
+    """Drop FP32 master storage for frozen parameters before distributed wrapping.
+
+    Trainable parameters retain their configured storage. Model-declared FP32
+    precision requirements and checkpoint FP32 compute hints remain authoritative.
+    Record the resulting parameter dtypes so model initialization does not undo
+    this split with a whole-model cast after FSDP has captured the storage layout.
+
+    Args:
+        model: Unsharded model after its final trainability policy is applied;
+            parameters may be on the meta device. Call before optimizer creation.
+        compute_dtype: Reduced compute dtype, or None to retain existing storage.
+    """
+    has_frozen_parameters = any(not parameter.requires_grad for parameter in model.parameters())
+    has_trainable_parameters = any(parameter.requires_grad for parameter in model.parameters())
+
+    def preserve_trainable_storage() -> None:
+        """Retain adapter dtypes when a mixed-trainability model is not reduced."""
+        if not (has_frozen_parameters and has_trainable_parameters):
+            return
+        for module in model.modules():
+            trainable_dtypes = {
+                name: parameter.dtype
+                for name, parameter in module.named_parameters(recurse=False)
+                if parameter.requires_grad
+            }
+            if trainable_dtypes:
+                module._preserve_parameter_dtypes = trainable_dtypes
+
+    if compute_dtype not in (torch.bfloat16, torch.float16):
+        # A model-wide storage reduction may be unsafe when submodules use
+        # different compute policies. Still retain configured trainable storage
+        # (for example FP32 LoRA adapters) across later model-wide initializer
+        # casts. Frozen parameters remain unrecorded and follow those casts.
+        preserve_trainable_storage()
+        return
+    fp32_keywords = _get_fp32_module_keywords(model)
+    pinned_ids = {
+        id(parameter)
+        for name, parameter in model.named_parameters(remove_duplicate=False)
+        if any(keyword in name for keyword in fp32_keywords)
+    }
+    preserve_storage = False
+    for parameter in model.parameters():
+        if parameter.requires_grad or parameter.dtype not in (torch.float32, compute_dtype):
+            continue
+        if id(parameter) in pinned_ids or getattr(parameter, "_hf_compute_dtype", None) == torch.float32:
+            continue
+        # Initialization-only storage change: no autograd graph, optimizer, or
+        # distributed wrapper owns these plain parameters yet. Preserve identity.
+        parameter.data = parameter.data.to(compute_dtype)
+        preserve_storage = True
+    if preserve_storage:
+        for module in model.modules():
+            module._preserve_parameter_dtypes = {
+                name: parameter.dtype for name, parameter in module.named_parameters(recurse=False)
+            }
+    else:
+        # No frozen parameter needed a storage cast, but adapters can still use
+        # a distinct configured dtype that later whole-model init casts must keep.
+        preserve_trainable_storage()
 
 
 def cast_frozen_modules_to_compute_dtype(model: nn.Module, compute_dtype: torch.dtype | None) -> None:
@@ -1560,6 +1800,7 @@ __all__ = [
     "get_rope_config",
     "initialize_linear_module",
     "initialize_rms_norm_module",
+    "prepare_frozen_parameters_for_sharding",
     "set_is_first_microbatch",
     "set_is_optim_step",
 ]

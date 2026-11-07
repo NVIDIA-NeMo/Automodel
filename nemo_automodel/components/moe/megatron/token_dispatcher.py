@@ -67,6 +67,17 @@ class _DispatchManager(ABC):
     """
 
     @abstractmethod
+    def _release_dispatch_state(self) -> None:
+        """Initialize or release this manager's per-dispatch state.
+
+        Routing probabilities can retain recomputed activations through their
+        autograd graph. Dispatch and permutation must also release consumed
+        tensors early because checkpoint recomputation can stop before combine.
+        Persistent capacity and static-routing state must remain untouched.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Set up metadata of routing_map and probs."""
         pass
@@ -119,6 +130,28 @@ class _DeepepManager(_DispatchManager):
     separate permute+alltoall steps.
     """
 
+    handle: object | None
+    token_indices: torch.Tensor | None
+    token_probs: torch.Tensor | None
+    tokens_per_expert: torch.Tensor | None
+    dispatched_indices: torch.Tensor | None
+    dispatched_probs: torch.Tensor | None
+    dispatched_routing_map: torch.Tensor | None
+    reversed_mapping_for_combine: torch.Tensor | None
+    hidden_shape_before_permute: torch.Size | None
+
+    def _release_dispatch_state(self) -> None:
+        """Initialize or release state owned by one dispatch."""
+        self.handle = None
+        self.token_indices = None
+        self.token_probs = None
+        self.tokens_per_expert = None
+        self.dispatched_indices = None
+        self.dispatched_probs = None
+        self.dispatched_routing_map = None
+        self.reversed_mapping_for_combine = None
+        self.hidden_shape_before_permute = None
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -141,11 +174,9 @@ class _DeepepManager(_DispatchManager):
         self.router_dtype = router_dtype
         self.moe_router_expert_pad_multiple = moe_router_expert_pad_multiple
 
-        # Metadata
-        self.token_indices: torch.Tensor | None = None
-        self.token_probs: torch.Tensor | None = None
-        # Handle used for combine operation
-        self.handle = None
+        # Initialize per-dispatch state; dispatch and permutation fill it,
+        # and combine releases the remaining state.
+        self._release_dispatch_state()
 
         self._fused_dispatch = _dispatch_fn if _dispatch_fn is not None else fused_dispatch
         self._fused_combine = _combine_fn if _combine_fn is not None else fused_combine
@@ -204,6 +235,10 @@ class _DeepepManager(_DispatchManager):
         self.tokens_per_expert = num_tokens_per_expert
         self.dispatched_indices = dispatched_indices
         self.dispatched_probs = dispatched_probs
+        # The kernel consumed the routing inputs; drop them so the manager stops referencing
+        # the router's autograd graph as early as possible (see _release_dispatch_state()).
+        self.token_probs = None
+        self.token_indices = None
 
         return hidden_states
 
@@ -265,8 +300,7 @@ class _DeepepManager(_DispatchManager):
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        # Release the handle after combine operation
-        self.handle = None
+        self._release_dispatch_state()
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -309,6 +343,9 @@ class _DeepepManager(_DispatchManager):
         )
         if self.router_dtype == "fp64":
             permuted_probs = permuted_probs.to(torch.float64)
+        # permute() consumed the dispatched routing tensors; only the unpermute inputs stay.
+        self.dispatched_indices = None
+        self.dispatched_probs = None
         return hidden_states, permuted_probs
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -426,6 +463,26 @@ class _HybridEPManager(_DispatchManager):
         and unpermute tokens for attention in single step
     """
 
+    handle: object | None
+    num_permuted_tokens: int | torch.Tensor | None
+    num_unpadded_tokens: int | None
+    token_probs: torch.Tensor | None
+    token_indices: torch.Tensor | None
+    routing_map: torch.Tensor | None
+    tokens_per_expert: torch.Tensor | None
+    dispatched_probs: torch.Tensor | None
+
+    def _release_dispatch_state(self) -> None:
+        """Initialize or release state owned by one dispatch."""
+        self.handle = None
+        self.num_permuted_tokens = None
+        self.num_unpadded_tokens = None
+        self.token_probs = None
+        self.token_indices = None
+        self.routing_map = None
+        self.tokens_per_expert = None
+        self.dispatched_probs = None
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -439,9 +496,11 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_sms_preprocessing: int | None = None,
         moe_hybridep_num_blocks_permute: int | None = None,
         moe_hybridep_num_blocks_unpermute: int | None = None,
+        moe_hybridep_max_tokens_per_rank: int | None = None,
         benchmark_static_routing: bool = False,
         moe_hybridep_capacity_factor: float | None = None,
         moe_hybridep_equal_token_counts: bool = False,
+        moe_hybridep_recompute_cache: str = "none",
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
@@ -454,6 +513,11 @@ class _HybridEPManager(_DispatchManager):
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.moe_hybridep_num_blocks_permute = moe_hybridep_num_blocks_permute
         self.moe_hybridep_num_blocks_unpermute = moe_hybridep_num_blocks_unpermute
+        if moe_hybridep_max_tokens_per_rank is not None and moe_hybridep_max_tokens_per_rank <= 0:
+            raise ValueError(
+                f"moe_hybridep_max_tokens_per_rank must be positive, got {moe_hybridep_max_tokens_per_rank}"
+            )
+        self.moe_hybridep_max_tokens_per_rank = moe_hybridep_max_tokens_per_rank
         # Capacity mode (dynamic routing): after one blocking calibration dispatch, later dispatches
         # pass this many rows as num_permuted_tokens and run non-blocking (see dispatch()).
         if moe_hybridep_capacity_factor is not None and benchmark_static_routing:
@@ -465,25 +529,21 @@ class _HybridEPManager(_DispatchManager):
         self._hybridep_capacity: int | None = None
         # Equal row counts across the EP group: the pad size is the aligned local count, no collective.
         self.equal_token_counts = moe_hybridep_equal_token_counts
+        # BackendConfig.dispatcher_recompute_cache: serve the combine output of the checkpoint forward in the
+        # recompute ("combine" / "moe_tail"); the block's MoERecomputeCache holds it.
+        self.moe_hybridep_recompute_cache = moe_hybridep_recompute_cache
         # Benchmark-only (TokenDispatcherConfig.moe_benchmark_static_routing):
         # persist num_permuted_tokens across dispatches, see dispatch()/reset.
         self.benchmark_static_routing = benchmark_static_routing
-        self.num_permuted_tokens = None
         # Benchmark-only companion pin: the EP-group padded token count (see dispatch()). Under static
         # routing every dispatch pads to the same size, so the per-dispatch MAX all-reduce + host sync
         # that computes it runs once. NEMO_STATIC_ROUTING_PAD_PIN=0 keeps the per-dispatch path (A/B).
         self._static_target_tokens: int | None = None
 
-        # Metadata
-        self.token_probs: torch.Tensor | None = None
-        self.token_indices: torch.Tensor | None = None
-        self.routing_map: torch.Tensor | None = None
-        # Handle used for combine operation
-        self.handle = None
+        # Initialize per-dispatch state; setup_metadata and dispatch fill it,
+        # and combine releases the remaining state after removing any token padding.
+        self._release_dispatch_state()
         self.pad_multiple = None
-        # Set by dispatch() when this rank padded its tokens up to the EP-group
-        # maximum; combine() slices the padding back off.
-        self.num_unpadded_tokens: int | None = None
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -627,9 +687,15 @@ class _HybridEPManager(_DispatchManager):
             num_sms_preprocessing_api=self.moe_hybridep_num_sms_preprocessing,
             num_blocks_permute=self.moe_hybridep_num_blocks_permute,
             num_blocks_unpermute=self.moe_hybridep_num_blocks_unpermute,
+            max_tokens_per_rank=self.moe_hybridep_max_tokens_per_rank,
         )
 
         self.tokens_per_expert = tokens_per_expert
+        # The kernel consumed the routing inputs; drop them so the manager stops referencing
+        # the router's autograd graph as early as possible (see _release_dispatch_state()).
+        self.token_probs = None
+        self.token_indices = None
+        self.routing_map = None
         if capacity_mode:
             # num_permuted_tokens already holds the capacity for a non-blocking dispatch; only the
             # one blocking calibration dispatch and the overflow check happen after the call.
@@ -689,19 +755,20 @@ class _HybridEPManager(_DispatchManager):
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
             fuse_permute=self.moe_hybridep_permute_fusion,
+            cache_output=self.moe_hybridep_recompute_cache != "none",
         )
-        self.handle = None
-        self.num_permuted_tokens = None
         if self.num_unpadded_tokens is not None:
             hidden_states = hidden_states[: self.num_unpadded_tokens]
-            self.num_unpadded_tokens = None
+        self._release_dispatch_state()
         return hidden_states
 
     def get_dispatched_metadata(self) -> torch.Tensor:
         return None, self.dispatched_probs
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states, self.dispatched_probs
+        # Hand the probabilities to the experts and stop holding them here.
+        dispatched_probs, self.dispatched_probs = self.dispatched_probs, None
+        return hidden_states, dispatched_probs
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states
@@ -812,7 +879,7 @@ class HybridEPPipelineRuntimeInitializer:
         return (HybridEPPipelineRuntimeInitializer, "process_global_buffer")
 
     @property
-    def signature(self) -> tuple[object, ...]:
+    def signature(self) -> tuple[int | torch.dtype | None, ...]:
         """Return the immutable configuration served by the global buffer."""
         return (
             id(self.manager.group),
@@ -827,6 +894,7 @@ class HybridEPPipelineRuntimeInitializer:
             self.manager.moe_hybridep_num_sms_preprocessing,
             self.manager.moe_hybridep_num_blocks_permute,
             self.manager.moe_hybridep_num_blocks_unpermute,
+            self.manager.moe_hybridep_max_tokens_per_rank,
             self.manager.pad_multiple,
             int(os.environ.get("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "64")),
         )
@@ -971,6 +1039,13 @@ class TokenDispatcherConfig:
 
     moe_hybridep_num_blocks_unpermute: int | None = None
     """Optional number of HybridEP combine unpermutation blocks."""
+    moe_hybridep_recompute_cache: str = "none"
+    """HybridEP (mirrors BackendConfig.dispatcher_recompute_cache): under block activation checkpointing serve
+    each MoE layer's combine output of the checkpoint forward in the recompute ("combine"), and with
+    "moe_tail" also skip the down projection's GEMM there. "none" recomputes the whole layer."""
+
+    moe_hybridep_max_tokens_per_rank: int | None = None
+    """Pre-size the HybridEP buffer for this many tokens per rank on the first dispatch (None = first micro-batch)."""
 
     moe_share_token_dispatcher: bool = True
     """Share one communication manager instance across MoE layers for the configured backend."""
@@ -1090,9 +1165,11 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                         moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                        moe_hybridep_max_tokens_per_rank=self.config.moe_hybridep_max_tokens_per_rank,
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
                         moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                         moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
+                        moe_hybridep_recompute_cache=self.config.moe_hybridep_recompute_cache,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
                 if (
@@ -1101,20 +1178,24 @@ class MoEFlexTokenDispatcher:
                     self._comm_manager.moe_hybridep_num_sms_preprocessing,
                     self._comm_manager.moe_hybridep_num_blocks_permute,
                     self._comm_manager.moe_hybridep_num_blocks_unpermute,
+                    self._comm_manager.moe_hybridep_max_tokens_per_rank,
                     self._comm_manager.hybridep_capacity_factor,
                     self._comm_manager.equal_token_counts,
+                    self._comm_manager.moe_hybridep_recompute_cache,
                 ) != (
                     self.config.moe_hybridep_compact_routing,
                     self.config.moe_hybridep_permute_fusion,
                     self.config.moe_hybridep_num_sms_preprocessing,
                     self.config.moe_hybridep_num_blocks_permute,
                     self.config.moe_hybridep_num_blocks_unpermute,
+                    self.config.moe_hybridep_max_tokens_per_rank,
                     self.config.moe_hybridep_capacity_factor,
                     self.config.moe_hybridep_equal_token_counts,
+                    self.config.moe_hybridep_recompute_cache,
                 ):
                     raise ValueError(
                         "Shared HybridEP dispatchers must use identical routing, fusion, kernel tuning, and sync-free "
-                        "dispatch settings"
+                        "dispatch settings (and the same recompute-cache setting)"
                     )
             else:
                 self._comm_manager = _HybridEPManager(
@@ -1129,9 +1210,11 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                     moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                    moe_hybridep_max_tokens_per_rank=self.config.moe_hybridep_max_tokens_per_rank,
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                     moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
+                    moe_hybridep_recompute_cache=self.config.moe_hybridep_recompute_cache,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,

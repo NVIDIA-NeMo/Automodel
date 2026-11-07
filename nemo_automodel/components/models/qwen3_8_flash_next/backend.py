@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 class Qwen3_8_FlashNextBackendConfig(BackendConfig):
     """Deprecated alias of :class:`BackendConfig` for Qwen3.8-Flash-Next.
 
-    FA4 QSA is now selected with the shared ``BackendConfig(attn="fa4")``. This class only keeps YAMLs that target
+    FA4 QSA is now selected with the shared ``BackendConfig(attn="fa4")`` and cuDNN indexed QSA with
+    ``BackendConfig(attn="cudnn")``. This class only keeps YAMLs that target
     ``nemo_automodel.components.models.qwen3_8_flash_next.backend.Qwen3_8_FlashNextBackendConfig`` working: the
     former ``attn="cute"`` is translated to ``"fa4"`` with a migration warning. All other settings are inherited.
     """

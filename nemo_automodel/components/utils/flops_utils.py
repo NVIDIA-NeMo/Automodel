@@ -1474,8 +1474,10 @@ def _kda_attention_per_layer_flops(
 def kimi_k3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for Kimi K3 (hybrid KDA / gated-MLA attention + latent MoE with a SiTU shared expert).
 
-    Accepts ``KimiK3TextConfig`` or the multimodal ``KimiK3Config`` wrapper (its
-    ``text_config`` is used; the vision tower is not counted, as for other VL entries).
+    Accepts ``KimiK3TextConfig`` or the multimodal ``KimiK3Config`` / ``KimiK31Config`` wrapper (its
+    ``text_config`` is used; the vision tower is not counted, as for other VL entries). Kimi K3.1
+    full-attention layers listed in ``dsa_config["dsa_layers"]`` are costed as sparse MLA plus the
+    DSA indexer.
 
     The layer pattern is read from the config rather than assumed: 1-based
     ``linear_attn_config["kda_layers"]`` marks KDA layers and every other layer
@@ -1514,10 +1516,13 @@ def kimi_k3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
     linear_attn_config = getattr(config, "linear_attn_config", None) or {}
     kda_layer_ids = set(linear_attn_config.get("kda_layers", []))
     num_kda_layers = sum(1 for layer in range(1, layers + 1) if layer in kda_layer_ids)
-    num_mla_layers = layers - num_kda_layers
+    dsa_config = getattr(config, "dsa_config", None) or {}
+    dsa_layer_ids = set(dsa_config.get("dsa_layers", []))
+    num_dsa_layers = sum(1 for layer in range(1, layers + 1) if layer in dsa_layer_ids)
+    num_mla_layers = layers - num_kda_layers - num_dsa_layers
 
     attention_heads = config.num_attention_heads
-    mla_per_layer = _mla_attention_per_layer_flops(
+    mla_args = (
         gbs,
         seq_len,
         hs,
@@ -1528,8 +1533,22 @@ def kimi_k3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
         config.qk_nope_head_dim,
         config.v_head_dim,
     )
+    mla_per_layer = _mla_attention_per_layer_flops(*mla_args)
+    dsa_per_layer = mla_per_layer
+    # With no more tokens than index_topk the DSA layer runs dense MLA and skips the indexer.
+    if num_dsa_layers and seq_len > dsa_config["index_topk"]:
+        # Sparse main attention; the indexer is counted separately below because K3.1 runs it
+        # forward-only (its hard top-k gets no gradient), i.e. 2x rather than 6x its GEMM FLOPs.
+        dsa_per_layer = _mla_attention_per_layer_flops(*mla_args, index_topk=dsa_config["index_topk"])
+        index_heads, index_head_dim = dsa_config["index_num_heads"], dsa_config["index_head_dim"]
+        index_proj_params = (config.q_lora_rank or hs) * index_heads * index_head_dim + hs * (
+            index_head_dim + index_heads
+        )
+        dsa_per_layer += 2 * gbs * seq_len * (index_proj_params + index_heads * index_head_dim * seq_len)
     if getattr(config, "mla_use_output_gate", False):
-        mla_per_layer += 6 * gbs * seq_len * hs * attention_heads * config.v_head_dim
+        output_gate = 6 * gbs * seq_len * hs * attention_heads * config.v_head_dim
+        mla_per_layer += output_gate
+        dsa_per_layer += output_gate
 
     kda_per_layer = 0
     if num_kda_layers:
@@ -1542,7 +1561,7 @@ def kimi_k3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
             linear_attn_config.get("short_conv_kernel_size", 4),
             linear_attn_config.get("use_full_rank_gate", False),
         )
-    attention_flops = num_mla_layers * mla_per_layer + num_kda_layers * kda_per_layer
+    attention_flops = num_mla_layers * mla_per_layer + num_dsa_layers * dsa_per_layer + num_kda_layers * kda_per_layer
 
     # --- MLP layer pattern (same rule as KimiDecoderLayer) ---
     num_experts = getattr(config, "num_experts", None)
@@ -1991,6 +2010,10 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
 
     # Get config class name
     config_class_name = config.__class__.__name__
+    if config_class_name == "Step5Config":
+        from nemo_automodel.components.models.step5.flops import step5_flops
+
+        return step5_flops
 
     # Map config class names to FLOPs formulas
     class_name_to_formula = {
@@ -2045,6 +2068,7 @@ def get_flops_formula_for_hf_config(config: Any) -> Callable | None:
         "KimiK25Config": mla_moe_flops,
         "KimiK3TextConfig": kimi_k3_flops,  # Kimi K3 (hybrid KDA/MLA + latent MoE)
         "KimiK3Config": kimi_k3_flops,  # Kimi K3 multimodal wrapper (text_config)
+        "KimiK31Config": kimi_k3_flops,  # Kimi K3.1 multimodal wrapper (text_config with dsa_config)
         # Step3.5-Flash
         "Step3p5Config": step3_5_flash_flops,
         "LongcatFlashConfig": mla_moe_flops,  # MLA + MoE
