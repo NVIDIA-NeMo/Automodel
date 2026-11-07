@@ -24,6 +24,7 @@ that the helpers correctly
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Dict, List
 
@@ -271,7 +272,7 @@ def testformat_prompt_completion_answer_only_mask():
 
     # Prompt/answer masking logic
     prompt_text = f"{context} {question} "
-    # The implementation tokenizes prompt without special tokens to calculate mask
+    # The prompt's own tokens (without BOS/EOS) are the ones to mask
     prompt_ids_no_special = tok(prompt_text, add_special_tokens=False)["input_ids"]
     full_text = f"{context} {question} {answer}"
     # @akoumparouli: remove the eos token
@@ -280,7 +281,7 @@ def testformat_prompt_completion_answer_only_mask():
     assert len(full_text_ids) == 4
     assert len(full_text_ids) == len(out["input_ids"])
 
-    # The format_prompt_completion adds BOS to len_prompt_ids, then shifts labels by 1
+    # The prompt length includes BOS, then labels are shifted by 1
     # So expected masked tokens = len(prompt_ids_no_special) + 1 (BOS) - 1 (shift) = len(prompt_ids_no_special)
     expected_zeros = len(prompt_ids_no_special)
     expected_ones = len(out["labels"]) - expected_zeros
@@ -1059,6 +1060,79 @@ class TestFormatPromptCompletionPadEos:
         assert out["labels"][0] == -100, "First label (prompt) must be masked"
         supervised = [v for v in out["labels"] if v != -100]
         assert len(supervised) > 0, "Must have supervised (answer) tokens"
+
+
+class _StubTokenizerLeadingSpace(_StubTokenizerPlain):
+    """GPT-2/Qwen-style pre-tokenization: a space is attached to the *next* word,
+    and a trailing space is its own token (``"Answer: "`` -> ``["Answer:", " "]``).
+    """
+
+    def __call__(self, text, *, add_special_tokens=True, padding=None, truncation=None, max_length=None):
+        ids: List[int] = [self.bos_token_id] if add_special_tokens else []
+        ids.extend(self._id_for_token(tok) for tok in re.findall(r"\s?\S+|\s+$", text))
+        if add_special_tokens:
+            ids.append(self.eos_token_id)
+        return {"input_ids": ids}
+
+
+@pytest.mark.parametrize("answer", ["Paris", "กรุงเทพมหานคร"])
+def test_format_prompt_completion_supervises_first_answer_token_when_space_merges(answer):
+    tok = _StubTokenizerLeadingSpace()
+    out = format_prompt_completion(
+        tok,
+        "Question: capital? Answer: ",
+        answer,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+    # The prompt's trailing space merges into the answer (" Paris" is one token);
+    # that token and EOS must both be supervised.
+    assert [t for t in out["labels"] if t != -100] == [tok._vocab[" " + answer], tok.eos_token_id]
+
+
+def test_format_prompt_completion_empty_answer_supervises_eos():
+    tok = _StubTokenizerPlain()
+    out = format_prompt_completion(
+        tok,
+        "Context Q? ",
+        "",
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+    # The EOS that the tokenizer appends to the prompt is not part of the prompt.
+    assert [t for t in out["labels"] if t != -100] == [tok.eos_token_id]
+
+
+class _StubTokenizerPlainLeftTruncating(_StubTokenizerPlain):
+    """Plain tokenizer that honours ``truncation``/``max_length`` with ``truncation_side="left"``."""
+
+    truncation_side = "left"
+
+    def __call__(self, text, *, add_special_tokens=True, padding=None, truncation=None, max_length=None):
+        ids = super().__call__(text, add_special_tokens=add_special_tokens)["input_ids"]
+        if truncation and max_length is not None:
+            ids = ids[-max_length:]
+        return {"input_ids": ids}
+
+
+def test_format_prompt_completion_left_truncation_never_supervises_prompt_tokens():
+    tok = _StubTokenizerPlainLeftTruncating()
+    prompt = "c1 c2 c3 c4 Q? "
+    out = format_prompt_completion(
+        tok,
+        prompt,
+        "a1 a2",
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        seq_length=8,
+        truncation=True,
+        answer_only_loss_mask=True,
+    )
+    # Left truncation cuts BOS, so the kept ids do not start with the prompt's ids.
+    prompt_only_ids = set(tok(prompt, add_special_tokens=False)["input_ids"])
+    assert not prompt_only_ids & {t for t in out["labels"] if t != -100}
 
 
 class _StubTokenizerChatTruncating(_StubTokenizerChat):
