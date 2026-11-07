@@ -31,12 +31,11 @@ import torch
 import torch.utils.data
 from datasets import Dataset, load_dataset
 from datasets import Image as HfImage
-from datasets import Sequence as HfSequence
 from PIL import Image
 from transformers import ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
-from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
+from nemo_automodel.components.datasets.vlm.conversation import ConversationMessage, ConversationSample
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
     _lmdb_env_cache,
@@ -174,6 +173,17 @@ def make_cord_v2_dataset(
     # return dataset.map(format, batched=False, num_proc=8,remove_columns=["ground_truth"])
 
 
+class _MedPixImage(TypedDict):
+    bytes: bytes | None
+    path: str | None
+
+
+class _MedPixBatch(TypedDict):
+    image_id: list[_MedPixImage | str | Image.Image]
+    question: list[str]
+    answer: list[str]
+
+
 @dataclass
 class MedPixDatasetConfig:
     """Construction-time configuration for the MedPix dataset."""
@@ -182,156 +192,54 @@ class MedPixDatasetConfig:
     """HuggingFace dataset id or local path for MedPix."""
     split: str = "train"
     """Dataset split to load."""
+    revision: str | None = None
+    """Optional HuggingFace dataset revision."""
+    seed: int | None = None
+    """Optional shuffle seed applied before packing; None preserves source order."""
 
     def build(self) -> Dataset:
-        """Build the lazily decoded MedPix dataset."""
-        return make_medpix_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
+        """Build Arrow-backed conversations with lazily decoded MedPix images."""
+        dataset = load_dataset(self.path_or_dataset, split=self.split, revision=self.revision)
+        if self.seed is not None:
+            dataset = dataset.shuffle(seed=self.seed)
+        dataset = dataset.cast_column("image_id", HfImage(decode=False))
+
+        def lazy_image(value: _MedPixImage | str | Image.Image) -> Image.Image | str | _MedPixImage:
+            # Opening embedded image bytes reads only the header, not the pixels.
+            if isinstance(value, dict):
+                if value.get("bytes") is not None:
+                    return Image.open(io.BytesIO(value["bytes"]))
+                if value.get("path"):
+                    return value["path"]
+            return value
+
+        def transform(batch: _MedPixBatch) -> dict[str, list[list[ConversationMessage]]]:
+            return {
+                "conversation": [
+                    [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": lazy_image(image)},
+                                {"type": "text", "text": question},
+                            ],
+                        },
+                        {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+                    ]
+                    for image, question, answer in zip(batch["image_id"], batch["question"], batch["answer"])
+                ]
+            }
+
+        return dataset.with_transform(transform)
 
 
 def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
-    """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
+    """Load MedPix conversations with deferred image decoding.
 
-    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
-    dataset stays Arrow-backed (no Python-side copy of every image). Images are
-    loaded undecoded (``Image(decode=False)``) and wrapped as lazy ``PIL``
-    handles (``Image.open`` reads only the header); the actual pixel decode then
-    happens on demand in the DataLoader workers, rather than eagerly decoding the
-    whole split up front.
+    This legacy factory preserves source order. Use MedPixDatasetConfig to
+    pin a dataset revision or shuffle raw rows deterministically before packing.
     """
-    dataset = load_dataset(path_or_dataset, split=split)
-    if "image_id" in getattr(dataset, "features", {}):
-        dataset = dataset.cast_column("image_id", HfImage(decode=False))
-
-    def lazy_image(value):
-        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
-        if isinstance(value, dict):
-            if value.get("bytes") is not None:
-                return Image.open(io.BytesIO(value["bytes"]))
-            if value.get("path"):
-                return value["path"]
-        return value
-
-    def transform(batch):
-        return {
-            "conversation": [
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": lazy_image(image)},
-                            {"type": "text", "text": question},
-                        ],
-                    },
-                    {"role": "assistant", "content": [{"type": "text", "text": answer}]},
-                ]
-                for image, question, answer in zip(batch["image_id"], batch["question"], batch["answer"])
-            ]
-        }
-
-    return dataset.with_transform(transform)
-
-
-class _SourceBlock(TypedDict):
-    type: str
-    text: str | None
-    index: int | None
-
-
-class _SourceMessage(TypedDict):
-    role: str
-    content: list[_SourceBlock]
-
-
-class _EncodedImage(TypedDict):
-    bytes: bytes | None
-    path: str | None
-
-
-class _SourceBatch(TypedDict):
-    messages: list[list[_SourceMessage]]
-    images: list[list[_EncodedImage]]
-
-
-class _TextBlock(TypedDict):
-    type: str
-    text: str
-
-
-class _ImageBlock(TypedDict):
-    type: str
-    image: Image.Image
-
-
-class _ConversationMessage(TypedDict):
-    role: str
-    content: list[_TextBlock | _ImageBlock]
-
-
-class _ConversationBatch(TypedDict):
-    conversation: list[list[_ConversationMessage]]
-
-
-def _image_conversations(batch: _SourceBatch) -> _ConversationBatch:
-    """Resolve indexed image blocks in a Hugging Face transform batch.
-
-    Image bytes stay compressed until the VLM processor loads each image.
-    This lets the pack planner read chat lengths without decoding all images.
-
-    Args:
-        batch: HF rows batched into lists; each row contains messages with
-            typed text/image blocks and an images list of encoded image records.
-
-    Returns:
-        A conversation list with PIL image objects opened lazily from the
-        embedded bytes or paths. Source messages and blocks are not mutated.
-    """
-    conversations: list[list[_ConversationMessage]] = []
-    for messages, images in zip(batch["messages"], batch["images"], strict=True):
-        conversation: list[_ConversationMessage] = []
-        used = set()
-        for message in messages:
-            content: list[_TextBlock | _ImageBlock] = []
-            for block in message["content"]:
-                if block["type"] == "text":
-                    if not isinstance(block["text"], str):
-                        raise ValueError("Text blocks require a string")
-                    content.append({"type": "text", "text": block["text"]})
-                elif block["type"] == "image":
-                    index = block["index"]
-                    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(images):
-                        raise ValueError(f"Invalid image index {index!r} for {len(images)} images")
-                    record = images[index]
-                    image = (
-                        Image.open(io.BytesIO(record["bytes"]))
-                        if record["bytes"] is not None
-                        else Image.open(record["path"])
-                    )
-                    content.append({"type": "image", "image": image})
-                    used.add(index)
-                else:
-                    raise ValueError(f"Unsupported HF chat content type: {block['type']!r}")
-            conversation.append({"role": message["role"], "content": content})
-        if used != set(range(len(images))):
-            raise ValueError("Every supplied image must be referenced by a conversation block")
-        conversations.append(conversation)
-    return {"conversation": conversations}
-
-
-@dataclass
-class HfImageConversationDatasetConfig:
-    """HF messages plus embedded images, shuffled deterministically before packing."""
-
-    path_or_dataset: str = "HuggingFaceH4/llava-instruct-mix-vsft"
-    split: str = "train"
-    revision: str | None = None
-    seed: int = 1234
-
-    def build(self) -> Dataset:
-        """Load Arrow-backed image/chat rows without eagerly decoding the images."""
-        dataset = load_dataset(self.path_or_dataset, split=self.split, revision=self.revision)
-        dataset = dataset.cast_column("images", HfSequence(HfImage(decode=False)))
-        dataset = dataset.shuffle(seed=self.seed)
-        return dataset.with_transform(_image_conversations)
+    return MedPixDatasetConfig(path_or_dataset=path_or_dataset, split=split).build()
 
 
 @dataclass

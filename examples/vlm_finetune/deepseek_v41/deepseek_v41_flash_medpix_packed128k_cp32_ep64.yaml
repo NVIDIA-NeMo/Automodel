@@ -1,11 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
-# Packed image/text SFT on 16 GB200 nodes x 4 GPUs in one NVLink domain.
+# Packed MedPix image/text SFT on 16 GB200 nodes x 4 GPUs in one NVLink domain.
 # Global sequence 131072, CP32 -> 4096 local language tokens; EP64, PP1.
 # Vision frames use the existing CP frame-sharding policy. The tower gathers
 # unmerged patches before the ceil-based spatial merger, including odd grids.
 # Native per-document shifting and THD metadata preserve image/document boundaries.
-# This is a new recipe; full pretrained 128K fit/performance require validation.
+# MedPix full-model training was validated at 4K and 64K; this 128K configuration
+# requires its own full pretrained fit/performance validation.
 
 recipe: FinetuneRecipeForVLM
 seed: 1234
@@ -97,7 +98,7 @@ freeze_config:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: ../checkpoints/deepseek_v41_flash_llava_packed128k_cp32_ep64
+  checkpoint_dir: ../checkpoints/deepseek_v41_flash_medpix_packed128k_cp32_ep64
   model_save_format: safetensors
   save_consolidated: false
   dequantize_base_checkpoint: true
@@ -112,9 +113,9 @@ loss_fn:
   compile: true
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.HfImageConversationDatasetConfig
-  path_or_dataset: HuggingFaceH4/llava-instruct-mix-vsft
-  revision: 4c04c8302cb25a9c7ee48d2dfda99308d432f87c  # pragma: allowlist secret (public dataset commit SHA)
+  _target_: nemo_automodel.components.datasets.vlm.datasets.MedPixDatasetConfig
+  path_or_dataset: mmoukouba/MedPix-VQA
+  revision: 69eb219d477ab8699296da1fd6b89beb768042d3  # pragma: allowlist secret (public dataset commit SHA)
   split: train
   seed: 1234
   truncate: false
@@ -170,7 +171,7 @@ wandb:
   enable: false  # Opt in with --wandb.enable true; validation runs enable W&B.
   entity: Nemo-automodel
   project: automodel-ds41-vision-packed128k
-  name: ds41-llava-packed128k-cp32-ep64-opt-ga2
+  name: ds41-medpix-packed128k-cp32-ep64-opt-ga2
   mode: online
   dir: ../logs/wandb
 
