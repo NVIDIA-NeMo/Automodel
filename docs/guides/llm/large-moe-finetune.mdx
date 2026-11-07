@@ -5,7 +5,7 @@ position: 5
 ---
 ## Introduction
 
-Mixture-of-Experts (MoE) architectures have become the dominant design for frontier language models, activating only a fraction of their total parameters per token to deliver strong performance at reduced compute cost. This guide walks through fine-tuning four example MoE LLMs with NVIDIA NeMo AutoModel. For a full list of supported architectures, see the [LLM model coverage](/model-coverage/large-language-models/overview) page.
+Mixture-of-Experts (MoE) architectures have become the dominant design for frontier language models, activating only a fraction of their total parameters per token to deliver strong performance at reduced compute cost. This guide shows you how to fine-tune four example MoE LLMs with NVIDIA NeMo AutoModel. For a full list of supported architectures, see the [LLM model coverage](/model-coverage/large-language-models/overview) page.
 
 | Model | Hugging Face Checkpoint | Validated Using |
 |-------|--------------|-----------------|
@@ -32,7 +32,7 @@ For details on how to swap in your own dataset, see the [LLM Dataset Guide](/dat
 
 ### MiniMax-M2.5
 
-[`examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml). Validated using **64 H100 GPUs** (8 nodes x 8).
+[`examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml) is validated using **64 H100 GPUs** (8 nodes x 8).
 
 Key distributed settings:
 
@@ -48,7 +48,7 @@ distributed:
 
 ### GLM-5
 
-[`examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml). Validated using **256 H100 GPUs** (32 nodes x 8).
+[`examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5_hellaswag_pp.yaml) is validated using **256 H100 GPUs** (32 nodes x 8).
 
 Key distributed settings:
 
@@ -65,7 +65,7 @@ distributed:
 
 ### Step-3.5 Flash (StepFun)
 
-[`examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml). Validated using **64 H100 GPUs** (8 nodes x 8).
+[`examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml) is validated using **64 H100 GPUs** (8 nodes x 8).
 
 Key distributed settings:
 
@@ -81,7 +81,7 @@ distributed:
 
 ### DeepSeek-V3.2
 
-[`examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml). Validated using **256 H100 GPUs** (32 nodes x 8).
+[`examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml) is validated using **256 H100 GPUs** (32 nodes x 8).
 
 Key distributed settings:
 
@@ -130,13 +130,76 @@ The following advanced settings apply only when `dispatcher: hybridep`:
 |---|---:|---|
 | `dispatcher_hybridep_compact_routing` | `false` | Pass top-k expert indices instead of a dense Boolean routing map. |
 | `dispatcher_hybridep_permute_fusion` | `false` | Fuse token permutation into dispatch and unpermutation into combine. |
-| `dispatcher_hybridep_num_sms_preprocessing` | `null` | Override the number of SMs used for routing-metadata preprocessing. |
+| `dispatcher_hybridep_num_sms_preprocessing` | `null` | Override the number of streaming multiprocessors (SMs) used for routing-metadata preprocessing. |
 | `dispatcher_hybridep_num_blocks_permute` | `null` | Override the number of dispatch permutation blocks. |
 | `dispatcher_hybridep_num_blocks_unpermute` | `null` | Override the number of combine unpermutation blocks. |
 | `dispatcher_capacity_factor` | `null` | Capacity mode for dynamic routing: size the dispatch buffers once from the first real batch times this factor and run later dispatches non-blocking; an overflow trips a device-side assert. Not for experts with `expert_bias`. |
 | `dispatcher_equal_token_counts` | `false` | Declare that every EP rank dispatches the same row count, so the per-dispatch pad-size all-reduce and its host sync are skipped. Keep `false` for variable-length or packed inputs: with genuinely unequal (aligned) row counts the HybridEP collective hangs silently instead of raising. |
 
 Leave the numeric tuning settings unset to use HybridEP defaults unless a matched benchmark demonstrates an improvement. A value that improves performance on one GPU architecture or topology might reduce performance on another.
+
+## Configure NCCL-EP
+
+NCCL-EP is an experimental, opt-in dispatcher for BF16 expert-parallel training
+on Hopper or newer GPUs. Select it with an explicit upper bound on the number
+of tokens entering each MoE layer on each rank per microbatch:
+
+```yaml
+model:
+  backend:
+    experts: torch_mm
+    dispatcher: nccl_ep
+    nccl_ep:
+      max_tokens_per_rank: 4096
+```
+
+Use the same bound on all expert parallelism (EP) ranks and layers. Include masked tokens and account
+for local batch size and sequence parallelism when choosing it. The transport
+rounds the bound up to a multiple of 64 and accepts any shorter input without
+padding; receive buffers are sized from the actual routing counts, so tokens are
+not dropped. The initial implementation uses eager dispatch and does not support
+capturing communication in CUDA Graphs or `dispatcher_async_dispatch: true`.
+
+NCCL-EP sizes its dispatch and combine kernels itself, so `dispatcher_num_sms`
+does not apply. To tune that budget, set `NCCL_EP_COMM_SMS` in the job
+environment. Received tokens use NCCL-EP's ordered
+expert layout, which activation-checkpoint recomputation requires and which keeps
+expert gradients reproducible from run to run.
+
+All ranks of the EP group must share one NVLink domain, such as one H100 node or
+one GB200 NVL72 rack. NeMo AutoModel rejects an EP group that spans several
+NVLink domains when it initializes NCCL-EP, because NCCL-EP's cross-domain
+combine currently fails with an illegal memory access on a rank that receives no
+tokens. Choose another dispatcher for expert parallelism across NVLink domains.
+
+Setting `NCCL_EP_HT_EM_PULL_PUSH=1` in the job environment selects NCCL-EP's
+NVLink pull-dispatch and push-combine kernels. They can reduce dispatch and
+combine time for balanced routing but can be slower when routing is heavily
+skewed.
+
+The runtime requires an NCCL-EP-enabled Transformer Engine build with
+`transformer_engine.pytorch.ep` and NCCL 2.30.4 or newer. CI builds enable
+`TE_WITH_NCCL_EP=1` on the PyTorch base image and verify the packaged library and
+JIT headers. Public-wheel installations retain `NVTE_WITH_NCCL_EP=0` because
+their PyTorch headers do not support that build. All NCCL-EP layers in a process
+must share the same EP group, token bound, hidden width, expert count, and top-k.
+Communication state is initialized during expert parallelization, before
+activation checkpointing, and released before process-group teardown.
+Transformer Engine 2.20 borrows the EP group's NCCL communicator, which the
+`ProcessGroupNCCL2` backend that PyTorch 2.15 uses for `backend="nccl"` does
+not expose. In that case NCCL-EP creates a classic `nccl-legacy` group over the
+same ranks, which adds one NCCL communicator per EP group.
+
+Run the focused two-GPU validation in an enabled container. The first script
+checks the transport on its own; the second checks a training step of a small
+model that composes NCCL-EP with FSDP2:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  tests/functional_tests/moe/run_nccl_ep_parity.py
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  tests/functional_tests/moe/run_nccl_ep_fsdp_parity.py
+```
 
 ## Launch Training
 
@@ -150,7 +213,7 @@ uv run automodel your_single_node_config.yaml --nproc-per-node 8
 
 The CLI takes the recipe config as its positional argument. Use this form only
 with a config whose distributed topology fits one node; the four configs above
-use multi-node PP/EP sizes and should be launched through Slurm or external
+use multi-node pipeline parallelism (PP) and EP sizes and should be launched through Slurm or external
 `torchrun` as shown below.
 
 ### Torchrun
