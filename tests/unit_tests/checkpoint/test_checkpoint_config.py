@@ -14,9 +14,12 @@
 
 """Tests for CheckpointingConfig in config.py."""
 
+import dataclasses
+
 import pytest
 import torch
 
+from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 from nemo_automodel.components.checkpoint.config import (
     CheckpointingConfig,
     _is_geq_torch_2_9,
@@ -211,6 +214,23 @@ class TestCheckpointingConfig:
         """Without PEFT, torch_save must be honored."""
         cfg = CheckpointingConfig(model_save_format="torch_save", is_peft=False)
         assert cfg.model_save_format.value == "torch_save"
+
+    def test_accepts_serialization_format_enum(self):
+        cfg = CheckpointingConfig(model_save_format=SerializationFormat.TORCH_SAVE)
+        assert cfg.model_save_format is SerializationFormat.TORCH_SAVE
+
+    def test_replace_preserves_model_save_format(self):
+        """dataclasses.replace re-runs __post_init__ on the already-converted Enum."""
+        cfg = CheckpointingConfig(model_save_format="torch_save")
+        copy = dataclasses.replace(cfg, checkpoint_dir="/tmp/other")
+        assert copy.model_save_format is SerializationFormat.TORCH_SAVE
+        assert str(copy.checkpoint_dir) == "/tmp/other"
+
+    def test_peft_torch_save_enum_fallback(self):
+        """The PEFT fallback applies to an Enum value, not only the raw string."""
+        cfg = CheckpointingConfig(model_save_format=SerializationFormat.TORCH_SAVE, is_peft=True)
+        assert cfg.model_save_format is SerializationFormat.SAFETENSORS
+        assert cfg.save_consolidated.value == "final"
 
 
 @pytest.mark.parametrize(
