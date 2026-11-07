@@ -21,7 +21,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TypeAlias, TypedDict, cast
 
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -30,6 +30,20 @@ from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloa
 
 from .base_dataset import BaseMultiresolutionDataset
 from .sampler import SequentialBucketSampler
+
+# Metadata comes from JSON manifests or the equivalent torch-saved cache fields.
+_MetadataValue: TypeAlias = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | list["_MetadataValue"]
+    | tuple["_MetadataValue", ...]
+    | dict[str, "_MetadataValue"]
+)
+_CacheValue: TypeAlias = torch.Tensor | list[torch.Tensor] | dict[str, torch.Tensor] | _MetadataValue
+
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +102,7 @@ class _CompoundBucketSignature:
     contexts: tuple[tuple[int, int, int], ...]
 
 
-def _normalize_shape(value: object, *, field_name: str, rank: int, allow_zero: bool = False) -> tuple[int, ...]:
+def _normalize_shape(value: _MetadataValue, *, field_name: str, rank: int, allow_zero: bool = False) -> tuple[int, ...]:
     if not isinstance(value, (list, tuple)) or len(value) != rank:
         raise ValueError(f"{field_name} must contain exactly {rank} dimensions, got {value!r}")
 
@@ -103,11 +117,11 @@ def _normalize_shape(value: object, *, field_name: str, rank: int, allow_zero: b
     return tuple(shape)
 
 
-def _parse_compound_bucket_signature(value: object, *, field_name: str) -> _CompoundBucketSignature:
+def _parse_compound_bucket_signature(value: _MetadataValue, *, field_name: str) -> _CompoundBucketSignature:
     if not isinstance(value, Mapping):
         raise ValueError(f"{field_name} must be a mapping with 'target' and 'contexts' entries")
 
-    signature = cast(Mapping[str, object], value)
+    signature = cast(Mapping[str, _MetadataValue], value)
     target = _normalize_shape(signature.get("target"), field_name=f"{field_name}.target", rank=3)
     raw_contexts = signature.get("contexts")
     if not isinstance(raw_contexts, list) or not raw_contexts:
@@ -132,7 +146,7 @@ def _signature_to_metadata(signature: _CompoundBucketSignature) -> _CompoundBuck
     }
 
 
-def _nonnegative_int(value: object, *, field_name: str) -> int:
+def _nonnegative_int(value: _MetadataValue, *, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field_name} must be a non-negative integer, got {value!r}")
     return value
@@ -155,7 +169,7 @@ def _validate_latent(tensor: torch.Tensor, *, field_name: str) -> tuple[int, int
     return cast(tuple[int, int, int], tuple(tensor.shape))
 
 
-def _require_tensor(data: Mapping[str, object], field_name: str) -> torch.Tensor:
+def _require_tensor(data: Mapping[str, _CacheValue], field_name: str) -> torch.Tensor:
     """Read a tensor field from a cache payload.
 
     Args:
@@ -216,10 +230,10 @@ class ImageEditDataset(BaseMultiresolutionDataset):
         """
         if quantization <= 0:
             raise ValueError(f"quantization must be positive, got {quantization}")
-        self.cache_manifest: dict[str, object] = {}
+        self.cache_manifest: dict[str, _MetadataValue] = {}
         super().__init__(cache_dir=cache_dir, quantization=quantization)
 
-    def _resolve_contained_path(self, path_value: object, *, field_name: str) -> Path:
+    def _resolve_contained_path(self, path_value: _MetadataValue, *, field_name: str) -> Path:
         if not isinstance(path_value, str) or not path_value:
             raise ValueError(f"{field_name} must be a non-empty path string")
 
@@ -234,7 +248,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
             raise ValueError(f"{field_name} {resolved} is outside cache directory {cache_dir}") from exc
         return resolved
 
-    def _load_metadata(self) -> list[dict[str, object]]:
+    def _load_metadata(self) -> list[dict[str, _MetadataValue]]:
         metadata_file = self.cache_dir / "metadata.json"
         if not metadata_file.is_file():
             raise FileNotFoundError(f"No metadata.json found in {self.cache_dir}")
@@ -243,7 +257,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
             raw_manifest = json.load(file)
         if not isinstance(raw_manifest, dict):
             raise ValueError(f"Invalid metadata format in {metadata_file}: expected a mapping")
-        manifest = cast(dict[str, object], raw_manifest)
+        manifest = cast(dict[str, _MetadataValue], raw_manifest)
 
         raw_shards = manifest.get("shards")
         if not isinstance(raw_shards, list) or not all(isinstance(name, str) and name for name in raw_shards):
@@ -251,7 +265,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
 
         self.cache_manifest = manifest
 
-        metadata: list[dict[str, object]] = []
+        metadata: list[dict[str, _MetadataValue]] = []
         for shard_index, shard_name in enumerate(raw_shards):
             shard_path = self._resolve_contained_path(shard_name, field_name=f"shards[{shard_index}]")
             with shard_path.open("r", encoding="utf-8") as file:
@@ -262,7 +276,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
             for item_index, raw_item in enumerate(shard):
                 if not isinstance(raw_item, dict):
                     raise ValueError(f"Metadata shard {shard_path} item {item_index} must be a mapping")
-                raw_item = cast(dict[str, object], raw_item)
+                raw_item = cast(dict[str, _MetadataValue], raw_item)
                 if "cache_file" not in raw_item:
                     raise ValueError(f"Metadata shard {shard_path} item {item_index} is missing 'cache_file'")
                 _parse_compound_bucket_signature(
@@ -305,7 +319,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
         )
         logger.info("Dataset organized into %d compound image-edit buckets", len(self.bucket_groups))
 
-    def get_bucket_info(self) -> dict[str, object]:
+    def get_bucket_info(self) -> dict[str, int | dict[str, int]]:
         """Return target/context shape groups used by the bucket sampler.
 
         Returns:
@@ -321,7 +335,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
 
     def _normalize_cache_metadata(
         self,
-        raw_metadata: object,
+        raw_metadata: _MetadataValue,
         *,
         signature: _CompoundBucketSignature,
         prompt_sequence_length: int,
@@ -345,12 +359,12 @@ class ImageEditDataset(BaseMultiresolutionDataset):
         """
         if not isinstance(raw_metadata, dict):
             raise ValueError(f"Image-edit cache {cache_file} field 'metadata' must be a mapping")
-        cache_metadata = cast(dict[str, object], raw_metadata)
+        cache_metadata = raw_metadata
 
         original_ids = cache_metadata.get("original_ids")
         if not isinstance(original_ids, dict) or not original_ids:
             raise ValueError(f"Image-edit cache {cache_file} metadata.original_ids must be a non-empty mapping")
-        original_id_values = cast(dict[object, object], original_ids)
+        original_id_values = cast(dict[str, _MetadataValue], original_ids)
         if any(
             not isinstance(name, str) or not name or isinstance(value, bool) or not isinstance(value, (str, int))
             for name, value in original_id_values.items()
@@ -404,7 +418,6 @@ class ImageEditDataset(BaseMultiresolutionDataset):
             raise ValueError(
                 f"Image-edit cache {cache_file} metadata.conditioning_shapes names must be non-empty strings"
             )
-        conditioning_shapes = cast(dict[str, object], conditioning_shapes)
         if set(conditioning_shapes) != set(conditioning_tensors):
             raise ValueError(
                 f"Image-edit cache {cache_file} conditioning_shapes names {sorted(conditioning_shapes)} do not match "
@@ -476,7 +489,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
         normalized["conditioning_shapes"] = normalized_conditioning_shapes
         return normalized
 
-    def __getitem__(self, idx: int) -> dict[str, object]:
+    def __getitem__(self, idx: int) -> dict[str, _CacheValue]:
         """Load and validate one cached image-edit sample.
 
         Args:
@@ -570,7 +583,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
             "conditioning_tensors": conditioning_tensors,
             "metadata": metadata,
         }
-        return cast(dict[str, object], sample)
+        return cast(dict[str, _CacheValue], sample)
 
 
 def _pad_prompts(

@@ -22,13 +22,14 @@ from nemo_automodel.components.models.common import BackendConfig
 
 @dataclass(kw_only=True)
 class Qwen3_8_FlashNextBackendConfig(BackendConfig):
-    """Extend shared backend choices with this model's optional FA4 QSA.
+    """Select this model's optional sparse-attention training backends.
 
     ``attn="cute"`` selects FA4 SM90 BF16 sparse GQA; ``attn="flex"`` selects
-    FlexAttention. CPU execution uses the numerical oracle with either choice.
+    FlexAttention. ``attn="cudnn"`` selects cuDNN indexed QSA on Blackwell,
+    with ratio-four routes and CP=1. CPU execution uses the numerical oracle.
     Other values and the environment-dependent default are retained for
     compatibility with existing BackendConfig callers; CUDA QSA requires
-    ``"flex"`` or ``"cute"``. All other component settings are inherited.
+    ``"flex"``, ``"cute"``, or ``"cudnn"``. All other component settings are inherited.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "cudnn", "cute"] = BackendConfig.attn

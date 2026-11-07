@@ -443,7 +443,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie ``lm_head`` to the shared diffusion text embedding."""
         self.lm_head.weight = self.model.embed_tokens.weight
 

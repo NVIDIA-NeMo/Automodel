@@ -41,11 +41,26 @@ class DraftSpec:
     draft_cls: type[nn.Module]
 
 
+class _DSparkDraftOptions(Protocol):
+    """Recipe options consumed by model-owned DSpark draft constructors."""
+
+    num_draft_layers: int
+    target_layer_ids: list[int]
+    block_size: int
+    num_anchors: int
+    mask_token_id: int
+    markov_rank: int
+    markov_head_type: str
+    confidence_head_alpha: float
+    confidence_head_with_markov: bool
+    confidence_head_stop_gradient: bool
+
+
 @runtime_checkable
 class ModelOwnedDSparkProvider(Protocol):
     """Target config that owns construction of its architecture-specific draft."""
 
-    def build_dspark_draft(self, options: object) -> nn.Module:
+    def build_dspark_draft(self, options: _DSparkDraftOptions) -> nn.Module:
         """Build a draft from the generic recipe's declarative options."""
 
 

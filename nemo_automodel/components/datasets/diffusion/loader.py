@@ -27,7 +27,7 @@ class DiffusionDataloaderBuild:
     """Materialized diffusion dataloader, sampler, and effective batch-tail policy."""
 
     dataloader: DataLoader
-    sampler: Sampler[object] | None
+    sampler: Sampler[int] | Sampler[list[int]] | None
     drop_last: bool = False
 
 

@@ -97,6 +97,7 @@ def _patch_checkpoint_ops(monkeypatch):
             self.global_rank_saves = []
             self.global_rank_loads = []
             self.staging_waits = 0
+            self.model_saves = []
 
         def save_model(
             self,
@@ -107,7 +108,8 @@ def _patch_checkpoint_ops(monkeypatch):
             is_final_checkpoint=False,
         ):
             """Save model state dict."""
-            del peft_config, tokenizer, is_final_checkpoint
+            del peft_config, tokenizer
+            self.model_saves.append((weights_path, is_final_checkpoint))
             if model is None:
                 return
             model_dir = os.path.join(weights_path, "model")
@@ -2180,3 +2182,166 @@ class TestUpdateProgressBar:
         pbar.close()
 
     # Should succeed without FileNotFoundError
+
+
+class _FiniteCheckpointStream:
+    """One owned iterable whose saved cursor distinguishes periodic and terminal state."""
+
+    synchronized_stream = True
+    use_distributed_checkpointing = True
+
+    def __init__(self):
+        self.cursor = 0
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.cursor == 5:
+            raise StopIteration
+        self.cursor += 1
+        return torch.full((1, 2), float(self.cursor))
+
+    def state_dict(self):
+        assert not self.closed, "checkpoint must precede explicit loader cleanup"
+        return {"cursor": self.cursor}
+
+    def load_state_dict(self, state):
+        self.cursor = state["cursor"]
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("recipe_kind", ["llm", "vlm"])
+@pytest.mark.parametrize("validate_last_training_step", [False, True])
+def test_finite_recipe_publishes_periodic_and_terminal_checkpoints_with_validation(
+    tmp_path, recipe_kind, validate_last_training_step
+):
+    """Real BaseRecipe/lifecycle saves must not collide at the last completed step."""
+    from types import MethodType
+
+    from nemo_automodel.components.loggers.metric_logger import MetricsSample
+    from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
+    from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+
+    recipe_type = TrainFinetuneRecipeForNextTokenPrediction if recipe_kind == "llm" else FinetuneRecipeForVLM
+    recipe = _ToyRecipe(tmp_path)
+    # Exercise pending publication: terminal save must publish the periodic
+    # directory first, then reserve a different directory through real lifecycle.
+    recipe.checkpointer.config.is_async = True
+    recipe.dataloader = _FiniteCheckpointStream()
+    recipe.step_scheduler = StepSchedulerConfig(
+        global_batch_size=2,
+        max_steps=99,
+        ckpt_every_steps=2,
+        val_every_steps=2 if validate_last_training_step else 99,
+        validate_on_checkpoint=False,
+        preemption_signal=None,
+    ).build(recipe.dataloader, 1, 1)
+    recipe.model_parts = [recipe.model]
+    recipe.max_grad_norm = 1.0
+    recipe.best_metric_key = "default"
+    recipe.pp_enabled = False
+    recipe.domain_mixture = None
+    recipe.partial_cuda_graph_manager = None
+    recipe._partial_cuda_graph_capture_pending = False
+    recipe._enable_qat_if_delayed = lambda step: None
+    recipe._collect_moe_load_balance = lambda: None
+    recipe._make_progress_bar = lambda: None
+    recipe.log_train_metrics = lambda sample: None
+    recipe._update_progress_bar = lambda *args: None
+    recipe._maybe_collect_garbage = lambda: None
+    recipe.metric_logger_train = SimpleNamespace(close=lambda: None)
+    logger = SimpleNamespace(close=lambda: None)
+    validation_loader = [torch.ones(1, 2)]
+    validation_calls = []
+    validation_logs = []
+
+    def train_step(batches, max_grad_norm):
+        recipe.optimizer.zero_grad()
+        loss = sum(recipe.model(batch).square().mean() for batch in batches) / len(batches)
+        loss.backward()
+        recipe.optimizer.step()
+        return MetricsSample(
+            step=recipe.step_scheduler.step, epoch=recipe.step_scheduler.epoch, metrics={"loss": loss.item()}
+        )
+
+    def validate(loader):
+        assert loader is validation_loader
+        recipe.model.eval()
+        with torch.no_grad():
+            loss = recipe.model(loader[0]).square().mean().item()
+        validation_calls.append((recipe.step_scheduler.step, recipe.step_scheduler.stream_exhausted))
+        return MetricsSample(
+            step=recipe.step_scheduler.step,
+            epoch=recipe.step_scheduler.epoch,
+            metrics={"val_loss": loss, "num_label_tokens": 2},
+        )
+
+    recipe._run_train_optim_step = train_step
+    recipe._run_validation_epoch = validate
+    if recipe_kind == "llm":
+        recipe.val_dataloaders = {"default": validation_loader}
+        recipe.metric_logger_valid = {"default": logger}
+        recipe.log_val_metrics = lambda name, sample, logger: validation_logs.append(sample)
+        recipe._run_validation_loaders = MethodType(recipe_type._run_validation_loaders, recipe)
+    else:
+        recipe.val_dataloader = validation_loader
+        recipe.metric_logger_valid = logger
+        recipe.log_val_metrics = validation_logs.append
+        recipe._run_validation_loader = MethodType(recipe_type._run_validation_loader, recipe)
+
+    # Do not replace save_checkpoint: this calls BaseRecipe, real reservation,
+    # publication, loss metadata, tracked-state routing and final-export selection.
+    recipe_type.run_train_validation_loop(recipe)
+
+    periodic = tmp_path / "epoch_0_step_1"
+    terminal = tmp_path / "epoch_1_step_1"
+    assert set(_checkpoint_dir_names(tmp_path)) == {periodic.name, terminal.name}
+    assert not is_checkpoint_incomplete(periodic) and not is_checkpoint_incomplete(terminal)
+    assert read_checkpoint_pointer(tmp_path, "LATEST") == terminal
+    assert recipe.checkpointer.model_saves == [(str(periodic), False), (str(terminal), True)]
+    assert recipe.checkpointer.distributed_saves == [("dataloader", str(periodic)), ("dataloader", str(terminal))]
+    assert torch.load(periodic / "step_scheduler.pt", weights_only=True) == {
+        "step": 2,
+        "epoch": 0,
+        "stream_exhausted": False,
+    }
+    terminal_scheduler = torch.load(terminal / "step_scheduler.pt", weights_only=True)
+    assert terminal_scheduler == {"step": 2, "epoch": 1, "stream_exhausted": True}
+    assert torch.load(periodic / "dataloader/dataloader.pt", weights_only=True) == {"cursor": 4}
+    assert torch.load(terminal / "dataloader/dataloader.pt", weights_only=True) == {"cursor": 5}
+    assert validation_calls == ([(1, False)] if validate_last_training_step else [(2, True)])
+    assert [sample.step for sample in validation_logs] == [1]
+    losses = json.loads((terminal / "losses.json").read_text())
+    assert losses["val_loss"] == validation_logs[0].metrics["val_loss"]
+    assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == (periodic if validate_last_training_step else terminal)
+    assert recipe.model.training and recipe.dataloader.closed
+    # Terminal state is resumable and does not reopen a completed pass.
+    resumed = StepSchedulerConfig(global_batch_size=2, max_steps=99, preemption_signal=None).build(
+        _FiniteCheckpointStream(), 1, 1
+    )
+    resumed.load_state_dict(terminal_scheduler)
+    assert resumed.stream_exhausted and list(resumed.epochs) == []
+
+
+def test_checkpoint_scan_prefers_closed_epoch_at_equal_step(tmp_path, monkeypatch):
+    """Fallback resume and retention must not depend on filesystem order at EOD."""
+    from pathlib import Path
+
+    periodic = tmp_path / "epoch_0_step_1"
+    terminal = tmp_path / "epoch_1_step_1"
+    periodic.mkdir()
+    terminal.mkdir()
+    for directory_order in ((periodic, terminal), (terminal, periodic)):
+        monkeypatch.setattr(Path, "glob", lambda root, pattern: iter(directory_order))
+        assert list_automodel_checkpoints(tmp_path) == [periodic, terminal]
+        assert find_latest_checkpoint(tmp_path) == terminal
+    # Epoch only breaks ties; a later global optimizer step still wins.
+    later_step = tmp_path / "epoch_0_step_2"
+    later_step.mkdir()
+    monkeypatch.setattr(Path, "glob", lambda root, pattern: iter((terminal, later_step, periodic)))
+    assert find_latest_checkpoint(tmp_path) == later_step
