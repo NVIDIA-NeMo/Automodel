@@ -29,7 +29,11 @@ from nemo_automodel.components.models.beam.model import BeamForCausalLM, beam_mo
 from nemo_automodel.components.models.beam.state_dict_adapter import BeamStateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
-from nemo_automodel.components.moe.quantized_experts import GroupedExpertsNVFP4, apply_nvfp4_to_moe_experts
+from nemo_automodel.components.moe.quantized_experts import (
+    GroupedExpertsNVFP4,
+    apply_nvfp4_to_moe_experts,
+    packed_expert_parameters,
+)
 from nemo_automodel.components.quantization.nvfp4 import NVFP4_BLOCK_SIZE, dequantize_nvfp4, quantize_nvfp4_modelopt
 
 from .utils import hf_model_and_checkpoint
@@ -281,7 +285,7 @@ def _materialize(model: BeamForCausalLM) -> None:
     ``prepare_frozen_parameters_for_sharding`` runs before sharding in production and records the storage dtypes
     that the whole-model cast inside ``initialize_weights`` must keep (the packed codes and scales among them).
     """
-    prepare_frozen_parameters_for_sharding(model, torch.float32)
+    prepare_frozen_parameters_for_sharding(model, torch.float32, keep_storage=packed_expert_parameters(model))
     to_empty_parameters_only(model, device=torch.device("cpu"))
     for module in model.modules():
         for key, buffer in list(module._buffers.items()):

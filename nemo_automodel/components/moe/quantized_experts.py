@@ -64,7 +64,7 @@ def _pin_storage_dtype(param: nn.Parameter) -> nn.Parameter:
     """Record a packed-storage parameter's dtype as its compute dtype so the frozen-parameter casts keep it.
 
     ``prepare_frozen_parameters_for_sharding`` and ``fully_shard_by_dtype`` honour ``_hf_compute_dtype``;
-    ``cast_frozen_modules_to_compute_dtype`` skips packed-expert modules by their resident flag.
+    the frozen-parameter casts also receive the parameters as ``keep_storage`` (``packed_expert_parameters``).
     """
     if param.is_floating_point():
         param._hf_compute_dtype = param.dtype
@@ -941,6 +941,26 @@ def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:
 
     logger.info("Applied NVFP4-resident storage to %d frozen expert module(s)", num_converted)
     return model
+
+
+def packed_expert_parameters(model: nn.Module) -> set[nn.Parameter]:
+    """Return the packed codes and scales of every mxfp4 / nvfp4 expert module in ``model``.
+
+    Their storage dtype is the weight format, not a master-weight dtype, so callers pass them to the
+    frozen-parameter casts as ``keep_storage``.
+
+    Args:
+        model: Model or model part, before or after distributed wrapping.
+
+    Returns:
+        The currently registered packed parameters; empty when ``model`` has no packed experts.
+    """
+    return {
+        module.get_parameter(name)
+        for module in model.modules()
+        if isinstance(module, (MXFP4ExpertStorageMixin, NVFP4ExpertStorageMixin))
+        for name in module.packed_parameter_names()
+    }
 
 
 def validate_nvfp4_checkpoint_config(checkpoint_dir: str) -> None:

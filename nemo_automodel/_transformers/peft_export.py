@@ -27,7 +27,7 @@ from nemo_automodel.components._peft.lora_experts import GroupedExpertsLoRA
 from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
-from nemo_automodel.shared.parameter_names import owns_packed_expert_storage
+from nemo_automodel.components.moe.quantized_experts import packed_expert_parameters
 
 
 def _require_no_packed_expert_storage(model: nn.Module, what: str) -> None:
@@ -39,12 +39,11 @@ def _require_no_packed_expert_storage(model: nn.Module, what: str) -> None:
     Raises:
         ValueError: If any module keeps its experts in a packed format.
     """
-    packed = [name for name, module in model.named_modules() if owns_packed_expert_storage(module)]
-    if packed:
+    if packed_expert_parameters(model):
         raise ValueError(
-            f"{what} is not supported for packed-expert storage (PeftConfig.expert_weight_format mxfp4 / nvfp4; "
-            f"modules: {packed[:3]}{'...' if len(packed) > 3 else ''}). Save the PEFT adapter instead "
-            "(checkpoint.save_consolidated: false) and merge it into a floating-point base offline."
+            f"{what} is not supported for packed-expert storage (PeftConfig.expert_weight_format mxfp4 / nvfp4). "
+            "Save the PEFT adapter instead (checkpoint.save_consolidated: false) and merge it into a "
+            "floating-point base offline."
         )
 
 

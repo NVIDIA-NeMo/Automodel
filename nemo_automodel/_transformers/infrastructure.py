@@ -75,6 +75,7 @@ from nemo_automodel.components.moe.experts import GroupedExpertsTE
 from nemo_automodel.components.moe.quantized_experts import (
     apply_mxfp4_to_moe_experts,
     apply_nvfp4_to_moe_experts,
+    packed_expert_parameters,
     validate_nvfp4_checkpoint_config,
     validate_packed_expert_topology,
 )
@@ -525,7 +526,9 @@ def _prepare_trainability_before_sharding(
         and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
         and frozen_compute_dtype is not None
     ):
-        prepare_frozen_parameters_for_sharding(model, frozen_compute_dtype)
+        prepare_frozen_parameters_for_sharding(
+            model, frozen_compute_dtype, keep_storage=packed_expert_parameters(model)
+        )
 
 
 def _validate_parameter_freezing_backend(
@@ -786,7 +789,11 @@ def apply_model_infrastructure(
 
     # Rebind trainability after model surgery and before DDP/FSDP capture.
     if isinstance(strategy_config, FSDP2Config) and peft_config is not None and quantization_config is None:
-        prepare_frozen_parameters_for_sharding(model, _get_frozen_storage_compute_dtype(strategy_config, mesh))
+        prepare_frozen_parameters_for_sharding(
+            model,
+            _get_frozen_storage_compute_dtype(strategy_config, mesh),
+            keep_storage=packed_expert_parameters(model),
+        )
     reapply_trainability = partial(
         _prepare_trainability_before_sharding,
         peft_enabled=peft_config is not None,
@@ -1005,7 +1012,7 @@ def apply_model_infrastructure(
         compute_dtype = None
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:
-            cast_frozen_modules_to_compute_dtype(mp, compute_dtype)
+            cast_frozen_modules_to_compute_dtype(mp, compute_dtype, keep_storage=packed_expert_parameters(mp))
 
     # Re-apply the Megatron-FSDP per-parameter state dropped by the lm-head re-tie and
     # post-wrap checkpoint reload, so the deferred optimizer registration and first

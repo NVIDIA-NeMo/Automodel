@@ -14,7 +14,6 @@
 
 """Utilities for stable logical parameter names."""
 
-from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
 
 
@@ -33,26 +32,3 @@ def canonical_parameter_fqn(name: str) -> str:
         The logical parameter name without checkpoint-wrapper components.
     """
     return name.replace(_CHECKPOINT_PREFIX, "")
-
-
-# Module flags set by the packed-expert storage mixins (mxfp4 / nvfp4): their frozen base
-# weights live in integer codes plus scale tensors whose storage dtype must never be cast.
-PACKED_EXPERT_RESIDENT_ATTRS = ("_mxfp4_resident", "_nvfp4_resident")
-
-
-def owns_packed_expert_storage(module: nn.Module) -> bool:
-    """Whether ``module`` keeps its frozen expert weights in a packed (quantized) storage format."""
-    return any(getattr(module, attr, False) for attr in PACKED_EXPERT_RESIDENT_ATTRS)
-
-
-def packed_expert_parameter_names(module: nn.Module) -> set[str]:
-    """Names of the packed-storage parameters of a packed-expert module (empty for any other module).
-
-    The storage mixins publish them through ``packed_parameter_names()``. The codes and scales they name are the
-    weight format itself, so dtype-reducing passes leave exactly these parameters alone and treat every other
-    parameter of the module (adapters, biases) like those of any other module.
-    """
-    if not owns_packed_expert_storage(module):
-        return set()
-    names = getattr(module, "packed_parameter_names", None)
-    return set(names()) if callable(names) else set()

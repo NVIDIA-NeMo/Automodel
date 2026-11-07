@@ -387,6 +387,7 @@ def test_frozen_dtype_casts_keep_packed_storage(moe_config):
         cast_frozen_modules_to_compute_dtype,
         prepare_frozen_parameters_for_sharding,
     )
+    from nemo_automodel.components.moe.quantized_experts import packed_expert_parameters
 
     lora = GroupedExpertsLoRANVFP4(_materialized_experts(moe_config, torch.device("cpu")), lora_dim=8, alpha=16)
     model = nn.Module()
@@ -406,8 +407,8 @@ def test_frozen_dtype_casts_keep_packed_storage(moe_config):
     assert lora.gate_and_up_projs_global._hf_compute_dtype == torch.float32
     assert lora.gate_and_up_projs_scales._hf_compute_dtype == torch.float8_e4m3fn
 
-    prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
-    cast_frozen_modules_to_compute_dtype(model, torch.bfloat16)
+    prepare_frozen_parameters_for_sharding(model, torch.bfloat16, keep_storage=packed_expert_parameters(model))
+    cast_frozen_modules_to_compute_dtype(model, torch.bfloat16, keep_storage=packed_expert_parameters(model))
 
     for name, dtype in expected.items():
         assert getattr(lora, name).dtype == dtype, name
@@ -446,6 +447,7 @@ def test_frozen_storage_cast_skips_packed_modules_without_the_parameter_pin(moe_
     """Expert parallelism and accelerate's init_empty_weights re-create parameter objects, dropping the per-parameter
     dtype hint; the storage reduction must still leave the packed module's fp32 row scales alone."""
     from nemo_automodel.components.models.common.utils import prepare_frozen_parameters_for_sharding
+    from nemo_automodel.components.moe.quantized_experts import packed_expert_parameters
 
     lora = GroupedExpertsLoRANVFP4(_materialized_experts(moe_config, torch.device("cpu")), lora_dim=8, alpha=16)
     for name in ("gate_and_up_projs_global", "gate_and_up_projs_scales", "down_projs_global", "down_projs_scales"):
@@ -456,7 +458,7 @@ def test_frozen_storage_cast_skips_packed_modules_without_the_parameter_pin(moe_
     model.dense = nn.Linear(8, 8).to(torch.float32)
     model.dense.requires_grad_(False)
 
-    prepare_frozen_parameters_for_sharding(model, torch.bfloat16)
+    prepare_frozen_parameters_for_sharding(model, torch.bfloat16, keep_storage=packed_expert_parameters(model))
 
     assert lora.gate_and_up_projs_global.dtype == torch.float32 and lora.down_projs_global.dtype == torch.float32
     assert lora.gate_and_up_projs_scales.dtype == torch.float8_e4m3fn
