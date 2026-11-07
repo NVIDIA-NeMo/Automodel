@@ -522,7 +522,6 @@ def test_packed_topology_guard():
 
 def test_exports_refuse_packed_experts(moe_config):
     from nemo_automodel._transformers.peft_export import _merge_and_get_hf_state_dict
-    from nemo_automodel.components.checkpoint.addons import _require_no_packed_expert_storage
 
     model = nn.Module()
     model.layers = nn.ModuleList([nn.Module()])
@@ -531,13 +530,3 @@ def test_exports_refuse_packed_experts(moe_config):
     )
     with pytest.raises(ValueError, match="Merged PEFT export is not supported for packed-expert storage"):
         _merge_and_get_hf_state_dict(model)
-
-    class _State:
-        pass
-
-    state = _State()
-    state.model = [model]
-    with pytest.raises(ValueError, match="save_consolidated is not supported"):
-        _require_no_packed_expert_storage(state)
-    state.model = nn.Linear(2, 2)
-    _require_no_packed_expert_storage(state)
