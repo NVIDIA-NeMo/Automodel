@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -66,6 +67,9 @@ from nemo_automodel.components.speculative.dspark.common import (
 )
 from nemo_automodel.components.speculative.dspark.markov_head import build_markov_head
 
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase, ProcessorMixin
+
 logger = logging.getLogger(__name__)
 
 _minimax_m3_flex_attention_compiled = torch.compile(
@@ -88,14 +92,16 @@ class _ReleasedDraftMetadataExporter:
     def __init__(self, released: MiniMaxM3DSparkReleasedConfig) -> None:
         self._released = released
 
-    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+    def validate(
+        self, *, tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None, original_model_path: str | None
+    ) -> None:
         """Accept every input: the export only depends on the released config."""
 
     def save(
         self,
         *,
         hf_metadata_dir: str,
-        tokenizer: object,
+        tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None,
         original_model_path: str | None,
         v4_compatible: bool,
     ) -> None:
@@ -395,7 +401,7 @@ class MiniMaxM3DSparkModel(nn.Module):
         return module
 
     def _get_consolidated_hf_metadata_exporter(
-        self, *, tokenizer: object, original_model_path: str | None
+        self, *, tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None, original_model_path: str | None
     ) -> _ReleasedDraftMetadataExporter | None:
         """Return the released-config writer, or None to use the generated config."""
         return None if self.released is None else _ReleasedDraftMetadataExporter(self.released)
