@@ -30,11 +30,14 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="real TE p
 
 
 def _metadata(documents: int, *, physical_padding: bool) -> dict[str, torch.Tensor | int | str | bool]:
+    """Make THD offsets [documents + 1]; padded cases also have unequal Q/KV lengths."""
     lengths_q = torch.tensor([16 + 16 * (i % 2) for i in range(documents)], device="cuda", dtype=torch.int32)
-    lengths_kv = lengths_q + 16
+    # FlashAttention cannot implement top-left causal attention with unequal
+    # Q/KV lengths. Keep that contract in the cuDNN-only physical-padding cases.
+    lengths_kv = lengths_q + (16 if physical_padding else 0)
     physical_q = torch.full_like(lengths_q, 32) if physical_padding else lengths_q
     physical_kv = torch.full_like(lengths_kv, 48) if physical_padding else lengths_kv
-    return {
+    metadata = {
         "qkv_format": "thd",
         "attn_mask_type": "padding_causal",
         "cu_seqlens_q": torch.cat((lengths_q.new_zeros(1), lengths_q.cumsum(0, dtype=torch.int32))),
@@ -42,9 +45,16 @@ def _metadata(documents: int, *, physical_padding: bool) -> dict[str, torch.Tens
         "cu_seqlens_q_padded": torch.cat((physical_q.new_zeros(1), physical_q.cumsum(0, dtype=torch.int32))),
         "cu_seqlens_kv_padded": torch.cat((physical_kv.new_zeros(1), physical_kv.cumsum(0, dtype=torch.int32))),
         "max_seqlen_q": 32,
-        "max_seqlen_kv": 48,
+        "max_seqlen_kv": 48 if physical_padding else 32,
         "pad_between_seqs": physical_padding,
     }
+    if not physical_padding:
+        # TE also infers absence of physical padding from these aliases when
+        # the explicit flag is omitted. The production adapter must retain it.
+        metadata["cu_seqlens_q_padded"] = metadata["cu_seqlens_q"]
+        metadata["cu_seqlens_kv_padded"] = metadata["cu_seqlens_kv"]
+        del metadata["pad_between_seqs"]
+    return metadata
 
 
 @pytest.mark.parametrize("softmax", ["vanilla", "learnable"])
