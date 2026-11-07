@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Required, TypedDict
 import torch
 from torch.distributed.tensor import DTensor, Shard
 
-from nemo_automodel.components.optim.dion import _get_dion_mesh, build_dion_optimizer, is_dion_optimizer
+from nemo_automodel.components.optim.dion import build_dion_optimizer, get_dion_mesh, is_dion_optimizer
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
@@ -580,7 +580,7 @@ class MuonConfig(_DionConfigBase):
             ValueError: If a Muon-updated 3D+ DTensor has a matrix axis sharded over a mesh other than Muon's.
         """
         optimizers = super().build(model, device_mesh=device_mesh, is_peft=is_peft)
-        dion_mesh = _get_dion_mesh(device_mesh)
+        dion_mesh = get_dion_mesh(device_mesh)
         process_group = dion_mesh.get_group() if dion_mesh is not None else None
         names = {id(p): n for part in getattr(model, "parts", [model]) for n, p in part.named_parameters()}
         muon_params = [
