@@ -584,6 +584,9 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+            Qwen3-MoE also supports attn="fa4": only the padded projections, Q/K
+            normalization and RoPE are compiled; packed varlen attention runs between
+            those fixed-shape graphs with its document metadata preserved.
         compile_situ: torch.compile the SiTU expert activation of models that opt in
             (currently Kimi K3): the weighted-SiTU forward and backward run as one fused
             whole-tensor kernel each (low-precision in/out, fp32 math inside, no chunk loop),

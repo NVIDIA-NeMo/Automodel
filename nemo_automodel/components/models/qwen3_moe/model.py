@@ -239,6 +239,7 @@ class Qwen3MoeModel(nn.Module):
 
 
 class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    _uses_native_fa4: bool = True
     # Skip patch_hf_model_for_pp: this model's own forward already handles
     # pipeline-parallel stage routing (embed_tokens/norm/lm_head are None off the
     # owning stage; hidden states arrive in the input_ids slot) AND context
@@ -324,6 +325,24 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: bool | None = None,
         **attn_kwargs: Any,
     ) -> CausalLMOutputWithPast:
+        """Compute logits while preserving packed document and padding metadata.
+
+        Args:
+            input_ids: Token IDs [batch, sequence], or the supported THD input layout.
+            position_ids: Optional document-local positions matching input_ids.
+            attention_mask: Optional [batch, sequence] padding/document IDs or
+                [batch, 1, sequence, sequence] dense attention mask.
+            padding_mask: Optional boolean [batch, sequence] mask, true at padding.
+            logits_to_keep: Number of trailing logits, or indices [selected_tokens].
+            output_hidden_states: Whether to include final hidden states.
+            **attn_kwargs: Backend metadata, including packed_token_indices
+                [batch, valid_tokens] and cu_seqlens [batch, documents + 1]
+                before the native FA4 model-entry hook flattens them.
+
+        Returns:
+            CausalLMOutputWithPast containing logits [batch, sequence, vocabulary]
+            or [tokens, vocabulary] for THD input, restricted by logits_to_keep.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -331,6 +350,8 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         )
 
         is_thd = attn_kwargs.get("qkv_format") == "thd"
+        if self.backend.attn == "fa4" and attention_mask is None and padding_mask is not None:
+            attention_mask = padding_mask.logical_not()
         if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
