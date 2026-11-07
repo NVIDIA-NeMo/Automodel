@@ -23,6 +23,7 @@ from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
     get_expert_slice_for_rank,
+    get_sharded_expert_range,
     is_dtensor,
     should_load_expert_for_rank,
     split_experts_weights_dtensor_aware,
@@ -42,6 +43,24 @@ class TestIsDtensor:
             mock_tensor = Mock(spec=DTensor)
             mock_tensor.__class__ = DTensor
             assert is_dtensor(mock_tensor)
+
+
+class TestGetShardedExpertRange:
+    @pytest.mark.parametrize("n_experts, world_size", [(64, 8), (5, 4), (10, 4), (60, 8), (64, 24), (3, 5)])
+    def test_matches_torch_chunk_layout(self, n_experts, world_size):
+        """The ranges must match how Shard(0) and FSDP2 actually lay out the expert dimension."""
+        chunk_sizes = [len(c) for c in torch.chunk(torch.arange(n_experts), world_size)]
+        chunk_sizes += [0] * (world_size - len(chunk_sizes))
+
+        ranges = [get_sharded_expert_range(n_experts, world_size, rank) for rank in range(world_size)]
+
+        assert [end - start for start, end in ranges] == chunk_sizes
+        assert ranges[0][0] == 0 and ranges[-1][1] == n_experts
+        assert all(prev[1] == cur[0] for prev, cur in zip(ranges, ranges[1:]))
+
+    def test_trailing_ranks_can_hold_no_experts(self):
+        assert get_sharded_expert_range(5, 4, 3) == (5, 5)
+        assert get_sharded_expert_range(64, 24, 23) == (64, 64)
 
 
 class TestGetExpertSliceForRank:
@@ -186,6 +205,42 @@ class TestSplitExpertsWeightsDtensorAware:
 
         assert len(split_weights) == 2
         assert expert_ids == [2, 3]
+
+    @pytest.mark.parametrize("n_experts, world_size", [(10, 4), (60, 8), (64, 24)])
+    @patch("nemo_automodel.components.moe.state_dict_utils.get_submesh")
+    @patch("nemo_automodel.components.moe.state_dict_utils.is_dtensor")
+    def test_ep_free_fsdp_uneven_expert_shards(self, mock_is_dtensor, mock_get_submesh, n_experts, world_size):
+        """EP-free FSDP2 shards experts with torch.chunk, so every rank must map its shard to the right expert IDs."""
+        from torch.distributed._tensor.placement_types import Shard
+
+        mock_is_dtensor.return_value = True
+
+        full_weight = torch.arange(n_experts, dtype=torch.float32).view(n_experts, 1, 1).expand(-1, 4, 6).contiguous()
+        # FSDP2 (``_chunk_with_empty``) and DTensor ``Shard(0)`` give each leading rank ceil(n_experts / world_size)
+        # experts; trailing ranks hold the remainder or nothing.
+        local_shards = list(torch.chunk(full_weight, world_size, dim=0))
+        local_shards += [full_weight.new_empty(0, 4, 6)] * (world_size - len(local_shards))
+
+        next_expert = 0
+        for rank, local_shard in enumerate(local_shards):
+            mock_weight = Mock()
+            mock_weight.to_local.return_value = local_shard
+            mock_weight.device_mesh.mesh_dim_names = ("dp_shard_cp",)
+            mock_weight.placements = (Shard(0),)
+
+            mock_dp_mesh = Mock()
+            mock_dp_mesh.get_local_rank.return_value = rank
+            mock_dp_mesh.size.return_value = world_size
+            mock_get_submesh.return_value = mock_dp_mesh
+
+            split_weights, expert_ids = split_experts_weights_dtensor_aware(mock_weight, n_experts)
+
+            assert expert_ids == list(range(next_expert, next_expert + local_shard.shape[0])), f"rank {rank}"
+            for expert_id, expert_weight in zip(expert_ids, split_weights):
+                assert torch.equal(expert_weight, full_weight[expert_id])
+            next_expert += local_shard.shape[0]
+
+        assert next_expert == n_experts
 
 
 class TestValidateDtensorExpertSharding:
