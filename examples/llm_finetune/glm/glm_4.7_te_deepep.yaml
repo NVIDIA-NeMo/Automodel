@@ -19,8 +19,8 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 512
-  local_batch_size: 8
+  global_batch_size: 2048
+  local_batch_size: 4
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
@@ -39,8 +39,16 @@ model:
   pretrained_model_name_or_path: zai-org/GLM-4.7
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: false  # Use unfused RoPE for packed THD inputs, matching the existing packed recipes.
+    experts: torch_mm
     dispatcher: hybridep
-
+    compile_router_weight: true
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 checkpoint:
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
@@ -53,9 +61,8 @@ distributed:
   cp_size: 1
   pp_size: 4
   ep_size: 32
-
   sequence_parallel: false
-
+  activation_checkpointing: true
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 1
@@ -64,11 +71,11 @@ distributed:
     patch_inner_model: false
     patch_causal_lm_model: false
     layers_per_stage: 2
-
   moe:
+    reshard_after_forward: true
     wrap_outer_model: false
-
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -76,16 +83,14 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
 
+  pad_to_max_length: false
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 0
-  split_across_pack: false
-
+  packed_sequence_size: 4096
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 160
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
   drop_last: true
 
@@ -95,11 +100,10 @@ validation_dataset:
   split: validation
   num_samples_limit: 64
 
+  pad_to_max_length: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.utils.default_collater
-    pad_seq_len_divisible: 160
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   batch_size: 8
   drop_last: true
 
@@ -120,7 +124,10 @@ optimizer:
 ci:
   cluster_tag: h100
   recipe_owner: hemildesai
-  nodes: 16
+  nodes: 32
   time: "01:00:00"
   env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  perf_testing:
+    fake_balanced_gate: true
+    schedule: weekly

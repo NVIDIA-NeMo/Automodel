@@ -461,6 +461,7 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
         return None
 
     from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
+    from nemo_automodel.components.models.common.packed_seq import FLASH_VARLEN_KWARGS
 
     def wrapper(base_collate_fn):
         def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
@@ -476,7 +477,14 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
                 size and ``S`` is padded sequence length, plus ``causal_mask_mapping`` entries covering the
                 same ``S`` token axis. Other tensor fields preserve the base collator's documented layout.
             """
-            return add_causal_masks_to_batch(base_fn(batch), model_config=config)
+            collated = base_fn(batch)
+            if "_packed_seq_ids" in collated:
+                # Flat Flash offsets describe the whole local batch and cannot
+                # be split along batch dimension. Model-entry hooks rebuild
+                # them from batch-major document IDs after PP microbatching.
+                for key in FLASH_VARLEN_KWARGS:
+                    collated.pop(key, None)
+            return add_causal_masks_to_batch(collated, model_config=config)
 
         return chained_collate_fn
 
@@ -1728,6 +1736,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
 
         reporting_loss = torch.sum(torch.stack(loss_buffer))
+        if self.pp_enabled:
+            # The last stage's CE may be bf16, while other stages contribute
+            # fp32 zeros. Every PP broadcast participant needs the same dtype.
+            reporting_loss = reporting_loss.float()
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
@@ -2034,7 +2046,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {} | num_tokens_per_step {} | mfu {}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
@@ -2044,6 +2056,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_data.metrics["tps"],
                 log_data.metrics["tps_per_gpu"],
                 log_data.metrics["num_label_tokens"],
+                log_data.metrics["num_tokens_per_step"],
+                log_data.metrics["mfu"],
             )
         )
         torch.cuda.reset_peak_memory_stats()

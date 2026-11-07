@@ -212,3 +212,131 @@ def test_linter_rejects_duplicate_top_level_keys():
     )
 
     assert any("Duplicate top-level key `model`" in error.message for error in errors)
+
+
+def _perf_text(perf_block: str) -> str:
+    return "recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: h100\n  perf_testing:\n" + perf_block
+
+
+def _perf_errors(block: str, *, default_schedule: bool = True):
+    """Lint a ``perf_testing`` block, appending a valid ``schedule`` unless the block sets one."""
+    if default_schedule and "    schedule:" not in block and not block.lstrip().startswith("-"):
+        block += "    schedule: nightly\n"
+    return lint_yaml_text(_perf_text(block), Path("examples/llm_finetune/perf.yaml"), Path.cwd())
+
+
+def test_linter_accepts_valid_perf_testing():
+    errors = _perf_errors('    time: "00:40:00"\n    schedule: weekly\n    fake_balanced_gate: false\n')
+
+    assert errors == []
+
+
+def test_linter_accepts_minimal_perf_testing():
+    assert _perf_errors("    schedule: disabled\n") == []
+
+
+def test_linter_requires_perf_testing_schedule():
+    errors = _perf_errors('    time: "00:40:00"\n', default_schedule=False)
+
+    assert len(errors) == 1
+    assert "`schedule` is required" in errors[0].message
+
+
+@pytest.mark.parametrize(
+    ("block", "expected"),
+    [
+        ("    schedule: true\n", "`schedule` must be one of"),
+        ("    schedule: 1\n", "`schedule` must be one of"),
+        ("    schedule: monthly\n", "`schedule` must be one of"),
+        ("    schedule: off\n", "`schedule` must be one of"),  # YAML 1.1 parses unquoted off as False
+        ("    time: 2400\n", "`time` must be"),
+        ('    time: "40 minutes"\n', "`time` must be"),
+        ('    time: "25:00"\n', "`time` must be"),
+        ('    time: "24:00:00"\n', "`time` must be"),
+        ("    config_overrides: {}\n", "unknown key `config_overrides`"),
+        ("    fake_balanced_gate: 1\n", "`fake_balanced_gate` must be a boolean"),
+        ("    fake_balanced_gate: 'true'\n", "`fake_balanced_gate` must be a boolean"),
+        ("    fake_balanced_gate: null\n", "`fake_balanced_gate` must be a boolean"),
+        ("    fake_balanced_gate: []\n", "`fake_balanced_gate` must be a boolean"),
+        ("    fake_balanced_gate: {}\n", "`fake_balanced_gate` must be a boolean"),
+        ("    parallelism: {}\n", "unknown key `parallelism`"),
+        ("    nightly: true\n", "unknown key `nightly`"),
+        ("    2: true\n", "key `2` must be a string"),
+    ],
+)
+def test_linter_rejects_invalid_perf_testing(block: str, expected: str):
+    errors = _perf_errors(block)
+
+    assert len(errors) == 1
+    assert expected in errors[0].message
+
+
+def test_linter_rejects_non_mapping_perf_testing():
+    errors = _perf_errors("    - a\n")
+
+    assert len(errors) == 1
+    assert "must be a mapping" in errors[0].message
+
+
+def test_linter_rejects_duplicate_perf_testing_keys_with_line_numbers():
+    errors = _perf_errors("    schedule: nightly\n    schedule: weekly\n")
+
+    assert len(errors) == 1
+    assert "Duplicate key `schedule`" in errors[0].message
+    assert errors[0].line == 6
+
+
+def test_linter_rejects_duplicate_fake_gate_keys():
+    errors = _perf_errors("    fake_balanced_gate: true\n    fake_balanced_gate: false\n")
+
+    assert len(errors) == 1
+    assert "Duplicate key `fake_balanced_gate`" in errors[0].message
+    assert errors[0].line == 6
+
+
+@pytest.mark.parametrize("key", ["recipe", "dataset.seq_len", "step_scheduler.local_batch_size", "distributed.ep_size"])
+def test_linter_rejects_workload_changes_in_perf_testing(key: str) -> None:
+    errors = _perf_errors(f"    config_overrides:\n      {key}: 4\n")
+
+    assert len(errors) == 1
+    assert "unknown key `config_overrides`" in errors[0].message
+
+
+def test_linter_reports_perf_testing_error_on_offending_line():
+    errors = _perf_errors("    schedule: 0\n")
+
+    assert errors[0].line == 5
+
+
+def test_linter_still_validates_perf_testing_for_deprecated_recipes():
+    text = (
+        "recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  deprecated: true\n  perf_testing:\n    time: nope\n"
+    )
+
+    errors = lint_yaml_text(text, Path("examples/llm_finetune/perf.yaml"), Path.cwd())
+
+    messages = " ".join(e.message for e in errors)
+    assert "`schedule` is required" in messages
+    assert "`time` must be" in messages
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "invalid_line"),
+    [("bogus", "nightly", None), ("nightly", "bogus", 7)],
+)
+def test_linter_checks_the_last_duplicate_perf_testing_section(first: str, second: str, invalid_line: int | None):
+    text = (
+        "recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: h100\n"
+        f"  perf_testing:\n    schedule: {first}\n  perf_testing:\n    schedule: {second}\n"
+    )
+
+    errors = lint_yaml_text(text, Path("examples/llm_finetune/perf.yaml"), Path.cwd())
+
+    assert "Duplicate key `perf_testing` in `ci`" in errors[0].message
+    assert errors[0].line == 6
+    if invalid_line is None:
+        assert len(errors) == 1
+    else:
+        assert len(errors) == 2
+        assert "`schedule` must be one of" in errors[1].message
+        assert errors[1].line == invalid_line

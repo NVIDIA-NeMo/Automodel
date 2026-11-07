@@ -1,4 +1,3 @@
-
 # ------------------------------------------------------------------------------------------------
 # WARNING: HARDWARE REQUIREMENTS
 # ------------------------------------------------------------------------------------------------
@@ -10,8 +9,8 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 1024
-  local_batch_size: 64
+  global_batch_size: 256
+  local_batch_size: 4
   ckpt_every_steps: 100
   val_every_steps: 50
   num_epochs: 2
@@ -33,15 +32,13 @@ model:
   torch_dtype: bfloat16
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: sdpa
     linear: torch
-    rms_norm: torch_fp32
-    experts: torch_mm
-    dispatcher: deepep
+    rms_norm: torch
+    experts: torch
+    dispatcher: torch
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
-    enable_fsdp_optimizations: true
-
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/qwen3_moe_sft
@@ -54,11 +51,21 @@ distributed:
   cp_size: 1
   pp_size: 1
   ep_size: 8
-  activation_checkpointing: true
-
   sequence_parallel: false
-
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: false
+    ignore_router_for_ac: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
 loss_fn:
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -66,34 +73,40 @@ dataset:
   path_or_dataset: rowan/hellaswag
   split: train
 
+  pad_to_max_length: false
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   shuffle: true
   num_workers: 4
 
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
   num_samples_limit: 128
 
+  pad_to_max_length: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
   num_workers: 4
 
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: torch.optim.Adam
   lr: 1.0e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
 
+packed_sequence:
+  packed_sequence_size: 4096
+  packing_strategy: neat
 ci:
   cluster_tag: h100
   recipe_owner: hemildesai
-  time: "00:25:00"
+  time: "01:00:00"
   known_issue_id: AM-648
   allow_failure: true
   checkpoint_robustness:
@@ -102,3 +115,7 @@ ci:
     hf_device_map_auto: true
     dataset.num_samples_limit: 500
     validation_dataset.num_samples_limit: 500
+  perf_testing:
+    fake_balanced_gate: true
+    schedule: nightly
+  nodes: 1
