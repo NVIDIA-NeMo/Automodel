@@ -39,16 +39,19 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     convert_attention_mask_to_padding_mask,
     shard_batch_contiguous,
 )
+from nemo_automodel.components.models.common.mtp.mtp import _packed_seq_ids_from_padded_lengths
 
 
 def _synthesize_single_document_seq_ids(batch: dict, seq_len: int) -> None:
-    """Materialize the trivial single-document ``_packed_seq_ids`` map.
+    """Materialize the ``_packed_seq_ids`` document map when the collate did not emit one.
 
-    Collates emit ``_packed_seq_ids`` only when 2+ documents are packed, but
     Gemma4's manual CP attention mask builder needs document boundaries even
-    for one document (1 = real token, 0 = pad). Derived from ``padding_mask``
-    when present, else all-ones. A no-op when ``_packed_seq_ids`` already
-    exists (genuinely packed input).
+    for one document (1 = real token, 0 = pad). THD collates describe packed
+    documents only through ``seq_lens_padded`` (``[B, num_docs]``, negative
+    sentinels after each row's last document), so that becomes one id per
+    document; otherwise the map is the single document derived from
+    ``padding_mask`` when present, else all-ones. A no-op when
+    ``_packed_seq_ids`` already exists.
 
     Args:
         batch: The CP batch dict; mutated in place to add ``_packed_seq_ids``.
@@ -57,6 +60,13 @@ def _synthesize_single_document_seq_ids(batch: dict, seq_len: int) -> None:
     if "_packed_seq_ids" in batch:
         return
     primary = batch["inputs_embeds"] if "inputs_embeds" in batch else batch["input_ids"]
+    seq_lens_padded = batch.get("seq_lens_padded")
+    if seq_lens_padded is not None:
+        # Without this, a THD pack is treated as one document and attends across its boundaries.
+        batch["_packed_seq_ids"] = _packed_seq_ids_from_padded_lengths(
+            seq_lens_padded, batch_size=primary.shape[0], seq_len=seq_len, device=primary.device
+        )
+        return
     padding_mask = batch.get("padding_mask")
     if padding_mask is not None:
         # padding_mask is [B, S], True == pad -> real-token map is its inverse.

@@ -23,6 +23,8 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoi
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.distributed.fsdp_patches import (
+    _fsdp_state_param_groups,
+    patch_fsdp_restore_unused_param_grads,
     patch_fsdp_uniform_reduce_dtype,
     patch_fsdp_unused_param_reduction,
 )
@@ -97,12 +99,15 @@ def test_configure_fsdp_unused_param_reduction_uses_public_fsdp_api(monkeypatch)
             self.calls.append((enabled, recurse))
 
     install_fallback = Mock()
+    install_restore = Mock()
     monkeypatch.setattr(parallelizer_utils, "FSDPModule", FakeFSDPModule)
     monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", install_fallback)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_restore_unused_param_grads", install_restore)
     model = nn.Sequential(FakeFSDPModule(), nn.Sequential(FakeFSDPModule()))
 
     assert configure_fsdp_unused_param_reduction(model) == 2
     install_fallback.assert_not_called()
+    install_restore.assert_called_once_with()
     assert model[0].calls == [(True, False)]
     assert model[1][0].calls == [(True, False)]
 
@@ -114,12 +119,15 @@ def test_configure_fsdp_unused_param_reduction_uses_legacy_fallback(monkeypatch)
         pass
 
     install_fallback = Mock()
+    install_restore = Mock()
     monkeypatch.setattr(parallelizer_utils, "FSDPModule", LegacyFSDPModule)
     monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", install_fallback)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_restore_unused_param_grads", install_restore)
     model = nn.Sequential(LegacyFSDPModule(), nn.Sequential(LegacyFSDPModule()))
 
     assert configure_fsdp_unused_param_reduction(model) == 2
     install_fallback.assert_called_once_with()
+    install_restore.assert_called_once_with()
 
 
 def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch):
@@ -155,6 +163,242 @@ def test_legacy_fsdp_unused_param_reduction_fills_missing_local_grad(monkeypatch
     assert torch.equal(param.grad, torch.zeros_like(param))
     assert calls == [(param_group, ("arg",), {"flag": True})]
     assert FSDPParamGroup.post_backward is patched_post_backward
+
+
+def _fake_fsdp_param(
+    *, used_locally: bool = False, grad_before: torch.Tensor | None = None, requires_grad: bool = True
+):
+    """FSDP2 parameter stand-in with a sharded parameter and an optional local unsharded gradient."""
+    sharded = nn.Parameter(torch.zeros(2), requires_grad=requires_grad)
+    sharded.grad = grad_before
+    unsharded = nn.Parameter(torch.zeros(2))
+    unsharded.grad = torch.ones(2) if used_locally else None
+    return SimpleNamespace(
+        sharded_param=sharded, _unsharded_param=unsharded, unsharded_param=unsharded, unsharded_accumulated_grad=None
+    )
+
+
+def _fake_param_group(fsdp_params, *, mesh_info_cls=None, zero_fills: bool = True, reduce_grads: bool = True):
+    """FSDP2 parameter group stand-in over the given parameters, sharded over one FSDP mesh by default."""
+    from torch.distributed.fsdp._fully_shard._fsdp_common import FSDPMeshInfo, TrainingState
+
+    return SimpleNamespace(
+        fsdp_params=fsdp_params,
+        reduce_scatter_unused_params=zero_fills,
+        reduce_grads=reduce_grads,
+        _training_state=TrainingState.PRE_BACKWARD,
+        mesh_info=object.__new__(mesh_info_cls or FSDPMeshInfo),
+        _reduce_scatter_process_group="shard-group",
+        _all_reduce_process_group="replicate-group",
+        device=torch.device("cpu"),
+        _partial_reduce_output=None,
+    )
+
+
+def _install_restore_patch(monkeypatch, *, legacy_fill: bool = False):
+    """Install the restore patch over stub FSDP2 hooks that reduce like a zero-filling reduce-scatter."""
+    from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
+
+    def post_backward(self, *args, **kwargs):
+        # Every requires-grad parameter takes part, so a missing sharded gradient becomes a reduced zero.
+        for fsdp_param in self.fsdp_params:
+            if fsdp_param.sharded_param.requires_grad and fsdp_param.sharded_param.grad is None:
+                fsdp_param.sharded_param.grad = torch.zeros(2)
+        self._training_state = TrainingState.POST_BACKWARD
+        return "post-backward-result"
+
+    post_backward._automodel_reduce_scatter_unused_params = legacy_fill
+    monkeypatch.setattr(FSDPParamGroup, "post_backward", post_backward)
+    monkeypatch.setattr(FSDPState, "_root_post_backward_final_callback", lambda self: "final-callback-result")
+    patch_fsdp_restore_unused_param_grads()
+    return FSDPParamGroup, FSDPState
+
+
+def _fake_all_reduce(monkeypatch, peer_flags):
+    """Make ``dist.all_reduce`` take the elementwise max with one peer's usage flags; return the calls."""
+    calls = []
+
+    def all_reduce(tensor, op, group):
+        calls.append((op, group))
+        tensor.copy_(torch.maximum(tensor, torch.tensor(peer_flags, dtype=tensor.dtype)))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    return calls
+
+
+def _root(groups):
+    """FSDP2 root state stand-in whose single state holds ``groups``."""
+    return SimpleNamespace(_state_ctx=SimpleNamespace(all_states=[SimpleNamespace(_fsdp_param_groups=groups)]))
+
+
+def _backward_through(param_group_cls, state_cls, groups):
+    """Run each group's post-backward, then the root final callback over one state holding them."""
+    for group in groups:
+        assert param_group_cls.post_backward(group) == "post-backward-result"
+    return state_cls._root_post_backward_final_callback(_root(groups))
+
+
+def test_restore_unused_param_grads_resets_only_grads_no_rank_used(monkeypatch):
+    param_group_cls, state_cls = _install_restore_patch(monkeypatch)
+    unused_everywhere = _fake_fsdp_param()
+    used_by_peer = _fake_fsdp_param()
+    used_here = _fake_fsdp_param(used_locally=True)
+    earlier_contribution = torch.full((2,), 3.0)
+    used_earlier = _fake_fsdp_param(grad_before=earlier_contribution)
+    frozen = _fake_fsdp_param(requires_grad=False)
+    # A unit that never ran forward on this rank has no unsharded parameter yet.
+    never_unsharded = _fake_fsdp_param()
+    del never_unsharded._unsharded_param
+    group = _fake_param_group([unused_everywhere, used_by_peer, used_here, used_earlier, frozen, never_unsharded])
+    calls = _fake_all_reduce(monkeypatch, peer_flags=[0, 1, 0, 0, 0])
+
+    assert _backward_through(param_group_cls, state_cls, [group]) == "final-callback-result"
+
+    assert unused_everywhere.sharded_param.grad is None
+    assert torch.equal(used_by_peer.sharded_param.grad, torch.zeros(2))
+    assert torch.equal(used_here.sharded_param.grad, torch.zeros(2))
+    assert used_earlier.sharded_param.grad is earlier_contribution
+    assert frozen.sharded_param.grad is None
+    assert never_unsharded.sharded_param.grad is None
+    assert calls == [(torch.distributed.ReduceOp.MAX, "shard-group")]
+    assert group._automodel_unused_param_probe is None
+
+
+def test_restore_unused_param_grads_reduces_usage_over_both_hsdp_groups(monkeypatch):
+    from torch.distributed.fsdp._fully_shard._fsdp_common import HSDPMeshInfo
+
+    param_group_cls, state_cls = _install_restore_patch(monkeypatch)
+    fsdp_param = _fake_fsdp_param()
+    group = _fake_param_group([fsdp_param], mesh_info_cls=HSDPMeshInfo)
+    calls = _fake_all_reduce(monkeypatch, peer_flags=[1])
+
+    _backward_through(param_group_cls, state_cls, [group])
+
+    assert torch.equal(fsdp_param.sharded_param.grad, torch.zeros(2))
+    assert calls == [
+        (torch.distributed.ReduceOp.MAX, "shard-group"),
+        (torch.distributed.ReduceOp.MAX, "replicate-group"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("group_kwargs", "pending_partial_reduce", "expected_calls"),
+    [({"reduce_grads": False}, False, 0), ({"zero_fills": False}, False, 0), ({}, True, 1)],
+    ids=["no-reduction-this-backward", "group-without-zero-fill", "deferred-hsdp-all-reduce"],
+)
+def test_restore_unused_param_grads_keeps_zeros_this_reduction_did_not_create(
+    monkeypatch, group_kwargs, pending_partial_reduce, expected_calls
+):
+    param_group_cls, state_cls = _install_restore_patch(monkeypatch)
+    fsdp_param = _fake_fsdp_param()
+    group = _fake_param_group([fsdp_param], **group_kwargs)
+    if pending_partial_reduce:
+        # Earlier micro-batches' reduce-scatter output still waits for its deferred all-reduce.
+        group._partial_reduce_output = torch.ones(2)
+    calls = _fake_all_reduce(monkeypatch, peer_flags=[0])
+
+    _backward_through(param_group_cls, state_cls, [group])
+
+    assert len(calls) == expected_calls
+    assert torch.equal(fsdp_param.sharded_param.grad, torch.zeros(2))
+
+
+def test_restore_unused_param_grads_probes_legacy_fill_and_ignores_repeated_post_backward(monkeypatch):
+    param_group_cls, state_cls = _install_restore_patch(monkeypatch, legacy_fill=True)
+    # The legacy fill is process-global, so a group without the public flag still zero-fills.
+    fsdp_param = _fake_fsdp_param()
+    group = _fake_param_group([fsdp_param], zero_fills=False)
+    calls = _fake_all_reduce(monkeypatch, peer_flags=[0])
+
+    param_group_cls.post_backward(group)
+    probe = group._automodel_unused_param_probe
+    # A repeated post-backward in the same backward must not overwrite the first probe.
+    param_group_cls.post_backward(group)
+    assert group._automodel_unused_param_probe is probe
+    state_cls._root_post_backward_final_callback(_root([group]))
+
+    assert len(calls) == 1
+    assert fsdp_param.sharded_param.grad is None
+    assert param_group_cls.post_backward._automodel_reduce_scatter_unused_params is True
+
+
+def test_restore_unused_param_grads_survives_tolerated_post_backward_failures(monkeypatch):
+    param_group_cls, state_cls = _install_restore_patch(monkeypatch)
+    reduced = _fake_fsdp_param()
+    reduced_group = _fake_param_group([reduced])
+    never_forwarded = _fake_param_group([_fake_fsdp_param()])
+    calls = _fake_all_reduce(monkeypatch, peer_flags=[0])
+    assert param_group_cls.post_backward(reduced_group) == "post-backward-result"
+
+    # Re-install over raising originals, the way the MoE pipeline path meets a never-forwarded FSDP unit.
+    def raising_post_backward(self, *args, **kwargs):
+        raise AttributeError("'FSDPCommContext' object has no attribute 'post_forward_order'")
+
+    def raising_final_callback(self):
+        raise AttributeError("'FSDPCommContext' object has no attribute 'post_forward_order'")
+
+    monkeypatch.setattr(param_group_cls, "post_backward", raising_post_backward)
+    monkeypatch.setattr(state_cls, "_root_post_backward_final_callback", raising_final_callback)
+    patch_fsdp_restore_unused_param_grads()
+
+    with pytest.raises(AttributeError, match="post_forward_order"):
+        param_group_cls.post_backward(never_forwarded)
+    assert never_forwarded._automodel_unused_param_probe is None
+    with pytest.raises(AttributeError, match="post_forward_order"):
+        state_cls._root_post_backward_final_callback(_root([reduced_group, never_forwarded]))
+
+    assert reduced.sharded_param.grad is None
+    assert len(calls) == 1
+    assert reduced_group._automodel_unused_param_probe is None
+
+
+def test_patch_fsdp_restore_unused_param_grads_is_idempotent(monkeypatch):
+    param_group_cls, state_cls = _install_restore_patch(monkeypatch)
+    post_backward = param_group_cls.post_backward
+    final_callback = state_cls._root_post_backward_final_callback
+
+    patch_fsdp_restore_unused_param_grads()
+
+    assert param_group_cls.post_backward is post_backward
+    assert state_cls._root_post_backward_final_callback is final_callback
+
+
+def test_patch_fsdp_unused_param_reduction_refuses_to_wrap_outside_the_probe(monkeypatch):
+    param_group_cls, _ = _install_restore_patch(monkeypatch)  # public-API build: no legacy fill underneath
+    probe = param_group_cls.post_backward
+
+    with pytest.raises(RuntimeError, match="must be installed before patch_fsdp_restore_unused_param_grads"):
+        patch_fsdp_unused_param_reduction()
+
+    assert param_group_cls.post_backward is probe
+
+
+def test_patch_fsdp_unused_param_reduction_stays_idempotent_under_the_probe(monkeypatch):
+    param_group_cls, _ = _install_restore_patch(monkeypatch, legacy_fill=True)
+    probe = param_group_cls.post_backward
+
+    patch_fsdp_unused_param_reduction()
+
+    assert param_group_cls.post_backward is probe
+
+
+def test_patch_fsdp_restore_unused_param_grads_requires_fsdp2_internals(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_state", None)
+
+    with pytest.raises(RuntimeError, match="keeps gradients of parameters no rank used as None"):
+        patch_fsdp_restore_unused_param_grads()
+
+
+def test_fsdp_state_param_groups_supports_single_and_multiple_group_states():
+    group = object()
+
+    assert _fsdp_state_param_groups(SimpleNamespace(_fsdp_param_groups=(group,))) == [group]
+    assert _fsdp_state_param_groups(SimpleNamespace(_fsdp_param_group=group)) == [group]
+    assert _fsdp_state_param_groups(SimpleNamespace(_fsdp_param_group=None)) == []
 
 
 def _install_uniform_reduce_dtype(monkeypatch, recorder):
@@ -267,9 +511,11 @@ def test_configure_fsdp_unused_param_reduction_installs_dtype_alignment_first(mo
     monkeypatch.setattr(parallelizer_utils, "FSDPModule", LegacyFSDPModule)
     monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_uniform_reduce_dtype", lambda: order.append("uniform_dtype"))
     monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_unused_param_reduction", lambda: order.append("zero_fill"))
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_restore_unused_param_grads", lambda: order.append("restore"))
 
     assert configure_fsdp_unused_param_reduction(nn.Sequential(LegacyFSDPModule())) == 1
-    assert order == ["uniform_dtype", "zero_fill"]
+    # The restore probe wraps the fill so it sees gradients before the zero fill.
+    assert order == ["uniform_dtype", "zero_fill", "restore"]
 
 
 def _tag_hf_compute_dtype(model: nn.Module) -> None:

@@ -30,6 +30,7 @@ class _OneStepScheduler:
         self.is_ckpt_step = False
         self.sigterm_flag = False
         self.sigterm_received = False
+        self.stream_exhausted = False
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -108,6 +109,7 @@ def test_encoder_loop_sets_dataset_epoch():
 def test_vlm_loop_calls_gc_hook():
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.model_parts = [MagicMock()]
+    recipe.dataloader = None
     recipe.step_scheduler = _OneStepScheduler()
     recipe.max_grad_norm = 1.0
     recipe._run_train_optim_step = MagicMock(return_value=_dummy_metrics())

@@ -292,6 +292,8 @@ navigation:
                 path: ../../model-coverage/llm/moonshotai/kimi-k2-base.mdx
               - page: "Kimi-K3"
                 path: ../../model-coverage/llm/moonshotai/kimi-k3.mdx
+              - page: "Kimi-K3.1-Pro"
+                path: ../../model-coverage/llm/moonshotai/kimi-k31-pro.mdx
               - page: "Kimi-Linear-48B-A3B-Instruct"
                 path: ../../model-coverage/llm/moonshotai/kimi-linear-48b-a3b-instruct.mdx
               - page: "Moonlight-16B-A3B"
@@ -623,6 +625,8 @@ navigation:
                 path: ../../model-coverage/vlm/moonshotai/kimi-k2-5.mdx
               - page: "Kimi-K3"
                 path: ../../model-coverage/vlm/moonshotai/kimi-k3.mdx
+              - page: "Kimi-K3.1-Pro"
+                path: ../../model-coverage/vlm/moonshotai/kimi-k31-pro.mdx
               - page: "Kimi-VL-A3B-Instruct"
                 path: ../../model-coverage/vlm/moonshotai/kimi-vl.mdx
           - section: "NVIDIA"
@@ -1041,6 +1045,9 @@ navigation:
           - page: "Train a DSpark Drafter for Speculative Decoding"
             path: ../../guides/speculative/dspark.mdx
             slug: dspark-speculative-decoding
+          - page: "Finetune a Model's Native MTP Head for Speculative Decoding"
+            path: ../../guides/speculative/mtp.mdx
+            slug: mtp-speculative-decoding
   - section: "Data"
     slug: datasets
     contents:
