@@ -228,6 +228,7 @@ def test_frozen_nvfp4_conversion_preserves_hybridep_settings(moe_config: MoEConf
         dispatcher_hybridep_num_sms_preprocessing=12,
         dispatcher_hybridep_num_blocks_permute=16,
         dispatcher_hybridep_num_blocks_unpermute=20,
+        dispatcher_hybridep_max_tokens_per_rank=4096,
         dispatcher_capacity_factor=1.5,
         dispatcher_equal_token_counts=True,
         dispatcher_recompute_cache="combine",
@@ -250,6 +251,7 @@ def test_frozen_nvfp4_conversion_preserves_hybridep_settings(moe_config: MoEConf
     assert converted.dispatcher_hybridep_num_sms_preprocessing == 12
     assert converted.dispatcher_hybridep_num_blocks_permute == 16
     assert converted.dispatcher_hybridep_num_blocks_unpermute == 20
+    assert converted.dispatcher_hybridep_max_tokens_per_rank == 4096
     assert converted.dispatcher_capacity_factor == 1.5
     assert converted.dispatcher_equal_token_counts is True
     assert converted.dispatch_rows_never_empty is True
