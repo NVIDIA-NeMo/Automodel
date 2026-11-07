@@ -62,6 +62,8 @@ from nemo_automodel._transformers.infrastructure import (
     instantiate_infrastructure,
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components._peft.lora import lora_token_gate
+from nemo_automodel.components.attention.gated_mtp_mask import create_gated_mtp_block_mask, create_gated_mtp_sdpa_mask
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
@@ -98,6 +100,7 @@ from nemo_automodel.components.models.common.packing import (
     validate_thd_packing_support,
 )
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.speculative.gated_mtp import GatedMTPLayout
 from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -529,6 +532,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     # (e.g. unit tests that exercise the step directly). It is read-only.
     magi = MagiState()
     domain_mixture = None
+    gated_mtp: GatedMTPLayout | None = None
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -817,6 +821,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
+
+        self.gated_mtp = None
+        if self.cfg.gated_mtp is not None:
+            self.gated_mtp = self.cfg.gated_mtp.build()
+            self._validate_gated_mtp(is_packed=dataloader_config.is_packed)
 
         # Optional setup-time prewarms (cuBLAS workspaces, Triton autotune
         # caches, NCCL communicators) while the allocator pool is still small,
@@ -1258,6 +1267,58 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = False
 
     # ------------------ helpers ------------------
+    def _validate_gated_mtp(self, *, is_packed: bool) -> None:
+        """Reject setups that gated-LoRA MTP does not support.
+
+        The base model must stay frozen with a plain LoRA adapter (else the next-token distribution changes and the
+        drafts are no longer lossless), the attention backend must honor the gated-MTP mask, and the layout needs
+        unpacked sequences without context, tensor, or pipeline parallelism.
+
+        Args:
+            is_packed: Whether the dataloader packs sequences.
+        """
+        model = self.model_parts[0]
+        if self.peft_config is None or self.peft_config.use_dora:
+            raise ValueError("gated_mtp trains a token-gated LoRA adapter; add a `peft:` LoRA config without DoRA.")
+        if model.supports.mtp_enabled:
+            raise ValueError("gated_mtp cannot be combined with the model's native MTP layers; disable them.")
+        if self.pp_enabled or self.mesh_context.cp_size > 1 or self.mesh_context.tp_size > 1:
+            raise NotImplementedError("gated_mtp does not support pipeline, context, or tensor parallelism yet.")
+        if is_packed:
+            raise NotImplementedError("gated_mtp does not support packed sequences yet.")
+        config = getattr(model, "config", None)
+        if getattr(config, "_attn_implementation", None) not in ("sdpa", "eager", "flex_attention"):
+            raise ValueError("gated_mtp needs attn_implementation 'sdpa', 'eager', or 'flex_attention'.")
+        vocab_size = getattr(config, "vocab_size", None)
+        if vocab_size is not None and not all(0 <= i < vocab_size for i in self.gated_mtp.mask_token_ids):
+            raise ValueError(f"gated_mtp.mask_token_ids must lie in the model vocabulary of size {vocab_size}.")
+
+    def _gated_mtp_attention_mask(
+        self, model: nn.Module, valid_mask: torch.Tensor
+    ) -> torch.Tensor | torch.nn.attention.flex_attention.BlockMask:
+        """Build the gated-MTP attention mask for the model's attention backend.
+
+        Args:
+            model: The model the mask is passed to.
+            valid_mask: Padding-validity mask over the clean copy, Tensor of shape [batch, sequence].
+
+        Returns:
+            A FlexAttention ``BlockMask`` for ``flex_attention``, else a dense additive Tensor of shape
+            [batch, 1, sequence * (1 + depths), sequence * (1 + depths)] in the dtype attention runs in.
+        """
+        num_depths = self.gated_mtp.num_depths
+        if model.config._attn_implementation == "flex_attention":
+            return create_gated_mtp_block_mask(num_depths, valid_mask)
+        # Build the additive mask in the dtype attention runs in (autocast, else the FSDP2 mixed-precision param
+        # dtype, else the weights' dtype, e.g. bf16 weights under DDP): SDPA does not cast the mask for us.
+        mp_policy = getattr(self.distributed_config, "mp_policy", None)
+        mask_dtype = (
+            getattr(self.distributed_config, "autocast_dtype", None)
+            or getattr(mp_policy, "param_dtype", None)
+            or model.get_input_embeddings().weight.dtype
+        )
+        return create_gated_mtp_sdpa_mask(num_depths, valid_mask, dtype=mask_dtype)
+
     def _forward_backward_step(
         self,
         idx,
@@ -1410,7 +1471,19 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with train_ctx(), sync_ctx, fp8_ctx:
+            gated_mtp_ctx = nullcontext()
+            if self.gated_mtp is not None:
+                # Append the mask tokens and gate the LoRA adapter on for them only. The gate stays installed
+                # through backward so that activation-checkpoint recomputation sees it too.
+                valid_mask = batch.get("attention_mask")
+                if valid_mask is None:
+                    valid_mask = torch.ones_like(batch["input_ids"])
+                gated_mtp_inputs = self.gated_mtp.prepare_inputs(batch["input_ids"], batch.get("position_ids"))
+                batch["input_ids"] = gated_mtp_inputs.input_ids
+                batch["position_ids"] = gated_mtp_inputs.position_ids
+                batch["attention_mask"] = self._gated_mtp_attention_mask(model, valid_mask)
+                gated_mtp_ctx = lora_token_gate(model, gated_mtp_inputs.lora_gate)
+            with train_ctx(), sync_ctx, fp8_ctx, gated_mtp_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, LinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1419,8 +1492,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         raise ValueError(
                             f"{type(self.loss_fn).__name__} requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
                         )
+                elif self.gated_mtp is not None:
+                    out = model(**batch, output_hidden_states=True)
                 else:
                     out = model(**batch)
+                if self.gated_mtp is not None:
+                    # Split into the clean copy (the base model) and the MTP depths (the mask tokens).
+                    out = self.gated_mtp.split_output(getattr(out, "logits", None), get_final_hidden_states(out))
 
                 # Gather the LM head once and share it across the main loss and
                 # all MTP depths (linear CE path) to avoid redundant

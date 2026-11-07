@@ -49,3 +49,34 @@ Watch `val_mtp_tau_sim` across validation runs: it should trend upward as the
 MTP head adapts to the fine-tuning domain. A value near `1.0` means the MTP
 head is barely contributing beyond the main head's own next token; a value
 approaching `1 + num_mtp_layers` means every MTP depth is being accepted.
+
+## Gated-LoRA MTP for models without an MTP head
+
+`qwen3_0p6b_gated_lora_mtp.yaml` adds MTP to a model that has no MTP layers,
+following [Your LLM Knows the Future](https://arxiv.org/abs/2507.11851). A
+`gated_mtp:` block lists one mask token id per MTP depth:
+
+```yaml
+gated_mtp:
+  mask_token_ids: [151700, 151701, 151702]
+```
+
+Every position in the batch is an anchor: one mask token per depth is appended
+after it, and a LoRA adapter that is only active on the mask tokens learns to
+draft the next tokens from them. All other tokens use the frozen base weights,
+so the model's own next-token distribution is unchanged and it verifies the
+drafts losslessly. The mask tokens' hidden states are fed to the same MTP loss
+and `val_mtp_tau_sim` metric as a native MTP head. `mtp.distillation_mode: soft`
+distills every depth towards the frozen base model's distribution, the
+verifier at decode time:
+
+```bash
+automodel examples/llm_finetune/mtp_finetune/qwen3_0p6b_gated_lora_mtp.yaml --nproc-per-node 8
+```
+
+The validation loss stays constant during training, since it is the base
+model's loss. The dense layout multiplies the sequence length by
+`1 + len(mask_token_ids)` and needs an attention backend that accepts a custom
+mask (`flex_attention`, preferred at scale, `sdpa`, or `eager`). It supports
+FSDP2/HSDP and DDP, but not yet tensor, context, or pipeline parallelism,
+packed sequences, DoRA, or LoRA on MoE experts.
