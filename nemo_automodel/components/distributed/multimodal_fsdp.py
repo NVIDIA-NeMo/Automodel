@@ -105,7 +105,7 @@ def _is_module_container(module: nn.Module) -> bool:
     return isinstance(module, (nn.ModuleList, nn.ModuleDict))
 
 
-def _container_items(module: nn.Module) -> list[tuple[object, nn.Module]]:
+def _container_items(module: nn.Module) -> list[tuple[str | int, nn.Module]]:
     if isinstance(module, nn.ModuleDict):
         return list(module.items())
     return list(enumerate(module))

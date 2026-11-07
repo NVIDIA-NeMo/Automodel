@@ -31,7 +31,7 @@ YAML / dict parsing belongs in the recipe layer — see
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 from nemo_automodel.components.distributed.config import ActivationCheckpointingMode, DistributedStrategyConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
@@ -198,14 +198,14 @@ class MeshContext:
         return (MeshAxisName.DP_SHARD_CP,)
 
     # @akoumpa: we will deprecate `pipeline_axis_kwargs` in 26.04.
-    def pipeline_axis_kwargs(self) -> Dict[str, object]:
+    def pipeline_axis_kwargs(self) -> dict[str, str | tuple[str, ...] | None]:
         """Axis-name kwargs for ``AutoPipeline``."""
         return {
             "pp_axis_name": MeshAxisName.PP,
         } | self.parallelize_axis_kwargs()
 
     # @akoumpa: we will deprecate `parallelize_axis_kwargs` in 26.04.
-    def parallelize_axis_kwargs(self) -> Dict[str, object]:
+    def parallelize_axis_kwargs(self) -> dict[str, str | tuple[str, ...] | None]:
         """Axis-name kwargs for ``parallelize_fn`` (EP/FSDP, no ``pp_axis_name``)."""
         return {
             "dp_axis_names": self._dp_axis_names(),

@@ -17,6 +17,8 @@ set -euo pipefail
 # Environment variables expected from CI template:
 #   CONFIG_PATH, TEST_LEVEL, NPROC_PER_NODE, TEST_NODE_COUNT,
 #   MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, PIPELINE_DIR, TEST_NAME
+# Optional recipe metadata overrides the node's default GPU rank count.
+NPROC_PER_NODE=${CONFIG_NPROC_PER_NODE:-$NPROC_PER_NODE}
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/diffusion_finetune_recipe_config.sh"
@@ -102,6 +104,7 @@ if [ "$MEDIA_TYPE" = "image_edit" ]; then
         --output_dir "$DATA_DIR/cache" \
         --processor "$PROCESSOR" \
         --model_name "$MODEL_NAME" \
+        --num_gpus "$NPROC_PER_NODE" \
         $PREPROCESS_EXTRA_ARGS
 elif [ "$MEDIA_TYPE" = "image" ]; then
     uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess image \
