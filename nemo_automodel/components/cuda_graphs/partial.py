@@ -988,11 +988,14 @@ class PartialCudaGraphManager:
                         if entry.retain_graph_in_backward:
                             graph_kwargs["retain_graph_in_backward"] = True
                         try:
-                            result = _get_make_graphed_callables()(
-                                modules=(adapter,),
-                                sample_args=(entry.capture_inputs(adapter, captured_call),),
-                                **graph_kwargs,
-                            )
+                            # Graph warmup and capture may retain backward graphs, which compiled
+                            # backwards with donated buffers reject.
+                            with torch._functorch.config.patch(donated_buffer=False):
+                                result = _get_make_graphed_callables()(
+                                    modules=(adapter,),
+                                    sample_args=(entry.capture_inputs(adapter, captured_call),),
+                                    **graph_kwargs,
+                                )
                         except Exception as error:
                             raise RuntimeError(f"Partial CUDA graph capture failed for {entry.name}") from error
                         if not isinstance(result, tuple):
