@@ -47,6 +47,13 @@ def test_fa4_rejects_attention_dropout():
         kimi_model.KimiMLAAttention(_small_config(attention_dropout=0.1), 3, BackendConfig(attn="fa4", linear="torch"))
 
 
+def test_fa4_rejects_dsa_indexer():
+    # Layer 4 is the tiny config's only full-attention layer, so dsa_config makes layer_idx 3 a DSA layer.
+    config = _small_config(dsa_config={"index_topk": 8, "index_head_dim": 16, "index_num_heads": 2})
+    with pytest.raises(ValueError, match="does not support the DSA indexer"):
+        kimi_model.KimiMLAAttention(config, 3, BackendConfig(attn="fa4", linear="torch"))
+
+
 def test_backend_attn_rejects_unsupported():
     with pytest.raises(ValueError, match="does not support backend.attn"):
         kimi_model.KimiMLAAttention(_small_config(), 3, BackendConfig(attn="flex", linear="torch"))

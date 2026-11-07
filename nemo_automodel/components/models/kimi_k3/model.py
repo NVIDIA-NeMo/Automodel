@@ -679,6 +679,12 @@ class KimiMLAAttention(nn.Module):
                 f"Kimi K3 MLA with backend.attn='fa4' does not support attention dropout "
                 f"(attention_dropout={self.attention_dropout}); set attention_dropout to 0 or use backend.attn='te'."
             )
+        if self.use_fa4 and self.indexer is not None:
+            raise ValueError(
+                "Kimi K3 MLA with backend.attn='fa4' does not support the DSA indexer (dsa_config); FA4 varlen "
+                "cannot apply the indexer's sparse key selection. Use backend.attn='cudnn' for the fused sparse "
+                "kernels, or 'eager', 'te' or 'sdpa'."
+            )
 
     def setup_cp_attention(self, cp_mesh) -> None:
         """Attach the context-parallel mesh used to gather full-sequence keys and values.
