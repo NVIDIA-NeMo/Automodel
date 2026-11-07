@@ -113,9 +113,14 @@ def _register_default_tokenizers():
     TokenizerRegistry.register("mistral", mistral_common)
     TokenizerRegistry.register("pixtral", mistral_common)
     TokenizerRegistry.register("mistral3", mistral_common)
+    TokenizerRegistry.register("mistral_large4", mistral_common)
     TokenizerRegistry.register("ministral3", mistral_common)
     TokenizerRegistry.register(
         "kimi_k3",
+        "nemo_automodel.components.models.kimi_k3.tokenization:TikTokenTokenizer",
+    )
+    TokenizerRegistry.register(
+        "kimi_k31",
         "nemo_automodel.components.models.kimi_k3.tokenization:TikTokenTokenizer",
     )
     # These models' chat templates render each tool-call argument as its own field, so they need

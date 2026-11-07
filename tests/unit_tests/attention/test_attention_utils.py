@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest import mock
 
 import pytest
@@ -26,7 +27,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.common.packing import flatten_packed_sequence_metadata
+from nemo_automodel.components.models.common.packing import PackingCapabilities, flatten_packed_sequence_metadata
 
 
 def _reference_varlen_sdpa(
@@ -753,9 +754,9 @@ class TestFA4Backend:
                     "n_videos": 0,
                 },
             ],
-            packing=SimpleNamespace(
+            packing=PackingCapabilities(
                 packed_mask_type="document_ids",
-                requires_packed_sequence_metadata=True,
+                return_packed_sequence_metadata=True,
             ),
         )
         attention_mask = collated["attention_mask"]

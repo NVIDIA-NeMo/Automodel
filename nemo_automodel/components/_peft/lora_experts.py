@@ -117,6 +117,7 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         self.gate_and_up_projs = orig_module.gate_and_up_projs
         self.down_projs = orig_module.down_projs
+        self.expert_activation_grouped = orig_module.expert_activation_grouped
 
         if self.expert_bias:
             self.gate_up_proj_bias = orig_module.gate_up_proj_bias
@@ -587,6 +588,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
         self.dispatcher_hybridep_num_blocks_permute = orig_module.dispatcher_hybridep_num_blocks_permute
         self.dispatcher_hybridep_num_blocks_unpermute = orig_module.dispatcher_hybridep_num_blocks_unpermute
+        self.dispatcher_hybridep_max_tokens_per_rank = orig_module.dispatcher_hybridep_max_tokens_per_rank
         # Sync-free dispatch knobs (BackendConfig.dispatcher_capacity_factor / dispatcher_equal_token_counts) travel
         # with the other HybridEP settings: the shared dispatcher is built from the first (wrapped) layer.
         self.dispatcher_capacity_factor = orig_module.dispatcher_capacity_factor
@@ -598,6 +600,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
         self.gate_and_up_projs = orig_module.gate_and_up_projs
         self.down_projs = orig_module.down_projs
+        self.expert_activation = orig_module.expert_activation
 
         if self.expert_bias:
             self.gate_up_proj_bias = orig_module.gate_up_proj_bias
