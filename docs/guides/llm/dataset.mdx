@@ -149,6 +149,10 @@ dataset:
 ```
 This calls `build_my_dataset()` from the specified file with the other keys (such as `num_blocks`) as arguments. This approach allows you to integrate custom datasets using configuration alone, with no need to alter the codebase or package structure.
 
+<Note>
+Loading the file runs its code, so NeMo AutoModel loads a file from outside the installed package only after you opt in. Launch with `NEMO_ENABLE_USER_MODULES=1 automodel my_config.yaml`, and only load files that you trust.
+</Note>
+
 ## Packed Sequence Support in NeMo AutoModel
 NeMo AutoModel supports **packed sequences**, which is a technique to optimize training with variable-length sequences (such as text) by minimizing padding.
 

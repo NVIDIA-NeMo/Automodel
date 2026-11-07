@@ -3,6 +3,25 @@ title: "Breaking Changes"
 description: ""
 position: 6
 ---
+## 0.8.0
+
+### Python Files Named by `_target_` Require an Opt-In
+
+A `_target_` or `*_fn` value in the `file.py:symbol` form runs the named file. NeMo AutoModel now loads such a file
+only when it is inside the installed `nemo_automodel` package or when you opt in. Previously, any existing file
+loaded, including a file shipped next to a downloaded configuration.
+
+If your configuration names your own file, for example a custom dataset builder, launch with the opt-in:
+
+```bash
+NEMO_ENABLE_USER_MODULES=1 automodel my_config.yaml
+```
+
+From Python, call `set_enable_user_modules(True)` from `nemo_automodel.components.config.loader` before loading the
+configuration. Without the opt-in, loading the configuration raises `ImportError` and the file does not run. A
+private or dunder symbol (a name that starts with `_` or contains `__`) is now rejected before the file runs. See
+[YAML Configuration](/get-started/configuration#target-resolution-and-code-execution) for details.
+
 ## 0.5.0
 
 ### Frozen Multimodal FSDP2 Modules Default to Root Sharding

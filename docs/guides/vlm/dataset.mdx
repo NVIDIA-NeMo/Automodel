@@ -135,6 +135,10 @@ dataset:
 ```
 This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
 
+<Note>
+Loading the file runs its code, so NeMo AutoModel loads a file from outside the installed package only after you opt in. Launch with `NEMO_ENABLE_USER_MODULES=1 automodel my_config.yaml`, and only load files that you trust.
+</Note>
+
 ## DataLoader Workers
 
 For VLM training and validation, `num_workers: 0` automatically selects one worker
