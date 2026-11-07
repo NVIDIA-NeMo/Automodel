@@ -41,6 +41,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
+from nemo_automodel.shared.deepep_v25 import DeepEpV25Config
 from nemo_automodel.shared.import_utils import is_te_min_version, safe_import
 from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
@@ -1503,6 +1504,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         self.static_routing = backend is not None and backend.benchmark_static_routing
         self.expert_bias = config.expert_bias
         self.is_gated = is_gated_activation(config.expert_activation)
+        self.deepep_v25 = backend.deepep_v25 if backend is not None else DeepEpV25Config()
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1591,6 +1593,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            deepep_v25=self.deepep_v25,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -1622,6 +1625,10 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         )
         if self.dispatcher_backend == "deepep":
             self._init_deepep_buffer(ep_group)
+        elif self.dispatcher_backend == "deepep_v25":
+            self.deepep_v25.init_buffer(
+                group=ep_group, hidden_dim=self.config.expert_dim, top_k=self.config.n_activated_experts
+            )
 
     def _init_deepep_buffer(self, ep_group: dist.ProcessGroup) -> None:
         """Initialize DeepEP communication buffers before activation checkpointing."""
@@ -1939,6 +1946,7 @@ class GroupedExpertsTE(nn.Module):
         self._static_m_splits: list | None = None
         if backend is not None and backend.compile_router_weight:
             _compile_router_weight_cores()
+        self.deepep_v25 = backend.deepep_v25 if backend is not None else DeepEpV25Config()
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
@@ -2264,6 +2272,7 @@ class GroupedExpertsTE(nn.Module):
             moe_permute_fusion=True,
             moe_enable_deepep=True,
             moe_flex_dispatcher_backend=self.dispatcher_backend,
+            deepep_v25=self.deepep_v25,
             moe_deepep_num_sms=self.dispatcher_num_sms,
             moe_hybridep_num_sms=self.dispatcher_num_sms,
             moe_share_token_dispatcher=self.dispatcher_share_token_dispatcher,
@@ -2287,6 +2296,10 @@ class GroupedExpertsTE(nn.Module):
             config=token_dispatcher_config,
             ep_group=ep_mesh.get_group(),
         )
+        if self.dispatcher_backend == "deepep_v25":
+            self.deepep_v25.init_buffer(
+                group=ep_mesh.get_group(), hidden_dim=self.config.expert_dim, top_k=self.config.n_activated_experts
+            )
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
         """Return dispatcher-owned resources that must be ready before a PP step.

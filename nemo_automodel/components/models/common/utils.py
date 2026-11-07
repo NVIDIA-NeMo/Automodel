@@ -32,6 +32,7 @@ from transformers import PretrainedConfig
 from transformers.generation import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.shared.deepep_v25 import DeepEpV25Config
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
@@ -528,8 +529,10 @@ class BackendConfig:
             Device and precision support follows TE's ``GroupedLinear`` contract.
             Parameters and checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
-            "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
+            "deepep" uses legacy DeepEP, "deepep_v25" uses the v2.5 EPBuffer API,
+            "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
+        deepep_v25: DeepEP v2.5 token capacity; required when selecting "deepep_v25".
         mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
             manager instance across MoE layers.
@@ -636,13 +639,14 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "deepep_v25", "mok"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
+    deepep_v25: DeepEpV25Config = field(default_factory=DeepEpV25Config)
     te_grouped_tensor: bool = False
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
@@ -757,6 +761,13 @@ class BackendConfig:
         elif not isinstance(self.cuda_graph, CudaGraphConfig):
             raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
 
+        if isinstance(self.deepep_v25, dict):
+            self.deepep_v25 = DeepEpV25Config(**self.deepep_v25)
+        elif not isinstance(self.deepep_v25, DeepEpV25Config):
+            raise TypeError("deepep_v25 must be a DeepEpV25Config or mapping")
+        if self.dispatcher == "deepep_v25" and self.deepep_v25.max_tokens_per_rank is None:
+            raise ValueError("dispatcher='deepep_v25' requires deepep_v25.max_tokens_per_rank")
+
         if isinstance(self.mok, dict):
             self.mok = MoKBackendConfig(**self.mok)
         elif not isinstance(self.mok, MoKBackendConfig):
@@ -796,7 +807,13 @@ class BackendConfig:
 
         # TE grouped experts require a flex dispatcher. Keep the existing standard-
         # dispatcher fallback for the deprecated gmm alias as well.
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
+        if self.experts in ("te", "gmm") and self.dispatcher not in (
+            "deepep",
+            "hybridep",
+            "uccl_ep",
+            "deepep_v25",
+            "mok",
+        ):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():

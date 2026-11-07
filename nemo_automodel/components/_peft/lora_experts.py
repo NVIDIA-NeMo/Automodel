@@ -583,6 +583,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
                 dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
             )
+        self.deepep_v25 = orig_module.deepep_v25
         self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
         self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
         self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing

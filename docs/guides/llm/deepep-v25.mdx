@@ -1,0 +1,125 @@
+---
+title: "DeepEP v2.5 Expert Parallelism"
+description: "BF16 and FP8 communication, deferred epilogues, and distributed validation."
+---
+
+The `deepep_v25` dispatcher uses DeepEP's `EPBuffer` interface for eager,
+dropless BF16 expert parallelism. Routing probabilities remain differentiable.
+It supports activation checkpointing, uneven token counts, masked routes, and
+ranks with no input or no received tokens. The initial integration supports one
+EP process group and a uniform hidden width, expert count, top-k, and token
+capacity and forward communication precision per process. Forward dispatch can
+optionally use block-scaled FP8, and deferred epilogues support communication
+stream allocation. CUDA graphs and expert padding are not supported.
+
+## Dependencies
+
+Use Hopper or newer GPUs, CUDA 13.1 or newer, PyTorch 2.10 or newer, and NCCL
+2.32.3 or newer, as required by DeepEP v2.5. The integration was developed against
+[DeepEP commit b5a33ee](https://github.com/deepseek-ai/DeepEP/tree/b5a33eefda39485f438dc764695b71ba7b9249b6).
+Initialize its `third-party/deep_jit` submodule before building; the build also
+needs the elfutils development headers. Set `EP_NCCL_ROOT_DIR` to the NCCL prefix
+containing `include` and `lib`, and ensure the same NCCL shared library is loaded
+at runtime. `torch.cuda.nccl.version()` can report PyTorch's compile-time version;
+check the loaded shared library when diagnosing dependency mismatches.
+
+DeepEP v2.5 and legacy DeepEP expose different APIs under the same Python package
+name. Install v2.5 in a dedicated environment and select `deepep_v25` explicitly;
+installing v2.5 does not make the legacy `deepep` dispatcher compatible.
+
+## Recipe configuration
+
+Add the following to a native AutoModel training or benchmark recipe. Set EP size
+to at least two and choose a divisor of the global expert count. Capacity must
+cover the maximum input rows on each rank per microbatch, including masked rows.
+For a batch of one sequence with length 4096 and CP=1, capacity 4096 is sufficient.
+Use the same capacity on all ranks.
+
+```yaml
+distributed:
+  ep_size: 8
+  activation_checkpointing: true
+model:
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    experts: torch_mm
+    dispatcher: deepep_v25
+    dispatcher_async_dispatch: false
+    deepep_v25:
+      max_tokens_per_rank: 4096
+```
+
+The buffer is initialized during expert parallelization, outside forward and
+checkpoint replay. Inputs are padded to a multiple of 64 with invalid routes;
+expert compute uses actual receive counts. Each forward owns its routing
+metadata. Checkpoint replay restores the recomputed receive order for both
+backward communication operations. Communication storage is shared across layers
+and ordered by CUDA streams. A fresh EP subgroup is initialized before DeepEP
+borrows its NCCL communicator.
+
+## Communication options
+
+The following settings enable analytical communication-resource selection,
+deferred epilogues, and FP8 forward dispatch:
+
+```yaml
+model:
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    experts: torch_mm
+    dispatcher: deepep_v25
+    dispatcher_num_sms: 0
+    dispatcher_async_dispatch: true
+    shared_expert_overlap: true
+    deepep_v25:
+      max_tokens_per_rank: 4096
+      use_fp8_dispatch: true
+```
+
+`dispatcher_async_dispatch` records input-ready events, allocates communication
+outputs on the communication stream, and runs deferred epilogues when their
+results are needed. The expert interface waits before consuming these tensors.
+`shared_expert_overlap` independently runs shared experts on a side stream, when
+the model has them; measure the resulting overlap on the target model and GPU.
+A zero SM budget selects DeepEP's analytical estimate. A positive budget applies
+to both dispatch and combine, including backward.
+
+`use_fp8_dispatch` uses DeepEP's block-128 E4M3 conversion helpers on the source
+rank and restores received activations to BF16 before the existing grouped GEMM.
+Router probabilities remain FP32. Expert computation, combine, and backward
+communication remain BF16; input gradients use a straight-through estimate for
+the forward quantization. The shared buffer retains BF16 capacity for backward.
+This is forward communication compression, not full FP8 expert training. Include
+quantization and restoration costs in end-to-end timing, and assess the numerical
+change separately from a comparison that keeps both backends in BF16.
+
+DeepEP's redundant-expert weight-prefetch and gradient-reduction primitives are
+not a dynamic load balancer by themselves. This dispatcher does not yet plan
+replicas or reroute tokens to redundant experts.
+
+For custom process lifecycles, call
+`nemo_automodel.components.moe.megatron.fused_a2a.free_buffer()` after all backward
+passes and before destroying the distributed process group.
+
+## Correctness checks
+
+Run the native two-GPU test from the repository root in an environment containing
+DeepEP v2.5:
+
+```bash
+bash tests/functional_tests/moe/L2_MoE_DeepEPV25_Parity.sh
+```
+
+It checks both BF16 communication and deferred FP8 forward communication. Expert
+outputs, input/router/expert gradients, global gradient norm, and an optimizer
+update are compared against an independent FP32 oracle, with and without
+activation checkpointing. For FP8, the oracle independently reconstructs the
+quantized forward values and straight-through input derivative; BF16 rounding
+tolerances are unchanged. It exercises two in-flight microbatches and uneven,
+empty-source, empty-receiver, and masked routes. CPU tests emulate transport and
+receive-order changes; they do not establish actual CUDA kernel correctness.
+
+Use `BenchmarkingRecipeForNextTokenPrediction` for end-to-end performance. Compare
+backends using the same model configuration, precision, routing, optimizer,
+sequence length, batch geometry, parallelism, and hardware. Random-init benchmark
+runs do not validate checkpoint loading or pretrained-model quality.

@@ -1024,6 +1024,9 @@ navigation:
       - page: "Fine-Tune Large MoE LLMs"
         path: ../../guides/llm/large-moe-finetune.mdx
         slug: large-moe-fine-tuning
+      - page: "DeepEP v2.5 Expert Parallelism"
+        path: ../../guides/llm/deepep-v25.mdx
+        slug: deepep-v25
       - page: "Diffusion Fine-Tuning"
         path: ../../guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
