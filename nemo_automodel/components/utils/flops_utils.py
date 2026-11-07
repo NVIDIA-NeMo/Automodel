@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import warnings
+from collections.abc import Sequence
 from typing import Any, Callable
 
 
@@ -46,7 +47,7 @@ def calculate_mfu(
     return mfu * 100
 
 
-def gpt3_flops(config, gbs=1, seq_len=None):
+def gpt3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for GPT3 family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
@@ -62,7 +63,7 @@ def gpt3_flops(config, gbs=1, seq_len=None):
     ) + (6 * gbs * seq_len * hs * vocab_size)
 
 
-def llama2_flops(config, gbs=1, seq_len=None):
+def llama2_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for llama2 family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
@@ -92,7 +93,7 @@ def llama2_flops(config, gbs=1, seq_len=None):
     )
 
 
-def llama3_flops(config, gbs=1, seq_len=None):
+def llama3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for llama3 family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
@@ -122,7 +123,7 @@ def llama3_flops(config, gbs=1, seq_len=None):
     )
 
 
-def nemotron_flops(config, gbs=1, seq_len=None):
+def nemotron_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for nemotron family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
@@ -152,7 +153,7 @@ def nemotron_flops(config, gbs=1, seq_len=None):
     )
 
 
-def mixtral_flops(config, gbs=1, seq_len=None):
+def mixtral_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for mixtral family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
@@ -183,7 +184,7 @@ def mixtral_flops(config, gbs=1, seq_len=None):
     )
 
 
-def qwen3_flops(config, gbs=1, seq_len=None):
+def qwen3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for Qwen3 family - accepts either AutoConfig or normalized config"""
 
     # For VL composite configs, use the text_config sub-config
@@ -247,7 +248,7 @@ def qwen3_flops(config, gbs=1, seq_len=None):
     return attention_flops + mlp_flops + vocab_flops
 
 
-def bert_flops(config, gbs=1, seq_len=None):
+def bert_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for BERT family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
@@ -260,7 +261,7 @@ def bert_flops(config, gbs=1, seq_len=None):
     return 72 * gbs * layers * seq_len * hs * hs * (1 + (seq_len / (6 * hs)) + (vocab_size / (12 * hs * layers)))
 
 
-def transformer_flops(config, gbs=1, seq_len=None):
+def transformer_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Calculate FLOPs for a standard Transformer model - accepts either AutoConfig or normalized config.
     Note: This does not cover encoder-decoder models.
     """
@@ -361,7 +362,7 @@ def transformer_flops(config, gbs=1, seq_len=None):
     return total_flops
 
 
-def clip_vit_l_flops(config):
+def clip_vit_l_flops(config: Any) -> float:
     """Model FLOPs for CLIP ViT"""
 
     if config.img_seq_len is None:
@@ -373,7 +374,7 @@ def clip_vit_l_flops(config):
     ) + (2 * config.gbs * config.hs * config.in_channels * config.img_h * config.img_w)
 
 
-def neva_projection_flops(config):
+def neva_projection_flops(config: Any) -> float:
     """Model FLOPs for NeVA Projection"""
 
     if "mlp" in config.projector_type:
@@ -387,7 +388,7 @@ def neva_projection_flops(config):
         )
 
 
-def flux_flops(config):
+def flux_flops(config: Any) -> float:
     """Model FLOPs for FLUX"""
 
     hs = config.hs
@@ -434,8 +435,10 @@ def flux_flops(config):
     return joint_layer_flops + single_layer_flops + other_flops
 
 
-def deepseekv3_flops(config, gbs=1, seq_len=None):
+def deepseekv3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for DeepSeek V3 - accepts either AutoConfig or normalized config"""
+    if seq_len is None:
+        raise ValueError("deepseekv3_flops requires seq_len")
 
     hs = config.hidden_size
     layers = config.num_hidden_layers
@@ -540,12 +543,12 @@ def deepseekv3_flops(config, gbs=1, seq_len=None):
     return (per_input_attention_flops + per_input_linear_flops + per_input_vocab_flops) * gbs
 
 
-def _nemotronh_mlp_layer_flops(config, gbs, seq_len):
+def _nemotronh_mlp_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
     """Model FLOPs for MLP layer. Assume gated linear unit."""
     return 6 * gbs * seq_len * config.hidden_size * config.intermediate_size * 3
 
 
-def _nemotronh_moe_layer_flops(config, gbs, seq_len):
+def _nemotronh_moe_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
     """Model FLOPs for a MoE layer in Nemotron V3/Super V3 (hybrid Mamba/Attention/MoE).
 
     Nemotron V3 uses relu2 (non-gated) for both routed and shared experts,
@@ -588,7 +591,14 @@ def _nemotronh_moe_layer_flops(config, gbs, seq_len):
     return routed_expert_flops + shared_expert_flops + gate_flops + latent_proj_flops
 
 
-def _nemotronh_mtp_flops(config, gbs, seq_len, num_mtp_layers, mtp_block_types, use_repeated_layer):
+def _nemotronh_mtp_flops(
+    config: Any,
+    gbs: int,
+    seq_len: int,
+    num_mtp_layers: int,
+    mtp_block_types: Sequence[str],
+    use_repeated_layer: bool,
+) -> float:
     """Model FLOPs for the Multi-Token-Prediction (MTP) head of Nemotron-3 Super/Ultra.
 
     The head predicts ``num_mtp_layers`` (N) additional tokens. Each of the N depths runs
@@ -637,7 +647,7 @@ def _nemotronh_mtp_flops(config, gbs, seq_len, num_mtp_layers, mtp_block_types, 
     return block_flops + eh_proj_flops + lm_head_flops
 
 
-def _non_mla_attn_layer_flops(config, gbs, seq_len):
+def _non_mla_attn_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
     """Model FLOPs for attention layer"""
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
@@ -657,7 +667,7 @@ def _non_mla_attn_layer_flops(config, gbs, seq_len):
     )
 
 
-def _mamba_layer_flops(config, gbs, seq_len):
+def _mamba_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
     """Model FLOPs for Mamba layer.
 
     Three components:
@@ -694,7 +704,7 @@ def _mamba_layer_flops(config, gbs, seq_len):
     return in_proj + scan + out_proj
 
 
-def _hybrid_model_flops(config, gbs, seq_len):
+def _hybrid_model_flops(config: Any, gbs: int, seq_len: int) -> float:
     """Model FLOPs for hybrid model"""
     if hasattr(config, "is_hybrid_model"):
         if not config.is_hybrid_model:
@@ -729,7 +739,7 @@ def _hybrid_model_flops(config, gbs, seq_len):
     return total
 
 
-def nemotronh_flops(config, gbs=1, seq_len=None):
+def nemotronh_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for NemotronH"""
     if seq_len is None:
         seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
@@ -738,14 +748,14 @@ def nemotronh_flops(config, gbs=1, seq_len=None):
 
 
 def attention_flops_calculator(
-    seqlen,
-    hidden_size,
-    num_attention_heads,
-    num_query_groups,
+    seqlen: int,
+    hidden_size: int,
+    num_attention_heads: int,
+    num_query_groups: int,
     kv_channels: int | None = None,
     is_swa: bool = False,
     swa_window_size: int = 128,
-):
+) -> float:
     """Calculate the flops for the attention part."""
     kv_channels = kv_channels or (hidden_size // num_attention_heads)
 
@@ -768,12 +778,12 @@ def attention_flops_calculator(
 
 
 def moe_mlp_flops_calculator(
-    seqlen,
-    hidden_size,
-    moe_ffn_hidden_size,
-    moe_router_topk,
+    seqlen: int,
+    hidden_size: int,
+    moe_ffn_hidden_size: int,
+    moe_router_topk: int,
     gated_linear_unit: bool = True,
-):
+) -> float:
     """Calculate the flops for the MLP"""
     total_num_tokens = seqlen * moe_router_topk
     linear_fc1 = total_num_tokens * hidden_size * moe_ffn_hidden_size * (2 if gated_linear_unit else 1)
@@ -782,28 +792,28 @@ def moe_mlp_flops_calculator(
 
 
 def loss_flops_calculator(
-    seqlen,
-    hidden_size,
-    vocab_size,
-):
+    seqlen: int,
+    hidden_size: int,
+    vocab_size: int,
+) -> float:
     """Calculate the flops for the loss"""
     return (seqlen * hidden_size * vocab_size) * 6
 
 
 def gpt_oss_flops_calculator(
-    gbs,
-    num_layers,
-    seqlen,
-    hidden_size,
-    num_attention_heads,
-    num_query_groups,
-    moe_ffn_hidden_size,
-    moe_router_topk,
-    vocab_size,
+    gbs: int,
+    num_layers: int,
+    seqlen: int,
+    hidden_size: int,
+    num_attention_heads: int,
+    num_query_groups: int,
+    moe_ffn_hidden_size: int,
+    moe_router_topk: int,
+    vocab_size: int,
     kv_channels: int | None = None,
     swa_window_size: int = 128,
-    window_attn_skip_freq: int | None = 2,
-):
+    window_attn_skip_freq: int = 2,
+) -> float:
     """Calculate the flops for the GPT-OSS model"""
     flops = 0
     for i in range(num_layers):
@@ -837,8 +847,10 @@ def gpt_oss_flops_calculator(
     return flops
 
 
-def gpt_oss_flops(config, gbs=1, seq_len=None):
+def gpt_oss_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for GPT-OSS"""
+    if seq_len is None:
+        raise ValueError("gpt_oss_flops requires seq_len")
     # Map config fields
     num_layers = config.num_hidden_layers
     hidden_size = config.hidden_size
@@ -873,7 +885,7 @@ def gpt_oss_flops(config, gbs=1, seq_len=None):
     )
 
 
-def glm4_moe_flops(config, gbs=1, seq_len=None):
+def glm4_moe_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Estimate FLOPs for GLM4 MoE model configurations."""
     if seq_len is None:
         seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
@@ -958,7 +970,7 @@ def glm4_moe_flops(config, gbs=1, seq_len=None):
     return attention_flops + mlp_flops + vocab_flops
 
 
-def minimax_m2_flops(config, gbs=1, seq_len=None):
+def minimax_m2_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for MiniMax-M2 family - accepts either AutoConfig or normalized config.
 
     Architecture: GQA attention (Q/K/V/O separate projections, head_dim may differ from
@@ -991,7 +1003,7 @@ def minimax_m2_flops(config, gbs=1, seq_len=None):
     gated_linear_multiplier = 2  # SwiGLU: gate + up projections
 
     # --- Attention flops (GQA with separate Q/K/V/O projections) ---
-    def _attention_flops_per_layer():
+    def _attention_flops_per_layer() -> float:
         return (
             6
             * gbs
@@ -1009,7 +1021,7 @@ def minimax_m2_flops(config, gbs=1, seq_len=None):
     attention_flops = _attention_flops_per_layer() * layers
 
     # --- MoE MLP flops (SwiGLU, all layers) ---
-    def _moe_mlp_flops_per_layer():
+    def _moe_mlp_flops_per_layer() -> float:
         # Routed experts (topk selected)
         routed = 6 * gbs * seq_len * hs * (1 + gated_linear_multiplier) * (ffn_hs * moe_router_topk)
         # Shared experts (if any)
@@ -1041,15 +1053,15 @@ def minimax_m2_flops(config, gbs=1, seq_len=None):
 
 
 def _gdn_attention_per_layer_flops(
-    gbs,
-    seq_len,
-    hidden_size,
-    linear_key_head_dim,
-    linear_value_head_dim,
-    linear_num_key_heads,
-    linear_num_value_heads,
-    linear_conv_kernel_dim,
-):
+    gbs: int,
+    seq_len: int,
+    hidden_size: int,
+    linear_key_head_dim: int,
+    linear_value_head_dim: int,
+    linear_num_key_heads: int,
+    linear_num_value_heads: int,
+    linear_conv_kernel_dim: int,
+) -> float:
     """FLOPs for a single Gated DeltaNet (GDN / linear attention) layer.
 
     Based on the GDN FLOPs calculator from Megatron-Bridge PR #2925.
@@ -1071,7 +1083,7 @@ def _gdn_attention_per_layer_flops(
     )
 
 
-def qwen3_5_flops(config, gbs=1, seq_len=None):
+def qwen3_5_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for Qwen3.5 family (MoE and Dense) with hybrid GDN/full attention.
 
     Qwen3.5 uses a hybrid attention pattern: 75% GDN (linear attention) layers
@@ -1207,19 +1219,19 @@ def qwen3_5_flops(config, gbs=1, seq_len=None):
 
 
 def _mla_attention_per_layer_flops(
-    gbs,
-    seq_len,
-    hs,
-    attention_heads,
-    q_lora_rank,
-    kv_lora_rank,
-    qk_rope_head_dim,
-    qk_nope_head_dim,
-    v_head_dim,
-    index_topk=None,
-    index_n_heads=0,
-    index_head_dim=0,
-):
+    gbs: int,
+    seq_len: int,
+    hs: int,
+    attention_heads: int,
+    q_lora_rank: int | None,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+    index_topk: int | None = None,
+    index_n_heads: int = 0,
+    index_head_dim: int = 0,
+) -> float:
     """Per-layer FLOPs for Multi-Latent Attention (MLA).
 
     Shared by DeepSeek V3, Kimi K2.5, Mistral Small 4, GLM-5, etc.
@@ -1269,27 +1281,27 @@ def _mla_attention_per_layer_flops(
 
 
 def _mla_moe_model_flops(
-    gbs,
-    seq_len,
-    hs,
-    layers,
-    attention_heads,
-    vocab_size,
-    q_lora_rank,
-    kv_lora_rank,
-    qk_rope_head_dim,
-    qk_nope_head_dim,
-    v_head_dim,
-    dense_ffn_hs,
-    moe_ffn_hs,
-    moe_router_topk,
-    moe_shared_expert_hs,
-    moe_layer_pattern,
-    mtp_num_layers=0,
-    index_topk=None,
-    index_n_heads=0,
-    index_head_dim=0,
-):
+    gbs: int,
+    seq_len: int,
+    hs: int,
+    layers: int,
+    attention_heads: int,
+    vocab_size: int,
+    q_lora_rank: int | None,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    qk_nope_head_dim: int,
+    v_head_dim: int,
+    dense_ffn_hs: int,
+    moe_ffn_hs: int,
+    moe_router_topk: int,
+    moe_shared_expert_hs: int,
+    moe_layer_pattern: Sequence[int],
+    mtp_num_layers: int = 0,
+    index_topk: int | None = None,
+    index_n_heads: int = 0,
+    index_head_dim: int = 0,
+) -> float:
     """FLOPs for MLA + MoE transformer models (DeepSeek-V3 style).
 
     Args:
@@ -1348,7 +1360,7 @@ def _mla_moe_model_flops(
     return attention_flops + ffn_flops + vocab_flops + mtp_flops
 
 
-def _build_moe_layer_pattern(config, layers):
+def _build_moe_layer_pattern(config: Any, layers: int) -> list[int]:
     """Build a list of 0/1 indicating dense(0) vs MoE(1) per layer.
 
     Handles multiple config styles: first_k_dense_replace + moe_layer_freq,
@@ -1367,7 +1379,7 @@ def _build_moe_layer_pattern(config, layers):
     ]
 
 
-def mla_moe_flops(config, gbs=1, seq_len=None):
+def mla_moe_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for MLA + MoE models (Kimi K2, GLM-5, Mistral Small 4, etc.).
 
     Handles VL wrappers by extracting text_config if present.
@@ -1861,7 +1873,7 @@ def qwen3_8_flash_next_flops(config: Any, gbs: int = 1, seq_len: int | None = No
     return float(trainable_flops + gdn_flops + attention_flops + indexer_flops)
 
 
-def step3_5_flash_flops(config, gbs=1, seq_len=None):
+def step3_5_flash_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for Step3.5-Flash (GQA + sliding-window / full attention + MoE).
 
     Architecture: hybrid full/SWA attention with different head counts per type,
