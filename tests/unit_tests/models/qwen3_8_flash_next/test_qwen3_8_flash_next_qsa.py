@@ -444,12 +444,13 @@ def test_qsa_sparse_backend_bypasses_generic_parent_initializer(attn_backend: st
     assert attention.qsa_cuda_kernel is qwen3_8_flash_next_qsa.select_qsa_cuda_kernel(attn_backend)
 
 
-@pytest.mark.parametrize("attn_backend", ["flex", "fa4", "sdpa"])
+@pytest.mark.parametrize("attn_backend", ["flex", "fa4", "cudnn", "sdpa"])
 def test_qsa_cuda_kernel_is_selected_once_at_setup(attn_backend: str) -> None:
     kernel = qwen3_8_flash_next_qsa.select_qsa_cuda_kernel(attn_backend)
     expected = {
         "flex": qwen3_8_flash_next_qsa._bf16_flex_sparse_gqa_attention,
         "fa4": qwen3_8_flash_next_qsa._fa4_qsa_attention,
+        "cudnn": qwen3_8_flash_next_qsa._cudnn_qsa_attention,
         "sdpa": None,
     }[attn_backend]
 
@@ -468,7 +469,7 @@ def test_qsa_cuda_without_a_kernel_is_rejected() -> None:
     selected = torch.zeros(1, 3, 1, dtype=torch.int32)
     # The rejection happens before any kernel runs, so a stand-in that reports CUDA is enough on a CPU job.
     cuda_like = type("CudaLike", (), {"is_cuda": True})()
-    with pytest.raises(RuntimeError, match="requires backend.attn='flex' or 'fa4'"):
+    with pytest.raises(RuntimeError, match="requires backend.attn='flex', 'fa4', or 'cudnn'"):
         qwen3_8_flash_next_qsa.qsa_gqa_attention(cuda_like, query, query, selected, cuda_kernel=None)
 
 
