@@ -70,8 +70,11 @@ fi
 
 # Loss here is ~10.9 (random init over a 32k vocab) and both legs compute it in
 # bf16, whose ~0.4% relative resolution at that magnitude is already ~0.04
-# absolute. 0.10 sits above that floor; a tighter absolute bound would be
-# measuring bf16, not pipeline parallelism.
+# absolute. The legs also do not start from identical weights: the recipe seeds
+# the RNG per rank before from_config init, so the pp2 run's second stage is
+# drawn from a different seed than the baseline's last layers. That alone moves
+# the step-0 loss by ~0.1, so the bound is 0.20; a tighter absolute bound would
+# be measuring init variance and bf16, not pipeline parallelism.
 #
 # Gradient norm is the sensitive half of this check and is compared relatively,
 # so it is unaffected by the loss magnitude. The bound stays loose because the
@@ -81,5 +84,5 @@ python tests/functional_tests/parallelism/compare_parallel_parity.py \
     "$RUN_DIR/baseline/training.jsonl" \
     "$RUN_DIR/pp2/training.jsonl" \
     --axis pp \
-    --loss-tol 0.10 \
+    --loss-tol 0.20 \
     --grad-norm-rtol 0.20

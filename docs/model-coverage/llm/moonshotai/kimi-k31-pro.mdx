@@ -1,0 +1,37 @@
+---
+title: "Kimi-K3.1-Pro"
+description: "Kimi-K3.1-Pro text-generation architecture, sparse-attention support, and real-checkpoint validation coverage in NVIDIA NeMo AutoModel."
+slug: model-coverage/large-language-models/moonshotai/Kimi-K3.1-Pro
+---
+
+[Kimi K3.1 Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro) extends the native Kimi K3 implementation with a learned indexer in each of its 24 gated multi-head latent attention (MLA) layers. The indexer selects up to 2,048 causal keys per query. The other 69 layers use Kimi Delta Attention (KDA).
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+|---|---|
+| Task | Text generation |
+| Architecture | `KimiK3ForCausalLM` |
+| Parameters | 2.8T total / 104B activated |
+| Layers | 93: 69 KDA and 24 gated DSA |
+| Checkpoint | `moonshotai/Kimi-K3.1-Pro` |
+| Context length | 1,048,576 tokens advertised by the checkpoint; this length has not been validated for training |
+
+## Implementation Limits
+
+- The `backend.attn: cudnn` path uses the fused cuDNN indexer to produce top-k coordinates, and the shared FlashMLA and cuDNN kernels attend directly to selected latent KV. This requires the optional cuDNN Frontend and FlashMLA dependencies and has been exercised on GB200. The `eager` and `sdpa` paths remain dense-mask references.
+- Indexer projections use BF16 with FP32 score accumulation; this is not the FP8 indexer used by some serving kernels. The indexer still scans all causal keys, and its score buffer remains quadratic. Sparse MLA avoids expanding all per-head K/V and avoids dense attention over unselected keys.
+- The pretrained indexer stays frozen, including after LoRA injection. Hard top-k selection has no language-model-loss gradient into the indexer; indexer distillation training is not implemented.
+- A sequence of at most 2,048 valid tokens keeps every causal key. Sparse-selection validation needs an individual sequence longer than 2,048 tokens. Padding or packing short documents is insufficient.
+
+On GB200, FlashMLA forward pads the 96 query heads to 128, while cuDNN backward runs the native 96 heads. Native-96 backward training is validated with cuDNN Frontend 1.30.0.
+
+The cuDNN path preserves the output gate and supports `kv_b_proj` LoRA through its effective weight. That projection requires zero LoRA dropout and does not support DoRA. Packed documents must be contiguous: interior masked holes within one document require the `sdpa` path.
+
+## Validation and Training
+
+Text forward-logit validation covers the first four real checkpoint layers with 4,096-token and 8,192-token single-document inputs against vLLM. This establishes four-layer forward coverage, not full-depth logits parity. Context-parallel forward and backward have component-level coverage.
+
+For a full-model training recipe and its 100-step validation results, see [nonpacked MedPix training](/model-coverage/vision-language-models/moonshotai/Kimi-K3.1-Pro).

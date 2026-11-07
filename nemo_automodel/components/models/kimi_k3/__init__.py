@@ -16,6 +16,7 @@ from nemo_automodel.components.models.kimi_k3.config import (
     KimiK3Config,
     KimiK3TextConfig,
     KimiK3VisionConfig,
+    KimiK31Config,
 )
 
-__all__ = ["KimiK3Config", "KimiK3TextConfig", "KimiK3VisionConfig"]
+__all__ = ["KimiK3Config", "KimiK31Config", "KimiK3TextConfig", "KimiK3VisionConfig"]
