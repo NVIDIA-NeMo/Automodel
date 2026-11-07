@@ -50,6 +50,7 @@ from safetensors.torch import load as safetensors_load
 from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
+from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 from torch.distributed.device_mesh import DeviceMesh
@@ -93,6 +94,7 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
+from nemo_automodel.shared.import_utils import get_torch_version
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 if TYPE_CHECKING:
@@ -2306,8 +2308,9 @@ fi
         Prefers the upstream ``torch.distributed.checkpoint.hf_storage.HuggingFaceStorageReader``
         when no ``key_mapping`` is needed, since it uses safetensors' native ``get_slice()`` for
         efficient partial reads (only the bytes for the local DTensor shard are read from disk).
-        Falls back to the backported reader when ``key_mapping`` is required or when the upstream
-        reader is not available.
+        Falls back to the backported reader when ``key_mapping`` is required, and for base-model
+        loads the upstream reader cannot serve: remote paths, torch before 2.9, integrated GPUs, and
+        checkpoints with dtypes the safetensors package does not decode.
 
         Args:
             model_path: Path to the model checkpoint directory or HF snapshot.
@@ -2327,27 +2330,21 @@ fi
             is_safetensors = _is_safetensors_checkpoint(model_path)
         if not is_init_step and not is_safetensors:
             return None
-        # The upstream HuggingFaceStorageReader delegates dtype decoding to
-        # safetensors.torch._TYPES, which does not yet recognize the FP8
-        # scale dtypes emitted by some quantized HF checkpoints (e.g.
-        # DeepSeek V4's F8_E8M0 scales → KeyError('F8_E8M0') inside
-        # read_metadata → DCP ends up with metadata=None on every rank).
-        # The in-tree backport's DTYPE_MAP was extended for F8_E8M0/F8_E5M2,
-        # so prefer it for base-model HF loads. Mid-training DCP loads may
-        # still use the faster upstream reader.
-        # Base-model loads may use the upstream reader too when every dtype of the checkpoint is one the safetensors
-        # package decodes (bf16 / fp16 / fp32 / fp8-e4m3 / integer); only checkpoints with dtypes it does not know
-        # (DeepSeek V4's F8_E8M0 scales) stay on the backport. On this reader each read is a safetensors slice copy,
-        # which is several times faster than the backport's mmap page-fault path on network filesystems.
-        if key_mapping is None and (not is_init_step or _safetensors_decodes_checkpoint_dtypes(model_path)):
+        if key_mapping is None and not is_init_step:
+            return _CachedMetadataHFReader(path=model_path)
+        # Base-model loads use the upstream reader too: each read is a safetensors slice copy, several times faster
+        # than the backport's mmap page-fault path on network filesystems. The upstream reader decodes dtypes with the
+        # safetensors package, which does not know some quantized-checkpoint scale dtypes (DeepSeek V4's F8_E8M0):
+        # reading the metadata then raises KeyError, and those checkpoints stay on the backport, whose DTYPE_MAP
+        # covers them. The metadata read here is cached for the dcp.load calls that follow.
+        if key_mapping is None and is_safetensors and _can_use_upstream_hf_reader(model_path):
+            reader = _CachedMetadataHFReader(path=model_path)
             try:
-                from torch.distributed.checkpoint.hf_storage import (
-                    HuggingFaceStorageReader as _UpstreamHFReader,
-                )
-
-                return _with_cached_metadata(_UpstreamHFReader(path=model_path))
-            except ImportError:
-                pass
+                reader.read_metadata()
+            except KeyError as error:
+                logger.info("Loading %s with the in-tree reader: safetensors cannot decode dtype %s", model_path, error)
+            else:
+                return reader
         return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
     def _get_original_model_path(self, model_state: ModelState) -> str | None:
@@ -2376,81 +2373,56 @@ fi
         return _get_hf_safetensors_reference_path(cache_dir, pretrained_model_name_or_path)
 
 
-def _with_cached_metadata(reader: StorageReader) -> StorageReader:
-    """Make a reader parse the checkpoint metadata once per checkpoint path.
+class _CachedMetadataHFReader(HuggingFaceStorageReader):
+    """The upstream safetensors reader, parsing the checkpoint metadata once per checkpoint path.
 
-    ``dcp.load`` calls ``read_metadata`` on every load, and torch's ``HuggingFaceStorageReader`` rescans every
-    shard header each time. The part-by-part base load issues one ``dcp.load`` per part with one reader, so it
-    relies on this cache (as it did on the backport reader's). The cache is dropped when ``reset`` moves the
-    reader to another checkpoint. Installed on the instance so the upstream class is left untouched.
+    ``dcp.load`` calls ``read_metadata`` on every load, and the upstream reader rescans every shard header each time.
+    The part-by-part base load issues one ``dcp.load`` per part with one reader, so it relies on this cache, as on the
+    backport reader's.
+    """
+
+    def __init__(self, path: str) -> None:
+        """Bind the reader to one checkpoint directory.
+
+        Args:
+            path: Local checkpoint directory.
+        """
+        super().__init__(path=path)
+        self._metadata_cache: Metadata | None = None
+
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        """Reset reader state and discard the cached metadata only when the checkpoint changes."""
+        previous_path = str(self.path)
+        super().reset(checkpoint_id)
+        if checkpoint_id is not None and str(self.path) != previous_path:
+            self._metadata_cache = None
+
+    def read_metadata(self) -> Metadata:
+        """Return the checkpoint metadata, parsing the safetensors headers on the first call only."""
+        if self._metadata_cache is None:
+            self._metadata_cache = super().read_metadata()
+        elif self._metadata_cache.storage_meta is not None:
+            self._metadata_cache.storage_meta.load_id = self.load_id
+        return self._metadata_cache
+
+
+def _can_use_upstream_hf_reader(model_path: str) -> bool:
+    """Whether a base-model load from ``model_path`` may use the upstream safetensors reader.
+
+    Before torch 2.9 the upstream reader reads whole shard files and decodes dtypes with a table that has no FP8. It
+    reads local directories only, and on integrated GPUs the backport stages reads through host memory instead.
 
     Args:
-        reader: A freshly constructed storage reader bound to one checkpoint path.
+        model_path: Checkpoint directory or remote path.
 
     Returns:
-        The same reader, with caching ``read_metadata`` and ``reset`` methods.
+        True for a local directory on torch 2.9 or later without an integrated CUDA device.
     """
-    read_metadata = reader.read_metadata
-    reset = reader.reset
-    state: dict[str, Any] = {"path": str(reader.path), "metadata": None}
-
-    def cached_read_metadata() -> Metadata:
-        if state["metadata"] is None:
-            state["metadata"] = read_metadata()
-        elif getattr(state["metadata"], "storage_meta", None) is not None:
-            state["metadata"].storage_meta.load_id = reader.load_id
-        return state["metadata"]
-
-    def resetting(checkpoint_id: str | os.PathLike | None = None) -> None:
-        reset(checkpoint_id)
-        if checkpoint_id is not None and str(reader.path) != state["path"]:
-            state["path"] = str(reader.path)
-            state["metadata"] = None
-
-    reader.read_metadata = cached_read_metadata
-    reader.reset = resetting
-    return reader
-
-
-def _safetensors_decodes_checkpoint_dtypes(model_path: str) -> bool:
-    """Whether every tensor dtype in a local safetensors checkpoint is one the ``safetensors`` package decodes.
-
-    The upstream ``HuggingFaceStorageReader`` maps dtype strings with ``safetensors.torch._TYPES`` while reading the
-    metadata, so a checkpoint with a dtype outside that table (for example ``F8_E8M0`` block scales) must use the
-    in-tree backport reader, which extends the table. Only the safetensors headers are read.
-
-    Args:
-        model_path: Local checkpoint directory.
-
-    Returns:
-        True when the directory holds safetensors files whose dtypes are all decodable by the package. Remote paths,
-        directories without safetensors files, unreadable headers and integrated-GPU hosts (where the backport stages
-        reads through host memory) return False.
-    """
-    try:
-        from safetensors.torch import _TYPES as safetensors_dtypes
-    except ImportError:
+    if get_torch_version().release < (2, 9) or not os.path.isdir(model_path):
         return False
-    if not os.path.isdir(model_path):
-        return False
-    if torch.cuda.is_available() and _is_integrated_cuda_device(torch.device("cuda", torch.cuda.current_device())):
-        return False
-    files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
-    if not files:
-        return False
-    try:
-        for file_name in files:
-            with open(file_name, "rb") as stream:
-                header_size = int.from_bytes(stream.read(8), "little")
-                header = json.loads(stream.read(header_size))
-            for key, entry in header.items():
-                if key == "__metadata__":
-                    continue
-                if entry.get("dtype") not in safetensors_dtypes:
-                    return False
-    except (OSError, ValueError):
-        return False
-    return True
+    if not torch.cuda.is_available():
+        return True
+    return not _is_integrated_cuda_device(torch.device("cuda", torch.cuda.current_device()))
 
 
 def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
