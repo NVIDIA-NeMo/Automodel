@@ -294,7 +294,7 @@ class TestCompileModel:
     def test_compile_enabled_simple_model(self, mock_torch_compile, mock_fa_fix, mock_configure):
         """Test compilation with a simple model."""
         config = CompileConfig(enabled=True, mode="default", dynamo_cache_size_limit=512)
-        mock_compiled_model = MagicMock()
+        mock_compiled_model = MagicMock(spec=nn.Module)
         mock_torch_compile.return_value = mock_compiled_model
 
         result = compile_model(self.model, config)
@@ -310,7 +310,7 @@ class TestCompileModel:
     def test_compile_enabled_with_backend(self, mock_torch_compile, mock_fa_fix, mock_configure):
         """Test compilation with specific backend."""
         config = CompileConfig(enabled=True, mode="max-autotune", backend="inductor")
-        mock_compiled_model = MagicMock()
+        mock_compiled_model = MagicMock(spec=nn.Module)
         mock_torch_compile.return_value = mock_compiled_model
 
         result = compile_model(self.model, config)
@@ -344,7 +344,7 @@ class TestCompileModel:
         config = CompileConfig(
             enabled=True, mode="default", fullgraph=True, dynamic=True, options={"some_option": "value"}
         )
-        mock_compiled_model = MagicMock()
+        mock_compiled_model = MagicMock(spec=nn.Module)
         mock_torch_compile.return_value = mock_compiled_model
 
         result = compile_model(self.model, config)

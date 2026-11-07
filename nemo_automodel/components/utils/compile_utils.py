@@ -15,13 +15,20 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any, Dict, Protocol
 
 import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+
+class _SupportsToDict(Protocol):
+    """Config-node style options container (e.g. a YAML-backed ``ConfigNode``)."""
+
+    def to_dict(self) -> Dict[str, Any]: ...
 
 
 @dataclass
@@ -33,7 +40,7 @@ class CompileConfig:
     fullgraph: bool = False
     dynamic: bool = False
     backend: str | None = None
-    options: Dict[str, Any] | None = None
+    options: Mapping[str, Any] | _SupportsToDict = field(default_factory=dict)
     dynamo_cache_size_limit: int = 256
 
     def __init__(
@@ -43,9 +50,9 @@ class CompileConfig:
         fullgraph: bool = False,
         dynamic: bool = False,
         backend: str | None = None,
-        options: Dict[str, Any] | None = None,
+        options: Mapping[str, Any] | _SupportsToDict | None = None,
         dynamo_cache_size_limit: int = 256,
-    ):
+    ) -> None:
         self.enabled = enabled
         self.mode = mode
         self.fullgraph = fullgraph
@@ -67,7 +74,7 @@ class CompileConfig:
         }
 
 
-def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: bool = True):
+def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: bool = True) -> None:
     """Configure torch._dynamo settings for compilation.
 
     Args:
@@ -90,7 +97,7 @@ def configure_torch_dynamo(cache_size_limit: int = 256, capture_scalar_outputs: 
         logger.warning("torch._dynamo not available, skipping dynamo configuration")
 
 
-def enable_torch_dynamo_scalar_outputs():
+def enable_torch_dynamo_scalar_outputs() -> None:
     """Enable torch.dynamo to capture scalar outputs for better Flash Attention + torch.compile compatibility."""
     try:
         import torch._dynamo.config
@@ -100,7 +107,7 @@ def enable_torch_dynamo_scalar_outputs():
         logger.warning("torch._dynamo not available, skipping scalar output capture configuration")
 
 
-def patch_prepare_fa2_from_position_ids():
+def patch_prepare_fa2_from_position_ids() -> bool:
     """
     Apply a simple targeted patch to fix the prepare_fa2_from_position_ids function
     for torch.compile compatibility.
@@ -110,7 +117,16 @@ def patch_prepare_fa2_from_position_ids():
     try:
         import transformers.modeling_flash_attention_utils as fa_utils
 
-        def prepare_fa2_from_position_ids(query, key, value, position_ids):
+        def prepare_fa2_from_position_ids(
+            query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, position_ids: torch.Tensor
+        ) -> tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            tuple[torch.Tensor, torch.Tensor],
+            tuple[float, float],
+        ]:
             """
             This function returns necessary arguments to call `flash_attn_varlen_func`.
             All three query, key, value states will be flattened.
@@ -119,6 +135,16 @@ def patch_prepare_fa2_from_position_ids():
             NOTE: ideally cumulative lengths should be prepared at the data collator stage
 
             This version includes the torch.compile fix for max_length computation.
+
+            Args:
+                query: Query states, shape ``[batch, seq, heads, head_dim]``.
+                key: Key states with the same leading dims as ``query``.
+                value: Value states with the same leading dims as ``key``.
+                position_ids: Position ids, shape ``[batch, seq]``; a new sequence starts wherever the value is 0.
+
+            Returns:
+                ``(query, key, value, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k))`` with
+                integer-valued max lengths and the states flattened to ``[batch * seq, heads, head_dim]`` and int32 cumulative lengths.
             """
             query = query.view(-1, query.size(-2), query.size(-1))
             key = key.contiguous().view(-1, key.size(-2), key.size(-1))
@@ -139,7 +165,8 @@ def patch_prepare_fa2_from_position_ids():
             return (query, key, value, indices_q, (cu_seq_lens, cu_seq_lens), (max_length, max_length))
 
         # Apply the patch
-        fa_utils.prepare_fa2_from_position_ids = prepare_fa2_from_position_ids
+        # Not every supported transformers release defines this attribute, so it cannot be assigned statically.
+        setattr(fa_utils, "prepare_fa2_from_position_ids", prepare_fa2_from_position_ids)
 
         return True
 
@@ -148,7 +175,7 @@ def patch_prepare_fa2_from_position_ids():
         return False
 
 
-def apply_flash_attention_compile_fix():
+def apply_flash_attention_compile_fix() -> bool:
     """
     Apply the Flash Attention + torch.compile compatibility fix.
 
@@ -177,7 +204,8 @@ def _resolve_compile_kwargs(config: CompileConfig) -> Dict[str, Any]:
     ``CompileConfig.options`` therefore replaces ``mode``, and combining
     options with a non-default mode is an explicit error.
     """
-    options_dict = config.options.to_dict() if hasattr(config.options, "to_dict") else dict(config.options)
+    options = config.options
+    options_dict = dict(options) if isinstance(options, Mapping) else options.to_dict()
     compile_kwargs: Dict[str, Any] = {
         "fullgraph": config.fullgraph,
         "dynamic": config.dynamic,
@@ -244,6 +272,8 @@ def compile_model(model: nn.Module, config: CompileConfig) -> nn.Module:
 
     try:
         compiled_model = torch.compile(model, **compile_kwargs)
+        if not isinstance(compiled_model, nn.Module):
+            raise TypeError(f"torch.compile returned {type(compiled_model).__name__}, expected nn.Module")
         logger.info("Model compilation successful")
         return compiled_model
     except Exception as e:

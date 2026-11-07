@@ -67,6 +67,10 @@ include = [
     "nemo_automodel/components/launcher/**",
     "nemo_automodel/components/loggers/**",
     "nemo_automodel/components/optim/**",
+    "nemo_automodel/components/utils/compile_utils.py",
+    "nemo_automodel/components/utils/flops_utils.py",
+    "nemo_automodel/components/utils/model_utils.py",
+    "nemo_automodel/components/utils/yaml_utils.py",
 ]
 
 [overrides.rules]

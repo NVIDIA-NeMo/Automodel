@@ -16,7 +16,7 @@ import fnmatch
 import inspect
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -170,8 +170,9 @@ def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
 
 def get_lm_head_module(model: nn.Module) -> nn.Module | None:
     """Return the model's LM head module, if one can be found."""
-    if hasattr(model, "get_output_embeddings"):
-        lm_head = model.get_output_embeddings()
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    if get_output_embeddings is not None:
+        lm_head = get_output_embeddings()
         if lm_head is not None:
             return lm_head
     for name, module in model.named_modules():
@@ -180,19 +181,24 @@ def get_lm_head_module(model: nn.Module) -> nn.Module | None:
     return None
 
 
+def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Gather a DTensor into a regular tensor; plain tensors pass through unchanged."""
+    full_tensor = getattr(tensor, "full_tensor", None)
+    return tensor if full_tensor is None else full_tensor()
+
+
 def get_lm_head_weight(model: nn.Module) -> torch.Tensor:
     """Return the model's LM-head weight, materializing DTensor weights when needed."""
     lm_head = get_lm_head_module(model)
     if lm_head is not None:
-        weight = lm_head.weight
-        return weight.full_tensor() if hasattr(weight, "full_tensor") else weight
+        return _full_tensor(getattr(lm_head, "weight"))
     for name, param in model.named_parameters(remove_duplicate=False):
         if "lm_head" in name and name.endswith(".weight"):
-            return param.full_tensor() if hasattr(param, "full_tensor") else param
+            return _full_tensor(param)
     raise ValueError("lm_head.weight not found in model")
 
 
-def _get_logical_numel(param) -> int:
+def _get_logical_numel(param: torch.Tensor) -> int:
     """Return the logical number of elements for a parameter,
     accounting for quantized (packed) storage.
 
@@ -241,7 +247,7 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
 
 
 @contextmanager
-def skip_random_init():
+def skip_random_init() -> Generator[None, None, None]:
     """
     Context manager to skip random weight initialization when loading pretrained models.
     """
@@ -250,14 +256,15 @@ def skip_random_init():
     except ImportError:
         mod = __import__("transformers.modeling_utils", fromlist=["_init_weights"])
     prev = getattr(mod, "_init_weights", True)
-    mod._init_weights = False
+    # Which transformers module defines the flag depends on the installed release.
+    setattr(mod, "_init_weights", False)
     try:
         yield
     finally:
-        mod._init_weights = prev
+        setattr(mod, "_init_weights", prev)
 
 
-def resolve_trust_remote_code(pretrained_model_name_or_path):
+def resolve_trust_remote_code(pretrained_model_name_or_path: str | None) -> bool:
     """
     Whitelist NVIDIA models to allow remote code execution.
 
@@ -326,7 +333,9 @@ def print_trainable_parameters(model: nn.Module, name: str = "Model") -> tuple[i
     return trainable_params, total_params
 
 
-def _freeze_module_by_attribute_and_patterns(model, attribute_name, name_patterns):
+def _freeze_module_by_attribute_and_patterns(
+    model: nn.Module, attribute_name: str | None, name_patterns: Sequence[str]
+) -> None:
     """Freeze a legacy model attribute and modules matching name substrings."""
     module = getattr(model, attribute_name, None) if attribute_name is not None else None
     if module is not None:
@@ -564,7 +573,7 @@ def parse_freeze_config(config: FreezeConfig | Mapping[str, Any] | None) -> Free
     )
 
 
-def enable_radio_vit_fused_attn(model):
+def enable_radio_vit_fused_attn(model: nn.Module) -> None:
     """Route RADIO ViT attention through ``F.scaled_dot_product_attention``.
 
     RADIO's timm Attention blocks default to ``fused_attn=False``, which
@@ -742,14 +751,13 @@ def apply_parameter_freezing(
     # Phi4MM: cast internal fp32 LoRA adapters to bf16 for FSDP2 compatibility,
     # and disable KV cache (remote code uses legacy DynamicCache.key_cache
     # attribute removed in transformers v5.x).
-    model_type = getattr(getattr(model, "config", None), "model_type", "")
-    if model_type == "phi4mm":
+    config = getattr(model, "config", None)
+    if config is not None and getattr(config, "model_type", "") == "phi4mm":
         cast_mixed_dtype_params_to_bf16(model)
-        if hasattr(model, "config"):
-            model.config.use_cache = False
+        config.use_cache = False
 
 
-def freeze_unused_kv_sharing_params(model):
+def freeze_unused_kv_sharing_params(model: nn.Module) -> None:
     """Freeze dead K/V parameters in KV-shared layers.
 
     Models like Gemma4 E2B/E4B use KV-sharing where the last N layers reuse
@@ -799,7 +807,7 @@ def freeze_unused_kv_sharing_params(model):
         )
 
 
-def freeze_deepseek_v4_indexer_params(model):
+def freeze_deepseek_v4_indexer_params(model: nn.Module) -> None:
     """Freeze DeepSeek V4 indexer params that only feed discrete top-k masks."""
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) != "deepseek_v4":
@@ -815,7 +823,7 @@ def freeze_deepseek_v4_indexer_params(model):
         logger.info("Froze %d DeepSeek V4 indexer parameters.", frozen_count)
 
 
-def freeze_minimax_m3_indexer_params(model):
+def freeze_minimax_m3_indexer_params(model: nn.Module) -> None:
     """Freeze MiniMax M3 lightning-indexer params that only feed discrete top-k masks."""
     config = getattr(model, "config", None)
     if not str(getattr(config, "model_type", "")).startswith("minimax_m3"):
@@ -831,7 +839,7 @@ def freeze_minimax_m3_indexer_params(model):
         logger.info("Froze %d MiniMax M3 indexer parameters.", frozen_count)
 
 
-def cast_mixed_dtype_params_to_bf16(model):
+def cast_mixed_dtype_params_to_bf16(model: nn.Module) -> None:
     """Cast fp32 parameters and buffers to bf16 for FSDP2 compatibility."""
     for p in model.parameters():
         if p.dtype == torch.float32:
@@ -841,7 +849,18 @@ def cast_mixed_dtype_params_to_bf16(model):
             b.data = b.data.to(torch.bfloat16)
 
 
-def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, seqlens_padding_value=-1000):
+def squeeze_input_for_thd(
+    input_ids: torch.Tensor | None,
+    position_ids: torch.Tensor,
+    padding_mask: torch.Tensor | None,
+    attn_kwargs: dict[str, torch.Tensor | int | float | bool | str | None],
+    seqlens_padding_value: int = -1000,
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor | None,
+    dict[str, torch.Tensor | int | float | bool | str | None],
+]:
     """
     Squeeze batch dimension and prepare inputs for THD (total, hidden, depth) format.
 
@@ -920,6 +939,8 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
         if isinstance(value, torch.Tensor):
             attn_kwargs[key] = value.squeeze(0)
         if key in ["cu_seqlens", "cu_seqlens_padded"]:
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"attn_kwargs[{key!r}] must be a tensor, got {type(value).__name__}")
             attn_kwargs[key] = value[value != seqlens_padding_value].contiguous()
         if key == "max_seqlen" and isinstance(value, torch.Tensor):
             attn_kwargs[key] = value.item()
@@ -927,14 +948,18 @@ def squeeze_input_for_thd(input_ids, position_ids, padding_mask, attn_kwargs, se
     # Resolve chunked THD metadata once per model call, after removing sentinels.
     # A single batch-wide flag cannot describe microbatches with different padding.
     if attn_kwargs.get("cu_seqlens_padded") is not None and attn_kwargs.get("pad_between_seqs") is None:
-        attn_kwargs["pad_between_seqs"] = not torch.equal(attn_kwargs["cu_seqlens_padded"], attn_kwargs["cu_seqlens"])
+        cu_seqlens_padded = attn_kwargs["cu_seqlens_padded"]
+        cu_seqlens = attn_kwargs["cu_seqlens"]
+        if not (isinstance(cu_seqlens_padded, torch.Tensor) and isinstance(cu_seqlens, torch.Tensor)):
+            raise TypeError("attn_kwargs['cu_seqlens'] and ['cu_seqlens_padded'] must be tensors")
+        attn_kwargs["pad_between_seqs"] = not torch.equal(cu_seqlens_padded, cu_seqlens)
 
     return input_ids, position_ids, padding_mask, attn_kwargs
 
 
 # taken and edited from https://github.com/huggingface/transformers/blob/32a58e31463e238c967207bf73772490c353551a/src/transformers/integrations/accelerate.py#L53-L158
 @contextmanager
-def init_empty_weights():
+def init_empty_weights() -> Generator[None, None, None]:
     """
     A context manager under which models are initialized with all parameters on the specified device.
 
@@ -960,17 +985,16 @@ def init_empty_weights():
     }
     old_register_parameter = nn.Module.register_parameter
 
-    def register_empty_parameter(module, name, param):
+    def register_empty_parameter(module: nn.Module, name: str, param: nn.Parameter | None) -> None:
         old_register_parameter(module, name, param)
-        if param is not None:
-            param_cls = type(module._parameters[name])
-            if HAVE_TORCHAO and isinstance(
-                module._parameters[name], torch_ao.float8.fsdp_utils.WeightWithDynamicFloat8CastTensor
-            ):
+        registered = module._parameters[name]
+        if param is not None and registered is not None:
+            param_cls = type(registered)
+            if HAVE_TORCHAO and isinstance(registered, torch_ao.float8.fsdp_utils.WeightWithDynamicFloat8CastTensor):
                 kwargs = {}
-                for k in module._parameters[name].__dict__:
+                for k in registered.__dict__:
                     if k in fp8_parameter_mapping:
-                        kwargs[fp8_parameter_mapping[k]] = getattr(module._parameters[name], k)
+                        kwargs[fp8_parameter_mapping[k]] = getattr(registered, k)
                 is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
             else:
                 # Standard nn.Parameter only accepts requires_grad, not arbitrary __dict__ attributes
@@ -979,15 +1003,16 @@ def init_empty_weights():
                     kwargs = {"requires_grad": param.requires_grad}
                     is_hf_initialized = None
                 else:
-                    kwargs = module._parameters[name].__dict__.copy()
+                    kwargs = registered.__dict__.copy()
                     kwargs["requires_grad"] = param.requires_grad
                     is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
-            module._parameters[name] = param_cls(module._parameters[name].to(device), **kwargs)
+            module._parameters[name] = param_cls(registered.to(device), **kwargs)
             if is_hf_initialized is not None:
                 setattr(module._parameters[name], "_is_hf_initialized", is_hf_initialized)
 
     try:
-        nn.Module.register_parameter = register_empty_parameter
+        # Monkey-patch: assigning to a method of an external class cannot be expressed statically.
+        setattr(nn.Module, "register_parameter", register_empty_parameter)
         yield
     finally:
-        nn.Module.register_parameter = old_register_parameter
+        setattr(nn.Module, "register_parameter", old_register_parameter)
