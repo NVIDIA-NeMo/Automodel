@@ -171,3 +171,105 @@ class TestYieldedTracking:
         # Second iteration without another load_state_dict should yield all
         second = _collect(sampler)
         assert len(second) == len(sampler)
+
+
+# ---------------------------------------------------------------------------
+# Length computation
+# ---------------------------------------------------------------------------
+
+
+class _LazyTokenizingDataset:
+    """Stand-in for ChatDataset: raw rows in ``.dataset``, tokenization in ``__getitem__``."""
+
+    def __init__(self, lengths):
+        self.dataset = [{"messages": [{"role": "user", "content": "x" * n}], "n_tokens": n} for n in lengths]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        n = self.dataset[idx]["n_tokens"]
+        return {"input_ids": list(range(n)), "labels": list(range(n))}
+
+
+class _TruncatingWrapper:
+    """Wrapper that is 1:1 with its inner list but shortens ``input_ids``."""
+
+    def __init__(self, lengths, cap):
+        self.dataset = _make_dataset(lengths)
+        self.cap = cap
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        return {"input_ids": self.dataset[idx]["input_ids"][: self.cap]}
+
+
+class TestComputeLengths:
+    def test_plain_list_dataset(self):
+        lengths = [10, 20, 30, 40]
+        assert LengthGroupedSampler._compute_lengths(_make_dataset(lengths)) == lengths
+
+    def test_lazily_tokenized_dataset_uses_getitem(self):
+        """Raw rows in `.dataset` lack `input_ids`; lengths must come from `__getitem__`."""
+        lengths = [8, 128, 16, 64]
+        ds = _LazyTokenizingDataset(lengths)
+        assert LengthGroupedSampler._compute_lengths(ds) == lengths
+
+    def test_lazily_tokenized_dataset_is_length_grouped(self):
+        ds = _LazyTokenizingDataset([8, 128, 16, 64, 4, 256, 32, 512])
+        sampler = LengthGroupedSampler(ds, batch_size=2, seed=0, num_replicas=1, rank=0)
+        # Descending length order: 512, 256, 128, 64, 32, 16, 8, 4
+        assert sampler.sorted_indices == [7, 5, 1, 3, 6, 2, 0, 4]
+
+    def test_shorter_subset_reads_selected_samples(self):
+        from torch.utils.data import Subset
+
+        ds = Subset(_make_dataset([10, 20, 30, 40]), [3, 1])
+        assert LengthGroupedSampler._compute_lengths(ds) == [40, 20]
+
+    def test_equal_length_permutation_subset_follows_index_mapping(self):
+        """A full-length ``Subset`` reorders samples without changing ``len``."""
+        from torch.utils.data import Subset
+
+        ds = Subset(_make_dataset([10, 20, 30, 40]), [3, 1, 0, 2])
+        assert LengthGroupedSampler._compute_lengths(ds) == [40, 20, 10, 30]
+
+    def test_equal_length_subset_with_repeated_indices(self):
+        """Repeated indices also keep ``len`` while changing the samples."""
+        from torch.utils.data import Subset
+
+        ds = Subset(_make_dataset([10, 20, 30, 40]), [0, 0, 3, 3])
+        assert LengthGroupedSampler._compute_lengths(ds) == [10, 10, 40, 40]
+
+    def test_length_changing_wrapper_is_measured_through_getitem(self):
+        """A 1:1 wrapper may still rewrite ``input_ids``; measure what it returns."""
+        ds = _TruncatingWrapper([10, 20, 30, 40], cap=16)
+        assert LengthGroupedSampler._compute_lengths(ds) == [10, 16, 16, 16]
+
+    def test_permuted_subset_is_grouped_on_its_own_order(self):
+        """End to end: grouping must follow the samples the sampler will yield."""
+        from torch.utils.data import Subset
+
+        ds = Subset(_make_dataset([8, 128, 16, 64]), [3, 1, 0, 2])
+        # ds[i] lengths are [64, 128, 8, 16]; descending order is 128, 64, 16, 8.
+        sampler = LengthGroupedSampler(ds, batch_size=1, seed=0, num_replicas=1, rank=0)
+        assert sampler.sorted_indices == [1, 0, 3, 2]
+
+    def test_tensor_input_ids(self):
+        import torch
+
+        ds = [{"input_ids": torch.arange(n)} for n in (10, 20, 30)]
+        assert LengthGroupedSampler._compute_lengths(ds) == [10, 20, 30]
+
+    def test_missing_input_ids_warns(self, caplog):
+        ds = [{"text": "a"}, {"text": "b"}]
+        with caplog.at_level("WARNING"):
+            assert LengthGroupedSampler._compute_lengths(ds) == [0, 0]
+        assert "Length grouping will have no effect" in caplog.text
+
+    def test_empty_dataset_does_not_warn(self, caplog):
+        with caplog.at_level("WARNING"):
+            assert LengthGroupedSampler._compute_lengths([]) == []
+        assert "Length grouping will have no effect" not in caplog.text
