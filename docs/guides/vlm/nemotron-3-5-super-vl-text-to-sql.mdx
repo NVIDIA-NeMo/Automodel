@@ -1,9 +1,9 @@
 ---
-title: "Nemotron 3.5 Super VL: Text-to-SQL with LoRA"
+title: "NVIDIA Nemotron 3.5 Super VL: Text-to-SQL with LoRA"
 description: "LoRA fine-tune Nemotron 3.5 Super VL on Spider so it answers natural-language questions with SQL for databases it has never seen, then evaluate on the Spider validation split."
 position: 16
 ---
-**A step-by-step guide for LoRA fine-tuning Nemotron 3.5 Super VL (121B hybrid Mamba and Attention
+**A step-by-step guide for LoRA fine-tuning NVIDIA Nemotron 3.5 Super VL (121B hybrid Mamba and Attention
 Mixture-of-Experts (MoE) VLM) on [Spider](https://huggingface.co/datasets/xlangai/spider), a cross-domain
 text-to-SQL dataset, using [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel). The whole run fits
 on a single node of 8 H100; inference and evaluation use the Spider validation split, whose databases never
@@ -13,11 +13,11 @@ appear in training.**
 
 ## What is Nemotron 3.5 Super VL?
 
-Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`, architecture
+NVIDIA Nemotron 3.5 Super VL (`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`, architecture
 `NemotronH_Omni_Reasoning_V3`) is the 121B member of the Nemotron 3.5 family: a NemotronV3 hybrid backbone
 (88 layers: 40 Mamba2, 8 attention, 40 MoE with 512 routed experts and top-22 routing) with a RADIO v2.5-H
 vision encoder. This guide uses it as a text-only model: the vision tower is loaded but never receives an
-image. See the [model coverage page](/model-coverage/omni/nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained) for the
+image. See the [model coverage page](/model-coverage/omni/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16) for the
 architecture details and the other recipes.
 
 ## Text-to-SQL on Spider
@@ -52,7 +52,7 @@ that might not end in a query. After fine-tuning, it outputs **exactly one SQL q
 - **1 node x 8 H100 80 GB** (512 experts sharded with `ep_size=8`; `cp_size=1` so the 8-question global
   batch is one question per data-parallel rank)
 - **Memory**: ~36 GiB per GPU. The frozen base weights need no fp32 master copy or optimizer state; only the
-  177M LoRA parameters carry fp32 master weights and Adam moments.
+  177M LoRA parameters carry fp32 master weights and bf16 Adam moments.
 - **Training time**: ~15 min for 400 steps (3,200 of the 7,000 training questions), including four
   validation passes over the 1,034 validation questions and adapter-only checkpoints (~355 MB each)
 
@@ -165,6 +165,8 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
+    experts: torch_mm
+    dispatcher: hybridep
     rms_norm: torch_fp32
     rope_fusion: false
     fake_balanced_gate: false
@@ -394,11 +396,11 @@ for i in range(0, len(validation), STRIDE)[:NUM_SAMPLES]:
 print(f"exact match {exact}/{NUM_SAMPLES} | mean similarity {similarity / NUM_SAMPLES:.3f}")
 ```
 
-Skipping the merge block scores the un-tuned base model the same way.
+Skipping the merge block scores the starting BF16 checkpoint the same way.
 
 **Resources:** One node with 8x H100 (bf16 weights spread over the GPUs).
-**Runtime:** About 2–4 min to load the base checkpoint, then about 3.4 s per question for the fine-tuned
-model (greedy, up to 256 new tokens). The un-tuned base model takes about 16 s per question because it writes
+**Runtime:** About 2–4 min to load the starting BF16 checkpoint, then about 3.4 s per question for the fine-tuned
+model (greedy, up to 256 new tokens). The starting BF16 checkpoint takes about 16 s per question because it writes
 a paragraph of reasoning before (or instead of) the query.
 
 ---
@@ -413,7 +415,7 @@ a paragraph of reasoning before (or instead of) the query.
 | LoRA, step 99 (`LOWEST_VAL`, val loss 0.230) | 7/20 | 0.847 | 0.956 | 12/20 |
 | LoRA, step 399 (`LATEST`, val loss 0.248) | **10/20** | **0.905** | **0.984** | **14/20** |
 
-The base model never returns a bare query: it reasons about the schema in prose ("We need to count the number
+Before task-specific fine-tuning, the model never returns a bare query: it reasons about the schema in prose ("We need to count the number
 of singers. The table singer has Singer_ID as primary key. So we can count distinct Singer_ID or just count
 rows...") and, when it does write SQL, wraps it in a code fence. After LoRA fine-tuning, every prediction is a
 single SQL statement against the given schema.

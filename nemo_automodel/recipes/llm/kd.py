@@ -55,6 +55,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.loader import StreamDatasetConfig
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -325,9 +326,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             pp_microbatch_size=pp_microbatch_size,
         )
 
-    def _configure_packing(self) -> PackingCapabilities:
+    @property
+    def _packing_contract(self) -> PackingCapabilities:
         """Emit metadata for both KD consumers, including a teacher built later."""
-        return replace(super()._configure_packing(), requires_packed_sequence_metadata=True)
+        return replace(super()._packing_contract, return_packed_sequence_metadata=True)
 
     def _configure_teacher_packing(self) -> None:
         """Adapt teacher stages and reject incompatible student/teacher mask layouts.
@@ -353,6 +355,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
     def setup(self):  # noqa: C901 – same complexity as parent
         """Build student & teacher, dataloaders, optimizers, etc."""
+        dataloader_config = self.cfg.dataloader
+        if dataloader_config is not None and isinstance(dataloader_config.dataset_config, StreamDatasetConfig):
+            raise ValueError("Stream-loader knowledge distillation is not yet certified")
         # Right now, we only support tokenizer compatibility for the same tokenizer.
         # We will add support for different tokenizers in the future.
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
@@ -1204,6 +1209,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         if not metric_logger is None:
             metric_logger.log(log_data)
@@ -1257,6 +1265,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # JSONL training log (always log for detailed local records).
         self.metric_logger_train.log(log_data)

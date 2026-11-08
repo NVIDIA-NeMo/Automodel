@@ -84,6 +84,8 @@ from nemo_automodel.shared.import_utils import UnavailableMeta, safe_import_from
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from nemo_automodel.components.distributed.mesh import MeshContext
 
 __all__ = [
@@ -1003,7 +1005,7 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
 
 def _attention_config(model: nn.Module):
     """Resolve the language-model config structurally for TP validation."""
-    candidates: list[tuple[int, object]] = []
+    candidates: list[tuple[int, PretrainedConfig]] = []
     named_modules = getattr(model, "named_modules", None)
     modules = named_modules() if callable(named_modules) else (("", model),)
     for name, module in modules:
@@ -1458,7 +1460,7 @@ def _get_parallel_plan(
                     model_cls.__name__,
                     tp_size,
                 )
-            base_model_tp_plan = {
+            base_model_tp_plan: dict[str, ParallelStyle] = {
                 "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.k_proj": ColwiseParallel(),

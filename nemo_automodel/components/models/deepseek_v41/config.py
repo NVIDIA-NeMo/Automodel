@@ -122,6 +122,12 @@ class DeepseekV41TextConfig(PretrainedConfig):
         dspark_num_experts_per_tok: int = 3,
         dtype: str = "bfloat16",
         compile_cache_quant: bool = False,
+        engram_strict_validation: bool = False,
+        engram_capacity_mode: bool = False,
+        compile_engram: bool = False,
+        reuse_sparse_selection_on_recompute: bool = True,
+        sparse_attention_backward: str = "atomic",
+        sparse_attention_backward_workspace_bytes: int = 2 * 1024**3,
         pad_token_id: int | None = 2,
         bos_token_id: int = 0,
         eos_token_id: int = 1,
@@ -216,6 +222,31 @@ class DeepseekV41TextConfig(PretrainedConfig):
         # torch.compile the cache quantize/dequantize core (fp8 / mxfp4 / nvfp4 rounding of the sliding-window and
         # compressed caches); a DeepSeek-V4.1 knob, so it lives here rather than on the shared BackendConfig
         self.compile_cache_quant = compile_cache_quant
+        # Validate every Engram lookup on the host with cross-rank agreement (the original behaviour, about twenty
+        # device-to-host synchronisations and seven small collectives per lookup); False keeps the same invariants as
+        # device-side asserts. See Qwen3_8_FlashNextEngramTableConfig.strict_validation.
+        self.engram_strict_validation = engram_strict_validation
+        # Engram capacity mode (Qwen3_8_FlashNextEngramTableConfig.capacity_mode): the owner exchange is sized once by
+        # the first lookup and never read back again. An opt-in for bounded workloads only (fixed-shape benchmark
+        # batches); fine-tuning with variable sequence lengths or local-batch padding keeps the exact-count path.
+        self.engram_capacity_mode = engram_capacity_mode
+        # torch.compile the Engram gate core (fp32 casts, the stream / key RMS reductions, the signed-square-root sigmoid
+        # gate and the gated residual add) once per process (engram.compile_engram_gate): allclose to eager, not
+        # bitwise. A DeepSeek-V4.1 knob like compile_cache_quant, so it lives here rather than on the shared BackendConfig.
+        self.compile_engram = compile_engram
+        # Under activation checkpointing, serve the frozen CSA2 indexer's selection and the sparse-index plan of
+        # the checkpoint forward to the recompute instead of recomputing them (attention.csa2_selection_replay);
+        # a DeepSeek-V4.1 knob like compile_cache_quant. Numerics are unchanged; False recomputes them.
+        self.reuse_sparse_selection_on_recompute = bool(reuse_sparse_selection_on_recompute)
+        if sparse_attention_backward not in ("atomic", "deterministic"):
+            raise ValueError("sparse_attention_backward must be atomic or deterministic")
+        if (
+            not isinstance(sparse_attention_backward_workspace_bytes, int)
+            or sparse_attention_backward_workspace_bytes <= 0
+        ):
+            raise ValueError("sparse_attention_backward_workspace_bytes must be a positive integer")
+        self.sparse_attention_backward = sparse_attention_backward
+        self.sparse_attention_backward_workspace_bytes = sparse_attention_backward_workspace_bytes
         super().__init__(
             dtype=kwargs.pop("torch_dtype", dtype),
             pad_token_id=pad_token_id,
@@ -549,6 +580,9 @@ class DeepseekV41DSparkConfig:
             raise ValueError("DeepSeek V4.1 DSpark requires confidence_head_with_markov=true")
 
         draft_config = copy.deepcopy(self.text_config)
+        # The dense draft uses SDPA, so it does not inherit the target's
+        # TileLang-only sparse backward selector. Preserve the target config.
+        draft_config.sparse_attention_backward = "atomic"
         draft_config.architectures = ["DeepseekV41DSparkModel"]
         draft_config.quantization_config = copy.deepcopy(self.quantization_config)
         return DeepseekV41DSparkModel(

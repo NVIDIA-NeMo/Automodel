@@ -111,6 +111,7 @@ optimizer:
   weight_decay: 0.0
 
 ci:
+  cluster_tag: h100
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 16

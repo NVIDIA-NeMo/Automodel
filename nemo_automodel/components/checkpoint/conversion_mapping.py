@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torch import nn
+    from transformers.quantizers.base import HfQuantizer
 
 
 # Try to import from transformers - this is the preferred source
@@ -60,6 +61,7 @@ except ImportError:
 # For these models, simple key renaming is not sufficient - they need WeightConverter
 # operations to merge individual expert weights into grouped format
 MODELS_REQUIRING_TENSOR_MERGING = {
+    "beam",
     "mixtral",
     "minimax",
     "phimoe",
@@ -128,7 +130,7 @@ def get_checkpoint_conversion_mapping(model_type: str) -> list | None:
 def get_model_conversion_mapping(
     model: "nn.Module",
     key_mapping: dict[str, str] | None = None,
-    hf_quantizer: object | None = None,
+    hf_quantizer: "HfQuantizer | None" = None,
     add_legacy: bool = True,
 ) -> list:
     """

@@ -62,3 +62,6 @@ optimizer:
   weight_decay: 0.0
   warmup_ratio: 0.05
   min_lr_ratio: 0.1
+
+ci:
+  cluster_tag: h100

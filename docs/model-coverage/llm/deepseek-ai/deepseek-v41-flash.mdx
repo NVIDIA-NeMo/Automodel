@@ -8,7 +8,7 @@ slug: model-coverage/large-language-models/deepseek-ai/DeepSeek-V4.1-Flash
 uses a 40-layer causal encoder/decoder Mixture-of-Experts (MoE) backbone with
 384 routed experts, one shared expert, and six selected experts per token. Its CSA2 attention shares
 compressed KV and index state between Full, Reuse, and Reindex layers.
-Single-pass mHC carries four residual streams, and two trainable Engram tables
+Single-pass Manifold-Constrained Hyper-Connections (mHC) carries four residual streams, and two trainable Engram tables
 at layers 1 and 14 provide tokenizer-dependent N-gram memory. The approximately
 552B backbone is accompanied by 196B Engram parameters.
 
@@ -89,9 +89,26 @@ See the [Slurm Launcher Guide](/job-launchers/slurm-cluster) and
 and communication prewarming must match the backend, topology, and local
 input shapes.
 
+## Experimental Fixed-Order Backward
+
+With `model.backend.attn: tilelang`, set
+`model.config.text_config.sparse_attention_backward: deterministic` to use fixed-order
+FP32 reduction of KV and sink gradients. The default `atomic` path is unchanged.
+The forward kernel, sparse selection, and checkpoint parameter layout are unchanged.
+This option does not make unrelated model operations or distributed collectives
+deterministic; qualify full-model repeatability separately.
+
+`model.config.text_config.sparse_attention_backward_workspace_bytes` limits partial KV
+contributions (default 2147483648 bytes). Sorting buffers, contiguous input
+chunks, sink partials, and final gradients are additional. Query chunks depend
+on tensor shapes and the configured cap. Smaller caps can increase launch and
+sorting overhead. This path requires CUDA BF16 TileLang execution and does not
+silently fall back to atomic reduction. Throughput, long-context memory, and
+full-state recovery must be qualified for the intended workload before use.
+
 ## Context Parallelism
 
-Unpacked, right-padded text supports context parallelism with contiguous sequence
+Unpacked, right-padded text supports context parallelism (CP) with contiguous sequence
 shards. Set `distributed.cp_size` and retain the same global batch size when
 comparing CP sizes. The model's sharder pads the global sequence so each rank
 owns complete compression groups and preserves global position IDs. Shift
@@ -102,7 +119,7 @@ Queries and hidden activations remain local. Window KV, newly compressed KV,
 and index keys are gathered across the CP group; reused compressed KV retains
 its gradient history across layers. Engram gathers integer token history for
 N-gram hashing, then looks up only the local tokens through the existing row
-owners. CP does not gather full Engram tables. TP, PP, packed documents, and
+owners. CP does not gather full Engram tables. Tensor parallelism (TP), pipeline parallelism (PP), packed documents, and
 image inputs remain outside this CP path.
 
 The [Tulu3 CP recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_tulu3_cp.yaml)
@@ -119,8 +136,8 @@ gradient-sized norm temporaries for contiguous CUDA owner shards. Set
 
 Set `model.backend.attn: cudnn` to run the sparse attention core through the
 cuDNN Frontend DSA kernels (forward and backward, the attention sink included)
-instead of the TileLang kernels; the indexer, the compressor and the mHC
-Sinkhorn stay on their TileLang/TileKernels paths. It needs
+instead of the TileLang kernels; the indexer, the compressor, and the mHC
+Sinkhorn stay on their TileLang and TileKernels paths. It needs
 `nvidia-cudnn-frontend[cutedsl]` 1.29 or later (FlashMLA's
 `flash_mla_sparse_fwd` is used for the forward when it is installed) on an SM100
 GPU. The kernels round differently from the TileLang path, so losses agree to
@@ -146,11 +163,17 @@ repository at `e2c47c5b` (torch 2.13, NCCL 2.30.5).
 
 The Tulu3 variants load `allenai/tulu-3-sft-mixture` from the Hugging Face Hub
 through `ChatDataset` with `tulu3_chat_template.jinja`. The CP8 recipe uses
-padded 4,096-token rows. The packed recipe uses 32,768-token THD packs built
+padded 4,096-token rows. The packed recipe uses 32,768-token THD (total tokens, heads, and head dimension) packs built
 at startup.
 For offline runs,
 [prepare_tulu3_data.py](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/prepare_tulu3_data.py)
 writes the same padded and prepacked layouts to disk.
+`tulu3_chat_template.jinja` accepts only system, user, and assistant turns.
+For data with tool calls or reasoning, use
+[`deepseek_v41_flash_training_chat_template.jinja`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v41/deepseek_v41_flash_training_chat_template.jinja)
+from the same directory, the released `chat_template.jinja` with loss spans
+(its header covers thinking-mode data). It renders those three roles
+identically.
 
 Three points apply to every H100 variant:
 
@@ -240,7 +263,7 @@ against the pinned checkpoint's unchanged official `inference/` implementation.
 Official TP1 was compared with native EP4 and 4 Engram owners using
 `torch_mm`, native HybridEP dispatch and combine, and TileLang. Dense and expert
 reference weights were decoded for BF16 compute, with the original cache and index quantization retained;
-this was not a default FP8/FP4 GEMM comparison.
+this was not a default FP8 or FP4 GEMM comparison.
 
 The native execution streamed one production block at a time while carrying
 its own residual, mHC, and CSA2 state. Embedding, final norm, and head weights

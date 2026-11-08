@@ -41,15 +41,24 @@ _SUPPORTED_ATTENTION_HEAD_DIMS = (512, 576)
 _VALUE_HEAD_DIM = 512
 _FLASH_MLA_TOPK_ALIGNMENT = 512
 # cuDNN Frontend >= 1.29 ships its own SM100 sparse-prefill forward (``sparse_attention_forward_wrapper``); it stands
-# in for FlashMLA when that package is absent. Resolved lazily so tests can patch ``_CUDNN_DSA``.
+# in for FlashMLA when that package is absent. Resolved lazily so tests can patch ``_CUDNN_DSA``. The kernel rejects
+# other architectures, so SM90 still needs FlashMLA for the forward.
+
+
+def _on_sm100_family() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 
 def _cudnn_forward_available() -> bool:
-    return bool(_HAS_CUDNN_DSA) and callable(getattr(_CUDNN_DSA, "sparse_attention_forward_wrapper", None))
+    return (
+        bool(_HAS_CUDNN_DSA)
+        and callable(getattr(_CUDNN_DSA, "sparse_attention_forward_wrapper", None))
+        and _on_sm100_family()
+    )
 
 
 def is_cudnn_sparse_attention_available() -> bool:
-    """Return whether the cuDNN backward and a sparse forward (FlashMLA or cuDNN >= 1.29) import."""
+    """Return whether the cuDNN backward and a sparse forward (FlashMLA, or cuDNN >= 1.29 on SM100) are usable."""
     return bool(_HAS_CUDNN_DSA) and (bool(_HAS_FLASH_MLA) or _cudnn_forward_available())
 
 
@@ -58,7 +67,8 @@ def _require_available() -> None:
     if not is_cudnn_sparse_attention_available():
         raise RuntimeError(
             "cuDNN sparse attention requires nvidia-cudnn-frontend[cutedsl] (>= 1.29 for its forward kernel, "
-            "or any version with the backward kernel plus FlashMLA's flash_mla_sparse_fwd)."
+            "which runs only on SM100-family GPUs, or any version with the backward kernel plus FlashMLA's "
+            "flash_mla_sparse_fwd, which also covers SM90)."
         )
 
 
@@ -107,9 +117,42 @@ def _compact_and_sort_indices(indices: torch.Tensor, key_count: int) -> tuple[to
     return sorted_key.masked_fill(sorted_key == key_count, -1).contiguous(), topk_length.contiguous()
 
 
+def _pad_to_topk_alignment(indices: torch.Tensor) -> torch.Tensor:
+    """Pad the sparse width of ``[query_tokens, sparse_width]`` indices to the FlashMLA alignment with ``-1``."""
+    padded_topk = math.ceil(indices.shape[-1] / _FLASH_MLA_TOPK_ALIGNMENT) * _FLASH_MLA_TOPK_ALIGNMENT
+    if padded_topk == indices.shape[-1]:
+        return indices
+    return torch.nn.functional.pad(indices, (0, padded_topk - indices.shape[-1]), value=-1)
+
+
+def plan_sparse_indices(indices: torch.Tensor, key_count: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Canonicalize sparse indices once for every call that will consume them.
+
+    :func:`cudnn_sparse_attention` derives this per call when ``topk_length`` is ``None``: the compact
+    ascending valid prefix, padded to the FlashMLA alignment, and the valid-prefix lengths. A model whose
+    layers share one selection (DeepSeek-V4.1's CSA2 lineages) builds the plan once and passes
+    ``topk_length`` precomputed, so the sort and its prologue run once per selection instead of once per layer.
+
+    Args:
+        indices: Integer tensor of shape ``[query_tokens, sparse_width]`` with global K/V coordinates and
+            negative invalid entries.
+        key_count: Number of rows in the flattened K/V tensor.
+
+    Returns:
+        Contiguous int32 indices of shape ``[query_tokens, padded_width]`` (ascending valid prefix, ``-1``
+        suffix, ``padded_width`` a multiple of 512) and contiguous int32 valid-prefix lengths of shape
+        ``[query_tokens]``.
+    """
+    sorted_indices, topk_length = _compact_and_sort_indices(indices, key_count)
+    return _pad_to_topk_alignment(sorted_indices).contiguous(), topk_length
+
+
 def _padded_head_count(num_heads: int, major: int) -> int:
     """Return the FlashMLA-supported query-head count for one SM generation."""
     if major >= 10:
+        # FlashMLA rejects H96, but accepts its zero-padded H128 forward.
+        if num_heads == 96:
+            return 128
         for padded in (64, 128):
             if num_heads == padded or (num_heads < padded and padded % num_heads == 0):
                 return padded
@@ -185,12 +228,9 @@ class _CudnnSparseAttention(torch.autograd.Function):
         """
         kv = kv_latent.squeeze(1).contiguous()
         if topk_length is None:
-            indices, topk_length = _compact_and_sort_indices(topk_indices.squeeze(1), kv.shape[0])
+            indices, topk_length = plan_sparse_indices(topk_indices.squeeze(1), kv.shape[0])
         else:
-            indices = topk_indices.squeeze(1).contiguous()
-        padded_topk = math.ceil(indices.shape[-1] / _FLASH_MLA_TOPK_ALIGNMENT) * _FLASH_MLA_TOPK_ALIGNMENT
-        if padded_topk != indices.shape[-1]:
-            indices = torch.nn.functional.pad(indices, (0, padded_topk - indices.shape[-1]), value=-1)
+            indices = _pad_to_topk_alignment(topk_indices.squeeze(1).contiguous())
 
         has_sink = attn_sink is not None
         if attn_sink is None:
@@ -271,7 +311,9 @@ class _CudnnSparseAttention(torch.autograd.Function):
                 used_dummy = True
                 q_input = torch.zeros_like(q[:1])
                 out_input = torch.zeros_like(out[:1])
-                grad_input = torch.zeros_like(grad_output[:1])
+                # zeros_like preserves a head-major gradient's ambiguous size-one stride;
+                # cuDNN's CuTe conversion requires a canonical contiguous dummy layout.
+                grad_input = grad_output.new_zeros((1, *grad_output.shape[1:]))
                 lse_input = torch.zeros_like(lse[:1])
                 indices_kernel = torch.zeros_like(indices[:1])
                 topk_length_kernel = torch.ones_like(topk_length[:1])
@@ -283,17 +325,19 @@ class _CudnnSparseAttention(torch.autograd.Function):
                 indices_kernel = indices.index_select(0, valid_row_indices)
                 topk_length_kernel = topk_length.index_select(0, valid_row_indices)
 
-        q_kernel, sink_kernel = _pad_attention_heads(q_input, attn_sink, ctx.padded_heads)
-        if ctx.padded_heads == q.shape[1]:
+        # cuDNN supports native H96 (including D576); only FlashMLA forward needs head padding.
+        backward_heads = 96 if q.shape[1] == 96 else ctx.padded_heads
+        q_kernel, sink_kernel = _pad_attention_heads(q_input, attn_sink, backward_heads)
+        if backward_heads == q.shape[1]:
             out_kernel = out_input
             grad_kernel = grad_input.contiguous()
             lse_kernel = lse_input
         else:
-            out_kernel = out_input.new_zeros((out_input.shape[0], ctx.padded_heads, out_input.shape[2]))
+            out_kernel = out_input.new_zeros((out_input.shape[0], backward_heads, out_input.shape[2]))
             out_kernel[:, : out_input.shape[1]] = out_input
-            grad_kernel = grad_input.new_zeros((grad_input.shape[0], ctx.padded_heads, grad_input.shape[2]))
+            grad_kernel = grad_input.new_zeros((grad_input.shape[0], backward_heads, grad_input.shape[2]))
             grad_kernel[:, : grad_input.shape[1]] = grad_input
-            lse_kernel = lse_input.new_zeros((lse_input.shape[0], ctx.padded_heads))
+            lse_kernel = lse_input.new_zeros((lse_input.shape[0], backward_heads))
             lse_kernel[:, : lse_input.shape[1]] = lse_input
 
         result = _CUDNN_DSA.sparse_attention_backward_wrapper(
@@ -435,4 +479,4 @@ def cudnn_sparse_attention(
     )
 
 
-__all__ = ["cudnn_sparse_attention", "is_cudnn_sparse_attention_available"]
+__all__ = ["cudnn_sparse_attention", "is_cudnn_sparse_attention_available", "plan_sparse_indices"]

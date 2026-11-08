@@ -96,3 +96,6 @@ distributed:
   cp_size: 1
   activation_checkpointing: true
   activation_checkpointing_scope: all
+
+ci:
+  cluster_tag: h100

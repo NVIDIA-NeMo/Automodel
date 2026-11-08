@@ -185,3 +185,6 @@ wandb:
   project: bagel-finetuning
   mode: disabled
   name: bagel_7b_mot_sft
+
+ci:
+  cluster_tag: h100

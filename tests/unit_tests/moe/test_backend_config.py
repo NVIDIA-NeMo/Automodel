@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import logging
+from typing import Literal
 
 import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig, CudaGraphConfig
+from nemo_automodel.components.models.common.utils import HAVE_TE
 from nemo_automodel.components.moe.config import MoEConfig
 
 
@@ -398,26 +400,25 @@ class TestBackendConfigCompileAttn:
             BackendConfig(compile_mla=True)
 
 
-class TestBackendConfigRopeFusionDisabled:
-    """TE fused RoPE is temporarily force-disabled globally in __post_init__ (see #3027)."""
+class TestBackendConfigRopeFusion:
+    """TE fusion honors its default and explicit choices, with non-TE precedence."""
 
-    def test_rope_fusion_default_forced_false(self):
-        """The default resolves to False regardless of TE/CUDA availability."""
-        assert BackendConfig().rope_fusion is False
+    def test_rope_fusion_default(self) -> None:
+        """The default enables fusion when both TE and CUDA are available."""
+        assert BackendConfig().rope_fusion is bool(HAVE_TE and torch.cuda.is_available())
 
-    def test_rope_fusion_explicit_true_is_overridden(self, caplog):
-        """An explicit rope_fusion=True is forced back to False and warns once."""
+    @pytest.mark.parametrize("fusion", [False, True])
+    def test_rope_fusion_explicit_choice(self, fusion: bool, caplog: pytest.LogCaptureFixture) -> None:
+        """Explicit requests survive configuration normalization without an override."""
         with caplog.at_level(logging.WARNING):
-            config = BackendConfig(rope_fusion=True)
-        assert config.rope_fusion is False
-        assert "rope_fusion is temporarily force-disabled globally" in caplog.text
-
-    def test_rope_fusion_explicit_false_no_warning(self, caplog):
-        """An explicit rope_fusion=False stays False and logs no override warning."""
-        with caplog.at_level(logging.WARNING):
-            config = BackendConfig(rope_fusion=False)
-        assert config.rope_fusion is False
+            config = BackendConfig(rope_fusion=fusion)
+        assert config.rope_fusion is fusion
         assert "force-disabled" not in caplog.text
+
+    @pytest.mark.parametrize("rope", ["quack", "triton"])
+    def test_non_te_backend_takes_precedence(self, rope: Literal["quack", "triton"]) -> None:
+        """A selected non-TE backend disables the incompatible TE fusion path."""
+        assert BackendConfig(rope=rope, rope_fusion=True).rope_fusion is False
 
 
 class TestBackendConfigPartialCudaGraphs:
@@ -485,9 +486,9 @@ class TestBackendConfigPartialCudaGraphs:
                 cuda_graph=CudaGraphConfig(modules=["attn"]),
             )
 
-    def test_whole_attention_uses_resolved_rope_fusion_value(self, caplog):
-        with caplog.at_level(logging.WARNING):
-            config = BackendConfig(
+    def test_whole_attention_rejects_enabled_rope_fusion(self) -> None:
+        with pytest.raises(ValueError, match="requires rope_fusion=False"):
+            BackendConfig(
                 attn="te",
                 linear="torch",
                 rms_norm="torch",
@@ -495,6 +496,13 @@ class TestBackendConfigPartialCudaGraphs:
                 cuda_graph=CudaGraphConfig(modules=["attn"]),
             )
 
+        config = BackendConfig(
+            attn="te",
+            linear="torch",
+            rms_norm="torch",
+            rope_fusion=False,
+            cuda_graph=CudaGraphConfig(modules=["attn"]),
+        )
         assert config.rope_fusion is False
         assert config.cuda_graph.modules == ["attn"]
 
@@ -506,6 +514,31 @@ class TestBackendConfigPartialCudaGraphs:
                 dispatcher="deepep",
                 cuda_graph=CudaGraphConfig(modules=["moe_router", "moe_preprocess"]),
             )
+
+
+@pytest.mark.parametrize("experts,dispatcher", [("torch", "torch"), ("torch_mm", "deepep")])
+def test_native_te_grouped_tensor_rejects_other_expert_backends(
+    experts: Literal["torch", "torch_mm"], dispatcher: Literal["torch", "deepep"]
+) -> None:
+    with pytest.raises(ValueError, match="te_grouped_tensor=True requires experts='te'"):
+        BackendConfig(experts=experts, dispatcher=dispatcher, te_grouped_tensor=True)
+
+
+@pytest.mark.parametrize("dispatcher", ["torch", "mok"])
+def test_native_te_grouped_tensor_rejects_unsupported_dispatchers(dispatcher: Literal["torch", "mok"]) -> None:
+    with pytest.raises(ValueError, match="te_grouped_tensor=True requires dispatcher=") as exc_info:
+        BackendConfig(experts="te", dispatcher=dispatcher, te_grouped_tensor=True)
+
+    assert f"got dispatcher='{dispatcher}'" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("dispatcher", ["deepep", "hybridep", "uccl_ep"])
+def test_native_te_grouped_tensor_is_opt_in(dispatcher: Literal["deepep", "hybridep", "uccl_ep"]) -> None:
+    assert not BackendConfig(experts="te", dispatcher=dispatcher).te_grouped_tensor
+    config = BackendConfig(experts="te", dispatcher=dispatcher, te_grouped_tensor=True)
+    assert config.te_grouped_tensor
+    assert config.experts == "te"
+    assert config.dispatcher == dispatcher
 
 
 class TestBackendConfigHybridEPSyncFree:
@@ -545,3 +578,29 @@ class TestBackendConfigHybridEPSyncFree:
                 benchmark_static_routing=True,
                 dispatcher_capacity_factor=1.5,
             )
+
+
+class TestDispatcherRecomputeCache:
+    """BackendConfig.dispatcher_recompute_cache: HybridEP-only recompute cache of the MoE combine output."""
+
+    def test_default_is_none(self):
+        assert BackendConfig().dispatcher_recompute_cache == "none"
+
+    @pytest.mark.parametrize("value", ["combine", "moe_tail"])
+    def test_accepts_the_two_modes_with_hybridep_and_torch_mm(self, value):
+        config = BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache=value)
+        assert config.dispatcher_recompute_cache == value
+
+    def test_rejects_unknown_value(self):
+        with pytest.raises(ValueError, match="dispatcher_recompute_cache must be one of"):
+            BackendConfig(experts="torch_mm", dispatcher="hybridep", dispatcher_recompute_cache="all")
+
+    def test_requires_hybridep(self):
+        with pytest.raises(ValueError, match="dispatcher_recompute_cache requires dispatcher='hybridep'"):
+            BackendConfig(experts="torch_mm", dispatcher="deepep", dispatcher_recompute_cache="combine")
+
+    def test_moe_tail_requires_torch_mm_experts(self):
+        with pytest.raises(ValueError, match="moe_tail' requires experts='torch_mm'"):
+            BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="moe_tail")
+        # the combine cache alone does not care about the expert kernel
+        assert BackendConfig(experts="te", dispatcher="hybridep", dispatcher_recompute_cache="combine")

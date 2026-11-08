@@ -118,6 +118,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  cluster_tag: h100
   time: "00:20:00"
   nodes: 4
   known_issue_id: AM-174

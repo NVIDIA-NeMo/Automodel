@@ -108,6 +108,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  cluster_tag: h100
   time: "01:00:00"
   vllm_deploy: true
   vllm_deploy_known_issue_id: AM-176

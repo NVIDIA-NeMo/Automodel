@@ -44,13 +44,16 @@ def _add_nvtx_hooks(model, name, add_backward_hooks=True):
         torch.cuda.nvtx.range_push(name)
 
     def pop_fwd(module, *args, **kwargs):
-        if getattr(module, "_nvtx_skipped", False):
+        if getattr(module, "_nvtx_skipped", True) or name not in _get_active_ranges():
             return
         torch.cuda.nvtx.range_pop()
         _get_active_ranges().discard(name)
+        module._nvtx_skipped = True
 
     model.register_forward_pre_hook(push_fwd)
-    model.register_forward_hook(pop_fwd)
+    # Non-reentrant activation checkpointing can stop recomputation by raising
+    # internally. Close the range on that path and on ordinary forward errors.
+    model.register_forward_hook(pop_fwd, always_call=True)
 
     if add_backward_hooks:
 

@@ -1,0 +1,158 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-parameter SFT of Beam-1.0-501B-A23B on the Tulu-3 SFT mixture on 8 nodes of eight 141 GB GPUs (64 H200).
+# EP64 + FSDP2 with activation checkpointing, packed THD sequences of 4096 tokens, GBS 64 packs (~262k tokens per
+# step) without gradient accumulation.
+#
+# Precision: model storage and checkpoints stay bf16; the router weight and its correction bias stay fp32 (Beam's
+# fp32 router contract). TE FusedAdam keeps an exact fp32 master weight for every bf16 parameter as the bf16 value plus
+# a 16-bit remainder, with fp32 Adam moments, and updates the fp32 parameters in place. FSDP2 computes in bf16 and
+# reduces gradients in fp32 (the default policy). See docs/guides/mixed-precision-training.mdx.
+#
+# Measured on 8 nodes of 8x H200: 100 steps, validation loss 0.483 -> 0.468, peak ~117 GiB per GPU. A resume from
+# the step-50 checkpoint reproduced the next step's loss exactly and stayed below the same peak.
+#
+# enable_fsdp_optimizations and reshard_after_forward keep the settings of the Beam LoRA recipe. A checkpoint holds
+# the bf16 weights (~1 TB) plus the optimizer state (~5 TB); saving one to a shared filesystem took ~9 minutes. So
+# checkpoint_dir must be on a shared filesystem with room for two checkpoints (steps 50 and 100).
+#
+# Launch from the repository root on each of the 8 nodes, with NODE_RANK 0-7 and MASTER_ADDR set to node 0:
+#   uv run torchrun --nnodes=8 --nproc-per-node=8 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
+#     -m nemo_automodel.cli.app examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 1
+  ckpt_every_steps: 50
+  val_every_steps: 25
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: reflection/Beam-1.0-501B-A23B
+  dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: torch
+    rms_norm: torch_fp32
+    experts: torch_mm
+    dispatcher: hybridep
+    rope_fusion: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/beam_1_0_501b_a23b_tulu3_ep64_8nodes
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:100000]
+  shuffle_seed: 42
+  truncation: true
+  seq_length: 4096
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: reflection/Beam-1.0-501B-A23B
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[100000:102048]
+  shuffle_seed: 42
+  truncation: true
+  seq_length: 4096
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: reflection/Beam-1.0-501B-A23B
+
+packed_sequence:
+  packed_sequence_size: 4096
+  max_packs: 6464
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+  drop_last: false
+  num_workers: 0
+  pin_memory: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: false
+  drop_last: false
+  num_workers: 0
+  pin_memory: false
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 1.0e-5
+  weight_decay: 0.0
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+lr_scheduler:
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+
+ci:
+  recipe_owner: mreso
+  nodes: 16
+  time: "01:30:00"
+  nproc_per_node: 4
+  cluster_tag: gb200
+  max_steps: 20
