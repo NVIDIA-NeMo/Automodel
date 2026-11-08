@@ -499,6 +499,7 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_num_sms_preprocessing: int | None = None,
         moe_hybridep_num_blocks_permute: int | None = None,
         moe_hybridep_num_blocks_unpermute: int | None = None,
+        moe_hybridep_max_tokens_per_rank: int | None = None,
         benchmark_static_routing: bool = False,
         moe_hybridep_capacity_factor: float | None = None,
         moe_hybridep_equal_token_counts: bool = False,
@@ -516,6 +517,11 @@ class _HybridEPManager(_DispatchManager):
         self.moe_hybridep_num_sms_preprocessing = moe_hybridep_num_sms_preprocessing
         self.moe_hybridep_num_blocks_permute = moe_hybridep_num_blocks_permute
         self.moe_hybridep_num_blocks_unpermute = moe_hybridep_num_blocks_unpermute
+        if moe_hybridep_max_tokens_per_rank is not None and moe_hybridep_max_tokens_per_rank <= 0:
+            raise ValueError(
+                f"moe_hybridep_max_tokens_per_rank must be positive, got {moe_hybridep_max_tokens_per_rank}"
+            )
+        self.moe_hybridep_max_tokens_per_rank = moe_hybridep_max_tokens_per_rank
         # Capacity mode (dynamic routing): after one blocking calibration dispatch, later dispatches
         # pass this many rows as num_permuted_tokens and run non-blocking (see dispatch()).
         if moe_hybridep_capacity_factor is not None and benchmark_static_routing:
@@ -685,6 +691,7 @@ class _HybridEPManager(_DispatchManager):
             num_sms_preprocessing_api=self.moe_hybridep_num_sms_preprocessing,
             num_blocks_permute=self.moe_hybridep_num_blocks_permute,
             num_blocks_unpermute=self.moe_hybridep_num_blocks_unpermute,
+            max_tokens_per_rank=self.moe_hybridep_max_tokens_per_rank,
         )
 
         self.tokens_per_expert = tokens_per_expert
@@ -876,7 +883,7 @@ class HybridEPPipelineRuntimeInitializer:
         return (HybridEPPipelineRuntimeInitializer, "process_global_buffer")
 
     @property
-    def signature(self) -> tuple[object, ...]:
+    def signature(self) -> tuple[int | torch.dtype | None, ...]:
         """Return the immutable configuration served by the global buffer."""
         return (
             id(self.manager.group),
@@ -891,6 +898,7 @@ class HybridEPPipelineRuntimeInitializer:
             self.manager.moe_hybridep_num_sms_preprocessing,
             self.manager.moe_hybridep_num_blocks_permute,
             self.manager.moe_hybridep_num_blocks_unpermute,
+            self.manager.moe_hybridep_max_tokens_per_rank,
             self.manager.pad_multiple,
             int(os.environ.get("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "64")),
         )
@@ -1042,6 +1050,9 @@ class TokenDispatcherConfig:
     each MoE layer's combine output of the checkpoint forward in the recompute ("combine"), and with
     "moe_tail" also skip the down projection's GEMM there. "none" recomputes the whole layer."""
 
+    moe_hybridep_max_tokens_per_rank: int | None = None
+    """Pre-size the HybridEP buffer for this many tokens per rank on the first dispatch (None = first micro-batch)."""
+
     moe_share_token_dispatcher: bool = True
     """Share one communication manager instance across MoE layers for the configured backend."""
 
@@ -1182,6 +1193,7 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                         moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                         moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                        moe_hybridep_max_tokens_per_rank=self.config.moe_hybridep_max_tokens_per_rank,
                         benchmark_static_routing=self.config.moe_benchmark_static_routing,
                         moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                         moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
@@ -1195,6 +1207,7 @@ class MoEFlexTokenDispatcher:
                     self._comm_manager.moe_hybridep_num_sms_preprocessing,
                     self._comm_manager.moe_hybridep_num_blocks_permute,
                     self._comm_manager.moe_hybridep_num_blocks_unpermute,
+                    self._comm_manager.moe_hybridep_max_tokens_per_rank,
                     self._comm_manager.hybridep_capacity_factor,
                     self._comm_manager.equal_token_counts,
                     self._comm_manager.moe_hybridep_recompute_cache,
@@ -1205,6 +1218,7 @@ class MoEFlexTokenDispatcher:
                     self.config.moe_hybridep_num_sms_preprocessing,
                     self.config.moe_hybridep_num_blocks_permute,
                     self.config.moe_hybridep_num_blocks_unpermute,
+                    self.config.moe_hybridep_max_tokens_per_rank,
                     self.config.moe_hybridep_capacity_factor,
                     self.config.moe_hybridep_equal_token_counts,
                     self.config.moe_hybridep_recompute_cache,
@@ -1227,6 +1241,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
                     moe_hybridep_num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
                     moe_hybridep_num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                    moe_hybridep_max_tokens_per_rank=self.config.moe_hybridep_max_tokens_per_rank,
                     benchmark_static_routing=self.config.moe_benchmark_static_routing,
                     moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                     moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,

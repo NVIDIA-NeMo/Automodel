@@ -4418,7 +4418,7 @@ class TestDispatcherRecomputeCacheKnob:
         assert deferred == [1]  # with no reader of the output the GEMM is skipped as before
 
 
-def test_te_alignment_reports_unavailable_quantization_api(monkeypatch) -> None:
+def test_te_alignment_reports_unavailable_quantization_api(monkeypatch: pytest.MonkeyPatch) -> None:
     from nemo_automodel.components.moe.experts import _te_expert_gemm_alignment
 
     monkeypatch.setattr("nemo_automodel.components.moe.experts.safe_import_from", lambda *args: (False, None))

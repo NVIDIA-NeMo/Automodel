@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
+from torch.autograd.function import FunctionCtx
 from torch.nn import functional as F
 
 _fp4_table_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -99,7 +100,7 @@ class _CacheQuantization(torch.autograd.Function):
     """Quantize cache values in forward and pass the activation gradient unchanged."""
 
     @staticmethod
-    def forward(ctx: object, values: torch.Tensor, block_size: int, format: str) -> torch.Tensor:
+    def forward(ctx: FunctionCtx, values: torch.Tensor, block_size: int, format: str) -> torch.Tensor:
         """Round independent channel groups without modifying the input.
 
         Args:
@@ -120,7 +121,7 @@ class _CacheQuantization(torch.autograd.Function):
         return _quantize(values, block_size, format)
 
     @staticmethod
-    def backward(ctx: object, gradient: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+    def backward(ctx: FunctionCtx, gradient: torch.Tensor) -> tuple[torch.Tensor, None, None]:
         """Pass the gradient for [..., channels] activations through quantization.
 
         Args:

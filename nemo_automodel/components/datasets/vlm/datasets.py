@@ -35,6 +35,7 @@ from PIL import Image
 from transformers import ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
     _lmdb_env_cache,
@@ -69,7 +70,7 @@ class RdrDatasetConfig:
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the RDR dataset from this config."""
         return make_rdr_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -119,7 +120,7 @@ class CordV2DatasetConfig:
     limit_dataset_samples: int | None = None
     """Optional maximum number of samples to load."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the CORD-V2 dataset from this config."""
         return make_cord_v2_dataset(
             path_or_dataset=self.path_or_dataset,
@@ -180,13 +181,26 @@ class MedPixDatasetConfig:
     """HuggingFace dataset id or local path for MedPix."""
     split: str = "train"
     """Dataset split to load."""
+    revision: str | None = None
+    """Optional HuggingFace dataset revision."""
+    seed: int | None = None
+    """Optional shuffle seed applied before packing; None preserves source order."""
 
-    def build(self) -> object:
+    def build(self) -> Dataset:
         """Build the lazily decoded MedPix dataset."""
-        return make_medpix_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
+        return make_medpix_dataset(
+            path_or_dataset=self.path_or_dataset, split=self.split, revision=self.revision, seed=self.seed
+        )
 
 
-def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
+def make_medpix_dataset(
+    path_or_dataset: str = "medpix-dataset/medpix-dataset",
+    split: str = "train",
+    *,
+    revision: str | None = None,
+    seed: int | None = None,
+    **kwargs,
+) -> Dataset:
     """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
 
     Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
@@ -196,7 +210,9 @@ def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="
     happens on demand in the DataLoader workers, rather than eagerly decoding the
     whole split up front.
     """
-    dataset = load_dataset(path_or_dataset, split=split)
+    dataset = load_dataset(path_or_dataset, split=split, revision=revision)
+    if seed is not None:
+        dataset = dataset.shuffle(seed=seed)
     if "image_id" in getattr(dataset, "features", {}):
         dataset = dataset.cast_column("image_id", HfImage(decode=False))
 
@@ -238,7 +254,7 @@ class LlavaOnevisionDatasetConfig:
     split: str = "train"
     """Dataset split to load."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the LLaVA-OneVision conversation dataset."""
         return make_llava_onevision_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -313,7 +329,7 @@ class Tulu3MagicoderTextMixDatasetConfig:
     limit_total: int | None = None
     """Optional cap on the merged row count."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the text-only Tulu-3/Magicoder mixture."""
         return make_tulu3_magicoder_text_mix_dataset(
             tulu_split=self.tulu_split,
@@ -580,7 +596,7 @@ class UnimmChatDatasetConfig:
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the UniMM-Chat dataset from this config."""
         return make_unimm_chat_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -1161,7 +1177,7 @@ class MetaDatasetConfig:
     shard_data: bool = False
     """If ``True``, each rank loads only its ``1/world_size`` slice."""
 
-    def build(self, *, rank: int | None = None, world_size: int | None = None) -> list[dict[str, object]]:
+    def build(self, *, rank: int | None = None, world_size: int | None = None) -> list[ConversationSample]:
         """Build the meta VLM dataset from this config.
 
         Args:
@@ -1504,13 +1520,16 @@ class PreTokenizedDatasetWrapperConfig:
     """If ``True``, truncate overlong samples instead of replacing them."""
     inject_fake_images: bool = True
     """If ``True``, inject a fake image into text-only samples for sharded training."""
-    post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None
+    post_tokenize_hook: (
+        Callable[[dict[str, torch.Tensor | list[list[int]]], ProcessorMixin], dict[str, torch.Tensor | list[list[int]]]]
+        | None
+    ) = None
     """Optional declarative callback applied to each tokenizer result."""
 
     def build(
         self,
         *,
-        dataset: torch.utils.data.Dataset | Sequence[dict[str, object]],
+        dataset: Dataset | torch.utils.data.Dataset | Sequence[ConversationSample],
         processor: "ProcessorMixin",
     ) -> "PreTokenizedDatasetWrapper":
         """Build a :class:`PreTokenizedDatasetWrapper` from this config.
@@ -1708,10 +1727,13 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     "pixel_values",
                     "pixel_values_videos",
                     "image_grid_thw",
+                    "image_grid_hws",
                     "video_grid_thw",
                     "second_per_grid_ts",
                     "image_position_ids",
+                    "image_sizes",
                     "mm_token_type_ids",
+                    "vision_token_types",
                 ):
                     if key in result and result[key] is not None:
                         output[key] = result[key]

@@ -878,13 +878,18 @@ def format_prompt_completion(
     """
     full_text = prompt + answer
 
-    # Tokenize separately to locate answer start
+    # Tokenize separately to locate answer start. NOTE: this is only for calculating
+    # the length of the prompt; we are not modifying the prompt to be returned here.
     if answer_only_loss_mask:
-        # don't add eos token here. NOTE: this is only for calculating the length of the prompt.
-        # we are not modifying the prompt to be returned here.
-        prompt_ids = [tokenizer.bos_token_id] if getattr(tokenizer, "add_bos_token", False) else []
-        prompt_ids += tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        len_prompt_ids = len(prompt_ids)
+        # Byte-level BPE tokenizers (GPT-2, Qwen) merge the prompt's trailing space
+        # into the first answer token ("Answer: " + "Paris" -> "Answer:", " Paris"),
+        # so len(prompt_ids) can overshoot the boundary. The prefix the prompt shares
+        # with the untruncated, unpadded full text is the real prompt length.
+        prompt_ids = tokenizer(prompt)["input_ids"]
+        # Drop a trailing EOS so it is not mistaken for prompt when the answer is empty.
+        if prompt_ids and prompt_ids[-1] == eos_token_id:
+            prompt_ids = prompt_ids[:-1]
+        len_prompt_ids = _common_prefix_length(prompt_ids, tokenizer(full_text)["input_ids"])
     else:
         len_prompt_ids = 0
     # transformers 5.5.0 still honored `padding_side: "right"` baked into the
