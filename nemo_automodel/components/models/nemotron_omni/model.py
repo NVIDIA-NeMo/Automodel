@@ -314,23 +314,6 @@ class _ModelProxy:
         self.language_model = llm.model
 
 
-@dataclass(frozen=True)
-class _MTPMediaFeatures:
-    """Encoded media reused by the primary stream and every MTP depth.
-
-    Attributes:
-        token_id: Placeholder token replaced by these features.
-        features: Tensor of shape [global_media_tokens, hidden], in global
-            placeholder order, retaining the encoder's autograd graph.
-        feature_index_by_token: Int64 Tensor of shape [global_tokens], mapping
-            the flattened original token stream to media-feature ordinals.
-    """
-
-    token_id: int
-    features: torch.Tensor
-    feature_index_by_token: torch.Tensor
-
-
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
@@ -1071,7 +1054,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         per_depth_input_ids: tuple[torch.Tensor, ...],
         *,
         local_token_indices: torch.Tensor | None,
-        media_features: list[_MTPMediaFeatures],
+        media_features: dict[int, tuple[torch.Tensor, torch.Tensor]],
         per_depth_valid_masks: tuple[torch.Tensor, ...] | None,
     ) -> tuple[torch.Tensor, ...]:
         """Embed local future tokens and restore their encoded media features.
@@ -1082,8 +1065,11 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             local_token_indices: Int64 Tensor of shape [local_tokens], mapping
                 the flattened local layout to the original global token stream.
                 Required only when media_features is nonempty.
-            media_features: Per-modality features and ordinal maps as documented
-                by _MTPMediaFeatures; computed once in this forward.
+            media_features: Maps each media placeholder token ID to a pair of
+                encoded features [global_media_tokens, hidden] and Int64 feature
+                ordinals [global_tokens]. Both follow the original global token
+                order and are computed once per forward; features retain the
+                encoder's autograd graph.
             per_depth_valid_masks: Optional Boolean tensors with the same shapes
                 as per_depth_input_ids; false entries cannot consume media.
 
@@ -1101,16 +1087,16 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 if local_token_indices is None:
                     raise ValueError("MTP media features require global token indices")
                 flat = future.reshape(-1, future.shape[-1])
-                for media in media_features:
-                    selected = ids.reshape(-1) == media.token_id
+                for token_id, (encoded_features, feature_index_by_token) in media_features.items():
+                    selected = ids.reshape(-1) == token_id
                     if per_depth_valid_masks is not None:
                         selected = selected & per_depth_valid_masks[depth - 1].reshape(-1)
                     positions = selected.nonzero(as_tuple=True)[0]
                     if positions.numel() == 0:
                         continue
                     source_positions = local_token_indices.index_select(0, positions) + depth
-                    feature_indices = media.feature_index_by_token.index_select(0, source_positions)
-                    features = media.features.index_select(0, feature_indices).to(dtype=flat.dtype)
+                    feature_indices = feature_index_by_token.index_select(0, source_positions)
+                    features = encoded_features.index_select(0, feature_indices).to(dtype=flat.dtype)
                     # Do not mutate an embedding output/view owned by FSDP hooks.
                     flat = flat.index_copy(0, positions, features)
                 future = flat.reshape(future.shape)
@@ -1245,7 +1231,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         _embeds_pre_built = inputs_embeds is not None
         mtp_per_depth_input_ids: tuple[torch.Tensor, ...] | None = kwargs.pop("mtp_per_depth_input_ids", None) or None
         mtp_valid_masks: tuple[torch.Tensor, ...] | None = kwargs.pop("mtp_per_depth_valid_masks", None)
-        mtp_media_features: list[_MTPMediaFeatures] = []
+        mtp_media_features: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         local_token_indices: torch.Tensor | None = None
         # Packed THD under CP: input_ids arrive already partitioned per document by
         # the framework TE THD sharder (cu_seqlens/cp_size/cp_rank come with it);
@@ -1341,7 +1327,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                         local_token_indices = (row_offsets[:, None] + columns[None, :]).reshape(-1)
             if mtp_per_depth_input_ids is not None:
                 feature_index_by_token = global_mask.reshape(-1).to(dtype=torch.long).cumsum(0) - 1
-                mtp_media_features.append(_MTPMediaFeatures(token_id, features, feature_index_by_token))
+                mtp_media_features[token_id] = (features, feature_index_by_token)
             if not _thd_cp:
                 return features
             return self._select_local_media_features(
