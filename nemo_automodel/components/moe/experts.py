@@ -43,7 +43,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 from nemo_automodel.components.moe.optimized_ops import _apply_router_weight_fp32, _compile_router_weight_cores
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
-from nemo_automodel.shared.import_utils import is_te_min_version, safe_import
+from nemo_automodel.shared.import_utils import is_te_min_version, safe_import, safe_import_from
 from nemo_automodel.shared.matrix_layout import TransposedMatrixModule
 
 _HAVE_TRITON, triton = safe_import("triton")
@@ -1407,8 +1407,11 @@ def _te_expert_gemm_alignment(recipe: "Recipe | None", *, use_grouped_tensor: bo
         return 1
     if use_grouped_tensor and (recipe.mxfp8() or recipe.float8_block_scaling()):
         return 128
-    from transformer_engine.pytorch.quantization import get_align_size_for_quantization
-
+    available, get_align_size_for_quantization = safe_import_from(
+        "transformer_engine.pytorch.quantization", "get_align_size_for_quantization"
+    )
+    if not available:
+        raise ImportError("TE expert alignment requires Transformer Engine's quantization alignment API")
     return get_align_size_for_quantization(recipe)
 
 

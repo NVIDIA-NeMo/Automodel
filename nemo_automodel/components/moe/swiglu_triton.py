@@ -301,14 +301,43 @@ class SwigluClampedTriton(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, x: torch.Tensor, probs: torch.Tensor, limit: float, routed_rows: torch.Tensor | None
+        ctx: torch.autograd.function.FunctionCtx,
+        x: torch.Tensor,
+        probs: torch.Tensor,
+        limit: float,
+        routed_rows: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Evaluate weighted SwiGLU, retaining inputs for its backward.
+
+        Args:
+            ctx: Autograd context owning the saved tensors.
+            x: Contiguous tensor of shape [rows, 2 * inter], gate followed by up.
+            probs: FP32 tensor of shape [rows] or [rows, 1].
+            limit: Clamp bound, or infinity for unclamped SwiGLU.
+            routed_rows: Optional device integer tensor of shape [1] bounding active rows.
+
+        Returns:
+            Tensor of shape [rows, inter] in x's dtype; inactive tail rows are uninitialized.
+        """
         ctx.save_for_backward(x, probs, routed_rows)
         ctx.limit = limit
         return _forward(x, probs, limit, routed_rows)
 
     @staticmethod
-    def backward(ctx, grad_y: torch.Tensor):
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_y: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, None, None]:
+        """Differentiate the routed leading rows, preserving the input layouts.
+
+        Args:
+            ctx: Autograd context with the saved forward inputs.
+            grad_y: Upstream tensor of shape [rows, inter].
+
+        Returns:
+            Input gradient of shape [rows, 2 * inter], optional probability gradient
+            matching [rows] or [rows, 1], and None for both nondifferentiable inputs.
+            Inactive tail rows of tensor gradients remain uninitialized.
+        """
         x, probs, routed_rows = ctx.saved_tensors
         grad_x, grad_probs = _backward(x, probs, grad_y, ctx.limit, routed_rows)
         return grad_x, (grad_probs if ctx.needs_input_grad[1] else None), None, None

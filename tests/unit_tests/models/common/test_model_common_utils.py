@@ -144,37 +144,94 @@ class TestIsFirstMicrobatch:
         assert get_is_first_microbatch() is False
 
 
-def test_te_patch_forwards_grouped_linear_buffers(monkeypatch):
-    """The microbatch-flag patch keeps GroupedLinear's output and input-gradient buffer arguments."""
+@pytest.mark.parametrize("buffers", ["none", "keyword", "positional", "legacy"])
+@pytest.mark.parametrize("first_microbatch", [None, False])
+def test_te_patch_forwards_grouped_linear_buffers(monkeypatch, buffers: str, first_microbatch: bool | None) -> None:
+    """Preserve TE's positional/keyword buffers, explicit flags, and older no-buffer API."""
     calls = []
 
-    class GroupedLinear:
-        def forward(self, inp, m_splits, is_first_microbatch=None, out=None, dgrad_out=None):
+    class GroupedLinear(nn.Module):
+        def forward(
+            self,
+            inp: torch.Tensor,
+            m_splits: list[int],
+            is_first_microbatch: bool | None = None,
+            out: torch.Tensor | None = None,
+            dgrad_out: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            """Record the buffer ABI without emulating TE math.
+
+            Args:
+                inp: Tensor of shape [rows, hidden].
+                m_splits: Expert row counts.
+                is_first_microbatch: Optional cache flag.
+                out: Optional tensor of shape [rows, hidden].
+                dgrad_out: Optional tensor of shape [rows, hidden].
+
+            Returns:
+                The input tensor of shape [rows, hidden], unchanged.
+            """
             calls.append((is_first_microbatch, out, dgrad_out))
             return inp
 
-    class Unpatched:
-        def forward(self, x):
+    class LegacyGroupedLinear(nn.Module):
+        def forward(
+            self, inp: torch.Tensor, m_splits: list[int], is_first_microbatch: bool | None = None
+        ) -> torch.Tensor:
+            """Emulate TE's pre-buffer signature.
+
+            Args:
+                inp: Tensor of shape [rows, hidden].
+                m_splits: Expert row counts.
+                is_first_microbatch: Optional cache flag.
+
+            Returns:
+                The input tensor of shape [rows, hidden], unchanged.
+            """
+            calls.append((is_first_microbatch, None, None))
+            return inp
+
+    class Unpatched(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            """Keep unrelated module calls unchanged.
+
+            Args:
+                x: Tensor with arbitrary shape.
+
+            Returns:
+                The input tensor with its shape and identity unchanged.
+            """
             return x
 
+    grouped_linear = LegacyGroupedLinear if buffers == "legacy" else GroupedLinear
     modules = {
         "transformer_engine.pytorch.module.grouped_linear": ModuleType("grouped_linear"),
         "transformer_engine.pytorch.module.linear": ModuleType("linear"),
         "transformer_engine.pytorch.module.rmsnorm": ModuleType("rmsnorm"),
     }
-    modules["transformer_engine.pytorch.module.grouped_linear"].GroupedLinear = GroupedLinear
+    modules["transformer_engine.pytorch.module.grouped_linear"].GroupedLinear = grouped_linear
     modules["transformer_engine.pytorch.module.linear"].Linear = type("Linear", (Unpatched,), {})
     modules["transformer_engine.pytorch.module.rmsnorm"].RMSNorm = type("RMSNorm", (Unpatched,), {})
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(GroupedLinear, "forward", GroupedLinear.forward)
     _make_lazy_te_patcher()()
+    inp, out, dgrad_out = (torch.zeros(1, 2) for _ in range(3))
     set_is_first_microbatch(True)
     try:
-        GroupedLinear().forward(torch.zeros(1), [1], out="out", dgrad_out="dgrad")
+        module = grouped_linear()
+        if buffers == "positional":
+            result = module(inp, [1], first_microbatch, out, dgrad_out)
+        elif buffers == "keyword":
+            result = module(inp, [1], first_microbatch, out=out, dgrad_out=dgrad_out)
+        else:
+            result = module(inp, [1], first_microbatch)
     finally:
         set_is_first_microbatch(None)
-    assert calls == [(True, "out", "dgrad")]
+    assert result is inp
+    assert len(calls) == 1
+    assert calls[0][0] is (True if first_microbatch is None else first_microbatch)
+    assert calls[0][1] is (out if buffers in ("positional", "keyword") else None)
+    assert calls[0][2] is (dgrad_out if buffers in ("positional", "keyword") else None)
 
 
 class TestTEFp8Config:

@@ -4416,3 +4416,13 @@ class TestDispatcherRecomputeCacheKnob:
         experts.dispatcher_recompute_cache = "moe_tail"
         experts(*args[:4])
         assert deferred == [1]  # with no reader of the output the GEMM is skipped as before
+
+
+def test_te_alignment_reports_unavailable_quantization_api(monkeypatch) -> None:
+    from nemo_automodel.components.moe.experts import _te_expert_gemm_alignment
+
+    monkeypatch.setattr("nemo_automodel.components.moe.experts.safe_import_from", lambda *args: (False, None))
+    assert _te_expert_gemm_alignment(None, use_grouped_tensor=False) == 1
+    assert _te_expert_gemm_alignment(_fake_recipe("mxfp8"), use_grouped_tensor=True) == 128
+    with pytest.raises(ImportError, match="quantization alignment API"):
+        _te_expert_gemm_alignment(_fake_recipe("current"), use_grouped_tensor=False)

@@ -1157,11 +1157,38 @@ def _make_lazy_te_patcher():
                 is_first_microbatch = get_is_first_microbatch()
             return _original_linear_forward(self, x, is_first_microbatch=is_first_microbatch, **kwargs)
 
-        def _patched_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=None, **kwargs):
+        def _patched_grouped_linear_forward(
+            self: "TEGroupedLinear",
+            inp: torch.Tensor,
+            m_splits: torch.Tensor | list[int],
+            is_first_microbatch: bool | None = None,
+            out: torch.Tensor | None = None,
+            dgrad_out: torch.Tensor | None = None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | list[torch.Tensor]]:
+            """Preserve TE's buffer API while supplying the training microbatch flag.
+
+            Args:
+                inp: Tensor of shape [rows, in_features], packed by expert.
+                m_splits: Integer tensor of shape [experts] or equivalent host list,
+                    counting each expert's leading rows, including alignment padding.
+                is_first_microbatch: Explicit cache flag, or None to use the training flag.
+                out: Optional contiguous non-grad tensor of shape [rows, out_features]
+                    in the activation dtype. TE writes only the routed rows in place.
+                dgrad_out: Optional contiguous non-grad tensor of shape [rows, in_features]
+                    in the activation dtype, written in place by backward.
+
+            Returns:
+                Output tensor of shape [rows, out_features], aliasing out when supplied.
+                With TE's return_bias option, also returns bias of shape [experts,
+                out_features] or a list of per-expert tensors of shape [out_features].
+            """
             if is_first_microbatch is None:
                 is_first_microbatch = get_is_first_microbatch()
+            # Older TE versions lack buffer arguments; preserve their no-buffer call.
+            if out is None and dgrad_out is None:
+                return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
             return _original_grouped_linear_forward(
-                self, inp, m_splits, is_first_microbatch=is_first_microbatch, **kwargs
+                self, inp, m_splits, is_first_microbatch=is_first_microbatch, out=out, dgrad_out=dgrad_out
             )
 
         TERMSNorm.forward = _patched_rmsnorm_forward
