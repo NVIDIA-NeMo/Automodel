@@ -362,7 +362,7 @@ def flatten_packed_sequence_metadata(
     return flat_indices, flat_cu_seqlens
 
 
-def _flatten_packed_metadata_at_model_entry(
+def prepare_packed_metadata(
     _module: torch.nn.Module,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
@@ -506,7 +506,7 @@ def _install_native_fa4_metadata_hook(model: torch.nn.Module) -> None:
     if getattr(model, "_native_fa4_metadata_hook_handle", None) is not None:
         return
     handle = model.register_forward_pre_hook(
-        _flatten_packed_metadata_at_model_entry,
+        prepare_packed_metadata,
         with_kwargs=True,
     )
     setattr(model, "_native_fa4_metadata_hook_handle", handle)

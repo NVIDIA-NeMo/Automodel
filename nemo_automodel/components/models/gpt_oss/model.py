@@ -28,7 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.packing import _flatten_packed_metadata_at_model_entry
+from nemo_automodel.components.models.common.packing import prepare_packed_metadata
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -184,9 +184,7 @@ class GptOssModel(nn.Module):
             Hidden states [batch, sequence, hidden] or [physical_tokens, hidden].
         """
         if self.backend.attn == "fa4" and attn_kwargs.get("qkv_format") == "thd":
-            prepared = _flatten_packed_metadata_at_model_entry(
-                self, (input_ids,), {**attn_kwargs, "padding_mask": padding_mask}
-            )
+            prepared = prepare_packed_metadata(self, (input_ids,), {**attn_kwargs, "padding_mask": padding_mask})
             if prepared is not None:
                 _, attn_kwargs = prepared
                 attn_kwargs.pop("padding_mask")
@@ -258,39 +256,14 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Declare only this model's bounded FA4 THD input path."""
         return self.backend.attn == "fa4"
 
-    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
-        """Reuse the shared THD conversion before model inputs and labels diverge.
+    @property
+    def requires_thd_batch_preparation(self) -> bool:
+        """Request framework-owned raw token/label flattening for the FA4 path.
 
-        Args:
-            batch: Raw packed inputs and labels [batch, sequence], positions
-                [batch, sequence], and real/padded lengths [batch, documents].
-                The mapping is unchanged here; the returned sharder prepares
-                row-major token streams and matching masks/offsets together.
-            num_chunks: Number of pipeline chunks; FA4 supports one chunk only.
-
-        Returns:
-            The existing THD sharder for FA4, or an empty mapping to retain the
-            framework's existing backend path. This method touches no weights.
+        This requests CP1 batch conversion only, not context or pipeline
+        parallelism. TE retains its existing backend-owned preparation.
         """
-        if self.backend.attn != "fa4" or batch.get("qkv_format") != "thd":
-            return {}
-        if num_chunks != 1:
-            raise ValueError("GPT-OSS FA4 THD preparation requires a single non-pipeline chunk")
-        from nemo_automodel.components.distributed.context_parallel.utils import (  # noqa: PLC0415
-            _resolve_cp_sharder,
-        )
-
-        return {
-            "cp_sharder": _resolve_cp_sharder(
-                None,
-                None,
-                magi=None,
-                is_thd=True,
-                num_chunks=num_chunks,
-                seq_lens_padding_value=-1000,
-                model=self,
-            )
-        }
+        return self.backend.attn == "fa4"
 
     @classmethod
     def from_config(

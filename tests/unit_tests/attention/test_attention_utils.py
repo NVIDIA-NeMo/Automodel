@@ -1069,54 +1069,13 @@ def test_fa4_physical_dependency_identity_is_cached_and_unreadable_falls_back(tm
         utils._fa4_interface_sha256.cache_clear()
 
 
-@pytest.mark.parametrize(
-    "change",
-    [None, "small_valid", "softcap", "window", "sink_dtype", "sink_device", "missing_used", "cpu", "other_arch"],
-)
-def test_fa4_physical_canonical_scope(change: str | None) -> None:
-    from types import SimpleNamespace
-
-    import nemo_automodel.components.attention.utils as utils
-
-    device = torch.device("cuda:0")
-    q = SimpleNamespace(shape=(32768, 64, 64), dtype=torch.bfloat16, is_cuda=True, device=device)
-    k = SimpleNamespace(shape=(32768, 8, 64), dtype=torch.bfloat16)
-    v = SimpleNamespace(shape=(32768, 8, 64), dtype=torch.bfloat16)
-    sink = SimpleNamespace(shape=(64,), dtype=torch.bfloat16, device=device)
-    kwargs = dict(
-        _fa4_seqused=torch.ones(512, dtype=torch.int32),
-        packed_token_indices=torch.arange(32768),
-        _fa4_physical_cu_seqlens=torch.arange(513, dtype=torch.int32),
-        learnable_sink=sink,
-        window_size=(129, 0),
-    )
-    if change == "small_valid":
-        kwargs["packed_token_indices"] = torch.arange(128)
-    if change == "softcap":
-        kwargs["softcap"] = 1.0
-    if change == "window":
-        kwargs["window_size"] = (65, 0)
-    if change == "sink_dtype":
-        sink.dtype = torch.float32
-    if change == "sink_device":
-        sink.device = torch.device("cpu")
-    if change == "missing_used":
-        kwargs.pop("_fa4_seqused")
-    if change == "cpu":
-        q.is_cuda = False
-    with mock.patch.object(
-        torch.cuda, "get_device_capability", return_value=(9, 0) if change == "other_arch" else (10, 0)
-    ):
-        assert utils._fa4_canonical_thd(q, k, v, kwargs) is (change is None)
-
-
 @pytest.mark.parametrize("dependency", ["patched", "original", "unknown"])
 @pytest.mark.parametrize("window", [(-1, 0), (129, 0)])
 def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency: str, window: tuple[int, int]) -> None:
     from torch.utils.checkpoint import checkpoint
 
     import nemo_automodel.components.attention.utils as utils
-    from nemo_automodel.components.models.common.packing import _flatten_packed_metadata_at_model_entry
+    from nemo_automodel.components.models.common.packing import prepare_packed_metadata
 
     tokens = 144
     physical = torch.tensor([0, 136, 136, 140], dtype=torch.int32)
@@ -1124,13 +1083,23 @@ def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency:
     valid[:128] = True
     valid[136:139] = True
     original = dict(qkv_format="thd", cu_seqlens=physical, cu_seqlens_padded=physical, padding_mask=~valid)
-    prepared = _flatten_packed_metadata_at_model_entry(None, (torch.arange(tokens),), original)[1]
+    prepared = prepare_packed_metadata(None, (torch.arange(tokens),), original)[1]
     sink = torch.randn(2, requires_grad=True)
     qkv = [torch.randn(tokens, 2, 4, requires_grad=True) for _ in range(3)]
     seen = []
 
     def kernel(q, k, v, **kwargs):
-        # Differentiable kernel stand-in: actual shared metadata/dispatch/scatter is exercised.
+        """Exercise shared dispatch with a differentiable external-kernel stand-in.
+
+        Args:
+            q: Query tensor [tokens, heads, channels].
+            k: Key tensor [tokens, heads, channels] in this non-GQA fixture.
+            v: Value tensor [tokens, heads, channels].
+            **kwargs: Sink [heads], offsets [documents + 1], used lengths [documents].
+
+        Returns:
+            Output [tokens, heads, channels] and absent LSE; no attention math is mocked as parity.
+        """
         used = kwargs.get("seqused_q")
         seen.append((q, kwargs))
         output = q + k + v + kwargs["learnable_sink"][None, :, None]
@@ -1154,25 +1123,32 @@ def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency:
         mock.patch.object(utils, "_fa4_interface_sha256", return_value=sha),
     ):
         _, call = initialize_attn_module_and_func("fa4", 2, 4, 4, 0.5)
-        # Scope policy has separate shape/device tests above; force this small CPU routing fixture eligible.
-        with mock.patch.object(utils, "_fa4_canonical_thd", return_value=True):
 
-            def forward(*values):
-                a, b, c, kwargs = preprocess_args_and_kwargs_for_attn(
-                    *values, None, "fa4", **prepared, learnable_sink=sink, window_size=window
-                )
-                if dependency == "patched":
-                    assert all(x is y for x, y in zip((a, b, c), values, strict=True))
-                return call(a, b, c, **kwargs)
+        # The model eligibility policy has separate tests; opt this small fixture in explicitly.
+        def forward(*values):
+            """Call shared preparation and the external-kernel stand-in.
 
-            reference = torch.where(valid[:, None, None], qkv[0] + qkv[1] + qkv[2] + sink[None, :, None], 0)
-            expected = torch.autograd.grad(reference, [*qkv, sink], torch.ones_like(reference))
-            for recompute in (False, True):
-                output = checkpoint(forward, *qkv, use_reentrant=False) if recompute else forward(*qkv)
-                gradients = torch.autograd.grad(output, [*qkv, sink], torch.ones_like(output))
-                assert torch.equal(output, reference)
-                assert all(torch.equal(a, b) for a, b in zip(gradients, expected, strict=True))
-                assert all(torch.count_nonzero(g[~valid]) == 0 for g in gradients[:3])
+            Args:
+                *values: Q/K/V tensors [physical_tokens, heads, channels].
+
+            Returns:
+                Physical output tensor [physical_tokens, heads, channels].
+            """
+            a, b, c, kwargs = preprocess_args_and_kwargs_for_attn(
+                *values, None, "fa4", **prepared, learnable_sink=sink, window_size=window, fa4_physical_layout=True
+            )
+            if dependency == "patched":
+                assert all(x is y for x, y in zip((a, b, c), values, strict=True))
+            return call(a, b, c, **kwargs)
+
+        reference = torch.where(valid[:, None, None], qkv[0] + qkv[1] + qkv[2] + sink[None, :, None], 0)
+        expected = torch.autograd.grad(reference, [*qkv, sink], torch.ones_like(reference))
+        for recompute in (False, True):
+            output = checkpoint(forward, *qkv, use_reentrant=False) if recompute else forward(*qkv)
+            gradients = torch.autograd.grad(output, [*qkv, sink], torch.ones_like(output))
+            assert torch.equal(output, reference)
+            assert all(torch.equal(a, b) for a, b in zip(gradients, expected, strict=True))
+            assert all(torch.count_nonzero(g[~valid]) == 0 for g in gradients[:3])
     assert all(("seqused_q" in kw) is (dependency == "patched") for _, kw in seen)
     assert all(kw["max_seqlen_q"] == (129 if dependency != "unknown" else 128) for _, kw in seen)
     assert all(kw["window_size"] == ((None, None) if window[0] < 0 else (128, None)) for _, kw in seen)
@@ -1181,7 +1157,6 @@ def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency:
 
 
 def test_fa4_physical_missing_max_has_descriptive_error() -> None:
-    import nemo_automodel.components.attention.utils as utils
 
     q = torch.empty(2, 2, 4)
     metadata = dict(
@@ -1191,9 +1166,8 @@ def test_fa4_physical_missing_max_has_descriptive_error() -> None:
         _fa4_seqused=torch.tensor([2], dtype=torch.int32),
         _fa4_physical_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
     )
-    with mock.patch.object(utils, "_fa4_canonical_thd", return_value=True):
-        with pytest.raises(ValueError, match="requires max_seqlen"):
-            preprocess_args_and_kwargs_for_attn(q, q, q, None, "fa4", **metadata)
+    with pytest.raises(ValueError, match="requires max_seqlen"):
+        preprocess_args_and_kwargs_for_attn(q, q, q, None, "fa4", **metadata, fa4_physical_layout=True)
 
 
 def test_fa4_physical_tensor_maximum_keeps_compact_contract() -> None:
@@ -1209,8 +1183,10 @@ def test_fa4_physical_tensor_maximum_keeps_compact_contract() -> None:
         _fa4_physical_cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
         _fa4_max_seqlen=maximum,
     )
-    with mock.patch.object(utils, "_fa4_canonical_thd", return_value=True) as scope:
-        a, b, c, kwargs = preprocess_args_and_kwargs_for_attn(q, q, q, None, "fa4", **metadata)
+    with mock.patch.object(utils, "_fa4_interface_sha256") as scope:
+        a, b, c, kwargs = preprocess_args_and_kwargs_for_attn(
+            q, q, q, None, "fa4", **metadata, fa4_physical_layout=True
+        )
     scope.assert_not_called()
     assert a.shape[0] == b.shape[0] == c.shape[0] == 2
     assert kwargs["max_seqlen_q"] is maximum and "seqused_q" not in kwargs

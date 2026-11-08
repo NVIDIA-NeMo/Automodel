@@ -517,3 +517,105 @@ def test_shard_sequence_for_cp_contiguous_respects_pad_multiple():
     assert padded_len == 8  # cp_size(2) * max(4, 2) = 8
     assert local.shape == (1, 4, 2, 3)
     torch.testing.assert_close(idx, torch.arange(4))
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_shared_thd_request_preserves_dense_and_converts_all_token_fields(packed: bool) -> None:
+    """The generic sharder, not the model, owns aligned token/label conversion."""
+    from types import SimpleNamespace
+
+    class Consumer(torch.nn.Module):
+        backend = SimpleNamespace(attn="fa4")
+        requires_thd_batch_preparation = True
+
+    ids = torch.arange(8).reshape(2, 4)
+    batch = dict(
+        input_ids=ids,
+        labels=ids + 10,
+        position_ids=torch.arange(4).expand(2, -1),
+        seq_lens=torch.tensor([[2], [3]]),
+        seq_lens_padded=torch.tensor([[4], [4]]),
+        qkv_format="thd" if packed else "bshd",
+    )
+    _, actual = cs.ContextParallelSharder(Consumer(), None, batch).shard(batch)
+    if packed:
+        assert actual["input_ids"].shape == (8,)
+        assert torch.equal(actual["input_ids"], ids.flatten())
+        assert torch.equal(actual["labels"], (ids + 10).flatten())
+        assert actual["padding_mask"].tolist() == [False, False, True, True, False, False, False, True]
+    else:
+        assert actual is batch and actual["input_ids"] is ids
+    assert ids.shape == (2, 4)
+
+
+@pytest.mark.parametrize("cp_size,num_chunks", [(2, 1), (1, 2)])
+def test_shared_thd_request_rejects_parallel_expansion(cp_size: int, num_chunks: int) -> None:
+    """Requesting normalization does not advertise context or pipeline support."""
+    from types import SimpleNamespace
+
+    class Consumer(torch.nn.Module):
+        backend = SimpleNamespace(attn="fa4")
+        requires_thd_batch_preparation = True
+
+    with pytest.raises(ValueError, match="CP1 and a single non-pipeline chunk"):
+        cs.ContextParallelSharder(
+            Consumer(), _FakeDeviceMesh(_FakeMesh(cp_size)), {"qkv_format": "thd"}, num_chunks=num_chunks
+        )
+
+
+def test_shared_thd_request_never_replaces_custom_sharder() -> None:
+    """Existing model-owned input hooks keep precedence, including CP layouts."""
+    from types import SimpleNamespace
+
+    class Consumer(torch.nn.Module):
+        backend = SimpleNamespace(attn="fa4")
+        supports_thd = True
+
+        @property
+        def requires_thd_batch_preparation(self) -> bool:
+            raise AssertionError("Custom sharder must take precedence")
+
+        def prepare_model_inputs_for_cp(
+            self, batch: dict[str, torch.Tensor | str], *, num_chunks: int = 1
+        ) -> dict[str, cs.ContextParallelSharder]:
+            """Keep the caller's batch on its own identity transport.
+
+            Args:
+                batch: Input IDs tensor [batch, sequence] and layout string.
+                num_chunks: Requested pipeline chunk count, unused by this fixture.
+
+            Returns:
+                The existing identity sharder; no tensor fields are consumed or changed.
+            """
+            return {"cp_sharder": cs.ContextParallelSharder(shard_batch=cs.shard_batch_identity)}
+
+    batch = {"qkv_format": "thd", "input_ids": torch.arange(4).reshape(1, 4)}
+    _, actual = cs.ContextParallelSharder(Consumer(), None, batch).shard(batch)
+    assert actual is batch
+
+
+def test_unsupported_model_keeps_identity_thd_path() -> None:
+    """A backend string alone must not opt another model into raw conversion."""
+    from types import SimpleNamespace
+
+    model = torch.nn.Module()
+    model.backend = SimpleNamespace(attn="fa4")
+    batch = {"qkv_format": "thd", "input_ids": torch.arange(4).reshape(1, 4)}
+    _, actual = cs.ContextParallelSharder(model, None, batch).shard(batch)
+    assert actual is batch and actual["input_ids"].shape == (1, 4)
+
+
+def test_shared_thd_request_respects_disabled_model_preparation() -> None:
+    """KD/PP callers that disable model preparation keep their previous identity path."""
+    from types import SimpleNamespace
+
+    class Consumer(torch.nn.Module):
+        backend = SimpleNamespace(attn="fa4")
+
+        @property
+        def requires_thd_batch_preparation(self) -> bool:
+            raise AssertionError("Disabled model preparation must not query the consumer")
+
+    batch = {"qkv_format": "thd", "input_ids": torch.arange(4).reshape(1, 4)}
+    _, actual = cs.ContextParallelSharder(Consumer(), None, batch, invoke_pre_embed=False).shard(batch)
+    assert actual is batch

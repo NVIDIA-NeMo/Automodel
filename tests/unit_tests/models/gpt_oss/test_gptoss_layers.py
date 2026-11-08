@@ -527,3 +527,42 @@ def test_fa4_preserves_te_sink_owner_order_and_window(
     for name, parameter in layers["fa4"].named_parameters():
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
     assert torch.count_nonzero(layers["fa4"].attn_module.softmax_offset.grad)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [None, "small_valid", "softcap", "window", "sink_dtype", "sink_device", "missing_used", "cpu", "other_arch"],
+)
+def test_fa4_physical_canonical_scope(change: str | None) -> None:
+    from types import SimpleNamespace
+
+    import nemo_automodel.components.models.gpt_oss.layers as layers_module
+
+    device = torch.device("cuda:0")
+    q = SimpleNamespace(shape=(32768, 64, 64), dtype=torch.bfloat16, is_cuda=True, device=device)
+    k = SimpleNamespace(shape=(32768, 8, 64), dtype=torch.bfloat16)
+    v = SimpleNamespace(shape=(32768, 8, 64), dtype=torch.bfloat16)
+    sink = SimpleNamespace(shape=(64,), dtype=torch.bfloat16, device=device)
+    kwargs = dict(
+        _fa4_seqused=torch.ones(512, dtype=torch.int32),
+        packed_token_indices=torch.arange(32768),
+        _fa4_physical_cu_seqlens=torch.arange(513, dtype=torch.int32),
+        learnable_sink=sink,
+        window_size=(129, 0),
+    )
+    if change == "small_valid":
+        kwargs["packed_token_indices"] = torch.arange(128)
+    if change == "softcap":
+        kwargs["softcap"] = 1.0
+    if change == "window":
+        kwargs["window_size"] = (65, 0)
+    if change == "sink_dtype":
+        sink.dtype = torch.float32
+    if change == "sink_device":
+        sink.device = torch.device("cpu")
+    if change == "missing_used":
+        kwargs.pop("_fa4_seqused")
+    if change == "cpu":
+        q.is_cuda = False
+    with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0) if change == "other_arch" else (10, 0)):
+        assert layers_module._use_physical_fa4_layout(q, k, v, kwargs) is (change is None)

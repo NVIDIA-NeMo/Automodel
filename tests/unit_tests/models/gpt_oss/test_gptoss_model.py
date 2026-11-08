@@ -895,8 +895,8 @@ def test_fa4_thd_inner_prepares_once_and_rejects_short_mask(monkeypatch: pytest.
         monkeypatch.setattr(layer, "forward", capture)
         captures.append(capture)
     monkeypatch.setattr(model_module, "position_ids_to_freqs_cis", lambda *args, **kwargs: torch.ones(2, 4))
-    prepare = Mock(wraps=model_module._flatten_packed_metadata_at_model_entry)
-    monkeypatch.setattr(model_module, "_flatten_packed_metadata_at_model_entry", prepare)
+    prepare = Mock(wraps=model_module.prepare_packed_metadata)
+    monkeypatch.setattr(model_module, "prepare_packed_metadata", prepare)
     padding = torch.zeros(2, dtype=torch.bool)
     kwargs = {"qkv_format": "thd", "padding_mask": padding, "cu_seqlens": torch.tensor([0, 2], dtype=torch.int32)}
     inner(torch.zeros(2, dtype=torch.long), position_ids=torch.arange(2), **kwargs)
@@ -973,7 +973,7 @@ def test_fa4_canonical_raw_thd_sharder_to_model_matches_te(monkeypatch: pytest.M
             assert torch.equal(first["packed_token_indices"], (~first["padding_mask"]).nonzero().flatten())
             assert first["_fa4_cu_seqlens"][-1] == 8 * 4092
             with pytest.raises(ValueError, match="single non-pipeline chunk"):
-                model.prepare_model_inputs_for_cp(raw, num_chunks=2)
+                ContextParallelSharder(model, None, raw, num_chunks=2)
     assert converted["te"].keys() == converted["fa4"].keys()
     for key, value in converted["te"].items():
         actual = converted["fa4"][key]
@@ -1008,10 +1008,10 @@ def test_fa4_raw_thd_capability_does_not_enable_flex_or_parallelism() -> None:
             assert not model.supports.supports_sequence_packing
             with pytest.raises(ValueError, match="cannot consume THD"):
                 validate_thd_packing_support([model])
-            assert model.prepare_model_inputs_for_cp({"qkv_format": "thd"}) == {}
+            assert not model.requires_thd_batch_preparation
         else:
             validate_thd_packing_support([model])
-            assert model.prepare_model_inputs_for_cp({"qkv_format": "bshd"}) == {}
+            assert model.requires_thd_batch_preparation
             with pytest.raises(ValueError, match="cp_size=2"):
                 validate_for_mesh(model, SimpleNamespace(cp_size=2, tp_size=1, pp_size=1, ep_size=1))
 

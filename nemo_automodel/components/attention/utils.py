@@ -25,8 +25,14 @@ import torch.nn.functional as F
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 from nemo_automodel.shared.import_utils import safe_import
 
-_FA4_ORIGINAL_INTERFACE_SHA256 = "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646"
-_FA4_PHYSICAL_INTERFACE_SHA256 = "de3781369943fcfa1df9344999c7ad7496bfb607d80e852406e07ebf8e28ed22"
+# Public source checksums, not credentials. Remove this compatibility gate once
+# upstream FA4 advertises initialized unused seqused output/gradient rows.
+_FA4_ORIGINAL_INTERFACE_SHA256 = (
+    "4d31465cd46d1737290862bf99fad54e929d7c37cc36807bf2fe56ac56f26646"  # pragma: allowlist secret
+)
+_FA4_PHYSICAL_INTERFACE_SHA256 = (
+    "de3781369943fcfa1df9344999c7ad7496bfb607d80e852406e07ebf8e28ed22"  # pragma: allowlist secret
+)
 
 
 @lru_cache(maxsize=1)
@@ -44,45 +50,6 @@ def _fa4_interface_sha256() -> str | None:
         return sha256(Path(module.__file__).read_bytes()).hexdigest()
     except OSError:
         return None
-
-
-def _fa4_canonical_thd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kwargs: dict[str, Any]) -> bool:
-    """Restrict physical THD dispatch to the measured SM100 kernel geometry.
-
-    Args:
-        q: Query tensor of shape [physical_tokens, heads, head_dim].
-        k: Key tensor of shape [physical_tokens, kv_heads, head_dim].
-        v: Value tensor of shape [physical_tokens, kv_heads, head_dim].
-        kwargs: Prepared metadata: ``_fa4_seqused`` is int32 [documents],
-            ``_fa4_physical_cu_seqlens`` is int32 [documents + 1],
-            ``packed_token_indices`` is int64 [valid_tokens], and
-            ``learnable_sink`` is BF16 [heads]. No input is mutated.
-
-    Returns:
-        Whether the shape, dtype, device, window and prefix metadata fall in
-        the validated scope. Other supported inputs retain compact dispatch.
-    """
-    used = kwargs.get("_fa4_seqused")
-    sink = kwargs.get("learnable_sink")
-    indices = kwargs.get("packed_token_indices")
-    return (
-        q.shape == (32768, 64, 64)
-        and k.shape == v.shape == (32768, 8, 64)
-        and q.dtype == k.dtype == v.dtype == torch.bfloat16
-        and q.is_cuda
-        and torch.cuda.get_device_capability(q.device) == (10, 0)
-        and used is not None
-        and used.numel() > 1
-        and indices is not None
-        and indices.numel() > 128
-        and kwargs.get("_fa4_physical_cu_seqlens") is not None
-        and sink is not None
-        and sink.shape == (64,)
-        and sink.dtype == torch.bfloat16
-        and sink.device == q.device
-        and kwargs.get("window_size", (-1, 0)) in ((-1, 0), (129, 0))
-        and kwargs.get("softcap") in (None, 0.0)
-    )
 
 
 def initialize_attn_module_and_func(
@@ -349,6 +316,8 @@ def preprocess_args_and_kwargs_for_attn(
     v: torch.Tensor,
     attention_mask: torch.Tensor | None,
     attn_impl: str,
+    *,
+    fa4_physical_layout: bool = False,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     """Preprocess attention inputs based on backend requirements.
@@ -366,6 +335,9 @@ def preprocess_args_and_kwargs_for_attn(
             padding mask (1/True for valid tokens, 0/False for padding).
             Packed TE inputs require None and THD sequence metadata instead.
         attn_impl: Attention backend name.
+        fa4_physical_layout: Model-owned eligibility for physical-prefix THD and
+            a conservative host maximum. False preserves compact dispatch. The
+            dependency compatibility check still gates physical buffer use.
         **kwargs: Backend metadata. Prepared THD FA4 uses private compact offsets
             [documents + 1] and indices [valid_tokens] computed once at model entry;
             outputs retain [physical_tokens, heads, channels] layout. Packed FA4 accepts ``cu_seqlens`` of shape
@@ -520,7 +492,7 @@ def preprocess_args_and_kwargs_for_attn(
 
         if cu_seqlens is not None and max_seqlen is None:
             raise ValueError("FA4 cu_seqlens requires max_seqlen")
-        if is_thd and isinstance(max_seqlen, int) and _fa4_canonical_thd(q, k, v, kwargs):
+        if is_thd and isinstance(max_seqlen, int) and fa4_physical_layout:
             interface_sha = _fa4_interface_sha256()
             if interface_sha in (
                 _FA4_ORIGINAL_INTERFACE_SHA256,
