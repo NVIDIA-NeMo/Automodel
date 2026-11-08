@@ -19,6 +19,7 @@ from typing import Literal, overload
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from transformers.utils import ModelOutput
 
 from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 from nemo_automodel.components.loss.utils import (
@@ -407,7 +408,9 @@ class PipelineCausalLMLoss(nn.Module):
         self.is_packed: bool = False
 
     @staticmethod
-    def _extract_seq_idx_tail(output) -> tuple[torch.Tensor | None, object]:
+    def _extract_seq_idx_tail(
+        output,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | tuple[torch.Tensor, ...] | ModelOutput]:
         """Detect and strip a trailing per-microbatch seq_idx from output.
 
         Convention: with MTP enabled the last-stage output is

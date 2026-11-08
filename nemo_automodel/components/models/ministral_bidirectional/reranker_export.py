@@ -115,7 +115,7 @@ class Mistral3RerankerMetadataExporter:
         self.dense_weight: torch.Tensor | None = None
         self.processor: PixtralProcessor | None = None
 
-    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+    def validate(self, *, tokenizer: PixtralProcessor, original_model_path: str | None) -> None:
         """Validate the export and collectively snapshot the small trained head before rank-zero I/O."""
         if self.model.config.pooling != "avg":
             raise ValueError("Portable Mistral3 reranker export requires mean pooling (pooling=avg).")
@@ -156,7 +156,7 @@ class Mistral3RerankerMetadataExporter:
         shutil.copyfile(Path(__file__).with_name("reranker_model.py"), directory / "model.py")
 
     def save(
-        self, *, hf_metadata_dir: str, tokenizer: object, original_model_path: str | None, v4_compatible: bool
+        self, *, hf_metadata_dir: str, tokenizer: PixtralProcessor, original_model_path: str | None, v4_compatible: bool
     ) -> None:
         """Save a Transformer/Pooling/Dense chain using the snapshot from this checkpoint step."""
         if self.dense_weight is None or self.processor is None:

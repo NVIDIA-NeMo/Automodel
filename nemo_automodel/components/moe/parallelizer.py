@@ -112,7 +112,7 @@ def _moe_shard_placement(param):
     return Shard(0) if param.ndim < 2 else Shard(1)
 
 
-def _is_selective_ac(activation_checkpointing: object) -> bool:
+def _is_selective_ac(activation_checkpointing: bool | str) -> bool:
     """Return True when the AC mode requests selective checkpointing.
 
     Kept inline (rather than imported from the dense FSDP2 parallelizer) so that
@@ -124,7 +124,7 @@ def _is_selective_ac(activation_checkpointing: object) -> bool:
     )
 
 
-def _is_moe_only_ac(activation_checkpointing: object) -> bool:
+def _is_moe_only_ac(activation_checkpointing: bool | str) -> bool:
     """Return True when the AC mode requests checkpointing of the MoE sub-blocks only."""
     return isinstance(activation_checkpointing, str) and activation_checkpointing.lower() == "moe"
 
