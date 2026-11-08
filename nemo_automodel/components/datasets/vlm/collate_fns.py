@@ -1709,7 +1709,9 @@ def neat_packed_vlm_collater(
     if any(x.get("vision_token_types") is not None for x in batch):
         result["vision_token_types"] = torch.stack(
             [
-                _pad_1d(x.get("vision_token_types", torch.full_like(torch.as_tensor(x["input_ids"]), -1)), -1, max_len)
+                _pad_1d(x["vision_token_types"], -1, max_len)
+                if x.get("vision_token_types") is not None
+                else torch.full_like(input_ids[0], -1)
                 for x in batch
             ]
         )
@@ -1837,7 +1839,9 @@ def packed_sequence_thd_vlm_collater(
     if any(x.get("vision_token_types") is not None for x in batch):
         vision_types = torch.stack(
             [
-                _pad_seq(x.get("vision_token_types", torch.full_like(torch.as_tensor(x["input_ids"]), -1)), -1, max_len)
+                _pad_seq(x["vision_token_types"], -1, max_len)
+                if x.get("vision_token_types") is not None
+                else torch.full_like(input_ids[0], -1)
                 for x in batch
             ]
         )

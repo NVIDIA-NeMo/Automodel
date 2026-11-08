@@ -478,6 +478,7 @@ def _build_packed_vlm_sample(
     all_labels: list[int] = []
     all_attention_mask: list[int] = []
     all_mm_token_type_ids: list[int] = []
+    has_vision_token_types = any(sample.get("vision_token_types") is not None for sample in samples)
     all_vision_token_types: list[int] = []
     all_position_ids_1d: list[int] = []
     mrope_position_ids_list: list[torch.Tensor] = []
@@ -521,14 +522,15 @@ def _build_packed_vlm_sample(
         else:
             all_mm_token_type_ids.extend([0] * padded_seq_len)
 
-        types = sample.get("vision_token_types")
-        if types is not None:
-            types = torch.as_tensor(types).reshape(-1).tolist()
-            if len(types) != seq_len:
-                raise ValueError("vision_token_types must align with shifted input_ids")
-        else:
-            types = [-1] * seq_len
-        all_vision_token_types.extend(types + [-1] * pad)
+        if has_vision_token_types:
+            types = sample.get("vision_token_types")
+            if types is not None:
+                types = torch.as_tensor(types).reshape(-1).tolist()
+                if len(types) != seq_len:
+                    raise ValueError("vision_token_types must align with shifted input_ids")
+            else:
+                types = [-1] * seq_len
+            all_vision_token_types.extend(types + [-1] * pad)
         if sample.get("image_grid_hws") is not None:
             image_grid_hws_list.append(sample["image_grid_hws"])
             n_images += sample["image_grid_hws"].shape[0]
@@ -573,7 +575,7 @@ def _build_packed_vlm_sample(
         "n_videos": n_videos,
     }
 
-    if any(sample.get("vision_token_types") is not None for sample in samples):
+    if has_vision_token_types:
         packed["vision_token_types"] = torch.tensor(all_vision_token_types, dtype=torch.long)
     if image_grid_hws_list:
         packed["image_grid_hws"] = torch.cat(image_grid_hws_list)

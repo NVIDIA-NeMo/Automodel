@@ -425,8 +425,6 @@ class DeepseekV41Model(nn.Module):
             destinations = torch.tensor(destination_indices, dtype=torch.long, device=embedded.device)
             indices = torch.tensor(feature_indices, dtype=torch.long, device=embedded.device)
             embedded = embedded.flatten(0, 1).index_copy(0, destinations, features[indices]).view_as(embedded)
-        else:
-            embedded = embedded.clone()
         for marker, value in (
             (IMAGE_START, self.image_start),
             (IMAGE_END, self.image_end),
