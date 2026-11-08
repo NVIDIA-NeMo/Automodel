@@ -24,6 +24,13 @@ Kimi and Step-5 keep synthetic-only `benchmark_static_routing` disabled in both
 normal and performance runs because it cannot represent real routing. This is a
 recorded difference from the two Kimi and one Step-5 legacy synthetic runs.
 
+The legacy `qwen/qwen3_moe_30b_te_fp8.yaml` and `moonlight/moonlight_16b_te_fp8.yaml`
+put activation checkpointing and resharding in a top-level `parallelizer` section,
+which no recipe reads. The Qwen3 FP8 counterpart sets
+`distributed.activation_checkpointing: true`, which the legacy run requested but
+never applied; that legacy run ran out of memory without it. The Moonlight FP8
+counterpart omits the section because its values equal the defaults.
+
 Run a config directly with the resources in its `ci` section, for example:
 
 ```bash
@@ -105,18 +112,34 @@ GPU validation; publish the exact source revision and terminal job results.
 ## Real-data finetuning
 
 The existing 32 corresponding finetuning recipes retain their real supervised
-corpora, pretrained initialization and learning hyperparameters. They now match
-the benchmark's loss implementation/precision, LoRA rank and options, optimizer
-execution settings, parallelism and batch sizes. The former Qwen32B mock example
-now uses real SQuAD. These shorter or packed supervised inputs still define a
+corpora, pretrained initialization and learning hyperparameters, including the
+optimizer algorithm and weight decay. They now match the benchmark's loss
+implementation/precision, LoRA rank and options, optimizer execution settings,
+garbage-collection interval, parallelism and batch sizes. The former Qwen32B mock
+example now uses real SQuAD. These shorter or packed supervised inputs still define a
 different workload from full-length pretraining, so report both token throughput
-and actual sequence lengths instead of assuming their TPS must match.
+and actual sequence lengths instead of assuming their TPS must match. The migrated
+loss upcast, optimizer-state and gradient-reduction precision come from throughput
+benchmarks; their effect on finetuning convergence has not been validated.
 
 The packed Qwen30B MXFP8 recipe keeps RoPE fusion disabled because its THD path has
-a documented NaN-gradient issue. Kimi static routing stays disabled. Neither
+a documented NaN-gradient issue. Kimi and Step-5 static routing stay disabled. Neither
 exception is hidden in performance overrides. No current legacy benchmark enables
 a positive `packed_sequence_size`; fixed-length synthetic data alone does not
 request THD packing.
+
+Other recorded differences:
+
+- GLM-4.7 Flash finetuning keeps `gate_precision: float32`, matching the Hugging Face
+  router that its checkpoint-robustness parity checks compare against. The benchmark
+  and pretraining configs project router logits in bf16; the fp32 router GEMM is small
+  relative to the experts.
+- DeepSeek V4 finetuning omits `group_compressor_fsdp_units`, which requires unpadded
+  inputs with implicit positions; its HellaSwag batches are padded. It keeps the other
+  `model.config` tuning of the pretraining config.
+- `qwen/qwen3_moe_30b_hellaswag.yaml` is the PyTorch-backend counterpart of
+  `qwen/qwen3_moe_30b_torch.yaml`. Use `qwen/qwen3_moe_30b_te_deepep.yaml` for the TE
+  and DeepEP backends.
 
 | Retained benchmark | Canonical finetuning config |
 |---|---|
@@ -190,6 +213,24 @@ The following recipes remain unpacked pending support or data-size validation:
   this empty loader.
 
 These exceptions must be labeled in performance reports. Do not interpret them
-as measured packed-finetuning results. Console training metrics now also include
+as measured packed-finetuning results.
+
+Packing at canonical global batch sizes leaves few optimizer steps per HellaSwag
+epoch. At a global batch of 512, one epoch of roughly 800 packs of 4,096 tokens is
+one full and one partial optimizer step, compared with about 78 steps for the same
+examples unpacked. Treat these recipes as throughput workloads at the canonical
+batch geometry; for convergence work, choose epochs and batch sizes for the dataset.
+
+Three packed recipes cannot fill one global batch per epoch, so every optimizer step
+is a partial epoch tail:
+
+| Finetuning config | Packs per epoch | Microbatches per rank (filled / needed) | Global batch filled |
+|---|---:|---:|---:|
+| [glm/glm_4.7_te_deepep.yaml](../llm_finetune/glm/glm_4.7_te_deepep.yaml) | 783 | 3 / 8 | 37.5% |
+| [stepfun/step_3.5_flash_hellaswag_pp.yaml](../llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml) | 795 | 6 / 16 | 37.5% |
+| [gpt_oss/gpt_oss_120b_te_mxfp8_gb200.yaml](../llm_finetune/gpt_oss/gpt_oss_120b_te_mxfp8_gb200.yaml) | 773 | 3 / 5 | 60% |
+
+Report their results with tokens per step; they never reach the canonical global
+batch. Console training metrics now also include
 `num_tokens_per_step` and the trainer's `mfu` value so reports can distinguish
 padding/partial-batch effects and retain MFU without checkpoint artifacts.
