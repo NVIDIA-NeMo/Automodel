@@ -25,7 +25,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  # pragma: allowlist secret -- Public Hugging Face model ID.
   mtp_loss_scaling_factor: 0.1
 
   backend:
@@ -124,7 +124,7 @@ ci:
   checkpoint_robustness:
     experts_implementation: grouped_mm
     trust_remote_code: true
-    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  # pragma: allowlist secret -- Public Hugging Face model ID.
     hf_device_map_auto: true
     step_scheduler.global_batch_size: 64
     dataset.num_samples_limit: 500
