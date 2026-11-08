@@ -13,11 +13,14 @@
 # limitations under the License.
 
 # Full-parameter SFT of the Step 5 Preview language backbone on Tulu3.
-# 11 GB200 nodes x 4 GPUs: EP44 / DP44, one 4,096-token sequence per GPU.
-# 352 routed experts per MoE layer give eight local experts per rank.
+# 16 H100 nodes x 8 GPUs: PP4 x DP32, with EP32 inside each pipeline stage.
+# NEAT packs samples (truncated at 4,096 tokens) into 8,192-token rows.
+# 352 routed experts per MoE layer give eleven local experts per rank.
+# Runtime tuning is migrated from
+# examples/llm_benchmark/step/step_5_preview_full92_mock_h100.yaml.
 #
 # To run this recipe:
-#   automodel examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml --nproc-per-node 4
+#   automodel examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml --nproc-per-node 8
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 42
@@ -28,6 +31,7 @@ step_scheduler:
   ckpt_every_steps: 1000
   val_every_steps: 1000
   max_steps: 100
+  gc_every_steps: 5
 
 dist_env:
   backend: nccl

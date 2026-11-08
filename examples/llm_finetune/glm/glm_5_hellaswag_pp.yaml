@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Recipe validated using 256 H100 GPUs (32 nodes x 8)
+# Runtime tuning migrated from examples/llm_benchmark/glm/glm_5_te_deepep.yaml uses
+# 128 H100 nodes (1,024 GPUs) with PP4 and EP64. The earlier 32-node version of this
+# recipe was validated on 256 GPUs.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 

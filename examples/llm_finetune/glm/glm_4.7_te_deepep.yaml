@@ -24,6 +24,7 @@ step_scheduler:
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -85,7 +86,9 @@ dataset:
 
   pad_to_max_length: false
 packed_sequence:
-  # Set packed_sequence_size > 0 to run with packed sequences
+  # HellaSwag yields 783 packs of 4,096 tokens: 3 of the 8 microbatches per rank that
+  # global_batch_size 2048 needs. Each epoch is one partial optimizer step (37.5% of
+  # the global batch); see examples/llm_benchmark/README.md.
   packed_sequence_size: 4096
   packing_strategy: thd
 dataloader:

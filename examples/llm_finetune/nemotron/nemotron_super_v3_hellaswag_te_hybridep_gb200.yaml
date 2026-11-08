@@ -26,6 +26,9 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  # pragma: allowlist secret -- Public Hugging Face model ID.
+  # Match the pretraining counterpart, which disables MTP. Set to 1 to train
+  # the checkpoint's MTP layer with the auxiliary loss below.
+  num_nextn_predict_layers: 0
   mtp_loss_scaling_factor: 0.1
 
   backend:

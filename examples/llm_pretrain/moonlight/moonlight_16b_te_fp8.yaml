@@ -34,10 +34,6 @@ autopipeline:
 dist_env:
   backend: nccl
   timeout_minutes: 10
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: false
-  reshard_after_forward: false
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:

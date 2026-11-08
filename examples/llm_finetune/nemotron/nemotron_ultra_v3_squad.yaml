@@ -34,10 +34,11 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:
   num_epochs: 1
   max_steps: 17
-  global_batch_size: 128  # local_batch_size(4) * dp_size(64) -> no grad accumulation.
+  global_batch_size: 128  # local_batch_size(1) * dp_size(128) -> no grad accumulation.
   local_batch_size: 1
   ckpt_every_steps: 50
   val_every_steps: 50
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -114,7 +115,7 @@ validation_dataloader:
   shuffle: false
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
   betas: [0.9, 0.95]
   eps: 1.0e-8
   lr: 5.0e-6

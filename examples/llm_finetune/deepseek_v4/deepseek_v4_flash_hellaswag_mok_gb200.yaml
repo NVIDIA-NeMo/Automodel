@@ -124,7 +124,7 @@ prewarm:
   comm_groups: true
 ci:
   cluster_tag: gb200
-  # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
+  # ep_size(32) = 32 GPUs => 8 nodes (4 GB200/node).
   recipe_owner: hemildesai
   nodes: 8
   # Cold multi-node start + TileLang JIT runs past the 00:10:00 default.

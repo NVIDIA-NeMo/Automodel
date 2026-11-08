@@ -5,6 +5,9 @@
 # It requires at least 8 GPUs (e.g., 8x A100 80GB or 8x H100 80GB) to run,
 # but you can potentially run it on less GPUs by reducing the local batch size.
 # ------------------------------------------------------------------------------------------------
+# Runtime tuning is migrated from examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml, so this
+# recipe uses the PyTorch attention, dispatcher and expert backends. For TE and DeepEP, use
+# examples/llm_finetune/qwen/qwen3_moe_30b_te_deepep.yaml.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -15,6 +18,7 @@ step_scheduler:
   val_every_steps: 50
   num_epochs: 2
   max_steps: 1000
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -94,7 +98,7 @@ validation_dataloader:
   num_workers: 4
 
 optimizer:
-  _target_: torch.optim.Adam
+  _target_: torch.optim.AdamW
   lr: 1.0e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]

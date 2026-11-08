@@ -28,6 +28,7 @@ step_scheduler:
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 2
+  gc_every_steps: 10
 
 distributed:
   strategy: fsdp2
@@ -81,6 +82,9 @@ dataset:
 
   pad_to_max_length: false
 packed_sequence:
+  # HellaSwag yields 795 packs of 4,096 tokens: 6 of the 16 microbatches per rank that
+  # global_batch_size 2048 needs. Each epoch is one partial optimizer step (37.5% of
+  # the global batch); see examples/llm_benchmark/README.md.
   packed_sequence_size: 4096
 
   packing_strategy: thd

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe with 16 H100 nodes (128 GPUs)
+# To run this recipe with 8 H100 nodes (64 GPUs)
 #   torchrun --nproc-per-node 8 examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag.yaml --nproc-per-node 8
 
 
@@ -25,7 +25,7 @@ step_scheduler:
   local_batch_size: 16
   ckpt_every_steps: 500
   val_every_steps: 500
-  gc_every_steps: 10
+  gc_every_steps: 100
   num_epochs: 1
   max_steps: 100
 
@@ -68,6 +68,12 @@ model:
     # Keep standard finetuning MTP-free by default. Set to 1 to enable
     # DeepSeek-V4 Flash MTP training with the auxiliary loss below.
     num_nextn_predict_layers: 0
+    # Tuning shared with the pretraining counterpart. group_compressor_fsdp_units
+    # is omitted: it requires unpadded inputs with implicit positions, and these
+    # HellaSwag batches are padded.
+    group_fp32_fsdp_units: true
+    reuse_sparse_selection_on_recompute: true
+    fuse_qnorm_rope: true
   trust_remote_code: false
   load_base_model: true
   # DeepSeek-V4 uses 0.3 for most pretraining, then 0.1 during LR decay.
@@ -156,7 +162,7 @@ prewarm:
   comm_groups: true
 ci:
   cluster_tag: h100
-  # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
+  # pp_size(2) * ep_size(32) = 64 GPUs => 8 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 8
   # Cold multi-node start + TileLang JIT runs past the 00:10:00 default.

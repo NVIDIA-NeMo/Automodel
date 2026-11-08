@@ -27,6 +27,7 @@ step_scheduler:
   local_batch_size: 2
   ckpt_every_steps: 100
   val_every_steps: 100  # will run every x number of gradient steps
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl

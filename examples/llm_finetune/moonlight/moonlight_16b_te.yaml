@@ -26,6 +26,7 @@ step_scheduler:
   ckpt_every_steps: 500
   val_every_steps: 500  # will run every x number of gradient steps
   num_epochs: 2
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
