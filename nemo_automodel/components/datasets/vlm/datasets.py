@@ -181,13 +181,26 @@ class MedPixDatasetConfig:
     """HuggingFace dataset id or local path for MedPix."""
     split: str = "train"
     """Dataset split to load."""
+    revision: str | None = None
+    """Optional HuggingFace dataset revision."""
+    seed: int | None = None
+    """Optional shuffle seed applied before packing; None preserves source order."""
 
     def build(self) -> Dataset:
         """Build the lazily decoded MedPix dataset."""
-        return make_medpix_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
+        return make_medpix_dataset(
+            path_or_dataset=self.path_or_dataset, split=self.split, revision=self.revision, seed=self.seed
+        )
 
 
-def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
+def make_medpix_dataset(
+    path_or_dataset: str = "medpix-dataset/medpix-dataset",
+    split: str = "train",
+    *,
+    revision: str | None = None,
+    seed: int | None = None,
+    **kwargs,
+) -> Dataset:
     """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
 
     Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
@@ -197,7 +210,9 @@ def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="
     happens on demand in the DataLoader workers, rather than eagerly decoding the
     whole split up front.
     """
-    dataset = load_dataset(path_or_dataset, split=split)
+    dataset = load_dataset(path_or_dataset, split=split, revision=revision)
+    if seed is not None:
+        dataset = dataset.shuffle(seed=seed)
     if "image_id" in getattr(dataset, "features", {}):
         dataset = dataset.cast_column("image_id", HfImage(decode=False))
 
@@ -1712,11 +1727,13 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     "pixel_values",
                     "pixel_values_videos",
                     "image_grid_thw",
+                    "image_grid_hws",
                     "video_grid_thw",
                     "second_per_grid_ts",
                     "image_position_ids",
                     "image_sizes",
                     "mm_token_type_ids",
+                    "vision_token_types",
                 ):
                     if key in result and result[key] is not None:
                         output[key] = result[key]
