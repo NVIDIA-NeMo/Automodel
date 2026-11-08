@@ -128,7 +128,8 @@ class DeepseekV41PipelineMixin:
         )
         source = max(layer for layer in text.kv_source_layer_ids if layer < boundary)
         if source <= text.candidate_source_layer_id < boundary:
-            metas += (torch.empty(batch, sequence, width, dtype=torch.bool, device="meta"),)
+            blocks = (width + text.candidate_block_size - 1) // text.candidate_block_size
+            metas += (torch.empty(batch, sequence, blocks, dtype=torch.bool, device="meta"),)
         return metas
 
     def _pack_pipeline_state(self, state: DeepseekV41AttentionState, boundary: int) -> tuple[torch.Tensor, ...]:
@@ -146,7 +147,8 @@ class DeepseekV41PipelineMixin:
             [batch, global_compressed, index_head_dim * element_size], int64
             top-k [batch, local_sequence, topk], bool validity and int64 document
             IDs [batch, global_compressed], then an optional bool candidate mask
-            [batch, local_sequence, global_compressed]. Document IDs are -1 in
+            [batch, local_sequence, ceil(global_compressed / candidate_block_size)].
+            Document IDs are -1 in
             unpacked mode. Tensors may alias state; consumers must not mutate them.
             The derived backend sparse plan is rebuilt on the receiving stage.
         """

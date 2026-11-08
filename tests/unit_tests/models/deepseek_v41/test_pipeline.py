@@ -262,3 +262,18 @@ def test_shared_state_accepts_int32_documents_and_broadcast_positions() -> None:
         payload = first(ids, position_ids=positions, attention_mask=mask, packed_seq_ids=documents)
         actual = last(*payload).logits
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("length,blocks", [(16, 2), (17, 3)])
+def test_decoder_candidates_use_compact_block_coordinates(length: int, blocks: int) -> None:
+    """The fixture has ratio-one decoder keys and eight keys per candidate block."""
+    torch.set_num_threads(1)
+    with torch.compiler.set_stance("force_eager"):
+        reference = _model(full_schedule=True)
+        first, last = _stages(reference, (24,))
+        ids = torch.ones(1, length, dtype=torch.long)
+        payload = first(ids)
+        _, metas = first.get_pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=length, dtype=torch.float32)
+        assert payload[-1].shape == (1, length, blocks)
+        assert metas[-1].shape == payload[-1].shape
+        torch.testing.assert_close(last(*payload).logits, reference(ids).logits, rtol=0, atol=0)

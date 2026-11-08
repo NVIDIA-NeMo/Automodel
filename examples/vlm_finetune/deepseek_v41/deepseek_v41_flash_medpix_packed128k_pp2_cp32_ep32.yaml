@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
-# Packed image/text SFT on 32 GB200 nodes x 4 GPUs.
-# Global sequence 131072, CP32 -> 4096 local language tokens; EP64 per stage, PP2.
+# Packed MedPix image/text SFT on 16 GB200 nodes x 4 GPUs.
+# Global sequence 131072, CP32 -> 4096 local language tokens; EP32 per stage, PP2.
 # Stage 0: vision + embedding + language layers 0-13 (encoder).
 # Stage 1: encoder layers 14-19 + decoder layers 20-39 + norm/head.
 # Vision frames use the existing CP frame-sharding policy. The tower gathers
@@ -13,14 +13,14 @@ recipe: FinetuneRecipeForVLM
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 4  # DP2 x local batch 2 x gradient accumulation 1.
+  global_batch_size: 4  # DP1 x local batch 2 x gradient accumulation 2.
   local_batch_size: 2  # Two pipeline microbatches, each containing one packed row.
   ckpt_every_steps: 1000
   save_checkpoint_every_epoch: false
   val_every_steps: 1000
   log_remote_every_steps: 1
   gc_every_steps: 10
-  num_epochs: 10
+  num_epochs: 100  # Small MedPix packs repeat until max_steps is reached.
   max_steps: 100
 
 dist_env:
@@ -132,7 +132,7 @@ distributed:
     scale_grads_in_schedule: false
     dtype: bfloat16
   cp_size: 32
-  ep_size: 64
+  ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
   defer_fsdp_grad_sync: false
@@ -158,7 +158,7 @@ freeze_config:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: ../checkpoints/deepseek_v41_flash_llava_packed128k_pp2_cp32_ep64
+  checkpoint_dir: ../checkpoints/deepseek_v41_flash_medpix_packed128k_pp2_cp32_ep32
   model_save_format: safetensors
   save_consolidated: false
   dequantize_base_checkpoint: true
@@ -173,9 +173,9 @@ loss_fn:
   compile: true
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.HfImageConversationDatasetConfig
-  path_or_dataset: HuggingFaceH4/llava-instruct-mix-vsft
-  revision: 4c04c8302cb25a9c7ee48d2dfda99308d432f87c
+  _target_: nemo_automodel.components.datasets.vlm.datasets.MedPixDatasetConfig
+  path_or_dataset: mmoukouba/MedPix-VQA
+  revision: 69eb219d477ab8699296da1fd6b89beb768042d3  # pragma: allowlist secret (public dataset commit SHA)
   split: train
   seed: 1234
   truncate: false
@@ -231,12 +231,12 @@ wandb:
   enable: false  # Opt in with --wandb.enable true; validation runs enable W&B.
   entity: Nemo-automodel
   project: automodel-ds41-vision-packed128k
-  name: ds41-llava-packed128k-pp2-cp32-ep64
+  name: ds41-medpix-packed128k-pp2-cp32-ep32
   mode: online
   dir: ../logs/wandb
 
 ci:
   recipe_owner: huiyingl
-  nodes: 32
+  nodes: 16
   cluster_tag: gb200
   time: "01:00:00"
