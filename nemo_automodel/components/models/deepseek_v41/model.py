@@ -453,6 +453,7 @@ class DeepseekV41Model(nn.Module):
         packed_seq_ids: torch.Tensor | None = None,
         pipeline_hidden_states: torch.Tensor | None = None,
         pipeline_pre_mix: torch.Tensor | None = None,
+        pipeline_attention_state: DeepseekV41AttentionState | None = None,
     ) -> DeepseekV41BackboneOutput:
         """Compute all positions without inference-only prefill shortcuts.
 
@@ -474,6 +475,8 @@ class DeepseekV41Model(nn.Module):
                 required only on a stage without token embeddings.
             pipeline_pre_mix: Incoming FP32 coefficients [batch, local_sequence, streams],
                 required with pipeline_hidden_states; gradients must not be detached.
+            pipeline_attention_state: Incoming immutable CSA2 state, with layouts
+                in DeepseekV41AttentionState, belonging to this microbatch only.
 
         Returns:
             Stage values with layouts documented by DeepseekV41BackboneOutput.
@@ -537,7 +540,7 @@ class DeepseekV41Model(nn.Module):
         validate_attention_inputs(
             position_ids, attention_mask, packed_seq_ids, sequence=input_ids.shape[1], cp_group=cp_group
         )
-        state = DeepseekV41AttentionState()
+        state = DeepseekV41AttentionState() if pipeline_attention_state is None else pipeline_attention_state
         captured = [] if output_residual_streams else None
         for layer in self.layers.values():
             if captured is not None:
@@ -556,7 +559,7 @@ class DeepseekV41Model(nn.Module):
             )
         if self.norm is not None:
             hidden_states = self.norm(DeepseekV41HyperConnection.collapse(hidden_states, pre_mix))
-        return DeepseekV41BackboneOutput(hidden_states, pre_mix, None if captured is None else tuple(captured))
+        return DeepseekV41BackboneOutput(hidden_states, pre_mix, None if captured is None else tuple(captured), state)
 
 
 class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
@@ -769,7 +772,7 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
         seq_lens: torch.Tensor | None = None,
         seq_lens_padded: torch.Tensor | None = None,
         qkv_format: str | None = None,
-    ) -> CausalLMOutputWithPast | tuple[torch.Tensor, torch.Tensor, torch.Tensor] | torch.Tensor:
+    ) -> CausalLMOutputWithPast | tuple[torch.Tensor, ...] | torch.Tensor:
         """Compute language outputs, or the documented PP stage tensor contract.
 
         Args:
@@ -777,7 +780,8 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
                 [batch, local_sequence, streams, hidden] on the non-first PP stage.
             pipeline_inputs: Only on a non-first stage: FP32 pre_mix
                 [batch, local_sequence, streams] and int64 metadata
-                [batch, local_sequence, 5], as documented by get_pipeline_stage_metas.
+                [batch, local_sequence, 5], followed by live CSA2 state tensors,
+                as documented by get_pipeline_stage_metas and _pack_pipeline_state.
             attention_mask: Optional binary right-padding tensor [batch, sequence].
             position_ids: Optional integer tensor of shape [batch, sequence].
             labels: Optional targets of shape [batch, sequence], with -100 ignored.
@@ -810,12 +814,12 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
         if cp_group is None and self.cp_mesh is not None:
             cp_group = self.cp_mesh.get_group()
         is_pp_stage = self.lm_head is None or self.model.embed_tokens is None
-        pipeline_hidden = pipeline_mix = None
+        pipeline_hidden = pipeline_mix = pipeline_state = None
         if self.model.embed_tokens is None:
-            if len(pipeline_inputs) != 2:
-                raise ValueError("The second PP stage requires pre_mix and token metadata")
+            if len(pipeline_inputs) < 2:
+                raise ValueError("A non-first PP stage requires pre_mix and token metadata")
             pipeline_hidden = input_ids
-            pipeline_mix, metadata = pipeline_inputs
+            pipeline_mix, metadata, *state_tensors = pipeline_inputs
             if metadata.dtype != torch.long or metadata.shape != (*input_ids.shape[:2], 5):
                 raise ValueError("PP token metadata must be int64 [batch, local_sequence, 5]")
             if pipeline_mix.dtype != torch.float32 or pipeline_mix.shape != input_ids.shape[:3]:
@@ -826,6 +830,12 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
             # Document IDs are nonnegative in packed mode; -1 denotes absent metadata.
             if packed_seq_ids[0, 0].item() == -1:
                 packed_seq_ids = None
+            pipeline_state = self._unpack_pipeline_state(
+                tuple(state_tensors),
+                boundary=int(next(iter(self.model.layers))),
+                hidden_states=pipeline_hidden,
+                packed=packed_seq_ids is not None,
+            )
             seq_lens = seq_lens_padded = qkv_format = None
             pixel_values = image_grid_hws = None
         elif pipeline_inputs:
@@ -908,14 +918,20 @@ class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, Pre
             packed_seq_ids=packed_seq_ids,
             pipeline_hidden_states=pipeline_hidden,
             pipeline_pre_mix=pipeline_mix,
+            pipeline_attention_state=pipeline_state,
         )
         hidden, captured = backbone.hidden_states, backbone.residual_streams
         if self.lm_head is None:
             valid = torch.ones_like(input_ids) if attention_mask is None else attention_mask.to(torch.long)
             documents = torch.full_like(input_ids, -1) if packed_seq_ids is None else packed_seq_ids
             vision_types = torch.full_like(input_ids, -1) if vision_token_types is None else vision_token_types
-            metadata = torch.stack((input_ids, position_ids, valid, documents, vision_types), dim=-1).long()
-            return hidden.contiguous(), backbone.pre_mix.contiguous(), metadata
+            metadata = torch.stack(
+                (input_ids, position_ids.expand_as(input_ids), valid, documents, vision_types), dim=-1
+            ).long()
+            boundary = int(tuple(self.model.layers)[-1]) + 1
+            return (hidden.contiguous(), backbone.pre_mix.contiguous(), metadata) + self._pack_pipeline_state(
+                backbone.attention_state, boundary
+            )
         if is_pp_stage and self._pp_return_hidden_states:
             return hidden
         if layout is not None:

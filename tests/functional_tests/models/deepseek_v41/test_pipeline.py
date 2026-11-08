@@ -12,8 +12,11 @@ import torch
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
 @pytest.mark.parametrize("checkpoint", [False, True])
+@pytest.mark.parametrize(
+    "cuts,schedule", [([14], "1f1b"), ([3], "1f1b"), ([24], "1f1b"), ([3, 9, 25], "interleaved1f1b")]
+)
 @pytest.mark.timeout(240)
-def test_pipeline_gradients_and_update(checkpoint: bool) -> None:
+def test_pipeline_gradients_and_update(checkpoint: bool, cuts: list[int], schedule: str) -> None:
     script = Path(__file__).with_name("run_pipeline.py")
     command = [
         sys.executable,
@@ -22,6 +25,10 @@ def test_pipeline_gradients_and_update(checkpoint: bool) -> None:
         "--standalone",
         "--nproc-per-node=2",
         str(script),
+        "--schedule",
+        schedule,
+        "--cuts",
+        *map(str, cuts),
     ]
     if checkpoint:
         command.append("--checkpoint")

@@ -79,12 +79,10 @@ class DeepseekV41ModelParallelizer(ModelParallelizer):
     def parallelize(self, model: DeepseekV41ForCausalLM, mesh_context: MeshContext, /) -> nn.Module:
         """Bind PP-local Engram ownership before the shared parallelizer captures parameters."""
         if mesh_context.pp_size > 1:
-            if mesh_context.pp_size != 2 or not isinstance(mesh_context.strategy_config, FSDP2Config):
-                raise ValueError("DeepSeek V4.1 pipeline training requires PP2 with FSDP2")
+            if not isinstance(mesh_context.strategy_config, FSDP2Config):
+                raise ValueError("DeepSeek V4.1 pipeline training requires FSDP2")
+            model._pipeline_layer_bounds()
             first = model.model.embed_tokens is not None
-            expected = list(range(14)) if first else list(range(14, model.config.text_config.num_hidden_layers))
-            if list(map(int, model.model.layers)) != expected:
-                raise ValueError("DeepSeek V4.1 PP2 stages must own layers 0–13 and 14–last")
             owner_mesh = mesh_context.device_mesh["dp_shard_cp"]
             if owner_mesh.size() > 1 and mesh_context.ep_size == 1:
                 raise ValueError("DeepSeek V4.1 PP with sharded Engram currently requires expert parallelism")

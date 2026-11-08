@@ -73,6 +73,60 @@ distributed:
   tp_size: 1
   pp_size: 2
   pipeline:
+    # Explicit stage split; change these module lists to choose other boundaries.
+    module_fqns_per_model_part:
+      -
+        - model.embed_tokens
+        - model.layers.0
+        - model.layers.1
+        - model.layers.2
+        - model.layers.3
+        - model.layers.4
+        - model.layers.5
+        - model.layers.6
+        - model.layers.7
+        - model.layers.8
+        - model.layers.9
+        - model.layers.10
+        - model.layers.11
+        - model.layers.12
+        - model.layers.13
+        - model.engram_hash
+        - model.vision
+        - model.aligner
+        - model.image_start
+        - model.image_end
+        - model.image_newline
+      -
+        - model.layers.14
+        - model.layers.15
+        - model.layers.16
+        - model.layers.17
+        - model.layers.18
+        - model.layers.19
+        - model.layers.20
+        - model.layers.21
+        - model.layers.22
+        - model.layers.23
+        - model.layers.24
+        - model.layers.25
+        - model.layers.26
+        - model.layers.27
+        - model.layers.28
+        - model.layers.29
+        - model.layers.30
+        - model.layers.31
+        - model.layers.32
+        - model.layers.33
+        - model.layers.34
+        - model.layers.35
+        - model.layers.36
+        - model.layers.37
+        - model.layers.38
+        - model.layers.39
+        - model.engram_hash
+        - model.norm
+        - lm_head
     pp_schedule: 1f1b
     pp_microbatch_size: 1
     scale_grads_in_schedule: false
