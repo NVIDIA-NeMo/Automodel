@@ -128,12 +128,12 @@ exception is hidden in performance overrides. No current legacy benchmark enable
 a positive `packed_sequence_size`; fixed-length synthetic data alone does not
 request THD packing.
 
+GLM-4.7 Flash finetuning explicitly sets `gate_precision: float32`. The benchmark
+and pretraining configs omit this setting, and `Glm4MoeLiteForCausalLM` resolves it
+to `torch.float32`. All three use FP32 router projections.
+
 Other recorded differences:
 
-- GLM-4.7 Flash finetuning keeps `gate_precision: float32`, matching the Hugging Face
-  router that its checkpoint-robustness parity checks compare against. The benchmark
-  and pretraining configs project router logits in bf16; the fp32 router GEMM is small
-  relative to the experts.
 - DeepSeek V4 finetuning omits `group_compressor_fsdp_units`, which requires unpadded
   inputs with implicit positions; its HellaSwag batches are padded. It keeps the other
   `model.config` tuning of the pretraining config.
