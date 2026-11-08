@@ -192,7 +192,7 @@ jobs:
 
       - name: Use validated PR nightly navigation
         run: |
-          uv run --no-project --isolated --python 3.12 --with pyyaml==6.0.3 python -I - <<'PY'
+          uv run --no-project --isolated --no-python-downloads --python "$(command -v python3)" --with pyyaml==6.0.3 python -I - <<'PY'
           import base64
           import binascii
           import os
