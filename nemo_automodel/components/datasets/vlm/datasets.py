@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import ClassVar, TypedDict
+from typing import ClassVar
 
 import torch
 import torch.utils.data
@@ -35,7 +35,7 @@ from PIL import Image
 from transformers import ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
-from nemo_automodel.components.datasets.vlm.conversation import ConversationMessage, ConversationSample
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
     _lmdb_env_cache,
@@ -173,17 +173,6 @@ def make_cord_v2_dataset(
     # return dataset.map(format, batched=False, num_proc=8,remove_columns=["ground_truth"])
 
 
-class _MedPixImage(TypedDict):
-    bytes: bytes | None
-    path: str | None
-
-
-class _MedPixBatch(TypedDict):
-    image_id: list[_MedPixImage | str | Image.Image]
-    question: list[str]
-    answer: list[str]
-
-
 @dataclass
 class MedPixDatasetConfig:
     """Construction-time configuration for the MedPix dataset."""
@@ -198,48 +187,62 @@ class MedPixDatasetConfig:
     """Optional shuffle seed applied before packing; None preserves source order."""
 
     def build(self) -> Dataset:
-        """Build Arrow-backed conversations with lazily decoded MedPix images."""
-        dataset = load_dataset(self.path_or_dataset, split=self.split, revision=self.revision)
-        if self.seed is not None:
-            dataset = dataset.shuffle(seed=self.seed)
+        """Build the lazily decoded MedPix dataset."""
+        return make_medpix_dataset(
+            path_or_dataset=self.path_or_dataset, split=self.split, revision=self.revision, seed=self.seed
+        )
+
+
+def make_medpix_dataset(
+    path_or_dataset: str = "medpix-dataset/medpix-dataset",
+    split: str = "train",
+    *,
+    revision: str | None = None,
+    seed: int | None = None,
+    **kwargs,
+) -> Dataset:
+    """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
+
+    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
+    dataset stays Arrow-backed (no Python-side copy of every image). Images are
+    loaded undecoded (``Image(decode=False)``) and wrapped as lazy ``PIL``
+    handles (``Image.open`` reads only the header); the actual pixel decode then
+    happens on demand in the DataLoader workers, rather than eagerly decoding the
+    whole split up front.
+    """
+    dataset = load_dataset(path_or_dataset, split=split, revision=revision)
+    if seed is not None:
+        dataset = dataset.shuffle(seed=seed)
+    if "image_id" in getattr(dataset, "features", {}):
         dataset = dataset.cast_column("image_id", HfImage(decode=False))
 
-        def lazy_image(value: _MedPixImage | str | Image.Image) -> Image.Image | str | _MedPixImage:
-            # Opening embedded image bytes reads only the header, not the pixels.
-            if isinstance(value, dict):
-                if value.get("bytes") is not None:
-                    return Image.open(io.BytesIO(value["bytes"]))
-                if value.get("path"):
-                    return value["path"]
-            return value
+    def lazy_image(value):
+        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
 
-        def transform(batch: _MedPixBatch) -> dict[str, list[list[ConversationMessage]]]:
-            return {
-                "conversation": [
-                    [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": lazy_image(image)},
-                                {"type": "text", "text": question},
-                            ],
-                        },
-                        {"role": "assistant", "content": [{"type": "text", "text": answer}]},
-                    ]
-                    for image, question, answer in zip(batch["image_id"], batch["question"], batch["answer"])
+    def transform(batch):
+        return {
+            "conversation": [
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": lazy_image(image)},
+                            {"type": "text", "text": question},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": answer}]},
                 ]
-            }
+                for image, question, answer in zip(batch["image_id"], batch["question"], batch["answer"])
+            ]
+        }
 
-        return dataset.with_transform(transform)
-
-
-def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
-    """Load MedPix conversations with deferred image decoding.
-
-    This legacy factory preserves source order. Use MedPixDatasetConfig to
-    pin a dataset revision or shuffle raw rows deterministically before packing.
-    """
-    return MedPixDatasetConfig(path_or_dataset=path_or_dataset, split=split).build()
+    return dataset.with_transform(transform)
 
 
 @dataclass
