@@ -1522,6 +1522,9 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
         )
+        self.dispatcher_hybridep_max_tokens_per_rank = (
+            backend.dispatcher_hybridep_max_tokens_per_rank if backend is not None else None
+        )
         # HybridEP capacity mode (BackendConfig.dispatcher_capacity_factor): the dispatcher returns
         # device-side tokens_per_expert and buffers of a fixed capacity, so the per-microbatch
         # count_nonzero host read in forward is skipped as well (rows are never empty).
@@ -1597,6 +1600,7 @@ class GroupedExpertsDeepEP(TransposedMatrixModule, nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_max_tokens_per_rank=self.dispatcher_hybridep_max_tokens_per_rank,
             moe_hybridep_capacity_factor=self.dispatcher_capacity_factor,
             moe_hybridep_equal_token_counts=self.dispatcher_equal_token_counts,
             moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
@@ -1957,6 +1961,9 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_hybridep_num_blocks_unpermute = (
             backend.dispatcher_hybridep_num_blocks_unpermute if backend is not None else None
         )
+        self.dispatcher_hybridep_max_tokens_per_rank = (
+            backend.dispatcher_hybridep_max_tokens_per_rank if backend is not None else None
+        )
 
         # BackendConfig.dispatcher_recompute_cache: the HybridEP combine output of a checkpoint forward is served
         # in the recompute ("combine"); "moe_tail" is refused by BackendConfig for this backend (no deferred GEMM
@@ -2266,6 +2273,7 @@ class GroupedExpertsTE(nn.Module):
             moe_hybridep_num_sms_preprocessing=self.dispatcher_hybridep_num_sms_preprocessing,
             moe_hybridep_num_blocks_permute=self.dispatcher_hybridep_num_blocks_permute,
             moe_hybridep_num_blocks_unpermute=self.dispatcher_hybridep_num_blocks_unpermute,
+            moe_hybridep_max_tokens_per_rank=self.dispatcher_hybridep_max_tokens_per_rank,
             moe_hybridep_recompute_cache=self.dispatcher_recompute_cache,
             moe_benchmark_static_routing=self.static_routing,
         )
@@ -2470,9 +2478,9 @@ def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):
         else:
             return tensor
 
-    # mxfp4-resident experts hold packed base weights (no gate_and_up_projs /
+    # mxfp4- / nvfp4-resident experts hold packed base weights (no gate_and_up_projs /
     # down_projs); those are filled from the checkpoint, nothing to init here.
-    if getattr(module, "_mxfp4_resident", False):
+    if getattr(module, "_mxfp4_resident", False) or getattr(module, "_nvfp4_resident", False):
         return
 
     with torch.device(buffer_device):
