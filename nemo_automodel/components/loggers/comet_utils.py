@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import logging
-from typing import Any, Dict
+from types import TracebackType
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -32,10 +33,10 @@ class CometLogger:
         workspace: str | None = None,
         api_key: str | None = None,
         experiment_name: str | None = None,
-        tags: list | None = None,
+        tags: list[str] | None = None,
         auto_metric_logging: bool = False,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         """
         Initialize Comet ML logger.
 
@@ -72,7 +73,7 @@ class CometLogger:
 
             logger.info(f"Comet experiment: {self.experiment.url}")
 
-    def log_params(self, params: Dict[str, Any]) -> None:
+    def log_params(self, params: dict[str, Any]) -> None:
         """Log parameters to Comet.
 
         Args:
@@ -83,7 +84,7 @@ class CometLogger:
 
         self.experiment.log_parameters(params)
 
-    def log_metrics(self, metrics: Dict[str, float], step: int | None = None) -> None:
+    def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
         """Log metrics to Comet.
 
         Args:
@@ -113,14 +114,19 @@ class CometLogger:
             self.experiment.end()
             logger.info("Comet experiment ended successfully")
 
-    def __enter__(self):
+    def __enter__(self) -> "CometLogger":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         self.end()
 
 
-def build_comet(cfg) -> CometLogger:
+def build_comet(cfg: Any) -> CometLogger:
     """Build a Comet logger from a raw config object.
 
     Back-compat shim. The logger-construction logic lives in

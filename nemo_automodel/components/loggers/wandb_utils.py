@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import wandb
 
 
-def init_wandb_run(wandb_cfg: dict, full_config: dict, default_name: str = ""):
+def init_wandb_run(wandb_cfg: dict[str, Any], full_config: dict[str, Any], default_name: str = "") -> "wandb.Run":
     """Initialize a W&B run from a config dict.
 
     A recipe-agnostic counterpart to recipe-local ``build_wandb`` helpers: it

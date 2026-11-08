@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
 if TYPE_CHECKING:
+    from nemo_automodel.components.loggers.comet_utils import CometLogger
     from nemo_automodel.components.loggers.trackio_utils import TrackioLogger
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ def _patch_mirror_values(swanlab: Any) -> None:
     _, run_cls = safe_import_from("wandb.sdk.wandb_run", "Run")
     log_mirrored = run_cls.log
 
-    def log_builtin_scalars(run, data=None, *args, **kwargs):
+    def log_builtin_scalars(run: Any, data: Mapping[str, Any] | None = None, *args: Any, **kwargs: Any) -> Any:
         if isinstance(data, Mapping):
             data = {k: _builtin_scalar(v) for k, v in data.items()}
         return log_mirrored(run, data, *args, **kwargs)
@@ -66,7 +67,7 @@ def _patch_mirror_values(swanlab: Any) -> None:
     run_cls.log = log_builtin_scalars
     log_scalars = swanlab.log
 
-    def log_strings_as_text(data, step=None):
+    def log_strings_as_text(data: Mapping[str, Any], step: int | None = None) -> Any:
         return log_scalars({k: swanlab.Text(v) if isinstance(v, str) else v for k, v in data.items()}, step=step)
 
     swanlab.log = log_strings_as_text
@@ -456,7 +457,7 @@ class CometConfig:
     tags: list[str] = field(default_factory=list)
     auto_metric_logging: bool = False
 
-    def build(self, model_name: str | None = None) -> Any:
+    def build(self, model_name: str | None = None) -> "CometLogger":
         """Initialise Comet ML and return the logger (active on rank 0).
 
         When ``model_name`` is provided a ``model:<name>`` tag is appended and,
