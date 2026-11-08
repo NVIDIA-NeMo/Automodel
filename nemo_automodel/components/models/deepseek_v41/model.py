@@ -39,6 +39,8 @@ caching and SWA bounded replay remain out of scope.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -55,6 +57,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
 )
+from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -71,23 +74,32 @@ from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4VisionG
 from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionState,
+    csa2_selection_replay,
+    use_triton_rope,
+    validate_attention_inputs,
 )
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41Config, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.cp import gather_sequence, shard_cp_batch
-from nemo_automodel.components.models.deepseek_v41.engram import DeepseekV41Engram, DeepseekV41NgramHash
-from nemo_automodel.components.models.deepseek_v41.fsdp import fully_shard_deepseek_v41
+from nemo_automodel.components.models.deepseek_v41.engram import (
+    DeepseekV41Engram,
+    DeepseekV41NgramHash,
+    compile_engram_gate,
+)
+from nemo_automodel.components.models.deepseek_v41.fsdp import PARALLELIZER
 from nemo_automodel.components.models.deepseek_v41.layers import (
     DeepseekV41HyperConnection,
     DeepseekV41RMSNorm,
+    compile_hc_cores,
+    compile_norm_core,
 )
 from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 from nemo_automodel.components.models.deepseek_v41.processing import (
-    IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,
     IMAGE_START,
     image_inputs_from_batch,
 )
+from nemo_automodel.components.models.deepseek_v41.quantization import compile_cache_quantization
 from nemo_automodel.components.models.deepseek_v41.state_dict_adapter import DeepseekV41StateDictAdapter
 from nemo_automodel.components.models.deepseek_v41.vision import (
     DeepseekV41VisionAligner,
@@ -133,7 +145,7 @@ class DeepseekV41Block(nn.Module):
         )
         self.attn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.ffn_norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
-        sinkhorn_backend = "tilelang" if backend.attn == "tilelang" else "torch"
+        sinkhorn_backend = "tilelang" if backend.attn in ("tilelang", "cudnn") else "torch"
         self.attn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
         self.ffn_hc = DeepseekV41HyperConnection(config, sinkhorn_backend=sinkhorn_backend)
         self.engram = (
@@ -152,6 +164,28 @@ class DeepseekV41Block(nn.Module):
         """Expose the shared parallelizer's MoE interface without duplicate registration."""
         return self.ffn
 
+    def nemo_checkpoint_context_fn(
+        self,
+        context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None,
+    ) -> Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None:
+        """Extend this block's activation-checkpoint contexts with CSA2 selection replay.
+
+        The MoE parallelizer calls this model-owned hook when it wraps the block in a checkpoint
+        wrapper. With ``reuse_sparse_selection_on_recompute`` the attention layer records the frozen
+        indexer's selection and the sparse-index plan during the checkpoint forward and takes them back
+        during the recompute instead of recomputing them; with the knob off the incoming contexts are
+        returned unchanged.
+
+        Args:
+            context_fn: The parallelizer's ``torch.utils.checkpoint`` context factory, or ``None``.
+
+        Returns:
+            The (possibly wrapped) context factory.
+        """
+        if not self.attn.reuse_selection_on_recompute:
+            return context_fn
+        return csa2_selection_replay.checkpoint_context_fn(context_fn)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -164,6 +198,7 @@ class DeepseekV41Block(nn.Module):
         engram_hash_ids: torch.Tensor | None = None,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
+        inputs_validated: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, DeepseekV41AttentionState]:
         """Execute one block while retaining differentiable shared KV ownership.
 
@@ -204,6 +239,7 @@ class DeepseekV41Block(nn.Module):
             attention_mask=attention_mask,
             cp_group=cp_group,
             packed_seq_ids=packed_seq_ids,
+            inputs_validated=inputs_validated,
         )
         hidden_states = self.attn_hc.expand(attended.hidden_states, hidden_states, attn_mix)
         ffn_mix = self.ffn_hc(hidden_states)
@@ -237,6 +273,14 @@ class DeepseekV41Model(nn.Module):
         config = config.text_config
         self.config = config
         self.moe_config = moe_config
+        if backend.compile_hc:
+            compile_hc_cores()
+        if backend.compile_norm and backend.rms_norm != "te":
+            compile_norm_core()
+        if config.compile_cache_quant:
+            compile_cache_quantization()
+        if config.compile_engram:
+            compile_engram_gate()
         dtype = dtype_from_str(config.dtype, torch.bfloat16)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=dtype)
         active_engram = any(i < config.num_hidden_layers for i in config.engram_layer_ids)
@@ -269,52 +313,124 @@ class DeepseekV41Model(nn.Module):
     def _image_embeddings(
         self,
         input_ids: torch.Tensor,
-        pixel_values: torch.Tensor,
-        image_grid_hws: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+        image_grid_hws: torch.Tensor | None,
         vision_token_types: torch.Tensor,
+        *,
+        cp_group: dist.ProcessGroup | None = None,
+        packed_seq_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Insert image features and learned delimiters into fresh token embeddings.
+        """Fuse globally ordered images into the local contiguous language shard.
 
         Args:
-            input_ids: Integer tensor of shape [batch, sequence].
-            pixel_values: Tensor of shape [all_patches, 3, patch_size, patch_size].
-            image_grid_hws: Integer tensor of shape [images, 2], containing patch grids.
-            vision_token_types: Integer tensor of shape [batch, sequence], with
-                -1 for text and 0/1/2/3 for image start/content/newline/end.
+            input_ids: Integer local token IDs [batch, local_sequence].
+            pixel_values: Global patches [patches, 3, patch_size, patch_size],
+                replicated within CP; None for a text-only batch.
+            image_grid_hws: Global image grids [images, 2], in batch-row order.
+            vision_token_types: Local markers [batch, local_sequence]; -1 for
+                text, 0/1/2/3 for image start/content/newline/end.
+            cp_group: CP-only group, or None. Complete spans are validated after
+                gathering marker metadata, so a shard may start inside an image.
+            packed_seq_ids: Local document IDs [batch, local_sequence], zero
+                for padding. An image must lie wholly inside one document.
 
         Returns:
-            Tensor of shape [batch, sequence, hidden], retaining text and image
-            gradients. The supplied input tensors are not modified.
+            Local fused embeddings [batch, local_sequence, hidden]. Vision
+            blocks and the projector each execute once, even on text-only
+            ranks, preserving FSDP collective order. Frame-sharder backward
+            sums contributions from all CP language shards.
         """
         if self.vision is None:
             raise ValueError("pixel_values requires an enabled DeepSeek V4.1 vision encoder")
         if vision_token_types.shape != input_ids.shape:
-            raise ValueError("vision_token_types must match input_ids [batch, sequence]")
-        if torch.any(input_ids[vision_token_types >= 0] != self.image_token_id):
+            raise ValueError("vision_token_types must match input_ids [batch, local_sequence]")
+        # Validate IDs after gathering too: every CP rank sees the same failure
+        # before any rank enters a visual collective.
+        types = gather_sequence(vision_token_types, cp_group)
+        ids = gather_sequence(input_ids, cp_group)
+        if torch.any(ids[types >= 0] != self.image_token_id):
             raise ValueError("Every image-span token must use the checkpoint's image_token_id")
-        images = image_inputs_from_batch(
-            pixel_values,
-            image_grid_hws,
-            vision_token_types,
-            downsample_ratio=self.vision_config.downsample_ratio,
-        )
-        embedded = self.embed_tokens(input_ids)
-        for item in images:
-            patches = item.patches.to(device=embedded.device, dtype=self.vision.patch_embed.proj.weight.dtype)
-            features = self.vision(patches, item.n_vit_h, item.n_vit_w)
-            features = self.aligner(features, item.n_vit_h, item.n_vit_w).to(embedded.dtype)
-            types = item.types.to(embedded.device)
-            if (types == IMAGE).sum() != features.shape[0]:
-                raise ValueError("Image token count does not match the downsampled vision grid")
-            span = embedded.new_empty(types.shape[0], embedded.shape[-1])
-            span[types == IMAGE] = features
-            span[types == IMAGE_START] = self.image_start.to(embedded.dtype)
-            span[types == IMAGE_END] = self.image_end.to(embedded.dtype)
-            span[types == IMAGE_NEW_LINE] = self.image_newline.to(embedded.dtype)
-            flat_indices = item.batch_index * input_ids.shape[1] + torch.arange(
-                item.start, item.start + types.shape[0], device=embedded.device
+        if pixel_values is None:
+            if image_grid_hws is not None or torch.any(types >= 0):
+                raise ValueError("Image spans require pixel_values")
+            images = ()
+        else:
+            if image_grid_hws is None:
+                raise ValueError("pixel_values requires image_grid_hws")
+            images = image_inputs_from_batch(
+                pixel_values, image_grid_hws, types, downsample_ratio=self.vision_config.downsample_ratio
             )
-            embedded = embedded.flatten(0, 1).index_copy(0, flat_indices, span).view_as(embedded)
+        if packed_seq_ids is not None:
+            documents = gather_sequence(packed_seq_ids, cp_group).cpu()
+            for item in images:
+                span_docs = documents[item.batch_index, item.start : item.start + item.types.numel()]
+                if torch.any(span_docs <= 0) or torch.any(span_docs != span_docs[0]):
+                    raise ValueError("An image span cannot cross a packed document boundary or padding")
+
+        embedded = self.embed_tokens(input_ids)
+        if not images:
+            # All DP ranks must call the same trainable FSDP units. This dummy
+            # never enters language tokens and receives exactly zero gradient.
+            size = self.vision_config.patch_size
+            pixel_values = embedded.new_zeros(1, 3, size, size)
+            image_grid_hws = torch.ones(1, 2, dtype=torch.long, device=embedded.device)
+        patches = pixel_values.to(device=embedded.device, dtype=self.vision.patch_embed.proj.weight.dtype)
+        grids = image_grid_hws.to(embedded.device)
+        grid_thw = torch.cat([torch.ones_like(grids[:, :1]), grids], dim=1)
+        encoded = maybe_distribute_visual(self.vision, patches.flatten(1), grid_thw).pooler_output
+        start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
+        end = start + input_ids.shape[1]
+        # Project only images contributing content to this language shard. An
+        # image straddling a shard boundary is projected as a whole on its
+        # consumers, preserving spatial-merge cells; only local token uses
+        # contribute gradients. Each FSDP-owned projector is still called once.
+        selected_patches = []
+        selected_grids = []
+        destination_indices: list[int] = []
+        feature_indices: list[int] = []
+        patch_offset = feature_offset = 0
+        ratio = self.vision_config.downsample_ratio
+        for item in images:
+            patch_end = patch_offset + item.n_vit_h * item.n_vit_w
+            height = (item.n_vit_h + ratio - 1) // ratio
+            width = (item.n_vit_w + ratio - 1) // ratio
+            # Plan integer placements on the host from already validated grids.
+            # Hundreds of images must not cause one GPU synchronization each.
+            keep = []
+            if item.start < end and item.start + item.types.numel() > start:
+                for row in range(height):
+                    for col in range(width):
+                        position = item.start + 1 + row * (width + 1) + col
+                        if start <= position < end:
+                            keep.append((position, row * width + col))
+            if keep:
+                selected_patches.append(encoded[patch_offset:patch_end])
+                selected_grids.append((item.n_vit_h, item.n_vit_w))
+                destination_indices.extend(item.batch_index * input_ids.shape[1] + pos - start for pos, _ in keep)
+                feature_indices.extend(feature_offset + index for _, index in keep)
+                feature_offset += height * width
+            patch_offset = patch_end
+        if selected_patches:
+            local_encoded = encoded if len(selected_patches) == len(images) else torch.cat(selected_patches)
+            local_grids = torch.tensor(selected_grids, dtype=torch.long, device=embedded.device)
+        else:
+            # Link the dummy to the gather even when no local image content is
+            # used, so every rank participates in its backward collective.
+            local_encoded = encoded[:1] * 0
+            local_grids = torch.ones(1, 2, dtype=torch.long, device=embedded.device)
+        features = self.aligner(local_encoded, image_grid_hws=local_grids).to(embedded.dtype)
+        # Keep the visual graph alive even on a shard with no image tokens.
+        embedded = embedded + features.reshape(-1)[:1].sum() * 0
+        if destination_indices:
+            destinations = torch.tensor(destination_indices, dtype=torch.long, device=embedded.device)
+            indices = torch.tensor(feature_indices, dtype=torch.long, device=embedded.device)
+            embedded = embedded.flatten(0, 1).index_copy(0, destinations, features[indices]).view_as(embedded)
+        for marker, value in (
+            (IMAGE_START, self.image_start),
+            (IMAGE_END, self.image_end),
+            (IMAGE_NEW_LINE, self.image_newline),
+        ):
+            embedded[vision_token_types == marker] = value.to(embedded.dtype)
         return embedded
 
     def forward(
@@ -328,7 +444,7 @@ class DeepseekV41Model(nn.Module):
         image_grid_hws: torch.Tensor | None = None,
         vision_token_types: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        output_hidden_states: bool = False,
+        output_residual_streams: bool = False,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
@@ -343,24 +459,39 @@ class DeepseekV41Model(nn.Module):
             image_grid_hws: Optional patch grids [images, 2].
             vision_token_types: Optional image/text markers [batch, sequence].
             inputs_embeds: Optional projected multimodal embeddings [batch, sequence, hidden].
-            output_hidden_states: Whether to retain streams before each block.
+            output_residual_streams: Whether to retain the residual streams before each block
+                (parity and debugging; not the recipe interface).
             packed_seq_ids: Optional document IDs [batch, local_sequence], zero for padding.
             cp_group: CP group; token axes above are local sequence shards.
                 Engram hashes use global token history, with only local rows looked up.
 
         Returns:
-            Final normalized hidden states [batch, sequence, hidden] and optional
-            per-block streams [batch, sequence, streams, hidden].
+            Final normalized hidden states [batch, sequence, hidden] and, under
+            ``output_residual_streams``, the per-block residual streams
+            [batch, sequence, streams, hidden] captured before each block; else None.
         """
         # Fuse within this FSDP owner's forward so learned image delimiters
         # are unsharded before they are read.
-        if pixel_values is not None:
-            if image_grid_hws is None or vision_token_types is None:
-                raise ValueError("pixel_values requires image_grid_hws and vision_token_types")
-            inputs_embeds = self._image_embeddings(input_ids, pixel_values, image_grid_hws, vision_token_types)
+        if self.vision is not None and (inputs_embeds is None or pixel_values is not None):
+            if vision_token_types is None:
+                if pixel_values is not None or image_grid_hws is not None:
+                    raise ValueError("Image inputs require vision_token_types")
+                vision_token_types = torch.full_like(input_ids, -1)
+            inputs_embeds = self._image_embeddings(
+                input_ids,
+                pixel_values,
+                image_grid_hws,
+                vision_token_types,
+                cp_group=cp_group,
+                packed_seq_ids=packed_seq_ids,
+            )
             image_mask = vision_token_types >= 0
-        elif image_grid_hws is not None or (vision_token_types is not None and torch.any(vision_token_types >= 0)):
-            raise ValueError("Image spans require pixel_values; image placeholders cannot be trained as ordinary text")
+        elif (
+            pixel_values is not None
+            or image_grid_hws is not None
+            or (vision_token_types is not None and torch.any(vision_token_types >= 0))
+        ):
+            raise ValueError("Image inputs require an enabled vision encoder")
         if position_ids is None:
             start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
             position_ids = (torch.arange(input_ids.shape[1], device=input_ids.device) + start).expand_as(input_ids)
@@ -379,8 +510,13 @@ class DeepseekV41Model(nn.Module):
             hashes = self.engram_hash(full_ids, token_mask=full_mask, sequence_ids=full_seq_ids)
             start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
             hashes = hashes[:, start : start + input_ids.shape[1]]
+        # The host-synchronising input checks run once here instead of in every attention layer (and again in
+        # every checkpoint recompute): with 40 layers that was 80+ launch-queue drains per step.
+        validate_attention_inputs(
+            position_ids, attention_mask, packed_seq_ids, sequence=input_ids.shape[1], cp_group=cp_group
+        )
         state = DeepseekV41AttentionState()
-        captured = [] if output_hidden_states else None
+        captured = [] if output_residual_streams else None
         for layer in self.layers.values():
             if captured is not None:
                 captured.append(hidden_states)
@@ -394,6 +530,7 @@ class DeepseekV41Model(nn.Module):
                 engram_hash_ids=None if layer.engram is None else hashes[:, :, layer.engram.layer_hash_index],
                 cp_group=cp_group,
                 packed_seq_ids=packed_seq_ids,
+                inputs_validated=True,
             )
         hidden_states = DeepseekV41HyperConnection.collapse(hidden_states, pre_mix)
         return self.norm(hidden_states), None if captured is None else tuple(captured)
@@ -408,7 +545,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     shard mesh must match the owner group exactly.
     """
 
-    _nemo_fully_shard = staticmethod(fully_shard_deepseek_v41)
     _owns_cp_attention: bool = True
     config_class: type[DeepseekV41Config] = DeepseekV41Config
     base_model_prefix: str = "model"
@@ -427,6 +563,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         "norm1.weight",
         "norm2.weight",
     ]
+    # fp32 holders whose forward ignores its input: one FSDP unit across all blocks (see
+    # parallelizer_utils.fully_shard_across_blocks) — per-block units could only be reduce-scattered one by one
+    # in FSDP2's root post-backward callback after the whole backward.
+    _fsdp_shard_across_blocks = ["attn.sinks_param"]
+    _packed_cp_attn_backends = ("tilelang", "cudnn")
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -437,6 +578,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         supports_pp: bool = False
         supports_ep: bool = True
         supports_thd: bool = True
+        supports_cp_vision_frame_sharding: bool = True
 
     @classmethod
     def from_config(cls, config: DeepseekV41Config, **kwargs: Any) -> DeepseekV41ForCausalLM:
@@ -450,6 +592,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         backend: BackendConfig | None = None,
         *,
         tokenizer: PreTrainedTokenizerFast | None = None,
+        revision: str | None = None,
         engram_process_group: dist.ProcessGroup | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
@@ -461,11 +604,15 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         self.backend = backend or BackendConfig(
             attn="tilelang", linear="torch", rms_norm="torch_fp32", experts="torch_mm", dispatcher="hybridep"
         )
+        if self.backend.rope == "triton":
+            # Process-wide dispatch of the attention module's rotation (same once-per-process pattern as the
+            # compiled cores): modules built before this call pick it up too. Default "torch" leaves eager.
+            use_triton_rope(True)
         dtype = dtype_from_str(text.dtype, torch.bfloat16)
         if engram_process_group is None and dist.is_available() and dist.is_initialized():
             engram_process_group = dist.group.WORLD
         if tokenizer is None and any(i < text.num_hidden_layers for i in text.engram_layer_ids):
-            tokenizer = config.build_tokenizer()
+            tokenizer = config.build_tokenizer(revision=revision)
         moe_config = moe_config or MoEConfig(
             dim=text.hidden_size,
             inter_dim=text.moe_intermediate_size,
@@ -589,8 +736,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         image_grid_hws: torch.Tensor | None = None,
         vision_token_types: torch.Tensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
-        return_hidden_states: bool = False,
         output_hidden_states: bool = False,
+        output_residual_streams: bool = False,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
         seq_lens: torch.Tensor | None = None,
@@ -608,8 +755,13 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             image_grid_hws: Optional patch-grid sizes [images, 2].
             vision_token_types: Optional image/text markers [batch, sequence].
             logits_to_keep: Number of final positions, or integer position indices [kept].
-            return_hidden_states: Return final hidden states for the recipe's loss.
-            output_hidden_states: Capture residual streams for numerical comparisons.
+            output_hidden_states: Attach the final normalized hidden states
+                [batch, sequence, hidden], in the backbone's activation dtype, as
+                every other model does; the recipes' linear losses project them
+                with ``lm_head.weight``.
+            output_residual_streams: Attach the per-layer residual streams instead, a
+                tuple of [batch, sequence, streams, hidden] captured before each block,
+                for parity checks and debugging. Exclusive with ``output_hidden_states``.
             seq_lens: Optional real document lengths [batch, documents] for packed text.
             seq_lens_padded: Optional physical document spans [batch, documents].
             qkv_format: Optional "thd" marker from packed_sequence_thd_collater.
@@ -620,15 +772,16 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
 
         Returns:
             CausalLMOutputWithPast containing logits [batch, kept_sequence, vocab],
-            optional scalar loss, and requested hidden tensors. No inference KV cache.
+            optional scalar loss, and ``hidden_states``: the final hidden states
+            [batch, sequence, hidden] under ``output_hidden_states``, the per-block
+            residual streams under ``output_residual_streams``, else None. No
+            inference KV cache.
         """
         if cp_group is None and self.cp_mesh is not None:
             cp_group = self.cp_mesh.get_group()
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
             if labels is not None:
                 raise ValueError("CP training requires the recipe loss with labels shifted before sequence sharding")
-            if pixel_values is not None:
-                raise ValueError("DeepSeek V4.1 context parallelism currently supports text only")
         if packed_seq_ids is not None:
             if labels is not None:
                 raise ValueError("Prepared packed input requires the recipe loss with independently shifted labels")
@@ -640,8 +793,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 raise ValueError("packed_seq_ids must be an integer tensor with shape [batch, local_sequence]")
         layout = None
         if seq_lens is not None:
-            if pixel_values is not None or packed_seq_ids is not None:
-                raise ValueError("Packed text requires seq_lens or prepared packed_seq_ids, without image inputs")
+            if packed_seq_ids is not None:
+                raise ValueError("Provide either seq_lens or prepared packed_seq_ids")
             if cp_group is not None and dist.get_world_size(cp_group) > 1:
                 raise ValueError("Packed CP input must pass through the model-owned ContextParallelSharder")
             layout = packed_layout(
@@ -652,6 +805,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 minimum_length=input_ids.shape[1],
             )
             input_ids = layout.pack(input_ids, fill=self.config.text_config.pad_token_id or 0)
+            if vision_token_types is not None:
+                vision_token_types = layout.pack(vision_token_types, fill=-1)
             position_ids = layout.position_ids
             packed_seq_ids = layout.sequence_ids
             attention_mask = packed_seq_ids > 0
@@ -659,6 +814,11 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             raise ValueError("Packed text requires seq_lens")
         if qkv_format not in (None, "thd"):
             raise ValueError("DeepSeek V4.1 qkv_format must be omitted or 'thd'")
+        if output_hidden_states and output_residual_streams:
+            raise ValueError(
+                "output_hidden_states returns the final hidden states and output_residual_streams the per-layer "
+                "residual streams; request one of them"
+            )
         hidden, captured = self.model(
             input_ids,
             position_ids=position_ids,
@@ -666,7 +826,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             pixel_values=pixel_values,
             image_grid_hws=image_grid_hws,
             vision_token_types=vision_token_types,
-            output_hidden_states=output_hidden_states,
+            output_residual_streams=output_residual_streams,
             cp_group=cp_group,
             packed_seq_ids=packed_seq_ids,
         )
@@ -674,7 +834,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             hidden = layout.restore(hidden)
             captured = None if captured is None else tuple(layout.restore(values) for values in captured)
         projected = compute_lm_head_logits(
-            self.lm_head, hidden, logits_to_keep, output_hidden_states=return_hidden_states
+            self.lm_head, hidden, logits_to_keep, output_hidden_states=output_hidden_states
         )
         loss = None
         if labels is not None:
@@ -695,7 +855,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         return CausalLMOutputWithPast(
             loss=loss,
             logits=projected.logits,
-            hidden_states=captured if output_hidden_states else projected.hidden_states,
+            hidden_states=captured if output_residual_streams else projected.hidden_states,
         )
 
     @torch.no_grad()
@@ -736,4 +896,5 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 layer.engram.embed.mark_sharding_contract()
 
 
+DeepseekV41ForCausalLM.parallelizer = PARALLELIZER
 ModelClass = DeepseekV41ForCausalLM

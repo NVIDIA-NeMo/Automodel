@@ -1,7 +1,6 @@
 ---
 name: testing
-description: Testing reference for NeMo AutoModel — unit and functional test layout, tier semantics (L0/L1/L2), running tests locally, adding or disabling tests, and pytest conventions.
-when_to_use: Adding, running, or disabling tests; debugging a test failure; choosing the right test tier; understanding L0 vs L1 vs L2; handling flaky tests; 'add a test', 'which tier', 'functional test layout'.
+description: "NeMo AutoModel tests: unit and functional layout, L0/L1/L2 tiers, running, adding, or disabling tests, and flaky tests. Use when adding, running, or debugging tests or choosing a tier."
 ---
 
 # Testing
@@ -61,6 +60,10 @@ or:
 1. Place the file under `tests/unit_tests/<domain>/test_<name>.py`.
 2. Keep configs tiny: small hidden dims, 1-2 layers, short sequences.
 3. Run locally: `pytest tests/unit_tests/<your_test>.py -v`
+4. If the test never uses CUDA (for example, Gloo ranks on CPU tensors), mark it
+   `cpu_only`, or the whole module with `pytestmark = pytest.mark.cpu_only`.
+   `L0_Unit_Tests_CPU` still runs it; the GPU unit-test shards skip it. Unlike
+   `run_only_on("CPU")`, the marker does not skip local runs.
 
 **No foreign `setattr` on config dataclasses in tests.** When applying
 overrides via `setattr(config_obj, key, value)`, always guard first:

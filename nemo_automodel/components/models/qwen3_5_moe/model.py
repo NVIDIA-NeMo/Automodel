@@ -73,6 +73,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
     cp_vision_frame_sharding_active,
     maybe_distribute_visual,
 )
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import (
@@ -186,7 +187,13 @@ class Qwen3_5MoeBlock(Block):
                 [axes, batch, sequence].
             packed_gdn_metadata: Optional model-forward-owned packing metadata;
                 tensor layouts are documented by :class:`GatedDeltaPackedMetadata`.
-            **attn_kwargs: Backend-specific attention arguments.
+            **attn_kwargs: Packed or THD metadata: ``_packed_seq_ids`` has shape
+                [batch, sequence] with 1-based document IDs and zero padding.
+                ``packed_token_indices`` has shape [batch, sequence] with row-local
+                positions and -1 padding, or [tokens] indexing flattened batch
+                and sequence axes. ``cu_seqlens`` has shape [batch, max_documents + 1]
+                with row-local boundaries and -1 padding, or [documents + 1] for
+                flattened/THD inputs. ``max_seqlen`` is an integer document length.
 
         Returns:
             Hidden states of shape [batch, sequence, hidden].
@@ -213,6 +220,8 @@ class Qwen3_5MoeBlock(Block):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                packed_token_indices=attn_kwargs.get("packed_token_indices"),
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
 
         if packed_gdn_metadata is not None:
@@ -244,6 +253,8 @@ class Qwen3_5MoeBlock(Block):
         elif self.layer_type == "linear_attention":
             self.linear_attn.dt_bias.data.fill_(1.0)
             self.linear_attn.A_log.data.uniform_(0, 16).log_()
+            # Match HF's PreTrainedModel._init_weights for this nn.Conv1d (normal, initializer_range), not torch's default
+            nn.init.normal_(self.linear_attn.conv1d.weight, mean=0.0, std=0.02)
             linear_list = [
                 self.linear_attn.in_proj_qkv,
                 self.linear_attn.in_proj_z,
@@ -546,6 +557,32 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
         cache_position=None,
         **kwargs,
     ):
+        """Route multimodal inputs while keeping text boundaries out of vision.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence], or floating-point
+                pipeline hidden states of shape [batch, sequence, hidden].
+            attention_mask: Padding/document IDs of shape [batch, sequence] or
+                a dense mask of shape [batch, 1, sequence, sequence].
+            position_ids: Text positions of shape [batch, sequence] or mRoPE
+                coordinates of shape [3 or 4, batch, sequence].
+            past_key_values: Unsupported recurrent or KV cache.
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            pixel_values: Optional image patches of shape [patches, patch_features].
+            pixel_values_videos: Optional video patches of shape [patches, patch_features].
+            image_grid_thw: Image grids of shape [images, 3] in temporal/height/width order.
+            video_grid_thw: Video grids of shape [videos, 3] in temporal/height/width order.
+            cache_position: Optional token positions of shape [sequence].
+            **kwargs: Text metadata, including ``cu_seqlens`` of shape
+                [batch, max_documents + 1] or [documents + 1], integer
+                ``max_seqlen``, and ``packed_token_indices`` of shape [batch,
+                sequence] or [tokens]. Image/video-prefixed metadata retains
+                the inherited HF precomputed-vision contract.
+
+        Returns:
+            Model output with ``last_hidden_state`` of shape [batch, sequence,
+            hidden] and, on the HF media path, ``rope_deltas`` of shape [batch, 1].
+        """
         # If we have visual pixel values and a vision encoder, go through the full HF
         # VL forward (vision encoding + multimodal scatter + text).
         if (pixel_values is not None or pixel_values_videos is not None) and self.visual is not None:
@@ -566,6 +603,11 @@ class Qwen3_5MoeModel(HFQwen3_5MoeModel):
             media_tensor = pixel_values if pixel_values is not None else pixel_values_videos
             if isinstance(media_tensor, torch.Tensor) and hasattr(self.visual, "rotary_pos_emb"):
                 self.visual.rotary_pos_emb.to(media_tensor.device)
+            # HF interprets bare sequence metadata as vision-frame boundaries.
+            # Preserve packed text metadata until the native text decoder.
+            for key in ("cu_seqlens", "max_seqlen"):
+                if key in kwargs:
+                    kwargs[f"_text_{key}"] = kwargs.pop(key)
             return super().forward(
                 input_ids=None,
                 attention_mask=attention_mask,
@@ -710,12 +752,22 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             use_cache: Whether to use a cache; only ``False`` or ``None`` is
                 supported.
             **attn_kwargs: Backend-specific attention arguments, including optional
-                ``_packed_seq_ids`` of shape [batch, sequence].
+                ``_packed_seq_ids`` of shape [batch, sequence], ``packed_token_indices``
+                of shape [batch, sequence] or [tokens], ``cu_seqlens`` of shape
+                [batch, max_documents + 1] or [documents + 1], and integer
+                ``max_seqlen``. Batch-major metadata uses -1 padding. Explicit
+                token metadata is supported without context parallelism.
+                The multimodal wrapper temporarily prefixes ``cu_seqlens`` and
+                ``max_seqlen`` with ``_text_`` across HF vision processing; their
+                layouts and values are unchanged.
 
         Returns:
             Model output whose ``last_hidden_state`` has shape [batch, sequence,
             hidden].
         """
+        for key in ("cu_seqlens", "max_seqlen"):
+            if f"_text_{key}" in attn_kwargs:
+                attn_kwargs[key] = attn_kwargs.pop(f"_text_{key}")
         if past_key_values is not None or use_cache:
             raise NotImplementedError("KV cache is not supported for the Qwen3.5-MoE backend implementation.")
 
@@ -745,6 +797,11 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
         # hidden_states are [B, S_local]).  Both TE ring-attention and FLA CP
         # do not support padding masks, so we null them out.
         if getattr(self, "_cp_enabled", False):
+            if attn_kwargs.get("packed_token_indices") is not None or attn_kwargs.get("cu_seqlens") is not None:
+                raise ValueError(
+                    "Qwen3.5 packed sequence metadata is unsupported with load-balanced context parallelism. "
+                    "Disable packing or use the supported SDPA block-diagonal CP path for Qwen3.5-MoE."
+                )
             attention_mask = None
             from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
 
@@ -772,6 +829,8 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
             packed_gdn_metadata = prepare_gated_delta_packed_metadata(
                 attention_mask,
                 attn_kwargs.get("_packed_seq_ids"),
+                packed_token_indices=attn_kwargs.get("packed_token_indices"),
+                cu_seqlens=attn_kwargs.get("cu_seqlens"),
             )
 
         # --- Decoder layers (Qwen3Next Block, unmodified) ---
@@ -822,8 +881,19 @@ class Qwen3_5MoeTextModelBackend(nn.Module):
 class Qwen3_5MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Text-only Qwen3.5-MoE causal language model."""
 
+    _uses_native_fa4 = True
+    requires_packed_sequence_metadata = True
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_keep_self_forward: bool = True
+
+    def validate_packed_attention_backend(self, attn_implementation: str) -> None:
+        """Reject packed TE before loading data: this model lacks TE token gathering."""
+        if attn_implementation == "te":
+            raise ValueError(
+                "Packed Qwen3.5-MoE does not support Transformer Engine attention: "
+                "its full-attention blocks do not gather/scatter the unpadded token stream. "
+                "Use model.backend.attn='sdpa' or the native 'fa4' backend for packed inputs."
+            )
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -1139,12 +1209,23 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     # through this packed attention contract.
     _packed_cp_attn_backends = ("sdpa",)
 
+    _uses_native_fa4 = True
+    requires_packed_sequence_metadata = True
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
-    # CP submesh, installed by Qwen3_5ParallelizationStrategy when context
+    # CP submesh, installed by Qwen3_5ModelParallelizer when context
     # parallelism is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
+
+    def validate_packed_attention_backend(self, attn_implementation: str) -> None:
+        """Reject packed TE before loading data: this model lacks TE token gathering."""
+        if attn_implementation == "te":
+            raise ValueError(
+                "Packed Qwen3.5-MoE does not support Transformer Engine attention: "
+                "its full-attention blocks do not gather/scatter the unpadded token stream. "
+                "Use model.backend.attn='sdpa' or the native 'fa4' backend for packed inputs."
+            )
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -1282,8 +1363,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # Wrap vision rotary embedding with fp32-safe version
         vision_model = getattr(self.model, "visual")
         rotary = vision_model.rotary_pos_emb
-        dim = rotary.inv_freq.shape[0] * 2
-        fp32_safe_rotary = Fp32SafeQwen3_5MoeVisionRotaryEmbedding(dim)
+        fp32_safe_rotary = Fp32SafeQwen3_5MoeVisionRotaryEmbedding(rotary.config)
         fp32_safe_rotary.register_buffer(
             "inv_freq",
             rotary.inv_freq.detach().clone().to(torch.float32, copy=True),
@@ -1633,54 +1713,26 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             else getattr(text_config, "output_hidden_states", False)
         )
 
-        # PP VLM support: retrieve pixel_values from stored chunks if not passed
-        pixel_values = kwargs.get("pixel_values", None)
-        pixel_values_videos = kwargs.get("pixel_values_videos", None)
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        video_grid_thw = kwargs.get("video_grid_thw", None)
-        image_token_id = self.config.image_token_id
-        vision_start_token_id = self.config.vision_start_token_id
-        has_media_tokens = input_ids is not None and (
-            (input_ids == image_token_id).any() or (input_ids == vision_start_token_id).any()
-        )
-
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        consumed_vlm_chunk = False
-
-        if pixel_values is None and has_media_tokens:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            if image_chunks is not None and chunk_idx < len(image_chunks):
-                pixel_values = image_chunks[chunk_idx]
-                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
-                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
-                    image_grid_hws = image_grid_chunks[chunk_idx]
-                    if image_grid_hws is not None and image_grid_hws.numel() > 0:
-                        if image_grid_hws.shape[-1] == 2:
-                            ones = torch.ones(
-                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
-                            )
-                            image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
-                        else:
-                            image_grid_thw = image_grid_hws
-                kwargs["pixel_values"] = pixel_values
-                kwargs["image_grid_thw"] = image_grid_thw
-                consumed_vlm_chunk = True
-
-        if pixel_values_videos is None and has_media_tokens:
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if video_chunks is not None and chunk_idx < len(video_chunks):
-                video_chunk = video_chunks[chunk_idx]
-                if video_chunk.numel() > 0:
-                    pixel_values_videos = video_chunk
-                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
-                    if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
-                        video_grid_thw = video_grid_chunks[chunk_idx]
-                    kwargs["pixel_values_videos"] = pixel_values_videos
-                    kwargs["video_grid_thw"] = video_grid_thw
-                consumed_vlm_chunk = True
-
-        if consumed_vlm_chunk:
-            self._vlm_chunk_idx = chunk_idx + 1
+        # Explicit chunks, rather than token values, own PP media scheduling.
+        pixel_values = kwargs.get("pixel_values")
+        pixel_values_videos = kwargs.get("pixel_values_videos")
+        image_grid_thw = kwargs.get("image_grid_thw")
+        video_grid_thw = kwargs.get("video_grid_thw")
+        if pixel_values is None and pixel_values_videos is None:
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values = media.pixel_values
+                pixel_values_videos = media.pixel_values_videos
+                image_grid_thw = media.image_grid
+                video_grid_thw = media.video_grid
+                if image_grid_thw is not None and image_grid_thw.shape[-1] == 2:
+                    image_grid_thw = torch.nn.functional.pad(image_grid_thw, (1, 0), value=1)
+                kwargs.update(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                )
 
         if "qkv_format" in kwargs and kwargs["qkv_format"] == "thd":
             input_ids, position_ids, padding_mask, kwargs = squeeze_input_for_thd(
@@ -1700,7 +1752,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             and inputs_embeds is None
             and input_ids is not None
             and not torch.is_floating_point(input_ids)
-            and has_media_tokens
             and (
                 (isinstance(pixel_values, torch.Tensor) and pixel_values.numel() > 0)
                 or (isinstance(pixel_values_videos, torch.Tensor) and pixel_values_videos.numel() > 0)

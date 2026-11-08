@@ -14,10 +14,36 @@
 
 """Focused tests for Qwen3.8-Flash-Next's model-specific GDN output gate."""
 
+import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextRMSNormGated
+from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
+from nemo_automodel.components.models.qwen3_8_flash_next.layers import (
+    Qwen3_8_FlashNextGatedDeltaNet,
+    Qwen3_8_FlashNextRMSNormGated,
+)
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_gated_delta_net_constructs_without_explicit_layer_types(device: str) -> None:
+    config = Qwen3_8_FlashNextTextConfig(
+        hidden_size=16,
+        num_hidden_layers=4,
+        full_attention_interval=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+    )
+
+    # Exercise the real Transformers constructor, not a mocked base class.
+    with torch.device(device):
+        layer = Qwen3_8_FlashNextGatedDeltaNet(config, layer_idx=0)
+
+    assert layer.layer_idx == 0
+    assert layer.in_proj_qkv.weight.shape == (48, 16)
+    assert layer.in_proj_qkv.weight.device.type == device
 
 
 def test_qwen3_8_flash_next_gdn_norm_uses_sigmoid_gate() -> None:

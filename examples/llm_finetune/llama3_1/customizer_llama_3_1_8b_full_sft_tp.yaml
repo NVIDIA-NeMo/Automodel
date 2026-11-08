@@ -78,6 +78,7 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 ci:
+  cluster_tag: h100
   time: "00:30:00"
   checkpoint_robustness:
     tokenizer_name: meta-llama/Llama-3.1-8B-Instruct

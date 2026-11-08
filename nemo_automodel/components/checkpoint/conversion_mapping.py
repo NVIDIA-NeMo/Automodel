@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torch import nn
+    from transformers.quantizers.base import HfQuantizer
 
 
 # Try to import from transformers - this is the preferred source
@@ -60,6 +61,7 @@ except ImportError:
 # For these models, simple key renaming is not sufficient - they need WeightConverter
 # operations to merge individual expert weights into grouped format
 MODELS_REQUIRING_TENSOR_MERGING = {
+    "beam",
     "mixtral",
     "minimax",
     "phimoe",
@@ -128,7 +130,7 @@ def get_checkpoint_conversion_mapping(model_type: str) -> list | None:
 def get_model_conversion_mapping(
     model: "nn.Module",
     key_mapping: dict[str, str] | None = None,
-    hf_quantizer: object | None = None,
+    hf_quantizer: "HfQuantizer | None" = None,
     add_legacy: bool = True,
 ) -> list:
     """
@@ -205,9 +207,9 @@ def get_combined_key_mapping(
         model_type: The model type string from config.model_type
         model_key_mapping: Optional key mapping from the model's
                           `_checkpoint_conversion_mapping` attribute
-        model: Optional model instance whose nested submodels may supply additional
-            scoped renames. Omit for models whose state-dict adapter or tensor
-            converters own checkpoint conversion.
+        model: Optional model instance used to resolve class-specific root renames
+            and scoped submodel renames. Omit for models whose state-dict adapter
+            or tensor converters own checkpoint conversion.
 
     Returns:
         Regex mapping, a callable that also applies nested-model renames in order,
@@ -230,6 +232,15 @@ def get_combined_key_mapping(
     # Try to get conversion mapping from transformers and extract simple renamings
     if _TRANSFORMERS_AVAILABLE:
         conversions = get_checkpoint_conversion_mapping(model_type)
+        if model is not None:
+            # HF registers some root rules by class rather than model_type.
+            # FSDP adds a subclass, so retain the first registered base class's
+            # rules instead of relying on the wrapper's generated class name.
+            for model_class in type(model).__mro__:
+                class_conversions = get_checkpoint_conversion_mapping(model_class.__name__)
+                if class_conversions is not None:
+                    conversions = class_conversions
+                    break
         if conversions:
             for conv in conversions:
                 # Only extract simple WeightRenaming, not WeightConverter

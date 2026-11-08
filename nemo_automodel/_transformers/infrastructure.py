@@ -14,7 +14,7 @@
 
 """Infrastructure instantiation and application.
 
-Distributed manager instantiation, sharding, PEFT/quantization application,
+Model-parallelization setup, sharding, PEFT/quantization application,
 and checkpoint loading utilities.  These free functions operate on an
 already-instantiated ``nn.Module`` and have no coupling to the
 ``_BaseNeMoAutoModelClass`` hierarchy.
@@ -24,6 +24,7 @@ for device meshes, parallelism sizes, and axis names.
 """
 
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import is_dataclass, replace
@@ -51,20 +52,34 @@ from nemo_automodel.components.distributed.config import (
     MegatronFSDPConfig,
     MoEParallelizerConfig,
 )
-from nemo_automodel.components.distributed.ddp import DDPManager
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.distributed.fsdp2 import fsdp2_sharding_enabled
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.megatron_fsdp import (
-    MegatronFSDPManager,
     restore_distributed_param_attrs,
     snapshot_distributed_param_attrs,
 )
 from nemo_automodel.components.distributed.mesh import MeshContext
+from nemo_automodel.components.distributed.model_parallelizer import (
+    compile_parallelized_model,
+    parallelize_model,
+)
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.models.common.utils import cast_frozen_modules_to_compute_dtype
+from nemo_automodel.components.models.common.utils import (
+    cast_frozen_modules_to_compute_dtype,
+    prepare_frozen_parameters_for_sharding,
+)
+from nemo_automodel.components.models.kimi_k3.model import freeze_kimi_k3_indexer_params
+from nemo_automodel.components.moe.experts import GroupedExpertsTE
+from nemo_automodel.components.moe.quantized_experts import (
+    apply_mxfp4_to_moe_experts,
+    apply_nvfp4_to_moe_experts,
+    packed_expert_parameters,
+    validate_nvfp4_checkpoint_config,
+    validate_packed_expert_topology,
+)
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.utils.compile_utils import compile_model
@@ -81,7 +96,9 @@ from nemo_automodel.components.utils.model_utils import (
     parse_freeze_config,
     print_trainable_parameters,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
+from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer
@@ -146,6 +163,23 @@ def _verify_safe_moe_tp_weights_loaded(model, *, checkpoint_loaded: bool) -> Non
 
 
 #  PEFT / quantization helpers
+def _validate_nvfp4_checkpoint(pretrained_model_name_or_path: str, cache_dir: str | None) -> None:
+    """Check a pretrained checkpoint's quantization metadata before its NVFP4 experts are loaded packed.
+
+    A local directory is read in place; a Hub repository contributes only its ``hf_quant_config.json`` /
+    ``config.json`` (the base load fetches the weights later).
+    """
+    if os.path.isdir(pretrained_model_name_or_path):
+        checkpoint_dir = pretrained_model_name_or_path
+    else:
+        from huggingface_hub import snapshot_download
+
+        checkpoint_dir = snapshot_download(
+            pretrained_model_name_or_path, cache_dir=cache_dir, allow_patterns=["hf_quant_config.json", "config.json"]
+        )
+    validate_nvfp4_checkpoint_config(checkpoint_dir)
+
+
 def _apply_peft_and_lower_precision(
     model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
 ):
@@ -159,6 +193,10 @@ def _apply_peft_and_lower_precision(
             peft_config.use_triton = False
         # Skip freeze here - will do global freeze after checkpoint loading
         apply_lora_to_linear_modules(model, peft_config, quantization_config=quantization_config, skip_freeze=True)
+        if peft_config.expert_weight_format == "mxfp4":
+            model = apply_mxfp4_to_moe_experts(model)
+        elif peft_config.expert_weight_format == "nvfp4":
+            model = apply_nvfp4_to_moe_experts(model)
 
     # FP8
     if fp8_config is not None:
@@ -219,6 +257,8 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext, reap
             reapply_trainability=reapply_trainability,
             **mesh.parallelize_axis_kwargs(),
         )
+    elif isinstance(model_wrapper, MeshContext):
+        model = parallelize_model(model, replace(model_wrapper, reapply_trainability=reapply_trainability))
     elif callable(getattr(model_wrapper, "parallelize", None)):
         model = model_wrapper.parallelize(model, reapply_trainability=reapply_trainability)
         model = (
@@ -228,37 +268,42 @@ def _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh: MeshContext, reap
 
 
 #  Infrastructure instantiation (config -> runtime objects)
-def _instantiate_distributed(
+def _with_parallelization_policy(
     config: DistributedStrategyConfig | None,
     mesh: MeshContext,
-) -> Union[FSDP2Manager, MegatronFSDPManager, DDPManager, None]:
-    """Instantiate the appropriate distributed manager from config.
+    moe_config: MoEParallelizerConfig | None = None,
+) -> MeshContext | None:
+    """Return the mesh context with its resolved execution policy attached.
 
     Args:
         config: Distributed config (FSDP2Config, MegatronFSDPConfig, or DDPConfig).
         mesh: MeshContext holding device_mesh and moe_mesh references.
 
     Returns:
-        The instantiated manager, or None if config is None.
+        The resolved mesh context, or None when no strategy or expert
+        parallelism is configured.
 
     Raises:
         ValueError: If device_mesh is required but not provided.
     """
-    if config is None:
+    if config is None and mesh.ep_size <= 1:
         return None
 
     if isinstance(config, FSDP2Config):
         if mesh.device_mesh is None:
             raise ValueError("device_mesh is required for FSDP2Config")
-        return FSDP2Manager(config, device_mesh=mesh.device_mesh, moe_mesh=mesh.moe_mesh)
     elif isinstance(config, MegatronFSDPConfig):
         if mesh.device_mesh is None:
             raise ValueError("device_mesh is required for MegatronFSDPConfig")
-        return MegatronFSDPManager(config, device_mesh=mesh.device_mesh)
-    elif isinstance(config, DDPConfig):
-        return DDPManager(config)
-    else:
+    elif config is not None and not isinstance(config, DDPConfig):
         raise ValueError(f"Unknown distributed config type: {type(config)}")
+
+    return replace(
+        mesh,
+        strategy_config=config,
+        moe_parallel_config=moe_config,
+        activation_checkpointing=getattr(config, "activation_checkpointing", False),
+    )
 
 
 def _with_activation_checkpointing(
@@ -324,18 +369,17 @@ def _instantiate_qat(
 def parallelize_for_pp(
     model: torch.nn.Module,
     *,
-    model_wrapper: Union[FSDP2Manager, MegatronFSDPManager, DDPManager] | None = None,
+    mesh_context: MeshContext | None = None,
     reapply_trainability: Callable[[torch.nn.Module], None] | None = None,
     **kwargs,
 ) -> torch.nn.Module:
-    """Parallelize model for pipeline parallelism (non-MoE case).
+    """Adapt pipeline/EP call sites to the model parallelizer contract.
 
-    This function adapts the pipeline parallelism interface to use model_wrapper.parallelize().
-    For MoE models, use parallelize_model from nemo_automodel.components.moe.parallelizer directly.
+    FSDP2 performs dense or MoE dispatch from one typed context.
 
     Args:
         model: The model to parallelize.
-        model_wrapper: Distributed manager instance.
+        mesh_context: Runtime topology and distributed strategy.
         reapply_trainability: Callback that re-resolves the trainability policy
             after pipeline-stage surgery and immediately before wrapping.
         **kwargs: Additional arguments (world_mesh, moe_mesh, axis names) passed by
@@ -344,10 +388,9 @@ def parallelize_for_pp(
     Returns:
         The parallelized model.
     """
-    if model_wrapper is not None:
-        if callable(getattr(model_wrapper, "parallelize", None)):
-            model = model_wrapper.parallelize(model, reapply_trainability=reapply_trainability)
-    return model
+    if mesh_context is None:
+        return model
+    return parallelize_model(model, replace(mesh_context, reapply_trainability=reapply_trainability))
 
 
 def instantiate_infrastructure(
@@ -378,11 +421,11 @@ def instantiate_infrastructure(
         mesh: MeshContext holding device meshes, sizes, and axis names.
 
     Returns:
-        tuple: (model_wrapper, autopipeline, parallelize_fn, qat_quantizer)
-            - model_wrapper: Distributed manager instance (or None)
+        tuple: (mesh_context, autopipeline, parallelize_fn, qat_quantizer)
+            - mesh_context: Resolved model parallelization context (or None)
             - autopipeline: AutoPipeline instance (or None)
-            - parallelize_fn: Parallelization function (or None) - built for EP
-                (MoE-specific parallelizer when ep_size > 1) or PP (via model_wrapper)
+            - parallelize_fn: Parallelization function (or None), built for EP
+                or PP through the model parallelizer when available.
             - qat_quantizer: QAT quantizer instance (or None)
     """
     if mesh is None:
@@ -392,56 +435,19 @@ def instantiate_infrastructure(
         activation_checkpointing = bool(getattr(distributed_config, "activation_checkpointing", False))
     distributed_config = _with_activation_checkpointing(distributed_config, activation_checkpointing)
 
-    model_wrapper = _instantiate_distributed(distributed_config, mesh)
+    if mesh.ep_size > 1 and moe_parallel_config is None:
+        moe_parallel_config = MoEParallelizerConfig()
+
+    resolved_mesh_context = _with_parallelization_policy(distributed_config, mesh, moe_parallel_config)
     autopipeline = _instantiate_pipeline(pipeline_config, mesh, device, distributed_config)
 
     parallelize_fn = None
-    if mesh.ep_size > 1:
-        from nemo_automodel.components.moe.parallelizer import parallelize_model
-
-        if moe_parallel_config is None:
-            moe_parallel_config = MoEParallelizerConfig()
-        # Forward the model wrapper's mp_policy (from FSDP2Config) to expert
-        # sharding when the MoE config doesn't set its own, so a custom precision
-        # policy isn't silently dropped for EP models.
-        moe_kwargs = moe_parallel_config.to_dict()
-        if moe_kwargs.get("mp_policy") is None and model_wrapper is not None:
-            moe_kwargs["mp_policy"] = getattr(model_wrapper, "mp_policy", None)
-        if isinstance(model_wrapper, FSDP2Manager):
-            # The dedicated MoE parallelizer replaces FSDP2Manager.parallelize
-            # whenever EP is enabled, so forward every FSDP2 setting it owns
-            # rather than silently dropping TP/SP/offload configuration.
-            moe_kwargs.setdefault("tp_shard_plan", model_wrapper.tp_plan)
-            moe_kwargs.setdefault("sequence_parallel", bool(model_wrapper.sequence_parallel))
-            moe_kwargs.setdefault("offload_policy", model_wrapper.offload_policy)
-            if model_wrapper.reshard_after_forward is not None:
-                # FSDP2Config is the canonical distributed policy. Preserve
-                # the MoE-specific default only when the manager leaves this
-                # setting unspecified.
-                moe_kwargs["reshard_after_forward"] = model_wrapper.reshard_after_forward
-            moe_kwargs.setdefault(
-                "enable_async_tensor_parallel",
-                bool(model_wrapper.enable_async_tensor_parallel),
-            )
-            moe_kwargs.setdefault(
-                "frozen_multimodal_sharding",
-                model_wrapper.frozen_multimodal_sharding,
-            )
-        parallelize_fn = partial(
-            parallelize_model,
-            activation_checkpointing=activation_checkpointing,
-            # The AC scope lives on the strategy config (normalized in its
-            # __post_init__); thread it through so expert-parallel configs keep
-            # scope parity with the generic FSDP2/DDP path.
-            activation_checkpointing_scope=getattr(distributed_config, "activation_checkpointing_scope", "all"),
-            **moe_kwargs,
-        )
-    elif autopipeline is not None and model_wrapper is not None:
-        parallelize_fn = partial(parallelize_for_pp, model_wrapper=model_wrapper)
+    if resolved_mesh_context is not None and (mesh.ep_size > 1 or autopipeline is not None):
+        parallelize_fn = partial(parallelize_for_pp, mesh_context=resolved_mesh_context)
 
     qat_quantizer = _instantiate_qat(qat_config)
 
-    return model_wrapper, autopipeline, parallelize_fn, qat_quantizer
+    return resolved_mesh_context, autopipeline, parallelize_fn, qat_quantizer
 
 
 def _uses_te_attention(model) -> bool:
@@ -504,6 +510,85 @@ def _apply_trainability_policy(
     freeze_unused_kv_sharing_params(model)
     freeze_deepseek_v4_indexer_params(model)
     freeze_minimax_m3_indexer_params(model)
+    freeze_kimi_k3_indexer_params(model)
+
+
+def _prepare_trainability_before_sharding(
+    model: torch.nn.Module,
+    *,
+    peft_enabled: bool,
+    freeze_config: FreezeConfig | None,
+    frozen_compute_dtype: torch.dtype | None,
+    strict: bool,
+) -> None:
+    """Resolve trainability and prepare parameter-freezing storage before FSDP capture."""
+    _apply_trainability_policy(model, peft_enabled=peft_enabled, freeze_config=freeze_config, strict=strict)
+    if (
+        freeze_config is not None
+        and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
+        and frozen_compute_dtype is not None
+    ):
+        prepare_frozen_parameters_for_sharding(
+            model, frozen_compute_dtype, keep_storage=packed_expert_parameters(model)
+        )
+
+
+def _validate_parameter_freezing_backend(
+    model: torch.nn.Module, mesh: MeshContext, freeze_config: FreezeConfig | None
+) -> None:
+    """Reject exact parameter exclusions across unsupported TE expert renumbering."""
+    if freeze_config is None:
+        return
+    selected_names = set(freeze_config.freeze_parameters or ()) | set(freeze_config.unfreeze_parameters or ())
+    if not selected_names:
+        return
+    if mesh.ep_size <= 1:
+        return
+    frozen_ids = {
+        id(parameter)
+        for name, parameter in model.named_parameters(remove_duplicate=False)
+        if canonical_parameter_fqn(name).replace("_orig_mod.", "") in selected_names
+    }
+    for module in model.modules():
+        if isinstance(module, GroupedExpertsTE) and any(
+            id(parameter) in frozen_ids for parameter in module.parameters()
+        ):
+            raise ValueError(
+                "freeze_config exact parameter selectors cannot name TE expert parameters with expert parallelism; "
+                "select their owning module instead"
+            )
+
+
+def _get_strategy_config(model_wrapper) -> DistributedStrategyConfig | None:
+    """Return the typed strategy from a context or legacy compatibility wrapper."""
+    if isinstance(model_wrapper, MeshContext):
+        return model_wrapper.strategy_config
+    return getattr(model_wrapper, "config", None)
+
+
+def _get_frozen_storage_compute_dtype(
+    strategy_config: DistributedStrategyConfig | None, mesh: MeshContext | None
+) -> torch.dtype | None:
+    """Resolve a safe model-wide compute dtype for frozen storage preparation.
+
+    MoE can override the FSDP2 parameter compute dtype for transformer blocks.
+    Since storage preparation currently accepts one dtype for the whole model,
+    skip it when that override differs from the root policy.
+    """
+    compute_dtype = getattr(getattr(strategy_config, "mp_policy", None), "param_dtype", None)
+    moe_config = getattr(mesh, "moe_parallel_config", None)
+    moe_policy = getattr(moe_config, "mp_policy", None)
+    if moe_policy is not None and getattr(moe_policy, "param_dtype", None) != compute_dtype:
+        return None
+    lm_head_precision = getattr(moe_config, "lm_head_precision", None)
+    if isinstance(lm_head_precision, str):
+        lm_head_precision = dtype_from_str(lm_head_precision, default=None)
+    if lm_head_precision == torch.float32:
+        # The head is sharded in FP32 independently of the root/MoE policy.
+        # This helper currently prepares one model-wide storage dtype, so keep
+        # source precision for all frozen params in this configuration.
+        return None
+    return compute_dtype
 
 
 #  apply_model_infrastructure  --  the main post-init orchestration function
@@ -527,6 +612,7 @@ def apply_model_infrastructure(
     pretrained_model_name_or_path="",
     weights_already_loaded=False,
     inject_te_attention: bool = False,
+    load_metadata_with_gloo: bool = False,
     **_kwargs,
 ):
     """Apply sharding, PEFT, quantization, and checkpoint loading to a model.
@@ -544,7 +630,7 @@ def apply_model_infrastructure(
         model: The model to apply infrastructure to
         is_meta_device: Whether model was initialized on meta device
         device: Target device for model
-        model_wrapper: Model wrapper (FSDP2Manager, DDPManager, etc.). Default: None
+        model_wrapper: MeshContext or deprecated manager compatibility wrapper. Default: None
         mesh: MeshContext with parallelism sizes (tp_size, cp_size, etc.) and mesh
             references. Default: None (treated as single-GPU defaults).
         peft_config: PEFT/LoRA configuration dict. Default: None
@@ -565,6 +651,7 @@ def apply_model_infrastructure(
         inject_te_attention: When True, inject TransformerEngine DotProductAttention
             into all ``self_attn`` modules of HF models (has no effect on custom
             models that already use TE via BackendConfig). Default: False.
+        load_metadata_with_gloo: Use a CPU group for base-weight load planning. Default: False.
         **_kwargs: Additional keyword arguments (ignored, allows passing extra kwargs)
 
     Returns:
@@ -572,6 +659,16 @@ def apply_model_infrastructure(
     """
     if mesh is None:
         mesh = MeshContext()
+    strategy_config = _get_strategy_config(model_wrapper)
+
+    freeze_config = parse_freeze_config(_kwargs.get("freeze_config"))
+    _validate_parameter_freezing_backend(model, mesh, freeze_config)
+    fsdp2_active = (
+        isinstance(strategy_config, FSDP2Config)
+        and mesh.device_mesh is not None
+        and fsdp2_sharding_enabled(mesh.device_mesh)
+    )
+    frozen_compute_dtype = _get_frozen_storage_compute_dtype(strategy_config, mesh) if fsdp2_active else None
 
     # Create a checkpointer for loading base weights only. Keep consolidation disabled
     # so load-only infrastructure does not emit save/export warnings.
@@ -583,19 +680,34 @@ def apply_model_infrastructure(
         model_repo_id=pretrained_model_name_or_path,
         save_consolidated=False,
         is_peft=peft_config is not None,
+        load_metadata_with_gloo=load_metadata_with_gloo,
     )
     checkpointer = Checkpointer(
         ckpt_config,
         0,
         0,
         0,
-        getattr(model_wrapper, "moe_mesh", None),
+        model_wrapper.moe_mesh if isinstance(model_wrapper, MeshContext) else getattr(model_wrapper, "moe_mesh", None),
         process_group=getattr(mesh, "process_group", None),
     )
 
     # Apply PEFT and lower precision if configured
     # When on meta device, wrap in init_empty_weights() so new LoRA modules are also on meta device
     # This allows copy operations between meta tensors to succeed (they're no-ops)
+    if peft_config is not None:
+        # Packed-expert storage (mxfp4 / nvfp4) is sharded along the expert axis only: refuse the layouts
+        # FSDP would otherwise apply to the packed tensors before any module is replaced.
+        expert_weight_format = getattr(peft_config, "expert_weight_format", "unquantized")
+        validate_packed_expert_topology(
+            expert_weight_format,
+            world_size=get_world_size_safe(),
+            ep_size=mesh.ep_size,
+            pp_size=mesh.pp_size,
+        )
+        if expert_weight_format == "nvfp4" and pretrained_model_name_or_path and load_base_model:
+            # The packed experts are filled by the base load through the state-dict adapter; only a ModelOpt
+            # NVFP4 (16-column block) export has the layout the adapter maps onto them.
+            _validate_nvfp4_checkpoint(pretrained_model_name_or_path, cache_dir)
     peft_ctx = init_empty_weights() if is_meta_device else nullcontext()
     with peft_ctx:
         model = _apply_peft_and_lower_precision(
@@ -609,6 +721,16 @@ def apply_model_infrastructure(
         from nemo_automodel._transformers.te_attention import inject_te_attention as _inject_te
 
         _inject_te(model)
+
+    # Resolve exact parameter names while the complete, unwrapped model is still present.
+    # Storage must be prepared before either loading branch can copy checkpoint values.
+    _prepare_trainability_before_sharding(
+        model,
+        peft_enabled=peft_config is not None,
+        freeze_config=freeze_config,
+        frozen_compute_dtype=frozen_compute_dtype,
+        strict=True,
+    )
 
     # When no PP and no TP, load checkpoint first (unwrapped model) so weights and dtypes come from
     # the checkpoint; then apply FSDP. With TP>1 we must shard first and load after so all ranks
@@ -631,24 +753,29 @@ def apply_model_infrastructure(
 
     checkpoint_already_loaded = False
     if load_before_shard:
-        if weights_already_loaded:
-            # HF's from_pretrained already populated the weights during model init.
-            # Still call load_base_model with load_base_model=False to
-            # handle weight tying
-            checkpointer.load_base_model(model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False)
-        else:
-            # Only meta-device models need their parameter shells materialized first.
-            if is_meta_device:
-                lora_a_init = getattr(peft_config, "lora_A_init", None)
-                checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
-            checkpointer.load_base_model(
-                model,
-                device,
-                cache_dir,
-                pretrained_model_name_or_path,
-                load_base_model=load_base_model,
-            )
-        checkpoint_already_loaded = True
+        try:
+            if weights_already_loaded:
+                # HF's from_pretrained already populated the weights during model init.
+                # Still call load_base_model with load_base_model=False to
+                # handle weight tying
+                checkpointer.load_base_model(
+                    model, device, cache_dir, pretrained_model_name_or_path, load_base_model=False
+                )
+            else:
+                # Only meta-device models need their parameter shells materialized first.
+                if is_meta_device:
+                    lora_a_init = getattr(peft_config, "lora_A_init", None)
+                    checkpointer.initialize_model_weights(model, device, peft_init_method=lora_a_init)
+                checkpointer.load_base_model(
+                    model,
+                    device,
+                    cache_dir,
+                    pretrained_model_name_or_path,
+                    load_base_model=load_base_model,
+                )
+            checkpoint_already_loaded = True
+        finally:
+            checkpointer.close()
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
     state_dict_adapter = getattr(model, "state_dict_adapter", None)
@@ -662,19 +789,18 @@ def apply_model_infrastructure(
             if not key.endswith("_extra_state")
         ]
 
-    # Validate selectors on the complete pre-parallelization hierarchy. The
-    # same policy is rebound after model surgery and before DDP/FSDP capture.
-    freeze_config = parse_freeze_config(_kwargs.get("freeze_config"))
-    _apply_trainability_policy(
-        model,
-        peft_enabled=peft_config is not None,
-        freeze_config=freeze_config,
-        strict=True,
-    )
+    # Rebind trainability after model surgery and before DDP/FSDP capture.
+    if isinstance(strategy_config, FSDP2Config) and peft_config is not None and quantization_config is None:
+        prepare_frozen_parameters_for_sharding(
+            model,
+            _get_frozen_storage_compute_dtype(strategy_config, mesh),
+            keep_storage=packed_expert_parameters(model),
+        )
     reapply_trainability = partial(
-        _apply_trainability_policy,
+        _prepare_trainability_before_sharding,
         peft_enabled=peft_config is not None,
         freeze_config=freeze_config,
+        frozen_compute_dtype=frozen_compute_dtype,
         strict=False,
     )
 
@@ -700,13 +826,17 @@ def apply_model_infrastructure(
         # objects and drop that state; snapshot it now and re-apply it afterwards.
         mfsdp_param_attrs = snapshot_distributed_param_attrs(model)
         _ensure_tied_lm_heads(model)
-        if compile_config is not None and not isinstance(model_wrapper, FSDP2Manager):
+        if compile_config is not None and not isinstance(strategy_config, FSDP2Config):
             model = compile_model(model, compile_config)
-        if isinstance(model_wrapper, FSDP2Manager):
+        if isinstance(strategy_config, FSDP2Config) and isinstance(model_wrapper, MeshContext):
+            model_parts = model.parts if hasattr(model, "parts") else [model]
+            for mp in model_parts:
+                compile_parallelized_model(mp, model_wrapper)
+        elif isinstance(strategy_config, FSDP2Config) and hasattr(model_wrapper, "maybe_compile"):
             model_parts = model.parts if hasattr(model, "parts") else [model]
             for mp in model_parts:
                 model_wrapper.maybe_compile(mp)
-        if isinstance(model_wrapper, DDPManager):
+        if isinstance(strategy_config, DDPConfig):
             ddp_model = getattr(model, "module", model)
             setattr(ddp_model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         else:
@@ -729,13 +859,13 @@ def apply_model_infrastructure(
             [
                 get_world_size_safe() == 1,
                 parallelize_fn is not None and get_world_size_safe() > 1,
-                callable(getattr(model_wrapper, "parallelize", None)),
+                isinstance(model_wrapper, MeshContext) or callable(getattr(model_wrapper, "parallelize", None)),
             ]
         )
     )
     # When FSDP2 CPU offload is enabled, params must be materialized on CPU —
     # FSDP2 manages GPU placement itself during forward/backward.
-    _has_cpu_offload = model_wrapper is not None and getattr(model_wrapper, "offload_policy", None) is not None
+    _has_cpu_offload = isinstance(strategy_config, FSDP2Config) and strategy_config.offload_policy is not None
     if need_materialize:
         init_device = torch.device("cpu") if _has_cpu_offload else device
         model_parts = model.parts if hasattr(model, "parts") else [model]
@@ -754,15 +884,18 @@ def apply_model_infrastructure(
     # decision so that changes to the meta-device policy cannot silently skip loading.
     should_load_checkpoint = need_checkpoint_load and not checkpoint_already_loaded and not weights_already_loaded
     if should_load_checkpoint:
-        model_parts = model.parts if hasattr(model, "parts") else [model]
-        for mp in model_parts:
-            checkpointer.load_base_model(
-                mp,
-                device,
-                cache_dir,
-                pretrained_model_name_or_path,
-                load_base_model=load_base_model,
-            )
+        try:
+            model_parts = model.parts if hasattr(model, "parts") else [model]
+            for mp in model_parts:
+                checkpointer.load_base_model(
+                    mp,
+                    device,
+                    cache_dir,
+                    pretrained_model_name_or_path,
+                    load_base_model=load_base_model,
+                )
+        finally:
+            checkpointer.close()
 
     _verify_safe_moe_tp_weights_loaded(
         model,
@@ -774,12 +907,12 @@ def apply_model_infrastructure(
     trainability_models: list[torch.nn.Module]
     if hasattr(model, "parts"):
         trainability_models = list(model.parts)
-    elif isinstance(model_wrapper, (DDPManager, MegatronFSDPManager)):
+    elif isinstance(strategy_config, (DDPConfig, MegatronFSDPConfig)):
         trainability_models = [getattr(model, "module", model)]
     else:
         trainability_models = [model]
     for mp in trainability_models:
-        reapply_trainability(mp)
+        _apply_trainability_policy(mp, peft_enabled=peft_config is not None, freeze_config=freeze_config, strict=False)
     if peft_config is not None or freeze_config is not None:
         if not any(param.requires_grad for mp in trainability_models for param in mp.parameters()):
             logger.warning(
@@ -850,7 +983,7 @@ def apply_model_infrastructure(
                     "DotProductAttention modules were found on the model."
                 )
         if mesh.cp_size > 1 and (not uses_te_attention or uses_thd_only_te_attention):
-            is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
+            is_compile_enabled = isinstance(strategy_config, FSDP2Config) and strategy_config.enable_compile
             cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
             for mp in model_parts:
                 attach_context_parallel_hooks(mp)
@@ -867,10 +1000,21 @@ def apply_model_infrastructure(
     # parameters keep their storage dtype (compute dtype is owned by autocast or the
     # distributed mixed-precision policy). No-op for pure-fp32 / pure-bf16 runs and when
     # no mp_policy is available (DDP/PP).
-    compute_dtype = getattr(getattr(model_wrapper, "mp_policy", None), "param_dtype", None)
+    mp_policy = getattr(strategy_config, "mp_policy", None)
+    if mp_policy is None:
+        mp_policy = getattr(model_wrapper, "mp_policy", None)
+    compute_dtype = getattr(mp_policy, "param_dtype", None)
+    # One-rank FSDP2 has no mixed-precision wrappers: retain uniform storage for
+    # explicit parameter freezes instead of introducing a plain-tensor dtype seam.
+    if (
+        freeze_config is not None
+        and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
+        and not fsdp2_active
+    ):
+        compute_dtype = None
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:
-            cast_frozen_modules_to_compute_dtype(mp, compute_dtype)
+            cast_frozen_modules_to_compute_dtype(mp, compute_dtype, keep_storage=packed_expert_parameters(mp))
 
     # Re-apply the Megatron-FSDP per-parameter state dropped by the lm-head re-tie and
     # post-wrap checkpoint reload, so the deferred optimizer registration and first

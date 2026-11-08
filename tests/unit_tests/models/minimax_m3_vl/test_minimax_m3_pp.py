@@ -21,15 +21,54 @@ last) built by nulling modules the way the framework's splitter does.
 """
 
 import copy
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import generate_hf_model_fqn_per_model_part
 from nemo_automodel.components.distributed.pipelining.hf_utils import MULTIMODAL_SUFFIXES, model_keeps_self_forward
 from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
 NUM_LAYERS = 3
+
+
+@pytest.mark.parametrize("is_first", [True, False])
+@pytest.mark.parametrize("has_lm_head", [True, False])
+@pytest.mark.parametrize("cp_size", [1, 8])
+@pytest.mark.parametrize("microbatch_size", [1, 2])
+def test_pipeline_runtime_uses_cp_local_token_capacity(vlm_model, is_first, has_lm_head, cp_size, microbatch_size):
+    vlm_model.cp_mesh = SimpleNamespace(size=lambda: cp_size)
+    if not has_lm_head:
+        vlm_model.lm_head = None
+    stage = SimpleNamespace(
+        is_first=is_first,
+        submod=vlm_model,
+        inputs_meta=None,
+        _configure_outputs_meta=Mock(),
+    )
+    ap = AutoPipeline(
+        world_mesh={"pp": object()},
+        pp_schedule="1f1b",
+        pp_microbatch_size=microbatch_size,
+        pp_batch_size=2 * microbatch_size,
+        device=torch.device("cpu"),
+    )
+    ap._model_config = vlm_model.config
+    ap._info.stages = [stage]
+    ap._info.schedule = SimpleNamespace()
+    initializer = Mock()
+    ap._runtime_initializers = [initializer]
+
+    # Exercise initial setup, a same-shape step, growth with CP padding, and shrink.
+    for seq_len in [16384, 16384, 16385, 8192]:
+        ap.update_seq_len(seq_len)
+        local_seq_len = seq_len if cp_size == 1 else (seq_len + (-seq_len) % (2 * cp_size)) // cp_size
+        initializer.prepare.assert_called_with(num_tokens=microbatch_size * local_seq_len, device=torch.device("cpu"))
+        expected_input_len = seq_len if is_first else local_seq_len
+        assert stage.inputs_meta[0].shape[:2] == (microbatch_size, expected_input_len)
 
 
 def _auto_fqns(num_stages: int):
@@ -163,13 +202,18 @@ def test_stage0_consumes_pp_media_chunks(vlm_model):
     # Stage 0: keep embed_tokens + all layers, but route through the chunk path
     # with pixel_values omitted from the call, as the PP schedule does.
     m = copy.deepcopy(vlm_model)
-    m._vlm_pixel_values_chunks = [pixel_values]
-    m._vlm_image_grid_hws_chunks = [grid_tensor]
+    m._vlm_pixel_values_chunks = [pixel_values[:0], pixel_values]
+    m._vlm_image_grid_hws_chunks = [grid_tensor[:0], grid_tensor]
     m._vlm_chunk_idx = 0
+    text_ids = torch.full_like(ids, 3)
     with torch.no_grad():
+        direct_text = vlm_model(text_ids)
+        staged_text = m(text_ids)
+        assert m._vlm_chunk_idx == 1
         via_chunks = m(ids)  # no pixel_values in the call -> must come from chunks
 
-    assert m._vlm_chunk_idx == 1, "media chunk cursor did not advance"
+    torch.testing.assert_close(staged_text, direct_text)
+    assert m._vlm_chunk_idx == 2, "media chunk cursor did not advance"
     torch.testing.assert_close(via_chunks, direct, rtol=1e-4, atol=1e-4)
 
     # Guard against the regression: without the chunk plumbing the image positions

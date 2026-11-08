@@ -73,6 +73,7 @@ _FIELDS_READ_BY_MODEL = (
     "hidden_size",
     "index_head_dim",
     "index_n_heads",
+    "indexer_rope_interleave",
     "index_topk",
     "indexer_types",
     "intermediate_size",
@@ -111,3 +112,16 @@ def test_per_layer_patterns_are_derived_when_absent():
     assert config.mlp_layer_types == ["dense"] * 3 + ["sparse"] * 3
     # Layer 0 and then every 2nd layer are full; the rest share.
     assert config.indexer_types == ["full", "full", "shared", "full", "shared", "full"]
+
+
+@pytest.mark.parametrize("interleaved", [None, False, True])
+def test_indexer_rotary_layout_survives_checkpoint_roundtrip(tmp_path, interleaved):
+    fields = dict(_RELEASED_FIELDS)
+    if interleaved is not None:
+        fields["indexer_rope_interleave"] = interleaved
+    (tmp_path / "config.json").write_text(json.dumps(fields))
+    config = AutoConfig.from_pretrained(tmp_path)
+    expected = interleaved is True
+    assert config.indexer_rope_interleave is expected
+    config.save_pretrained(tmp_path)
+    assert AutoConfig.from_pretrained(tmp_path).indexer_rope_interleave is expected

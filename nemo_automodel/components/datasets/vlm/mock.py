@@ -38,6 +38,8 @@ from typing import List, Tuple
 import numpy as np
 from PIL import Image
 
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
+
 _WORD_POOL = (
     "the image shows a landscape with mountains and rivers flowing through "
     "green valleys while clouds drift across the blue sky and birds fly "
@@ -84,7 +86,7 @@ class MockVlmDatasetConfig:
     seed: int = 0
     """Random seed for reproducibility."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the mock VLM dataset from this config."""
         return build_mock_vlm_dataset(
             num_samples=self.num_samples,

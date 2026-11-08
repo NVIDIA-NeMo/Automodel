@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from nemo_automodel.components.config.loader import (
     ConfigNode,
@@ -107,6 +108,17 @@ def test_resolve_target_error():
         _resolve_target("surely.does.not.exist")
 
 
+def test_resolve_target_reports_missing_dependency_of_existing_module(tmp_path: Path, monkeypatch):
+    """A dependency missing inside an existing module surfaces as itself, not as a missing attribute."""
+    (tmp_path / "needs_missing_dep.py").write_text(
+        "import nemo_automodel_missing_dependency_for_test  # noqa: F401\n\nclass Target:\n    pass\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with pytest.raises(ModuleNotFoundError, match="nemo_automodel_missing_dependency_for_test"):
+        _resolve_target("needs_missing_dep.Target")
+
+
 def test_confignode_wrap_and_fn_resolution(tmp_module):
     """
     * Scalar values must be translated.
@@ -144,6 +156,35 @@ def test_dotted_get_set_contains():
     assert cfg.get("non.existent", default="sentinel") == "sentinel"
 
 
+def test_set_by_dotted_indexes_into_lists():
+    cfg = ConfigNode({"optimizer": {"betas": [0.9, 0.95]}, "ds": [{"path": "a"}, {"path": "b"}]})
+
+    cfg.set_by_dotted("optimizer.betas.1", "0.98")
+    cfg.set_by_dotted("ds.1.path", "z")
+    cfg.set_by_dotted("ds.0", {"path": "y", "split": "train"})
+
+    assert cfg.optimizer.betas == [0.9, 0.98]
+    assert isinstance(cfg.ds, list) and len(cfg.ds) == 2
+    assert cfg.get("ds.1.path") == "z"
+    assert isinstance(cfg.ds[0], ConfigNode) and cfg.ds[0].to_dict() == {"path": "y", "split": "train"}
+    with pytest.raises(IndexError):
+        cfg.set_by_dotted("ds.2.path", "w")
+    with pytest.raises(IndexError):
+        cfg.set_by_dotted("optimizer.betas.x", 0.5)
+    assert cfg.optimizer.betas == [0.9, 0.98]
+
+
+def test_cli_override_of_list_element_keeps_the_list(tmp_path: Path):
+    from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text("optimizer:\n  lr: 1.0e-5\n  betas: [0.9, 0.95]\n")
+
+    cfg = parse_args_and_load_config(argv=["--config", str(cfg_path), "--optimizer.betas.1", "0.98"])
+
+    assert cfg.optimizer.betas == [0.9, 0.98]
+
+
 def test_instantiate_simple(tmp_module):
     """
     Instantiate a simple object with scalar arguments supplied as strings
@@ -164,6 +205,7 @@ def test_instantiate_simple(tmp_module):
     obj = cfg.instantiate()
     assert isinstance(obj, mod.Point)
     assert (obj.x, obj.y) == (1, 2)
+
 
 @pytest.mark.parametrize(
     "path, exists",
@@ -300,6 +342,38 @@ def test_str_does_not_include_internal_original_strings_mapping():
     assert "_original_strings" not in repr(cfg)
 
 
+def test_to_yaml_dict_serializes_noncallable_target_overrides():
+    """Intentional target and callback replacements must not revert to their original imports."""
+    cfg = ConfigNode({"_target_": "builtins.len", "callback_fn": "builtins.len"})
+    cfg._target_ = "builtins.sorted"
+    cfg.callback_fn = None
+
+    assert cfg.to_yaml_dict(use_orig_values=True) == {
+        "_target_": "builtins.sorted",
+        "callback_fn": None,
+    }
+
+
+def test_to_yaml_dict_uses_live_callable_when_original_target_cannot_resolve():
+    """A stale original import must not mask a serializable live callable."""
+    cfg = ConfigNode({"_target_": "builtins.len"})
+    cfg._target_ = sorted
+    cfg._original_strings["_target_"] = "missing.module.target"
+
+    assert cfg.to_yaml_dict(use_orig_values=True)["_target_"] == "builtins.sorted"
+
+
+def test_to_yaml_dict_emits_tuples_as_safe_loadable_lists():
+    """A tuple CLI value must not dump as `!!python/tuple`, which yaml.safe_load rejects."""
+    cfg = ConfigNode({"optimizer": {"betas": [0.9, 0.999]}})
+    cfg.set_by_dotted("optimizer.betas", translate_value("(0.9, 0.95)"))
+
+    out = cfg.to_yaml_dict(use_orig_values=True)
+
+    assert out["optimizer"]["betas"] == [0.9, 0.95]
+    assert yaml.safe_load(yaml.dump(out)) == out
+
+
 def test_load_yaml_config(tmp_path):
     """YAML helper must produce a ConfigNode with translated values."""
     yml = tmp_path / "cfg.yaml"
@@ -330,6 +404,7 @@ def test_load_yaml_config_resolves_oc_env(monkeypatch, tmp_path: Path):
     )
     cfg = load_yaml_config(str(yml))
     assert cfg.dataset.delta_storage_options.DATABRICKS_HOST == "https://example.databricks.local"
+
 
 def test_load_yaml_config_oc_env_default(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("NOT_SET", raising=False)

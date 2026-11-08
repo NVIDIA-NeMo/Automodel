@@ -19,11 +19,11 @@ With MLflow integration, you can:
 
 Before using MLflow logging in NeMo AutoModel, ensure you have:
 
-1. **MLflow installed**: MLflow is installed with `nemo-automodel` by default. If you see an import error in a released-package environment, recreate that environment and install NeMo AutoModel there:
+1. **MLflow installed**: MLflow is included in the NeMo AutoModel container and the `tracking` and `all` extras. For a base package installation, add the `mlflow` extra to install the tracking client and its default local SQLite backend:
    ```bash
    uv venv
    source .venv/bin/activate
-   uv pip install "nemo-automodel"
+   uv pip install "nemo-automodel[mlflow]"
    ```
 
 2. **MLflow tracking server** (optional): For production use, set up a tracking server to centralize experiment data. For local development, current MLflow releases use a local SQLite database at `sqlite:///mlflow.db` by default.
@@ -148,9 +148,10 @@ View run at: sqlite:///mlflow.db/#/experiments/1/runs/abc123def456
 
 ### View Results in MLflow UI
 
-Launch the MLflow UI to visualize your experiments:
+Install the `mlflow-full` extra and launch the MLflow UI to visualize your experiments:
 
 ```bash
+uv pip install "nemo-automodel[mlflow-full]"
 mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
@@ -232,16 +233,9 @@ Supported storage backends include S3, Azure Blob Storage, Google Cloud Storage,
 
 ### MLflow Not Installed
 
-If you see an import error:
-```
-ImportError: MLflow is not installed. Please install it (e.g. pip install mlflow).
-```
-
-Recreate the released-package environment so its declared MLflow dependency is installed:
+If MLflow is missing, install the tracking extra in your active environment:
 ```bash
-uv venv
-source .venv/bin/activate
-uv pip install "nemo-automodel"
+uv pip install "nemo-automodel[mlflow]"
 ```
 
 ### Existing Filesystem Tracking Store

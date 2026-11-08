@@ -33,8 +33,8 @@
 #   --distributed.cp_size 1 --step_scheduler.global_batch_size 128
 # (the GB200 recipe keeps GBS 64 at CP1 because dp is 64 there).
 # Launch requirements: NCCL_PXN_DISABLE=1 (or NCCL_NET_PLUGIN=none NCCL_NET=IB) and node-local JIT caches, see the model-coverage page.
-# Data: DS41_DATA_ROOT prepared by prepare_tulu3_data.py in this directory (4096-token,
-# right-padded ChatDataset rows with assistant-only shifted labels).
+# Data: 4096-token, right-padded Tulu3 ChatDataset rows with assistant-only shifted labels,
+# loaded from the Hugging Face Hub (prepare_tulu3_data.py writes the same rows for offline runs).
 # Measured (100 updates): CP8 train loss 0.7147 -> 0.6202, validation 0.5541 / 0.5444;
 # CP1 reference 0.8003 -> 0.5060, validation 0.5477 / 0.5384; 65.7 GiB peak.
 
@@ -63,8 +63,8 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:
     _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41Config.from_pretrained
-    pretrained_model_name_or_path: ${DS41_CHECKPOINT}
-    name_or_path: ${DS41_CHECKPOINT}
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+    name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
     revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
     vision_config:
       _target_: nemo_automodel.components.models.deepseek_v41.config.DeepseekV41VisionConfig
@@ -120,8 +120,19 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: datasets.load_from_disk
-  dataset_path: ${DS41_DATA_ROOT}/train
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:16384]
+  shuffle_seed: 42
+  seq_length: 4096
+  padding: max_length
+  truncation: true
+  chat_template: examples/llm_finetune/deepseek_v41/tulu3_chat_template.jinja
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+    revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
+    trust_remote_code: false
 
 packed_sequence:
   packed_sequence_size: 0
@@ -135,8 +146,19 @@ dataloader:
   num_workers: 4
 
 validation_dataset:
-  _target_: datasets.load_from_disk
-  dataset_path: ${DS41_DATA_ROOT}/validation
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[16384:16640]
+  shuffle_seed: 42
+  seq_length: 4096
+  padding: max_length
+  truncation: true
+  chat_template: examples/llm_finetune/deepseek_v41/tulu3_chat_template.jinja
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4.1-Flash
+    revision: df42c109f1defefcbfcedbe7d905718a12266e40  # pragma: allowlist secret (public model commit SHA)
+    trust_remote_code: false
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

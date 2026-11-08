@@ -51,6 +51,7 @@ from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.mistral3.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
 )
+from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 except AttributeError:
                     pass
         super().__init__(config)
+        apply_pixtral_forward_backport(self.model.vision_tower)
         self.tie_weights()
         self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
 
@@ -187,7 +189,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 sub._mistral3_fp8_rotary_reinit_done = False
                 sub.register_forward_pre_hook(_rotary_reinit_self_hook, with_kwargs=True, prepend=True)
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie ``lm_head`` to the active text embedding when requested."""
         if getattr(getattr(self, "config", None), "tie_word_embeddings", False):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight

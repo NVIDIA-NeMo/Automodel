@@ -18,6 +18,13 @@ import numpy as np
 import torch
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
+from nemo_automodel.components.datasets.packing import (
+    DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    PackedSequenceContract,
+    build_packed_sequence_metadata,
+    resolve_packing_contract,
+)
+
 
 def batchify(tensor, default_tensor_cls=torch.LongTensor):
     """
@@ -508,57 +515,50 @@ def packed_sequence_thd_collater_vlm(examples, processor=None, **kwargs):
     return packed_sequence_thd_collater(examples)
 
 
-def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
-    """Convert an indexed attention mask to a 4D block-causal mask.
-
-    Args:
-        attention_mask: Integer tensor of shape ``[B, S]`` where each
-            position contains the 1-based index of the sub-sequence it
-            belongs to (0 = padding).
-
-    Returns:
-        Bool tensor of shape ``[B, 1, S, S]`` suitable for
-        ``eager`` / ``sdpa`` attention backends.  ``True`` means the
-        position is **allowed** to attend.
-    """
-    # attention_mask: [B, S]
-    B, S = attention_mask.shape
-
-    # same_doc[b, i, j] = True iff positions i and j belong to the same sub-sequence
-    mask_q = attention_mask.unsqueeze(2)  # [B, S, 1]
-    mask_k = attention_mask.unsqueeze(1)  # [B, 1, S]
-    same_doc = mask_q == mask_k  # [B, S, S]
-
-    # causal: position i can attend to position j only if j <= i
-    causal = torch.ones(S, S, dtype=torch.bool, device=attention_mask.device).tril()  # [S, S]
-
-    # not_padding: both positions must be non-padding (index > 0)
-    not_padding_q = (attention_mask > 0).unsqueeze(2)  # [B, S, 1]
-    not_padding_k = (attention_mask > 0).unsqueeze(1)  # [B, 1, S]
-
-    mask_4d = same_doc & causal.unsqueeze(0) & not_padding_q & not_padding_k  # [B, S, S]
-
-    return mask_4d.unsqueeze(1)  # [B, 1, S, S]
-
-
-def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -> dict:
+def neat_packed_collater(
+    batch: list[dict],
+    attn_implementation: str | None = None,
+    *,
+    packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+) -> dict:
     """Collater for neat-packed LLM sequences.
 
     Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
-    indexed ``attention_mask`` to the format required by the attention backend.
+    indexed ``attention_mask`` to the representation requested by ``packing``.
 
-    For flash attention (``flash_attention_2`` / ``flash_attention_3`` /
-    ``flash_attention_4``): keeps the indexed 2D mask ``[B, S]``.
-    For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
+    ``document_ids`` keeps the indexed 2D mask ``[B, S]`` and
+    ``block_causal`` converts the mask to ``[B, 1, S, S]``. Models may
+    independently request flat-token metadata through the same contract.
+    ``flash_varlen`` emits HF varlen kwargs without an attention mask.
 
     Args:
-        batch: List of sample dicts produced by ``neat_pack_dataset``.
-        attn_implementation: Attention backend (``"flash_attention_2"``,
-            ``"sdpa"``, or ``"eager"``).
+        batch: Sample mappings from ``neat_pack_dataset``. Each holds
+            ``input_ids``, ``labels``, ``position_ids``, and indexed
+            ``attention_mask`` tensors or lists of shape [sequence].
+        attn_implementation: Deprecated attention-backend name retained for
+            Python-call compatibility during the packing-contract migration.
+        packing: Structural model contract selecting the packed mask representation.
+            Native mask/Flash collation requires a model-derived contract supplying
+            the attention conversion; recipes provide it automatically.
 
     Returns:
-        Dict with batched tensors ready for model forward.
+        Mapping with ``input_ids``, ``labels``, and ``position_ids`` of shape
+        [batch, sequence]. ``attention_mask`` has shape [batch, sequence] for
+        document IDs or [batch, 1, sequence, sequence] for block-causal masking.
+        For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
+        and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
+        padding runs. ``max_length_q`` and ``max_length_k`` are Python ints.
+        Optional ``_packed_seq_ids`` retains the [batch, sequence] document map.
+        A contract requiring native packed-sequence metadata additionally adds
+        int64 ``packed_token_indices`` of shape [batch, sequence], containing
+        row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
+        [batch, max_documents + 1], containing row-local cumulative lengths
+        and -1 after each row's last boundary; and a Python int ``max_seqlen``.
+        Model entry flattens these into [tokens] indices into batch * sequence
+        and [documents + 1] boundaries over the unpadded token stream. These
+        are not physical offsets for pre-packed THD buffers.
     """
+    packing = resolve_packing_contract(packing, attn_implementation)
     if not batch:
         return {}
 
@@ -566,19 +566,18 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     labels = batchify(torch.stack([torch.as_tensor(x["labels"]) for x in batch]))
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
+    packed_mask_type = packing.packed_mask_type
 
-    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
-        mask_out = attention_mask
-    else:
-        mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
-
-    result = {
-        "input_ids": input_ids,
-        "labels": labels,
-        "position_ids": position_ids,
-        "attention_mask": mask_out,
-    }
-    if attention_mask.max() > 1:
+    if packed_mask_type not in ("document_ids", "flash_varlen", "block_causal"):
+        raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
+    result = {"input_ids": input_ids, "labels": labels, "position_ids": position_ids}
+    prepare_attention = packing.prepare_attention_inputs
+    if prepare_attention is None:
+        raise ValueError("Native packed collation requires a model-derived packing contract")
+    result.update(prepare_attention(attention_mask))
+    if packing.return_packed_sequence_metadata:
+        result.update(build_packed_sequence_metadata(attention_mask))
+    if attention_mask.max() > 1 or packing.return_packed_sequence_metadata:
         result["_packed_seq_ids"] = attention_mask
     return result
 

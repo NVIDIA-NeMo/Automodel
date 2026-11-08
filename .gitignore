@@ -29,6 +29,11 @@ __pycache__/
 .Python
 wandb
 build/
+# Documentation build helpers are source code, mirrored by regression tests.
+!tools/docs/build/
+!tools/docs/build/*.py
+!tests/unit_tests/tools/docs/build/
+!tests/unit_tests/tools/docs/build/*.py
 develop-eggs/
 dist/
 downloads/
@@ -194,5 +199,6 @@ docs/fern/product-docs/
 # as untracked. Add a line per archived GA train as new versions are cut.
 docs/fern/versions/v0.4/pages/
 docs/fern/versions/v0.5/pages/
+docs/fern/versions/v0.7/pages/
 
 training_logs/

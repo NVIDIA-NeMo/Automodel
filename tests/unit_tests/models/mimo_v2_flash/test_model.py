@@ -119,6 +119,58 @@ class TestMiMoV2FlashAttention:
             tiny_config.num_attention_heads * tiny_config.v_head_dim,
         )
 
+    @pytest.mark.parametrize("cp_enabled", [False, True])
+    @pytest.mark.parametrize("native_cp", [False, True])
+    def test_te_unequal_value_dimension_matches_sdpa(self, tiny_config, backend_config, cp_enabled, native_cp):
+        """Native and CP-padded V preserve attention outputs and gradients."""
+        tiny_config.v_head_dim = 4
+        backend_config.attn = "te"
+        captured = {}
+
+        def attention(query, key, value, **kwargs):
+            captured["v_dim"] = value.shape[-1]
+            result = torch.nn.functional.scaled_dot_product_attention(
+                query.transpose(1, 2),
+                key.transpose(1, 2).repeat_interleave(2, dim=1),
+                value.transpose(1, 2).repeat_interleave(2, dim=1),
+                is_causal=True,
+            )
+            return result.transpose(1, 2).flatten(-2)
+
+        with patch(
+            "nemo_automodel.components.models.mimo_v2_flash.model.initialize_attn_module_and_func",
+            return_value=(torch.nn.Identity(), attention),
+        ) as initialize:
+            model = MiMoV2FlashAttention(tiny_config, backend_config, is_swa=False, layer_idx=0)
+        assert initialize.call_args.kwargs["num_v_channels"] == 4
+        reference_backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", rope_fusion=False)
+        reference = MiMoV2FlashAttention(tiny_config, reference_backend, is_swa=False, layer_idx=0)
+        reference.load_state_dict(model.state_dict())
+        if cp_enabled:
+            from unittest.mock import Mock
+
+            mesh = Mock()
+            mesh.size.return_value = 2
+            model.attn_module.set_context_parallel_group = Mock()
+            with (
+                patch("torch.distributed.get_process_group_ranks", return_value=[0, 1]),
+                patch("nemo_automodel.components.models.mimo_v2_flash.model.is_te_min_version", return_value=native_cp),
+            ):
+                model.setup_cp_attention(mesh, cp_stream=object())
+        hidden = torch.randn(1, 5, 32, requires_grad=True)
+        reference_hidden = hidden.detach().clone().requires_grad_(True)
+        rope = (torch.ones(1, 5, 4), torch.zeros(1, 5, 4))
+        actual = model._forward_te(hidden, rope, attention_mask=None)
+        causal_mask = torch.full((1, 1, 5, 5), float("-inf")).triu(1)
+        expected = reference(reference_hidden, position_embeddings=rope, attention_mask=causal_mask)[0]
+        assert captured["v_dim"] == (8 if cp_enabled and not native_cp else 4)
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        torch.testing.assert_close(hidden.grad, reference_hidden.grad, atol=1e-6, rtol=1e-5)
+        for actual_parameter, reference_parameter in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual_parameter.grad, reference_parameter.grad, atol=1e-6, rtol=1e-5)
+
     def test_swa_attention_uses_swa_head_dims(self, tiny_config, backend_config):
         tiny_config.swa_num_attention_heads = 8
         tiny_config.swa_head_dim = 4

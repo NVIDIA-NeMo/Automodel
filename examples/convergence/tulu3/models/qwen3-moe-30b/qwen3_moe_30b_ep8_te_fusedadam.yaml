@@ -123,6 +123,7 @@ wandb:
 # --thinking (its training mode); without it the empty <think> prefill sends the model
 # OOD and IFEval collapses. baseline/stderr measured.
 ci:
+  cluster_tag: h100
   recipe_owner: athitten
   nodes: 1
   time: "02:00:00"                     # full 1000-step train + IFEval

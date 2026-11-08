@@ -105,4 +105,5 @@ optimizer:
   weight_decay: 0.01
 
 ci:
+  cluster_tag: h100
   recipe_owner: adil-a

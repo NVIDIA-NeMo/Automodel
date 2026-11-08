@@ -44,7 +44,9 @@ from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.speculative.dspark.common import (
     DSparkForwardOutput,
     build_eval_mask,
+    context_doc_ids,
     create_noise_embed,
+    create_position_ids,
     sample_anchor_positions,
 )
 from nemo_automodel.shared.utils import dtype_from_str
@@ -151,10 +153,11 @@ class _DeepseekV41DSparkAttention(DeepseekV41Attention):
                 scale=self.head_dim**-0.5,
             ).transpose(1, 2)
         else:
-            logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
-            probabilities = (logits + bias).softmax(dim=-1)
-            probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
-            attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
+            with torch.autocast(device_type=query.device.type, enabled=False):
+                logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
+                probabilities = (logits + bias).softmax(dim=-1)
+                probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
+                attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
         valid_tokens = torch.ones(batch, draft_sequence, dtype=torch.bool, device=hidden_states.device)
         return self._project_output(attended, draft_angles, valid_tokens)
 
@@ -205,7 +208,8 @@ class _DeepseekV41DSparkConfidenceHead(nn.Module):
         """
         if hidden_states.shape[:-1] != markov_embeddings.shape[:-1]:
             raise ValueError("DSpark hidden states and Markov embeddings must have matching leading dimensions")
-        return self.proj(torch.cat((hidden_states.float(), markov_embeddings.float()), dim=-1)).squeeze(-1)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            return self.proj(torch.cat((hidden_states.float(), markov_embeddings.float()), dim=-1)).squeeze(-1)
 
 
 class _DeepseekV41DSparkBlock(nn.Module):
@@ -376,26 +380,35 @@ class DeepseekV41DSparkBackbone(nn.Module):
             for stage_idx in range(config.num_nextn_predict_layers)
         )
 
-    def build_position_ids(self, anchor_positions: torch.Tensor, context_sequence: int) -> torch.Tensor:
+    def build_position_ids(
+        self,
+        anchor_positions: torch.Tensor,
+        context_sequence: int,
+        context_position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Build official target-context and draft-query positions.
 
         Args:
             anchor_positions: Integer tensor [batch, num_anchors] containing the
                 target token that seeds each draft block.
             context_sequence: Number of target-context tokens.
+            context_position_ids: Optional integer tensor [batch, context_sequence]
+                with the document-local positions of packed rows. ``None`` uses
+                ``0`` through ``context_sequence - 1``.
 
         Returns:
             Integer tensor [batch, context_sequence + num_anchors * block_size].
-            Draft positions are ``anchor`` through ``anchor + block_size - 1``.
-            The target feature at ``anchor - 1`` predicts the anchor token that
-            occupies the first draft input slot.
+            Draft positions are the anchor's position through that position plus
+            ``block_size - 1``. The target feature at ``anchor - 1`` predicts the
+            anchor token that occupies the first draft input slot.
         """
         if anchor_positions.ndim != 2:
             raise ValueError("DSpark anchor_positions must have shape [batch, num_anchors]")
-        batch, num_anchors = anchor_positions.shape
-        context = torch.arange(context_sequence, device=anchor_positions.device).view(1, -1).expand(batch, -1)
-        offsets = torch.arange(self.config.dspark_block_size, device=anchor_positions.device).view(1, 1, -1)
-        draft = (anchor_positions.unsqueeze(-1) + offsets).reshape(batch, num_anchors * self.config.dspark_block_size)
+        context = context_position_ids
+        if context is None:
+            context = torch.arange(context_sequence, device=anchor_positions.device).view(1, -1)
+            context = context.expand(anchor_positions.shape[0], -1)
+        draft = create_position_ids(anchor_positions, self.config.dspark_block_size, context_position_ids)
         return torch.cat((context, draft), dim=1)
 
     def build_attention_mask(
@@ -404,6 +417,7 @@ class DeepseekV41DSparkBackbone(nn.Module):
         block_keep_mask: torch.Tensor,
         context_sequence: int,
         dtype: torch.dtype,
+        context_doc_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Build the released SWA-128 multi-anchor training mask.
 
@@ -417,6 +431,9 @@ class DeepseekV41DSparkBackbone(nn.Module):
             block_keep_mask: Boolean tensor [batch, num_anchors].
             context_sequence: Number of target-context tokens.
             dtype: Floating dtype of the returned additive mask.
+            context_doc_ids: Optional integer tensor [batch, context_sequence] with
+                the document of each packed context token. A block then sees only
+                context in its anchor's document.
 
         Returns:
             Additive tensor [batch, 1, num_anchors * block_size,
@@ -436,6 +453,11 @@ class DeepseekV41DSparkBackbone(nn.Module):
         anchor = anchor_positions.view(batch, 1, num_anchors, 1).repeat_interleave(block_size, dim=2)
         is_context = key_index < context_sequence
         context_visible = is_context & (key_index < anchor) & (key_index >= anchor - self.config.sliding_window)
+        if context_doc_ids is not None:
+            anchor_doc = torch.gather(context_doc_ids, 1, anchor_positions)
+            anchor_doc = anchor_doc.view(batch, 1, num_anchors, 1).repeat_interleave(block_size, dim=2)
+            key_doc = F.pad(context_doc_ids, (0, draft_sequence), value=-1).view(batch, 1, 1, kv_sequence)
+            context_visible = context_visible & (key_doc == anchor_doc)
 
         is_draft = key_index >= context_sequence
         key_block = (key_index - context_sequence) // block_size
@@ -546,6 +568,8 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
     """Model-owned adapter from the native draft to the shared DSpark loss contract."""
 
     _no_split_modules = ["_DeepseekV41DSparkBlock"]
+    # forward accepts position_ids / seq_lens / doc_remaining for packed rows.
+    supports_sequence_packing = True
     _keep_in_fp32_modules_strict = [
         "attn_hc",
         "ffn_hc",
@@ -553,6 +577,9 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         "bias_vl",
         "confidence_head",
     ]
+    # Same fp32 holders as DeepseekV41ForCausalLM: when the draft is sharded on its own, its attention
+    # sinks share one FSDP unit across the draft blocks too (parallelizer_utils.fully_shard_across_blocks).
+    _fsdp_shard_across_blocks = ["attn.sinks_param"]
 
     def __init__(
         self,
@@ -639,7 +666,8 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         Returns:
             FP32 tensor of shape [batch, sequence, vocab].
         """
-        return F.linear(hidden_states.float(), self.lm_head.weight.float())
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            return F.linear(hidden_states.float(), self.lm_head.weight.float())
 
     def forward(
         self,
@@ -647,8 +675,16 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> DSparkForwardOutput:
         """Run native V4.1 DSpark training for sampled anchors.
+
+        Packing keeps every block inside its anchor's document: the anchor's first
+        target is in the document, the target window holds only that document's
+        context, RoPE uses document-local positions, and supervision stops at the
+        document end.
 
         Args:
             input_ids: Target-token tensor of shape [batch, sequence].
@@ -657,6 +693,12 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
             loss_mask: Supervision tensor of shape [batch, sequence].
             target_last_hidden_states: Optional frozen target-state tensor of
                 shape [batch, sequence, hidden] used by the probability-distance loss.
+            position_ids: Optional integer tensor of shape [batch, sequence] with
+                document-local positions of packed rows.
+            seq_lens: Optional integer tensor of shape [batch, documents] with packed
+                document lengths; zero entries pad the document axis.
+            doc_remaining: Optional integer tensor of shape [batch, sequence] with the
+                tokens left in each position's packed document.
 
         Returns:
             Shared DSpark loss inputs. Draft logits have shape [batch,
@@ -666,11 +708,13 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         batch, sequence = input_ids.shape
         if target_hidden_states.shape[:2] != (batch, sequence):
             raise ValueError("target_hidden_states must match input_ids [batch, sequence]")
+        packed = seq_lens is not None
         anchor_positions, block_keep_mask = sample_anchor_positions(
             seq_len=sequence,
             loss_mask=loss_mask,
             num_anchors=self.num_anchors,
             device=input_ids.device,
+            doc_remaining=doc_remaining if packed else None,
         )
         num_blocks = anchor_positions.shape[1]
         block_size = self.config.dspark_block_size
@@ -695,17 +739,18 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
             mask_token_id=self.config.dspark_noise_token_id,
             block_size=self.config.dspark_block_size,
         )
-        position_ids = self.build_position_ids(anchor_positions, sequence)
+        full_position_ids = self.build_position_ids(anchor_positions, sequence, position_ids if packed else None)
         attention_mask = self.build_attention_mask(
             anchor_positions,
             block_keep_mask,
             sequence,
             noise_embeddings.dtype,
+            context_doc_ids(seq_lens, sequence, input_ids.device) if packed else None,
         )
         backbone_output = super().forward(
             noise_embeddings,
             target_hidden_states.detach(),
-            position_ids=position_ids,
+            position_ids=full_position_ids,
             attention_mask=attention_mask,
             previous_token_ids=previous_token_ids.reshape(batch, -1),
             enable_confidence_head=self.enable_confidence_head,
@@ -719,6 +764,8 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
             label_indices=label_indices,
             safe_label_indices=safe_label_indices,
             block_keep_mask=block_keep_mask,
+            doc_remaining=doc_remaining if packed else None,
+            anchor_positions=anchor_positions if packed else None,
         )
 
         aligned_target_logits = None

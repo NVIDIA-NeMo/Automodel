@@ -56,6 +56,7 @@ from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics
 from nemo_automodel.recipes.llm import train_dspark
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_backend,
+    chat_template_kwargs_from,
     gather_full_weight_module,
     repair_glm_5_2_qk_rope_head_dim,
     resolve_reduced_target_layers,
@@ -604,7 +605,8 @@ _TINY_GLM_CONFIG = {
 }
 
 
-def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeypatch, enabled):
     """Regression: ``from_pretrained`` re-read the checkpoint's own config, silently
     rebuilding the full-depth target and discarding ``target_num_hidden_layers`` (OOM
     on one node). The GLM target build must hand the reduced, repaired config to
@@ -622,12 +624,13 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
         captured.update(kwargs)
         return "target-model"
 
+    monkeypatch.setattr(tb.NeMoAutoConfig, "resolve_revision", lambda *args, **kwargs: None)
     monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
     monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
 
     recipe_cfg = _opt_cfg(target_num_hidden_layers=2)
     target_config, target_model, distributed_setup = tb.build_glm_5_2_target(
-        cfg=SimpleNamespace(),
+        cfg=ConfigNode({"checkpoint": {"load_metadata_with_gloo": enabled}}),
         world_size=8,
         device=SimpleNamespace(type="cuda"),
         compute_dtype=torch.bfloat16,
@@ -644,6 +647,7 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
     # The attribute-map clobber is repaired back to the raw checkpoint value.
     assert target_config.qk_rope_head_dim == 8
     assert captured["load_base_model"] is True
+    assert captured["load_metadata_with_gloo"] is enabled
     assert captured["distributed_setup"] == "distributed-setup"
     assert captured["torch_dtype"] == torch.bfloat16
 
@@ -663,7 +667,8 @@ def test_build_glm_5_2_target_requires_cuda(tmp_path):
         )
 
 
-def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch, enabled):
     """The V4 build must hand the (reduced) config to ``from_config`` with the sharded
     distributed_setup and ``load_base_model=True`` (the full 43-layer target OOMs on
     one node, so ``target_num_hidden_layers`` must survive to ``from_config``)."""
@@ -677,13 +682,14 @@ def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
         return "target-model"
 
     monkeypatch.setattr(
-        tb.DeepseekV4Config, "from_pretrained", staticmethod(lambda *a, **k: SimpleNamespace(num_hidden_layers=43))
+        tb.NeMoAutoConfig, "from_pretrained", staticmethod(lambda *a, **k: SimpleNamespace(num_hidden_layers=43))
     )
+    monkeypatch.setattr(tb.NeMoAutoConfig, "resolve_revision", lambda *args, **kwargs: None)
     monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
     monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
 
     target_config, target_model, distributed_setup = tb.build_deepseek_v4_target(
-        cfg=SimpleNamespace(),
+        cfg=ConfigNode({"checkpoint": {"load_metadata_with_gloo": enabled}}),
         world_size=8,
         device=SimpleNamespace(type="cuda"),
         compute_dtype=torch.bfloat16,
@@ -697,6 +703,7 @@ def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
     assert target_config.num_hidden_layers == 4
     assert captured["config"] is target_config
     assert captured["load_base_model"] is True
+    assert captured["load_metadata_with_gloo"] is enabled
     assert captured["distributed_setup"] == "distributed-setup"
     assert captured["torch_dtype"] == torch.bfloat16
 
@@ -776,11 +783,78 @@ def _validate_cached_manifest(manifest=None, target_config=None, target_layer_id
         target_model_type=kwargs.pop("target_model_type", "qwen3"),
         seq_length=kwargs.pop("seq_length", 8),
         compute_dtype=kwargs.pop("compute_dtype", torch.float32),
+        chat_template_sha256=kwargs.pop("chat_template_sha256", "sha-current"),
+        chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
     )
 
 
 def test_cached_dspark_manifest_accepts_matching_shapes():
     _validate_cached_manifest()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "configured", "warns"),
+    [
+        ({}, "sha-current", False),
+        ({"chat_template_sha256": "sha-current"}, "sha-current", False),
+        ({"chat_template_sha256": "sha-old"}, None, False),
+        ({"chat_template_sha256": "sha-old"}, "sha-current", True),
+    ],
+)
+def test_cached_dspark_manifest_warns_only_on_a_chat_template_mismatch(caplog, overrides, configured, warns):
+    caplog.set_level("WARNING")
+    _validate_cached_manifest(manifest=_cached_manifest(**overrides), chat_template_sha256=configured)
+    assert ("chat template (sha256 sha-old)" in caplog.text) == warns
+
+
+@pytest.mark.parametrize(
+    ("recipe_args", "expected"),
+    [
+        ({}, None),
+        ({"chat_template_kwargs": {"thinking_mode": "thinking"}}, {"thinking_mode": "thinking"}),
+        ({"chat_template_kwargs": "thinking"}, "thinking"),  # left for the dataset to reject
+    ],
+)
+def test_chat_template_kwargs_from_reads_a_plain_mapping(recipe_args, expected):
+    kwargs = chat_template_kwargs_from(ConfigNode({"recipe_args": recipe_args}).recipe_args)
+    assert kwargs == expected
+    assert kwargs is None or type(kwargs) in (dict, str)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "configured"),
+    [
+        ({}, None),
+        ({}, {}),
+        ({"chat_template_kwargs": {"thinking_mode": "chat"}}, {"thinking_mode": "chat"}),
+        # Top-level kwargs are read by name, so their order does not change the render.
+        ({"chat_template_kwargs": {"a": 1, "opts": {"y": 1, "x": 2}}}, {"opts": {"y": 1, "x": 2}, "a": 1}),
+    ],
+)
+def test_cached_dspark_manifest_accepts_matching_chat_template_kwargs(overrides, configured):
+    # A manifest without the field predates it; read_manifest reads it as {} (no kwargs).
+    _validate_cached_manifest(manifest=_cached_manifest(**overrides), chat_template_kwargs=configured)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "configured"),
+    [
+        # A run that sets none renders with none, so a cache built with kwargs does not match it.
+        ({"chat_template_kwargs": {"thinking_mode": "thinking"}}, None),
+        ({"chat_template_kwargs": {"thinking_mode": "chat"}}, {"thinking_mode": "thinking"}),
+        ({}, {"thinking_mode": "thinking"}),
+        ({}, "thinking"),
+        # Equal under Python ==, but a template renders them differently (tojson: false vs 0).
+        ({"chat_template_kwargs": {"mode": False}}, {"mode": 0}),
+        ({"chat_template_kwargs": {"opts": {"mode": 1}}}, {"opts": {"mode": 1.0}}),
+        # Equal under Python ==, but a template iterating the nested mapping renders another order.
+        ({"chat_template_kwargs": {"opts": {"b": 2, "a": 1}}}, {"opts": {"a": 1, "b": 2}}),
+        ({"chat_template_kwargs": {"opts": [{"b": 2, "a": 1}]}}, {"opts": [{"a": 1, "b": 2}]}),
+    ],
+)
+def test_cached_dspark_manifest_rejects_chat_template_kwargs_mismatch(overrides, configured):
+    with pytest.raises(ValueError, match="chat_template_kwargs"):
+        _validate_cached_manifest(manifest=_cached_manifest(**overrides), chat_template_kwargs=configured)
 
 
 def test_cached_dspark_manifest_warns_on_target_path_mismatch(caplog):

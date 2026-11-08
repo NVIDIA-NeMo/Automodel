@@ -63,8 +63,6 @@ distributed:
   mp_policy:
     param_dtype: bfloat16
     reduce_dtype: bfloat16
-    output_dtype: bfloat16
-    cast_forward_inputs: true
 
 dataset:
   # Replace these paths with prepared BAGEL-format data.
@@ -187,3 +185,6 @@ wandb:
   project: bagel-pretraining
   mode: disabled
   name: bagel_mot_pretrain
+
+ci:
+  cluster_tag: h100

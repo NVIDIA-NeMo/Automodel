@@ -54,6 +54,14 @@ parallelism, pipeline parallelism, and video training are not enabled. An EP
 size must evenly divide the model's 288 routed experts and fit the available GPU
 memory; EP72 is the published validated topology, not a model requirement.
 
+For chat SFT through `ChatDataset`, set the dataset's `chat_template` to
+`examples/llm_finetune/glm5_next/glm5_3_flash_training_chat_template.jinja`.
+GLM ends an assistant turn with the next role token (`<|user|>`,
+`<|observation|>`, or `<|system|>`), which the released template renders as part
+of the following turn and omits after the final turn. The training template
+renders the same text, appends that token after the final turn, and marks each
+assistant span together with its end-of-turn token as the loss target.
+
 ## Attention Backends
 
 - KDA layers use Flash Linear Attention (FLA) kernels. For CP, FLA carries the
@@ -120,10 +128,14 @@ multi-node launch. If FlashMLA or cuDNN Frontend is unavailable, change
 
 ### Hugging Face Logit Parity
 
-A four-layer model containing KDA, KDA, KDA, and DSA was compared with the
-Transformers reference at sequence length 4,096 over the full 154,880-token
-vocabulary. All 135 expected tensors loaded with no missing, unexpected, or
-shape-mismatched keys.
+A four-layer model containing KDA, KDA, KDA, and DSA, with
+`vision_config.depth=1`, was compared with the Transformers reference at
+sequence length 4,096 over the full 154,880-token vocabulary. The reference
+side needs a Transformers build that includes `glm5_next` (5.17.0 or later);
+the training path does not. All 135 tensors NeMo AutoModel expects for this
+model (110 language, 25 vision) loaded with no missing, unexpected, or
+shape-mismatched keys. The Transformers-side key count differs, because the
+state-dict adapter changes the parameter layout.
 
 | Metric | Result |
 |---|---:|

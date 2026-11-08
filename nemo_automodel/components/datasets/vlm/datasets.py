@@ -25,17 +25,17 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
+from typing import ClassVar
 
 import torch
 import torch.utils.data
 from datasets import Dataset, load_dataset
 from datasets import Image as HfImage
 from PIL import Image
+from transformers import ProcessorMixin
 
-if TYPE_CHECKING:
-    from transformers import ProcessorMixin
-
+from nemo_automodel.components.datasets.llm.formatting_utils import GENERATION_REGEX
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
     _lmdb_env_cache,
@@ -70,7 +70,7 @@ class RdrDatasetConfig:
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the RDR dataset from this config."""
         return make_rdr_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -120,7 +120,7 @@ class CordV2DatasetConfig:
     limit_dataset_samples: int | None = None
     """Optional maximum number of samples to load."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the CORD-V2 dataset from this config."""
         return make_cord_v2_dataset(
             path_or_dataset=self.path_or_dataset,
@@ -181,13 +181,26 @@ class MedPixDatasetConfig:
     """HuggingFace dataset id or local path for MedPix."""
     split: str = "train"
     """Dataset split to load."""
+    revision: str | None = None
+    """Optional HuggingFace dataset revision."""
+    seed: int | None = None
+    """Optional shuffle seed applied before packing; None preserves source order."""
 
-    def build(self) -> object:
+    def build(self) -> Dataset:
         """Build the lazily decoded MedPix dataset."""
-        return make_medpix_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
+        return make_medpix_dataset(
+            path_or_dataset=self.path_or_dataset, split=self.split, revision=self.revision, seed=self.seed
+        )
 
 
-def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
+def make_medpix_dataset(
+    path_or_dataset: str = "medpix-dataset/medpix-dataset",
+    split: str = "train",
+    *,
+    revision: str | None = None,
+    seed: int | None = None,
+    **kwargs,
+) -> Dataset:
     """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
 
     Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
@@ -197,7 +210,9 @@ def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="
     happens on demand in the DataLoader workers, rather than eagerly decoding the
     whole split up front.
     """
-    dataset = load_dataset(path_or_dataset, split=split)
+    dataset = load_dataset(path_or_dataset, split=split, revision=revision)
+    if seed is not None:
+        dataset = dataset.shuffle(seed=seed)
     if "image_id" in getattr(dataset, "features", {}):
         dataset = dataset.cast_column("image_id", HfImage(decode=False))
 
@@ -239,7 +254,7 @@ class LlavaOnevisionDatasetConfig:
     split: str = "train"
     """Dataset split to load."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the LLaVA-OneVision conversation dataset."""
         return make_llava_onevision_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -314,7 +329,7 @@ class Tulu3MagicoderTextMixDatasetConfig:
     limit_total: int | None = None
     """Optional cap on the merged row count."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the text-only Tulu-3/Magicoder mixture."""
         return make_tulu3_magicoder_text_mix_dataset(
             tulu_split=self.tulu_split,
@@ -581,7 +596,7 @@ class UnimmChatDatasetConfig:
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    def build(self) -> list[dict[str, object]]:
+    def build(self) -> list[ConversationSample]:
         """Build the UniMM-Chat dataset from this config."""
         return make_unimm_chat_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -1162,7 +1177,7 @@ class MetaDatasetConfig:
     shard_data: bool = False
     """If ``True``, each rank loads only its ``1/world_size`` slice."""
 
-    def build(self, *, rank: int | None = None, world_size: int | None = None) -> list[dict[str, object]]:
+    def build(self, *, rank: int | None = None, world_size: int | None = None) -> list[ConversationSample]:
         """Build the meta VLM dataset from this config.
 
         Args:
@@ -1505,13 +1520,16 @@ class PreTokenizedDatasetWrapperConfig:
     """If ``True``, truncate overlong samples instead of replacing them."""
     inject_fake_images: bool = True
     """If ``True``, inject a fake image into text-only samples for sharded training."""
-    post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None
+    post_tokenize_hook: (
+        Callable[[dict[str, torch.Tensor | list[list[int]]], ProcessorMixin], dict[str, torch.Tensor | list[list[int]]]]
+        | None
+    ) = None
     """Optional declarative callback applied to each tokenizer result."""
 
     def build(
         self,
         *,
-        dataset: torch.utils.data.Dataset | Sequence[dict[str, object]],
+        dataset: Dataset | torch.utils.data.Dataset | Sequence[ConversationSample],
         processor: "ProcessorMixin",
     ) -> "PreTokenizedDatasetWrapper":
         """Build a :class:`PreTokenizedDatasetWrapper` from this config.
@@ -1614,34 +1632,38 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                             if isinstance(item, dict) and isinstance(item.get("image"), Image.Image):
                                 item["image"] = item["image"].convert("RGB")
 
-                # Render template text.
-                text = self.processor.apply_chat_template(
-                    [conversation],
-                    tokenize=False,
-                )
-                if isinstance(text, list):
-                    text = text[0]
-
-                # Extract pre-loaded media for the processor.
-                images, videos = _extract_media_from_conversations(
-                    [conversation],
-                )
-
-                # Build video_metadata from preserved _video_fps / _frame_indices
-                # so the processor inserts correct timestamps and skips re-sampling.
+                # Preserve video timestamps and skip re-sampling pre-loaded frames.
                 video_metadata = _build_video_metadata(conversation)
-
-                processor_kwargs = {
-                    "text": [text],
-                    "images": images,
-                    "videos": videos,
-                    "return_tensors": "pt",
-                    "do_sample_frames": False,
-                }
+                processor_kwargs = {"do_sample_frames": False}
                 if video_metadata:
                     processor_kwargs["video_metadata"] = [video_metadata]
 
-                result = self.processor(**processor_kwargs)
+                chat_template = self.processor.chat_template if isinstance(self.processor, ProcessorMixin) else None
+                if isinstance(chat_template, dict):
+                    chat_template = chat_template.get("default")
+                template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
+                if template_has_generation_kwd:
+                    result = self.processor.apply_chat_template(
+                        [conversation],
+                        tokenize=True,
+                        return_dict=True,
+                        return_tensors="pt",
+                        return_assistant_tokens_mask=True,
+                        processor_kwargs=processor_kwargs,
+                    )
+                elif type(self.processor).__name__ == "MistralCommonBackend":
+                    # MistralCommonBackend owns the HF token API and takes no media kwargs.
+                    result = self.processor.apply_chat_template(
+                        [conversation], tokenize=True, return_dict=True, return_tensors="pt"
+                    )
+                else:
+                    text = self.processor.apply_chat_template([conversation], tokenize=False)
+                    if isinstance(text, list):
+                        text = text[0]
+                    images, videos = _extract_media_from_conversations([conversation])
+                    result = self.processor(
+                        text=[text], images=images, videos=videos, return_tensors="pt", **processor_kwargs
+                    )
                 if self.post_tokenize_hook is not None:
                     result = self.post_tokenize_hook(result, self.processor)
 
@@ -1662,11 +1684,10 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
 
                 # Build labels BEFORE truncation so the full assistant text
                 # can be matched against the full input_ids.
-                labels = build_labels_from_template(
-                    result["input_ids"],  # (1, seq_len)
-                    [conversation],
-                    self.processor,
-                )[0]  # (seq_len,)
+                if template_has_generation_kwd:
+                    labels = result["input_ids"].masked_fill(result.pop("assistant_masks") == 0, -100)[0]
+                else:
+                    labels = build_labels_from_template(result["input_ids"], [conversation], self.processor)[0]
 
                 # Now truncate if needed (after labels are built)
                 if self.truncate and self.max_length is not None and seq_len > self.max_length:
@@ -1706,10 +1727,13 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     "pixel_values",
                     "pixel_values_videos",
                     "image_grid_thw",
+                    "image_grid_hws",
                     "video_grid_thw",
                     "second_per_grid_ts",
                     "image_position_ids",
+                    "image_sizes",
                     "mm_token_type_ids",
+                    "vision_token_types",
                 ):
                     if key in result and result[key] is not None:
                         output[key] = result[key]

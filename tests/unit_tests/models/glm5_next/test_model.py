@@ -256,3 +256,104 @@ def test_moe_router_correction_bias_only_controls_expert_selection():
 
     assert config.score_func == "sigmoid_with_bias"
     assert not config.router_weight_uses_score_correction_bias
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the FLA kernel branch runs only for CUDA tensors")
+def test_short_sequence_training_uses_chunk_kda_and_reaches_kda_parameters(monkeypatch):
+    calls = []
+
+    def fake_chunk_kda(q, k, v, g, beta, **kwargs):
+        calls.append(q.shape[1])
+        output = (q * k + v) * beta.unsqueeze(-1).to(v.dtype) + g.float().mean().to(v.dtype)
+        return output, None
+
+    monkeypatch.setattr(glm5_next_layers, "_CHUNK_KDA_OK", True)
+    monkeypatch.setattr(glm5_next_layers, "_chunk_kda", fake_chunk_kda)
+    # PyTorch short convolution and gate keep the test free of Triton compilation.
+    monkeypatch.setattr(glm5_next_layers, "_SHORT_CONV_OK", False)
+    monkeypatch.setattr(glm5_next_layers, "_KDA_GATE_OK", False)
+    config = tiny_glm5_next_config().text_config
+    config.hidden_size, config.linear_head_dim, config.linear_num_heads = 128, 64, 2
+    config.linear_conv_kernel_dim = 4
+    config.torch_dtype = "bfloat16"
+    torch.manual_seed(0)
+    layer = Glm5NextLinearAttention(config, layer_idx=0).cuda().train()
+    hidden_states = torch.randn(1, 32, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+    layer(hidden_states).float().sum().backward()
+
+    assert calls == [32]
+    missing = [name for name, param in layer.named_parameters() if param.grad is None]
+    assert missing == []
+
+
+def test_generation_config_is_initialized_from_model_config():
+    from transformers.generation import GenerationConfig
+
+    from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
+
+    config = tiny_glm5_next_config()
+    config.text_config.eos_token_id = [2, 1]
+    config.text_config.bos_token_id = 1
+
+    model = Glm5NextForConditionalGeneration(config, backend=tiny_backend(adapter=False))
+
+    assert isinstance(model.generation_config, GenerationConfig)
+    assert model.generation_config.eos_token_id == [2, 1]
+    assert model.generation_config.bos_token_id == 1
+    assert model.generation_config.pad_token_id == 0
+
+
+def test_pretrained_build_preserves_generation_config_in_export(tmp_path, monkeypatch):
+    """A from_pretrained build must round-trip the checkpoint's generation metadata into the export."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from transformers.generation import GenerationConfig
+
+    from nemo_automodel._transformers import model_init
+    from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon
+    from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    GenerationConfig(
+        eos_token_id=[2, 1],
+        do_sample=True,
+        temperature=1.0,
+        top_p=0.95,
+    ).save_pretrained(checkpoint_dir)
+    config = tiny_glm5_next_config()
+    config.architectures = ["Glm5NextForConditionalGeneration"]
+    config.save_pretrained(checkpoint_dir)
+
+    monkeypatch.setattr(model_init, "_resolve_custom_model_cls_for_config", lambda _: Glm5NextForConditionalGeneration)
+    monkeypatch.setattr(model_init, "_download_model_weights", lambda *args, **kwargs: None)
+
+    is_custom, model = model_init._init_model(
+        cls=MagicMock(),
+        pretrained_model_name_or_path_or_config=str(checkpoint_dir),
+        attn_implementation="sdpa",
+        torch_dtype=torch.float32,
+        quantization_config=None,
+        force_hf=False,
+        backend=tiny_backend(adapter=False),
+    )
+    assert is_custom is True
+
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[model]),
+        hf_metadata_dir=str(export_dir),
+        fqn_to_file_index_mapping={},
+        tokenizer=None,
+        original_model_path=str(checkpoint_dir),
+        v4_compatible=False,
+    )
+    exported = GenerationConfig.from_pretrained(export_dir)
+
+    assert exported.eos_token_id == [2, 1]
+    assert exported.do_sample is True
+    assert exported.temperature == 1.0
+    assert exported.top_p == 0.95

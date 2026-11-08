@@ -130,6 +130,7 @@ optimizer:
   weight_decay: 0.1
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   max_steps: 10
   time: "00:20:00"

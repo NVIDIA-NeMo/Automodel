@@ -54,7 +54,7 @@ class BagelDataloaderConfig:
         self,
         *,
         tokenizer: "PreTrainedTokenizerBase",
-        special_tokens: Mapping[str, object],
+        special_tokens: Mapping[str, int],
         rank: int,
         world_size: int,
         batch_size: int,

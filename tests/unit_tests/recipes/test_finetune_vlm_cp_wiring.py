@@ -38,6 +38,7 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_CONTRACT
 from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
@@ -425,7 +426,7 @@ class _FakePPModel:
         self.info = SimpleNamespace(has_last_stage=False, stages=[], schedule=None)
 
 
-class _StageWithCPPreembedInForward:
+class _StageWithCPPreembedInForward(torch.nn.Module):
     # Sunk VLM (minimax/qwen3_5/qwen3_5_moe/step3p7): embeds + shards per
     # microbatch inside forward and pulls media from the PP side channel, so
     # media MUST still be staged for PP under CP.
@@ -433,7 +434,7 @@ class _StageWithCPPreembedInForward:
         return {}
 
 
-class _StageWithoutCPPrepare:
+class _StageWithoutCPPrepare(torch.nn.Module):
     pass
 
 
@@ -471,7 +472,7 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
     )
 
     def _stub_build_checkpoint_config(*args, **kwargs):
-        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None)
+        cfg = SimpleNamespace(checkpoint_dir="ckpts", model_state_dict_keys=None, load_metadata_with_gloo=False)
         cfg.build = lambda **kw: SimpleNamespace(
             config=cfg,
             load_base_model=lambda *args, **kwargs: None,
@@ -500,7 +501,8 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
 
     loader_config = SimpleNamespace(
         packing=None,
-        resolve_packing_attn_implementation=lambda **kwargs: None,
+        is_packed=False,
+        output_format="batched",
         build=_build_dataloader,
     )
     monkeypatch.setattr(
@@ -586,6 +588,10 @@ def test_setup_always_stages_pp_media_under_pp(
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
     assert dataloader_calls[0]["cp_size"] == cp_size
+    contract = dataloader_calls[0]["packing_contract"]
+    assert contract.packed_mask_type == DEFAULT_PACKED_SEQUENCE_CONTRACT.packed_mask_type
+    assert contract.return_packed_sequence_metadata is False
+    assert contract.return_document_ids is False
 
 
 # -----------------------------------------------------------------------------

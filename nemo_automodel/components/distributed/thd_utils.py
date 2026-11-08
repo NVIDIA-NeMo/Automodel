@@ -112,6 +112,10 @@ def process_input_for_thd(
             - 'seq_lens_padded': Padded sequence lengths tensor of shape [batch_size, num_packs]
                 containing lengths including separator tokens. Values matching
                 seq_lens_padding_value indicate padding and are filtered out.
+            - Optional _packed_seq_ids: Selected subdocument IDs [batch_size, seq_len],
+                matching attention boundaries. Zero marks padding.
+            - Optional document_ids: Original membership [batch_size, seq_len] for
+                an explicit model consumer; it does not override attention or loss.
         seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
             tensors that should be filtered out (default: -1000)
         padding_token_id: Filler token id. The padding mask is derived from the pack
@@ -132,16 +136,18 @@ def process_input_for_thd(
                 purely at the end (cp_size == 1), the last entry is grown to total_tokens to absorb
                 that pad and avoid TE's ``pad_between_seqs=True`` path; see the absorption block in
                 the function body for the gate.
-            - 'cu_seqlens_padded': (optional) Cumulative PADDED sequence lengths tensor of the same
-                shape as ``cu_seqlens``. Only emitted when it differs from ``cu_seqlens`` after
-                absorption (i.e., when padding lives between sub-sequences, which is the CP case).
-                Forwarded to TE as ``cu_seqlens_q_padded`` / ``cu_seqlens_kv_padded`` with
-                ``pad_between_seqs=True`` so the kernel reads memory offsets from the padded
-                variant while attending only over the real-length slots.
+            - 'cu_seqlens_padded': Cumulative physical sequence boundaries, retained whenever
+                seq_lens_padded is provided, including when equal to cu_seqlens.
+            - 'pad_between_seqs': Whether the complete physical and attention boundary arrays
+                differ after trailing-pad absorption. This controls TE dispatch independently
+                of the presence of physical metadata needed by other consumers such as MTP.
             - 'max_seqlen': Scalar int32 tensor equal to ``max(cu_seqlens[i+1] - cu_seqlens[i])``
                 after any absorption. Honors TE's contract that
                 ``max_seqlen_q >= max(cu_seqlens_q[i+1] - cu_seqlens_q[i])``.
             - 'padding_mask': Boolean tensor of shape [total_tokens] indicating padding positions
+            - Optional _packed_seq_ids: Selected IDs [total_tokens], made distinct across
+                batch documents while preserving zero-valued padding. Optional
+                document_ids are transformed independently to the same layout.
             - Non-tensor keys from input batch are preserved (e.g., 'qkv_format')
 
     Example:
@@ -222,10 +228,9 @@ def process_input_for_thd(
             )
             cu_seqlens_padded = cu_seqlens_padded.to(dtype=torch.int32).to(device=valid_seq_lens_padded.device)
 
-        # Trailing-only pack-pad (cp_size==1): absorb into cu_seqlens[-1] so
-        # the emit gate below drops cu_seqlens_padded and TE skips its
-        # pad_between_seqs=True path. CP>1 differs in multiple entries and
-        # falls through; both arrays are emitted and TE handles padding.
+        # Absorb trailing-only pack padding into the final attention segment.
+        # Both boundary arrays are retained; their equality disables TE's
+        # separate-padding path. Internal padding keeps distinct boundaries.
         if (
             cu_seqlens is not None
             and cu_seqlens_padded is not None
@@ -264,11 +269,19 @@ def process_input_for_thd(
         "labels": labels_thd,
         "padding_mask": padding_mask,
     }
-    # Emit cu_seqlens_padded only when it differs from cu_seqlens — its
-    # presence is what flips TE's pad_between_seqs=True path in
-    # attention/utils.py.
-    if cu_seqlens_padded is not None and not torch.equal(cu_seqlens_padded, cu_seqlens):
+    for key in ("_packed_seq_ids", "document_ids"):
+        document_ids = batch.get(key)
+        if document_ids is not None:
+            if document_ids.shape != labels.shape:
+                raise ValueError(f"THD {key} must match labels [batch, sequence]")
+            # IDs are local to each batch document; make them unique before flattening.
+            offsets = torch.cat([document_ids.new_zeros(1), document_ids.amax(dim=1).cumsum(0)[:-1]])
+            result[key] = torch.where(document_ids > 0, document_ids + offsets[:, None], 0).reshape(-1)
+    # Physical boundaries are data, not a backend switch. Decide padding once
+    # for this stream, comparing the entire arrays (including the final offset).
+    if cu_seqlens_padded is not None:
         result["cu_seqlens_padded"] = cu_seqlens_padded
+        result["pad_between_seqs"] = not torch.equal(cu_seqlens_padded, cu_seqlens)
     if max_seqlen is not None:
         result["max_seqlen"] = max_seqlen
 
@@ -325,9 +338,9 @@ def split_batch_into_thd_chunks(
                 seq_lens_padding_value across chunks for rectangularity). Built from seq_lens
                 (real lengths) per chunk; see ``process_input_for_thd`` for the absorption
                 semantics applied per chunk.
-            - 'cu_seqlens_padded': (optional) Same shape, emitted whenever ANY chunk emits it.
-                For chunks that absorbed (no separate padded variant), this row equals the
-                chunk's ``cu_seqlens``.
+            - 'cu_seqlens_padded': Same shape, retained when physical lengths are provided.
+            - 'pad_between_seqs' is not copied across chunks: each microbatch resolves it
+                from its own boundary arrays at model entry.
             - 'max_seqlen': [num_chunks] per-chunk scalar tensor.
             - 'padding_mask': [num_chunks, tokens_per_chunk]
             - Non-tensor keys from input batch are preserved
@@ -392,8 +405,7 @@ def split_batch_into_thd_chunks(
         "cu_seqlens": pad_and_stack([c["cu_seqlens"] for c in chunk_results], seq_lens_padding_value),
         "padding_mask": torch.stack([c["padding_mask"] for c in chunk_results]),
     }
-    # Emit cu_seqlens_padded whenever any chunk emits it; absorbed chunks
-    # fall back to their cu_seqlens (semantically equal) for rectangularity.
+    # Stack physical boundaries independently of the per-microbatch padding decision.
     if any("cu_seqlens_padded" in c for c in chunk_results):
         stacked["cu_seqlens_padded"] = pad_and_stack(
             [c.get("cu_seqlens_padded", c["cu_seqlens"]) for c in chunk_results],
@@ -401,5 +413,10 @@ def split_batch_into_thd_chunks(
         )
     if all("max_seqlen" in c for c in chunk_results):
         stacked["max_seqlen"] = torch.stack([c["max_seqlen"] for c in chunk_results])
-    stacked.update({k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor)})
+    for key in ("_packed_seq_ids", "document_ids"):
+        if all(key in c for c in chunk_results):
+            stacked[key] = torch.stack([c[key] for c in chunk_results])
+    stacked.update(
+        {k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor) and k != "pad_between_seqs"}
+    )
     return stacked

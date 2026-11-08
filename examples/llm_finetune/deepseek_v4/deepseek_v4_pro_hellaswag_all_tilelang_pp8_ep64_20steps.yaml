@@ -56,7 +56,12 @@ distributed:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 30
+  # A cold start of this recipe on 64 H100 nodes takes 38-40 min before step 0: every rank
+  # JIT-compiles its own HybridEP (nvcc, per-process cache) and TileLang kernels, and pipeline
+  # parallelism serializes that across the 8 stages. 30 min hits the NCCL watchdog on the
+  # first P2P recv; 120 leaves headroom. Set NEMO_HYBRIDEP_JIT_CACHE=<shared dir> to reuse the
+  # HybridEP kernels across runs.
+  timeout_minutes: 120
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
@@ -131,6 +136,7 @@ optimizer:
   weight_decay: 0.1
 
 ci:
+  cluster_tag: h100
   # pp_size(8) * ep_size(64) = 512 GPUs => 64 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 64
