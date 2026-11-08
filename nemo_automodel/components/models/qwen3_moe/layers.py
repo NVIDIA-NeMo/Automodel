@@ -114,11 +114,36 @@ class Qwen3MoeAttention(nn.Module):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        rope_concentration: float = 1.0,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
-        if self._compiled_forward is not None:  # pragma: no cover - compiled path only on GPU benchmark runs
-            return self._compiled_forward(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
-        return self._forward_impl(x, freqs_cis=freqs_cis, attention_mask=attention_mask, **attn_kwargs)
+        """Apply attention with FP32 rotary arithmetic and original Q/K output dtypes.
+
+        Args:
+            x: Hidden states [batch, sequence, hidden] or packed [tokens, hidden].
+            freqs_cis: FP32 coefficients [batch, sequence, rotary_dim] or
+                [tokens, rotary_dim], or fused angles [positions, 1, 1, rotary_dim].
+                Fused BSHD positions may flatten the batch and sequence axes.
+            attention_mask: Optional [batch, sequence] or
+                [batch, 1, sequence, sequence] mask for the selected backend.
+            rope_concentration: Scale applied once to each fused rotated Q/K.
+            **attn_kwargs: Attention metadata, including logical and padded
+                cumulative sequence boundaries [documents + 1], and CP size/rank.
+
+        Returns:
+            Hidden states with the same leading token axes and hidden width as x.
+        """
+        if self._compiled_forward is not None:
+            return self._compiled_forward(
+                x,
+                freqs_cis=freqs_cis,
+                attention_mask=attention_mask,
+                rope_concentration=rope_concentration,
+                **attn_kwargs,
+            )
+        return self._forward_impl(
+            x, freqs_cis=freqs_cis, attention_mask=attention_mask, rope_concentration=rope_concentration, **attn_kwargs
+        )
 
     def _forward_impl(
         self,
@@ -126,8 +151,23 @@ class Qwen3MoeAttention(nn.Module):
         *,
         freqs_cis: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        rope_concentration: float = 1.0,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Execute attention using the tensor layouts documented by forward.
+
+        Args:
+            x: Hidden states [batch, sequence, hidden] or [tokens, hidden].
+            freqs_cis: Coefficients [..., rotary_dim] or fused angles
+                [positions, 1, 1, rotary_dim], as documented by forward.
+            attention_mask: Optional [batch, sequence] or
+                [batch, 1, sequence, sequence] backend attention mask.
+            rope_concentration: Multiplicative concentration for fused Q/K.
+            **attn_kwargs: Logical/physical boundaries [documents + 1] and CP metadata.
+
+        Returns:
+            Hidden states with x's shape and dtype.
+        """
         if len(x.shape) == 2:
             qkv_format = "thd"
             num_tokens = x.shape[0]
@@ -152,17 +192,35 @@ class Qwen3MoeAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # RoPE (complex rotation)
+        # Flatten BSHD token axes when the model supplied per-example angles.
+        # TE broadcasts one angle table across its batch axis; flattening avoids
+        # discarding later examples without inspecting CUDA position values.
+        q_shape, k_shape = q.shape, k.shape
+        q_dtype, k_dtype = q.dtype, k.dtype
+        # Match TE's FP32 rotary arithmetic in the eager path as well. Casting
+        # coefficients/products to BF16 before each operation changes routing
+        # and gradients when fusion is toggled. Round only the rotated result.
+        # Non-unit concentration also needs FP32 output until scaling is applied.
+        if not self.backend.rope_fusion or rope_concentration != 1.0:
+            q, k = q.float(), k.float()
+        if qkv_format == "bshd" and self.backend.rope_fusion and freqs_cis.shape[0] == bsz * seqlen:
+            q = q.reshape(1, bsz * seqlen, self.num_heads, self.head_dim)
+            k = k.reshape(1, bsz * seqlen, self.num_kv_heads, self.head_dim)
         q, k = apply_rotary_emb_qk(
             q,
             k,
             freqs_cis,
             format=qkv_format,
             rope_fusion=self.backend.rope_fusion,
-            cu_seqlens=attn_kwargs.get("cu_seqlens", None),
+            # RoPE indexes physical Q/K rows, including inter-document padding.
+            # Attention still receives the original logical boundaries below.
+            cu_seqlens=attn_kwargs.get("cu_seqlens_padded", attn_kwargs.get("cu_seqlens")),
+            concentration=rope_concentration,
             cp_size=attn_kwargs.get("cp_size", 1),
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
+
+        q, k = q.reshape(q_shape).to(q_dtype), k.reshape(k_shape).to(k_dtype)
 
         # Backend-specific attention
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(

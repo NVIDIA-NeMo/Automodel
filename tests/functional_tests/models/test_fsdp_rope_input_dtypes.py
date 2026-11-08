@@ -227,7 +227,10 @@ def _worker(rank: int, rendezvous: str) -> None:
                     assert old_error > 0.05
                     assert not torch.equal(angles[0][0], angles[2][0].float())
                 else:
-                    torch.testing.assert_close(actual, old_output, rtol=0, atol=0)
+                    # Eager Qwen now also rotates in FP32. Rounding its FP32
+                    # coefficients at the FSDP boundary must be detected too.
+                    assert old_error > 0.0
+                    assert not torch.equal(angles[0][0], angles[2][0].float())
                 if rank == 0:
                     print(
                         dict(

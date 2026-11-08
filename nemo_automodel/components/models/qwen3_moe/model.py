@@ -193,16 +193,36 @@ class Qwen3MoeModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Embed tokens and execute Qwen blocks with consistent rotary metadata.
+
+        Args:
+            input_ids: Token IDs [batch, sequence] or packed [tokens].
+            position_ids: Optional token positions with the same leading token axes.
+            attention_mask: Optional [batch, sequence] or
+                [batch, 1, sequence, sequence] attention mask.
+            padding_mask: Optional boolean padding mask with the token axes.
+            **attn_kwargs: Backend metadata, including qkv_format, cumulative
+                logical/padded boundaries [documents + 1], and CP size/rank.
+
+        Returns:
+            Hidden states with the input token axes followed by hidden width.
+        """
         if position_ids is None:
             position_ids = (
                 torch.arange(0, input_ids.shape[1], device=input_ids.device).unsqueeze(0).expand(input_ids.shape[0], -1)
             )
 
-        # Compute freqs_cis from RotaryEmbedding inv_freq and current position_ids; then concat [cos, sin]
+        qkv_format = attn_kwargs.get("qkv_format", "bshd")
+        # Preserve every example's positions. The attention layer restores the
+        # original BSHD shape after applying these flattened per-token angles.
+        rotary_positions = (
+            position_ids.reshape(1, -1) if self.backend.rope_fusion and qkv_format == "bshd" else position_ids
+        )
+        concentration, _ = self.rotary_emb._compute_concentration_and_inv_freq()
         freqs_cis = position_ids_to_freqs_cis(
             self.rotary_emb,
-            position_ids,
-            qkv_format=attn_kwargs.get("qkv_format", "bshd"),
+            rotary_positions,
+            qkv_format=qkv_format,
             for_fused_rope=self.backend.rope_fusion,
             cp_size=attn_kwargs.get("cp_size", 1),
         )
@@ -215,6 +235,7 @@ class Qwen3MoeModel(nn.Module):
                 freqs_cis=freqs_cis,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
+                rope_concentration=concentration,
                 **attn_kwargs,
             )
 
