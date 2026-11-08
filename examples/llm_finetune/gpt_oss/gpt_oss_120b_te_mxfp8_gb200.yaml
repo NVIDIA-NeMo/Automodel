@@ -28,7 +28,7 @@ model:
   pretrained_model_name_or_path: openai/gpt-oss-120b
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: fa4
     linear: te
     rms_norm: te
     rope_fusion: false  # Use unfused RoPE for packed THD inputs, matching the existing packed recipes.
@@ -117,7 +117,7 @@ optimizer:
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
 
-  foreach: false
+  foreach: true
 ci:
   cluster_tag: gb200
   recipe_owner: hemildesai

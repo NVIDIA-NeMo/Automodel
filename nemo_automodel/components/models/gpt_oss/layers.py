@@ -77,8 +77,8 @@ class GptOssAttention(nn.Module):
         else:
             self.yarn_concentration = None
 
-        assert backend.attn in ("flex", "te"), "Only Flex and TE Attention are supported for GPT-OSS"
-        if backend.attn == "te" and not is_te_min_version("2.8.0"):
+        assert backend.attn in ("flex", "te", "fa4"), "GPT-OSS requires Flex, TE or the bounded FA4 path"
+        if backend.attn in ("te", "fa4") and not is_te_min_version("2.8.0"):
             raise ValueError(
                 "Transformer Engine DotProductAttention for GPT-OSS is only supported for TE version 2.8.0 or higher"
             )
@@ -103,6 +103,18 @@ class GptOssAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Attend with the configured backend and the original learned sink parameter.
+
+        Args:
+            x: Hidden states [batch, sequence, hidden] or [physical_tokens, hidden].
+            freqs_cis: RoPE frequencies in the layout prepared for these token positions.
+            attention_mask: Optional BSHD padding mask [batch, sequence].
+            **attn_kwargs: Logical/physical offsets [documents + 1] and optional
+                private compact FA4 indices [valid_tokens], prepared at model entry.
+
+        Returns:
+            Projected states with the same layout as x. Physical padding remains present.
+        """
         # Detect THD format: either 2D [T, hidden], explicit THD metadata, or
         # 3D [1, T, hidden] with cu_seqlens from PP schedule splitting.
         explicit_thd = attn_kwargs.get("qkv_format") == "thd" or _has_thd_metadata(attn_kwargs)
@@ -151,12 +163,18 @@ class GptOssAttention(nn.Module):
                 "enable_gqa": True,
             }
         else:
-            updated_attn_kwargs = attn_kwargs
+            updated_attn_kwargs = dict(attn_kwargs)
+            if self.backend.attn == "fa4":
+                sink = self.attn_module.softmax_offset
+                updated_attn_kwargs["learnable_sink"] = sink.to_local() if isinstance(sink, DTensor) else sink
             if qkv_format == "thd":
                 updated_attn_kwargs = {**updated_attn_kwargs, "qkv_format": "thd"}
                 attention_mask = None
             if self.sliding_window is not None:
-                updated_attn_kwargs["window_size"] = (self.sliding_window, 0)
+                # TE uses a left distance; shared FA4 preprocessing subtracts one
+                # from an inclusive-current width. Preserve the existing TE distance.
+                window = self.sliding_window + (1 if self.backend.attn == "fa4" else 0)
+                updated_attn_kwargs["window_size"] = (window, 0)
 
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
             q, k, v, attention_mask, self.backend.attn, **updated_attn_kwargs

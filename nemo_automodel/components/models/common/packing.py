@@ -372,10 +372,15 @@ def _flatten_packed_metadata_at_model_entry(
     Args:
         _module: Native FA4 model receiving the forward call.
         args: Positional model inputs. Tensor entries retain their model-specific
-            layouts and are returned unchanged.
+            layouts and are returned unchanged. THD requires token IDs [tokens]
+            or [1, tokens] as the first positional input or keyword input_ids.
         kwargs: Model inputs containing ``packed_token_indices`` of shape
             [batch, sequence] or [tokens] and ``cu_seqlens`` of shape
-            [batch, max_documents + 1] or [documents + 1].
+            [batch, max_documents + 1] or [documents + 1]. For THD, padding_mask
+            is bool [physical_tokens] (True at padding), and cu_seqlens_padded
+            or cu_seqlens is int32 [documents + 1] with physical boundaries.
+            Original mask/boundaries remain unchanged; private FA4 offsets
+            index the compact stream selected by packed_token_indices.
 
     Returns:
         Updated positional and keyword inputs whose packed token indices have
@@ -383,11 +388,69 @@ def _flatten_packed_metadata_at_model_entry(
         ``None`` when neither packed-metadata tensor was supplied.
 
     Raises:
-        ValueError: If pre-packed THD is requested, only one metadata tensor is
-            supplied, or either layout is inconsistent with the current microbatch.
+        ValueError: If THD lacks its authoritative mask/boundaries, only one NEAT
+            metadata tensor is supplied, or a layout is inconsistent with the microbatch.
     """
     if kwargs.get("qkv_format") == "thd":
-        raise ValueError("Native FA4 does not support pre-packed THD inputs. Use NEAT packing.")
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        if not isinstance(input_ids, torch.Tensor) or not (
+            input_ids.ndim == 1 or (input_ids.ndim == 2 and input_ids.shape[0] == 1)
+        ):
+            raise ValueError("FA4 THD requires token IDs [physical_tokens] or [1, physical_tokens]")
+        physical_tokens = input_ids.shape[-1]
+        padding_mask = kwargs.get("padding_mask")
+        boundaries = kwargs.get("cu_seqlens_padded")
+        if boundaries is None:
+            boundaries = kwargs.get("cu_seqlens")
+        if not isinstance(padding_mask, torch.Tensor) or not isinstance(boundaries, torch.Tensor):
+            raise ValueError("FA4 THD requires the prepared padding_mask and sequence boundaries")
+        if padding_mask.ndim == 2 and padding_mask.shape[0] == 1:
+            padding_mask = padding_mask.squeeze(0)
+        if (
+            padding_mask.ndim != 1
+            or padding_mask.dtype != torch.bool
+            or boundaries.ndim != 1
+            or boundaries.dtype != torch.int32
+        ):
+            raise ValueError("FA4 THD requires a bool [physical_tokens] mask and flat sequence boundaries")
+        if padding_mask.numel() != physical_tokens:
+            raise ValueError("FA4 THD padding_mask length must match physical input tokens")
+        if boundaries.numel() < 2 or bool(
+            (
+                (boundaries[0] != 0)
+                | (boundaries < 0).any()
+                | (boundaries > physical_tokens).any()
+                | (boundaries[1:] < boundaries[:-1]).any()
+            ).item()
+        ):
+            raise ValueError("FA4 THD physical boundaries must start at zero, be ordered and lie within input tokens")
+        if "_fa4_cu_seqlens" in kwargs:
+            return None
+        valid_tokens = ~padding_mask
+        flat_indices = torch.nonzero(valid_tokens, as_tuple=False).flatten()
+        # Sample the authoritative mask at existing physical boundaries; never
+        # reconstruct document membership or mutate the MoE/RoPE metadata.
+        valid_prefix = torch.cat((boundaries.new_zeros(1), valid_tokens.cumsum(0, dtype=torch.int32)))
+        compact_offsets = valid_prefix.index_select(0, boundaries.to(torch.long))
+        flat_indices, compact_offsets = flatten_packed_sequence_metadata(
+            flat_indices, compact_offsets, batch_size=1, sequence_length=padding_mask.numel()
+        )
+        updated_kwargs = dict(kwargs)
+        updated_kwargs["packed_token_indices"] = flat_indices
+        updated_kwargs["_fa4_cu_seqlens"] = compact_offsets
+        used_lengths = (compact_offsets[1:] - compact_offsets[:-1]).contiguous()
+        updated_kwargs["_fa4_max_seqlen"] = int(used_lengths.max().item())
+        # A used-length kernel describes valid prefixes, unlike general compact indices.
+        # Establish eligibility once at model entry; keep all public metadata unchanged.
+        positions = torch.arange(physical_tokens, device=boundaries.device)
+        document = torch.bucketize(positions, boundaries[1:], right=True)
+        represented = document < used_lengths.numel()
+        safe_document = document.clamp_max(used_lengths.numel() - 1)
+        prefix_mask = represented & (positions < (boundaries[:-1] + used_lengths)[safe_document])
+        if flat_indices.numel() and bool(torch.equal(prefix_mask, valid_tokens)):
+            updated_kwargs["_fa4_physical_cu_seqlens"] = boundaries
+            updated_kwargs["_fa4_seqused"] = used_lengths
+        return args, updated_kwargs
     packed_token_indices = kwargs.get("packed_token_indices")
     cu_seqlens = kwargs.get("cu_seqlens")
     if packed_token_indices is None and cu_seqlens is None:

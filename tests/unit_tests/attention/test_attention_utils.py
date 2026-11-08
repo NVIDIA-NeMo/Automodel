@@ -14,6 +14,7 @@
 
 
 import sys
+from pathlib import Path
 from types import ModuleType
 from unittest import mock
 
@@ -912,9 +913,9 @@ class TestFA4Backend:
                 )
         assert isinstance(exc_info.value.__cause__, RuntimeError)
 
-    @pytest.mark.parametrize("qkv_format", ["thd", "sbhd"])
+    @pytest.mark.parametrize("qkv_format", ["sbhd"])
     def test_fa4_rejects_unsupported_qkv_format(self, qkv_format):
-        """The adapter accepts BSHD, not pre-packed THD buffers."""
+        """The factory accepts BSHD/prepared THD, but rejects unsupported layouts."""
         with mock.patch.dict("sys.modules", {"flash_attn.cute": mock.MagicMock()}):
             with pytest.raises(ValueError, match="requires BSHD"):
                 initialize_attn_module_and_func(
@@ -934,9 +935,9 @@ class TestFA4Backend:
             ((2, 4, 2, 4), {"cu_seqlens_padded": torch.tensor([0, 4, 8], dtype=torch.int32)}),
         ],
     )
-    def test_fa4_rejects_thd_before_kernel(self, shape, metadata):
+    def test_fa4_rejects_unprepared_thd_before_kernel(self, shape, metadata):
         q = k = v = torch.randn(shape)
-        with pytest.raises(ValueError, match="pre-packed THD"):
+        with pytest.raises(ValueError, match="FA4.*requires"):
             preprocess_args_and_kwargs_for_attn(q, k, v, None, "fa4", **metadata)
 
     def test_dense_fa4_unpacks_kernel_result_and_preserves_gradients(self):
@@ -970,3 +971,246 @@ def test_te_padding_flag_uses_boundaries_not_field_presence(padded, expected, ex
     _, _, _, kwargs = preprocess_args_and_kwargs_for_attn(q, q, q, None, "te", **metadata)
     assert kwargs["pad_between_seqs"] is expected
     assert kwargs["cu_seqlens_q_padded"] is metadata["cu_seqlens_padded"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("lengths", [(2, 3, 3), (2, 2, 3), (2, 1, 2)])
+def test_fa4_prepared_thd_rejects_unequal_physical_streams(lengths: tuple[int, int, int]) -> None:
+    """Longer K/V streams must not be silently truncated by shared Q indices."""
+    q, k, v = [torch.randn(length, 2, 4) for length in lengths]
+    with pytest.raises(ValueError, match="equal physical Q/K/V"):
+        preprocess_args_and_kwargs_for_attn(
+            q,
+            k,
+            v,
+            None,
+            "fa4",
+            qkv_format="thd",
+            _fa4_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            _fa4_max_seqlen=2,
+            packed_token_indices=torch.tensor([0, 1]),
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("empty", [False, True])
+def test_fa4_prepared_thd_scatter_preserves_physical_layout_and_sink_gradient(empty: bool) -> None:
+    """Prepared THD gathers valid rows, restores gaps and keeps empty sink gradients."""
+    q = torch.randn(5, 2, 4, requires_grad=True)
+    k = torch.randn(5, 1, 4, requires_grad=True)
+    v = torch.randn(5, 1, 4, requires_grad=True)
+    sink = torch.randn(2, requires_grad=True)
+    indices = torch.tensor([] if empty else [0, 1, 4], dtype=torch.long)
+    offsets = torch.tensor([0, 0, 0] if empty else [0, 2, 3], dtype=torch.int32)
+    q1, k1, v1, kwargs = preprocess_args_and_kwargs_for_attn(
+        q,
+        k,
+        v,
+        None,
+        "fa4",
+        qkv_format="thd",
+        _fa4_cu_seqlens=offsets,
+        _fa4_max_seqlen=0 if empty else 2,
+        packed_token_indices=indices,
+        learnable_sink=sink,
+        window_size=(129, 0),
+    )
+    assert kwargs["window_size"] == (128, None)
+    torch.testing.assert_close(q1, q[indices])
+    expected = q1 + k1.repeat_interleave(2, -2) + v1.repeat_interleave(2, -2) + sink[None, :, None]
+    external = ModuleType("flash_attn.cute")
+    external.flash_attn_func = mock.Mock(side_effect=AssertionError("dense selected"))
+    external.flash_attn_varlen_func = mock.Mock(return_value=(expected, None))
+    with mock.patch.dict(sys.modules, {"flash_attn.cute": external}):
+        _, run = initialize_attn_module_and_func("fa4", 2, 4, 4, 0.5, qkv_format="thd")
+    output = run(q1, k1, v1, **kwargs)
+    assert output.shape == (5, 2, 4)
+    padding = torch.ones(5, dtype=torch.bool)
+    padding[indices] = False
+    assert torch.count_nonzero(output[padding]) == 0
+    upstream = torch.randn_like(output)
+    upstream[padding] = 0
+    output.backward(upstream)
+    for tensor in (q, k, v):
+        assert tensor.grad is not None and torch.count_nonzero(tensor.grad[padding]) == 0
+    assert sink.grad is not None
+    if empty:
+        external.flash_attn_varlen_func.assert_not_called()
+        assert torch.equal(sink.grad, torch.zeros_like(sink))
+    else:
+        torch.testing.assert_close(output[indices], expected)
+        torch.testing.assert_close(sink.grad, upstream[indices].sum((0, 2)))
+
+
+def test_fa4_physical_dependency_identity_is_cached_and_unreadable_falls_back(tmp_path: Path) -> None:
+    from hashlib import sha256
+    from types import SimpleNamespace
+
+    import nemo_automodel.components.attention.utils as utils
+
+    source = tmp_path / "interface.py"
+    source.write_bytes(b"original dependency fixture")
+    utils._fa4_interface_sha256.cache_clear()
+    try:
+        with mock.patch.object(
+            utils, "safe_import", return_value=(True, SimpleNamespace(__file__=str(source)))
+        ) as importer:
+            expected = sha256(source.read_bytes()).hexdigest()
+            assert utils._fa4_interface_sha256() == expected
+            source.write_bytes(b"changed fixture")
+            assert utils._fa4_interface_sha256() == expected
+            assert importer.call_count == 1
+        utils._fa4_interface_sha256.cache_clear()
+        with mock.patch.object(
+            utils, "safe_import", return_value=(True, SimpleNamespace(__file__=str(source / "missing")))
+        ):
+            assert utils._fa4_interface_sha256() is None
+    finally:
+        utils._fa4_interface_sha256.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [None, "small_valid", "softcap", "window", "sink_dtype", "sink_device", "missing_used", "cpu", "other_arch"],
+)
+def test_fa4_physical_canonical_scope(change: str | None) -> None:
+    from types import SimpleNamespace
+
+    import nemo_automodel.components.attention.utils as utils
+
+    device = torch.device("cuda:0")
+    q = SimpleNamespace(shape=(32768, 64, 64), dtype=torch.bfloat16, is_cuda=True, device=device)
+    k = SimpleNamespace(shape=(32768, 8, 64), dtype=torch.bfloat16)
+    v = SimpleNamespace(shape=(32768, 8, 64), dtype=torch.bfloat16)
+    sink = SimpleNamespace(shape=(64,), dtype=torch.bfloat16, device=device)
+    kwargs = dict(
+        _fa4_seqused=torch.ones(512, dtype=torch.int32),
+        packed_token_indices=torch.arange(32768),
+        _fa4_physical_cu_seqlens=torch.arange(513, dtype=torch.int32),
+        learnable_sink=sink,
+        window_size=(129, 0),
+    )
+    if change == "small_valid":
+        kwargs["packed_token_indices"] = torch.arange(128)
+    if change == "softcap":
+        kwargs["softcap"] = 1.0
+    if change == "window":
+        kwargs["window_size"] = (65, 0)
+    if change == "sink_dtype":
+        sink.dtype = torch.float32
+    if change == "sink_device":
+        sink.device = torch.device("cpu")
+    if change == "missing_used":
+        kwargs.pop("_fa4_seqused")
+    if change == "cpu":
+        q.is_cuda = False
+    with mock.patch.object(
+        torch.cuda, "get_device_capability", return_value=(9, 0) if change == "other_arch" else (10, 0)
+    ):
+        assert utils._fa4_canonical_thd(q, k, v, kwargs) is (change is None)
+
+
+@pytest.mark.parametrize("dependency", ["patched", "original", "unknown"])
+@pytest.mark.parametrize("window", [(-1, 0), (129, 0)])
+def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency: str, window: tuple[int, int]) -> None:
+    from torch.utils.checkpoint import checkpoint
+
+    import nemo_automodel.components.attention.utils as utils
+    from nemo_automodel.components.models.common.packing import _flatten_packed_metadata_at_model_entry
+
+    tokens = 144
+    physical = torch.tensor([0, 136, 136, 140], dtype=torch.int32)
+    valid = torch.zeros(tokens, dtype=torch.bool)
+    valid[:128] = True
+    valid[136:139] = True
+    original = dict(qkv_format="thd", cu_seqlens=physical, cu_seqlens_padded=physical, padding_mask=~valid)
+    prepared = _flatten_packed_metadata_at_model_entry(None, (torch.arange(tokens),), original)[1]
+    sink = torch.randn(2, requires_grad=True)
+    qkv = [torch.randn(tokens, 2, 4, requires_grad=True) for _ in range(3)]
+    seen = []
+
+    def kernel(q, k, v, **kwargs):
+        # Differentiable kernel stand-in: actual shared metadata/dispatch/scatter is exercised.
+        used = kwargs.get("seqused_q")
+        seen.append((q, kwargs))
+        output = q + k + v + kwargs["learnable_sink"][None, :, None]
+        if used is not None:
+            mask = torch.zeros(q.shape[0], dtype=torch.bool)
+            for start, count in zip(kwargs["cu_seqlens_q"][:-1], used, strict=True):
+                mask[int(start) : int(start + count)] = True
+            output = torch.where(mask[:, None, None], output, 0)
+        return output, None
+
+    package = ModuleType("flash_attn.cute")
+    package.flash_attn_func = mock.Mock(side_effect=AssertionError("dense path selected"))
+    package.flash_attn_varlen_func = kernel
+    sha = {
+        "patched": utils._FA4_PHYSICAL_INTERFACE_SHA256,
+        "original": utils._FA4_ORIGINAL_INTERFACE_SHA256,
+        "unknown": None,
+    }[dependency]
+    with (
+        mock.patch.dict(sys.modules, {"flash_attn.cute": package}),
+        mock.patch.object(utils, "_fa4_interface_sha256", return_value=sha),
+    ):
+        _, call = initialize_attn_module_and_func("fa4", 2, 4, 4, 0.5)
+        # Scope policy has separate shape/device tests above; force this small CPU routing fixture eligible.
+        with mock.patch.object(utils, "_fa4_canonical_thd", return_value=True):
+
+            def forward(*values):
+                a, b, c, kwargs = preprocess_args_and_kwargs_for_attn(
+                    *values, None, "fa4", **prepared, learnable_sink=sink, window_size=window
+                )
+                if dependency == "patched":
+                    assert all(x is y for x, y in zip((a, b, c), values, strict=True))
+                return call(a, b, c, **kwargs)
+
+            reference = torch.where(valid[:, None, None], qkv[0] + qkv[1] + qkv[2] + sink[None, :, None], 0)
+            expected = torch.autograd.grad(reference, [*qkv, sink], torch.ones_like(reference))
+            for recompute in (False, True):
+                output = checkpoint(forward, *qkv, use_reentrant=False) if recompute else forward(*qkv)
+                gradients = torch.autograd.grad(output, [*qkv, sink], torch.ones_like(output))
+                assert torch.equal(output, reference)
+                assert all(torch.equal(a, b) for a, b in zip(gradients, expected, strict=True))
+                assert all(torch.count_nonzero(g[~valid]) == 0 for g in gradients[:3])
+    assert all(("seqused_q" in kw) is (dependency == "patched") for _, kw in seen)
+    assert all(kw["max_seqlen_q"] == (129 if dependency != "unknown" else 128) for _, kw in seen)
+    assert all(kw["window_size"] == ((None, None) if window[0] < 0 else (128, None)) for _, kw in seen)
+    assert all(kw["learnable_sink"] is sink for _, kw in seen)
+    assert torch.equal(original["cu_seqlens_padded"], physical)
+
+
+def test_fa4_physical_missing_max_has_descriptive_error() -> None:
+    import nemo_automodel.components.attention.utils as utils
+
+    q = torch.empty(2, 2, 4)
+    metadata = dict(
+        qkv_format="thd",
+        _fa4_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        packed_token_indices=torch.arange(2),
+        _fa4_seqused=torch.tensor([2], dtype=torch.int32),
+        _fa4_physical_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    with mock.patch.object(utils, "_fa4_canonical_thd", return_value=True):
+        with pytest.raises(ValueError, match="requires max_seqlen"):
+            preprocess_args_and_kwargs_for_attn(q, q, q, None, "fa4", **metadata)
+
+
+def test_fa4_physical_tensor_maximum_keeps_compact_contract() -> None:
+    import nemo_automodel.components.attention.utils as utils
+
+    q = torch.empty(4, 2, 4)
+    maximum = torch.tensor(2, dtype=torch.int32)
+    metadata = dict(
+        qkv_format="thd",
+        _fa4_cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        packed_token_indices=torch.tensor([0, 1]),
+        _fa4_seqused=torch.tensor([2], dtype=torch.int32),
+        _fa4_physical_cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+        _fa4_max_seqlen=maximum,
+    )
+    with mock.patch.object(utils, "_fa4_canonical_thd", return_value=True) as scope:
+        a, b, c, kwargs = preprocess_args_and_kwargs_for_attn(q, q, q, None, "fa4", **metadata)
+    scope.assert_not_called()
+    assert a.shape[0] == b.shape[0] == c.shape[0] == 2
+    assert kwargs["max_seqlen_q"] is maximum and "seqused_q" not in kwargs

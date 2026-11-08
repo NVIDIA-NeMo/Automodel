@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packing import _flatten_packed_metadata_at_model_entry
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -169,6 +170,26 @@ class GptOssModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Run decoder layers, preparing private FA4 metadata once per model call.
+
+        Args:
+            input_ids: Token IDs [batch, sequence] or physical THD IDs [tokens].
+            position_ids: Optional positions with the same token layout.
+            attention_mask: Optional BSHD padding mask [batch, sequence].
+            padding_mask: Optional bool [tokens] mask, True at physical THD padding.
+            **attn_kwargs: Original THD offsets [documents + 1], maxima and layout;
+                private FA4 offsets index compact valid tokens. Inputs are not mutated.
+
+        Returns:
+            Hidden states [batch, sequence, hidden] or [physical_tokens, hidden].
+        """
+        if self.backend.attn == "fa4" and attn_kwargs.get("qkv_format") == "thd":
+            prepared = _flatten_packed_metadata_at_model_entry(
+                self, (input_ids,), {**attn_kwargs, "padding_mask": padding_mask}
+            )
+            if prepared is not None:
+                _, attn_kwargs = prepared
+                attn_kwargs.pop("padding_mask")
         if position_ids is None:
             if input_ids.ndim == 1:
                 position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
@@ -220,6 +241,7 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _packed_cp_attn_backends = ("te",)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -229,6 +251,46 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = False
         supports_pp: bool = False
         supports_ep: bool = True
+        supports_thd: bool = True
+
+    @property
+    def _owns_packed_attention(self) -> bool:
+        """Declare only this model's bounded FA4 THD input path."""
+        return self.backend.attn == "fa4"
+
+    def prepare_model_inputs_for_cp(self, batch: dict[str, Any], *, num_chunks: int = 1) -> dict[str, Any]:
+        """Reuse the shared THD conversion before model inputs and labels diverge.
+
+        Args:
+            batch: Raw packed inputs and labels [batch, sequence], positions
+                [batch, sequence], and real/padded lengths [batch, documents].
+                The mapping is unchanged here; the returned sharder prepares
+                row-major token streams and matching masks/offsets together.
+            num_chunks: Number of pipeline chunks; FA4 supports one chunk only.
+
+        Returns:
+            The existing THD sharder for FA4, or an empty mapping to retain the
+            framework's existing backend path. This method touches no weights.
+        """
+        if self.backend.attn != "fa4" or batch.get("qkv_format") != "thd":
+            return {}
+        if num_chunks != 1:
+            raise ValueError("GPT-OSS FA4 THD preparation requires a single non-pipeline chunk")
+        from nemo_automodel.components.distributed.context_parallel.utils import (  # noqa: PLC0415
+            _resolve_cp_sharder,
+        )
+
+        return {
+            "cp_sharder": _resolve_cp_sharder(
+                None,
+                None,
+                magi=None,
+                is_thd=True,
+                num_chunks=num_chunks,
+                seq_lens_padding_value=-1000,
+                model=self,
+            )
+        }
 
     @classmethod
     def from_config(
