@@ -21,6 +21,7 @@ distributed:
   dp_replicate_size: 1
   ep_size: 8
   sequence_parallel: false
+  activation_checkpointing: true
 autopipeline:
   _target_: nemo_automodel.components.distributed.pipelining.AutoPipeline
   pp_schedule: interleaved1f1b
@@ -33,9 +34,6 @@ autopipeline:
 dist_env:
   backend: nccl
   timeout_minutes: 10
-parallelizer:
-  _target_: nemo_automodel.components.moe.parallelizer.parallelize_model
-  activation_checkpointing: true
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
   config:

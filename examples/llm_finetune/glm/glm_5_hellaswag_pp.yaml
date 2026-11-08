@@ -114,6 +114,8 @@ ci:
   recipe_owner: hemildesai
   nodes: 128
   time: "00:45:00"
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   perf_testing:
     fake_balanced_gate: true
     schedule: weekly

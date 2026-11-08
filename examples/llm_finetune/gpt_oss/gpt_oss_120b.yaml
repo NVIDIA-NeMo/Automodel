@@ -127,6 +127,8 @@ ci:
   local_batch_size: 1
   nodes: 8
   time: "01:00:00"
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   perf_testing:
     fake_balanced_gate: true
     schedule: nightly
