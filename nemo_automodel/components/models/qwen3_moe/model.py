@@ -218,14 +218,22 @@ class Qwen3MoeModel(nn.Module):
         rotary_positions = (
             position_ids.reshape(1, -1) if self.backend.rope_fusion and qkv_format == "bshd" else position_ids
         )
-        concentration, _ = self.rotary_emb._compute_concentration_and_inv_freq()
-        freqs_cis = position_ids_to_freqs_cis(
-            self.rotary_emb,
-            rotary_positions,
-            qkv_format=qkv_format,
-            for_fused_rope=self.backend.rope_fusion,
-            cp_size=attn_kwargs.get("cp_size", 1),
-        )
+        concentration, inv_freq = self.rotary_emb._compute_concentration_and_inv_freq()
+        if self.backend.rope_fusion:
+            freqs_cis = position_ids_to_freqs_cis(
+                self.rotary_emb,
+                rotary_positions,
+                qkv_format=qkv_format,
+                for_fused_rope=True,
+                cp_size=attn_kwargs.get("cp_size", 1),
+            )
+        else:
+            # Keep coefficients unscaled: both implementations apply concentration
+            # after FP32 rotation, before their one final cast back to Q/K dtype.
+            angles = position_ids.float().unsqueeze(-1) * inv_freq.to(device=position_ids.device, dtype=torch.float32)
+            freqs_cis = torch.cat((angles.cos(), angles.sin()), dim=-1)
+            if qkv_format == "thd":
+                freqs_cis = freqs_cis.reshape(-1, freqs_cis.shape[-1])
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 

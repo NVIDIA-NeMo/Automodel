@@ -29,7 +29,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
 )
-from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.components.models.qwen3_moe.rope_utils import apply_rotary_emb_qk
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.getLogger(__name__)
@@ -196,13 +196,6 @@ class Qwen3MoeAttention(nn.Module):
         # TE broadcasts one angle table across its batch axis; flattening avoids
         # discarding later examples without inspecting CUDA position values.
         q_shape, k_shape = q.shape, k.shape
-        q_dtype, k_dtype = q.dtype, k.dtype
-        # Match TE's FP32 rotary arithmetic in the eager path as well. Casting
-        # coefficients/products to BF16 before each operation changes routing
-        # and gradients when fusion is toggled. Round only the rotated result.
-        # Non-unit concentration also needs FP32 output until scaling is applied.
-        if not self.backend.rope_fusion or rope_concentration != 1.0:
-            q, k = q.float(), k.float()
         if qkv_format == "bshd" and self.backend.rope_fusion and freqs_cis.shape[0] == bsz * seqlen:
             q = q.reshape(1, bsz * seqlen, self.num_heads, self.head_dim)
             k = k.reshape(1, bsz * seqlen, self.num_kv_heads, self.head_dim)
@@ -220,7 +213,7 @@ class Qwen3MoeAttention(nn.Module):
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
 
-        q, k = q.reshape(q_shape).to(q_dtype), k.reshape(k_shape).to(k_dtype)
+        q, k = q.reshape(q_shape), k.reshape(k_shape)
 
         # Backend-specific attention
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(

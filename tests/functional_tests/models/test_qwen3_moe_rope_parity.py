@@ -126,7 +126,10 @@ def test_qwen_rotary_fusion_outputs_and_parameter_gradients(
     for index in (0, 1):
         actual_rotary = prepare_attention.call_args_list[0].args[index]
         expected_rotary = prepare_attention.call_args_list[1].args[index]
-        assert _relative_error(actual_rotary, expected_rotary) < (1e-6 if dtype == torch.float32 else 1e-4)
+        if dtype == torch.bfloat16:
+            torch.testing.assert_close(actual_rotary, expected_rotary, rtol=0, atol=0)
+        else:
+            assert _relative_error(actual_rotary, expected_rotary) < 1e-6
     tolerance = 5e-5 if dtype == torch.float32 else 5e-3
     assert _relative_error(actual, expected) < tolerance
     for (name, parameter), (reference_name, reference_parameter) in zip(
