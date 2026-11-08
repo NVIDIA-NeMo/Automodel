@@ -419,6 +419,7 @@ def test_hybridep_preprocess_records_cuda_graph_sample(hybrid_ep_manager, monkey
         ("moe_hybridep_capacity_factor", 1.5),
         ("moe_hybridep_equal_token_counts", True),
         ("moe_hybridep_recompute_cache", "combine"),
+        ("moe_router_expert_pad_multiple", 32),
     ],
 )
 def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, setting, value):
@@ -435,6 +436,23 @@ def test_shared_hybridep_manager_rejects_incompatible_settings(monkeypatch, sett
     monkeypatch.setattr(config, setting, value)
     with pytest.raises(ValueError, match="identical routing, fusion, kernel tuning, and sync-free"):
         MoEFlexTokenDispatcher(2, [0, 1], config, group)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("alignment", [None, 32, 128])
+def test_hybridep_manager_receives_expert_alignment(monkeypatch, shared, alignment):
+    monkeypatch.setattr(MoEFlexTokenDispatcher, "shared_hybridep_manager", None)
+    monkeypatch.setattr("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", Mock())
+    config = TokenDispatcherConfig(
+        moe_flex_dispatcher_backend="hybridep",
+        num_moe_experts=8,
+        moe_share_token_dispatcher=shared,
+        moe_router_expert_pad_multiple=alignment,
+    )
+    group = Mock()
+    group.size.return_value = 4
+    dispatcher = MoEFlexTokenDispatcher(2, [0, 1], config, group)
+    assert dispatcher._comm_manager.pad_multiple == alignment
 
 
 class TestIndicesToMultihot:

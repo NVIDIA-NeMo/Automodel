@@ -2567,6 +2567,57 @@ def test_te_nccl_ep_alignment_follows_te_fp8(moe_config, fake_native_te, monkeyp
         assert GroupedExpertsTE(moe_config, backend=deepep).expert_alignment == 1
 
 
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("kind", [None, "current", "mxfp8", "block"])
+def test_te_hybridep_alignment_uses_gemm_path(moe_config, fake_native_te, monkeypatch, native, kind):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    monkeypatch.setattr("nemo_automodel.components.models.common.utils.HAVE_TE", True)
+    recipe = None if kind is None else {"recipe": _fake_recipe(kind)}
+    backend = BackendConfig(experts="te", dispatcher="hybridep", te_grouped_tensor=native, te_fp8=recipe)
+    experts = GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="hybridep")
+    expected = 1 if kind is None else 128 if native and kind in ("mxfp8", "block") else 32 if kind == "mxfp8" else 16
+    assert experts.expert_alignment == expected
+    mesh = Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    mesh.mesh_dim_names = ("ep",)
+    with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher") as dispatcher:
+        experts.init_token_dispatcher(mesh)
+    args = dispatcher.call_args.kwargs
+    assert args["config"].moe_router_expert_pad_multiple == (expected if expected > 1 else None)
+    assert args["expert_alignment"] == 1  # NCCL-EP's separate constructor contract stays backend-specific.
+
+
+def test_te_hybridep_rechecks_runtime_recipe_alignment(moe_config, fake_native_te, monkeypatch):
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    monkeypatch.setattr("nemo_automodel.components.models.common.utils.HAVE_TE", True)
+    recipe = _fake_recipe("mxfp8")
+    backend = BackendConfig(experts="te", dispatcher="hybridep", te_fp8={"recipe": recipe})
+    experts = GroupedExpertsTE(moe_config, backend=backend, dispatcher_backend="hybridep")
+    assert experts.expert_alignment == 32
+    mesh = Mock()
+    mesh.size.return_value = 2
+    mesh.get_local_rank.return_value = 0
+    mesh.mesh_dim_names = ("ep",)
+    experts.init_token_dispatcher(mesh)
+    experts.expert_activation = lambda values, probabilities: values.chunk(2, -1)[0] * probabilities
+    x = torch.randn(3, moe_config.dim, dtype=moe_config.dtype, requires_grad=True)
+    args = (x, torch.ones(3, dtype=torch.bool), torch.ones(3, 1, dtype=x.dtype), torch.zeros(3, 1, dtype=torch.long))
+    fake_native_te.state.is_fp8_enabled.return_value = True
+    fake_native_te.state.get_fp8_recipe.return_value = recipe
+    experts(*args)
+    assert experts.fp8_padding.calls == 0
+    # An externally selected recipe may need stricter alignment than the dispatcher was constructed with.
+    monkeypatch.setattr(
+        sys.modules["transformer_engine.pytorch.quantization"], "get_align_size_for_quantization", lambda recipe: 128
+    )
+    experts(*args)
+    assert experts.fp8_padding.calls == 2
+    assert experts.fp8_unpadding.calls == 1
+
+
 def test_te_nccl_ep_requires_grouped_tensor(moe_config, fake_native_te):
     from nemo_automodel.components.moe.experts import GroupedExpertsTE
 

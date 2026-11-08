@@ -503,6 +503,7 @@ class _HybridEPManager(_DispatchManager):
         moe_hybridep_capacity_factor: float | None = None,
         moe_hybridep_equal_token_counts: bool = False,
         moe_hybridep_recompute_cache: str = "none",
+        moe_router_expert_pad_multiple: int | None = None,
     ) -> None:
         self.group = group
         self.num_local_experts = num_local_experts
@@ -540,7 +541,7 @@ class _HybridEPManager(_DispatchManager):
         # Initialize per-dispatch state; setup_metadata and dispatch fill it,
         # and combine releases the remaining state after removing any token padding.
         self._release_dispatch_state()
-        self.pad_multiple = None
+        self.pad_multiple = moe_router_expert_pad_multiple
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -1185,6 +1186,7 @@ class MoEFlexTokenDispatcher:
                         moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                         moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                         moe_hybridep_recompute_cache=self.config.moe_hybridep_recompute_cache,
+                        moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                     )
                 self._comm_manager = MoEFlexTokenDispatcher.shared_hybridep_manager
                 if (
@@ -1196,6 +1198,7 @@ class MoEFlexTokenDispatcher:
                     self._comm_manager.hybridep_capacity_factor,
                     self._comm_manager.equal_token_counts,
                     self._comm_manager.moe_hybridep_recompute_cache,
+                    self._comm_manager.pad_multiple,
                 ) != (
                     self.config.moe_hybridep_compact_routing,
                     self.config.moe_hybridep_permute_fusion,
@@ -1205,6 +1208,7 @@ class MoEFlexTokenDispatcher:
                     self.config.moe_hybridep_capacity_factor,
                     self.config.moe_hybridep_equal_token_counts,
                     self.config.moe_hybridep_recompute_cache,
+                    self.config.moe_router_expert_pad_multiple,
                 ):
                     raise ValueError(
                         "Shared HybridEP dispatchers must use identical routing, fusion, kernel tuning, and sync-free "
@@ -1227,6 +1231,7 @@ class MoEFlexTokenDispatcher:
                     moe_hybridep_capacity_factor=self.config.moe_hybridep_capacity_factor,
                     moe_hybridep_equal_token_counts=self.config.moe_hybridep_equal_token_counts,
                     moe_hybridep_recompute_cache=self.config.moe_hybridep_recompute_cache,
+                    moe_router_expert_pad_multiple=self.config.moe_router_expert_pad_multiple,
                 )
             self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
                 num_experts=self.tp_size * self.config.num_moe_experts,

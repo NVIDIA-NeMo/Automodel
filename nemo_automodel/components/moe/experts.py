@@ -1392,19 +1392,20 @@ def _routed_rows_swiglu(
     return partial(swiglu_routed_rows, routed_rows=tokens_per_expert.sum(dim=0, keepdim=True), limit=limit)
 
 
-def _te_grouped_gemm_alignment(recipe: "Recipe | None") -> int:
-    """Return the row multiple that TE's grouped-tensor expert GEMMs need in each expert segment.
+def _te_expert_gemm_alignment(recipe: "Recipe | None", *, use_grouped_tensor: bool) -> int:
+    """Return TE's required expert-row multiple for the selected GEMM path.
 
     Args:
         recipe: Active Transformer Engine quantization recipe, or None for unquantized GEMMs.
+        use_grouped_tensor: Whether experts use TE's native grouped-tensor GEMMs.
 
     Returns:
-        1 without quantization; 128 for MXFP8 and FP8 block scaling; otherwise Transformer
-        Engine's alignment for the recipe.
+        1 without quantization; 128 for grouped-tensor MXFP8 and FP8 block scaling;
+        otherwise Transformer Engine's alignment for the recipe.
     """
     if recipe is None:
         return 1
-    if recipe.mxfp8() or recipe.float8_block_scaling():
+    if use_grouped_tensor and (recipe.mxfp8() or recipe.float8_block_scaling()):
         return 128
     from transformer_engine.pytorch.quantization import get_align_size_for_quantization
 
@@ -2136,11 +2137,14 @@ class GroupedExpertsTE(nn.Module):
                 "nccl_ep.zero_copy requires apply_router_weight_after_down=False: the down projection "
                 "writes the combine input directly"
             )
-        # NCCL-EP pads each expert's rows to the multiple the FP8 grouped GEMMs need, so they run
-        # without TE's padding and unpadding copies. Other dispatchers pack rows unpadded.
+        # Keep one alignment policy for native dispatcher padding and TE's fallback padding.
+        # HybridEP retains the legacy path's granularity (MXFP8=32), while NCCL-EP
+        # uses grouped-tensor GEMMs (MXFP8=128).
         self.expert_alignment = 1
-        if nccl_ep and backend is not None and backend.te_fp8 is not None:
-            self.expert_alignment = _te_grouped_gemm_alignment(backend.te_fp8.build_recipe())
+        if dispatcher_backend in ("nccl_ep", "hybridep") and backend is not None and backend.te_fp8 is not None:
+            self.expert_alignment = _te_expert_gemm_alignment(
+                backend.te_fp8.build_recipe(), use_grouped_tensor=self.use_grouped_tensor
+            )
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -2460,6 +2464,9 @@ class GroupedExpertsTE(nn.Module):
 
         token_dispatcher_config = TokenDispatcherConfig(
             moe_router_topk=self.config.n_activated_experts,
+            moe_router_expert_pad_multiple=(
+                self.expert_alignment if self.dispatcher_backend == "hybridep" and self.expert_alignment > 1 else None
+            ),
             num_moe_experts=self.config.n_routed_experts,
             moe_permute_fusion=True,
             moe_enable_deepep=True,
@@ -2487,7 +2494,7 @@ class GroupedExpertsTE(nn.Module):
             config=token_dispatcher_config,
             ep_group=ep_mesh.get_group(),
             hidden_dim=self.config.expert_dim,
-            expert_alignment=self.expert_alignment,
+            expert_alignment=self.expert_alignment if self.dispatcher_backend == "nccl_ep" else 1,
         )
 
     def get_pipeline_runtime_initializers(self) -> tuple[HybridEPPipelineRuntimeInitializer, ...]:
@@ -2596,9 +2603,11 @@ class GroupedExpertsTE(nn.Module):
                         f"te_grouped_tensor=True does not support {recipe!r} with {dtype} on this device. {fallback}"
                     )
                 self._grouped_tensor_signature = signature
-        # NCCL-EP already padded each expert's rows for the te_fp8 recipe; other dispatchers pack them unpadded.
+        # Dispatcher alignment must cover the active recipe, including external autocast changes.
         rows_aligned = recipe is None or (
-            self.expert_alignment > 1 and self.expert_alignment % _te_grouped_gemm_alignment(recipe) == 0
+            self.expert_alignment > 1
+            and self.expert_alignment % _te_expert_gemm_alignment(recipe, use_grouped_tensor=self.use_grouped_tensor)
+            == 0
         )
         actual_m_splits = None
         unpadding = self.fp8_unpadding
