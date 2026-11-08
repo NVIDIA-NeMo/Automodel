@@ -20,9 +20,9 @@ are shifted by one token, including across chunk boundaries.
 The canonical configs contain the benchmark's model initialization, precision,
 kernels, loss, optimizer, parallelism and global/local batches. Their normal route
 uses real gates; only `ci.perf_testing.fake_balanced_gate` enables balanced gates.
-Kimi's synthetic-only `benchmark_static_routing` remains disabled in both normal
-and performance runs because it cannot represent real routing. This is a recorded
-difference from those two legacy synthetic runs.
+Kimi and Step-5 keep synthetic-only `benchmark_static_routing` disabled in both
+normal and performance runs because it cannot represent real routing. This is a
+recorded difference from the two Kimi and one Step-5 legacy synthetic runs.
 
 Run a config directly with the resources in its `ci` section, for example:
 
