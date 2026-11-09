@@ -33,10 +33,7 @@ from nemo_automodel.components.speculative.dflash.draft_kimi_k3 import (
     build_kimi_k3_dflash_draft_config,
     build_kimi_k3_dflash_target_kwargs,
 )
-from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
-    Qwen3DFlashDraftModel,
-    build_qwen3_dflash_draft_config,
-)
+from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.components.speculative.dflash.draft_qwen3_dflash2 import Qwen3DFlash2DraftModel
 
 
@@ -118,7 +115,6 @@ DFLASH_DRAFT_REGISTRY: dict[str, DFlashDraftSpec] = {
         arch: DFlashDraftSpec(
             draft_cls=Qwen3DFlashDraftModel,
             draft2_cls=Qwen3DFlash2DraftModel,
-            build_draft_config=build_qwen3_dflash_draft_config,
         )
         for arch in _QWEN3_ARCHITECTURES
     },
