@@ -23,7 +23,7 @@ from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 from torch.utils.data import DataLoader
@@ -49,6 +49,9 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
 from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.datasets.vlm.pp_media import wrap_vlm_collate_for_pp
+
+if TYPE_CHECKING:
+    from transformers.video_processing_utils import BaseVideoProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -202,12 +205,12 @@ class RankedVlmDatasetConfig(Protocol):
 class VlmVideoProcessorConfig:
     """Declarative video-processor factory and keyword arguments."""
 
-    factory: Callable[..., object]
+    factory: Callable[..., BaseVideoProcessor]
     """Configured video-processor factory."""
     kwargs: dict[str, object] = field(default_factory=dict)
     """Declarative keyword arguments for the configured factory."""
 
-    def build(self, *, pretrained_model_name_or_path: str) -> object:
+    def build(self, *, pretrained_model_name_or_path: str) -> BaseVideoProcessor:
         """Build the configured video processor.
 
         Args:
@@ -369,7 +372,7 @@ class VlmDataloaderConfig:
         dp_world_size: int,
         batch_size: int,
         dataset_build_context: AbstractContextManager[object] | None = None,
-        get_rope_index: Callable[..., object] | None = None,
+        get_rope_index: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
         packing_attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         pp_n_microbatches: int | None = None,

@@ -450,6 +450,103 @@ def test_hybridep_checkpoint_replay_reuses_the_forward_capacity_extent():
     assert buffer.replayed_num_permuted_tokens == 24
 
 
+@pytest.mark.parametrize("max_tokens_per_rank,expected_seq_len", [(None, 2), (3072, 3072), (1, 2)])
+def test_hybridep_first_dispatch_presizes_buffer_to_max_tokens_per_rank(
+    monkeypatch, max_tokens_per_rank, expected_seq_len
+):
+    """The first dispatch must allocate the buffer for max(tokens, max_tokens_per_rank), never smaller than the batch."""
+
+    class FakeHybridEPBuffer:
+        def dispatch_with_permute(self, **kwargs):
+            return kwargs["hidden"], kwargs["probs"], None, torch.tensor([1, 1]), ("handle",)
+
+    recorded = {}
+
+    def fake_init(group, hidden_dim, seq_len, num_local_experts, *args, **kwargs):
+        recorded["seq_len"] = seq_len
+        recorded["hidden_dim"] = hidden_dim
+        fused_a2a._hybrid_ep_buffer = FakeHybridEPBuffer()
+
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+    monkeypatch.setattr(fused_a2a, "init_hybrid_ep_buffer", fake_init)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda *args, **kwargs: None
+    )  # first-call timing sync; CPU tensors here
+    hidden = torch.randn(2, 4)
+    routing_map = torch.tensor([[True, False], [False, True]])
+    probs = torch.randn(2, 2)
+
+    # Call the autograd Function directly (as the legacy-order test does): the ``hybrid_ep_dispatch``
+    # wrapper only exists when HybridEP is importable. Positional order ends with the new argument.
+    fused_a2a.HybridEPDispatch.apply(
+        hidden,
+        routing_map,
+        probs,
+        None,
+        2,
+        20,
+        21,
+        None,
+        None,
+        None,
+        None,
+        False,
+        None,
+        None,
+        None,
+        max_tokens_per_rank,
+    )
+
+    assert recorded == {"seq_len": expected_seq_len, "hidden_dim": 4}
+
+
+@pytest.mark.parametrize("max_tokens_per_rank", [None, 2048])
+def test_hybridep_dispatch_backward_returns_one_gradient_per_forward_input(monkeypatch, max_tokens_per_rank):
+    """Backward through ``HybridEPDispatch`` must work when every forward argument is passed.
+
+    ``hybrid_ep_dispatch`` always forwards all 16 arguments (``max_tokens_per_rank`` included), so
+    autograd expects 16 gradients from ``backward``; a shorter tuple fails every backward, whether
+    or not the option is set.
+    """
+
+    class FakeHybridEPBuffer:
+        def dispatch_with_permute(self, **kwargs):
+            return kwargs["hidden"], kwargs["probs"], None, torch.tensor([1, 1]), ("handle",)
+
+        def combine_with_unpermute(self, *, hidden, probs, handle, pad_multiple, fuse_unpermute_combine=False):
+            assert handle == ("handle",)
+            return hidden * 2, probs * 3
+
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", FakeHybridEPBuffer())
+    hidden = torch.randn(2, 4, requires_grad=True)
+    routing_map = torch.tensor([[True, False], [False, True]])
+    probs = torch.randn(2, 2, requires_grad=True)
+
+    # Same positional call as the ``hybrid_ep_dispatch`` wrapper: all 16 forward inputs.
+    dispatched_hidden, dispatched_probs, _, _, _ = fused_a2a.HybridEPDispatch.apply(
+        hidden,
+        routing_map,
+        probs,
+        None,
+        2,
+        20,
+        21,
+        None,
+        None,
+        None,
+        None,
+        False,
+        None,
+        None,
+        None,
+        max_tokens_per_rank,
+    )
+    (dispatched_hidden.sum() + dispatched_probs.sum()).backward()
+
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 2))
+    torch.testing.assert_close(probs.grad, torch.full_like(probs, 3))
+
+
 # ---------------------------------------------------------------------------
 # BackendConfig.dispatcher_recompute_cache: the combine output of the checkpoint
 # forward is served in the recompute

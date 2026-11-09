@@ -105,7 +105,7 @@ def _packed_batch(contract, materialize_4d_mask, single_document=False):
         ``position_ids`` of shape [3, 1, sequence], and packing metadata.
     """
     from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
-    from nemo_automodel.components.datasets.vlm.neat_packing_vlm import _build_packed_vlm_sample
+    from nemo_automodel.components.datasets.vlm.preprocessing import merge_vlm_documents
 
     generator = torch.Generator().manual_seed(4321)
     lengths = (sum(DOC_LENGTHS),) if single_document else DOC_LENGTHS
@@ -120,7 +120,7 @@ def _packed_batch(contract, materialize_4d_mask, single_document=False):
             }
         )
         start += length
-    pack = _build_packed_vlm_sample(samples, pack_size=sum(DOC_LENGTHS), padding_idx=0, has_mrope=True)
+    pack = merge_vlm_documents(samples, padding_idx=0, has_mrope=True)
     return neat_packed_vlm_collater([pack], padding_idx=0, packing=contract, materialize_4d_mask=materialize_4d_mask)
 
 
