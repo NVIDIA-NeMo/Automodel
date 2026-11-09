@@ -113,6 +113,24 @@ to enable it with Zephon's defaults, or provide `buffer_size` and `parallelism`
 inside that mapping to tune it. Omit the group or set it to `null` to leave the
 operator out; runtime buffering remains enabled independently.
 
+For remote sources, configure a node-local shard cache. Its disk budget and the
+Parquet decoded row-group cache budget are independent; neither bounds pipeline RAM:
+
+```yaml
+cache:
+  cache_dir: /local_nvme/zephon
+  cache_limit_bytes: 80gb
+  parquet_rg_cache:
+    limit_bytes: 8gb
+```
+
+These settings live under `dataset.zephon` and apply to text and images.
+`parquet_rg_cache` also accepts `enabled`, `root`, and `min_free_bytes`; omitted
+fields use Zephon's defaults. Set `enabled: false` to disable decoded caching.
+See [storage and shard caching](https://docs.zephon.io/datasets/storage_backends_and_shard_cache.html)
+for cache sizing and the [Parquet guide](https://docs.zephon.io/datasets/parquet.html)
+for decoded-cache behavior.
+
 You can also place the data settings in a TOML file and reference it with
 `dataset.zephon.data_config`. Inline YAML values override that file; relative
 source, cache, and checkpoint paths in TOML are resolved relative to the TOML file.
