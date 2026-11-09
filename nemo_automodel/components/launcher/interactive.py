@@ -15,12 +15,25 @@
 import importlib
 import logging
 import os
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Protocol
 
 from nemo_automodel.components.launcher.base import Launcher
 
 logger = logging.getLogger(__name__)
+
+
+class _Recipe(Protocol):
+    """What the interactive launcher needs from a resolved recipe.
+
+    ``resolve_recipe_cls`` can return anything a dotted path points at,
+    so the launcher only relies on this slice of the surface.
+    """
+
+    def setup(self) -> None: ...
+
+    def run_train_validation_loop(self) -> int | None: ...
 
 
 def _get_repo_root() -> Path:
@@ -37,11 +50,12 @@ def _get_repo_root() -> Path:
     return Path(__file__).parents[3]
 
 
-def resolve_recipe_cls(target_str: str):
-    """Import and return the recipe class from a dotted path.
+def resolve_recipe_cls(target_str: str) -> Callable[..., _Recipe]:
+    """Import and return the recipe factory from a dotted path.
 
-    "  pip install nemo-automodel          # CPU/basic\n"
-    "  pip install nemo-automodel[all]     # with CUDA & all extras\n\n"
+    Calling the returned object with the parsed config must produce an
+    object satisfying :class:`_Recipe`; that contract lives with the
+    launcher, not with the config string.
     """
     module_path, cls_name = target_str.rsplit(".", 1)
     module = importlib.import_module(module_path)
@@ -85,21 +99,34 @@ class InteractiveLauncher(Launcher):
         """
         return "LOCAL_RANK" in os.environ and "TORCHELASTIC_RUN_ID" in os.environ
 
-    def _run_recipe_in_process(self, recipe_target: str, config: Dict[str, Any]) -> int:
+    def _run_recipe_in_process(self, recipe_target: str, config: dict[str, Any]) -> int:
         """Instantiate and run a recipe in the current process."""
-        recipe_cls = resolve_recipe_cls(recipe_target)
-        recipe = recipe_cls(config)
+        recipe = resolve_recipe_cls(recipe_target)(config)
         recipe.setup()
-        return recipe.run_train_validation_loop()
+        rc = recipe.run_train_validation_loop()
+        # Recipes currently fall off the end of the loop, so None counts as success.
+        return 0 if rc is None else rc
 
     def launch(
         self,
-        config: Dict[str, Any],
+        config: dict[str, Any],
         config_path: Path,
         recipe_target: str,
-        launcher_config: Any = None,
-        extra_args: List[str] | None = None,
+        launcher_config: int | None = None,
+        extra_args: Sequence[str] | None = None,
     ) -> int:
+        """Run the recipe on this node, via torchrun or in-process.
+
+        Args:
+            config: Parsed YAML config dict (without the launcher section).
+            config_path: Resolved path to the original YAML file.
+            recipe_target: Dotted import path of the recipe class.
+            launcher_config: Number of local processes, or None to auto-detect.
+            extra_args: Additional CLI overrides forwarded to the recipe.
+
+        Returns:
+            Process exit code (0 = success).
+        """
         try:
             from torch.distributed.run import determine_local_world_size, get_args_parser
             from torch.distributed.run import run as thrun
@@ -117,7 +144,7 @@ class InteractiveLauncher(Launcher):
             )
             return self._run_recipe_in_process(recipe_target, config)
 
-        nproc_per_node: int | None = launcher_config
+        nproc_per_node = launcher_config
         repo_root = _get_repo_root()
         script_path = _recipe_module_path(recipe_target, repo_root)
 

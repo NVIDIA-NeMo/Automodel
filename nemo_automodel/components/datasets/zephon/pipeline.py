@@ -136,7 +136,6 @@ def finalize_pipeline(
     The pipeline ends at batch grouping. The loader calls to_training and applies
     model-input adaptations after receiving each original SampleBatch.
     """
-    _, io = safe_import("zephon.io")
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     canonical = (
         options.checkpoint.canonical_replicas if options.checkpoint.canonical_replicas is not None else dp_world_size
@@ -162,14 +161,8 @@ def finalize_pipeline(
         mtp_buffer=options.runtime.mtp_buffer,
         mtp_prefetch=options.runtime.mtp_prefetch,
     )
-    if options.cache.cache_dir is not None:
-        pipeline.options(
-            io_options=io.StoreOptions(
-                cache=io.CacheOptions.from_any(
-                    {"enabled": True, "root": options.cache.cache_dir, "limit_bytes": options.cache.cache_limit_bytes}
-                )
-            )
-        )
+    if options.cache.cache_dir is not None or options.cache.parquet_rg_cache is not None:
+        pipeline.options(io_options=options.cache.build())
     if dist.is_initialized():
         pipeline.options(world_size=world_size, global_rank=dist.get_rank())
     if options.checkpoint.aggregate_dir is not None:
