@@ -16,8 +16,12 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import TYPE_CHECKING
 
 from nemo_automodel.components.launcher.skypilot.config import SkyPilotConfig
+
+if TYPE_CHECKING:
+    import sky
 
 # Fixed remote path where the job config YAML is uploaded.
 REMOTE_CONFIG_PATH = "/tmp/automodel_job_config.yaml"
@@ -34,8 +38,8 @@ _CLOUD_CLASSES = {
 }
 
 
-def _get_cloud(cloud_name: str):
-    """Return a sky cloud object for the given cloud name string."""
+def _get_cloud(cloud_name: str) -> sky.Cloud:
+    """Return the SkyPilot cloud instance for the given cloud name string."""
     import sky
 
     cls_name = _CLOUD_CLASSES[cloud_name.lower()]

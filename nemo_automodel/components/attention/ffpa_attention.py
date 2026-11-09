@@ -530,7 +530,7 @@ def ffpa_attention_forward(
             raise RuntimeError("ffpa_attention_forward: flex_attention is unavailable for sliding-window layers")
         return flex(module, query, key, value, attention_mask, scaling=scaling, softcap=softcap, **kwargs)
 
-    def _fallback():
+    def _fallback() -> tuple[torch.Tensor, torch.Tensor | None]:
         if softcap is None:
             sdpa = _get_sdpa()
             if sdpa is not None:

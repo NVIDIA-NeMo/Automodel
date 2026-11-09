@@ -1,4 +1,4 @@
-# Set dataset.zephon.sources[0].path to your image-conversation JSONL directory.
+# Set dataset.zephon.sources[0].path to your image-conversation self-contained Parquet shard directory.
 # Run: uv run automodel examples/vlm_finetune/zephon/train.yaml --nproc-per-node 1
 recipe: FinetuneRecipeForVLM
 seed: 42
@@ -21,7 +21,6 @@ dataset:
     sources:
     - name: images
       path: /data/image-conversations
-      fmt: jsonl
     packing:
       seq_len: 1024
     source:

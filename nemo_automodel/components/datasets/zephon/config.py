@@ -36,10 +36,12 @@ from nemo_automodel.components.datasets.packing import (
     BatchOutputFormat,
     PackedSequenceContract,
 )
+from nemo_automodel.shared.import_utils import safe_import
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
     from zephon import Pipeline
+    from zephon.io import ParquetRGCacheOptions, StoreOptions
 
     from nemo_automodel.components.datasets.zephon.llm import TokenIds
     from nemo_automodel.components.datasets.zephon.loader import ZephonDataLoader
@@ -260,15 +262,49 @@ class ZephonRuntimeOptions:
 
 
 @dataclass(frozen=True, kw_only=True)
+class ZephonParquetRGCacheOptions:
+    """Decoded Parquet cache overrides; omitted fields retain Zephon defaults."""
+
+    enabled: bool | None = None
+    root: str | None = None
+    limit_bytes: int | str | None = None
+    min_free_bytes: int | str | None = None
+
+    def build(self) -> ParquetRGCacheOptions:
+        """Construct Zephon's cache settings without replacing automatic defaults."""
+        _, io = safe_import("zephon.io")
+        values = {
+            "enabled": self.enabled,
+            "root": self.root,
+            "limit_bytes": self.limit_bytes,
+            "min_free_bytes": self.min_free_bytes,
+        }
+        return io.ParquetRGCacheOptions.from_any({name: value for name, value in values.items() if value is not None})
+
+
+@dataclass(frozen=True, kw_only=True)
 class ZephonCacheOptions:
     """Downloaded source cache settings."""
 
     cache_dir: str | None = None
     cache_limit_bytes: int | str | None = None
+    parquet_rg_cache: ZephonParquetRGCacheOptions | None = None
+    """Separate decoded-cache budget; source shards use cache_limit_bytes."""
 
     def __post_init__(self) -> None:
         if self.cache_limit_bytes is not None and self.cache_dir is None:
             raise ValueError("cache_limit_bytes requires cache_dir")
+
+    def build(self) -> StoreOptions:
+        """Configure source and decoded caches through Zephon's existing I/O API."""
+        _, io = safe_import("zephon.io")
+        cache = None
+        if self.cache_dir is not None:
+            cache = {"enabled": True, "root": self.cache_dir, "limit_bytes": self.cache_limit_bytes}
+        parquet = io.ParquetOptions.from_any(None)
+        if self.parquet_rg_cache is not None:
+            parquet = io.ParquetOptions(rg_cache=self.parquet_rg_cache.build())
+        return io.StoreOptions(cache=io.CacheOptions.from_any(cache), parquet=parquet)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -303,6 +339,7 @@ class ZephonOptions:
     and values delegated to Zephon; these remain declarative until build time.
     """
 
+    source_type: ClassVar[type[ZephonSource]] = ZephonSource
     sources: tuple[ZephonSource, ...] = ()
     source: ZephonSourceOptions = field(default_factory=ZephonSourceOptions)
     packing: ZephonPackingOptions = field(default_factory=ZephonPackingOptions)
@@ -566,6 +603,13 @@ def _group_recipe_options(values: dict[str, Any]) -> dict[str, Any]:
             unknown = prefetch.keys() - {item.name for item in fields(ZephonPrefetchOptions)}
             if unknown:
                 raise ValueError(f"Unexpected Zephon source.prefetch option(s): {sorted(unknown)}")
+        if name == "cache" and group.get("parquet_rg_cache") is not None:
+            decoded = group["parquet_rg_cache"]
+            if not isinstance(decoded, dict):
+                raise ValueError("Zephon cache.parquet_rg_cache must be a mapping or None")
+            unknown = decoded.keys() - {item.name for item in fields(ZephonParquetRGCacheOptions)}
+            if unknown:
+                raise ValueError(f"Unexpected Zephon cache.parquet_rg_cache option(s): {sorted(unknown)}")
         if group:
             values[name] = group
     return values
@@ -596,6 +640,10 @@ def resolve_zephon_settings(values: dict[str, Any]) -> dict[str, Any]:
             value = values.get(group, {}).get(key)
             if value is not None and not Path(value).is_absolute():
                 values[group][key] = str(recipe_path.parent / value)
+        decoded = values.get("cache", {}).get("parquet_rg_cache")
+        if decoded is not None and decoded.get("root") is not None:
+            if not Path(decoded["root"]).is_absolute():
+                decoded["root"] = str(recipe_path.parent / decoded["root"])
     for key, value in _group_recipe_options(inline).items():
         if key in _OPTION_GROUPS:
             inherited = values.get(key, {})
@@ -603,6 +651,11 @@ def resolve_zephon_settings(values: dict[str, Any]) -> dict[str, Any]:
                 # Override individual nested fields, while explicit null disables
                 # the operator even when the TOML file enabled it.
                 value = {**value, "prefetch": {**(inherited.get("prefetch") or {}), **value["prefetch"]}}
+            if key == "cache" and isinstance(value.get("parquet_rg_cache"), dict):
+                value = {
+                    **value,
+                    "parquet_rg_cache": {**(inherited.get("parquet_rg_cache") or {}), **value["parquet_rg_cache"]},
+                }
             values[key] = {**inherited, **value}
         else:
             values[key] = value
@@ -627,17 +680,21 @@ def zephon_options_from_values(
     if unknown:
         raise ValueError(f"Unexpected Zephon option(s): {sorted(unknown)}")
     sources = []
+    source_type = options_type.source_type
     for index, source in enumerate(values.get("sources", [])):
-        unknown_source = set(source) - {item.name for item in fields(ZephonSource)}
+        unknown_source = set(source) - {item.name for item in fields(source_type)}
         if unknown_source:
             raise ValueError(f"Unexpected Zephon source {source.get('name', index)!r} fields: {sorted(unknown_source)}")
         if not source.get("name") or not source.get("path"):
             raise ValueError(f"Zephon source {source.get('name', index)!r} needs a nonempty name and path")
-        sources.append(ZephonSource(**source))
+        sources.append(source_type(**source))
     values["sources"] = tuple(sources)
     prefetch = values.get("source", {}).get("prefetch")
     if prefetch is not None:
         values["source"]["prefetch"] = ZephonPrefetchOptions(**prefetch)
+    decoded = values.get("cache", {}).get("parquet_rg_cache")
+    if decoded is not None:
+        values["cache"]["parquet_rg_cache"] = ZephonParquetRGCacheOptions(**decoded)
     # A partial group must inherit its declared factory's defaults, including
     # image-specific source/packing defaults on an options subtype.
     group_fields = {item.name: item for item in fields(options_type) if item.name in _OPTION_GROUPS}

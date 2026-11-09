@@ -1543,6 +1543,21 @@ class EncodedVlmDocument(TypedDict):
     vision_token_types: NotRequired[torch.Tensor]
 
 
+def _copy_conversation(example: ConversationSample) -> ConversationSample:
+    """Copy mutable message containers while retaining caller-owned media buffers."""
+    example = dict(example)
+    example["conversation"] = [
+        {
+            **message,
+            "content": [dict(item) if isinstance(item, dict) else item for item in message["content"]]
+            if isinstance(message.get("content"), list)
+            else message.get("content"),
+        }
+        for message in example["conversation"]
+    ]
+    return example
+
+
 def encode_vlm_document(
     example: ConversationSample,
     processor: ProcessorMixin,
@@ -1559,8 +1574,8 @@ def encode_vlm_document(
 
     Args:
         example: Native conversation document, with messages under ``conversation``.
-            Media may be paths or in-memory images/frames. The conversation structure
-            is copied before media loading; the caller's document is not modified.
+            Media must already be decoded images/frames. The conversation structure
+            is copied before processing; the caller's document is not modified.
         processor: Effective processor with its selected tokenizer and chat template.
         max_length: Optional expanded-token limit. Omit when a downstream packer
             owns oversized-document policy.
@@ -1578,7 +1593,7 @@ def encode_vlm_document(
         and media but are excluded by the attention mask and labels.
 
     Raises:
-        VlmMediaDecodeError: Image loading or RGB conversion fails before processing.
+        VlmMediaDecodeError: RGB conversion fails before processing.
         VlmMediaTokenMismatchError: Expanded token slots and media grids disagree.
         ValueError: Expanded tokens exceed the configured limit. Other processor or
             template errors propagate without being classified as corrupt media.
@@ -1590,23 +1605,7 @@ def encode_vlm_document(
         mask_fake_vision_tokens_single,
     )
 
-    example = dict(example)
-    example["conversation"] = [
-        {
-            **message,
-            "content": [dict(item) if isinstance(item, dict) else item for item in message["content"]]
-            if isinstance(message.get("content"), list)
-            else message.get("content"),
-        }
-        for message in example["conversation"]
-    ]
-    # preserve_video_metadata=True: store _video_fps and
-    # _frame_indices on each video item so we can fix timestamps.
-    try:
-        example = _preload_media(example, processor, preserve_video_metadata=True)
-    except (OSError, Image.DecompressionBombError) as exc:
-        # Keep decode failures distinct from processor/template configuration errors.
-        raise VlmMediaDecodeError(f"Cannot decode conversation media: {exc}") from exc
+    example = _copy_conversation(example)
     conversation = example["conversation"]
 
     # Inject fake image into pure-text samples for FSDP/Zero3.
@@ -1619,8 +1618,14 @@ def encode_vlm_document(
         content = message.get("content")
         if isinstance(content, list):
             for item in content:
-                if isinstance(item, dict) and isinstance(item.get("image"), Image.Image):
-                    item["image"] = item["image"].convert("RGB")
+                if isinstance(item, dict) and item.get("type") == "image":
+                    image = item.get("image")
+                    if not isinstance(image, Image.Image):
+                        raise ValueError("encode_vlm_document requires decoded PIL images; load media before encoding")
+                    try:
+                        item["image"] = image.convert("RGB")
+                    except (OSError, Image.DecompressionBombError) as exc:
+                        raise VlmMediaDecodeError(f"Cannot decode conversation media: {exc}") from exc
 
     # Preserve video timestamps and skip re-sampling pre-loaded frames.
     video_metadata = _build_video_metadata(conversation)
@@ -1811,8 +1816,12 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         rng = _replacement_rng(idx)
         for attempt in range(self.max_retries):
             try:
+                example = _copy_conversation(self.dataset[idx])
+                # Native datasets own path/URL loading. Preserve video metadata so
+                # encoding can fix timestamps without re-sampling loaded frames.
+                example = _preload_media(example, self.processor, preserve_video_metadata=True)
                 return encode_vlm_document(
-                    self.dataset[idx],
+                    example,
                     self.processor,
                     max_length=self.max_length,
                     truncate=self.truncate,

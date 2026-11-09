@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, NotRequired, cast
 
@@ -58,11 +58,13 @@ from nemo_automodel.components.datasets.zephon.attention import (
     adapt_model_inputs,
     enable_xdoc_attention,
 )
+from nemo_automodel.components.datasets.zephon.vlm_input import VlmInputOptions, normalize_image_document
 from nemo_automodel.shared.import_utils import safe_import_from
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
     from zephon import SampleBatch
+    from zephon.io import Dataset
     from zephon.ops import OpContext
     from zephon.types import SampleRecord
 
@@ -100,6 +102,7 @@ class VlmEncoderConfig:
     parallelism: int | None = None  # None retains Zephon's OpTraits default.
     chat_template: str | None = None
     on_media_error: Literal["raise", "drop"] = "raise"
+    inputs: dict[str, VlmInputOptions] = field(default_factory=dict)
 
     def build(self, *, pretrained_model_name_or_path: str, positions: ImagePositionState) -> BaseOp:
         """Build a Zephon operator with worker-local processor state."""
@@ -118,10 +121,19 @@ class _EncodeImageDocuments(BaseOp):
         self._positions = positions
         self._processor: ProcessorMixin | None = None
         self._owner_pid = os.getpid()
+        self._inputs: dict[int, tuple[str, VlmInputOptions]] = {}
 
     def setup(self, ctx: OpContext) -> None:
         """Initialize the processor once per worker; no model enters the worker."""
         super().setup(ctx)
+        # IDs come from Zephon's work source, not from the order of config entries.
+        datasets: Mapping[int, Dataset] = ctx.get("datasets_by_id", {})
+        self._inputs = {
+            key: (dataset.name, self._config.inputs.get(dataset.name, VlmInputOptions()))
+            for key, dataset in datasets.items()
+        }
+        if self._config.inputs and not datasets:
+            raise ValueError("Per-source VLM input options require datasets_by_id in the Zephon operator context")
         # In-process runners share the trainer; only cap independent worker processes.
         if os.getpid() != self._owner_pid:
             os.environ["OMP_NUM_THREADS"] = "1"
@@ -135,6 +147,7 @@ class _EncodeImageDocuments(BaseOp):
     def teardown(self) -> None:
         """Release worker state; safe after partial setup or repeated cleanup."""
         self._processor = None
+        self._inputs.clear()
 
     def traits(self) -> OpTraits:
         """Encoding preserves record order; opt-in decode filtering is not indexable."""
@@ -149,8 +162,8 @@ class _EncodeImageDocuments(BaseOp):
         """Encode records while retaining metadata and bookkeeping records.
 
         Args:
-            elems: Raw conversation records. Media inputs are image paths/PIL
-                images; records have no training tensors yet.
+            elems: Fetched image/chat records with embedded media. No paths or
+                URLs are opened; records have no training tensors yet.
 
         Returns:
             Records with unshifted IDs/labels/eligibility [sequence], scalar
@@ -166,18 +179,11 @@ class _EncodeImageDocuments(BaseOp):
             if record.meta.is_sentinel:
                 output.append(record)
                 continue
-            # Reject unsupported media before decoding; these are not droppable media errors.
-            for message in record.payload["conversation"]:
-                content = message.get("content")
-                if isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") not in (None, "text", "image"):
-                            raise ValueError(
-                                f"Zephon image conversations support only image and text content; got {item['type']!r}"
-                            )
+            source_name, input_options = self._inputs.get(record.meta.sample_id[0], ("VLM source", VlmInputOptions()))
             try:
+                conversation = normalize_image_document(record.payload, options=input_options, source_name=source_name)
                 document = encode_vlm_document(
-                    record.payload, self._processor, inject_fake_images=self._config.inject_fake_images
+                    conversation, self._processor, inject_fake_images=self._config.inject_fake_images
                 )
             except (VlmMediaDecodeError, VlmMediaTokenMismatchError) as exc:
                 if self._config.on_media_error == "raise":

@@ -24,7 +24,12 @@ if TYPE_CHECKING:
         ZephonPretokenizedTextDatasetConfig,
         ZephonTextDatasetConfig,
     )
-    from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmDatasetConfig, ZephonVlmOptions
+    from nemo_automodel.components.datasets.zephon.vlm_config import (
+        ZephonVlmDatasetConfig,
+        ZephonVlmOptions,
+        ZephonVlmSource,
+    )
+    from nemo_automodel.components.datasets.zephon.vlm_input import VlmInputOptions
 
 __all__ = [
     "ZephonDataloaderConfig",
@@ -33,6 +38,8 @@ __all__ = [
     "ZephonTextDatasetConfig",
     "ZephonVlmDatasetConfig",
     "ZephonVlmOptions",
+    "ZephonVlmSource",
+    "VlmInputOptions",
 ]
 
 
@@ -40,7 +47,11 @@ def __getattr__(name: str) -> type:
     """Load configuration only when requested, keeping worker helpers lightweight."""
     if name not in __all__:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_name = ".vlm_config" if name in ("ZephonVlmDatasetConfig", "ZephonVlmOptions") else ".config"
+    module_name = (
+        ".vlm_config"
+        if name in ("ZephonVlmDatasetConfig", "ZephonVlmOptions", "ZephonVlmSource", "VlmInputOptions")
+        else ".config"
+    )
     module = importlib.import_module(module_name, __name__)
     value = getattr(module, name)
     globals()[name] = value

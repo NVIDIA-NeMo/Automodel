@@ -32,11 +32,26 @@ from nemo_automodel.components.datasets.vlm.loader import (
 from nemo_automodel.components.datasets.zephon.config import (
     ZephonOptions,
     ZephonPackingOptions,
+    ZephonSource,
     ZephonSourceOptions,
     ZephonStreamDatasetConfig,
 )
+from nemo_automodel.components.datasets.zephon.vlm_input import VlmInputOptions
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ZephonVlmSource(ZephonSource):
+    """An image source with optional per-source schema normalization."""
+
+    input: VlmInputOptions = field(default_factory=VlmInputOptions)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # Source dictionaries enter at the existing recipe/TOML config boundary.
+        if isinstance(self.input, dict):
+            object.__setattr__(self, "input", VlmInputOptions(**self.input))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -46,6 +61,8 @@ class ZephonVlmOptions(ZephonOptions):
     Assistant tokens are supervised using the processor's chat template. Fake
     image segments keep vision participation for text-only packed documents.
     """
+
+    source_type: ClassVar[type[ZephonSource]] = ZephonVlmSource
 
     # Image packing cannot split documents, and media-aware token estimation
     # is unsupported. These factories also own defaults for partial YAML groups.
@@ -160,6 +177,7 @@ class ZephonVlmDatasetConfig(ZephonStreamDatasetConfig[VlmStreamBuildContext, Vl
             on_media_error=self.zephon.on_media_error,
             parallelism=options.workers.tokenize_parallelism,
             chat_template=context.chat_template,
+            inputs={source.name: source.input for source in options.sources if isinstance(source, ZephonVlmSource)},
         ).build(pretrained_model_name_or_path=context.pretrained_model_name_or_path, positions=positions)
         pipeline = create_source_pipeline(
             options, seed=context.seed, dp_rank=context.dp_rank, dp_world_size=context.dp_world_size

@@ -571,3 +571,21 @@ def test_image_recipe_rejects_unsupported_token_estimation(estimation):
     values["dataset"]["zephon"]["source"] = {"token_estimation": estimation}
     with pytest.raises(ValueError, match="media-aware estimator"):
         RecipeConfig(ConfigNode(values)).vlm_dataloader
+
+
+def test_per_source_input_options_parse_at_recipe_and_toml_boundaries(tmp_path):
+    from nemo_automodel.components.datasets.zephon.vlm_config import ZephonVlmSource
+    from nemo_automodel.components.datasets.zephon.vlm_input import VlmInputOptions
+
+    values = _recipe()
+    values["dataset"]["zephon"]["sources"][0]["input"] = {"column_mapping": {"messages": "dialog"}}
+    options = RecipeConfig(ConfigNode(values)).vlm_dataloader.dataset_config.zephon
+    source = options.sources[0]
+    assert isinstance(source, ZephonVlmSource)
+    assert source.input == VlmInputOptions(column_mapping={"messages": "dialog"})
+    recipe = tmp_path / "sources.toml"
+    recipe.write_text('[[sources]]\nname="images"\npath="data"\n[sources.input.column_mapping]\nmessages="dialog"\n')
+    values["dataset"]["zephon"] = {"data_config": str(recipe)}
+    source = RecipeConfig(ConfigNode(values)).vlm_dataloader.dataset_config.zephon.sources[0]
+    assert source.input.column_mapping == {"messages": "dialog"}
+    assert source.path == str(tmp_path / "data")

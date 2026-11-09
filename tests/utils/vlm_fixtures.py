@@ -104,8 +104,7 @@ def tiny_vlm_config():
     )
 
 
-@pytest.fixture
-def inputs(tmp_path, processor):
+def _make_inputs(tmp_path, processor):
     # Bound injected fake-image cost so text-only input participates in packing.
     processor.image_processor.size["longest_edge"] = 256
     processor_path = tmp_path / "processor"
@@ -126,3 +125,22 @@ def inputs(tmp_path, processor):
             }
         )
     return str(processor_path), documents
+
+
+@pytest.fixture
+def inputs(tmp_path, processor):
+    return _make_inputs(tmp_path, processor)
+
+
+@pytest.fixture
+def embedded_inputs(tmp_path, processor):
+    """Self-contained fetched documents; filesystem access belongs to fixture preparation."""
+    from pathlib import Path
+
+    processor_path, documents = _make_inputs(tmp_path, processor)
+    for document in documents:
+        for message in document["conversation"]:
+            for block in message["content"]:
+                if block["type"] == "image":
+                    block["image"] = Path(block["image"]).read_bytes()
+    return processor_path, documents

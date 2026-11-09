@@ -212,3 +212,17 @@ def test_named_template_without_default_renders_and_labels_same_selection(proces
     encoded = encode_vlm_document(_document(), processor, inject_fake_images=False)
     assert encoded["labels"][encoded["labels"] != -100].tolist() == [6, 7, 4]
     assert encoded["input_ids"].eq(processor.image_token_id).sum().item() == 6
+
+
+def test_native_wrapper_loads_paths_but_shared_encoder_never_does(processor, tmp_path):
+    document = _document()
+    path = tmp_path / "image.png"
+    document["conversation"][0]["content"][0]["image"].save(path)
+    expected = encode_vlm_document(document, processor, inject_fake_images=False)
+    document["conversation"][0]["content"][0]["image"] = str(path)
+    with pytest.raises(ValueError, match="requires decoded PIL images"):
+        encode_vlm_document(document, processor, inject_fake_images=False)
+    actual = PreTokenizedDatasetWrapper([document], processor, max_retries=1, inject_fake_images=False)[0]
+    for key in expected:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+    assert document["conversation"][0]["content"][0]["image"] == str(path)
