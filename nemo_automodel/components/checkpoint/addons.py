@@ -41,6 +41,7 @@ from nemo_automodel.shared.peft_config import PeftConfig as _AutomodelPeftConfig
 if TYPE_CHECKING:
     from peft import PeftConfig
     from torch.distributed import ProcessGroup
+    from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 
 _MOE_LORA_PARAMETER_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
@@ -129,7 +130,9 @@ class CheckpointAddon(Protocol):
 class _ConsolidatedHFMetadataExporter(Protocol):
     """Model-provided writer for consolidated Hugging Face metadata."""
 
-    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+    def validate(
+        self, *, tokenizer: "PreTrainedTokenizerBase | ProcessorMixin | None", original_model_path: str | None
+    ) -> None:
         """Validate exporter inputs before any distributed rank writes files."""
         ...
 
@@ -137,7 +140,7 @@ class _ConsolidatedHFMetadataExporter(Protocol):
         self,
         *,
         hf_metadata_dir: str,
-        tokenizer: object,
+        tokenizer: "PreTrainedTokenizerBase | ProcessorMixin | None",
         original_model_path: str | None,
         v4_compatible: bool,
     ) -> None:

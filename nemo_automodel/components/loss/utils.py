@@ -24,7 +24,7 @@ from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
 _DATASET_IGNORE_INDEX = -100
 
 
-def _get_loss_ignore_index(loss_fn: object) -> int:
+def _get_loss_ignore_index(loss_fn: nn.Module) -> int:
     """Return the label sentinel consumed by ``loss_fn``."""
     ignore_index = getattr(loss_fn, "ignore_index", _DATASET_IGNORE_INDEX)
     return int(ignore_index) if isinstance(ignore_index, Integral) else _DATASET_IGNORE_INDEX

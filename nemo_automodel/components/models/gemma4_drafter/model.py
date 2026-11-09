@@ -102,7 +102,7 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
                 self.masked_embedding = full_vocab_head
             self.tie_weights()
 
-        def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
             """Tie ``lm_head`` to the drafter token embedding."""
             self.lm_head.weight = self.model.embed_tokens.weight
 

@@ -41,7 +41,10 @@ from typing import TYPE_CHECKING, Callable, Literal, NamedTuple
 
 import torch
 import torch.utils.data
+from datasets import Dataset as HfDataset
 from PIL import Image
+
+from nemo_automodel.components.datasets.vlm.conversation import ConversationSample
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
@@ -61,6 +64,7 @@ from nemo_automodel.components.datasets.vlm.samplers import (
 logger = logging.getLogger(__name__)
 
 MEDIA_KEYS = (
+    "image_grid_hws",
     "pixel_values",
     "patch_pixel_values",
     "num_patches",
@@ -171,7 +175,9 @@ class _SampleLengthEstimate(NamedTuple):
     unsized_media: int
 
 
-def _image_height_width(image: object) -> tuple[int, int] | None:
+def _image_height_width(
+    image: Image.Image | io.BytesIO | bytes | str | dict[str, bytes | str | None] | None,
+) -> tuple[int, int] | None:
     """Read the ``(height, width)`` of a conversation image without decoding its pixels.
 
     Handles the forms VLM datasets put in conversations: PIL images (including lazy
@@ -433,6 +439,14 @@ def _shift_sample(sample: dict, has_mrope: bool = False) -> dict:
         mm_ttids = torch.as_tensor(mm_ttids)
         out["mm_token_type_ids"] = mm_ttids[0, :-1] if mm_ttids.ndim == 2 else mm_ttids[:-1]
 
+    if sample.get("vision_token_types") is not None:
+        types = torch.as_tensor(sample["vision_token_types"]).reshape(-1)
+        if types.shape[0] != len(sample["input_ids"]):
+            raise ValueError("vision_token_types must align with the unshifted input_ids")
+        if types.numel() and types[-1] >= 0:
+            raise ValueError("The next-token shift would truncate an image span; append a text/EOS token")
+        out["vision_token_types"] = types[:-1]
+
     if has_mrope and "position_ids" in sample and sample["position_ids"] is not None:
         out["position_ids"] = sample["position_ids"][:, :-1]
 
@@ -471,7 +485,7 @@ class PackedDatasetWrapperConfig:
         inner_dataset: "PreTokenizedDatasetWrapper",
         bins: list[list[int]],
         padding_idx: int,
-        get_rope_index: Callable[..., object] | None = None,
+        get_rope_index: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> "PackedDatasetWrapper":
         """Build a :class:`PackedDatasetWrapper` from this config.
 
@@ -644,8 +658,8 @@ class NeatPackConfig:
         *,
         dataset: "PreTokenizedDatasetWrapper",
         padding_idx: int,
-        ds_raw: torch.utils.data.Dataset | Sequence[dict[str, object]] | None = None,
-        get_rope_index: Callable[..., object] | None = None,
+        ds_raw: HfDataset | torch.utils.data.Dataset | Sequence[ConversationSample] | None = None,
+        get_rope_index: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
         processor: "ProcessorMixin | None" = None,
         cp_size: int = 1,
     ) -> "PackedDatasetWrapper":
@@ -744,11 +758,18 @@ def neat_pack_dataset_vlm(
     if get_rope_index is not None and sequence_alignment > 1:
         raise NotImplementedError("Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented.")
 
+    # A processor may count its own token expansion exactly using image headers.
+    # Keep the generic resize/character heuristic for processors without it.
+    # TODO: Clean up the processor/packing token-counting contract to replace
+    # this runtime method lookup with an explicit interface.
+    token_counter = getattr(processor, "estimate_packed_tokens", None)
     # Extract processor configs for accurate media token estimation
     image_cfg = LengthGroupedSampler._extract_image_config(processor) if processor is not None else None
     video_cfg = LengthGroupedSampler._extract_video_config(processor) if processor is not None else None
     count_image_tokens = _image_token_counter(processor)
-    if image_cfg is not None or video_cfg is not None:
+    if token_counter is not None:
+        logger.info("Neat packing VLM: using processor token counts without pixel decoding.")
+    elif image_cfg is not None or video_cfg is not None:
         logger.info("Neat packing VLM: using processor configs for media token estimation.")
     else:
         logger.warning(
@@ -781,9 +802,14 @@ def neat_pack_dataset_vlm(
         t0 = time.perf_counter()
 
         for i in range(N):
-            estimate = _estimate_sample_length(
-                ds_raw[i], image_cfg=image_cfg, video_cfg=video_cfg, count_image_tokens=count_image_tokens
-            )
+            example = ds_raw[i]
+            if token_counter is not None:
+                total_tokens, media_tokens = token_counter(example["conversation"])
+                estimate = _SampleLengthEstimate(total_tokens, media_tokens, 0)
+            else:
+                estimate = _estimate_sample_length(
+                    example, image_cfg=image_cfg, video_cfg=video_cfg, count_image_tokens=count_image_tokens
+                )
             unsized_media += estimate.unsized_media
             est_len = _aligned_length(max(estimate.total_tokens - 1, 0), sequence_alignment)  # -1 for shift
             if est_len > pack_size:

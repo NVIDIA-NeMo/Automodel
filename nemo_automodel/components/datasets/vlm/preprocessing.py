@@ -71,6 +71,8 @@ def merge_vlm_documents(
     all_labels: list[torch.Tensor] = []
     all_attention_mask: list[torch.Tensor] = []
     all_mm_token_type_ids: list[torch.Tensor] = []
+    has_vision_token_types = any(sample.get("vision_token_types") is not None for sample in samples)
+    all_vision_token_types: list[torch.Tensor] = []
     all_position_ids_1d: list[torch.Tensor] = []
     mrope_position_ids_list: list[torch.Tensor] = []
     seq_lens: list[int] = []
@@ -80,6 +82,7 @@ def merge_vlm_documents(
     patch_pixel_values_list: list[torch.Tensor] = []
     num_patches_list: list[torch.Tensor] = []
     image_grid_thw_list: list[torch.Tensor] = []
+    image_grid_hws_list: list[torch.Tensor] = []
     image_position_ids_list: list[torch.Tensor] = []
     image_sizes_list: list[torch.Tensor] = []
     pixel_values_videos_list: list[torch.Tensor] = []
@@ -106,6 +109,15 @@ def merge_vlm_documents(
         token_types = ids.new_zeros(seq_len) if token_types is None else torch.as_tensor(token_types, dtype=torch.long)
         all_mm_token_type_ids.append(torch.nn.functional.pad(token_types, (0, pad)))
 
+        if has_vision_token_types:
+            types = sample.get("vision_token_types")
+            types = ids.new_full((seq_len,), -1) if types is None else torch.as_tensor(types).reshape(-1)
+            if types.numel() != seq_len:
+                raise ValueError("vision_token_types must align with shifted input_ids")
+            all_vision_token_types.append(torch.nn.functional.pad(types, (0, pad), value=-1))
+        if sample.get("image_grid_hws") is not None:
+            image_grid_hws_list.append(sample["image_grid_hws"])
+
         if has_mrope and "position_ids" in sample:
             mrope_position_ids_list.append(sample["position_ids"])
         elif sample.get("position_ids") is not None:
@@ -128,7 +140,7 @@ def merge_vlm_documents(
             image_position_ids_list.append(sample["image_position_ids"])
         if sample.get("image_sizes") is not None:
             image_sizes_list.append(sample["image_sizes"])
-        for key in ("image_grid_thw", "image_position_ids", "image_sizes"):
+        for key in ("image_grid_hws", "image_grid_thw", "image_position_ids", "image_sizes"):
             if sample.get(key) is not None:
                 n_images += sample[key].shape[0]
                 break
@@ -159,6 +171,11 @@ def merge_vlm_documents(
         n_images=n_images,
         n_videos=n_videos,
     )
+
+    if has_vision_token_types:
+        packed["vision_token_types"] = torch.cat(all_vision_token_types)
+    if image_grid_hws_list:
+        packed["image_grid_hws"] = torch.cat(image_grid_hws_list)
 
     if has_mrope and mrope_position_ids_list:
         packed["position_ids"] = torch.cat(mrope_position_ids_list, dim=1)
