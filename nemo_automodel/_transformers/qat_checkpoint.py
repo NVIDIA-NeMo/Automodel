@@ -25,7 +25,7 @@ import json
 from dataclasses import asdict, dataclass, fields
 from itertools import chain
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeAlias
 
 import torch
 from torch import nn
@@ -40,6 +40,7 @@ _FORMAT = "nemo_automodel.lora_qat"
 _MODEL_FILE = "model.safetensors"
 _QUANTIZED_FILE = "quantized.safetensors"
 _MANIFEST_FILE = "manifest.json"
+_JSONValue: TypeAlias = str | int | float | bool | None | list["_JSONValue"] | dict[str, "_JSONValue"]
 
 
 @dataclass(frozen=True)
@@ -123,16 +124,16 @@ def _checkpoint_path(directory: Path, filename: str) -> Path:
     return path
 
 
-def _json_fields(value: object, expected: set[str], label: str) -> dict[str, object]:
+def _json_fields(value: _JSONValue, expected: set[str], label: str) -> dict[str, _JSONValue]:
     """Check exact fields at the untrusted JSON boundary."""
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError(f"{label}: missing or unknown metadata fields; expected {sorted(expected)}")
     return value
 
 
-def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+def _unique_json_object(pairs: list[tuple[str, _JSONValue]]) -> dict[str, _JSONValue]:
     """Reject duplicate JSON object keys rather than silently taking the last value."""
-    result = {}
+    result: dict[str, _JSONValue] = {}
     for key, value in pairs:
         if key in result:
             raise ValueError(f"duplicate JSON metadata key: {key}")

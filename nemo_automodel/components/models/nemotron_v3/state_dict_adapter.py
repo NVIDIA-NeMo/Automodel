@@ -161,14 +161,19 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
     def _hf_key_to_native(self, key: str) -> str:
         """Normalize a public HF Nemotron V3 key to its native namespace."""
-        hf_root = re.escape(self._hf_prefix.rstrip("."))
+        # A legacy adapter can use a different namespace from its base model.
+        # Normalize each input independently of the namespace retained for export.
+        hf_root = "(?:backbone|model)"
         key = re.sub(
             rf"^(?P<outer>base_model\.model\.)?{hf_root}\.norm_f\.weight$",
             lambda match: f"{match.group('outer') or ''}model.norm.weight",
             key,
         )
+        # Accept singular ``embedding`` (transformers save_pretrained / RL toy
+        # assets) and plural ``embeddings`` (released nvidia checkpoints). Export
+        # stays plural via ``_native_key_to_hf``. Matches nvidia remote-code load_hook.
         key = re.sub(
-            rf"^(?P<outer>base_model\.model\.)?{hf_root}\.embeddings\.weight$",
+            rf"^(?P<outer>base_model\.model\.)?{hf_root}\.embeddings?\.weight$",
             lambda match: f"{match.group('outer') or ''}model.embed_tokens.weight",
             key,
         )
@@ -248,8 +253,12 @@ class NemotronV3StateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
 
         # Detect whether the source checkpoint uses the remote-code ``backbone``
         # namespace or Transformers v5's native ``model`` namespace. MTP keys
-        # never carry either prefix.
+        # never carry either prefix. Adapter-only restores must not change the
+        # base checkpoint's export namespace: legacy PEFT keys can use native
+        # ``model`` names even when the base checkpoint uses ``backbone``.
         for key in backbone_state_dict.keys():
+            if any(part.startswith("lora_") for part in key.split(".")):
+                continue
             bare_key = key.removeprefix("base_model.model.")
             if bare_key.startswith("backbone."):
                 self._uses_model_prefix = False

@@ -27,7 +27,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss
 
 
@@ -64,7 +63,7 @@ class DSparkTrainerModule(nn.Module):
 
     def __init__(
         self,
-        draft_model: Qwen3DSparkModel,
+        draft_model: nn.Module,
         *,
         loss_decay_gamma: float | None = None,
         ce_loss_alpha: float = 0.1,
@@ -95,10 +94,11 @@ class DSparkTrainerModule(nn.Module):
         inside one document (block-causal context, per-document positions, and
         document-truncated supervision).
         """
-        # Only the Qwen3 draft accepts the packing kwargs (the other registered
-        # drafts keep the original signature), and packing is gated to the Qwen3
-        # draft at recipe setup. Pass the packing metadata only when packing is
-        # active so the unpacked path stays signature-compatible with every draft.
+        # Only drafts with ``supports_sequence_packing`` accept the packing kwargs
+        # (the other registered drafts keep the original signature), and the recipe
+        # rejects packing for the others at setup. Pass the packing metadata only
+        # when packing is active so the unpacked path stays signature-compatible
+        # with every draft.
         packing_kwargs = (
             {"position_ids": position_ids, "seq_lens": seq_lens, "doc_remaining": doc_remaining}
             if seq_lens is not None

@@ -350,23 +350,25 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         """Forward pass with multimodal fusion.
 
         Args:
-            input_ids: Input token IDs
-            input_features: Audio input features
-            pixel_values: Image pixel values
-            pixel_values_videos: Video pixel values
-            image_grid_thw: Image grid (temporal, height, width)
-            video_grid_thw: Video grid (temporal, height, width)
-            attention_mask: Attention mask
-            feature_attention_mask: Feature attention mask for audio
-            audio_feature_lengths: Audio feature lengths
-            position_ids: Position IDs (3D for MRoPE)
-            padding_mask: Padding mask
-            inputs_embeds: Optional pre-computed input embeddings
-            labels: Labels for loss computation
+            input_ids: Integer token IDs of shape [batch, sequence].
+            input_features: Audio features of shape [audios, mel_bins, frames].
+            pixel_values: Packed image patches of shape [image_patches, patch_features],
+                where patch_features flattens channels, temporal depth, height, and width.
+            pixel_values_videos: Packed video patches of shape [video_patches, patch_features].
+            image_grid_thw: Integer temporal/height/width grids of shape [images, 3].
+            video_grid_thw: Integer temporal/height/width grids of shape [videos, 3].
+            attention_mask: Padding mask of shape [batch, sequence].
+            feature_attention_mask: Valid audio frames of shape [audios, frames].
+            audio_feature_lengths: Valid frame counts of shape [audios].
+            position_ids: Rotary coordinates of shape [3, batch, sequence].
+            padding_mask: Valid token mask of shape [batch, sequence].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            labels: Target token IDs of shape [batch, sequence].
             output_router_logits: Whether to output router logits
             use_audio_in_video: Whether audio is in video
-            video_second_per_grid: Seconds per grid for videos
-            logits_to_keep: If > 0, only compute logits for the last
+            video_second_per_grid: Temporal grid spacing of shape [videos].
+            logits_to_keep: Integer count or index tensor of shape [selected_positions].
+                If > 0, only compute logits for the last
                 ``logits_to_keep`` token positions (0 = all positions). Enables
                 memory-efficient fused cross-entropy by letting the recipe request
                 a single-position lm_head projection alongside the final hidden
@@ -377,9 +379,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             **attn_kwargs: Additional attention arguments
 
         Returns:
-            Logits tensor, a dict with loss/aux_loss if labels provided, or a
+            Logits of shape [batch, selected_sequence, vocab] (or [tokens, vocab]
+            for packed input), a dict with scalar loss/aux_loss if labels provided, or a
             :class:`~transformers.modeling_outputs.CausalLMOutputWithPast`
-            carrying the final hidden states when ``output_hidden_states`` is set.
+            carrying hidden states of shape [batch, sequence, hidden] when requested.
         """
         output_hidden_states = (
             output_hidden_states
@@ -461,7 +464,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             image_embeds = image_features.pooler_output
             if not torch.is_tensor(image_embeds):
                 image_embeds = torch.cat(image_embeds, dim=0)
-            image_embeds_multiscale = image_features.deepstack_features
+            image_embeds_multiscale = [
+                level if torch.is_tensor(level) else torch.cat(level, dim=0)
+                for level in image_features.deepstack_features
+            ]
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -478,7 +484,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             video_embeds = video_features.pooler_output
             if not torch.is_tensor(video_embeds):
                 video_embeds = torch.cat(video_embeds, dim=0)
-            video_embeds_multiscale = video_features.deepstack_features
+            video_embeds_multiscale = [
+                level if torch.is_tensor(level) else torch.cat(level, dim=0)
+                for level in video_features.deepstack_features
+            ]
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds

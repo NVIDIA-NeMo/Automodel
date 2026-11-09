@@ -575,8 +575,8 @@ class TestTrailingPadAbsorption:
         assert torch.equal(result["cu_seqlens"], expected_cu), (
             f"cu_seqlens should be absorbed: expected {expected_cu.tolist()}, got {result['cu_seqlens'].tolist()}"
         )
-        # cu_seqlens_padded is dropped (equal to cu_seqlens, gated out).
-        assert "cu_seqlens_padded" not in result
+        # Physical offsets remain available even when TE needs no padding path.
+        assert torch.equal(result["cu_seqlens_padded"], result["cu_seqlens"])
         # CRITICAL: max_seqlen reflects the absorbed slot width (576), not
         # the pre-absorption max real sub-seq length (112). This is what
         # makes the layout TE-contract-clean.
@@ -604,8 +604,9 @@ class TestTrailingPadAbsorption:
 
         # Absorption fires → cu_seqlens[-1] == packed_size.
         assert int(result["cu_seqlens"][-1].item()) == packed
-        # cu_seqlens_padded dropped.
-        assert "cu_seqlens_padded" not in result, "cu_seqlens_padded should be omitted when absorption fired"
+        # Equal physical offsets are retained with padding disabled.
+        assert torch.equal(result["cu_seqlens_padded"], result["cu_seqlens"])
+        assert result["pad_between_seqs"] is False
         # max_seqlen reflects the absorbed last slot width = 112 + 16 = 128.
         assert int(result["max_seqlen"].item()) == 128, (
             f"max_seqlen should reflect post-absorption slot 128; got {int(result['max_seqlen'].item())}"
@@ -640,9 +641,8 @@ class TestTrailingPadAbsorption:
         result = split_batch_into_thd_chunks(batch, num_chunks=2, padding_token_id=0)
 
         assert "cu_seqlens" in result
-        # Both chunks absorbed (cu_seqlens_padded == cu_seqlens for both),
-        # so split_batch_into_thd_chunks omits the padded key.
-        assert "cu_seqlens_padded" not in result
+        # Both chunks retain their physical offsets after absorption.
+        assert torch.equal(result["cu_seqlens_padded"], result["cu_seqlens"])
 
         # Chunk 0 (full pack, absorbed) — last non-sentinel value == packed_size.
         c0_cu = result["cu_seqlens"][0]
@@ -704,3 +704,73 @@ def test_process_input_for_thd_2d_position_ids_unchanged():
     }
     out = process_input_for_thd(batch)
     assert tuple(out["position_ids"].shape) == (B * S,)
+
+
+@pytest.mark.parametrize(
+    "real,physical,expected_cu,expected_padding",
+    [
+        ([4, 4], [4, 4], [0, 4, 8], False),
+        ([3, 3], [3, 5], [0, 3, 8], False),
+        ([3, 3], [4, 4], [0, 3, 6], True),
+    ],
+)
+def test_thd_retains_physical_boundaries_and_separate_padding_flag(real, physical, expected_cu, expected_padding):
+    batch = {
+        "input_ids": torch.arange(8).view(1, 8),
+        "labels": torch.arange(8).view(1, 8),
+        "position_ids": torch.arange(8).view(1, 8),
+        "seq_lens": torch.tensor([real]),
+        "seq_lens_padded": torch.tensor([physical]),
+    }
+    out = process_input_for_thd(batch)
+    assert out["cu_seqlens"].tolist() == expected_cu
+    assert out["cu_seqlens_padded"].tolist() == [0, physical[0], 8]
+    assert out["pad_between_seqs"] is expected_padding
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_thd_mixed_chunks_compute_padding_for_each_microbatch(reverse):
+    from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+
+    real = [[4, 4], [3, 3]]
+    if reverse:
+        real.reverse()
+    batch = {
+        "input_ids": torch.arange(16).view(2, 8),
+        "labels": torch.arange(16).view(2, 8),
+        "position_ids": torch.arange(8).repeat(2, 1),
+        "seq_lens": torch.tensor(real),
+        "seq_lens_padded": torch.tensor([[4, 4], [4, 4]]),
+    }
+    out = split_batch_into_thd_chunks(batch, 2)
+    # A batch-wide bool would wrongly reuse the first chunk's padding state.
+    assert "pad_between_seqs" not in out
+    for index, lengths in enumerate(real):
+        kwargs = {key: out[key][index : index + 1] for key in ("cu_seqlens", "cu_seqlens_padded", "max_seqlen")}
+        _, _, _, kwargs = squeeze_input_for_thd(
+            out["input_ids"][index : index + 1], out["position_ids"][index : index + 1], None, kwargs
+        )
+        assert kwargs["pad_between_seqs"] is (lengths == [3, 3])
+
+
+def test_thd_original_document_ids_survive_attention_joining_and_pp_chunks():
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd, split_batch_into_thd_chunks
+
+    tokens = torch.arange(12).reshape(2, 6)
+    batch = dict(
+        input_ids=tokens,
+        labels=tokens,
+        position_ids=tokens,
+        seq_lens=torch.tensor([[6], [6]]),
+        seq_lens_padded=torch.tensor([[6], [6]]),
+        _packed_seq_ids=torch.ones((2, 6), dtype=torch.long),
+        document_ids=torch.tensor([[1, 1, 2, 2, 3, 3], [1, 1, 1, 2, 2, 2]]),
+    )
+    prepared = process_input_for_thd(batch)
+    assert prepared["_packed_seq_ids"].tolist() == [1] * 6 + [2] * 6
+    assert prepared["document_ids"].tolist() == [1, 1, 2, 2, 3, 3, 4, 4, 4, 5, 5, 5]
+    assert prepared["cu_seqlens"].tolist() == [0, 6, 12]
+    chunked = split_batch_into_thd_chunks(batch, num_chunks=2)
+    torch.testing.assert_close(chunked["_packed_seq_ids"], batch["_packed_seq_ids"])
+
+    torch.testing.assert_close(chunked["document_ids"], batch["document_ids"])

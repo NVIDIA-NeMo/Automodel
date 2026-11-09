@@ -49,7 +49,7 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -130,6 +130,7 @@ optimizer:
   weight_decay: 0.1
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi
   max_steps: 10
   time: "00:20:00"

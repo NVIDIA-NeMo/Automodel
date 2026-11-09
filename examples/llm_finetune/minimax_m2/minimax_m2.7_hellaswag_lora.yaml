@@ -54,7 +54,7 @@ model:
     rms_norm: torch_fp32
     rope_fusion: true
     dispatcher: hybridep
-    experts: gmm
+    experts: torch_mm
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -111,6 +111,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  cluster_tag: h100
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: hemildesai
   # Allow the complete source, reload, and resume calibration matrix to finish.

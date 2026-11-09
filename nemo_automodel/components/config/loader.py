@@ -313,7 +313,12 @@ def _resolve_target(dotted_path: str) -> Any:
 
         try:
             module = importlib.import_module(module_name)
-        except ModuleNotFoundError:
+        except ModuleNotFoundError as e:
+            # Only a missing candidate (or one of its parents) means "try a shorter prefix".
+            # A dependency missing inside an existing module is the real error; falling back
+            # would report it as an unresolvable attribute instead.
+            if e.name is not None and not (module_name == e.name or module_name.startswith(e.name + ".")):
+                raise
             continue
 
         obj = module
@@ -385,8 +390,8 @@ class ConfigNode:
             d (dict): A dictionary representing configuration options.
             raise_on_missing_attr (bool): if True, it will return `None` on a missing attr.
         """
-        # Finetune scripts can modify the config in place, so we need to keep a copy of the
-        # original config for checkpointing.
+        # Finetune scripts can modify the config in place, so keep the originally loaded
+        # values separate from the live, serializable attributes.
         self._raw_config = deepcopy(d)
         # Store original string values before resolution (for _fn and _target_ keys)
         self._original_strings: dict[str, str] = {}
@@ -668,28 +673,40 @@ class ConfigNode:
                     redact_sensitive=redact_sensitive,
                     use_orig_values=use_orig_values,
                 )
-            # Lists
-            if isinstance(value, list):
+            # Lists and tuples (CLI values such as `(0.9, 0.95)` parse to tuples); emit plain
+            # sequences so the result stays loadable with yaml.safe_load.
+            if isinstance(value, (list, tuple)):
                 return [_convert(None, v) for v in value]
             # Dicts (shouldn't normally appear because we wrap into ConfigNode, but handle defensively)
             if isinstance(value, dict):
                 return {k: _convert(k, v) for k, v in value.items()}
-            # Prefer original YAML string for _target_ / *_fn when use_orig_values is set
+            # Prefer original YAML strings only while their resolved callable remains live.
+            # Programmatic target/callback overrides must serialize the replacement.
             orig_strings = getattr(self, "_original_strings", {})
-            if use_orig_values and key in orig_strings:
-                return orig_strings[key]
             # Convert targets/functions to dotted path strings
             is_target_like = key == "_target_" or (isinstance(key, str) and key.endswith("_fn")) or key == "collate_fn"
             try:
                 import inspect as _inspect
 
                 if is_target_like and (callable(value) or _inspect.ismethod(value) or _inspect.isclass(value)):
-                    return self._to_dotted_path(value)
+                    dotted_value = self._to_dotted_path(value)
+                    if use_orig_values and key in orig_strings:
+                        try:
+                            original_value = _resolve_target(orig_strings[key])
+                        except Exception:
+                            original_value = None
+                        if callable(original_value) and (
+                            value is original_value or dotted_value == self._to_dotted_path(original_value)
+                        ):
+                            return orig_strings[key]
+                    return dotted_value
                 # Even if the key isn't target-like, convert bare callables to dotted path to avoid <function ...> repr
                 if callable(value) or _inspect.ismethod(value) or _inspect.isclass(value):
                     return self._to_dotted_path(value)
             except Exception:
                 pass
+            if type(value).__module__ == "torch" and type(value).__name__ == "dtype":
+                return str(value).removeprefix("torch.")
             if use_orig_values and hasattr(value, "_orig_value"):
                 return getattr(value, "_orig_value")
             # Primitive – already typed via translate_value/_wrap
@@ -784,16 +801,44 @@ class ConfigNode:
         Set (or append) a value in the config using a dotted key.
 
         e.g. set_by_dotted("foo.bar.abc", 1) will ensure self.foo.bar.abc == 1
+
+        A numeric part indexes into an existing list, as in ``get``:
+        set_by_dotted("optimizer.betas.1", 0.98) replaces only that element.
         """
         parts = dotted_key.split(".")
         node = self
+        owner = self  # nearest ConfigNode, used to wrap values stored in lists
         # walk / create intermediate ConfigNodes
         for p in parts[:-1]:
-            if p not in node.__dict__ or not isinstance(node.__dict__[p], ConfigNode):
-                node.__dict__[p] = ConfigNode({})
-            node = node.__dict__[p]
+            if isinstance(node, list):
+                node = node[self._list_index(node, p, dotted_key)]
+            else:
+                if p not in node.__dict__ or not isinstance(node.__dict__[p], (ConfigNode, list)):
+                    node.__dict__[p] = ConfigNode({})
+                node = node.__dict__[p]
+            if isinstance(node, ConfigNode):
+                owner = node
+            elif not isinstance(node, list):
+                raise TypeError(
+                    f"Cannot set '{dotted_key}': '{p}' is a {type(node).__name__}, not a config node or list"
+                )
         # wrap the final leaf value
-        node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
+        if isinstance(node, list):
+            node[self._list_index(node, parts[-1], dotted_key)] = owner._wrap("", value)
+        else:
+            node.__dict__[parts[-1]] = node._wrap(parts[-1], value)
+
+    @staticmethod
+    def _list_index(items: list[Any], part: str, dotted_key: str) -> int:
+        """Return the list position named by one dotted-key part, or raise."""
+        try:
+            idx = int(part)
+            items[idx]
+        except (ValueError, IndexError):
+            raise IndexError(
+                f"Cannot set '{dotted_key}': '{part}' is not a valid index into a list of length {len(items)}"
+            ) from None
+        return idx
 
     def _format(self, level: int = 0, *, use_orig_values: bool = True) -> str:
         """Return a string representation of the configuration node with indentation.
@@ -890,6 +935,6 @@ def load_yaml_config(path: str | Path) -> "ConfigNode":
     Returns:
         ConfigNode: A configuration node representing the YAML file.
     """
-    with open(path, "r", encoding="utf-8") as f:
+    with Path(path).open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     return ConfigNode(raw)

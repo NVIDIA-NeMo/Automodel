@@ -983,16 +983,21 @@ class MoESplitExpertsStateDictMixin:
                 the last dimension.
 
         Returns:
-            One contiguous grouped tensor in ``self.dtype``.
+            One contiguous grouped tensor in the source dtype. Installation casts it to the destination
+            parameter, so FP32 checkpoint values survive into FP32-selected experts.
         """
         if not expert_parts or not expert_parts[0]:
             raise ValueError("At least one expert projection tensor is required")
 
         first_expert = expert_parts[0]
+        source_dtype = first_expert[0].dtype
+        for parts in expert_parts:
+            for part in parts:
+                source_dtype = torch.promote_types(source_dtype, part.dtype)
         leading_shape = first_expert[0].shape[:-1]
         grouped = torch.empty(
             (len(expert_parts), *leading_shape, sum(part.shape[-1] for part in first_expert)),
-            dtype=self.dtype,
+            dtype=source_dtype,
             device=first_expert[0].device,
         )
         if len(first_expert) == 1:
@@ -1020,7 +1025,10 @@ class MoESplitExpertsStateDictMixin:
 
         Args:
             fqn: Fully qualified name of the tensor in native format.
-            tensor: The tensor to convert.
+            tensor: Native grouped-expert tensor. Gate/up tensors have shape
+                ``[experts, hidden, 2 * expert_hidden]`` (or
+                ``[experts, hidden, expert_hidden]`` for non-gated MoE), and
+                down tensors have shape ``[experts, expert_hidden, hidden]``.
             prefix_override: When provided, replaces ``self._hf_prefix`` in
                 emitted HF keys. Used to route conversions through namespaces
                 outside the main backbone, e.g. ``"mtp."`` for the MTP head.
@@ -1030,7 +1038,10 @@ class MoESplitExpertsStateDictMixin:
                 that forward arbitrary state-dict kwargs (e.g. ``exclude_key_regex``).
 
         Returns:
-            List of (fqn, tensor) tuples in HuggingFace format, or None if not an expert tensor.
+            List of ``(fqn, tensor)`` tuples in Hugging Face format, or ``None``
+            if this is not an expert tensor. Save/export tensors are contiguous;
+            checkpoint-load tensors may be non-contiguous views into CUDA model
+            storage so DCP can overwrite the native grouped weight in place.
         """
         n_experts = self.moe_config.n_routed_experts
         inter_dim = self.moe_config.moe_inter_dim
@@ -1090,7 +1101,7 @@ class MoESplitExpertsStateDictMixin:
 
             splits = self._split_experts_weights(tensor, n_experts)
 
-            inplace_ok = (
+            inplace_ok = for_checkpoint_load and (
                 (is_dtensor(tensor) or (isinstance(tensor, torch.Tensor) and tensor.is_cuda and not tensor.is_meta))
                 and len(splits) > 0
                 and not is_dtensor(splits[0])
@@ -1143,7 +1154,7 @@ class MoESplitExpertsStateDictMixin:
                 validate_dtensor_expert_sharding(tensor, n_experts, f"down_projs (DeepEP) layer {layer_num}")
 
             splits = self._split_experts_weights(tensor, n_experts)
-            inplace_ok = (
+            inplace_ok = for_checkpoint_load and (
                 (is_dtensor(tensor) or (isinstance(tensor, torch.Tensor) and tensor.is_cuda and not tensor.is_meta))
                 and len(splits) > 0
                 and not is_dtensor(splits[0])

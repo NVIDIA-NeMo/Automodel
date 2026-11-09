@@ -28,7 +28,7 @@ model:
     sparse_attn: msa
     linear: te
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: hybridep
     enable_fsdp_optimizations: true
 
@@ -85,3 +85,7 @@ ci:
   nodes: 32
   nproc_per_node: 4
   cluster_tag: gb200
+  env_vars:
+    # Keep each EP32 group within one NVLink block: 8 nodes x 4 GPUs. HybridEP rejects a group
+    # split across blocks ("The buffer config is not valid").
+    SBATCH_SEGMENT_SIZE: "8"

@@ -155,3 +155,35 @@ def test_indexer_document_local_support(
     for head in range(indexer.num_index_heads):
         assert set(support[head, 13].tolist()) == {0, 3}
         assert set(support[head, 23].tolist()) == {1, 2}
+
+
+def test_block_sel_flat_offset_stays_int64_past_int32_max():
+    from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import _block_sel_flat_offset
+
+    # Two 262,144-token sequences with four index heads and 128-token blocks: the
+    # [2, 4, S, S // 128] table has 2**32 entries, so every row of the second
+    # sequence sits past the int32 range of the inlined Triton index arithmetic.
+    num_index_heads, query_length, num_blocks = 4, 262_144, 2_048
+    offset = _block_sel_flat_offset(
+        torch.tensor(1),
+        torch.tensor(0),
+        torch.tensor(0),
+        torch.tensor(0),
+        num_index_heads,
+        query_length,
+        num_blocks,
+    )
+
+    assert offset.dtype == torch.int64
+    assert int(offset) == num_index_heads * query_length * num_blocks
+    assert int(offset) > torch.iinfo(torch.int32).max
+
+
+def test_block_sel_flat_offset_matches_direct_indexing():
+    from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import _block_sel_flat_offset
+
+    block_sel = torch.rand(2, 3, 5, 4) > 0.5
+    flat = block_sel.reshape(-1)
+    for index in torch.cartesian_prod(*(torch.arange(n) for n in block_sel.shape)):
+        offset = _block_sel_flat_offset(index[0], index[1], index[2], index[3], *block_sel.shape[1:])
+        assert bool(flat[offset]) == bool(block_sel[tuple(index.tolist())])

@@ -115,7 +115,7 @@ def test_torch_dtype_representer():
 def test_generation_config_representer():
     from transformers import GenerationConfig
 
-    cfg = GenerationConfig.from_pretrained("gpt2")
+    cfg = GenerationConfig(bos_token_id=50256, eos_token_id=50256)
     dumped, loaded = _roundtrip(cfg)
 
     assert loaded["_call_"] is True
@@ -123,3 +123,5 @@ def test_generation_config_representer():
     # Should contain a nested dictionary with at least one known key
     assert "config_dict" in loaded
     assert isinstance(loaded["config_dict"], dict)
+    assert loaded["config_dict"]["bos_token_id"] == 50256
+    assert loaded["config_dict"]["eos_token_id"] == 50256

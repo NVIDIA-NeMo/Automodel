@@ -37,7 +37,7 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -145,6 +145,7 @@ wandb:
   dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   # pp_size(8) * ep_size(8) = 64 GPUs => 8 nodes (8 H100/node).
   nodes: 8
   # The complete source, reload, and resume matrix repeatedly constructs this 200B model.

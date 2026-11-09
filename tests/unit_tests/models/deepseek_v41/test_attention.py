@@ -197,7 +197,7 @@ def test_candidate_blocks_pin_latest_partial_block_and_drop_unreachable_blocks()
     scores = torch.tensor([[[10.0, 9.0, 8.0, 7.0, -2.0, -torch.inf], [-torch.inf] * 6]])
     lengths = torch.tensor([[[5], [0]]])
     actual = _select_candidate_blocks(scores, lengths, topk_blocks=2, block_size=2)
-    expected = torch.tensor([[[True, True, False, False, True, True], [False] * 6]])
+    expected = torch.tensor([[[True, False, True], [False] * 3]])
     torch.testing.assert_close(actual, expected)
 
 
@@ -301,6 +301,35 @@ def test_padding_and_incomplete_groups_do_not_change_real_token_outputs() -> Non
     actual.hidden_states.square().sum().backward()
     assert torch.isfinite(hidden.grad).all()
     assert torch.count_nonzero(hidden.grad[~mask.bool()]) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_apply_rope_assembly_is_bitwise_the_concatenation(dtype: torch.dtype, inverse: bool) -> None:
+    """clone + slice write must equal torch.cat of the untouched channels and the rotated ones, values and grads."""
+    torch.manual_seed(7)
+    angles = torch.rand(2, 5, 4) * 6.28
+    frequencies = torch.polar(torch.ones_like(angles), angles)
+    if inverse:
+        frequencies = frequencies.conj()
+    for values in (
+        torch.randn(2, 5, 16, dtype=dtype),
+        torch.randn(2, 5, 3, 16, dtype=dtype),
+        torch.randn(2, 3, 5, 16, dtype=dtype).transpose(1, 2),  # non-contiguous, as the attention output arrives
+    ):
+        values = values.detach().requires_grad_(True)
+        reference_input = values.detach().clone().requires_grad_(True)
+        pairs = torch.view_as_complex(reference_input[..., -8:].float().unflatten(-1, (-1, 2)).contiguous())
+        rotation = frequencies.unsqueeze(2) if values.ndim == 4 else frequencies
+        rotated = torch.view_as_real(pairs * rotation).flatten(-2).to(dtype)
+        reference = torch.cat((reference_input[..., :-8], rotated), dim=-1)
+        actual = _apply_rope(values, angles, inverse=inverse)
+        assert actual.is_contiguous() and actual.data_ptr() != values.data_ptr()
+        assert torch.equal(actual, reference)
+        upstream = torch.randn_like(actual)
+        (actual * upstream).sum().backward()
+        (reference * upstream).sum().backward()
+        assert torch.equal(values.grad, reference_input.grad)
 
 
 def test_rotary_recomputes_exact_fp32_frequencies_after_bfloat16_cast() -> None:
@@ -438,7 +467,7 @@ def test_indexer_rejects_missing_latent_keys_and_candidates():
     with pytest.raises(ValueError, match="requires candidates"):
         reindex(x, **kwargs, state=state)
     with pytest.raises(ValueError, match="requires candidates"):
-        reindex(x, **kwargs, state=replace(state, candidates=torch.ones(1, 4, 2, dtype=torch.bool)))
+        reindex(x, **kwargs, state=replace(state, candidates=torch.ones(1, 4, 3, dtype=torch.bool)))
 
 
 def test_candidate_blocks_with_no_visible_keys():
@@ -550,6 +579,7 @@ def test_compressor_cast_boundary_and_all_gradients_match_literal_projection(rat
 def test_indexer_uses_bf16_scores_and_returns_sorted_positions_with_empty_queries():
     torch.manual_seed(83)
     config = _arithmetic_config(dtype="bfloat16", index_topk=3)
+    config.candidate_block_size = 1  # Each candidate bit selects one key in this arithmetic oracle.
     module = _Indexer(config, layer_idx=4, dtype=torch.bfloat16)
     x = torch.randn(2, 8, config.hidden_size, dtype=torch.bfloat16)
     qr = torch.randn(2, 8, config.q_lora_rank, dtype=torch.bfloat16)
@@ -592,3 +622,98 @@ def test_indexer_uses_bf16_scores_and_returns_sorted_positions_with_empty_querie
     assert not actual.topk_indices[:, 0].ge(0).any()
     assert state.topk_indices is None
     assert all(not parameter.requires_grad for parameter in module.parameters())
+
+
+def test_validate_attention_inputs_runs_once_and_layers_skip_host_checks(monkeypatch) -> None:
+    """The host-synchronising checks live in validate_attention_inputs; a layer told inputs_validated=True does not
+    repeat them (no torch.equal / torch.all / torch.any on device tensors in its forward)."""
+    from nemo_automodel.components.models.deepseek_v41.attention import validate_attention_inputs
+
+    positions = torch.arange(4)[None]
+    validate_attention_inputs(positions, None, None, sequence=4)
+    validate_attention_inputs(positions, torch.tensor([[1, 1, 1, 0]]), None, sequence=4)
+    with pytest.raises(ValueError, match="zero-based"):
+        validate_attention_inputs(torch.tensor([[0, 1, 0, 1]]), None, None, sequence=4)
+    with pytest.raises(ValueError, match="right padding"):
+        validate_attention_inputs(positions, torch.tensor([[0, 1, 1, 1]]), None, sequence=4)
+    with pytest.raises(ValueError, match="zero and one"):
+        validate_attention_inputs(positions, torch.full((1, 4), 2), None, sequence=4)
+
+    hidden = torch.randn(1, 4, 16)
+    source = DeepseekV41Attention(_config(), 1, _backend())
+
+    def no_sync(*args, **kwargs):
+        raise AssertionError("host-synchronising comparison in the attention hot path")
+
+    monkeypatch.setattr(torch, "equal", no_sync)
+    monkeypatch.setattr(torch, "all", no_sync)
+    monkeypatch.setattr(torch, "any", no_sync)
+    out = source(hidden, position_ids=positions, state=DeepseekV41AttentionState(), inputs_validated=True)
+    assert out.hidden_states.shape == hidden.shape
+    out = source(
+        hidden,
+        position_ids=positions,
+        state=DeepseekV41AttentionState(),
+        attention_mask=torch.tensor([[1, 1, 1, 0]]),
+        inputs_validated=True,
+    )
+    assert out.hidden_states.shape == hidden.shape
+    with pytest.raises(AssertionError, match="host-synchronising"):
+        source(hidden, position_ids=positions, state=DeepseekV41AttentionState())
+
+
+def test_packed_indexer_query_tiles_match_dense_document_oracle():
+    """Cover tile cuts, repeated scores, decoder candidates and padded query rows."""
+    torch.manual_seed(491)
+    config = _config()
+    source = _Indexer(config, layer_idx=3, dtype=torch.float32)
+    consumer = _Indexer(config, layer_idx=4, dtype=torch.float32)
+    batch, sequence, width = 2, 273, 271
+    queries = torch.randn(batch, sequence, config.index_n_heads, config.index_head_dim)
+    keys = torch.randn(batch, width, config.index_head_dim)
+    weights = torch.randn(batch, sequence, config.index_n_heads)
+    # Exact ties ensure selection retains the whole document's original key width.
+    keys[:, 20:24] = keys[:, 19:20]
+    documents = torch.ones(batch, sequence, dtype=torch.long)
+    documents[:, 137:260] = 2
+    documents[:, 260:] = 0
+    key_documents = documents[:, :width].clone()
+    valid = key_documents > 0
+    valid[:, 136] = False
+    positions = torch.arange(sequence).expand(batch, -1)
+    state = DeepseekV41AttentionState(compression_ratio=1, compressed_seq_ids=key_documents, compressed_valid=valid)
+    scores = torch.einsum("bshd,btd->bsht", queries, keys).relu()
+    scores = (scores * weights.unsqueeze(-1)).sum(2)
+    allowed = torch.arange(width)[None, None] <= positions.unsqueeze(-1)
+    allowed = allowed & (documents.unsqueeze(-1) == key_documents.unsqueeze(1)) & valid.unsqueeze(1)
+    scores = scores.masked_fill(~allowed, -torch.inf)
+    expected = torch.full((batch, sequence, min(config.index_topk, width)), -1, dtype=torch.long)
+    expected_reindex = expected.clone()
+    for row in range(batch):
+        for document in (1, 2):
+            q = torch.where(documents[row] == document)[0]
+            k = torch.where((key_documents[row] == document) & valid[row])[0]
+            values = scores[row, q[:, None], k]
+            selected = values.topk(min(config.index_topk, k.numel()), sorted=False).indices.sort(-1).values
+            expected[row, q, : selected.shape[-1]] = torch.where(
+                torch.isfinite(values.gather(-1, selected)), k[selected], -1
+            )
+            # Independent dense source mask, matching the released block definition.
+            padded = F.pad(values, (0, -k.numel() % config.candidate_block_size), value=-torch.inf)
+            blocks = padded.unflatten(-1, (-1, config.candidate_block_size)).amax(-1)
+            last = (torch.isfinite(values).sum(-1, keepdim=True) - 1) // config.candidate_block_size
+            blocks = blocks.masked_fill(torch.arange(blocks.shape[-1]) == last, torch.inf)
+            picked = blocks.topk(min(config.candidate_topk_blocks, blocks.shape[-1]), dim=-1)
+            mask = torch.zeros_like(blocks, dtype=torch.bool).scatter(-1, picked.indices, picked.values > -torch.inf)
+            mask = mask.repeat_interleave(config.candidate_block_size, -1)[:, : k.numel()]
+            filtered = values.masked_fill(~mask, -torch.inf)
+            selected = filtered.topk(min(config.index_topk, k.numel()), sorted=False).indices.sort(-1).values
+            expected_reindex[row, q, : selected.shape[-1]] = torch.where(
+                torch.isfinite(filtered.gather(-1, selected)), k[selected], -1
+            )
+    actual = source._select_queries(queries, keys, weights, positions, documents, state)
+    reused = consumer._select_queries(queries, keys, weights, positions, documents, actual)
+    torch.testing.assert_close(actual.topk_indices, expected, atol=0, rtol=0)
+    torch.testing.assert_close(reused.topk_indices, expected_reindex, atol=0, rtol=0)
+    assert reused.candidates is actual.candidates
+    assert actual.candidates.shape[-1] == (width + config.candidate_block_size - 1) // config.candidate_block_size

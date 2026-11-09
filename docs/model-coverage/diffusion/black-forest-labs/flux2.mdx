@@ -1,20 +1,43 @@
 ---
 title: "FLUX.2-dev"
-description: "Supported FLUX.2-dev checkpoint and NeMo AutoModel diffusion recipes."
-slug: model-coverage/diffusion/black-forest-labs/flux-2-dev
+description: "Fine-tune FLUX.2-dev for text-to-image generation with NeMo AutoModel using checked-in full-parameter and LoRA flow-matching recipes."
+slug: model-coverage/diffusion/black-forest-labs/FLUX.2-dev
 ---
 
-[FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is a text-to-image diffusion model supported by NeMo AutoModel's flow-matching training recipe.
+[FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev) is Black Forest Labs' 32B rectified flow transformer for text-to-image generation and single- or multi-reference image editing.
 
-<Info>
+NeMo AutoModel includes full-parameter and Low-Rank Adaptation (LoRA) text-to-image fine-tuning recipes for this checkpoint.
 
-| | |
+## Fine-Tune FLUX.2-dev
+
+From the repository root, run:
+
+```bash
+uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/flux2_t2i_flow.yaml
+```
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
 |---|---|
-| **Task** | Text-to-Image |
-| **Architecture** | Diffusion Transformer (Flow Matching) |
-| **HF Org** | [black-forest-labs](https://huggingface.co/black-forest-labs) |
-
-</Info>
+| Upstream Tasks | Text-to-image generation; single- and multi-reference image editing |
+| Model Type | Rectified flow transformer |
+| Parameters | 32B |
+| Reference Architecture | `Flux2` |
+| Transformer Blocks | 8 double-stream / 48 single-stream |
+| Hidden Size | 6,144 |
+| Attention | 48 heads |
+| Feed-Forward Ratio | 3.0 |
+| Text Encoder | `Mistral-Small-3.2-24B-Instruct-2506` |
+| Text Feature Width | 15,360 |
+| Latent Channels | 128 input / 128 output |
+| Position Axes | 4 axes with 32 dimensions each |
+| Rotary Position Embedding Theta | 2,000 |
+| Guidance | Guidance-distilled with guidance embedding enabled |
+| Weight Dtype | `BF16` |
 
 ## Example Model and Recipes
 
@@ -22,10 +45,5 @@ slug: model-coverage/diffusion/black-forest-labs/flux-2-dev
 |---|---|
 | [`black-forest-labs/FLUX.2-dev`](https://huggingface.co/black-forest-labs/FLUX.2-dev) | [Full fine-tuning](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow.yaml) |
 | [`black-forest-labs/FLUX.2-dev`](https://huggingface.co/black-forest-labs/FLUX.2-dev) | [LoRA](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/flux2_t2i_flow_lora.yaml) |
-
-```bash
-uv run torchrun --nproc-per-node=8 examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/flux2_t2i_flow.yaml
-```
 
 See the [Diffusion Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).

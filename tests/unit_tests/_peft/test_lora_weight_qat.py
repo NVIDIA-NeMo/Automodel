@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DeviceMesh, Replicate, distribute_tensor
 
-from nemo_automodel.components._peft.lora import LinearLoRA, TritonLinearLoRA, patch_linear_module
+from nemo_automodel.components._peft.lora import LinearLoRA, TritonLinearLoRA, lora_token_gate, patch_linear_module
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components._peft.lora_mlp import _fusible, fused_lora_swiglu_mlp
 from nemo_automodel.components.moe.config import MoEConfig
@@ -108,6 +108,25 @@ def test_dense_effective_qdq_forward_gradients_and_step(quant_config, implementa
     assert torch.equal(layer.weight, frozen_weight)
     if bias:
         assert torch.equal(layer.bias, frozen_bias)
+
+
+@pytest.mark.parametrize("cls", [LinearLoRA, TritonLinearLoRA])
+def test_dense_qat_keyword_inputs_and_token_gate(quant_config: WeightQuantizationConfig, cls: type[LinearLoRA]) -> None:
+    """Preserve nn.Linear input aliases and reject token-dependent merged weights."""
+    layer = cls(nn.Linear(32, 32))
+    layer.weight_fake_quantizer = quant_config.build()
+    x = torch.randn(2, 3, 32)
+    expected = layer(x)
+    torch.testing.assert_close(layer(input=x), expected, rtol=0, atol=0)
+    torch.testing.assert_close(layer(x=x), expected, rtol=0, atol=0)
+    with pytest.raises(TypeError, match="either x or input"):
+        layer(input=x, x=x)
+    with pytest.raises(TypeError, match="requires an input tensor"):
+        layer()
+    with lora_token_gate(layer, torch.tensor([[1, 0, 1], [0, 1, 0]])):
+        with pytest.raises(ValueError, match="per-token adapter gating"):
+            layer(x)
+    torch.testing.assert_close(layer(x), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("cls", [LinearLoRA, TritonLinearLoRA])
@@ -349,28 +368,13 @@ def _cpu_grouped_mm(x: torch.Tensor, operands: torch.Tensor, *, offs: torch.Tens
     return torch.cat([x[bounds[i] : bounds[i + 1]] @ operand for i, operand in enumerate(operands)])
 
 
-def _cpu_gmm(x: torch.Tensor, operands: torch.Tensor, counts: torch.Tensor, *, trans_b: bool) -> torch.Tensor:
-    """CPU stand-in for grouped_gemm's untransposed operand interface.
-
-    Args:
-        x: CPU tensor [routed_tokens, in], grouped by expert.
-        operands: Contiguous CPU tensor [local_experts, in, out].
-        counts: Integer tensor [local_experts], tokens per expert.
-        trans_b: Must be False for the expert operand contract.
-
-    Returns:
-        CPU tensor [routed_tokens, out] retaining input and weight gradients.
-    """
-    assert trans_b is False
-    return _cpu_grouped_mm(x, operands, offs=counts.cumsum(0))
-
-
 @pytest.mark.parametrize("expert_bias", [False, True])
 @pytest.mark.parametrize("activation", ["swiglu", "relu2"])
 @pytest.mark.parametrize("grouped_mm", [False, True])
 @pytest.mark.parametrize("after_down", [False, True])
+@pytest.mark.parametrize("with_transform", [False, True])
 def test_expert_qat_exact_loaded_parent_outputs_and_gradients(
-    quant_config, expert_bias, activation, grouped_mm, after_down
+    quant_config, expert_bias, activation, grouped_mm, after_down, with_transform
 ):
     torch.manual_seed(67)
     layer = _make_experts(expert_bias=expert_bias, activation=activation, after_down=after_down)
@@ -400,14 +404,16 @@ def test_expert_qat_exact_loaded_parent_outputs_and_gradients(
     ref_weights = weights.detach().clone().requires_grad_()
     indices = torch.tensor([[1, 0], [0, 1], [1, 0], [0, 1], [1, 0]])
     mask = torch.tensor([True, True, False, True, True])
+    transform = nn.LayerNorm(32) if with_transform else None
+    reference_transform = copy.deepcopy(transform)
     with patch.object(torch, "_grouped_mm", side_effect=_cpu_grouped_mm, create=True):
-        expected = parent(ref_x, mask, ref_weights, indices)
+        expected = parent(ref_x, mask, ref_weights, indices, post_expert_output=reference_transform)
         # QAT must bypass the overridden additive-LoRA kernels, not call module.forward.
         with (
             patch.object(layer, "_forward_loop", side_effect=AssertionError("legacy LoRA kernel")),
             patch.object(layer, "_forward_grouped_mm", side_effect=AssertionError("legacy LoRA kernel")),
         ):
-            actual = layer(x, mask, weights, indices)
+            actual = layer(x, mask, weights, indices, post_expert_output=transform)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     probe = torch.randn_like(actual)
     (actual * probe).sum().backward()
@@ -415,6 +421,9 @@ def test_expert_qat_exact_loaded_parent_outputs_and_gradients(
     torch.autograd.backward(tuple(effective.values()), (parent.gate_and_up_projs.grad, parent.down_projs.grad))
     torch.testing.assert_close(x.grad, ref_x.grad, atol=0, rtol=0)
     torch.testing.assert_close(weights.grad, ref_weights.grad, atol=0, rtol=0)
+    if transform is not None:
+        for parameter, ref_parameter in zip(transform.parameters(), reference_transform.parameters()):
+            torch.testing.assert_close(parameter.grad, ref_parameter.grad, atol=0, rtol=0)
     for name, param in layer.named_parameters():
         if param.requires_grad:
             torch.testing.assert_close(param.grad, reference.get_parameter(name).grad, atol=0, rtol=0)
@@ -478,7 +487,7 @@ def test_expert_qat_rejects_autocast_before_dispatch(deep_ep, device_type):
     layer.token_dispatcher.token_permutation2.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["grouped_mm", "deepep_torch_mm", "deepep_gmm"])
+@pytest.mark.parametrize("backend", ["grouped_mm", "deepep_torch_mm"])
 def test_grouped_gemm_qat_operand_plumbing(quant_config, backend):
     """CPU GEMM/dispatcher stand-ins test math and call counts, not distributed execution."""
     torch.manual_seed(59)
@@ -489,7 +498,8 @@ def test_grouped_gemm_qat_operand_plumbing(quant_config, backend):
     else:
         layer = GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP(_experts_config()), lora_dim=3, alpha=7)
         layer.load_state_dict(source.state_dict())
-    layer.use_torch_mm = backend != "deepep_gmm"
+    if backend == "grouped_mm":
+        layer.use_torch_mm = True
     layer.weight_fake_quantizer = quant_config.build()
     x = torch.randn(3, 32, requires_grad=True)
     weights = torch.rand(3, 1, requires_grad=True)
@@ -502,13 +512,8 @@ def test_grouped_gemm_qat_operand_plumbing(quant_config, backend):
         layer.token_dispatcher.token_permutation2.return_value = (x, torch.tensor([2, 1]), weights[:, 0])
         layer.token_dispatcher.token_unpermutation = nn.Identity()
     expected = _reference_experts(reference, ref_x, mask, ref_weights, indices, quant_config.build())
-    with (
-        patch.object(torch, "_grouped_mm", side_effect=_cpu_grouped_mm, create=True) as torch_mm,
-        patch("nemo_automodel.components._peft.lora_experts.ops") as ops,
-    ):
-        ops.gmm.side_effect = _cpu_gmm
+    with patch.object(torch, "_grouped_mm", side_effect=_cpu_grouped_mm, create=True) as gemm:
         actual = layer(x, mask, weights, indices)
-        gemm = ops.gmm if backend == "deepep_gmm" else torch_mm
         assert gemm.call_count == 2  # Only effective gate/up and down GEMMs; no additive adapter GEMMs.
         assert gemm.call_args_list[0].args[1].shape == (2, 32, 128)
         assert gemm.call_args_list[1].args[1].shape == (2, 64, 32)
@@ -529,12 +534,10 @@ def test_grouped_gemm_qat_operand_plumbing(quant_config, backend):
 @pytest.mark.parametrize("tokens", [0, 3])
 @pytest.mark.parametrize("after_down", [False, True])
 @pytest.mark.parametrize("qat", [False, True])
-@pytest.mark.parametrize("grouped_mm", [False, True])
-def test_deepep_empty_dispatch_gradients(quant_config, tokens, after_down, qat, grouped_mm):
+def test_deepep_empty_dispatch_gradients(quant_config, tokens, after_down, qat):
     source = _make_experts(after_down=after_down)
     layer = GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP(_experts_config(after_down=after_down)), lora_dim=3, alpha=7)
     layer.load_state_dict(source.state_dict())
-    layer.use_torch_mm = grouped_mm
     layer.weight_fake_quantizer = quant_config.build() if qat else None
     x = torch.randn(tokens, 32, requires_grad=True)
     weights = torch.rand(tokens, 1, requires_grad=True)
@@ -542,8 +545,7 @@ def test_deepep_empty_dispatch_gradients(quant_config, tokens, after_down, qat, 
     layer.token_dispatcher.token_permutation2.return_value = (x[:0], torch.zeros(2, dtype=torch.long), weights[:0, 0])
     layer.token_dispatcher.token_unpermutation = nn.Identity()
     # Inspect the local empty output passed to combine; this stand-in performs no communication.
-    with patch("nemo_automodel.components._peft.lora_experts.ops"):
-        out = layer(x, torch.zeros(tokens, dtype=torch.bool), weights, torch.zeros(tokens, 1, dtype=torch.long))
+    out = layer(x, torch.zeros(tokens, dtype=torch.bool), weights, torch.zeros(tokens, 1, dtype=torch.long))
     assert out.shape == (0, 32)
     out.sum().backward()
     for tensor in (x, weights, *(p for p in layer.parameters() if p.requires_grad)):
@@ -552,9 +554,9 @@ def test_deepep_empty_dispatch_gradients(quant_config, tokens, after_down, qat, 
 
 
 @pytest.mark.parametrize("expert_bias", [False, True])
-@pytest.mark.parametrize("grouped_mm", [False, True])
 @pytest.mark.parametrize("after_down", [False, True])
-def test_deepep_qat_exact_parent_outputs_and_gradients(quant_config, cpu_mesh, expert_bias, grouped_mm, after_down):
+@pytest.mark.parametrize("with_transform", [False, True])
+def test_deepep_qat_exact_parent_outputs_and_gradients(quant_config, cpu_mesh, expert_bias, after_down, with_transform):
     """Real parent math with CPU dispatcher/GEMM stand-ins, not native DeepEP validation."""
     torch.manual_seed(71)
     source = _make_experts(expert_bias=expert_bias, after_down=after_down)
@@ -583,7 +585,6 @@ def test_deepep_qat_exact_parent_outputs_and_gradients(quant_config, cpu_mesh, e
         setattr(parent, name, nn.Parameter(distribute_tensor(value, cpu_mesh, [Replicate()]), "bias" not in name))
     parent.n_routed_experts = config.n_routed_experts
     parent.ep_size = 1
-    parent.use_torch_mm = layer.use_torch_mm = grouped_mm
     layer.weight_fake_quantizer = quant_config.build()
     x = torch.randn(5, 32, requires_grad=True)
     weights = torch.rand(5, 1, requires_grad=True)
@@ -595,14 +596,11 @@ def test_deepep_qat_exact_parent_outputs_and_gradients(quant_config, cpu_mesh, e
         module.token_dispatcher = Mock()
         module.token_dispatcher.token_permutation2.return_value = (hidden, torch.tensor([3, 2]), probs[:, 0])
         module.token_dispatcher.token_unpermutation = nn.Identity()
-    with (
-        patch.object(torch, "_grouped_mm", side_effect=_cpu_grouped_mm, create=True),
-        patch("nemo_automodel.components._peft.lora_experts.ops") as lora_ops,
-        patch("nemo_automodel.components.moe.experts.ops", create=True) as parent_ops,
-    ):
-        lora_ops.gmm.side_effect = parent_ops.gmm.side_effect = _cpu_gmm
-        actual = layer(x, mask, weights, indices)
-        expected = parent(ref_x, mask, ref_weights, indices)
+    transform = nn.LayerNorm(32) if with_transform else None
+    reference_transform = copy.deepcopy(transform)
+    with patch.object(torch, "_grouped_mm", side_effect=_cpu_grouped_mm, create=True):
+        actual = layer(x, mask, weights, indices, post_expert_output=transform)
+        expected = parent(ref_x, mask, ref_weights, indices, post_expert_output=reference_transform)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     probe = torch.randn_like(actual)
     (actual * probe).sum().backward()
@@ -612,29 +610,15 @@ def test_deepep_qat_exact_parent_outputs_and_gradients(quant_config, cpu_mesh, e
     )
     torch.testing.assert_close(x.grad, ref_x.grad, atol=0, rtol=0)
     torch.testing.assert_close(weights.grad, ref_weights.grad, atol=0, rtol=0)
+    if transform is not None:
+        for parameter, ref_parameter in zip(transform.parameters(), reference_transform.parameters()):
+            torch.testing.assert_close(parameter.grad, ref_parameter.grad, atol=0, rtol=0)
     for name, param in layer.named_parameters():
         if param.requires_grad:
             torch.testing.assert_close(param.grad, source.get_parameter(name).grad, atol=0, rtol=0)
             assert torch.count_nonzero(param.grad) > 0
         else:
             assert param.grad is None
-
-
-@pytest.mark.parametrize("after_down", [False, True])
-def test_deepep_qat_missing_backend_fails_before_dispatch(after_down):
-    layer = GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP(_experts_config(after_down=after_down)))
-    layer.weight_fake_quantizer = Mock(spec=nn.Module)
-    layer.token_dispatcher = Mock()
-    assert not layer.use_torch_mm
-    with (
-        patch("nemo_automodel.components._peft.lora_experts.ops", None),
-        pytest.raises(RuntimeError, match="requires grouped_gemm or use_torch_mm=True"),
-    ):
-        layer(
-            torch.randn(2, 32), torch.ones(2, dtype=torch.bool), torch.rand(2, 2), torch.zeros(2, 2, dtype=torch.long)
-        )
-    layer.token_dispatcher.token_permutation2.assert_not_called()
-    layer.weight_fake_quantizer.assert_not_called()
 
 
 def test_deepep_qat_rejects_dispatch_dtype_change():
@@ -676,13 +660,14 @@ def test_expert_constructor_preserves_source_dtype(cls, base_cls):
 def test_experts_reject_mxfp8_before_dispatch_or_quantization(deep_ep):
     if deep_ep:
         base = GroupedExpertsDeepEP(_experts_config())
-        base.use_mxfp8 = True
         layer = GroupedExpertsDeepEPLoRA(base)
         layer.token_dispatcher = Mock()
     else:
         base = GroupedExperts(_experts_config())
-        base.use_mxfp8 = True
         layer = GroupedExpertsLoRA(base)
+    # Construction rejects MXFP8 in the prerequisite PR; retain the runtime
+    # guard for a backend flag changed after an otherwise supported wrapping.
+    layer.use_mxfp8 = True
     layer.weight_fake_quantizer = WeightQuantizationConfig(format="mxfp4").build()
     with pytest.raises(NotImplementedError, match="MXFP8"):
         layer(
@@ -719,7 +704,8 @@ def _ordinary_expert_pair(backend, dtype, expert_bias, activation, after_down):
     with torch.no_grad():
         for parameter in parent.parameters():
             parameter.normal_(std=0.2)
-    parent.use_torch_mm = backend in ("grouped_mm", "deepep_torch_mm")
+    if not deep_ep:
+        parent.use_torch_mm = backend == "grouped_mm"
     # Aligned rank avoids conflating router placement with padding-dependent GEMM rounding.
     layer = (GroupedExpertsDeepEPLoRA if deep_ep else GroupedExpertsLoRA)(parent, lora_dim=8, alpha=13)
     return layer, parent
@@ -850,7 +836,7 @@ def _reference_additive_experts(layer, x, mask, weights, indices, *, grouped, de
     return result.to(x.dtype)
 
 
-@pytest.mark.parametrize("backend", ["loop", "grouped_mm", "deepep_torch_mm", "deepep_gmm"])
+@pytest.mark.parametrize("backend", ["loop", "grouped_mm", "deepep_torch_mm"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("expert_bias", [False, True])
 @pytest.mark.parametrize("activation", ["swiglu", "relu2"])
@@ -866,12 +852,7 @@ def test_ordinary_zero_b_exact_parent(cpu_mesh, backend, dtype, expert_bias, act
         parent.ep_size = 1
         parent.token_dispatcher = _cpu_slot_dispatcher(4)
         layer.token_dispatcher = _cpu_slot_dispatcher(4)
-    with (
-        patch.object(torch, "_grouped_mm", side_effect=_cpu_grouped_mm, create=True),
-        patch("nemo_automodel.components._peft.lora_experts.ops") as lora_ops,
-        patch("nemo_automodel.components.moe.experts.ops", create=True) as parent_ops,
-    ):
-        lora_ops.gmm.side_effect = parent_ops.gmm.side_effect = _cpu_gmm
+    with patch.object(torch, "_grouped_mm", side_effect=_cpu_grouped_mm, create=True):
         actual = layer(x, mask, weights, indices)
         expected = parent(x, mask, weights, indices)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -903,7 +884,7 @@ def test_ordinary_after_down_reduces_in_topk_not_expert_order(backend, dtype):
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("backend", ["loop", "grouped_mm", "deepep_torch_mm", "deepep_gmm"])
+@pytest.mark.parametrize("backend", ["loop", "grouped_mm", "deepep_torch_mm"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("expert_bias", [False, True])
 @pytest.mark.parametrize("activation", ["swiglu", "relu2"])
@@ -924,11 +905,7 @@ def test_ordinary_nonzero_additive_reference(backend, dtype, expert_bias, activa
     expected = _reference_additive_experts(
         reference, ref_x, mask, ref_weights, indices, grouped=backend != "loop", deep_ep=deep_ep
     )
-    with (
-        patch.object(torch, "_grouped_mm", side_effect=_cpu_grouped_mm, create=True),
-        patch("nemo_automodel.components._peft.lora_experts.ops") as ops,
-    ):
-        ops.gmm.side_effect = _cpu_gmm
+    with patch.object(torch, "_grouped_mm", side_effect=_cpu_grouped_mm, create=True):
         actual = layer(x, mask, weights, indices)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     # The independent FP32 autograd oracle verifies routing and every additive

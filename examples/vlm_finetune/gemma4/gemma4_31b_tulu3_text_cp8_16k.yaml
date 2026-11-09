@@ -109,6 +109,7 @@ wandb:
   dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   time: "01:00:00"
   env_vars:
     # CP backward fragments the allocator; NCCL then cannot get its connection buffers, leads to OOM.

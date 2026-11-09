@@ -60,7 +60,16 @@ def ref_cce(monkeypatch):
     """
 
     def _ref(
-        hidden, lm_weight, targets, ignore_index=-100, softcap=None, reduction="sum", shift=False, filter_eps=None
+        hidden,
+        lm_weight,
+        targets,
+        ignore_index=-100,
+        softcap=None,
+        reduction="sum",
+        shift=False,
+        filter_eps=None,
+        accum_e_fp32=False,
+        impl="cce",
     ):
         logits = hidden.float() @ lm_weight.float().t()
         return F.cross_entropy(
@@ -110,7 +119,7 @@ def _inputs(requires_grad=False, seed=0):
 
 
 def _count_gathers():
-    """Patch _get_lm_head_weight in both namespaces with a counting wrapper."""
+    """Count weight retrievals at the shared materialization boundary."""
     n = {"c": 0}
     real = _lutils._get_lm_head_weight
 
@@ -120,7 +129,6 @@ def _count_gathers():
 
     return (
         n,
-        mock.patch.object(_mtp, "_get_lm_head_weight", side_effect=spy),
         mock.patch.object(_lutils, "_get_lm_head_weight", side_effect=spy),
     )
 
@@ -182,8 +190,8 @@ def test_lm_head_gathered_once(ref_cce):
     torch.manual_seed(1)
     m = _TinyModel()
     hs, labels = _inputs()
-    n, p1, p2 = _count_gathers()
-    with p1, p2:
+    n, patch_weight = _count_gathers()
+    with patch_weight:
         calculate_mtp_loss(
             FusedLinearCrossEntropy(reduction="sum"),
             mtp_per_depth_h=[h.clone() for h in hs],
@@ -200,8 +208,8 @@ def test_lm_weight_passthrough_skips_gather(ref_cce):
     torch.manual_seed(1)
     m = _TinyModel()
     hs, labels = _inputs()
-    n, p1, p2 = _count_gathers()
-    with p1, p2:
+    n, patch_weight = _count_gathers()
+    with patch_weight:
         calculate_mtp_loss(
             FusedLinearCrossEntropy(reduction="sum"),
             mtp_per_depth_h=[h.clone() for h in hs],
@@ -290,7 +298,7 @@ def test_non_fused_path_does_not_gather_lm_head():
     with (
         mock.patch.object(_mtp, "calculate_loss", side_effect=fake_calc),
         mock.patch.object(
-            _mtp, "_get_lm_head_weight", side_effect=AssertionError("non-fused path must not gather the LM head")
+            _lutils, "_get_lm_head_weight", side_effect=AssertionError("non-fused path must not gather the LM head")
         ),
     ):
         calculate_mtp_loss(
@@ -327,8 +335,8 @@ def test_sharded_lm_head_gathers_once_and_matches(ref_cce):
         labels = torch.randint(0, V, (B, S))
         m = _TinyModel(weight=distribute_tensor(W_full.clone(), mesh, [Shard(0)]))
 
-        n, p1, p2 = _count_gathers()
-        with p1, p2:
+        n, patch_weight = _count_gathers()
+        with patch_weight:
             loss = calculate_mtp_loss(
                 FusedLinearCrossEntropy(reduction="sum"),
                 mtp_per_depth_h=hs,

@@ -11,16 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
+import fnmatch
 import importlib
+import json
+import math
 import multiprocessing
 import os
+import re
+import statistics
+import subprocess
 import sys
 import types
+import warnings
 from pathlib import Path
 from shutil import rmtree
 
+import psutil
 import pytest
+import pytest_timeout
 import torch
+from _pytest.runner import runtestprotocol
 
 os.environ.setdefault("HF_CACHE", "/home/TestData/lite/hf_cache")
 os.environ.setdefault("HF_HOME", "/home/TestData/HF_HOME")
@@ -49,21 +60,435 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Give unmarked unit tests a 5s fallback timeout.
+_DEFAULT_RUNTIME_BUDGET_SECONDS = 30.0
+_DEFAULT_HARD_TIMEOUT_SECONDS = 70.0
+_TIMEOUT_MULTIPLIER = 3
+_RUNTIME_BUDGET_ATTRIBUTE = "_automodel_runtime_budget_seconds"
+_DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+# Directories whose tests never use CUDA. L0_Unit_Tests_CPU runs them, so the GPU shards deselect them.
+_CPU_ONLY_DIRECTORIES = frozenset({"ci_tests", "tools"})
+# Seconds each test file took in the GPU unit-test shards; refresh with tools/update_gpu_shard_durations.py.
+_GPU_SHARD_DURATIONS_PATH = Path(__file__).parent / "gpu_shard_durations.json"
+_FILE_SHARDS = pytest.StashKey[dict[str, int]]()
 
-    pytest-timeout resolves a test's timeout as marker, then ``--timeout``, then
-    ``PYTEST_TIMEOUT``, then the ``timeout`` ini option. The fallback is installed
-    as a marker, so it would outrank all three global settings; it is therefore
-    skipped entirely when any of them was set explicitly. Genuine per-test or
-    per-module ``timeout`` markers are always preserved.
+
+def _run_git(repo_root: Path, *args: str) -> str | None:
+    """Run a small, read-only git query, returning ``None`` outside a checkout."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _runtime_budget_base(repo_root: Path) -> str | None:
+    """Find the revision that represents main for this checkout.
+
+    Pull-request CI tests a synthetic merge commit, whose first parent is the
+    exact base revision. Local branches use their merge-base with
+    ``origin/main`` when it is available. The environment override is useful
+    for other CI entry points.
     """
-    if config.getoption("timeout") is not None or "PYTEST_TIMEOUT" in os.environ or config.getini("timeout"):
+    override = os.environ.get("AUTOMODEL_RUNTIME_BUDGET_BASE")
+    if override:
+        return override
+
+    parents = _run_git(repo_root, "rev-list", "--parents", "-n", "1", "HEAD")
+    if not parents:
+        return None
+    revisions = parents.split()
+    if len(revisions) > 2:
+        return revisions[1]
+
+    origin_main = _run_git(repo_root, "rev-parse", "--verify", "origin/main")
+    if origin_main:
+        merge_base = _run_git(repo_root, "merge-base", "HEAD", origin_main)
+        if merge_base:
+            return merge_base
+
+    return revisions[1] if len(revisions) == 2 else revisions[0]
+
+
+def _changed_python_lines(repo_root: Path, unit_tests_root: Path) -> tuple[dict[Path, set[int]], set[Path]]:
+    """Return added/modified lines and untracked Python files under unit tests."""
+    try:
+        relative_root = unit_tests_root.relative_to(repo_root)
+    except ValueError:
+        return {}, set()
+
+    base = _runtime_budget_base(repo_root)
+    if base is None:
+        return {}, set()
+
+    diff = _run_git(
+        repo_root,
+        "diff",
+        "--unified=0",
+        "--no-ext-diff",
+        "--diff-filter=AM",
+        base,
+        "--",
+        str(relative_root),
+    )
+    changed_lines: dict[Path, set[int]] = {}
+    current_path: Path | None = None
+    for line in (diff or "").splitlines():
+        if line.startswith("+++ b/"):
+            current_path = (repo_root / line[6:]).resolve()
+            if current_path.suffix != ".py":
+                current_path = None
+            continue
+        if current_path is None:
+            continue
+        match = _DIFF_HUNK_RE.match(line)
+        if match is None:
+            continue
+        start = int(match.group(1))
+        count = int(match.group(2) or 1)
+        # A deletion-only hunk has no added lines. Include its new location so
+        # deleting work from the middle of a test still counts as a change.
+        changed_lines.setdefault(current_path, set()).update(range(start, start + max(1, count)))
+
+    untracked = _run_git(
+        repo_root,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "--",
+        str(relative_root),
+    )
+    new_files = {(repo_root / path).resolve() for path in (untracked or "").splitlines() if path.endswith(".py")}
+    return changed_lines, new_files
+
+
+def _test_definitions(path: Path) -> list[tuple[str, int, int]]:
+    """Return qualified test names and source ranges from a Python module."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return []
+
+    definitions: list[tuple[str, int, int]] = []
+
+    def visit(body: list[ast.stmt], parents: tuple[str, ...] = ()) -> None:
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                visit(node.body, (*parents, node.name))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+                decorator_lines = [decorator.lineno for decorator in node.decorator_list]
+                start = min([node.lineno, *decorator_lines])
+                definitions.append(("::".join((*parents, node.name)), start, node.end_lineno or node.lineno))
+
+    visit(tree.body)
+    return definitions
+
+
+def _changed_test_definitions(unit_tests_root: Path) -> set[tuple[Path, str]]:
+    """Map the current diff to exact pytest test functions."""
+    repo_text = _run_git(unit_tests_root, "rev-parse", "--show-toplevel")
+    if repo_text is None:
+        return set()
+    repo_root = Path(repo_text).resolve()
+    changed_lines, new_files = _changed_python_lines(repo_root, unit_tests_root.resolve())
+
+    changed_tests: set[tuple[Path, str]] = set()
+    for path in changed_lines.keys() | new_files:
+        lines = changed_lines.get(path, set())
+        for name, start, end in _test_definitions(path):
+            if path in new_files or any(start <= line <= end for line in lines):
+                changed_tests.add((path, name))
+    return changed_tests
+
+
+def _item_definition(item: pytest.Item) -> tuple[Path, str]:
+    qualified_name = "::".join(part.split("[", 1)[0] for part in item.nodeid.split("::")[1:])
+    return item.path.resolve(), qualified_name
+
+
+def _direct_marker(item: pytest.Item, name: str) -> pytest.Mark | None:
+    """Return a marker only when it is attached to this exact test item."""
+    for node, marker in item.iter_markers_with_node(name=name):
+        if node is item:
+            return marker
+    return None
+
+
+def _runtime_budget(marker: pytest.Mark, default_hard_timeout: float) -> tuple[float, float]:
+    if len(marker.args) != 1 or set(marker.kwargs) - {"hard_timeout", "reason"}:
+        raise pytest.UsageError(
+            "runtime_budget requires one duration and accepts only hard_timeout= and reason= keyword arguments"
+        )
+    try:
+        budget = float(marker.args[0])
+        hard_timeout = float(marker.kwargs.get("hard_timeout", max(default_hard_timeout, budget * 3)))
+    except (TypeError, ValueError) as error:
+        raise pytest.UsageError("runtime_budget durations must be numbers") from error
+    if not math.isfinite(budget) or not math.isfinite(hard_timeout) or budget <= 0 or hard_timeout <= budget:
+        raise pytest.UsageError("runtime_budget requires a positive budget and a hard_timeout greater than it")
+    if budget > _DEFAULT_RUNTIME_BUDGET_SECONDS and not str(marker.kwargs.get("reason", "")).strip():
+        raise pytest.UsageError("runtime_budget exceptions above 30s require a non-empty reason")
+    return budget, hard_timeout
+
+
+def _global_timeout_was_configured(config: pytest.Config) -> bool:
+    return config.getoption("timeout") is not None or "PYTEST_TIMEOUT" in os.environ or bool(config.getini("timeout"))
+
+
+def _apply_runtime_policy(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Apply soft runtime budgets to changed tests and hard watchdogs to hangs.
+
+    A runtime regression should fail only after the test has completed, without
+    interrupting compiler or multiprocessing cleanup. The pytest-timeout marker
+    is reserved for a much larger hard watchdog. Slow-test exceptions use the
+    exact-test ``runtime_budget`` marker. Legacy allowances retain their hang
+    watchdog, but only changed tests receive a configured soft budget capped at 30 seconds.
+    """
+    if _global_timeout_was_configured(config):
         return
+
+    runtime_budget = float(config.getoption("unit_test_runtime_budget"))
+    hard_timeout = float(config.getoption("unit_test_hard_timeout"))
+    if (
+        not math.isfinite(runtime_budget)
+        or not math.isfinite(hard_timeout)
+        or runtime_budget <= 0
+        or hard_timeout <= runtime_budget
+    ):
+        raise pytest.UsageError(
+            "--unit-test-runtime-budget must be positive and --unit-test-hard-timeout must be greater than it"
+        )
+
+    unit_tests_root = Path(__file__).parent
+    changed_tests = _changed_test_definitions(unit_tests_root)
+    for item in items:
+        if unit_tests_root not in item.path.parents:
+            continue
+
+        runtime_markers = list(item.iter_markers_with_node(name="runtime_budget"))
+        inherited_runtime_markers = [(node, marker) for node, marker in runtime_markers if node is not item]
+        if inherited_runtime_markers:
+            raise pytest.UsageError(
+                f"{item.nodeid}: runtime_budget must be applied directly to a test, not to a module or class"
+            )
+        direct_runtime_marker = _direct_marker(item, "runtime_budget")
+        direct_timeout_marker = _direct_marker(item, "timeout")
+        is_changed_test = _item_definition(item) in changed_tests
+
+        if direct_runtime_marker is not None:
+            if direct_timeout_marker is not None:
+                raise pytest.UsageError(
+                    f"{item.nodeid}: runtime_budget owns the hard watchdog; remove the direct timeout marker"
+                )
+            budget, item_hard_timeout = _runtime_budget(direct_runtime_marker, hard_timeout)
+            if is_changed_test:
+                if budget > _DEFAULT_RUNTIME_BUDGET_SECONDS:
+                    raise pytest.UsageError(
+                        f"{item.nodeid}: new or modified unit tests cannot request a runtime_budget above 30s. "
+                        "Optimize the test or move expensive integration coverage to functional tests."
+                    )
+                setattr(item, _RUNTIME_BUDGET_ATTRIBUTE, min(budget, runtime_budget))
+            item.add_marker(pytest.mark.timeout(item_hard_timeout), append=False)
+            continue
+
+        if is_changed_test:
+            setattr(item, _RUNTIME_BUDGET_ATTRIBUTE, runtime_budget)
+
+        # Exact timeout markers are intentional hard-watchdog tests. Inherited
+        # markers are legacy slow-module allowances and must not exempt a newly
+        # changed test from the default hard watchdog.
+        if direct_timeout_marker is not None:
+            continue
+        if is_changed_test or item.get_closest_marker("timeout") is None:
+            item.add_marker(pytest.mark.timeout(hard_timeout), append=False)
+
+
+def _assign_file_shards(paths: list[str], durations: dict[str, float], num_shards: int) -> dict[str, int]:
+    """Assign whole test files to shards, longest first, each to the least-loaded shard.
+
+    A file without a recorded duration weighs as much as the median recorded file. Ties
+    break on the path and the lowest shard index, so every shard computes the same split.
+
+    Args:
+        paths: Test file paths relative to the unit-test root.
+        durations: Recorded seconds per test file, keyed like ``paths``.
+        num_shards: Number of shards to fill.
+
+    Returns:
+        The shard index of every path.
+    """
+    default_seconds = statistics.median(durations.values()) if durations else 1.0
+    loads = [0.0] * num_shards
+    assignment = {}
+    for path in sorted(paths, key=lambda path: (-durations.get(path, default_seconds), path)):
+        shard = loads.index(min(loads))
+        assignment[path] = shard
+        loads[shard] += durations.get(path, default_seconds)
+    return assignment
+
+
+def _file_shard_assignment(config: pytest.Config) -> dict[str, int] | None:
+    """Return the shard of every unit-test file, or ``None`` when the suite is not split."""
+    num_shards = config.getoption("file_num_shards")
+    if num_shards == 1:
+        return None
+    if _FILE_SHARDS not in config.stash:
+        unit_tests_root = Path(__file__).parent
+        patterns = config.getini("python_files")
+        paths = [
+            path.relative_to(unit_tests_root).as_posix()
+            for path in unit_tests_root.rglob("*.py")
+            if any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns)
+        ]
+        durations = json.loads(_GPU_SHARD_DURATIONS_PATH.read_text())["seconds"]
+        config.stash[_FILE_SHARDS] = _assign_file_shards(paths, durations, num_shards)
+    return config.stash[_FILE_SHARDS]
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    """Skip test files that belong to another file shard, before importing them."""
+    unit_tests_root = Path(__file__).parent
+    assignment = _file_shard_assignment(config)
+    if assignment is None or unit_tests_root not in collection_path.parents:
+        return None
+    shard = assignment.get(collection_path.relative_to(unit_tests_root).as_posix())
+    if shard is None or shard == config.getoption("file_shard_id"):
+        return None
+    return True
+
+
+def pytest_report_collectionfinish(config: pytest.Config) -> str | None:
+    """Name this session's file shard in the collection summary."""
+    assignment = _file_shard_assignment(config)
+    if assignment is None:
+        return None
+    shard_id = config.getoption("file_shard_id")
+    owned = sum(shard == shard_id for shard in assignment.values())
+    return f"file shard {shard_id + 1}/{config.getoption('file_num_shards')}: {owned} of {len(assignment)} test files"
+
+
+def pytest_itemcollected(item: pytest.Item) -> None:
+    """Mark tests under CUDA-free directories so the GPU shards can deselect them."""
+    unit_tests_root = Path(__file__).parent
+    if unit_tests_root not in item.path.parents:
+        return
+    if item.path.relative_to(unit_tests_root).parts[0] in _CPU_ONLY_DIRECTORIES:
+        item.add_marker(pytest.mark.cpu_only)
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Resolve configured limits, then allow three times each limit in unit tests."""
+    _apply_runtime_policy(config, items)
     unit_tests_root = Path(__file__).parent
     for item in items:
-        if unit_tests_root in item.path.parents and item.get_closest_marker("timeout") is None:
-            item.add_marker(pytest.mark.timeout(5))
+        if unit_tests_root not in item.path.parents:
+            continue
+        budget = getattr(item, _RUNTIME_BUDGET_ATTRIBUTE, None)
+        if budget is not None:
+            setattr(item, _RUNTIME_BUDGET_ATTRIBUTE, budget * _TIMEOUT_MULTIPLIER)
+        # Resolve marker/CLI/environment/ini precedence before scaling. Keep
+        # method and phase scope, and preserve zero as an explicitly disabled timer.
+        settings = pytest_timeout._get_item_settings(item)
+        if settings.timeout is not None:
+            item.add_marker(
+                pytest.mark.timeout(
+                    settings.timeout * _TIMEOUT_MULTIPLIER,
+                    method=settings.method,
+                    func_only=settings.func_only,
+                ),
+                append=False,
+            )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> bool | None:
+    """Confirm runtime-only overruns once without retrying correctness failures.
+
+    Reuse pytest's runner so function fixtures are torn down and recreated on
+    confirmation, including under xdist. Shared fixtures follow pytest's normal
+    next-item teardown rules and can be recreated at scope boundaries. Compiler
+    caches can remain warm. Publish only the final reports, so JUnit, -x and
+    xdist observe one result per item. All three phases count toward the budget.
+    """
+    budget = getattr(item, _RUNTIME_BUDGET_ATTRIBUTE, None)
+    if budget is None:
+        return None
+    budget_description = (
+        f"{budget:g}s effective runtime budget ({budget / _TIMEOUT_MULTIPLIER:g}s configured x{_TIMEOUT_MULTIPLIER})"
+    )
+
+    item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+    reports = runtestprotocol(item, log=False, nextitem=nextitem)
+    elapsed = sum(report.duration for report in reports)
+    if len(reports) == 3 and all(report.passed for report in reports) and elapsed > budget:
+        # This protocol diagnostic must not abort the session under -W error.
+        with warnings.catch_warnings():
+            warnings.simplefilter("always", pytest.PytestWarning)
+            warnings.warn(
+                pytest.PytestWarning(
+                    f"{item.nodeid} took {elapsed:.2f}s, exceeding its {budget_description}; confirming once."
+                ),
+                stacklevel=2,
+            )
+        # pytest-timeout wraps the protocol, not runtestprotocol(). Give the
+        # confirmation a fresh watchdog rather than charging both attempts to
+        # the first timer. Function-only watchdogs reset in pytest_runtest_call.
+        timeout_settings = pytest_timeout._get_item_settings(item)
+        if timeout_settings.timeout and not timeout_settings.func_only:
+            item.ihook.pytest_timeout_cancel_timer(item=item)
+            item.ihook.pytest_timeout_set_timer(item=item, settings=timeout_settings)
+        reports = runtestprotocol(item, log=False, nextitem=nextitem)
+        confirmed_elapsed = sum(report.duration for report in reports)
+        if len(reports) == 3 and all(report.passed for report in reports) and confirmed_elapsed > budget:
+            call_report = reports[1]
+            call_report.outcome = "failed"
+            call_report.longrepr = (
+                f"{item.nodeid} exceeded its {budget_description} in both attempts "
+                f"({elapsed:.2f}s, {confirmed_elapsed:.2f}s in setup+call+teardown). "
+                "Optimize the test or move expensive integration coverage to functional tests."
+            )
+        # JUnit collects user properties from the final teardown report.
+        reports[-1].user_properties.append(("runtime_budget_first_attempt_seconds", elapsed))
+    for report in reports:
+        item.ihook.pytest_runtest_logreport(report=report)
+    item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+    return True
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
+    """Remember hard timeouts so teardown can clean up abandoned children."""
+    outcome = yield
+    report = outcome.get_result()
+    if report.failed and "Timeout (" in report.longreprtext:
+        setattr(item, "_automodel_timed_out", True)
+
+
+def _descendant_processes() -> list[psutil.Process]:
+    try:
+        return psutil.Process().children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return []
+
+
+def _is_inductor_compile_worker(process: psutil.Process) -> bool:
+    try:
+        command = " ".join(process.cmdline()).replace("\\", "/")
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    return "torch/_inductor/compile_worker" in command or "torch._inductor.compile_worker" in command
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Remember long-lived children so a timeout does not kill another test's pool."""
+    setattr(item, "_automodel_child_pids_before", {process.pid for process in _descendant_processes()})
 
 
 def pytest_addoption(parser):
@@ -80,6 +505,42 @@ def pytest_addoption(parser):
         action="store_true",
         help="pass this argument to active tests which download models from the cloud.",
     )
+    parser.addoption(
+        "--unit-test-runtime-budget",
+        dest="unit_test_runtime_budget",
+        type=float,
+        default=_DEFAULT_RUNTIME_BUDGET_SECONDS,
+        help="Configured runtime budget including fixtures; enforced at 3x with one confirmation (default: 30s -> 90s).",
+    )
+    parser.addoption(
+        "--file-shard-id",
+        dest="file_shard_id",
+        type=int,
+        default=0,
+        help="0-based shard to collect when --file-num-shards splits the suite (default: 0).",
+    )
+    parser.addoption(
+        "--file-num-shards",
+        dest="file_num_shards",
+        type=int,
+        default=1,
+        help="Split whole test files across this many shards, balanced by gpu_shard_durations.json (default: 1).",
+    )
+    parser.addoption(
+        "--unit-test-hard-timeout",
+        dest="unit_test_hard_timeout",
+        type=float,
+        default=_DEFAULT_HARD_TIMEOUT_SECONDS,
+        help="Configured hard watchdog in seconds, enforced at 3x (default: 70s -> 210s).",
+    )
+
+
+@pytest.fixture
+def mock_hub_revision(monkeypatch):
+    """Keep tests with mocked config/weight loaders independent of Hub access."""
+    from nemo_automodel import NeMoAutoConfig
+
+    monkeypatch.setattr(NeMoAutoConfig, "resolve_revision", lambda source, revision=None, **kwargs: revision)
 
 
 @pytest.fixture
@@ -210,24 +671,47 @@ def _fail_on_leaked_process_group():
 
 
 @pytest.fixture(autouse=True)
-def _kill_leaked_child_processes():
+def _kill_leaked_child_processes(request: pytest.FixtureRequest):
     """Kill worker processes a test left behind, so a hung worker cannot stall the session.
 
     pytest-timeout's signal method only interrupts the pytest process. ``mp.spawn(join=True)``
-    starts non-daemonic workers, and when the timeout fires inside its ``join`` those workers
-    keep running. Python then waits for them at interpreter exit, so a single hung worker holds
-    the CI job until the workflow timeout, the failure mode the per-test budget exists to bound.
+    and TorchInductor's compile pool leave child processes running when the timeout interrupts
+    their wait. Python then waits for those workers at interpreter exit, so a single hung worker
+    can hold the CI job until its workflow timeout.
     """
     yield
-    leaked = multiprocessing.active_children()
-    if not leaked:
+
+    multiprocessing_children = multiprocessing.active_children()
+    multiprocessing_pids = {process.pid for process in multiprocessing_children if process.pid is not None}
+    leaked_pids = multiprocessing_pids.copy()
+    if getattr(request.node, "_automodel_timed_out", False):
+        child_pids_before = getattr(request.node, "_automodel_child_pids_before", set())
+        leaked_pids.update(
+            process.pid
+            for process in _descendant_processes()
+            if process.pid not in child_pids_before or _is_inductor_compile_worker(process)
+        )
+    if not leaked_pids:
         return
-    for process in leaked:
-        process.kill()
-    for process in leaked:
+
+    leaked_processes: list[psutil.Process] = []
+    for pid in sorted(leaked_pids):
+        try:
+            process = psutil.Process(pid)
+            process.kill()
+            if pid not in multiprocessing_pids:
+                leaked_processes.append(process)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    # Only multiprocessing may reap its own children, even if a bounded join
+    # returns before reaping. If psutil consumes their waitpid status, multiprocessing
+    # cannot record an exit code and active_children() keeps reporting dead workers.
+    for process in multiprocessing_children:
         process.join(timeout=5)
+    if leaked_processes:
+        psutil.wait_procs(leaked_processes, timeout=5)
     pytest.fail(
-        f"test left {len(leaked)} child process(es) running (pids {[process.pid for process in leaked]}); "
+        f"test left {len(leaked_pids)} child process(es) running (pids {sorted(leaked_pids)}); "
         "they were killed. Join or terminate spawned workers before the test returns",
         pytrace=False,
     )
@@ -251,3 +735,14 @@ def pytest_configure(config):
         "markers",
         "torch_memory_limit(cpu_mb=None, cuda_mb=None): limits per-test PyTorch allocator usage",
     )
+    config.addinivalue_line(
+        "markers",
+        "runtime_budget(seconds, hard_timeout=None, reason=None): configured soft budget and hard watchdog, enforced at 3x",
+    )
+    config.addinivalue_line(
+        "markers",
+        "cpu_only: the test never uses CUDA; L0_Unit_Tests_CPU runs it, so the GPU unit-test shards deselect it",
+    )
+    num_shards = config.getoption("file_num_shards")
+    if num_shards < 1 or not 0 <= config.getoption("file_shard_id") < num_shards:
+        raise pytest.UsageError("--file-num-shards must be at least 1 and --file-shard-id in [0, --file-num-shards)")

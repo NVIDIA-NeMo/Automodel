@@ -43,6 +43,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.tp_replicas import broadcast_tp_replicas, synchronize_tp_replica_gradients
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule, FeatureNoiseConfig
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
@@ -57,6 +58,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
     raise_if_peft_configured,
+    read_load_metadata_with_gloo,
     should_sync_grads,
 )
 
@@ -175,6 +177,7 @@ class TrainEagle1Recipe(BaseRecipe):
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
             torch_dtype=self.compute_dtype,
             force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            load_metadata_with_gloo=read_load_metadata_with_gloo(self.cfg.get("checkpoint", None)),
         )
         self.dist_setup = None
         self.distributed_config = None
@@ -388,6 +391,13 @@ class TrainEagle1Recipe(BaseRecipe):
                 default_name=wandb_name_prefix + str(target_path).rstrip("/").split("/")[-1],
             )
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.get("trackio", None) is not None:
+            trackio_cfg = TrackioConfig.from_kwargs(**self.cfg.trackio.to_dict())
+            trackio_cfg.name = trackio_cfg.name or wandb_name_prefix + str(target_path).rstrip("/").split("/")[-1]
+            self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
+            logger.info("Trackio experiment tracking enabled")
+
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
         ckpt_cfg = self.cfg.get("checkpoint", None)
@@ -501,7 +511,7 @@ class TrainEagle1Recipe(BaseRecipe):
         def write_recipe_metadata() -> None:
             self._save_extra_state(path, epoch=epoch)
             try:
-                save_config(self.cfg.raw_config, path)
+                save_config(self.cfg.to_yaml_dict(use_orig_values=True), path)
             except (AttributeError, OSError) as e:
                 logger.warning("Failed to save config snapshot: %s", e)
 
@@ -740,10 +750,13 @@ class TrainEagle1Recipe(BaseRecipe):
         }
 
     def _wandb_log(self, data: dict, step: int) -> None:
-        """Log a metrics dict to W&B when a run is active (rank 0)."""
+        """Log a metrics dict to W&B and Trackio when a run is active (rank 0)."""
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(data, step=step)
 
     def run_train_validation_loop(self):
         """Run the training loop."""
@@ -941,6 +954,8 @@ class TrainEagle1Recipe(BaseRecipe):
 
         if getattr(self, "wandb_run", None) is not None:
             self.wandb_run.finish()
+        if getattr(self, "trackio_logger", None) is not None:
+            self.trackio_logger.finish()
 
 
 def main(config_path: str | None = None):

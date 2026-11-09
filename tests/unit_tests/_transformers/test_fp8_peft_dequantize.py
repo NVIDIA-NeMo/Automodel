@@ -16,6 +16,8 @@
 
 from unittest.mock import MagicMock, patch
 
+from transformers import PretrainedConfig
+
 from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass, _maybe_dequantize_fp8_for_peft
 
 # ---------------------------------------------------------------------------
@@ -117,12 +119,12 @@ class TestMetaDeviceWithNativeQuantConfig:
     @staticmethod
     def _compute_is_meta_device(model_wrapper, world_size, is_hf_model, quantization_config, hf_native_quant_cfg):
         """Replicate the is_meta_device logic from _build_model."""
-        from nemo_automodel.components.distributed.ddp import DDPManager
-        from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
+        from nemo_automodel._transformers.infrastructure import _get_strategy_config
+        from nemo_automodel.components.distributed import DDPConfig, MegatronFSDPConfig
 
         return all(
             [
-                not isinstance(model_wrapper, (MegatronFSDPManager, DDPManager)),
+                not isinstance(_get_strategy_config(model_wrapper), (MegatronFSDPConfig, DDPConfig)),
                 world_size > 1 or not is_hf_model,
                 quantization_config is None and hf_native_quant_cfg is None,
             ]
@@ -220,8 +222,7 @@ class TestKwargsConfigInjectionGate:
     @staticmethod
     def _run_build_model_with_native_fp8(is_hf_model):
         quant_cfg = {"quant_method": "fp8", "dequantize": False}
-        hf_config = MagicMock()
-        hf_config.quantization_config = quant_cfg
+        hf_config = PretrainedConfig(quantization_config=quant_cfg)
         sentinel_model = MagicMock()
 
         with (

@@ -16,19 +16,39 @@
 
 import math
 from collections import OrderedDict
-from dataclasses import fields, is_dataclass
-from typing import Any
+from dataclasses import Field, fields, is_dataclass
+from typing import Any, ClassVar, Protocol
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from nemo_automodel.components.models.common import BackendConfig, MoKBackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_utils import create_dtensor_from_local
 from nemo_automodel.shared.import_utils import safe_import
+
+
+class _MoKTensorRecord(Protocol):
+    """Tensor-only dataclass accepted by checkpoint flattening and reconstruction."""
+
+    __dataclass_fields__: ClassVar[dict[str, Field[torch.Tensor | tuple[torch.Tensor, ...]]]]
+
+
+class _MoKAutogradContext(Protocol):
+    runtime: "_MoKRuntime"
+    saved_tensors: tuple[torch.Tensor, ...]
+    mok_tensor_specs: tuple[
+        tuple[type[_MoKTensorRecord], tuple[tuple[str, int], ...]],
+        tuple[type[_MoKTensorRecord], tuple[tuple[str, int], ...]],
+    ]
+    mxfp8_weight_tensor_count: int
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None: ...
+
 
 _MOK_IMPORT_MESSAGE = (
     "dispatcher='mok' requires a built Mixture-of-Kittens installation or an importable mixture-of-kittens checkout."
@@ -99,9 +119,31 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _copy_local_init_weight(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy a canonical initialization into the local MOK parameter storage.
+
+    Args:
+        destination: Parameter of shape [experts, output_features, input_features].
+            A DTensor may shard experts over EP and feature axes over FSDP.
+            Its local storage is mutated in place without replacing the parameter.
+        source: Tensor of shape [local_experts, output_features, input_features],
+            already restricted to this EP rank's experts but containing the full
+            feature axes. It may be a noncontiguous transposed view and is not mutated.
+    """
+    local = _local_tensor(destination)
+    if isinstance(destination, DTensor):
+        _, offsets = compute_local_shape_and_global_offset(
+            destination.shape, destination.device_mesh, destination.placements
+        )
+        # The canonical draw already uses the local expert count. Apply only
+        # feature-axis offsets; applying the EP offset again drops local experts.
+        source = source.narrow(1, offsets[1], local.size(1)).narrow(2, offsets[2], local.size(2))
+    local.copy_(source)
+
+
 def _flatten_mok_tensor_dataclass(
-    value: object,
-) -> tuple[tuple[torch.Tensor, ...], tuple[type, tuple[tuple[str, int], ...]]]:
+    value: _MoKTensorRecord,
+) -> tuple[tuple[torch.Tensor, ...], tuple[type[_MoKTensorRecord], tuple[tuple[str, int], ...]]]:
     """Flatten a MoK schedule/context without retaining tensor references in metadata.
 
     MoK's dataclasses contain either tensors or tuples of tensors (the latter for
@@ -141,10 +183,10 @@ def _flatten_mok_tensor_dataclass(
 
 
 def _unflatten_mok_tensor_dataclass(
-    spec: tuple[type, tuple[tuple[str, int], ...]],
+    spec: tuple[type[_MoKTensorRecord], tuple[tuple[str, int], ...]],
     tensors: tuple[torch.Tensor, ...],
     offset: int,
-) -> tuple[object, int]:
+) -> tuple[_MoKTensorRecord, int]:
     """Reconstruct a MoK dataclass from checkpoint-managed saved tensors."""
     dataclass_type, field_layout = spec
     values: dict[str, Any] = {}
@@ -261,8 +303,8 @@ class _MoKRuntime:
         routed_down_weights: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
-        object,
-        object,
+        _MoKTensorRecord,
+        _MoKTensorRecord,
         tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...] | None,
     ]:
         """Run MoK's manual forward and retain its backward context.
@@ -329,8 +371,8 @@ class _MoKRuntime:
 
     def backward(
         self,
-        schedule: object,
-        forward_context: object,
+        schedule: _MoKTensorRecord,
+        forward_context: _MoKTensorRecord,
         grad_output: torch.Tensor,
         x: torch.Tensor,
         router_weights: torch.Tensor,
@@ -340,7 +382,7 @@ class _MoKRuntime:
         routed_gate_weights: torch.Tensor,
         routed_up_weights: torch.Tensor,
         routed_down_weights: torch.Tensor,
-        mxfp8_weights: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], ...] | None,
+        mxfp8_weights: tuple[tuple[torch.Tensor, ...], ...] | None,
     ) -> tuple[torch.Tensor, ...]:
         """Run MoK's manual backward.
 
@@ -414,7 +456,7 @@ class _MoKAutogradFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx: object,
+        ctx: _MoKAutogradContext,
         runtime: _MoKRuntime,
         x: torch.Tensor,
         router_weights: torch.Tensor,
@@ -482,7 +524,7 @@ class _MoKAutogradFunction(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx: object, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+    def backward(ctx: _MoKAutogradContext, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         """Run the fused MoK backward pass.
 
         Args:
@@ -603,6 +645,8 @@ class GroupedExpertsMoK(nn.Module):
             unsupported.append("shared_expert_inter_dim must equal moe_inter_dim")
         if config.expert_activation != "swiglu" or config.shared_expert_activation != "swiglu":
             unsupported.append("routed and shared expert activations must both be swiglu")
+        if config.swiglu_clamp_after_activation:
+            unsupported.append("swiglu_clamp_after_activation=True")
         if config.expert_bias:
             unsupported.append("expert_bias=True")
         if config.shared_expert_gate:
@@ -703,10 +747,11 @@ class GroupedExpertsMoK(nn.Module):
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         """Initialize MoK-native weights from the canonical expert layout.
 
-        Draw random values in the same tensor shapes and order as
-        :class:`GroupedExperts` before transposing them into MoK's native
-        layouts.  Otherwise switching only the dispatcher changes a
-        random-initialized model even when every process uses the same seed.
+        Draw random values in the same tensor shapes and order as unsharded
+        :class:`GroupedExperts` for this EP rank's experts, then transpose into
+        MoK's native layouts and select the local FSDP feature slices. Keeping
+        full feature widths in the draw preserves the random stream and the
+        initialized values when FSDP splits the parameters.
 
         Args:
             buffer_device: Device on which initialization kernels execute.
@@ -714,7 +759,6 @@ class GroupedExpertsMoK(nn.Module):
         """
         with torch.device(buffer_device):
             routed_gate = _local_tensor(self.routed_gate_weights)
-            routed_up = _local_tensor(self.routed_up_weights)
             routed_down = _local_tensor(self.routed_down_weights)
             inter_dim = self.config.moe_inter_dim
 
@@ -723,15 +767,15 @@ class GroupedExpertsMoK(nn.Module):
             # contiguous tensors consumed by MoK.
             canonical_gate_up = routed_gate.new_empty((routed_gate.size(0), self.config.dim, 2 * inter_dim))
             canonical_gate_up.normal_(mean=0.0, std=init_std)
-            routed_gate.copy_(canonical_gate_up[..., :inter_dim].transpose(-1, -2))
-            routed_up.copy_(canonical_gate_up[..., inter_dim:].transpose(-1, -2))
+            _copy_local_init_weight(self.routed_gate_weights, canonical_gate_up[..., :inter_dim].transpose(-1, -2))
+            _copy_local_init_weight(self.routed_up_weights, canonical_gate_up[..., inter_dim:].transpose(-1, -2))
             del canonical_gate_up
 
             # GroupedExperts draws down projection weights immediately after
             # the combined tensor, in [expert, intermediate, hidden] order.
             canonical_down = routed_down.new_empty((routed_down.size(0), inter_dim, self.config.dim))
             canonical_down.normal_(mean=0.0, std=init_std)
-            routed_down.copy_(canonical_down.transpose(-1, -2))
+            _copy_local_init_weight(self.routed_down_weights, canonical_down.transpose(-1, -2))
         self.runtime._invalidate_mxfp8_cache()
 
     def _save_to_state_dict(

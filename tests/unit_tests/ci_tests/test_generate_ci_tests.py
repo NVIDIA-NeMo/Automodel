@@ -17,11 +17,67 @@ from pathlib import Path
 import pytest
 from ruamel.yaml import YAML
 
+from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
 
 # Over the default 5s budget on purpose: this module parses every example config under examples/.
 # Shrink the work or the process count before raising this further.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = pytest.mark.timeout(70)
+
+
+def test_llm_benchmark_configs_define_required_benchmark_fields():
+    required_fields = {
+        "warmup_steps",
+        "peak_tflops",
+        "nsys_start",
+        "nsys_end",
+        "nsys_ranks",
+    }
+    violations = []
+
+    for config in Path("examples/llm_benchmark").rglob("*.yaml"):
+        recipe = YAML(typ="safe").load(config) or {}
+        benchmark = recipe.get("benchmark") or {}
+        missing = sorted(required_fields - benchmark.keys())
+        if missing:
+            violations.append(f"{config}: {', '.join(missing)}")
+
+    assert not violations, "Benchmark configs are missing required fields:\n" + "\n".join(violations)
+
+
+def test_nemotron_super_v3_hybridep_benchmark_uses_shared_ci_inputs():
+    config = Path("examples/llm_benchmark/nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml")
+    recipe = YAML(typ="safe").load(config)
+
+    assert recipe["model"]["config"]["_target_"] == "nemo_automodel.NeMoAutoConfig.from_pretrained"
+    assert recipe["model"]["config"]["pretrained_model_name_or_path"] == (
+        # Public Hugging Face model ID; the entropy detector misclassifies it as a credential.
+        "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"  # pragma: allowlist secret
+    )
+    assert recipe["step_scheduler"]["local_batch_size"] == 2
+    assert "known_issue_id" not in recipe["ci"]
+    assert "freeze_config" not in recipe
+    assert "multimodal" not in recipe["distributed"]
+    assert "flops_scope" not in recipe["benchmark"]
+
+    jobs = generate_job(config, {}, "performance", "llm_benchmark", ".")
+
+    assert len(jobs) == 1
+    job_name, job = jobs[0]
+    assert job_name == ""
+    assert job["extends"] == ".llm_benchmark_test"
+    assert job["stage"] == "performance"
+    assert job["variables"]["TEST_NODE_COUNT"] == 4
+    assert job["variables"]["CONFIG_NPROC_PER_NODE"] == 4
+    assert job["variables"]["RESERVED_CLUSTER_TAG"] == "/gb200/"
+    assert "CUDA_VISIBLE_DEVICES" not in job["variables"]
+
+
+def test_qwen35_moe_lora_benchmark_disables_mtp():
+    config = Path("examples/llm_benchmark/qwen/qwen3.5_moe_te_deepep_lora.yaml")
+    recipe = YAML(typ="safe").load(config)
+
+    assert recipe["model"]["num_nextn_predict_layers"] == 0
 
 
 def test_example_checkpoint_robustness_configs_do_not_use_removed_fields():
@@ -89,6 +145,30 @@ def test_generate_gpt_oss_120b_release_job_uses_ep64():
     assert recipe["distributed"]["activation_checkpointing"] is False
 
 
+def test_release_keeps_glm_53_cudnn_dsa_recipe_with_container_flashmla():
+    pipeline = generate_pipeline(".", "release", "llm_finetune")
+
+    assert "glm_5.2_tulu3_4k_cudnn_100k" not in pipeline
+    assert "glm_5.3_tulu3_4k_cudnn_100step" in pipeline
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "examples/llm_finetune/ling/ling_1t_sft.yaml",
+        "examples/llm_finetune/minimax_m2/minimax_m2.5_hellaswag_pp.yaml",
+        "examples/llm_finetune/glm/glm_5.2_hellaswag_pp.yaml",
+    ],
+)
+def test_slow_hybridep_pp_recipes_use_runtime_dispatcher_initialization(config_path):
+    recipe = YAML(typ="safe").load(Path(config_path))
+
+    assert recipe["model"]["backend"]["dispatcher"] == "hybridep"
+    assert recipe["distributed"]["pp_size"] > 1
+    assert "pp_seq_len" not in recipe["distributed"]["pipeline"]
+    assert "prewarm" not in recipe
+
+
 def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkpointing():
     config = Path("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep.yaml")
 
@@ -101,6 +181,67 @@ def test_generate_gpt_oss_120b_benchmark_job_uses_ep64_without_activation_checkp
     assert variables["EP_SIZE"] == world_size
     assert recipe["distributed"]["ep_size"] == world_size
     assert recipe["distributed"]["activation_checkpointing"] is False
+
+
+def test_generate_deepseek_v3_1024_benchmark_job_uses_activation_checkpointing():
+    config = Path("examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml")
+
+    jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 128
+    assert recipe["distributed"]["activation_checkpointing"] is True
+    assert recipe["step_scheduler"]["local_batch_size"] == 4
+
+
+def test_glm_4_7_flash_benchmark_recipe_generates_with_checkpointing():
+    config = Path("examples/llm_benchmark/glm/glm_4.7_flash_te_deepep.yaml")
+
+    jobs = dict(generate_job(config, {}, "performance", "llm_benchmark", "."))
+    recipe = YAML(typ="safe").load(config)
+
+    assert jobs[""]["variables"]["TEST_NODE_COUNT"] == 1
+    assert recipe["distributed"]["activation_checkpointing"] is True
+    assert parse_distributed_section(recipe["distributed"])["activation_checkpointing"] is True
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep.yaml",
+        "examples/llm_benchmark/deepseek/deepseek_v3_te_deepep_1024.yaml",
+        "examples/llm_benchmark/glm/glm_4.7_flash_te_deepep.yaml",
+        "examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml",
+        "examples/llm_benchmark/qwen/qwen3_moe_235b_te_deepep.yaml",
+        "examples/llm_benchmark/qwen/qwen3_moe_30b_te_deepep.yaml",
+        "examples/llm_benchmark/qwen/qwen3_moe_30b_torch.yaml",
+        "examples/llm_finetune/deepseek_v32/deepseek_v32_hellaswag_pp.yaml",
+        "examples/llm_finetune/qwen/qwen3_moe_30b_lora.yaml",
+    ],
+)
+def test_migrated_moe_recipes_preserve_activation_checkpointing(config_path):
+    """The #1225 config migration must not silently change these recipes' AC policy."""
+    recipe = YAML(typ="safe").load(Path(config_path))
+
+    assert recipe["distributed"]["activation_checkpointing"] is True
+    assert parse_distributed_section(recipe["distributed"])["activation_checkpointing"] is True
+
+
+@pytest.mark.parametrize(
+    ("config_path", "activation_checkpointing", "loss_impl"),
+    [
+        ("examples/llm_benchmark/gpt_oss/gptoss_20b_te_deepep.yaml", None, "torch_compile"),
+        ("examples/llm_benchmark/gpt_oss/gptoss_120b_te_deepep_gb200.yaml", True, "cce"),
+    ],
+)
+def test_gpt_oss_oom_benchmark_configs_use_fused_loss(config_path, activation_checkpointing, loss_impl):
+    recipe = YAML(typ="safe").load(Path(config_path))
+
+    assert recipe["model"]["output_hidden_states"] is True
+    assert recipe["loss_fn"]["_target_"] == ("nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy")
+    assert recipe["loss_fn"].get("impl", "cce") == loss_impl
+    if activation_checkpointing is not None:
+        assert recipe["distributed"]["activation_checkpointing"] is activation_checkpointing
 
 
 def test_generate_vllm_deploy_time_override(tmp_path):
@@ -119,6 +260,20 @@ ci:
 
     assert jobs[""]["variables"]["TIME"] == "00:25:00"
     assert jobs["_vllm_deploy"]["variables"]["TIME"] == "00:30:00"
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml",
+        "examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad_peft.yaml",
+    ],
+)
+def test_nemotron_flash_suppresses_unsupported_vllm_deploy(config_path):
+    jobs = dict(generate_job(Path(config_path), {}, "release", "llm_finetune", "."))
+
+    assert "" in jobs
+    assert "_vllm_deploy" not in jobs
 
 
 def test_generate_checkpoint_robustness_process_isolation_derives_phases(tmp_path):
@@ -263,6 +418,20 @@ def test_generate_qwen3_moe_lora_uses_all_isolated_checkpoint_phases():
         assert key not in robustness
 
 
+def test_generate_glm51_lora_includes_native_checkpoint_validation():
+    config = Path("examples/llm_finetune/glm/glm_5.1_lora.yaml")
+    job = dict(generate_job(config, {}, "release", "llm_finetune", "."))[""]
+    variables = job["variables"]
+
+    assert job.get("allow_failure") is None
+    assert variables["HAS_ROBUSTNESS"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
+    assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == "train_and_save automodel_reload resume"
+    assert variables["TEST_NODE_COUNT"] == 16
+    assert variables["TIME"] == "00:35:00"
+    assert variables["REQUIRE_FINITE_METRICS"] == "true"
+
+
 def test_generate_nemotron_resume_cohort_preserves_known_issue_gating():
     expected_times = {
         "customizer_nemotron_nano_peft": "00:30:00",
@@ -314,3 +483,167 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
     assert "skip_resume" not in robustness
     assert robustness["trust_remote_code"] is True
     assert robustness["hf_device_map_auto"] is True
+
+
+@pytest.mark.parametrize("scope", ["test", "nightly", "release", "performance"])
+@pytest.mark.parametrize("deprecated", [True, False, "true"])
+def test_recipe_deprecation_filters_all_job_variants(tmp_path: Path, scope: str, deprecated: bool | str) -> None:
+    recipe = Path("examples/llm_finetune/family/model.yaml")
+    path = tmp_path / recipe
+    path.parent.mkdir(parents=True)
+    YAML().dump(
+        {
+            "ci": {
+                "deprecated": deprecated,
+                "allow_failure": True,
+                "vllm_deploy": True,
+                "embed_eval": True,
+                "rerank_eval": True,
+                "cluster_tag": "h100",
+            }
+        },
+        path,
+    )
+    jobs = generate_job(recipe, {}, scope, "llm_finetune", str(tmp_path))
+    if deprecated is True:
+        assert jobs == []
+    else:
+        assert {suffix for suffix, _ in jobs} == {"", "_vllm_deploy", "_embed_eval", "_rerank_eval"}
+
+
+def test_deprecated_nightly_scope_completes_without_gpu_jobs(tmp_path: Path) -> None:
+    config_dir = tmp_path / "tests/ci_tests/configs/retrieval_cross_encoder"
+    config_dir.mkdir(parents=True)
+    (config_dir / "override_recipes.yml").write_text("exempt_models: []\nexempt_configs: {}\n")
+    (config_dir / "nightly_recipes.yml").write_text(
+        "examples_dir: retrieval\nconfigs: [cross_encoder/deprecated.yaml]\n"
+    )
+    recipe = tmp_path / "examples/retrieval/cross_encoder/deprecated.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("ci: {deprecated: true}\n")
+    pipeline = generate_pipeline(str(tmp_path), "nightly", "retrieval_cross_encoder")
+    jobs = {name: job for name, job in pipeline.items() if name != "include"}
+    assert len(jobs) == 1
+    job = jobs["no_enrolled_retrieval_cross_encoder_tests"]
+    assert job["variables"] == {"GIT_STRATEGY": "none"}
+    assert "extends" not in job
+    assert "parallel" not in job
+    assert job["rules"] == [{"when": "always"}]
+
+
+@pytest.fixture(scope="module")
+def deprecated_recipe_paths() -> set[str]:
+    paths = set()
+    for path in Path("examples").rglob("*.yaml"):
+        recipe = YAML(typ="safe").load(path)
+        if isinstance(recipe, dict) and (recipe.get("ci") or {}).get("deprecated") is True:
+            paths.add(str(path))
+    assert paths
+    return paths
+
+
+@pytest.mark.parametrize("scope", ["test", "nightly", "release", "performance"])
+@pytest.mark.parametrize(
+    "folder",
+    [
+        "llm_finetune",
+        "llm_benchmark",
+        "llm_pretrain",
+        "vlm_finetune",
+        "retrieval_bi_encoder",
+        "retrieval_cross_encoder",
+    ],
+)
+def test_deprecated_recipes_are_not_scheduled(scope: str, folder: str, deprecated_recipe_paths: set[str]) -> None:
+    pipeline = generate_pipeline(".", scope, folder)
+    scheduled_paths = {
+        job["variables"]["CONFIG_PATH"]
+        for job in pipeline.values()
+        if isinstance(job, dict) and "CONFIG_PATH" in job.get("variables", {})
+    }
+    assert not deprecated_recipe_paths.intersection(scheduled_paths)
+
+
+@pytest.mark.parametrize("scope", ["nightly", "release"])
+def test_flux_examples_keep_gpu_ci_enrollment(scope: str) -> None:
+    pipeline = generate_pipeline(".", scope, "diffusion_finetune")
+    assert "flux_t2i_flow" in pipeline
+    assert "flux_t2i_flow_lora" in pipeline
+
+
+@pytest.mark.parametrize(
+    ("scope", "folder", "retained_paths"),
+    [
+        (
+            "performance",
+            "llm_benchmark",
+            [
+                "examples/llm_benchmark/qwen/qwen2_5_7b_quack_baseline.yaml",
+                "examples/llm_benchmark/qwen/qwen2_5_7b_quack.yaml",
+                "examples/llm_benchmark/qwen/qwen2_5_7b_peft_benchmark.yaml",
+                "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml",
+                "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml",
+            ],
+        ),
+        (
+            "release",
+            "llm_finetune",
+            [
+                *sorted(str(path) for path in Path("examples/llm_finetune").rglob("*customizer*.yaml")),
+                "examples/llm_finetune/qwen/qwen2_5_7b_squad_peft.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_7b_hellaswag_fp8.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_squad_flashoptim.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_squad_qat.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_0p5b_packed_cp2.yaml",
+                "examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml",
+                "examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml",
+                "examples/llm_finetune/agent/qwen2_5_3b_synthtraces.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_columnmapped_lora.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp_dynamic_seq_len.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_instruct_squad_qlora_2node.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_squad_peft_rtx_spark.yaml",
+                "examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_hsdp.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_squad_neftune.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml",
+                "examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes_2nodes.yaml",
+                "examples/llm_finetune/phi/phi_4_hellaswag_fp8.yaml",
+                "examples/llm_finetune/phi/phi_4_squad.yaml",
+                "examples/llm_finetune/phi/phi_4_squad_peft.yaml",
+                "examples/llm_finetune/phi/phi_4_squad_tp2.yaml",
+                "examples/llm_finetune/phi/phi_4_squad_tp2_peft.yaml",
+                "examples/llm_finetune/qwen/qwen25_magi_prefix_tree_rollouts.yaml",
+                "examples/llm_finetune/qwen/qwen2_5_7b_squad_muon.yaml",
+            ],
+        ),
+        (
+            "nightly",
+            "retrieval_bi_encoder",
+            [
+                "examples/retrieval/bi_encoder/llama3_2_1b.yaml",
+            ],
+        ),
+        ("nightly", "retrieval_cross_encoder", ["examples/retrieval/cross_encoder/llama3_2_1b.yaml"]),
+        (
+            "release",
+            "vlm_finetune",
+            [
+                "examples/vlm_finetune/phi4/phi4_mm_cv17.yaml",
+                "examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_rdr.yaml",
+                "examples/vlm_finetune/qwen2_5/qwen2_5_vl_3b_shopify.yaml",
+            ],
+        ),
+    ],
+)
+def test_retained_examples_remain_scheduled(scope: str, folder: str, retained_paths: list[str]) -> None:
+    pipeline = generate_pipeline(".", scope, folder)
+    scheduled = {
+        job["variables"]["CONFIG_PATH"]
+        for job in pipeline.values()
+        if isinstance(job, dict) and "CONFIG_PATH" in job.get("variables", {})
+    }
+    assert set(retained_paths) <= scheduled

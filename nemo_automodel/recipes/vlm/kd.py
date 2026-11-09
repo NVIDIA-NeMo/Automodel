@@ -43,6 +43,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -56,11 +57,15 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
+from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
+from nemo_automodel.components.loss.utils import _count_label_tokens, _get_loss_ignore_index, _normalize_kd_labels
+from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
@@ -77,6 +82,7 @@ from nemo_automodel.recipes.kd_utils import (
     RUN_TEACHER,
     STOP_TEACHER,
     KDMeshBridge,
+    configure_kd_teacher_packing,
     create_kd_distributed_setups,
     materialize_teacher_logits,
 )
@@ -93,11 +99,13 @@ def _build_kd_loss_fn(cfg_kd):
 
 
 def _build_teacher_model(
-    cfg_teacher,
-    cfg_freeze,
+    cfg_teacher: ConfigNode,
+    cfg_freeze: ConfigNode | None,
     seed: int,
     distributed_setup: DistributedSetup | None = None,
-    device=None,
+    device: torch.device | str | None = None,
+    *,
+    load_metadata_with_gloo: bool = False,
 ) -> torch.nn.Module:
     """Build and initialize the teacher VLM for knowledge distillation.
 
@@ -110,6 +118,7 @@ def _build_teacher_model(
         seed: Random seed for reproducibility.
         distributed_setup: Resolved distributed topology and policy object.
         device: Device to place the teacher model on.
+        load_metadata_with_gloo: Use Gloo for pretrained checkpoint load planning.
 
     Returns:
         The frozen teacher model ready for inference.
@@ -125,6 +134,7 @@ def _build_teacher_model(
         cfg_fp8=None,
         cfg_compile=None,
         distributed_setup=distributed_setup,
+        load_metadata_with_gloo=load_metadata_with_gloo,
     )
 
     if device is not None:
@@ -183,6 +193,23 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         self._kd_loss_buffer = []
         self._ce_loss_buffer = []
 
+    @property
+    def _packing_contract(self) -> PackingCapabilities:
+        """Emit metadata for the teacher as well as the student."""
+        return replace(super()._packing_contract, return_packed_sequence_metadata=True)
+
+    def _configure_teacher_packing(self) -> None:
+        """Configure the teacher after construction and check its mask contract."""
+        dataloader = self.cfg.vlm_dataloader
+        if dataloader is None or dataloader.packing is None or dataloader.packing.packing_format == "thd":
+            return
+        student_parts = self.model_parts if not self.separate_meshes or self.kd_mesh_bridge.is_student else []
+        configure_kd_teacher_packing(
+            [self.teacher_model] if self.teacher_model is not None else [],
+            student_parts,
+            control_group=self.kd_mesh_bridge.control_group if self.separate_meshes else None,
+        )
+
     def setup(self):
         """Build student & teacher, dataloaders, optimizers, etc."""
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
@@ -204,9 +231,11 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                     seed=self.cfg.get("seed", 42),
                     distributed_setup=self.distributed_setup,
                     device=self.dist_env.device,
+                    load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
                 )
             else:
                 self.teacher_model = None
+            self._configure_teacher_packing()
             self.kd_mesh_bridge.synchronize()
             return
 
@@ -218,8 +247,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             seed=self.cfg.get("seed", 42),
             distributed_setup=getattr(self, "distributed_setup", None),
             device=teacher_device,
+            load_metadata_with_gloo=self.cfg.checkpoint.load_metadata_with_gloo,
         )
 
+        self._configure_teacher_packing()
         logger.info("Teacher Model: " + str(self.teacher_model))
 
         self._setup_kd_state()
@@ -370,7 +401,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 teacher_logits = separate_teacher_logits
 
             # Student forward.
-            student_batch = filter_forward_kwargs(model, batch)
+            student_batch = dict(batch)
+            if self.kd_ratio < 1.0 and isinstance(self.loss_fn, LinearCrossEntropy):
+                student_batch["output_hidden_states"] = True
+            student_batch = filter_forward_kwargs(model, student_batch)
             student_out = model(**student_batch)
             del student_batch
 
@@ -395,10 +429,15 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 )
             del hidden_states
 
+            kd_labels = _normalize_kd_labels(
+                labels,
+                loss_ignore_index=_get_loss_ignore_index(self.loss_fn),
+                kd_ignore_index=_get_loss_ignore_index(self.kd_loss_fn),
+            )
             kd_loss = self.kd_loss_fn(
                 student_logits,
                 teacher_logits,
-                labels,
+                kd_labels,
                 num_batch_labels=num_label_tokens,
             )
             del teacher_logits
@@ -412,8 +451,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
     def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step with KD loss tracking."""
+        ignore_index = _get_loss_ignore_index(self.loss_fn)
         num_label_tokens = torch.tensor(
-            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
         )
         num_label_tokens = self._dp_allreduce(num_label_tokens).item()
 
@@ -535,9 +575,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             total_kd_loss = 0.0
             total_num_label_tokens = 0
             loss_buffer: list[torch.Tensor] = []
+            ignore_index = _get_loss_ignore_index(self.loss_fn)
 
             for batch in val_dataloader:
-                num_label_tokens = (batch["labels"] != -100).sum().item()
+                num_label_tokens = _count_label_tokens(batch["labels"], ignore_index)
                 self._forward_backward_step(
                     0,
                     batch,
@@ -589,6 +630,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_valid.log(log_data)
 
@@ -623,6 +667,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_train.log(log_data)
 

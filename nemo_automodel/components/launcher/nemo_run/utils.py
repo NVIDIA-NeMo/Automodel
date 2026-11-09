@@ -71,13 +71,31 @@ def load_executor_from_file(name: str, executors_file: str) -> Any:
 
 
 def apply_overrides(executor: Any, overrides: dict) -> None:
-    """Apply arbitrary YAML overrides to an executor via ``setattr``.
+    """Apply YAML overrides to an executor via ``setattr``.
 
     Dict and list values are *merged* with existing executor attributes
     (dicts are updated, lists are extended).  All other values are set
     directly.
+
+    Args:
+        executor: Executor instance to configure, from ``EXECUTOR_MAP``.
+        overrides: Attribute name to value, collected by
+            :meth:`NemoRunConfig.from_dict` from the unrecognised keys of the
+            ``nemo_run:`` YAML section.
+
+    Raises:
+        ValueError: If ``executor`` has no attribute named by one of the keys.
+            NeMo-Run executors are dataclasses with fixed fields, so assigning an
+            unknown name would create an attribute the scheduler never reads,
+            leaving the field the user meant to set at its default.
     """
     for key, value in overrides.items():
+        if not hasattr(executor, key):
+            known = sorted(k for k in getattr(executor, "__dict__", {}) if not k.startswith("_"))
+            raise ValueError(
+                f"Executor '{type(executor).__name__}' has no attribute '{key}' to override. "
+                f"Available: {', '.join(known) if known else '<none>'}"
+            )
         existing = getattr(executor, key, None)
         if isinstance(value, dict) and isinstance(existing, dict):
             merged = dict(existing)

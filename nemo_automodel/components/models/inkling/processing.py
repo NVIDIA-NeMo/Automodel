@@ -116,20 +116,23 @@ class InklingProcessor(ProcessorMixin):
             )
 
         text_inputs: dict[str, Any] = {}
-        text_kwargs = merged_kwargs["text_kwargs"]
+        text_kwargs = dict(merged_kwargs["text_kwargs"])
         return_tensors = text_kwargs.get("return_tensors")
+        return_text_replacement_offsets = text_kwargs.pop("return_text_replacement_offsets", False)
         if text is not None:
             text_batch = [text] if isinstance(text, str) else list(text)
-            text_batch = self._replace_multimodal_tokens(
+            text_batch, text_replacement_offsets = self._replace_multimodal_tokens(
                 text_batch,
                 image_replacements=image_replacements,
                 audio_replacements=audio_replacements,
             )
             text_inputs = self.tokenizer(text_batch, **text_kwargs)
+            if return_text_replacement_offsets:
+                text_inputs["text_replacement_offsets"] = text_replacement_offsets
 
         data = {**text_inputs, **processed_images, **processed_audio}
         data = {key: value for key, value in data.items() if key not in self.unused_input_names}
-        return BatchFeature(data=data, tensor_type=return_tensors)
+        return BatchFeature(data=data, tensor_type=return_tensors, skip_tensor_conversion=self.skip_tensor_conversion)
 
     @staticmethod
     def _normalize_audio_batch(audio: Any) -> list[Any]:
@@ -150,8 +153,12 @@ class InklingProcessor(ProcessorMixin):
         *,
         image_replacements: list[str],
         audio_replacements: list[str],
-    ) -> list[str]:
-        """Expand media placeholders once per corresponding input, in batch order."""
+    ) -> tuple[list[str], list[list[dict[str, Any]]]]:
+        """Expand media placeholders once per corresponding input, in batch order.
+
+        Returns the expanded texts and the per-sample ``text_replacement_offsets``
+        that ``apply_chat_template`` uses to realign ``{% generation %}`` spans.
+        """
         replacements_by_token = (
             (self.image_token, image_replacements),
             (self.audio_token, audio_replacements),
@@ -160,13 +167,7 @@ class InklingProcessor(ProcessorMixin):
             expected = sum(sample.count(token) for sample in text)
             if replacements and expected != len(replacements):
                 raise ValueError(f"Received {len(replacements)} media inputs for {expected} {token!r} placeholders")
-            if not replacements:
-                continue
-            replacement_iter = iter(replacements)
-            for idx, sample in enumerate(text):
-                parts = sample.split(token)
-                text[idx] = parts[0] + "".join(next(replacement_iter) + part for part in parts[1:])
-        return text
+        return self.get_text_with_replacements(text, image_replacements, [], audio_replacements)
 
     def _extract_dmel_bins(self, input_features: torch.Tensor) -> torch.Tensor:
         """Quantize continuous log-mel values into dMel token IDs.

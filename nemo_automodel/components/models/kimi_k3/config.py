@@ -12,13 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checkpoint-compatible configuration classes for Moonshot Kimi K3."""
+"""Checkpoint-compatible configuration classes for Moonshot Kimi K3 and Kimi K3.1."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
+
+# Defaults of the ``dsa_config`` block, matching the released ``moonshotai/Kimi-K3.1-Pro`` checkpoint.
+_DSA_CONFIG_DEFAULTS: dict[str, Any] = {
+    "index_topk": 2048,
+    "index_head_dim": 128,
+    "index_num_heads": 32,
+    "index_rope_dim": 0,
+    "index_k_norm_type": "layernorm",
+    "index_topk_freq": 1,
+    "index_skip_topk_offset": 1,
+}
+
+
+def _normalize_dsa_config(dsa_config: dict[str, Any] | None, full_attn_layers: list[int]) -> dict[str, Any] | None:
+    """Fill the optional ``dsa_config`` fields, defaulting ``dsa_layers`` to every full-attention layer."""
+    if dsa_config is None:
+        return None
+    normalized = {**_DSA_CONFIG_DEFAULTS, **dsa_config}
+    if "dsa_layers" not in normalized:
+        normalized["dsa_layers"] = list(full_attn_layers)
+    normalized["dsa_layers"] = [int(layer) for layer in normalized["dsa_layers"]]
+    return normalized
 
 
 class KimiK3TextConfig(PretrainedConfig):
@@ -28,6 +50,11 @@ class KimiK3TextConfig(PretrainedConfig):
     tech report Table 1): 93 layers (69 KDA + 24 gated MLA), 96 attention heads, dense FFN 33792,
     896 latent-MoE experts (16 active, 2 shared), so ``from_config`` builds the same shape that
     ``from_pretrained`` loads.
+
+    Kimi K3.1 keeps this backbone and adds a ``dsa_config`` block: the listed full-attention
+    layers become gated DeepSeek Sparse Attention (DSA) layers, i.e. the same gated MLA plus a
+    lightning indexer that picks ``index_topk`` keys per query. ``dsa_config=None`` (Kimi K3)
+    keeps every full-attention layer dense.
     """
 
     model_type = "kimi_linear"
@@ -82,10 +109,17 @@ class KimiK3TextConfig(PretrainedConfig):
         mla_use_output_gate: bool = True,
         # KDA and residual mixing.
         linear_attn_config: dict[str, Any] | None = None,
+        dsa_config: dict[str, Any] | None = None,
         kda_mode: str = "chunk",
         kda_unpad_inputs: bool = True,
         kda_use_fused_gate: bool = True,
+        kda_chunk_impl: str = "fla",
         kda_use_qk_l2norm_in_kernel: bool = True,
+        kda_disable_recompute: bool = False,
+        kda_conv_backend: str = "triton",
+        kda_transpose_state_layout: bool = True,
+        situ_backend: str = "torch",
+        attn_res_triton: bool = False,
         attn_res_block_size: int | None = 12,
         activation_situ_beta: float | None = 4.0,
         activation_situ_linear_beta: float | None = 25.0,
@@ -153,10 +187,23 @@ class KimiK3TextConfig(PretrainedConfig):
         self.mla_use_output_gate = mla_use_output_gate
 
         self.linear_attn_config = linear_attn_config
+        self.dsa_config = _normalize_dsa_config(dsa_config, linear_attn_config["full_attn_layers"])
         self.kda_mode = kda_mode
         self.kda_unpad_inputs = kda_unpad_inputs
         self.kda_use_fused_gate = kda_use_fused_gate
+        self.kda_chunk_impl = kda_chunk_impl
         self.kda_use_qk_l2norm_in_kernel = kda_use_qk_l2norm_in_kernel
+        self.kda_disable_recompute = kda_disable_recompute
+        self.kda_conv_backend = kda_conv_backend
+        self.kda_transpose_state_layout = kda_transpose_state_layout
+        # Kimi-K3-only kernel switches. situ_backend selects the SiTU activation kernels: "torch" (the eager chunked
+        # cores, optionally torch.compiled through BackendConfig.compile_situ), "triton" (kimi_k3/situ_triton.py) or
+        # "triton_fast_math" (the same kernels with SFU tanh.approx / exp2 / rcp.approx, <= 1 bf16 ulp from libdevice);
+        # under the Triton choices compile_situ still governs the shapes the Triton kernels do not take. attn_res_triton
+        # routes the attention-residual mix through kimi_k3/attn_res_triton.py. The Triton choices and attn_res_triton
+        # are no-ops without Triton.
+        self.situ_backend = situ_backend
+        self.attn_res_triton = attn_res_triton
         self.attn_res_block_size = attn_res_block_size
         self.activation_situ_beta = activation_situ_beta
         self.activation_situ_linear_beta = activation_situ_linear_beta
@@ -177,6 +224,20 @@ class KimiK3TextConfig(PretrainedConfig):
             raise ValueError("moe_router_activation_func must be 'sigmoid' or 'softmax'.")
         if self.kda_mode not in {"chunk", "fused_recurrent"}:
             raise ValueError("kda_mode must be 'chunk' or 'fused_recurrent'.")
+        if self.kda_conv_backend not in {"triton", "cuda"}:
+            raise ValueError("kda_conv_backend must be 'triton' or 'cuda'.")
+        if self.situ_backend not in {"torch", "triton", "triton_fast_math"}:
+            raise ValueError("situ_backend must be 'torch', 'triton' or 'triton_fast_math'.")
+        if self.kda_chunk_impl not in {"fla", "fused"}:
+            raise ValueError(
+                "kda_chunk_impl must be 'fla' (flash-linear-attention) or 'fused' (fused CUDA forward + Triton backward)."
+            )
+        if self.kda_chunk_impl == "fused" and self.kda_mode != "chunk":
+            raise ValueError("kda_chunk_impl='fused' requires kda_mode='chunk'.")
+        if self.kda_chunk_impl == "fused" and not getattr(self, "kda_use_qk_l2norm_in_kernel", True):
+            raise ValueError(
+                "kda_chunk_impl='fused' requires kda_use_qk_l2norm_in_kernel=True (the kernels normalise q and k)."
+            )
         if self.linear_attn_config is None:
             return
         if "kda_layers" not in self.linear_attn_config or "full_attn_layers" not in self.linear_attn_config:
@@ -188,6 +249,31 @@ class KimiK3TextConfig(PretrainedConfig):
         overlap = set(self.linear_attn_config["kda_layers"]) & set(self.linear_attn_config["full_attn_layers"])
         if overlap:
             raise ValueError(f"KDA and full-attention layer lists overlap: {sorted(overlap)}")
+        self._validate_dsa_config()
+
+    def _validate_dsa_config(self) -> None:
+        dsa_config = self.dsa_config
+        if dsa_config is None:
+            return
+        not_full_attn = set(dsa_config["dsa_layers"]) - set(self.linear_attn_config["full_attn_layers"])
+        if not_full_attn:
+            raise ValueError(f"dsa_config.dsa_layers must be full-attention layers; got {sorted(not_full_attn)}.")
+        for key in ("index_topk", "index_head_dim", "index_num_heads"):
+            if int(dsa_config[key]) <= 0:
+                raise ValueError(f"dsa_config.{key} must be positive, got {dsa_config[key]}.")
+        if dsa_config["index_k_norm_type"] not in {"layernorm", "rmsnorm"}:
+            raise ValueError(
+                f"dsa_config.index_k_norm_type must be 'layernorm' or 'rmsnorm', got {dsa_config['index_k_norm_type']!r}."
+            )
+        # The K3.1 MLA layers are NoPE, so there is no rotary table for the indexer to share.
+        if dsa_config["index_rope_dim"] != 0:
+            raise ValueError(f"Kimi K3.1 DSA requires dsa_config.index_rope_dim=0, got {dsa_config['index_rope_dim']}.")
+        # index_topk_freq > 1 would reuse one layer's top-k across later layers (index sharing),
+        # which the released checkpoint does not use.
+        if dsa_config["index_topk_freq"] != 1:
+            raise ValueError(
+                f"Kimi K3.1 DSA requires dsa_config.index_topk_freq=1, got {dsa_config['index_topk_freq']}."
+            )
 
     @property
     def is_mla(self) -> bool:
@@ -214,6 +300,10 @@ class KimiK3TextConfig(PretrainedConfig):
     def is_kda_layer(self, layer_idx: int) -> bool:
         """Return whether zero-based ``layer_idx`` is a KDA layer."""
         return bool(self.linear_attn_config and layer_idx + 1 in self.linear_attn_config["kda_layers"])
+
+    def is_dsa_layer(self, layer_idx: int) -> bool:
+        """Return whether zero-based ``layer_idx`` is a sparse (DSA) full-attention layer."""
+        return self.dsa_config is not None and layer_idx + 1 in self.dsa_config["dsa_layers"]
 
 
 class KimiK3VisionConfig(PretrainedConfig):
@@ -330,3 +420,36 @@ class KimiK3Config(PretrainedConfig):
             **kwargs,
         )
         self.vision_config._attn_implementation = vision_attn_implementation
+
+
+class KimiK31Config(KimiK3Config):
+    """Top-level Kimi K3.1 vision-language checkpoint configuration.
+
+    Kimi K3.1 Pro shares the Kimi K3 vision tower and text backbone; its text config carries a
+    ``dsa_config`` block that turns the 24 full-attention layers into gated DSA layers. A text
+    config dict without that block gets the released defaults, so a K3.1 checkpoint never
+    silently builds the dense K3 backbone.
+    """
+
+    model_type = "kimi_k31"
+    architectures = ["KimiK31ForConditionalGeneration"]
+
+    def __init__(
+        self,
+        text_config: dict[str, Any] | KimiK3TextConfig | None = None,
+        vision_config: dict[str, Any] | KimiK3VisionConfig | None = None,
+        architectures: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if text_config is None:
+            text_config = KimiK3TextConfig(dsa_config={})
+        elif isinstance(text_config, dict) and text_config.get("dsa_config") is None:
+            text_config = {**text_config, "dsa_config": {}}
+        elif isinstance(text_config, KimiK3TextConfig) and text_config.dsa_config is None:
+            raise ValueError("KimiK31Config requires a text_config with a dsa_config block.")
+        super().__init__(
+            text_config=text_config,
+            vision_config=vision_config,
+            architectures=architectures or ["KimiK31ForConditionalGeneration"],
+            **kwargs,
+        )

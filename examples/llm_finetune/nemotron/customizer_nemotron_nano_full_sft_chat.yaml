@@ -15,7 +15,7 @@ model:
   attn_implementation: sdpa
   backend:
     _target_: nemo_automodel.components.models.common.utils.BackendConfig
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
@@ -345,6 +345,7 @@ parallelizer:
   activation_checkpointing: false
 
 ci:
+  cluster_tag: h100
   time: "00:30:00"
   checkpoint_robustness:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16

@@ -117,4 +117,5 @@ nvtx: false
 #   name: <your-wandb-exp-name>
 
 ci:
+  cluster_tag: h100
   recipe_owner: HuiyingLi

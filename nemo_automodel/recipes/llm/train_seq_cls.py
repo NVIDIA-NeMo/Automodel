@@ -35,7 +35,7 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import FreezeConfig, ModuleSelector, filter_forward_kwargs
@@ -86,6 +86,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
+        self.trackio_logger = None
+        if self.dist_env.is_main and self.cfg.trackio is not None:
+            self.trackio_logger = self.cfg.trackio.build(
+                run_config=self.cfg.to_yaml_dict(use_orig_values=True), model_name=_get_model_name(self.cfg.model)
+            )
+            logging.info("Trackio experiment tracking enabled")
+
         self._log_experiment_details()
         self._log_library_versions()
 
@@ -125,6 +132,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
             cfg_freeze=freeze_config,
+            load_metadata_with_gloo=checkpoint_config.load_metadata_with_gloo,
         )
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
@@ -139,15 +147,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         def materialize_loader(config):
             build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
-            with ScopedRNG(seed=config.seed, ranked=True):
-                return config.build(
-                    tokenizer=self.tokenizer,
-                    dataset_build_context=build_context,
-                    dp_rank=self._get_dp_rank(),
-                    dp_world_size=self._get_dp_group_size(),
-                    pp_enabled=False,
-                    cp_size=self.cfg.get("distributed.cp_size", 1),
-                )
+            return config.build(
+                tokenizer=self.tokenizer,
+                dataset_build_context=build_context,
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+                pp_enabled=False,
+                cp_size=self.cfg.get("distributed.cp_size", 1),
+            )
 
         self.dataloader = materialize_loader(self.cfg.dataloader)
 
@@ -234,6 +241,19 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
+        # Global number of labels over the whole accumulated batch and every DP
+        # rank. Normalizing the backward loss by this -- rather than by a local
+        # per-microbatch mean -- is what makes the gradient invariant to both the
+        # micro-batch split and dp_size. It is the convention train_ft.py uses
+        # with num_label_tokens, and it is what makes the `* dp_size` below
+        # correct: that factor cancels the DP gradient average, which only
+        # reconstructs the global mean when the denominator is already global.
+        num_label_samples = torch.tensor(
+            sum(batch["labels"].numel() for batch in batches),
+            dtype=torch.long,
+        )
+        num_label_samples = max(int(self._dp_allreduce(num_label_samples).item()), 1)
+
         for batch in batches:
             batch = {
                 k: (v.to(self.dist_env.device, non_blocking=True) if v is not None else None) for k, v in batch.items()
@@ -244,22 +264,35 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 out = model(**batch)
                 logits = getattr(out, "logits", out)
                 loss = self.loss_fn(logits, labels.view(-1))
-            losses.append(loss.detach().clone())
+            # Keep the summed loss, not the per-microbatch mean: means cannot be
+            # added back together, and the reported metric is normalized by the
+            # same global label count the gradient uses.
+            losses.append((loss * labels.numel()).detach().clone())
 
             # Collect predictions for accuracy calculation
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds.detach())
             all_labels.append(labels.view(-1).detach())
-            (loss * self._get_dp_group_size(include_cp=True)).backward()
+            # `loss` is the mean over this micro-batch, so `loss * n_local` is its
+            # summed loss; dividing by the global count gives this micro-batch's
+            # share of the global mean. Every sequence-classification sample
+            # carries exactly one label, so `numel()` is the supervised count and
+            # matches how num_label_samples above was accumulated.
+            local_loss = loss * labels.numel() / num_label_samples
+            (local_loss * self._get_dp_group_size(include_cp=True)).backward()
 
         # Synchronize unsharded TP replicas, then calculate the distributed-aware gradient norm.
         synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
+        moe_mesh = getattr(self, "moe_mesh", None)
         grad_norm = clip_grad_norm(
             max_grad_norm=self.max_grad_norm,
             model_parts=self.model_parts,
             norm_type=2.0,
             pp_enabled=self._get_pp_rank() != 0 if hasattr(self, "_get_pp_rank") else False,
             device_mesh=self.device_mesh,
+            # setup() is what assigns moe_mesh, and this step is reachable without it.
+            moe_mesh=moe_mesh,
+            ep_axis_name="ep" if moe_mesh is not None and "ep" in (moe_mesh.mesh_dim_names or ()) else None,
         )
 
         # Calculate accuracy
@@ -317,9 +350,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                     reference_mfu=mfu_calculator.reference_mfu,
                 )
 
+        # Global summed loss over every micro-batch and DP rank, divided by the
+        # same global label count as the gradient. Dividing by len(batches)
+        # instead would report a mean of means: inflated by dp_size, and wrong
+        # whenever micro-batches are unevenly sized.
         total_loss = torch.sum(torch.stack(losses))
         total_loss = self._dp_allreduce(total_loss, include_cp=True).detach()
-        loss = total_loss / len(batches)
+        loss = total_loss / num_label_samples
 
         return MetricsSample(
             step=self.step_scheduler.step,
@@ -355,14 +392,24 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
                 out = model(**batch)
                 logits = getattr(out, "logits", out)
                 loss = self.loss_fn(logits, labels.view(-1))
-            total_loss += loss.detach()
+            # Summed, not the batch mean: the last batch of a shard is usually
+            # short, so batch means cannot be averaged with equal weight. In FP32,
+            # so a half-precision loss cannot overflow while the sum grows.
+            total_loss += loss.detach().float() * labels.numel()
 
             # Collect predictions for accuracy
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds)
             all_labels.append(labels.view(-1))
-            count += 1
+            count += labels.numel()
 
+        # Each DP rank validates a disjoint shard; reduce like the accuracy below.
+        if self._get_dp_group_size(include_cp=True) > 1:
+            device = self.dist_env.device
+            total_loss = self._dp_allreduce(
+                torch.as_tensor(total_loss, dtype=torch.float32, device=device), include_cp=True
+            )
+            count = self._dp_allreduce(torch.tensor(count, dtype=torch.float32, device=device), include_cp=True).item()
         total_loss = total_loss if count == 0 else total_loss / count
 
         # Calculate accuracy
@@ -413,6 +460,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         # JSONL validation log
         self.metric_logger_valid.log(log_data)
@@ -446,10 +496,13 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         if not self.dist_env.is_main:
             return
 
-        # Log to remote services (WandB) according to step_scheduler frequency
+        # Log to remote services (WandB, Trackio) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=self.step_scheduler.step)
 
         # JSONL training log (always log for detailed local records)
         self.metric_logger_train.log(log_data)

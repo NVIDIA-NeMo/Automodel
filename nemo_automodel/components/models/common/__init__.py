@@ -18,6 +18,7 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.models.common.utils import (
     HAVE_DEEP_EP,
     HAVE_TE,
+    AttentionBackend,
     BackendConfig,
     CudaGraphConfig,
     MoKBackendConfig,
@@ -33,6 +34,7 @@ __all__ = [
     # Backend utilities
     "HAVE_TE",
     "HAVE_DEEP_EP",
+    "AttentionBackend",
     "BackendConfig",
     "CudaGraphConfig",
     "MoKBackendConfig",

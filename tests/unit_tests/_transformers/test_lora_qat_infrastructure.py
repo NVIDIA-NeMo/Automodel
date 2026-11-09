@@ -15,6 +15,7 @@
 """CPU coverage for the existing qat_config boundary and preparation ordering."""
 
 from collections import OrderedDict
+from dataclasses import replace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -24,8 +25,7 @@ from torch import nn
 from nemo_automodel._transformers.qat import QAT
 from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig, MoEParallelizerConfig
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.quantization.qat import QATConfig, QATRule
 from nemo_automodel.components.quantization.weight_qat import WeightFakeQuantizer, WeightQuantizationConfig
@@ -218,9 +218,9 @@ def test_mesh_axes_rejected_before_model_mutation(infrastructure, axis):
     assert type(model[0]) is nn.Linear
 
 
-@pytest.mark.parametrize("manager_name", ["DDPManager", "MegatronFSDPManager"])
-def test_unverified_managers_rejected_even_at_world_one(infrastructure, manager_name):
-    manager = object.__new__(getattr(infrastructure, manager_name))
+@pytest.mark.parametrize("strategy", [DDPConfig(), MegatronFSDPConfig()])
+def test_unverified_strategies_rejected_even_at_world_one(infrastructure, strategy):
+    manager = MeshContext(strategy_config=strategy)
     with pytest.raises(ValueError, match="Megatron FSDP or DDP"):
         infrastructure.apply_model_infrastructure(
             _model(),
@@ -235,7 +235,7 @@ def test_unverified_managers_rejected_even_at_world_one(infrastructure, manager_
 def test_multi_rank_without_explicit_mesh_is_rejected(infrastructure):
     with (
         patch.object(infrastructure, "get_world_size_safe", return_value=2),
-        pytest.raises(ValueError, match="FSDP2Manager and an explicit MeshContext"),
+        pytest.raises(ValueError, match="FSDP2 strategy and an explicit MeshContext"),
     ):
         infrastructure.apply_model_infrastructure(
             _model(),
@@ -261,7 +261,11 @@ def _topology(world_size=2, ep_size=1, dp_replicate=1):
         }),
         moe_mesh=named_mesh({"ep_shard": world_size // ep_size, "ep": ep_size}) if ep_size > 1 else None,
     )
-    manager = FSDP2Manager(FSDP2Config(enable_compile=False), mesh.device_mesh, mesh.moe_mesh)
+    manager = replace(
+        mesh,
+        strategy_config=FSDP2Config(enable_compile=False),
+        moe_parallel_config=MoEParallelizerConfig() if ep_size > 1 else None,
+    )
     return mesh, manager
 
 
@@ -271,7 +275,8 @@ def test_supported_topologies_prepare_before_sharding(infrastructure, world_size
     manager, pipeline, parallelize_fn, quantizer = infrastructure.instantiate_infrastructure(
         distributed_config=FSDP2Config(enable_compile=False), mesh=mesh, qat_config=_qat_config(),
     )
-    assert isinstance(manager, FSDP2Manager)
+    assert isinstance(manager, MeshContext)
+    assert isinstance(manager.strategy_config, FSDP2Config)
     assert pipeline is None
     model = _model()
     # Stop at the sharding boundary: real 2-H100 parity is covered separately.
@@ -302,7 +307,7 @@ def test_supported_topologies_prepare_before_sharding(infrastructure, world_size
     ("extra_expert_shard", "ep_size=world_size"),
     ("missing_ep_parallelizer", "FSDP2 MoE parallelizer"),
     ("custom_dense_parallelizer", "not a custom parallelize_fn"),
-    ("missing_manager", "FSDP2Manager"),
+    ("missing_manager", "FSDP2 strategy"),
     ("mismatched_manager_mesh", "same meshes"),
     ("mismatched_manager_moe_mesh", "same meshes"),
     ("subset_mesh", "dp_shard_size=world_size"),
@@ -313,9 +318,9 @@ def test_unsupported_compositions_fail_before_preparation(infrastructure, case, 
     world_size = 4 if case in ("hsdp", "extra_expert_shard") else 2
     ep_size = 2 if case in ("extra_expert_shard", "missing_ep_parallelizer", "oversized_moe_mesh") else 1
     mesh, manager = _topology(world_size, ep_size, dp_replicate=2 if case == "hsdp" else 1)
-    kwargs = dict(mesh=mesh, model_wrapper=manager, parallelize_fn=MagicMock() if ep_size > 1 else None)
+    kwargs = dict(mesh=mesh, model_wrapper=manager, parallelize_fn=None)
     if case == "missing_ep_parallelizer":
-        kwargs["parallelize_fn"] = None
+        manager.moe_parallel_config = None
     elif case == "custom_dense_parallelizer":
         kwargs["parallelize_fn"] = MagicMock()
     elif case == "missing_manager":
@@ -374,13 +379,10 @@ def test_ep_checks_actual_experts_before_sharding(infrastructure, expert_kind, b
     with (
         patch.object(infrastructure, "get_world_size_safe", return_value=2),
         patch.object(infrastructure, "_shard_ep_fsdp", side_effect=lambda model, *args: model) as shard,
-        # QAT.prepare permits this local DeepEP kernel; the high-level distributed
-        # gate must independently reject the dispatcher even when prepare succeeds.
-        patch("nemo_automodel._transformers.qat._HAS_GROUPED_GEMM", True),
     ):
         kwargs = dict(
             is_meta_device=False, device=torch.device("cpu"), mesh=mesh, model_wrapper=manager,
-            parallelize_fn=MagicMock(), qat_quantizer=quantizer,
+            qat_quantizer=quantizer,
             peft_config=PeftConfig(target_modules=targets, dim=4, use_memory_efficient_lora=False),
         )
         if backend == "torch":
@@ -389,7 +391,7 @@ def test_ep_checks_actual_experts_before_sharding(infrastructure, expert_kind, b
             assert isinstance(model["experts"], GroupedExpertsLoRA if expert_kind == "qat" else GroupedExperts)
             assert isinstance(model["projection"].weight_fake_quantizer, WeightFakeQuantizer)
         else:
-            with pytest.raises(ValueError, match="reference loop|MXFP8 expert backend"):
+            with pytest.raises(ValueError, match="reference loop|torch_mm_mxfp8"):
                 infrastructure.apply_model_infrastructure(model, **kwargs)
             shard.assert_not_called()
 
@@ -579,7 +581,7 @@ def test_legacy_qat_retains_bfloat16_requirement_and_mode(infrastructure):
 
 
 @pytest.mark.parametrize("method", ["from_config", "from_pretrained"])
-def test_auto_model_routes_lora_qat_without_distributed_strategy(infrastructure, method):
+def test_auto_model_routes_lora_qat_without_distributed_strategy(infrastructure, method, tmp_path):
     from transformers import PretrainedConfig
 
     from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
@@ -595,7 +597,7 @@ def test_auto_model_routes_lora_qat_without_distributed_strategy(infrastructure,
         patch.object(NeMoAutoModelForCausalLM, "_build_model", return_value=sentinel) as build,
     ):
         result = getattr(NeMoAutoModelForCausalLM, method)(
-            hf_config if method == "from_config" else "unused-local-model",
+            hf_config if method == "from_config" else str(tmp_path),
             qat_config=_qat_config(),
             peft_config=_peft_config(),
             trust_remote_code=False,

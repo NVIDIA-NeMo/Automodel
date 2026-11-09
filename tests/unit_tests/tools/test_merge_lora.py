@@ -372,6 +372,7 @@ class TestParseArgs:
         assert args.no_save_tokenizer is False
         assert args.trust_remote_code is False
         assert args.model_class is None
+        assert args.automodel_native_export is False
 
     def test_all_flags(self, monkeypatch):
         from tools.merge_lora import parse_args
@@ -499,8 +500,104 @@ class TestMain:
 
 
 # ---------------------------------------------------------------------------
-# merge_lora (mocked)
+# merge_lora
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tied,target_modules,multimodal",
+    [
+        (True, ["lm_head"], False),
+        (False, ["lm_head"], False),
+        (True, ["q_proj"], False),
+        (True, ["embed_tokens"], False),
+        (True, ["embed_tokens", "lm_head"], False),
+        (True, ["lm_head"], True),
+    ],
+    ids=["tied-head", "untied-head", "tied-projection", "tied-input", "tied-input-and-head", "tied-vlm-head"],
+)
+def test_merge_lora_preserves_tied_embedding_outputs(
+    tmp_path: Path, tied: bool, target_modules: list[str], multimodal: bool
+) -> None:
+    from peft import LoraConfig, get_peft_model
+    from safetensors.torch import load_file
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoModelForImageTextToText,
+        LlamaConfig,
+        LlamaForCausalLM,
+        SmolVLMConfig,
+        SmolVLMForConditionalGeneration,
+    )
+
+    from tools.merge_lora import merge_lora
+
+    torch.manual_seed(0)
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        tie_word_embeddings=tied,
+        pad_token_id=0,
+    )
+    auto_cls = AutoModelForCausalLM
+    if multimodal:
+        config = SmolVLMConfig(
+            text_config=config.to_dict(),
+            vision_config={
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "image_size": 16,
+                "patch_size": 4,
+            },
+            tie_word_embeddings=tied,
+            pad_token_id=0,
+            image_token_id=31,
+        )
+        base = SmolVLMForConditionalGeneration(config).eval()
+        auto_cls = AutoModelForImageTextToText
+    else:
+        base = LlamaForCausalLM(config).eval()
+    original_embeddings = base.get_input_embeddings().weight.detach().clone()
+    base_dir, adapter_dir, output_dir = (tmp_path / name for name in ("base", "adapter", "merged"))
+    base.save_pretrained(base_dir)
+    model = get_peft_model(
+        base, LoraConfig(r=2, lora_alpha=4, target_modules=target_modules, task_type="CAUSAL_LM")
+    ).eval()
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "lora_" in name:
+                parameter.normal_(0, 0.1)
+        input_ids = torch.tensor([[1, 4, 5, 6]])
+        expected_embeddings = model.get_input_embeddings()(input_ids)
+        expected_logits = model(input_ids).logits
+    model.save_pretrained(adapter_dir, save_embedding_layers=False)
+
+    merge_lora(
+        str(base_dir),
+        str(adapter_dir),
+        str(output_dir),
+        dtype="float32",
+        device="cpu",
+        save_tokenizer=False,
+        model_class=auto_cls.__name__ if multimodal else None,
+    )
+
+    merged = auto_cls.from_pretrained(output_dir).eval()
+    torch.testing.assert_close(merged.get_input_embeddings()(input_ids), expected_embeddings, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(merged(input_ids).logits, expected_logits, rtol=1e-5, atol=1e-6)
+    if "embed_tokens" not in target_modules:
+        torch.testing.assert_close(merged.get_input_embeddings().weight, original_embeddings, rtol=0, atol=0)
+    expected_tied = tied and target_modules == ["q_proj"]
+    assert merged.config.tie_word_embeddings is expected_tied
+    assert merged.config.get_text_config().tie_word_embeddings is expected_tied
+    assert (merged.get_input_embeddings().weight is merged.get_output_embeddings().weight) is expected_tied
+    assert ("lm_head.weight" in load_file(output_dir / "model.safetensors")) is not expected_tied
 
 
 class TestMergeLoraFunction:
@@ -509,6 +606,73 @@ class TestMergeLoraFunction:
         mock_model.named_parameters.return_value = []
         mock_model.named_modules.return_value = []
         return mock_model
+
+    def test_opt_in_automodel_export_uses_torch_backend(self, tmp_path, monkeypatch):
+        import nemo_automodel
+        from nemo_automodel.components.models.common import BackendConfig
+        from tools import merge_lora as merge_mod
+
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text(
+            json.dumps({"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": 192, "lora_alpha": 384}),
+            encoding="utf-8",
+        )
+        (adapter_dir / "automodel_peft_config.json").write_text(
+            json.dumps({"moe_rank_scaling": True}), encoding="utf-8"
+        )
+        model = self._make_mock_model()
+        automodel_cls = MagicMock()
+        automodel_cls.from_pretrained.return_value = model
+        native_export = MagicMock()
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "prog",
+                "-m",
+                "/fake/model",
+                "-a",
+                str(adapter_dir),
+                "-o",
+                str(tmp_path / "merged"),
+                "--dtype",
+                "bfloat16",
+                "--no-save-tokenizer",
+                "--automodel-native-export",
+            ],
+        )
+
+        with patch.dict(
+            nemo_automodel.__dict__,
+            {
+                "NeMoAutoModelForCausalLM": automodel_cls,
+                "export_merged_peft_checkpoint": native_export,
+            },
+        ):
+            merge_mod.main()
+
+        load_kwargs = automodel_cls.from_pretrained.call_args.kwargs
+        assert isinstance(load_kwargs["backend"], BackendConfig)
+        assert load_kwargs["backend"].linear == "torch"
+        assert load_kwargs["peft_config"].dim == 192
+        assert load_kwargs["peft_config"].moe_rank_scaling is True
+        native_export.assert_called_once_with(
+            model,
+            adapter_path=str(adapter_dir),
+            output_dir=str(tmp_path / "merged"),
+        )
+
+    def test_automodel_native_export_rejects_qlora(self, monkeypatch):
+        from tools import merge_lora as merge_mod
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["prog", "-m", "/model", "-a", "/adapter", "-o", "/out", "--qlora", "--automodel-native-export"],
+        )
+        with pytest.raises(ValueError, match="--qlora cannot be combined"):
+            merge_mod.main()
 
     @patch("tools.merge_lora.gc")
     @patch("tools.merge_lora.torch")

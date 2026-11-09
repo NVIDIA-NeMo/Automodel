@@ -36,9 +36,7 @@ from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components.quantization.qat import QATConfig, QATRule
 from nemo_automodel.components.quantization.weight_qat import QuantizedWeight, WeightFakeQuantizer
-from nemo_automodel.shared.import_utils import safe_import
 
-_HAS_GROUPED_GEMM, _ = safe_import("grouped_gemm.ops")
 _LORA_TYPES = (LinearLoRA, GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA)
 
 
@@ -116,6 +114,8 @@ def _validate_lora(
 ) -> None:
     """Validate LoRA storage metadata only, including meta-device initialization."""
     if isinstance(module, LinearLoRA):
+        if module._lora_token_gate is not None:
+            raise ValueError(f"{name}: LoRA QAT does not support per-token adapter gating")
         if module.use_dora or (module.dropout_p != 0 and (quantizer is not None or module.training)):
             raise ValueError(f"{name}: LoRA QAT does not support DoRA or nonzero dropout")
         if getattr(module, "super_fwd", None) is not None or getattr(module, "quant_state", None) is not None:
@@ -130,8 +130,6 @@ def _validate_lora(
             raise ValueError(f"{name}: bias must match base weight output shape, dtype and device")
     elif module.use_mxfp8:
         raise ValueError(f"{name}: MXFP8 expert backend is unsupported for LoRA QAT")
-    elif isinstance(module, GroupedExpertsDeepEPLoRA) and not module.use_torch_mm and not _HAS_GROUPED_GEMM:
-        raise ValueError(f"{name}: DeepEP QAT requires grouped_gemm or use_torch_mm=True")
     if not math.isfinite(module.scale):
         raise ValueError(f"{name}: LoRA scale must be finite")
     projections = _projections(module)

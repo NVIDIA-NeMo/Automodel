@@ -15,6 +15,41 @@ _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
 
 
+def _as_float(value: Any) -> float | None:
+    """Return ``value`` as a float, or None when it is not numeric (e.g. relative-step Adafactor's ``lr=None``)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _set_group_mults(optimizer: Optimizer) -> None:
+    """Store each param group's constructed ``lr`` / ``weight_decay`` as ``lr_mult`` / ``wd_mult`` relative to group 0.
+
+    :meth:`OptimizerParamScheduler.step` rewrites every group's ``lr`` and ``weight_decay`` from the schedule, so a
+    group built with its own values (a no-decay group, a separate head LR) would otherwise be reset to the base
+    schedule. ``LRSchedulerConfig.build`` reads the schedule's base values from group 0, so each group keeps its ratio
+    to group 0 as a multiplier. The multipliers live in the param groups, so they are saved with the optimizer and
+    restored on resume instead of being recomputed from the resumed run's config.
+
+    A group that already carries ``lr_mult`` (or a per-group ``max_lr`` / ``min_lr``) or ``wd_mult`` keeps it
+    unchanged. Every other group, group 0 included, gets both keys so the saved param-group layout does not depend
+    on which groups happen to differ from group 0. The multiplier is 1.0 when group 0's value is zero or non-numeric
+    (e.g. relative-step Adafactor's ``lr=None``).
+
+    Args:
+        optimizer: Optimizer whose param groups still hold their constructed values.
+    """
+    base_lr = _as_float(optimizer.param_groups[0]["lr"])
+    base_wd = _as_float(optimizer.param_groups[0].get("weight_decay", 0.0))
+    for group in optimizer.param_groups:
+        lr, wd = _as_float(group["lr"]), _as_float(group.get("weight_decay", 0.0))
+        if "lr_mult" not in group and "max_lr" not in group and "min_lr" not in group:
+            group["lr_mult"] = lr / base_lr if base_lr and lr is not None else 1.0
+        if "wd_mult" not in group:
+            group["wd_mult"] = wd / base_wd if base_wd and wd is not None else 1.0
+
+
 class OptimizerParamScheduler:
     """
     Anneals learning rate and weight decay.
@@ -114,6 +149,9 @@ class OptimizerParamScheduler:
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         if self.override_opt_param_scheduler:
             assert not self.use_checkpoint_opt_param_scheduler, "both override and use-checkpoint are set."
+
+        # Record each group's own lr / weight_decay as multipliers before step(0) overwrites them.
+        _set_group_mults(optimizer)
 
         # Set the learning rate
         self.step(0)
@@ -248,7 +286,9 @@ class OptimizerParamScheduler:
 
     def step(self, increment: int) -> None:
         """
-        Set lr for all parameters groups.
+        Set lr and weight decay for all parameter groups.
+
+        Each group gets the scheduled value times its ``lr_mult`` / ``wd_mult`` (see :func:`_set_group_mults`).
 
         Args:
             increment (int): number of steps to increment

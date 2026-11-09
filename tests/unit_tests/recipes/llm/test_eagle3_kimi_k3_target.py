@@ -96,9 +96,9 @@ def test_backend_defaults_to_expert_parallel_fp32_norm():
 
 def test_backend_honors_overrides():
     backend = _build_kimi_k3_target_backend(
-        _Cfg(target_dispatcher="deepep", target_experts="gmm", target_enable_fsdp_optimizations=False)
+        _Cfg(target_dispatcher="deepep", target_experts="torch_mm", target_enable_fsdp_optimizations=False)
     )
-    assert (backend.dispatcher, backend.experts) == ("deepep", "gmm")
+    assert (backend.dispatcher, backend.experts) == ("deepep", "torch_mm")
     assert not backend.enable_fsdp_optimizations
 
 

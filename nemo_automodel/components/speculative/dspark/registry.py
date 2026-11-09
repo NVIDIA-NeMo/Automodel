@@ -21,6 +21,7 @@ string so adding a target family is a one-line append, with no recipe change.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from torch import nn
 
@@ -28,7 +29,6 @@ from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import Deeps
 from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
-from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 
 
@@ -37,8 +37,31 @@ class DraftSpec:
     """How to build a DSpark draft model for a particular target architecture."""
 
     # Constructed as ``draft_cls(draft_config)``; some drafts are HF PreTrainedModel
-    # subclasses (Qwen3, Gemma4) while others are plain modules (V4, GLM, MiniMax M3).
+    # subclasses (Qwen3, Gemma4) while others are plain modules (V4, GLM).
     draft_cls: type[nn.Module]
+
+
+class _DSparkDraftOptions(Protocol):
+    """Recipe options consumed by model-owned DSpark draft constructors."""
+
+    num_draft_layers: int
+    target_layer_ids: list[int]
+    block_size: int
+    num_anchors: int
+    mask_token_id: int
+    markov_rank: int
+    markov_head_type: str
+    confidence_head_alpha: float
+    confidence_head_with_markov: bool
+    confidence_head_stop_gradient: bool
+
+
+@runtime_checkable
+class ModelOwnedDSparkProvider(Protocol):
+    """Target config that owns construction of its architecture-specific draft."""
+
+    def build_dspark_draft(self, options: _DSparkDraftOptions) -> nn.Module:
+        """Build a draft from the generic recipe's declarative options."""
 
 
 # Qwen3-style dense (and MoE) targets: the draft only consumes the target's
@@ -66,9 +89,6 @@ DSPARK_DRAFT_REGISTRY["KimiK3ForConditionalGeneration"] = DraftSpec(draft_cls=Ki
 # text sub-config.
 DSPARK_DRAFT_REGISTRY["Gemma4ForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4DSparkModel)
 DSPARK_DRAFT_REGISTRY["Gemma4UnifiedForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4DSparkModel)
-# MiniMax M3 VL target (model_type "minimax_m3_vl"): a dense text-only draft built from
-# the target's text sub-config.
-DSPARK_DRAFT_REGISTRY["MiniMaxM3SparseForConditionalGeneration"] = DraftSpec(draft_cls=MiniMaxM3DSparkModel)
 
 
 def resolve_dspark_draft_spec(architectures: list[str]) -> DraftSpec:
@@ -104,4 +124,10 @@ def build_target_layer_ids(num_target_layers: int, num_feature_layers: int) -> l
     return ids
 
 
-__all__ = ["DraftSpec", "DSPARK_DRAFT_REGISTRY", "resolve_dspark_draft_spec", "build_target_layer_ids"]
+__all__ = [
+    "DraftSpec",
+    "DSPARK_DRAFT_REGISTRY",
+    "ModelOwnedDSparkProvider",
+    "resolve_dspark_draft_spec",
+    "build_target_layer_ids",
+]

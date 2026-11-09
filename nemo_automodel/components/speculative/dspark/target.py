@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Protocol, Sequence, runtime_checkable
 
 import torch
 import torch.nn as nn
@@ -52,21 +52,77 @@ class DSparkTargetBatch:
     doc_remaining: torch.Tensor | None = None
 
 
+@runtime_checkable
+class _DSparkTargetFeatureProvider(Protocol):
+    """Optional model-owned selection of modules carrying DSpark features."""
+
+    def get_dspark_target_feature_modules(self, layer_ids: list[int]) -> tuple[nn.Module, ...]:
+        """Return modules whose first forward input is each requested feature."""
+
+
+class _PackedActivationLayout(Protocol):
+    """Model-owned token layout of activations captured during a packed forward."""
+
+    def restore(self, values: torch.Tensor) -> torch.Tensor:
+        """Map a tensor of shape [batch, model_sequence, ...] to [batch, sequence, ...]."""
+
+
+class _DSparkPackedForward(Protocol):
+    """Model-owned frozen forward for targets that isolate packed documents themselves.
+
+    The generic packing path masks attention with a block-causal ``[batch, 1, sequence,
+    sequence]`` mask. Targets whose attention also mixes tokens through other state, such
+    as compressed KV or sparse indexers, run packed rows through their own metadata instead.
+    """
+
+    def __call__(self, model: nn.Module, input_ids: torch.Tensor, *, seq_lens: torch.Tensor) -> _PackedActivationLayout:
+        """Run the frozen forward on packed rows.
+
+        Args:
+            model: Target model whose activations the wrapper hooks.
+            input_ids: Tensor of shape [batch, sequence] holding packed documents.
+            seq_lens: Tensor of shape [batch, documents] with document lengths; each row
+                sums to ``sequence`` and zero entries pad the document axis.
+
+        Returns:
+            The layout that maps activations captured during the forward back to
+            [batch, sequence].
+        """
+
+
 class HFDSparkTargetModel:
     """Capture intermediate + final hidden states from a frozen HF causal LM.
 
     A forward hook on decoder layer ``i`` captures ``hidden_states[i + 1]`` (the
     HuggingFace ``output_hidden_states`` offset-1 convention); a hook on the final
-    norm captures the post-norm last hidden state.
+    norm captures the post-norm last hidden state. Models with a nonstandard
+    feature contract can expose ``get_dspark_target_feature_modules``; the wrapper
+    then captures the first input of each returned module instead. Targets that
+    isolate packed documents with their own metadata pass a model-owned
+    ``packed_forward``, which replaces the generic block-causal mask on the packing path.
     """
 
-    def __init__(self, model: nn.Module, target_layer_ids: Sequence[int], cp_mesh=None):
+    def __init__(
+        self,
+        model: nn.Module,
+        target_layer_ids: Sequence[int],
+        cp_mesh=None,
+        packed_forward: _DSparkPackedForward | None = None,
+    ):
         self.model = model.eval()
         self._num_layers = len(self._get_transformer_layers())
         # ``-1`` (the embedding output) is accepted, matching
         # ``common.extract_context_feature`` and the draft ``fc`` sizing in the
         # config builders.
         self.target_layer_ids = validate_target_layer_ids(list(target_layer_ids), self._num_layers)
+        self._target_feature_modules = (
+            self.model.get_dspark_target_feature_modules(self.target_layer_ids)
+            if isinstance(self.model, _DSparkTargetFeatureProvider)
+            else None
+        )
+        if self._target_feature_modules is not None and len(self._target_feature_modules) != len(self.target_layer_ids):
+            raise ValueError("get_dspark_target_feature_modules must return one module for each requested target layer")
+        self._packed_forward = packed_forward
         # Context parallelism shards this frozen forward along the sequence dim;
         # generate_batch gathers the captured hidden states back to the full
         # sequence so the draft's anchor/block masks stay CP-unaware. cp_mesh is the
@@ -160,24 +216,35 @@ class HFDSparkTargetModel:
     ) -> DSparkTargetBatch:
         """Run the target model once and capture the DSpark context + last hidden state.
 
-        Features follow ``common.extract_context_feature`` exactly: ``-1`` is the
-        embedding output, the final layer is the post-norm hidden state (HF
-        ``output_hidden_states[num_layers]``), and any other id is that decoder
-        layer's output. The final-norm output is also returned as the last hidden
-        state for the TV / confidence losses.
+        Args:
+            input_ids: Long tensor of shape [batch, sequence] containing target tokens.
+            attention_mask: Binary tensor of shape [batch, sequence], with one for
+                valid tokens and zero for padding.
+            loss_mask: Tensor of shape [batch, sequence] selecting supervised tokens.
+            position_ids: Optional long tensor of shape [batch, sequence] containing
+                per-document reset positions for packed input.
+            seq_lens: Optional long tensor of shape [batch, max_documents] containing
+                packed document lengths.
+            doc_remaining: Optional long tensor of shape [batch, sequence] containing
+                the valid tokens remaining in each position's packed document.
+            **mm_kwargs: Multimodal tensors accepted by the wrapped target. Their
+                layouts follow that target model's forward contract.
 
-        ``mm_kwargs`` carries any multimodal inputs present in the training batch
-        (``pixel_values``, ``image_grid_thw``, ...); :func:`filter_forward_kwargs`
-        drops whatever the target's own forward signature does not accept, so a
-        text-only target (Qwen3, Gemma4, or MiniMax M3 without multimodal training
-        data) is never passed inputs it cannot handle -- this is a no-behavior-change
-        extension for every existing (``mm_kwargs``-empty) caller. A VLM target
-        (e.g. MiniMax M3) splices the vision features into its embedding sequence
-        internally when they are provided.
+        Returns:
+            DSparkTargetBatch with target_hidden_states of shape [batch, sequence,
+            captured_layers * hidden], target_last_hidden_states of shape [batch,
+            sequence, hidden], unmodified input_ids and loss_mask tensors of shape
+            [batch, sequence], and the optional packing tensors in their input layouts.
+
+        Features normally follow ``common.extract_context_feature``: ``-1`` is
+        the embedding output, the final layer is the post-norm hidden state, and
+        any other id is that decoder layer's output. A model-owned feature provider
+        can replace those intermediate capture points. The final-norm output is
+        always returned separately for the TV and confidence losses.
         """
         layers = self._get_transformer_layers()
         last = self._num_layers - 1
-        captured: dict[object, torch.Tensor] = {}
+        captured: dict[int | str, torch.Tensor] = {}
         handles = []
 
         def _make_hook(key):
@@ -186,24 +253,40 @@ class HFDSparkTargetModel:
 
             return _hook
 
-        if -1 in self.target_layer_ids:
-            handles.append(self.model.get_input_embeddings().register_forward_hook(_make_hook("embed")))
-        for layer_id in self.target_layer_ids:
-            if 0 <= layer_id < last:
-                handles.append(layers[layer_id].register_forward_hook(_make_hook(layer_id)))
+        def _make_input_hook(key: int):
+            def _hook(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+                """Capture a tensor of shape [batch, sequence, streams, hidden]."""
+                if not inputs:
+                    raise RuntimeError(f"DSpark target feature module for layer {key} received no positional input")
+                captured[key] = inputs[0]
+
+            return _hook
+
+        if self._target_feature_modules is not None:
+            handles.extend(
+                module.register_forward_pre_hook(_make_input_hook(layer_id))
+                for layer_id, module in zip(self.target_layer_ids, self._target_feature_modules)
+            )
+        else:
+            if -1 in self.target_layer_ids:
+                handles.append(self.model.get_input_embeddings().register_forward_hook(_make_hook("embed")))
+            for layer_id in self.target_layer_ids:
+                if 0 <= layer_id < last:
+                    handles.append(layers[layer_id].register_forward_hook(_make_hook(layer_id)))
         # The final norm gives both the post-norm last hidden state and the
         # last-layer feature (post-norm), matching the HF offset-1 convention.
         handles.append(self._get_final_norm().register_forward_hook(_make_hook("norm")))
 
         target_attention_mask = attention_mask
         extra_kwargs: dict[str, torch.Tensor] = {}
-        if seq_lens is not None:
+        if seq_lens is not None and position_ids is None:
+            raise ValueError("DSpark sequence packing requires per-document position_ids, but none were provided.")
+        use_packed_forward = seq_lens is not None and self._packed_forward is not None
+        if seq_lens is not None and not use_packed_forward:
             # Packing: run the frozen target block-causal (SDPA/eager consume the
             # [B, 1, S, S] additive mask; FlashAttention infers boundaries from the
             # per-document position_ids at batch size 1) so the captured context
             # hidden states do not leak across document boundaries.
-            if position_ids is None:
-                raise ValueError("DSpark sequence packing requires per-document position_ids, but none were provided.")
             # ``filter_forward_kwargs`` drops kwargs the target forward does not
             # declare. If it would drop ``position_ids``, the target falls back to
             # default arange positions (wrong per-document RoPE) and, on the FA path,
@@ -229,16 +312,7 @@ class HFDSparkTargetModel:
                     seq_lens, seq_length=input_ids.shape[1], dtype=param_dtype, device=input_ids.device
                 )
 
-        forward_kwargs = filter_forward_kwargs(
-            self.model,
-            dict(
-                input_ids=input_ids,
-                attention_mask=target_attention_mask,
-                use_cache=False,
-                **extra_kwargs,
-                **mm_kwargs,
-            ),
-        )
+        layout = None
         if self._cp_size > 1:
             # Shard the sequence, run the target as ring attention, then gather every
             # captured hidden state back to the full sequence.
@@ -267,7 +341,21 @@ class HFDSparkTargetModel:
             captured = dict(zip(keys, gathered))
         else:
             try:
-                self.model(**forward_kwargs)
+                if use_packed_forward:
+                    layout = self._packed_forward(self.model, input_ids, seq_lens=seq_lens)
+                else:
+                    self.model(
+                        **filter_forward_kwargs(
+                            self.model,
+                            dict(
+                                input_ids=input_ids,
+                                attention_mask=target_attention_mask,
+                                use_cache=False,
+                                **extra_kwargs,
+                                **mm_kwargs,
+                            ),
+                        )
+                    )
             finally:
                 for handle in handles:
                     handle.remove()
@@ -275,7 +363,9 @@ class HFDSparkTargetModel:
                 raise RuntimeError("DSpark target capture did not record the final-norm output.")
 
         def _feature(layer_id: int) -> torch.Tensor:
-            if layer_id == -1:
+            if self._target_feature_modules is not None:
+                feat = captured[layer_id]
+            elif layer_id == -1:
                 feat = captured["embed"]
             elif layer_id == last:
                 feat = captured["norm"]
@@ -284,9 +374,15 @@ class HFDSparkTargetModel:
             return self._collapse_hc_streams(feat)
 
         target_hidden_states = torch.cat([_feature(layer_id) for layer_id in self.target_layer_ids], dim=-1)
+        target_last_hidden_states = captured["norm"]
+        if layout is not None:
+            # Restoring after the per-token stream collapse gathers [batch, sequence, hidden]
+            # tensors instead of every captured [batch, sequence, streams, hidden] one.
+            target_hidden_states = layout.restore(target_hidden_states)
+            target_last_hidden_states = layout.restore(target_last_hidden_states)
         return DSparkTargetBatch(
             target_hidden_states=target_hidden_states,
-            target_last_hidden_states=captured["norm"],
+            target_last_hidden_states=target_last_hidden_states,
             input_ids=input_ids,
             loss_mask=loss_mask,
             position_ids=position_ids,

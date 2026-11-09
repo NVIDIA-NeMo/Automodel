@@ -101,7 +101,7 @@ distributed:
   pp_size: 1
   cp_size: 1
   ep_size: 32
-  defer_fsdp_grad_sync: true
+  defer_fsdp_grad_sync: false
   sequence_parallel: false
   activation_checkpointing: true
   moe:
@@ -204,4 +204,5 @@ wandb:
 ci:
   recipe_owner: huiyingl
   nodes: 8
+  cluster_tag: gb200
   time: "01:00:00"

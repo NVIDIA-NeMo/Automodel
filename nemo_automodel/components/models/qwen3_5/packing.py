@@ -20,7 +20,17 @@ from dataclasses import dataclass
 
 import torch
 
-from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
+from nemo_automodel.components.models.common.packing import (
+    flatten_packed_sequence_metadata,
+    is_indexed_packed_mask,
+)
+
+
+@dataclass(frozen=True)
+class HostTensor:
+    """Keep a CPU metadata tensor outside distributed input device transfers."""
+
+    tensor: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -47,32 +57,75 @@ class GatedDeltaPackedMetadata:
 def prepare_gated_delta_packed_metadata(
     attention_mask: torch.Tensor | None,
     packed_seq_ids: torch.Tensor | None,
+    *,
+    packed_token_indices: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    compute_device: torch.device | None = None,
+    host_packed_seq_ids: HostTensor | None = None,
 ) -> GatedDeltaPackedMetadata | None:
-    """Build shared GatedDeltaNet metadata once for a model forward.
+    """Prepare dataset-provided GatedDeltaNet metadata once per model forward.
 
     Args:
         attention_mask: Optional indexed document mask of shape [batch,
             sequence] or a backend-specific attention mask.
         packed_seq_ids: Optional indexed document IDs of shape [batch,
             sequence] supplied beside a backend-specific attention mask.
+        packed_token_indices: Optional valid-token indices of shape [batch,
+            sequence] before model-entry normalization or [tokens] afterward.
+        cu_seqlens: Optional cumulative document lengths of shape [batch,
+            max_documents + 1] before model-entry normalization or
+            [documents + 1] afterward.
+        compute_device: Device used by the decoder. Host document IDs and
+            supplied metadata are transferred there after normalization.
+        host_packed_seq_ids: CPU mirror of shape [batch, sequence] retained
+            through distributed input transfer; it must match ``packed_seq_ids``.
 
     Returns:
         Device and CPU packed-sequence metadata whose tensor layouts are
         documented by :class:`GatedDeltaPackedMetadata`, or ``None`` for an
         unpacked mask.
     """
-    if is_indexed_packed_mask(attention_mask):
-        document_ids = attention_mask
-    elif is_indexed_packed_mask(packed_seq_ids):
-        document_ids = packed_seq_ids
-    else:
+    # An explicit metadata bundle also represents a single
+    # joined document, whose padding still needs gathering before recurrence.
+    has_metadata = packed_token_indices is not None or cu_seqlens is not None
+    document_ids = None
+    metadata_candidate = None
+    for candidate in (packed_seq_ids, attention_mask):
+        if candidate is None or candidate.dtype == torch.bool or candidate.dim() != 2:
+            continue
+        if metadata_candidate is None:
+            metadata_candidate = candidate
+        candidate_cpu = (
+            host_packed_seq_ids.tensor
+            if candidate is packed_seq_ids and host_packed_seq_ids is not None
+            else candidate.detach().to(device="cpu")
+        )
+        if is_indexed_packed_mask(candidate_cpu):
+            document_ids = candidate
+            break
+    if document_ids is None and has_metadata:
+        document_ids = metadata_candidate
+    if document_ids is None:
         return None
 
-    indices, cu_seqlens, _ = get_unpad_data(document_ids)
+    if packed_token_indices is None or cu_seqlens is None:
+        raise ValueError("Packed Qwen3.5 inputs require dataset-provided packed_token_indices and cu_seqlens.")
+    if packed_token_indices.ndim != 1 or cu_seqlens.ndim != 1:
+        packed_token_indices, cu_seqlens = flatten_packed_sequence_metadata(
+            packed_token_indices,
+            cu_seqlens,
+            batch_size=document_ids.shape[0],
+            sequence_length=document_ids.shape[1],
+        )
     cu_seqlens = cu_seqlens.to(torch.long)
+    cu_seqlens_cpu = cu_seqlens.detach().cpu()
+    if compute_device is not None and document_ids.device != compute_device:
+        if document_ids.device.type == "cpu" and compute_device.type == "cuda":
+            document_ids = document_ids.pin_memory()
+        document_ids = document_ids.to(device=compute_device, non_blocking=True)
     return GatedDeltaPackedMetadata(
         document_ids=document_ids,
-        indices=indices,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens.detach().cpu(),
+        indices=packed_token_indices.to(device=document_ids.device, non_blocking=True),
+        cu_seqlens=cu_seqlens.to(device=document_ids.device, non_blocking=True),
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )

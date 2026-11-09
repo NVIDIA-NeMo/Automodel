@@ -36,6 +36,7 @@ from nemo_automodel.components._peft.lora import (
     LinearLoRA,
     PeftConfig,
     apply_lora_to_linear_modules,
+    lora_token_gate,
     patch_linear_module,
     patch_moe_module,
 )
@@ -68,6 +69,15 @@ def _controller(*, scale_format="e8m0"):
         QATRule(["0"], WeightQuantizationConfig("fp8", (32, 32), scale_format=scale_format)),
         QATRule(["2"], WeightQuantizationConfig("mxfp4", (1, 32))),
     ]))
+
+
+def test_prepare_rejects_token_gate_without_installing_quantizers() -> None:
+    model = _patched()
+    with lora_token_gate(model, torch.ones(1, 2)):
+        with pytest.raises(ValueError, match="per-token adapter gating"):
+            _controller().prepare(model)
+    assert model[0].weight_fake_quantizer is None
+    assert model[2].weight_fake_quantizer is None
 
 
 def _one_rule(*patterns):

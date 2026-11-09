@@ -121,6 +121,7 @@ lr_scheduler:
 nvtx: false
 
 ci:
+  cluster_tag: h100
   recipe_owner: khazic
   nodes: 1
   time: "01:00:00"

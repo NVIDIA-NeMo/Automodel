@@ -41,7 +41,7 @@ model:
     attn: te
     linear: te
     rms_norm: torch_fp32
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
     gate_precision: float32
     fake_balanced_gate: false
@@ -120,6 +120,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  cluster_tag: h100
   recipe_owner: hemildesai
   nodes: 1
   time: "00:30:00"

@@ -112,6 +112,8 @@ The forward pass quantizes and dequantizes the effective weight
 frozen. Untargeted adapters train normally and export as merged floating weights.
 Training storage and activations are not packed FP8/FP4. Use matching base/adapter
 storage dtypes, zero dropout, no DoRA, and no autocast for the targeted examples.
+Per-token adapter gating is unsupported: a token-dependent adapter cannot be
+represented by the single merged weight used by QAT and reference export.
 
 | Weight format | Supported block sizes | Scale format |
 | --- | --- | --- |

@@ -64,7 +64,7 @@ model:
     attn: te
     linear: te
     rms_norm: te
-    experts: gmm
+    experts: torch_mm
     dispatcher: hybridep
     fake_balanced_gate: false
     enable_fsdp_optimizations: false
@@ -137,6 +137,7 @@ lr_scheduler:
   min_lr: 1.0e-5
 
 ci:
+  cluster_tag: h100
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: adil-a
   time: "00:30:00"

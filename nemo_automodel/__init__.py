@@ -40,7 +40,9 @@ from .package_info import __package_name__, __version__
 _SUBMODULES = {"recipes", "shared", "components", "models"}
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    "NeMoAutoConfig": ("nemo_automodel._transformers.auto_config", "NeMoAutoConfig"),
     "NeMoAutoModelForCausalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForCausalLM"),
+    "NeMoAutoModelForDiffusion": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForDiffusion"),
     "NeMoAutoModelForImageTextToText": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForImageTextToText"),
     "NeMoAutoModelForMultimodalLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForMultimodalLM"),
     "NeMoAutoModelForSeq2SeqLM": ("nemo_automodel._transformers.auto_model", "NeMoAutoModelForSeq2SeqLM"),
@@ -60,6 +62,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "ModelCapabilities": ("nemo_automodel._transformers.model_capabilities", "ModelCapabilities"),
     "query_capabilities": ("nemo_automodel._transformers.model_capabilities", "query_capabilities"),
     "register_architecture": ("nemo_automodel._transformers.registry", "register_architecture"),
+    "export_merged_peft_checkpoint": (
+        "nemo_automodel._transformers.peft_export",
+        "export_merged_peft_checkpoint",
+    ),
 }
 
 __all__ = sorted([*_SUBMODULES, "__version__", "__package_name__", *_LAZY_ATTRS.keys()])

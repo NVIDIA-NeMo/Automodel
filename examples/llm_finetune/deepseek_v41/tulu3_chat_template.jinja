@@ -1,0 +1,15 @@
+{{- bos_token -}}
+{%- for message in messages -%}
+    {%- if message['role'] == 'system' -%}
+        {{- '<｜System｜>' -}}
+        {{- message['content'] -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- '<｜User｜>' + message['content'] -}}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- '<｜Assistant｜></think>' -}}
+        {%- generation -%}{{- message['content'] + eos_token -}}{%- endgeneration -%}
+    {%- else -%}
+        {{- raise_exception('Tulu3 text template supports only system, user, and assistant roles') -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<｜Assistant｜></think>' -}}{%- endif -%}

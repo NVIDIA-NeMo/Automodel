@@ -26,9 +26,41 @@ import pytest
 pytest_plugins = ["pytester"]
 
 # The inner pytest subprocess imports torch from scratch and needs a few seconds beyond the 5s fallback.
-pytestmark = pytest.mark.timeout(60)
+pytestmark = [pytest.mark.timeout(70), pytest.mark.cpu_only]
 
 _CONFTEST_SOURCE = Path(__file__).with_name("conftest.py").read_text()
+
+
+def _run_inner_pytest(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> pytest.RunResult:
+    """Run timeout cleanup alone and expose child output if its watchdog expires."""
+    # Generated runs test timeout cleanup, not the installed plugin set. Avoid
+    # unrelated plugin startup and callbacks in these fresh interpreters.
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    pytester.makepyfile(
+        _inner_watchdog="import faulthandler\nfaulthandler.enable()\nfaulthandler.dump_traceback_later(30)\n",
+    )
+    try:
+        return pytester.runpytest_subprocess(
+            "-p",
+            "no:faulthandler",  # Its shutdown hook would cancel our interpreter-exit diagnostic.
+            "-p",
+            "_inner_watchdog",
+            "-p",
+            "pytest_timeout",
+            "-p",
+            "no:cacheprovider",
+            "--tb=short",
+            timeout=40,
+        )
+    except pytest.Pytester.TimeoutExpired:
+        # Pytester raises before dumping these files on timeout, hiding whether
+        # startup, test execution, or interpreter shutdown stalled.
+        for stream in ("stdout", "stderr"):
+            output = pytester.path / stream
+            if output.exists():
+                print(f"Inner pytest {stream}:\n{output.read_text(encoding='utf-8', errors='replace')[-16000:]}")
+        raise
+
 
 _HANGING_WORKER = """
 import time
@@ -44,17 +76,125 @@ def _hang(rank):
 @pytest.mark.timeout(1)
 def test_hanging_worker():
     mp.spawn(_hang, nprocs=1, join=True)
+
+
+def test_next_test_has_no_stale_workers():
+    assert not mp.active_children(), "timeout cleanup left stale multiprocessing children"
+"""
+
+_UNREAPED_WORKER = """
+import multiprocessing.process
+import os
+from collections.abc import Iterator
+
+
+@pytest.fixture(scope="session", autouse=True)
+def defer_worker_reaping() -> Iterator[None]:
+    # A bounded join can return before it reaps the worker. Wait for a real
+    # exit without consuming its status to exercise that cleanup race reliably.
+    def join_without_reaping(self: multiprocessing.process.BaseProcess, timeout: float | None = None) -> None:
+        patch.undo()
+        os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOWAIT)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(multiprocessing.process.BaseProcess, "join", join_without_reaping)
+        yield
+"""
+
+_HANGING_POPEN = """
+import subprocess
+import sys
+
+import pytest
+
+
+@pytest.mark.timeout(1)
+def test_hanging_popen():
+    subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)", "torch._inductor.compile_worker"]
+    ).wait()
+"""
+
+_PREEXISTING_POPEN = """
+import subprocess
+import sys
+import time
+
+import pytest
+
+
+@pytest.fixture(scope="session")
+def persistent_child():
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", "persistent-test-child"])
+    yield process
+    assert process.poll() is None, "the timeout cleanup killed a child owned by the session fixture"
+    process.kill()
+    process.wait(timeout=5)
+
+
+def test_child_is_running(persistent_child):
+    assert persistent_child.poll() is None
+
+
+@pytest.mark.timeout(1)
+def test_timeout_does_not_own_existing_child(persistent_child):
+    time.sleep(120)
 """
 
 
-def test_pytest_exits_after_timed_out_spawn(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("defer_reaping", [False, True], ids=["normal-join", "unreaped-worker"])
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=70,
+    reason="starts a fresh pytest subprocess that imports torch and spawns a worker",
+)
+def test_pytest_exits_after_timed_out_spawn(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, defer_reaping: bool
+) -> None:
     # pytester relocates HOME for inner runs, which hides user-site installs such as torch from a fresh
     # interpreter, so hand the subprocess the outer interpreter's import path.
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(path for path in sys.path if path))
     pytester.makeconftest(_CONFTEST_SOURCE)
-    pytester.makepyfile(test_hang=_HANGING_WORKER)
+    pytester.makepyfile(test_hang=_HANGING_WORKER + (_UNREAPED_WORKER if defer_reaping else ""))
     # Without the cleanup, interpreter shutdown blocks on the sleeping worker and this raises TimeoutExpired.
-    result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=40)
+    result = _run_inner_pytest(pytester, monkeypatch)
+    result.assert_outcomes(passed=1, failed=1, errors=1)
+    result.stdout.fnmatch_lines(["*Timeout (>3.0s) from pytest-timeout*"])
+    result.stdout.fnmatch_lines(["*left * child process(es) running*"])
+
+
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=70,
+    reason="starts a fresh pytest subprocess and a Popen child",
+)
+def test_pytest_cleans_non_multiprocessing_child_after_timeout(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+):
+    """TorchInductor uses Popen workers that multiprocessing.active_children misses."""
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(path for path in sys.path if path))
+    pytester.makeconftest(_CONFTEST_SOURCE)
+    pytester.makepyfile(test_hang=_HANGING_POPEN)
+
+    result = _run_inner_pytest(pytester, monkeypatch)
+
     result.assert_outcomes(failed=1, errors=1)
-    result.stdout.fnmatch_lines(["*Timeout (>1.0s) from pytest-timeout*"])
+    result.stdout.fnmatch_lines(["*Timeout (>3.0s) from pytest-timeout*"])
     result.stdout.fnmatch_lines(["*left 1 child process(es) running*"])
+
+
+@pytest.mark.runtime_budget(
+    30,
+    hard_timeout=70,
+    reason="starts a fresh pytest subprocess and a persistent Popen child",
+)
+def test_timeout_cleanup_preserves_preexisting_child(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(path for path in sys.path if path))
+    pytester.makeconftest(_CONFTEST_SOURCE)
+    pytester.makepyfile(test_hang=_PREEXISTING_POPEN)
+
+    result = _run_inner_pytest(pytester, monkeypatch)
+
+    result.assert_outcomes(passed=1, failed=1)
+    result.stdout.fnmatch_lines(["*Timeout (>3.0s) from pytest-timeout*"])
+    assert "the timeout cleanup killed a child owned by the session fixture" not in result.stdout.str()

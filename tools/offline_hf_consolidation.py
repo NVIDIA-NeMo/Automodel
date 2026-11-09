@@ -162,6 +162,16 @@ def parse_args() -> argparse.Namespace:
             "FP8 and non-floating tensors keep their original dtype."
         ),
     )
+    parser.add_argument(
+        "--timeout-minutes",
+        type=int,
+        default=30,
+        help=(
+            "Distributed process-group timeout in minutes (default: 30). The rank-completion "
+            "barriers tolerate ranks finishing at very different times when output shards are "
+            "imbalanced; the timeout must comfortably exceed the slowest rank's runtime."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -175,7 +185,7 @@ def main() -> None:
     backend = args.backend
     if backend == "auto":
         backend = "nccl" if torch.cuda.device_count() > 0 else "gloo"
-    initialize_distributed(backend)
+    initialize_distributed(backend, timeout_minutes=args.timeout_minutes)
 
     os.makedirs(args.output_dir, exist_ok=True)
 

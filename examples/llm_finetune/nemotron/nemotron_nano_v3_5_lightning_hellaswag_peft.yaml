@@ -56,7 +56,7 @@ model:
     attn: te
     linear: te
     rms_norm: te
-    experts: gmm
+    experts: torch_mm
     dispatcher: deepep
 
 checkpoint:
@@ -120,6 +120,7 @@ lr_scheduler:
   min_lr: 1.0e-5
 
 ci:
+  cluster_tag: h100
   # ep_size(8) = 8 GPUs => 1 node (8 H100/node).
   recipe_owner: adil-a
   time: "00:30:00"

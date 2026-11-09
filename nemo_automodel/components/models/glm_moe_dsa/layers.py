@@ -21,6 +21,7 @@ and GlmMoeDsaMLA which integrates the indexer with Multi-head Latent Attention.
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 # Try to import fast_hadamard_transform, fall back to torch implementation
@@ -92,8 +93,8 @@ def _dsa_kernel_backend(backend: BackendConfig) -> str:
 def _apply_index_rope_half_split(x: torch.Tensor, freqs_cis: torch.Tensor, qkv_format: str) -> torch.Tensor:
     """Apply NON-interleaved (half-split) RoPE to the indexer's rope slice.
 
-    The DSA indexer uses half-split RoPE (``rotate_half``: pair dim ``j`` with ``j + d/2``),
-    unlike the main MLA attention which uses interleaved RoPE. ``freqs_cis`` is the same
+    Legacy DSA indexers use half-split RoPE (``rotate_half``: pair dim ``j`` with ``j + d/2``),
+    unlike checkpoints that request interleaved indexer RoPE. ``freqs_cis`` is the same
     complex tensor used by the MLA (``exp(i * theta_j * pos)`` for ``j in [0, d/2)``); we read
     its real/imag parts as cos/sin so the angles match exactly.
 
@@ -178,6 +179,9 @@ class GlmMoeDsaIndexer(nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.hidden_size = config.hidden_size
         self.softmax_scale = self.head_dim**-0.5
+        self.rope_interleave = getattr(config, "indexer_rope_interleave", False)
+        if not isinstance(self.rope_interleave, bool):
+            raise ValueError("indexer_rope_interleave must be boolean")
 
         self.backend = backend
         linear_impl = backend.linear
@@ -204,14 +208,36 @@ class GlmMoeDsaIndexer(nn.Module):
         # LayerNorm for K (official uses LayerNorm, not RMSNorm). eps=1e-6 matches the reference / HF.
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype)
 
-        # Per-head weight projection from hidden states
-        self.weights_proj = initialize_linear_module(
-            linear_impl=linear_impl,
-            in_features=self.hidden_size,
-            out_features=self.num_heads,
-            bias=False,
-            dtype=dtype,
-        )
+        # Per-head weight projection from hidden states. Always a plain torch Linear whose GEMM runs in
+        # fp32 (see ``_head_weights``): its output drives top-k key selection, so it never runs through
+        # the FP8 GEMM that ``backend.linear='te'`` would pick for it, and it follows the GLM-5.3 RL
+        # trainer / SGLang precision in every configuration.
+        self.weights_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False, dtype=dtype)
+
+    def _head_weights(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-head indexer weights in fp32.
+
+        The projection follows the GLM-5.3 RL trainer / SGLang: one fp32 GEMM on the resident (bf16)
+        weight, in every configuration. HF Transformers lists ``indexer.weights_proj`` in
+        ``_keep_in_fp32_modules`` but enforces it only for fp16 loads, so a bf16 HF model rounds the
+        projection to bf16; that rounding is deliberately not reproduced (it only moves near-tied keys).
+        The GEMM runs with autocast disabled: ``F.linear`` is autocast-eligible, so casting the operands
+        alone would still produce bf16 under a bf16 autocast wrapper, and the dense scorer's
+        autocast-disabled head reduction needs fp32 operands. An installed adapter (LoRA/DoRA, possibly
+        with dropout) overrides ``forward``; it is always called so its update, dropout and magnitude
+        semantics are kept, and its output is lifted to fp32.
+
+        Args:
+            x: Hidden states of shape ``[tokens, hidden]`` (THD) or ``[batch, sequence, hidden]``.
+
+        Returns:
+            fp32 tensor of shape ``x.shape[:-1] + [index_n_heads]``.
+        """
+        proj = self.weights_proj
+        if type(proj).forward is nn.Linear.forward:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                return F.linear(x.float(), proj.weight.float())
+        return proj(x).float()
 
     def forward(
         self,
@@ -270,10 +296,14 @@ class GlmMoeDsaIndexer(nn.Module):
         # Split K into pe and nope parts (rope slice first, matching Q)
         k_pe, k_nope = torch.split(k, [self.qk_rope_head_dim, self.qk_nope_head_dim], dim=-1)
 
-        # Apply NON-interleaved (half-split) RoPE to the pe parts. The indexer uses half-split
-        # RoPE (matching the DSA reference / HF), unlike the interleaved RoPE of the MLA path.
-        q_pe = _apply_index_rope_half_split(q_pe, freqs_cis, qkv_format)
-        k_pe = _apply_index_rope_half_split(k_pe, freqs_cis, qkv_format)
+        # Honor the checkpoint's indexer layout independently of the MLA path.
+        # Missing/false flags preserve the legacy half-split rotation.
+        if self.rope_interleave:
+            q_pe = apply_rotary_emb(q_pe, freqs_cis, qkv_format)
+            k_pe = apply_rotary_emb(k_pe.unsqueeze(-2), freqs_cis, qkv_format).squeeze(-2)
+        else:
+            q_pe = _apply_index_rope_half_split(q_pe, freqs_cis, qkv_format)
+            k_pe = _apply_index_rope_half_split(k_pe, freqs_cis, qkv_format)
 
         # Combine pe and nope parts (rope slice first, matching the reference layout)
         q = torch.cat([q_pe, q_nope], dim=-1)
@@ -302,7 +332,7 @@ class GlmMoeDsaIndexer(nn.Module):
                 )
             # Preserve the reference scaling in FP32. The cuDNN adapter owns the final bf16 cast and
             # intentionally applies no additional scale to these per-head weights.
-            head_weights = self.weights_proj(x).float() * (self.num_heads**-0.5) * self.softmax_scale
+            head_weights = self._head_weights(x) * (self.num_heads**-0.5) * self.softmax_scale
             return cudnn_indexer_topk(
                 q.contiguous(),
                 k.contiguous(),
@@ -337,7 +367,7 @@ class GlmMoeDsaIndexer(nn.Module):
                 raise ValueError("TileLang DSA indexer requires 'cu_seqlens' in attn_kwargs (THD packing metadata).")
             # Fold the index softmax_scale (head_dim ** -0.5) into the per-head weight: the kernel
             # computes relu(q·k) * w with no internal scale, and relu(s*x) == s*relu(x) for s > 0.
-            head_weights = self.weights_proj(x).float() * (self.num_heads**-0.5) * self.softmax_scale
+            head_weights = self._head_weights(x) * (self.num_heads**-0.5) * self.softmax_scale
             return tilelang_indexer_topk(
                 q.contiguous(),
                 k.contiguous(),
@@ -366,21 +396,26 @@ class GlmMoeDsaIndexer(nn.Module):
         # (n_heads ** -0.5) factor goes here and softmax_scale is applied to the q·k scores
         # below (relu(scale * x) == scale * relu(x)), then the head reduction is a matmul.
         # weights: [B, S, H] or [T, H]
-        weights = self.weights_proj(x).float() * (self.num_heads**-0.5)
+        weights = self._head_weights(x) * (self.num_heads**-0.5)
 
         # Per-head q·k scores with K kept single-head (no expand-to-heads), mirroring HF so the
         # index scores — and therefore the top-k selection — track the reference as closely as
         # floating point allows.
-        if qkv_format == "thd":
-            # q: [T, H, D], k: [T, D]  ->  [T, H, T]
-            scores = torch.matmul(q.float(), k.float().transpose(-1, -2))
-        else:
-            # q: [B, S, H, D], k: [B, S, D]  ->  [B, S, H, T]
-            scores = torch.matmul(q.float(), k.float().transpose(-1, -2).unsqueeze(1))
-        scores = torch.relu(scores * self.softmax_scale)
+        # Combine the query and head axes so all queries share one GEMM per batch,
+        # avoiding a batch of small [H, D] @ [D, T] products. Restore the reference
+        # [B, S, H, T] (or packed [T, H, T]) layout before reducing over heads.
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            scores = torch.matmul(q.float().flatten(-3, -2), k.float().transpose(-1, -2))
+        scores = scores.unflatten(-2, (seq_len, self.num_heads))
+        # The GEMM result is newly owned; keep the reference operation order while
+        # reusing its storage instead of creating two full FP32 score copies.
+        # Scale before ReLU: ReLU's backward saves its output, so a later in-place
+        # scaling would invalidate that saved tensor if scores receive a gradient.
+        scores = scores.mul_(self.softmax_scale).relu_()
 
         # Head-weighted sum via matmul: weights[..., 1, H] @ scores[..., H, T] -> [..., 1, T].
-        scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [T, T] or [B, S, T]
 
         # Apply attention mask if provided. Convert a {0,1} keep-mask to an additive key mask
         # (kept -> 0, padding -> finfo.min) so padding keys are excluded from the top-k selection,
@@ -553,13 +588,15 @@ class GlmMoeDsaMLA(nn.Module):
         `torch.full(..., finfo.min).scatter_(-1, topk_indices, 0)`
 
         Args:
-            topk_indices: Indices of top-k positions [B, S, topk] or [T, topk]
+            topk_indices: Integer tensor of shape [batch, sequence, top_k] or
+                [tokens, top_k] for packed THD inputs.
             seq_len: Sequence length
             qkv_format: 'bshd' or 'thd'
             bsz: Batch size (only used for bshd format)
             n_heads: Number of attention heads to expand to
             dtype: Data type for the output tensor
-            attention_mask: Optional attention mask to combine with (for SDPA)
+            attention_mask: Optional key keep mask of shape [batch, sequence],
+                or additive mask broadcastable to [batch, heads, sequence, sequence].
             union_across_batches: If True, union top-k across batches (for TE);
                                   if False, keep per-batch masks (for SDPA)
 
@@ -575,38 +612,27 @@ class GlmMoeDsaMLA(nn.Module):
         # TE's core_attention_bias tolerates -inf, which is why only the SDPA path was affected.
         neg = torch.finfo(dtype).min
 
+        num_tokens = topk_indices.shape[0] if qkv_format == "thd" else seq_len
+        mask_shape = (num_tokens, num_tokens) if qkv_format == "thd" else (bsz, seq_len, seq_len)
+        sparse_mask = torch.full(mask_shape, neg, device=device, dtype=dtype).scatter_(-1, topk_indices, 0.0)
+
+        # Top-k can include future positions when fewer than top_k causal keys exist.
+        # Apply causality before head expansion: masking the expanded TE bias would
+        # allocate and traverse an additional [1, heads, sequence, sequence] tensor.
+        causal_bool = torch.ones(num_tokens, num_tokens, dtype=torch.bool, device=device).triu(1)
+        sparse_mask.masked_fill_(causal_bool, neg)
+
         if qkv_format == "thd":
-            num_tokens = topk_indices.shape[0]
-            # Create mask directly in final shape [1, n_heads, T, T]
-            # All heads share the same mask, so we create [T, T] and expand
-            sparse_mask = torch.full((num_tokens, num_tokens), neg, device=device, dtype=dtype).scatter_(
-                -1, topk_indices, 0.0
-            )
             # expand creates a view, contiguous makes a copy
             sparse_mask = sparse_mask.view(1, 1, num_tokens, num_tokens).expand(1, n_heads, -1, -1).contiguous()
         else:
             if union_across_batches:
-                # For TE: create [B, S, S], scatter, union via max, then expand
-                sparse_mask = torch.full((bsz, seq_len, seq_len), neg, device=device, dtype=dtype).scatter_(
-                    -1, topk_indices, 0.0
-                )
                 # Union: max(0, finfo.min) = 0 for any position selected in any batch
                 sparse_mask = sparse_mask.max(dim=0, keepdim=True).values
                 sparse_mask = sparse_mask.view(1, 1, seq_len, seq_len).expand(1, n_heads, -1, -1).contiguous()
             else:
-                # For SDPA: create [B, S, S], scatter, expand (no contiguous needed)
-                sparse_mask = torch.full((bsz, seq_len, seq_len), neg, device=device, dtype=dtype).scatter_(
-                    -1, topk_indices, 0.0
-                )
+                # SDPA accepts a broadcast view over heads.
                 sparse_mask = sparse_mask.unsqueeze(1).expand(-1, n_heads, -1, -1)
-
-        # Enforce causality independently of the top-k selection: a query attends only to keys
-        # at positions <= its own. Required because at seq_len <= index_topk the top-k selects
-        # every token (including future) and the SDPA path consumes this mask with is_causal=False;
-        # without it the DSA attention is bidirectional and leaks the next token.
-        q_len, k_len = sparse_mask.shape[-2], sparse_mask.shape[-1]
-        causal_bool = torch.ones(q_len, k_len, dtype=torch.bool, device=sparse_mask.device).triu(1)
-        sparse_mask = sparse_mask.masked_fill(causal_bool, neg)
 
         # Combine with the attention mask if provided. Convert a {0,1} keep-mask to an additive
         # key mask (kept -> 0, padding -> finfo.min) and broadcast it over the key axis; adding a raw

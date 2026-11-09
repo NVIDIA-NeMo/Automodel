@@ -35,7 +35,7 @@ import sys
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
@@ -69,6 +69,62 @@ def _init_distributed() -> None:
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
+
+
+def _test_backward(tp_mesh: DeviceMesh, dtype: torch.dtype) -> None:
+    """Compare weighted CE gradients and a projection update with a full-vocab reference."""
+    world_size = tp_mesh.size()
+    rank = tp_mesh.get_local_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    vocab_size, hidden_size = 128, 32
+    vocab_local = vocab_size // world_size
+    shard = slice(rank * vocab_local, (rank + 1) * vocab_local)
+    cases = [
+        ("none", "transposed"),
+        ("none", "contiguous"),
+        ("none", "expanded"),
+        ("mean", "scalar"),
+        ("sum", "scalar"),
+    ]
+    for reduction, layout in cases:
+        torch.manual_seed(6789)
+        inputs = torch.randn(2, 8, hidden_size, device=device, dtype=dtype)
+        full_weight = torch.randn(vocab_size, hidden_size, device=device, dtype=dtype) * 0.1
+        reference_weight = full_weight.float().clone().requires_grad_()
+        local_weight = full_weight[shard].clone().requires_grad_()
+        labels = torch.randint(0, vocab_size, (2, 8), device=device)
+        labels[0, 3] = -100
+        labels[1, 6] = -100
+        reference_logits = F.linear(inputs.float(), reference_weight)
+        reference_loss = F.cross_entropy(
+            reference_logits.reshape(-1, vocab_size), labels.reshape(-1), reduction=reduction
+        )
+        local_logits = F.linear(inputs, local_weight)
+        logits_dt = DTensor.from_local(local_logits, tp_mesh, [Shard(-1)], run_check=True)
+        actual_loss = TEParallelCrossEntropy(reduction=reduction)(logits_dt, labels)
+        if reduction == "none":
+            reference_loss = reference_loss.reshape(2, 8)
+            # A transposed, nonuniform upstream gradient with a zero first weight.
+            weights = (torch.arange(16, device=device, dtype=torch.float32) / 16).reshape(8, 2).t()
+            if layout == "contiguous":
+                weights = weights.contiguous()
+            elif layout == "expanded":
+                weights = torch.tensor(0.375, device=device).expand(2, 8)
+        else:
+            weights = torch.tensor(0.375, device=device)
+        reference_loss.backward(weights)
+        actual_loss.backward(weights)
+        rtol, atol = (2e-4, 2e-5) if dtype == torch.float32 else (2e-2, 2e-2)
+        torch.testing.assert_close(actual_loss, reference_loss, rtol=rtol, atol=atol)
+        torch.testing.assert_close(local_weight.grad.float(), reference_weight.grad[shard], rtol=rtol, atol=atol)
+        actual_norm_sq = local_weight.grad.float().square().sum()
+        dist.all_reduce(actual_norm_sq, group=tp_mesh.get_group())
+        torch.testing.assert_close(actual_norm_sq.sqrt(), reference_weight.grad.norm(), rtol=rtol, atol=atol)
+        actual_updated = local_weight.detach().float() - 0.1 * local_weight.grad.float()
+        reference_updated = reference_weight.detach()[shard] - 0.1 * reference_weight.grad[shard]
+        torch.testing.assert_close(actual_updated, reference_updated, rtol=rtol, atol=atol)
+        if rank == 0:
+            print(f"PASS: backward TP{world_size} {dtype} {reduction=} {layout=}")
 
 
 def main() -> int:
@@ -141,12 +197,15 @@ def main() -> int:
             print("PASS: DTensor + TEParallelCrossEntropy matches reference")
         else:
             print(
-                "FAIL: Loss mismatch\n"
-                f"  ref_loss={ref_loss.item()}\n"
-                f"  te_loss={te_loss.item()}\n",
+                f"FAIL: Loss mismatch\n  ref_loss={ref_loss.item()}\n  te_loss={te_loss.item()}\n",
                 file=sys.stderr,
             )
 
+    for test_dtype in (torch.float32, torch.bfloat16):
+        _test_backward(tp_mesh, test_dtype)
+    if rank == 0:
+        print("PASS: weighted and reduced CE gradients, global norm and projection update match reference")
+    dist.destroy_process_group()
     return 0 if all_ok else 1
 
 
