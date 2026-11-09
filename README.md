@@ -195,7 +195,7 @@ SOTA algorithms
 - ✅ **Learning Algorithms** - SFT (Supervised Fine-Tuning), PEFT (LoRA, QLoRA), and QAT (Quantization-Aware Training).
 - ✅ **Knowledge distillation** - Support for knowledge distillation with LLMs.
 - ✅ **VLM knowledge distillation** - Chunked KD loss and a Qwen3.5-VL teacher-student recipe.
-- ✅ **Speculative decoding training** - Train target-aligned EAGLE-1/2/3/4, P-EAGLE, DFlash, DFlash 2, and DSpark drafters for faster verified generation.
+- ✅ **Speculative decoding training** - Train target-aligned EAGLE-1/2/3/4, P-EAGLE, DFlash, DFlash 2, DSpine, and DSpark drafters for faster verified generation.
 
 Model Coverage and 🤗 Ecosystem compatibility
 - ✅ **Transformers v5 🤗** - Built on latest transformers with device-mesh driven parallelism.

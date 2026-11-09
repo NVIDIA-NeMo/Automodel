@@ -400,6 +400,7 @@ class TrainDFlashRecipe(BaseRecipe):
             self.optimizer, make_warmup_cosine_schedule(warmup_steps, total_optim_steps, min_lr_ratio)
         )
         self.total_optim_steps = total_optim_steps
+        self.warmup_steps = warmup_steps
         self.runtime = SimpleNamespace(global_step=0)
         self._resume_epoch = 0
         self._skipped_micro_batches = 0
