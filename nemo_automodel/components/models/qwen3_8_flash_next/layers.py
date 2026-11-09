@@ -49,6 +49,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     qsa_gqa_attention,
     qsa_route_replay,
     qsa_route_selection_region,
+    select_qsa_cuda_kernel,
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
 from nemo_automodel.components.moe.config import MoEConfig
@@ -558,7 +559,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     The main query/key/value, output gate, and output projection retain the
     Qwen3-Next equations.  A separate frozen indexer returns logical token IDs,
     then the model-owned QSA dispatcher evaluates only those IDs. CUDA BF16
-    training selects FlexAttention or SM90 CuTe through backend.attn; CPU and
+    training selects FlexAttention, SM90 CuTe, or Blackwell cuDNN through backend.attn; CPU and
     explicit reference backends use the PyTorch oracle. Main Q/K/V remain
     differentiable.
     """
@@ -566,19 +567,24 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     def __init__(self, config: Qwen3_8_FlashNextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         # QSA owns its sparse-attention dispatch. The inherited constructor is
         # reused only for projections/norms, but its generic attention factory
-        # does not implement ``flex`` or ``cute``. Give it an isolated SDPA
+        # does not implement ``flex``, ``fa4`` or ``cudnn``. Give it an isolated SDPA
         # copy, then discard the unused callable and retain the real backend.
         parent_backend = replace(backend, attn="sdpa")
         super().__init__(config, layer_idx, parent_backend)
         self.backend = backend
         self.attn_module = None
         self.attn_func = None
+        self.qsa_cuda_kernel = select_qsa_cuda_kernel(backend.attn)
         self._cp_mesh: DeviceMesh | None = None
         self.indexer = Qwen3_8_FlashNextQSAIndexer(config, backend)
+        if backend.attn == "cudnn" and (self.indexer.compress_ratio != 4 or self.indexer.token_budget > 2048):
+            raise ValueError("cuDNN QSA requires indexer_compress_ratio=4 and indexer_budget<=2048")
         self.reuse_routes_on_recompute = bool(getattr(config, "qsa_reuse_routes_on_recompute", True))
 
     def setup_cp_attention(self, cp_mesh: DeviceMesh) -> None:
         """Install the contiguous CP mesh used for QSA K/V exchange."""
+        if self.backend.attn == "cudnn" and cp_mesh.size() > 1:
+            raise ValueError("cuDNN QSA does not support context parallelism; use backend.attn='flex' for CP")
         self._cp_mesh = cp_mesh
 
     def forward(
@@ -676,15 +682,15 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             key = qwen3_8_flash_next_cp_all_gather(key, cp_context, sequence_dim=1, differentiable=True)
             value = qwen3_8_flash_next_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
 
-        # One dispatcher serves dense, packed, and CP layouts: routes are
-        # global K/V coordinates and both CUDA backends accept S_q != S_kv, so
-        # packed rows need no dedicated kernel path. CPU keeps the oracle.
+        # Routes use global K/V coordinates for dense, packed, and CP layouts.
+        # Flex/FA4 support unequal Q/KV extents; cuDNN rejects CP at setup.
+        # Packed rows need no dedicated dispatcher. CPU keeps the oracle.
         attn_output = qsa_gqa_attention(
             query,
             key,
             value,
             selected_token_ids,
-            backend=self.backend.attn,
+            cuda_kernel=self.qsa_cuda_kernel,
             softmax_scale=self.scaling,
             flex_mask=flex_mask,
         )
