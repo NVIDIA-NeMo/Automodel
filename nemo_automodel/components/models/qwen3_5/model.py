@@ -625,6 +625,8 @@ class Qwen3_5DenseBlock(Block):
         elif self.layer_type == "linear_attention":
             self.linear_attn.dt_bias.data.fill_(1.0)
             self.linear_attn.A_log.data.uniform_(0, 16).log_()
+            # Match HF's PreTrainedModel._init_weights for this nn.Conv1d (normal, initializer_range), not torch's default
+            nn.init.normal_(self.linear_attn.conv1d.weight, mean=0.0, std=0.02)
             for linear in (
                 self.linear_attn.in_proj_qkv,
                 self.linear_attn.in_proj_z,
@@ -1188,7 +1190,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
         self.lm_head = new_embeddings
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
@@ -1455,7 +1457,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=True)
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie ``lm_head`` to the active VLM text embedding when requested."""
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight

@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 import torch
 
@@ -53,6 +54,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 PIL_AVAILABLE, PIL = safe_import("PIL")
+
+_JSONValue: TypeAlias = str | int | float | bool | None | Sequence["_JSONValue"] | Mapping[str, "_JSONValue"]
 
 _METADATA_SHARD_SIZE = 1000
 _RESOLUTION_PRESETS = {
@@ -80,7 +83,7 @@ class _ManifestSample:
     prompt: str
     target: _MediaReference
     context: _MediaReference
-    metadata: dict[str, object]
+    metadata: dict[str, _JSONValue]
     row_index: int
 
 
@@ -581,7 +584,7 @@ def _write_metadata_shards(records: list[Flux3EditRecord], output_dir: Path) -> 
     return shard_names
 
 
-def _write_json_atomic(path: Path, value: object) -> None:
+def _write_json_atomic(path: Path, value: Mapping[str, _JSONValue] | list[Flux3EditRecord]) -> None:
     """Write one JSON value through a same-directory temporary file."""
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     temporary_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")

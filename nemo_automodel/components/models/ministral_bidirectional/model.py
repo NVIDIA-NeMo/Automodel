@@ -35,6 +35,8 @@ from transformers.utils import logging
 from nemo_automodel.components.models.pixtral.compat import apply_pixtral_forward_backport
 
 if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase, ProcessorMixin
+
     from .reranker_export import Mistral3RerankerMetadataExporter
 
 
@@ -602,7 +604,7 @@ class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
         self.state_dict_adapter = Mistral3RerankerStateDictAdapter()
 
     def _get_consolidated_hf_metadata_exporter(
-        self, *, tokenizer: object, original_model_path: str | None
+        self, *, tokenizer: "PreTrainedTokenizerBase | ProcessorMixin | None", original_model_path: str | None
     ) -> "Mistral3RerankerMetadataExporter":
         """Select the portable reranker export for direct and distributed checkpoint saves."""
         from .reranker_export import Mistral3RerankerMetadataExporter
