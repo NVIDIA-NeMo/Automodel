@@ -736,9 +736,32 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         self.vision_model.eval()
         try:
             if isinstance(pixel_values, (list, tuple)):
-                # RADIO only accepts a dense (B, C, H, W) tensor, so variable
-                # resolutions have to be run one at a time.
-                return [self._extract_feature_dense(pv[None] if pv.dim() == 3 else pv) for pv in pixel_values]
+                if not pixel_values:
+                    return []
+                raw_features: list[torch.Tensor] = []
+                patch_grids: list[tuple[int, int]] = []
+                tile_counts: list[int] = []
+                token_counts: list[int] = []
+                for pixels in pixel_values:
+                    pixels = pixels[None] if pixels.dim() == 3 else pixels
+                    features, (height, width) = self._extract_raw_vision_features(pixels)
+                    tiles = features.shape[0]
+                    raw_features.append(features.reshape(1, -1, features.shape[-1]))
+                    patch_grids.extend([(height, width)] * tiles)
+                    tile_counts.append(tiles)
+                    token_counts.append(
+                        tiles * int(height * self.downsample_ratio) * int(width * self.downsample_ratio)
+                    )
+                # Packed DP batches may contain different numbers of images.
+                # One projector call keeps its FSDP all-gathers in the same
+                # order on every rank, using the existing multi-image path.
+                projected = self.vision_projector(
+                    torch.cat(raw_features, dim=1), patch_grid_shapes=patch_grids, ps_version=self.ps_version
+                )
+                return [
+                    features.reshape(tiles, -1, projected.shape[-1])
+                    for features, tiles in zip(projected.split(token_counts, dim=1), tile_counts)
+                ]
             return self._extract_feature_dense(pixel_values)
         finally:
             if was_training:
@@ -753,8 +776,20 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         Returns:
             Projected features shaped [batch, image_tokens, llm_hidden_size].
         """
-        vit_embeds = self.vision_model(pixel_values).features
-        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+        vit_embeds, patch_grid = self._extract_raw_vision_features(pixel_values)
+        return self.vision_projector(vit_embeds, patch_grid_shapes=[patch_grid], ps_version=self.ps_version)
+
+    def _extract_raw_vision_features(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int]]:
+        """Encode a dense image batch before projector-owned normalization.
+
+        Args:
+            pixel_values: Images shaped [tiles, channels, height, width].
+
+        Returns:
+            BF16 features [tiles, patches, vision_hidden] and their (height, width)
+            grid in patches, preserving each tile's patch order and gradients.
+        """
+        vit_embeds = self.vision_model(pixel_values).features.to(dtype=torch.bfloat16)
 
         # Patch grid comes from input dims so non-square dynamic-res tiles also work.
         # Native RadioModel (embeddings/encoder tree) exposes `patch_size` directly; the
@@ -764,9 +799,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         else:
             patch_size = self.vision_model.patch_size
         _, _, H, W = pixel_values.shape
-        return self.vision_projector(
-            vit_embeds, patch_grid_shapes=[(H // patch_size, W // patch_size)], ps_version=self.ps_version
-        )
+        return vit_embeds, (H // patch_size, W // patch_size)
 
     def extract_feature_dynamic(
         self,
