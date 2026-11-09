@@ -19,7 +19,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, fields
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+from nemo_automodel.shared.import_utils import safe_import
+
+if TYPE_CHECKING:
+    from zephon.io import ParquetRGCacheOptions, StoreOptions
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -208,15 +213,49 @@ class ZephonRuntimeOptions:
 
 
 @dataclass(frozen=True, kw_only=True)
+class ZephonParquetRGCacheOptions:
+    """Decoded Parquet cache overrides; omitted fields retain Zephon defaults."""
+
+    enabled: bool | None = None
+    root: str | None = None
+    limit_bytes: int | str | None = None
+    min_free_bytes: int | str | None = None
+
+    def build(self) -> ParquetRGCacheOptions:
+        """Construct Zephon's cache settings without replacing automatic defaults."""
+        _, io = safe_import("zephon.io")
+        values = {
+            "enabled": self.enabled,
+            "root": self.root,
+            "limit_bytes": self.limit_bytes,
+            "min_free_bytes": self.min_free_bytes,
+        }
+        return io.ParquetRGCacheOptions.from_any({name: value for name, value in values.items() if value is not None})
+
+
+@dataclass(frozen=True, kw_only=True)
 class ZephonCacheOptions:
     """Downloaded source cache settings."""
 
     cache_dir: str | None = None
     cache_limit_bytes: int | str | None = None
+    parquet_rg_cache: ZephonParquetRGCacheOptions | None = None
+    """Separate decoded-cache budget; source shards use cache_limit_bytes."""
 
     def __post_init__(self) -> None:
         if self.cache_limit_bytes is not None and self.cache_dir is None:
             raise ValueError("cache_limit_bytes requires cache_dir")
+
+    def build(self) -> StoreOptions:
+        """Configure source and decoded caches through Zephon's existing I/O API."""
+        _, io = safe_import("zephon.io")
+        cache = None
+        if self.cache_dir is not None:
+            cache = {"enabled": True, "root": self.cache_dir, "limit_bytes": self.cache_limit_bytes}
+        parquet = io.ParquetOptions.from_any(None)
+        if self.parquet_rg_cache is not None:
+            parquet = io.ParquetOptions(rg_cache=self.parquet_rg_cache.build())
+        return io.StoreOptions(cache=io.CacheOptions.from_any(cache), parquet=parquet)
 
 
 @dataclass(frozen=True, kw_only=True)

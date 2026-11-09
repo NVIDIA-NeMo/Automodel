@@ -18,8 +18,10 @@
 import pytest
 
 from nemo_automodel.components.datasets.zephon.config import (
+    ZephonCacheOptions,
     ZephonOptions,
     ZephonPackingOptions,
+    ZephonParquetRGCacheOptions,
     ZephonPrefetchOptions,
     ZephonRuntimeOptions,
     ZephonSource,
@@ -115,3 +117,28 @@ def test_source_prefetch_accepts_operator_defaults_or_positive_values(name: str)
     for invalid in (0, -1, True, 1.5, "8"):
         with pytest.raises(ValueError, match=f"source.prefetch.{name} must be a positive integer or None"):
             ZephonPrefetchOptions(**{name: invalid})
+
+
+def test_cache_overrides_preserve_automatic_defaults_and_explicit_disable() -> None:
+    from zephon.io import StoreOptions
+
+    assert ZephonCacheOptions().build() == StoreOptions.from_any(None)
+    options = ZephonCacheOptions(
+        cache_dir="/cache",
+        cache_limit_bytes="80gb",
+        parquet_rg_cache=ZephonParquetRGCacheOptions(enabled=False, limit_bytes="8gb", min_free_bytes=0),
+    ).build()
+    assert options.cache.enabled and options.cache.limit_bytes == 80 * 1024**3
+    assert options.parquet.rg_cache.enabled is False
+    assert options.parquet.rg_cache.limit_bytes == 8 * 1024**3
+    assert options.parquet.rg_cache.min_free_bytes == 0
+    decoded_only = ZephonCacheOptions(parquet_rg_cache=ZephonParquetRGCacheOptions(root="/decoded")).build()
+    assert not decoded_only.cache.enabled
+    assert str(decoded_only.parquet.rg_cache.root) == "/decoded"
+
+
+def test_decoded_cache_rejects_invalid_budgets_through_zephon() -> None:
+    with pytest.raises(ValueError, match="limit_bytes must be positive"):
+        ZephonParquetRGCacheOptions(limit_bytes=0).build()
+    with pytest.raises(ValueError, match="min_free_bytes cannot be negative"):
+        ZephonParquetRGCacheOptions(min_free_bytes=-1).build()

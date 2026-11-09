@@ -26,8 +26,10 @@ from zephon.work import StaticMixtureWorkSource, TokenEstimation
 
 from nemo_automodel.components.datasets.zephon.config import (
     TokenEstimationSettings,
+    ZephonCacheOptions,
     ZephonOptions,
     ZephonPackingOptions,
+    ZephonParquetRGCacheOptions,
     ZephonPrefetchOptions,
     ZephonRuntimeOptions,
     ZephonSource,
@@ -141,3 +143,19 @@ def test_source_prefetch_inserts_only_when_enabled_and_delegates_unset_options(
     else:
         assert warm_cache.call_count == 1
         assert warm_cache.call_args.kwargs == expected
+
+
+def test_decoded_cache_reaches_shared_runtime_without_enabling_source_cache(options: ZephonOptions) -> None:
+    options = replace(
+        options,
+        cache=ZephonCacheOptions(
+            parquet_rg_cache=ZephonParquetRGCacheOptions(root="/decoded", limit_bytes="2gb", min_free_bytes=0)
+        ),
+    )
+    with patch.object(Pipeline, "options", autospec=True, side_effect=Pipeline.options) as calls:
+        pipeline = create_source_pipeline(options, seed=42, dp_rank=0, dp_world_size=1)
+        finalize_pipeline(pipeline, options, seed=42, batch_size=2, dp_rank=0, dp_world_size=1)
+    io = next(call.kwargs["io_options"] for call in calls.call_args_list if "io_options" in call.kwargs)
+    assert not io.cache.enabled
+    assert io.parquet.rg_cache.limit_bytes == 2 * 1024**3
+    assert io.parquet.rg_cache.min_free_bytes == 0
