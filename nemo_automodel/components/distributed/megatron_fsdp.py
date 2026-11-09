@@ -291,7 +291,7 @@ def maybe_shard_optimizer(
             (e.g. Dion); asserts when sharding would otherwise apply.
     """
     if isinstance(distributed_config, MegatronFSDPConfig) and dist.get_world_size() > 1:
-        assert allow, "Dion optimizer does not support fully_shard_optimizer"
+        assert allow, "Configured optimizer does not support Megatron-FSDP optimizer sharding"
         if not HAS_MEGATRON_FSDP:
             return optimizer
         return fully_shard_optimizer(model_part, optimizer)
