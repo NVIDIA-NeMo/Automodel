@@ -171,3 +171,23 @@ def test_non_main_rank_still_runs_image_conditioned_pipeline_without_saving(tmp_
     mock_load_image.assert_called_once_with("/data/source.png")
     assert pipe.calls == [{"prompt": "edit this", "generator": generator, "image": loaded_image}]
     pipe.output_image.save.assert_not_called()
+
+
+@pytest.mark.parametrize("scale", [1.0, 4.25])
+def test_modular_guidance_configures_guider_instead_of_ignored_input(tmp_path, scale):
+    from diffusers import ModularPipeline
+    from diffusers.guiders import ClassifierFreeGuidance
+
+    pipe = MagicMock(spec=ModularPipeline)
+    pipe.guider = ClassifierFreeGuidance(guidance_scale=3.5)
+    pipe.return_value = SimpleNamespace(images=[MagicMock()])
+    cfg = _make_cfg(tmp_path, ["create an image"])
+    cfg.inference.guidance_scale = scale
+    generator_patch, _ = _mock_cuda_generator()
+
+    with generator_patch, patch.object(gen.torch.cuda, "is_available", return_value=False):
+        gen.run_inference(pipe, cfg, is_rank0=True)
+
+    configured = pipe.update_components.call_args.kwargs["guider"]
+    assert configured.guidance_scale == scale
+    assert "guidance_scale" not in pipe.call_args.kwargs

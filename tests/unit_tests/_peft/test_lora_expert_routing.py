@@ -267,8 +267,7 @@ def test_wrapper_preserves_storage_flags_and_parameter_paths(backend, dtype, lor
         else:
             assert not parameter.requires_grad
             torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
-            assert parameter.data_ptr() != source.get_parameter(name).data_ptr()
-            assert source.get_parameter(name).requires_grad
+            assert parameter is source.get_parameter(name)
     if backend.startswith("deepep"):
         for name in (
             "dispatcher_backend",
@@ -441,7 +440,8 @@ def test_post_down_reduces_in_topk_slot_order(backend):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("after_down", [False, True])
 @pytest.mark.parametrize("empty_case", ["zero_tokens", "masked", "no_local_routes"])
-def test_empty_routes_preserve_shape_and_zero_gradients(backend, dtype, after_down, empty_case):
+@pytest.mark.parametrize("with_transform", [False, True])
+def test_empty_routes_preserve_shape_and_zero_gradients(backend, dtype, after_down, empty_case, with_transform):
     """Empty inputs and fully inactive routes remain attached with exactly zero gradients."""
     wrapped = _wrap(_source(backend=backend, after_down=after_down, bias=True, dtype=dtype))
     x, mask, weights, indices = _inputs(dtype)
@@ -453,7 +453,8 @@ def test_empty_routes_preserve_shape_and_zero_gradients(backend, dtype, after_do
         mask = torch.zeros_like(mask)
     else:
         indices = torch.full_like(indices, 3)
-    actual = wrapped(x, mask, weights, indices)
+    transform = torch.nn.Linear(4, 4, bias=True, dtype=dtype) if with_transform else None
+    actual = wrapped(x, mask, weights, indices, post_expert_output=transform)
     assert actual.shape == x.shape and actual.dtype == dtype
     assert torch.isfinite(actual).all() and torch.count_nonzero(actual) == 0
     actual.sum().backward()
@@ -461,3 +462,37 @@ def test_empty_routes_preserve_shape_and_zero_gradients(backend, dtype, after_do
         assert tensor.grad is not None
         assert torch.isfinite(tensor.grad).all() and torch.count_nonzero(tensor.grad) == 0
     assert all(parameter.grad is None for name, parameter in wrapped.named_parameters() if name not in _ADAPTER_NAMES)
+    if transform is not None:
+        for parameter in transform.parameters():
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all() and torch.count_nonzero(parameter.grad) == 0
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+@pytest.mark.parametrize("after_down", [False, True])
+def test_post_expert_transform_preserves_parent_output_and_gradients(backend: str, after_down: bool) -> None:
+    """Keep the upstream transform between expert projection and post-down weighting."""
+    source = _source(backend=backend, after_down=after_down, bias=True, dtype=torch.float32)
+    if backend.startswith("deepep"):
+        reference_source = GroupedExperts(source.config).to(dtype=torch.float32)
+        reference_source.load_state_dict(source.state_dict())
+    else:
+        reference_source = source
+    wrapped = _wrap(source)
+    transform = torch.nn.LayerNorm(4)
+    reference_transform = deepcopy(transform)
+    x, mask, weights, indices = _inputs(torch.float32)
+    parent_x = x.detach().clone().requires_grad_()
+    parent_weights = weights.detach().clone().requires_grad_()
+    expected = reference_source(parent_x, mask, parent_weights, indices, post_expert_output=reference_transform)
+    actual = wrapped(x, mask, weights, indices, post_expert_output=transform)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(x.grad, parent_x.grad, rtol=0, atol=0)
+    torch.testing.assert_close(weights.grad, parent_weights.grad, rtol=0, atol=0)
+    for parameter, reference in zip(transform.parameters(), reference_transform.parameters()):
+        # DeepEP transforms one batch; the loop reference accumulates per-expert
+        # parameter gradients separately, with different FP32 reduction order.
+        torch.testing.assert_close(parameter.grad, reference.grad, rtol=1e-5, atol=1e-7)

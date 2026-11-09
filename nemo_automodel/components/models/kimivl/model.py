@@ -26,6 +26,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
@@ -727,32 +728,57 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         **kwargs,
     ):
         # Resolve from the text/decoder sub-config (the language model produces text logits).
+        """Run one Kimi-VL microbatch, consuming staged PP media when present.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] on the first stage,
+                with one media placeholder per merged image feature, or float
+                hidden states of shape [batch, sequence, hidden] from the
+                previous pipeline stage.
+            attention_mask: Optional tensor of shape [batch, sequence]; nonzero
+                marks a real token. It also masks the internal shifted loss.
+            position_ids: Optional tensor of shape [batch, sequence].
+            past_key_values: Unused; kept for HF API compatibility.
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
+            labels: Optional tensor of shape [batch, sequence] aligned with
+                input_ids; the loss shifts them by one internally. Image and padding
+                targets must already be masked with -100.
+            use_cache: Unused; kept for HF API compatibility.
+            output_attentions: Unused; kept for HF API compatibility.
+            output_hidden_states: Include final hidden states when return_dict
+                is set.
+            return_dict: Return a LlavaCausalLMOutputWithPast instead of logits.
+            pixel_values: Optional tensor of shape [patches, channels,
+                patch_height, patch_width], where each image's height * width
+                patches are concatenated along axis 0 in image order. When None,
+                the next staged PP media chunk is used.
+            image_grid_hws: Optional tensor of shape [images, 2] storing each
+                image's (height, width) patch grid.
+            padding_mask: Optional tensor of shape [batch, sequence] where True
+                marks padding.
+            logits_to_keep: Number of trailing positions to project, or indices
+                of shape [kept_sequence].
+            **kwargs: Attention metadata forwarded to the language model.
+
+        Returns:
+            Logits of shape [batch, kept_sequence, vocab], or hidden states of
+            shape [batch, sequence, hidden] on a stage without the LM head.
+            kept_sequence is restricted by logits_to_keep (0 keeps all). With
+            return_dict, a LlavaCausalLMOutputWithPast that also carries the
+            scalar loss and, when requested, hidden states
+            [batch, sequence, hidden].
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else getattr(self.config.text_config, "output_hidden_states", False)
         )
 
-        # Retrieve pre-chunked VLM inputs from model attributes
-        # This allows native forward to work with pipeline parallelism
-        # finetune.py stores chunks on model, we retrieve them here per microbatch
-        if (
-            pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
-            and self._vlm_pixel_values_chunks is not None
-        ):
-            # Check if we have media tokens to process
-            has_media_tokens = (
-                input_ids is not None
-                and self.media_placeholder_token_id is not None
-                and (input_ids == self.media_placeholder_token_id).any()
-            )
-            if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(self._vlm_pixel_values_chunks):
-                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
-                    self._vlm_chunk_idx = chunk_idx + 1
+        if pixel_values is None:
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values = media.pixel_values
+                image_grid_hws = media.image_grid
 
         hidden_states = self.model(
             input_ids=input_ids,

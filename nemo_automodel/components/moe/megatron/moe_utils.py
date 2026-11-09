@@ -226,12 +226,27 @@ def swiglu_back(g, y):
 
 
 @torch.compile
-def weighted_swiglu_back(g, y, weights):
-    """Compute input and weight gradients for weighted SwiGLU."""
+def weighted_swiglu_back(
+    g: torch.Tensor, y: torch.Tensor, weights: torch.Tensor, *, need_weight_grad: bool = True
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Compute input and optional weight gradients for weighted SwiGLU.
+
+    Args:
+        g: Upstream gradient of shape [tokens, intermediate].
+        y: Gate/up activations of shape [tokens, 2 * intermediate].
+        weights: Routing weights of shape [tokens, 1].
+        need_weight_grad: Whether the routing weights require a gradient.
+
+    Returns:
+        Input gradient with ``y``'s shape and dtype, and either the weight
+        gradient with ``weights``' shape and dtype or ``None``.
+    """
 
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = swiglu_back(g * weights, y)
+    if not need_weight_grad:
+        return input_grad.to(input_dtype), None
     # precison of w may be higher than y and g, so we need to cast g to w_dtype
     weights_grad = swiglu(y) * g.to(w_dtype)
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
@@ -286,12 +301,26 @@ def geglu_back(g, y):
 
 
 @torch.compile
-def weighted_geglu_back(g, y, weights):
-    """Compute input and weight gradients for weighted GEGLU."""
+def weighted_geglu_back(
+    g: torch.Tensor, y: torch.Tensor, weights: torch.Tensor, *, need_weight_grad: bool = True
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Compute input and optional routing gradients for weighted GEGLU.
+
+    Args:
+        g: Upstream gradient of shape [tokens, intermediate].
+        y: Gate/up activations of shape [tokens, 2 * intermediate].
+        weights: Routing weights of shape [tokens, 1].
+        need_weight_grad: Whether routing weights require gradients.
+
+    Returns:
+        Gradient with ``y``'s shape/dtype and an optional gradient with ``weights``' shape/dtype.
+    """
 
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = geglu_back(g * weights, y)
+    if not need_weight_grad:
+        return input_grad.to(input_dtype), None
     weights_grad = geglu(y) * g.to(w_dtype)
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
@@ -312,7 +341,7 @@ class WeightedGEGLUFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_geglu_back(grad_output, input, weights)
+        tmp, wgrad = weighted_geglu_back(grad_output, input, weights, need_weight_grad=ctx.needs_input_grad[1])
         return tmp, wgrad, None
 
 
@@ -343,7 +372,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
+        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights, need_weight_grad=ctx.needs_input_grad[1])
         return tmp, wgrad, None
 
 
@@ -368,7 +397,7 @@ def quick_gelu(y: torch.Tensor, alpha: float = 1.702) -> torch.Tensor:
 
 
 @torch.compile
-def quick_geglu(y: torch.Tensor, linear_offset: float = 0.0) -> torch.Tensor:
+def quick_geglu(y: torch.Tensor, linear_offset: float | torch.Tensor = 0.0) -> torch.Tensor:
     """Performs Quick-GELU-based GEGLU activation : quick_gelu(y1) * (y2 + offset).
 
     Args:
@@ -383,7 +412,9 @@ def quick_geglu(y: torch.Tensor, linear_offset: float = 0.0) -> torch.Tensor:
 
 
 @torch.compile
-def weighted_quick_geglu(y: torch.Tensor, weights: torch.Tensor, linear_offset: float = 0.0) -> torch.Tensor:
+def weighted_quick_geglu(
+    y: torch.Tensor, weights: torch.Tensor, linear_offset: float | torch.Tensor = 0.0
+) -> torch.Tensor:
     """Token-wise-weighted Quick-GEGLU activation.
 
     The weights tensor is expected to have the same first-dimension length as ``y`` and a trailing
@@ -396,7 +427,7 @@ def weighted_quick_geglu(y: torch.Tensor, weights: torch.Tensor, linear_offset: 
 
 # gradient of sigmoid approximation of gelu
 @torch.compile
-def quick_geglu_back(g, y, linear_offset: float = 0.0) -> torch.Tensor:
+def quick_geglu_back(g, y, linear_offset: float | torch.Tensor = 0.0) -> torch.Tensor:
     """Compute the input gradient for Quick-GEGLU activation."""
 
     y_1, y_2 = torch.chunk(y, 2, -1)
@@ -407,14 +438,32 @@ def quick_geglu_back(g, y, linear_offset: float = 0.0) -> torch.Tensor:
 
 
 @torch.compile
-def weighted_quick_geglu_back(g, y, weights, linear_offset: float = 0.0):
-    """Backward helper for weighted Quick-GEGLU.
-    Returns gradient w.r.t input `y` and `weights`.
+def weighted_quick_geglu_back(
+    g: torch.Tensor,
+    y: torch.Tensor,
+    weights: torch.Tensor,
+    linear_offset: float | torch.Tensor = 0.0,
+    *,
+    need_weight_grad: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Compute input and optional routing gradients for weighted Quick-GEGLU.
+
+    Args:
+        g: Upstream gradient of shape [tokens, intermediate].
+        y: Gate/up activations of shape [tokens, 2 * intermediate].
+        weights: Routing weights of shape [tokens, 1].
+        linear_offset: Scalar or scalar tensor added to the up activation.
+        need_weight_grad: Whether routing weights require gradients.
+
+    Returns:
+        Gradient with ``y``'s shape/dtype and an optional gradient with ``weights``' shape/dtype.
     """
     input_dtype = y.dtype
     w_dtype = weights.dtype
     # Gradient w.r.t input uses the chain rule with weighting.
     input_grad = quick_geglu_back(g * weights, y, linear_offset)
+    if not need_weight_grad:
+        return input_grad.to(input_dtype), None
     # Gradient w.r.t weights is the activation times upstream grad (cast to weight dtype).
     weights_grad = quick_geglu(y, linear_offset) * g.to(w_dtype)
     # Sum across the feature dimension to keep weights shape `[tokens, 1]`.
@@ -491,7 +540,9 @@ class WeightedQuickGeGLUFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, weights, linear_offset = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        input_grad, wgrad = weighted_quick_geglu_back(grad_output, input, weights, linear_offset)
+        input_grad, wgrad = weighted_quick_geglu_back(
+            grad_output, input, weights, linear_offset, need_weight_grad=ctx.needs_input_grad[1]
+        )
         return input_grad, wgrad, None, None
 
 

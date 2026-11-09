@@ -30,6 +30,7 @@ import logging
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from types import ModuleType
 from typing import List
 
 import torch
@@ -44,6 +45,22 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.shared.import_utils import get_torch_version, safe_import
+
+__all__ = [
+    "SELECTIVE_AC_WRAPPER_FLAG",
+    "apply_full_layer_checkpointing_to_layers",
+    "apply_selective_checkpointing_to_layers",
+    "apply_submodule_checkpointing",
+    "detect_kv_sharing_and_maybe_disable_cache",
+    "ensure_fsdp_ops_sac_ignored",
+    "ensure_profiler_ops_sac_ignored",
+    "ignore_sac_ops",
+    "is_selective_activation_checkpointing",
+    "make_selective_checkpoint_context_fn",
+    "sdpa_backend_snapshot_context_fn",
+    "transformer_engine_attention_backend_snapshot_context_fn",
+    "unwrap_checkpoint_wrapper",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +86,7 @@ def _resolve_torch_op(dotted_path: str):
     return _resolve_op_attr(torch.ops, dotted_path)
 
 
-def _resolve_op_attr(root: object, dotted_path: str):
+def _resolve_op_attr(root: ModuleType, dotted_path: str):
     """Resolve a dotted attribute path from ``root``, or ``None`` if any part is absent.
 
     Used for ops that live outside ``torch.ops`` (higher-order ops, optional
@@ -210,7 +227,7 @@ _SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_save_ops()
 _SELECTIVE_AC_TO_COPY_OP = _resolve_torch_op("aten._to_copy")
 
 
-def is_selective_activation_checkpointing(activation_checkpointing: object) -> bool:
+def is_selective_activation_checkpointing(activation_checkpointing: bool | str | None) -> bool:
     """Return whether the config value selects selective activation checkpointing.
 
     Args:
@@ -274,7 +291,7 @@ def _maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, 
     logger.info("[selective-ac] %s -> %s", key, verdict)
 
 
-def ignore_sac_ops(ops: list[object | None]) -> None:
+def ignore_sac_ops(ops: list[torch._ops.OpOverload | torch._ops.HigherOrderOperator | None]) -> None:
     """Add available operators to PyTorch's selective-AC ignore set.
 
     Args:
@@ -363,6 +380,20 @@ def ensure_fsdp_ops_sac_ignored() -> None:
             )
         )
     )
+
+
+def ensure_moe_recompute_cache_ops_sac_ignored() -> None:
+    """Keep the deferred expert down projection's placeholder out of SAC's op-stream replay.
+
+    ``BackendConfig.dispatcher_recompute_cache="moe_tail"`` skips the down-projection GEMM in a checkpoint
+    recompute whose HybridEP combine is served from the forward's cache: ``moe/experts._DownProjGroupedMM``
+    then only allocates its output (``aten.new_empty``). That allocation exists in the recompute alone, and
+    selective checkpointing — including the router-saving context ``apply_ac`` installs under
+    ``ignore_router_for_ac`` — indexes every recompute op against the forward's stream
+    (``aten.new_empty.default encountered during backward but not found in storage``). The placeholder
+    carries no activation; it executes outside the accounting like FSDP's recompute-only allocations above.
+    """
+    ignore_sac_ops([getattr(getattr(torch.ops.aten, "new_empty", None), "default", None)])
 
 
 def make_selective_checkpoint_context_fn():

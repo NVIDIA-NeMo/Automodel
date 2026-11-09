@@ -212,6 +212,53 @@ def test_tied_config_aliases_lm_head_and_text_embedding() -> None:
     assert model.lm_head.weight is model.model.language_model.embed_tokens.weight
 
 
+def test_deferred_flash_boundaries_bypass_vision_and_reach_decoder(monkeypatch):
+    from nemo_automodel.components.models.common.packing import configure_packing
+
+    config = _tiny_config()
+    config._attn_implementation = "sdpa"
+    model = Qwen3VLForConditionalGeneration(config).eval()
+    configure_packing("flash_attention_2", model=model)
+    boundaries = torch.tensor([[1, 1, 2, 2]])
+    seen = []
+
+    def reject_upstream(*args, **kwargs):
+        raise AssertionError("Packed media must use the native path that isolates decoder metadata")
+
+    def check_vision(module, args, kwargs):
+        """Inspect vision patches [patches, features] without changing them."""
+        assert not {"_packed_seq_ids", "cu_seq_lens_q", "cu_seq_lens_k"}.intersection(kwargs)
+        seen.append("vision")
+
+    def check_decoder(module, args, kwargs):
+        """Inspect text embeddings [batch, sequence, hidden] after metadata resolution."""
+        torch.testing.assert_close(kwargs["_packed_seq_ids"], boundaries)
+        assert kwargs["cu_seq_lens_q"].tolist() == [0, 2, 4]
+        assert kwargs["cu_seq_lens_q"] is kwargs["cu_seq_lens_k"]
+        seen.append("decoder")
+
+    monkeypatch.setattr(HFQwen3VLForConditionalGeneration, "forward", reject_upstream)
+    vision_hook = model.model.visual.register_forward_pre_hook(check_vision, with_kwargs=True)
+    decoder_hook = model.get_decoder().register_forward_pre_hook(check_decoder, with_kwargs=True)
+    patch_dim = (
+        config.vision_config.in_channels * config.vision_config.temporal_patch_size * config.vision_config.patch_size**2
+    )
+    try:
+        with torch.no_grad():
+            result = model(
+                input_ids=torch.tensor([[1, config.image_token_id, 2, 3]]),
+                position_ids=torch.arange(4).view(1, 1, 4).expand(3, 1, 4),
+                image_grid_thw=torch.tensor([[1, 2, 2]]),
+                pixel_values=torch.randn(4, patch_dim),
+                _packed_seq_ids=boundaries,
+            )
+        assert result.logits.shape == (1, 4, config.text_config.vocab_size)
+        assert seen == ["vision", "decoder"]
+    finally:
+        vision_hook.remove()
+        decoder_hook.remove()
+
+
 def test_mixed_image_video_embed_uses_one_visual_forward(monkeypatch) -> None:
     """Mixed media is encoded once and returns sequence-ordered DeepStack inputs."""
     model = _bare_model()

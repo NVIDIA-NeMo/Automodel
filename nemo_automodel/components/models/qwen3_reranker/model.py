@@ -315,7 +315,7 @@ class Qwen3RerankerForCausalReranking(Qwen3ForCausalLM):
         kwargs.update(hub_kwargs)
         return super().from_pretrained(pretrained_model_name_or_path, *args, config=config, **kwargs)
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Alias ``lm_head`` to the input embeddings when the config asks for it.
 
         Declared model-locally rather than inherited: transformers v5 does not reliably tie a

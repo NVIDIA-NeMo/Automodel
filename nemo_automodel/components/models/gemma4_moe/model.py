@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Packed sliding-mask semantics follow Hugging Face Transformers (Apache-2.0):
+# https://github.com/huggingface/transformers/pull/46850
+# Revision: 1f3294c82c1d9153a531b7b21b178b432d52a6b4
+# Source: src/transformers/models/gemma4/modeling_gemma4.py, create_masks_for_vision_model.
 
 """Gemma4 MoE NeMo Automodel support.
 
@@ -88,6 +94,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 )
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packed_seq import indexed_mask_to_4d_block_causal
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -98,7 +105,12 @@ from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
+from .attention import prepare_gemma4_document_mask
+from .cp_attention import (
+    apply_gemma4_cp_attention_backend_policy,
+    gemma4_vision_group_ids,
+    set_gemma4_cp_dense_metadata,
+)
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
 from .parallelization import PARALLELIZER
 from .sdpa_fp32 import enable_gemma4_sdpa_fp32
@@ -245,6 +257,18 @@ class Gemma4Gate(nn.Module):
         self.register_buffer("root_size", torch.tensor(scalar_root_size), persistent=False)
 
     def forward(self, x, token_mask=None, cp_mesh=None):
+        """Select experts using FP32 router arithmetic.
+
+        Args:
+            x: Tensor of shape [..., hidden] with arbitrary leading dimensions.
+            token_mask: Optional boolean tensor matching x's leading dimensions;
+                unused by this router.
+            cp_mesh: Optional context-parallel mesh; unused by this router.
+
+        Returns:
+            Weights in the input dtype and integer expert indices, each shaped
+            [..., topk], followed by None for auxiliary loss.
+        """
         # Router math runs in fp32 regardless of parameter/activation storage
         # dtype. With bf16 storage (e.g. bf16 weights + fp32 master weights via
         # TE FusedAdam), bf16 logits can flip top-k expert selection, so keep
@@ -259,7 +283,8 @@ class Gemma4Gate(nn.Module):
         x_norm = self.norm(x).to(torch.float32)
         x_norm = x_norm * self.scale.to(torch.float32) * self.scalar_root_size
 
-        expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            expert_scores = F.linear(x_norm, self.proj.weight.to(torch.float32))
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
@@ -551,7 +576,23 @@ def _build_packed_gemma4_causal_mask_mapping(
 
     ``packed_seq_ids`` contains 1-based document ids and 0 for padding.
     Full-attention layers remain plain packed causal attention. Sliding layers
-    also include Gemma4's same-image-token bidirectional edges.
+    also include Gemma4's same-image-token bidirectional edges, clipped at the
+    window's left boundary.
+
+    Args:
+        packed_seq_ids: Tensor of shape [batch, sequence] with document ids.
+        mm_token_type_ids: Tensor of shape [batch, sequence] with image tokens
+            marked as 1, on the same device as packed_seq_ids.
+        dtype: Floating-point dtype used for additive masks.
+        sliding_window: Maximum causal lookback including the query, or no limit.
+        as_additive: Return additive masks instead of boolean masks.
+        as_block_mask: Return FlexAttention block masks instead of dense masks.
+        flex_block_size: Query/key block sizes for FlexAttention.
+
+    Returns:
+        Full/sliding masks of shape [batch, 1, query, key], or BlockMask objects
+        with the same logical layout. Padding queries are fully masked in dense
+        masks and attend only key zero in block masks to keep FlexAttention safe.
     """
     if packed_seq_ids.ndim != 2:
         raise ValueError(f"_packed_seq_ids must be a 2D [B, S] tensor, got shape={tuple(packed_seq_ids.shape)}")
@@ -581,17 +622,30 @@ def _build_packed_gemma4_causal_mask_mapping(
             allowed = (q_pack_id == kv_pack_id) & (q_pack_id > 0) & (kv_idx <= q_idx)
             return torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
 
-        def _sliding_mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+        def _sliding_mask_mod(
+            batch_idx: torch.Tensor, head_idx: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ) -> torch.Tensor:
+            """Evaluate one sliding-attention edge.
+
+            Args:
+                batch_idx: Scalar tensor with the batch index.
+                head_idx: Scalar tensor with the head index (mask is head-independent).
+                q_idx: Scalar tensor with the query position in the packed sequence.
+                kv_idx: Scalar tensor with the key position in the packed sequence.
+
+            Returns:
+                Scalar boolean tensor indicating whether the edge is allowed.
+            """
             q_pack_id = packed_seq_ids[batch_idx, q_idx]
             kv_pack_id = packed_seq_ids[batch_idx, kv_idx]
             same_doc = (q_pack_id == kv_pack_id) & (q_pack_id > 0)
             allowed = same_doc & (kv_idx <= q_idx)
-            if sliding_window is not None:
-                allowed = allowed & ((q_idx - kv_idx) < sliding_window)
             q_group = vision_group_ids[batch_idx, q_idx]
             kv_group = vision_group_ids[batch_idx, kv_idx]
             same_vision_group = (q_group == kv_group) & (q_group >= 0)
             allowed = (allowed | same_vision_group) & same_doc
+            if sliding_window is not None:
+                allowed = allowed & ((q_idx - kv_idx) < sliding_window)
             return torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
 
         return {
@@ -621,14 +675,12 @@ def _build_packed_gemma4_causal_mask_mapping(
     causal = kv_positions <= q_positions
 
     full_mask = same_doc & causal
-    sliding_mask = full_mask
-    if sliding_window is not None:
-        sliding_mask = sliding_mask & ((q_positions - kv_positions) < sliding_window)
-
     same_vision_group = (vision_group_ids[:, :, None] == vision_group_ids[:, None, :]) & (
         vision_group_ids[:, :, None] >= 0
     )
-    sliding_mask = (sliding_mask | same_vision_group) & same_doc
+    sliding_mask = (full_mask | same_vision_group) & same_doc
+    if sliding_window is not None:
+        sliding_mask = sliding_mask & ((q_positions - kv_positions) < sliding_window)
 
     full_mask = full_mask.view(batch_size, 1, seq_len, seq_len)
     sliding_mask = sliding_mask.view(batch_size, 1, seq_len, seq_len)
@@ -863,13 +915,113 @@ class Gemma4MoEModel(HFGemma4Model):
 
 
 # ---------------------------------------------------------------------------
-# Top-level conditional-generation model
+# Model-owned context parallelism (shared with Gemma4 Unified)
 # ---------------------------------------------------------------------------
-class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
-    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
-    supports_gradient_checkpointing = True
+class Gemma4ContextParallelMixin:
+    """Model-owned contiguous context parallelism for the Gemma4-family conditional-generation models.
+
+    The model owns CP batch sharding and its decoder-layer p2p attention ring. The recipe gets a
+    sharder-only :class:`ContextParallelSharder` from :meth:`prepare_model_inputs_for_cp`; its
+    ``shard_batch`` (:meth:`_cp_shard_batch_aux_only`) installs the ring on first use and records
+    ``cp_mesh``, and the model's forward embeds, splices vision and keeps this rank's contiguous slice.
+    """
+
     # Gemma4 owns CP batch sharding and its decoder-layer p2p attention ring.
     _owns_cp_attention = True
+    # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
+    # hands the model the CP submesh; None means the forward embeds/shards nothing
+    # for CP.
+    cp_mesh = None
+
+    def setup_cp_attention(self, cp_mesh) -> None:
+        """Install Gemma4's model-owned p2p ring CP attention (dense path).
+
+        Idempotent: flips the ``_cp_enabled`` flag the forward reads and installs
+        the ring on every self-attn module (each was given a per-module
+        ``setup_cp_attention`` by ``attach_gemma4_cp_ring_attention`` at
+        construction). Invoked from Gemma4's own batch-sharding callable
+        (``_cp_shard_batch_aux_only``) the first time the recipe hands it the CP
+        submesh, so the install is fully model-owned and needs no framework
+        dispatch.
+        """
+        if getattr(self, "_cp_enabled", False):
+            return
+        self._cp_enabled = True
+        for module in self.modules():
+            if module is self:
+                continue
+            module_setup = getattr(module, "setup_cp_attention", None)
+            if callable(module_setup):
+                module_setup(cp_mesh)
+
+    def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        """Gemma4-owned aux-only CP batch sharder that also self-installs the ring.
+
+        Exposed as ``ContextParallelSharder.shard_batch`` by the sharder-only
+        ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
+        submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
+        model-owned path (dense variants are not guaranteed to run the MoE
+        ``apply_cp``), so install the ring here (idempotent) and record
+        ``cp_mesh`` for the forward, which embeds, splices vision and keeps this
+        rank's contiguous slice per microbatch. Only the no-grad aux streams (and
+        the synthesized ``_packed_seq_ids``) are sharded here; ``input_ids`` /
+        ``pixel_values`` / ``mm_token_type_ids`` stay full for the forward.
+        """
+        self.setup_cp_attention(cp_mesh)
+        self.cp_mesh = cp_mesh
+        return make_contiguous_aux_only_shard_cp_batch_and_ctx(
+            cp_mesh,
+            tp_mesh,
+            batch,
+            loss_mask=loss_mask,
+            padding_token_id=padding_token_id,
+        )
+
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Return a sharder-only CP backend; embed + splice + slice happen in forward.
+
+        Sunk (Megatron-style per-microbatch) CP: the returned
+        :class:`ContextParallelSharder` contiguously shards only the no-grad
+        aux streams (labels/position_ids/loss_mask/padding_mask + the synthesized
+        ``_packed_seq_ids`` document map) via
+        :func:`make_contiguous_aux_only_shard_cp_batch_and_ctx` and leaves
+        ``input_ids`` / ``pixel_values`` / ``mm_token_type_ids`` full-length. The
+        forward then embeds, splices vision, builds the ``mm_token_type_ids`` /
+        ``_gemma4_vision_group_ids`` ring metadata (and dense Gemma4's
+        ``per_layer_inputs``) on the full sequence and keeps this rank's contiguous
+        slice, so the embeddings and vision tower are trainable under CP and the
+        PP×CP shared pre-embed graph no longer exists. Nothing is consumed here.
+        Defining this method is the opt-in signal the recipe checks
+        (``hasattr(model, "prepare_model_inputs_for_cp")``).
+
+        Args:
+            batch: The full-sequence batch; left intact (nothing consumed).
+            num_chunks: Accepted for hook-signature parity; unused (contiguous CP).
+        """
+        del num_chunks
+        if batch.get("input_ids") is None:
+            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=self._cp_shard_batch_aux_only,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
+
+
+# ---------------------------------------------------------------------------
+# Top-level conditional-generation model
+# ---------------------------------------------------------------------------
+class Gemma4ForConditionalGeneration(
+    Gemma4ContextParallelMixin, HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin
+):
+    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
+    supports_gradient_checkpointing = True
     # Whole-block activation checkpointing replays each decoder layer during backward.
     # E2B/E4B tolerate that for two separate reasons, one per kind of layer:
     #   * non-shared layers are the ones that call `past_key_values.update()`. A
@@ -894,16 +1046,67 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     # modules: they hold the vanilla-HF reference (ckpt_robustness tests) to the
     # same fp32 routing contract instead of letting it round the router to bf16.
     _keep_in_fp32_modules_strict = ["router.proj", "router.scale"]
-    # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
-    # hands the model the CP submesh; None means the forward embeds/shards nothing
-    # for CP.
-    cp_mesh = None
     """Gemma4 VL conditional generation model with NeMo MoE backend.
 
     When the checkpoint has ``enable_moe_block=True`` in its text config,
     replaces the HF-native language model with ``Gemma4MoETextModelBackend``
     (NeMo GroupedExperts + Gemma4Gate).  Otherwise falls through to vanilla HF.
     """
+
+    @property
+    def packed_metadata_entry_module(self) -> nn.Module:
+        """Prepare packed masks before this model applies its vision policy."""
+        return self
+
+    def validate_packed_attention_backend(self, attn_implementation: str) -> None:
+        """Reject Flash packing that cannot preserve native vision attention."""
+        text_config = self.config.text_config
+        if (
+            attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+            and text_config.use_bidirectional_attention == "vision"
+        ):
+            raise ValueError(
+                "Gemma4 vision packing requires SDPA or eager attention; Flash varlen cannot preserve "
+                "native image-bidirectional sliding attention."
+            )
+
+    def prepare_document_attention_mask(
+        self,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None,
+        mm_token_type_ids: torch.Tensor | None,
+        document_ids: torch.Tensor | None,
+    ) -> torch.Tensor | dict[str, torch.Tensor] | None:
+        """Compose document attention with the native full/sliding vision policy.
+
+        Args:
+            attention_mask: Compact integer attention IDs [batch, sequence],
+                a mask [batch, 1, sequence, sequence], a prepared mapping of
+                masks with that layout, or None for native masking.
+            mm_token_type_ids: Modality IDs [batch, sequence], or None for text.
+            document_ids: Original document IDs [batch, sequence], or None.
+
+        Returns:
+            Prepared boolean SDPA or additive eager masks [batch, 1, sequence,
+            sequence] for full/sliding layers; otherwise the original input.
+            Native CP returns None because its ring consumer owns masks.
+            No input tensor or model position is modified.
+        """
+        if getattr(self, "_cp_enabled", False):
+            # Native CP owns ring masks; compact IDs already describe its local shard.
+            return None
+        if (
+            document_ids is not None
+            and isinstance(attention_mask, torch.Tensor)
+            and attention_mask.ndim == 2
+            and attention_mask.dtype != torch.bool
+            and not attention_mask.is_floating_point()
+        ):
+            attention_mask = indexed_mask_to_4d_block_causal(attention_mask)
+        if document_ids is not None and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4:
+            return prepare_gemma4_document_mask(
+                self.config.text_config, attention_mask, mm_token_type_ids, document_ids, dtype=self.dtype
+            )
+        return attention_mask
 
     @classmethod
     def get_capabilities(cls, config: "Gemma4Config") -> ModelCapabilities:
@@ -991,68 +1194,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             enable_gemma4_sdpa_fp32()
         return cls.from_config(config, *model_args, **kwargs)
 
-    def setup_cp_attention(self, cp_mesh) -> None:
-        """Install Gemma4's model-owned p2p ring CP attention (dense path).
-
-        Idempotent: flips the ``_cp_enabled`` flag the forward reads and installs
-        the ring on every self-attn module (each was given a per-module
-        ``setup_cp_attention`` by ``attach_gemma4_cp_ring_attention`` at
-        construction). Invoked from Gemma4's own batch-sharding callable
-        (``_cp_shard_batch_aux_only``) the first time the recipe hands it the CP
-        submesh, so the install is fully model-owned -- no framework dispatch is
-        required.
-        """
-        if getattr(self, "_cp_enabled", False):
-            return
-        self._cp_enabled = True
-        for module in self.modules():
-            if module is self:
-                continue
-            module_setup = getattr(module, "setup_cp_attention", None)
-            if callable(module_setup):
-                module_setup(cp_mesh)
-
-    def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-        """Gemma4-owned aux-only CP batch sharder that also self-installs the ring.
-
-        Exposed as ``ContextParallelSharder.shard_batch`` by the sharder-only
-        ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
-        submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
-        model-owned path (dense variants are not guaranteed to run the MoE
-        ``apply_cp``) -- so install the ring here (idempotent) and record
-        ``cp_mesh`` for the forward, which embeds, splices vision and keeps this
-        rank's contiguous slice per microbatch. Only the no-grad aux streams (and
-        the synthesized ``_packed_seq_ids``) are sharded here; ``input_ids`` /
-        ``pixel_values`` / ``mm_token_type_ids`` stay full for the forward.
-        """
-        self.setup_cp_attention(cp_mesh)
-        self.cp_mesh = cp_mesh
-        return make_contiguous_aux_only_shard_cp_batch_and_ctx(
-            cp_mesh,
-            tp_mesh,
-            batch,
-            loss_mask=loss_mask,
-            padding_token_id=padding_token_id,
-        )
-
     def _apply_cp_attention_backend_policy(self) -> None:
         """Apply the model-owned CP attention backend policy to the final module tree."""
-        text_config = getattr(self.config, "text_config", self.config)
-        full_backend = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower()
-        sliding_backend = str(getattr(text_config, "cp_sliding_attn_backend", "flex")).lower()
-
-        if full_backend not in {"flex", "ffpa"}:
-            raise ValueError(f"Unsupported cp_full_attn_backend: {full_backend!r}")
-        if sliding_backend not in {"flex", "fa"}:
-            raise ValueError(f"Unsupported cp_sliding_attn_backend: {sliding_backend!r}")
-
-        for module in self.modules():
-            if isinstance(module, Gemma4Attention):
-                attach_gemma4_cp_ring_attention(
-                    module,
-                    use_ffpa=full_backend == "ffpa",
-                    sliding_backend=sliding_backend,
-                )
+        apply_gemma4_cp_attention_backend_policy(self, Gemma4Attention)
 
     def __init__(
         self,
@@ -1148,7 +1292,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 dtype=get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16),
             )
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie ``lm_head`` to the active text ``embed_tokens`` when requested.
 
         Overrides HF's generic tying so that any caller after the MoE
@@ -1187,6 +1331,29 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ):
+        """Run Gemma4, retaining native image policy for document-causal inputs.
+
+        Args:
+            input_ids: Token IDs [batch, sequence], unless embeddings are supplied.
+            position_ids: Scalar decoder coordinates [batch, sequence].
+            attention_mask: Eligibility [batch, sequence] or an additive/boolean
+                mask [batch, 1, query, key]. A 4D document-causal mask marked by
+                ``_packed_seq_ids`` is composed with native image/window policy.
+            padding_mask: Boolean exclusions [batch, sequence] for native parallel paths.
+            inputs_embeds: Optional token embeddings [batch, sequence, hidden].
+            cache_position: Cache offsets [sequence].
+            pixel_values: Processor patches [images, patches, patch_features].
+            image_position_ids: Processor patch coordinates [images, patches, 2].
+            mm_token_type_ids: Processor modality IDs [batch, sequence].
+            logits_to_keep: Number of trailing logits or token indices [selected].
+            output_hidden_states: Whether to retain decoder hidden states.
+            **kwargs: Other native HF inputs, including original document IDs
+                ``_packed_seq_ids`` [batch, sequence] when packed.
+
+        Returns:
+            Native model output with logits [batch, selected_sequence, vocabulary]
+            and optional hidden states/cache/media features.
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -1206,6 +1373,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 cache_position = torch.arange(seq_len, device=inputs_embeds.device)
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+        if (
+            kwargs.get("_packed_seq_ids") is not None
+            and attention_mask is None
+            and not getattr(self, "_cp_enabled", False)
+        ) or any(kwargs.get(key) is not None for key in ("cu_seq_lens_q", "cu_seq_lens_k")):
+            self.validate_packed_attention_backend(text_config._attn_implementation)
+            if (
+                kwargs.get("_packed_seq_ids") is not None
+                and attention_mask is None
+                and not getattr(self, "_cp_enabled", False)
+            ):
+                raise ValueError("Configure packed attention before forwarding compact Gemma4 attention IDs")
         cp_enabled = getattr(self, "_cp_enabled", False)
         tp_e_series_enabled = bool(
             getattr(self, "_gemma4_tp_enabled", False) and getattr(text_config, "hidden_size_per_layer_input", 0)
@@ -1263,18 +1442,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 # mm_token_type_ids / _gemma4_vision_group_ids are the forward-sliced
                 # streams; _packed_seq_ids and padding_mask ride the aux-only sharder.
                 if cp_enabled:
-                    cp_meta = {
-                        "mm_token_type_ids": mm_token_type_ids,
-                        "padding_mask": padding_mask,
-                        "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
-                        "_gemma4_vision_group_ids": vision_group_ids_local,
-                        "_gemma4_has_vision_tokens": has_vision_tokens,
-                    }
-                    # Left set (not cleared) so the activation-checkpoint recompute in
-                    # backward sees the same metadata; each CP forward overwrites it.
-                    for _mod in self.modules():
-                        if getattr(_mod, "_cp_uses_attention_hook", False):
-                            _mod._cp_dense_metadata = cp_meta
+                    set_gemma4_cp_dense_metadata(
+                        self,
+                        mm_token_type_ids=mm_token_type_ids,
+                        padding_mask=padding_mask,
+                        packed_seq_ids=kwargs.get("_packed_seq_ids"),
+                        vision_group_ids=vision_group_ids_local,
+                        has_vision_tokens=has_vision_tokens,
+                    )
 
                 # FSDP2 copies plain dict inputs while casting layer arguments.
                 # This model-owned mapping preserves one KV store across all
@@ -1345,6 +1520,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # instead, which FSDP2 leaves as one shared object. setdefault avoids
             # overwriting a store a caller already provided (e.g. the drafter).
             kwargs.setdefault("shared_kv_states", _FSDPSafeSharedKVStates())
+            attention_mask = self.prepare_document_attention_mask(
+                attention_mask, mm_token_type_ids, kwargs.get("document_ids", kwargs.get("_packed_seq_ids"))
+            )
             return super().forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -1519,42 +1697,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             raise ValueError("Gemma4 per-layer inputs require a valid pad_token_id.")
         return pad_token_id
 
-    def prepare_model_inputs_for_cp(
-        self,
-        batch: dict[str, Any],
-        *,
-        num_chunks: int = 1,
-    ) -> dict[str, Any]:
-        """Return a sharder-only CP backend; embed + splice + slice happen in forward.
-
-        Sunk (Megatron-style per-microbatch) CP: the returned
-        :class:`ContextParallelSharder` contiguously shards only the no-grad
-        aux streams (labels/position_ids/loss_mask/padding_mask + the synthesized
-        ``_packed_seq_ids`` document map) via
-        :func:`make_contiguous_aux_only_shard_cp_batch_and_ctx` and leaves
-        ``input_ids`` / ``pixel_values`` / ``mm_token_type_ids`` full-length. The
-        forward (:meth:`_cp_sunk_prepare_inputs`) then embeds, splices vision,
-        builds ``per_layer_inputs`` and the ``mm_token_type_ids`` /
-        ``_gemma4_vision_group_ids`` ring metadata on the full sequence and keeps
-        this rank's contiguous slice, so the embeddings and vision tower are
-        trainable under CP and the PP×CP shared pre-embed graph no longer exists.
-        Nothing is consumed here. Defining this method is the opt-in signal the
-        recipe checks (``hasattr(model, "prepare_model_inputs_for_cp")``).
-
-        Args:
-            batch: The full-sequence batch; left intact (nothing consumed).
-            num_chunks: Accepted for hook-signature parity; unused (contiguous CP).
-        """
-        del num_chunks
-        if batch.get("input_ids") is None:
-            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
-        return {
-            "cp_sharder": ContextParallelSharder(
-                shard_batch=self._cp_shard_batch_aux_only,
-                local_token_global_indices=contiguous_local_indices,
-            )
-        }
-
     def _cp_sunk_prepare_inputs(
         self,
         *,
@@ -1639,8 +1781,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ) -> None:
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            for p in self.parameters():
-                p.data = p.data.to(dtype)
+            cast_model_to_dtype(self, dtype)
             return
 
         # Guard: HF's super().__init__() calls post_init() -> init_weights() ->

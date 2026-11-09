@@ -137,6 +137,7 @@ optimizer:
   weight_decay: 0.1
 
 ci:
+  cluster_tag: h100
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: hemildesai
   # Two CPU-offloaded HF loads take about 20 minutes; allow the resume check to finish too.

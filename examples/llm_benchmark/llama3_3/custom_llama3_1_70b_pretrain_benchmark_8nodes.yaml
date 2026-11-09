@@ -96,6 +96,9 @@ distributed:
   defer_fsdp_grad_sync: False   # Must be False with GA>1: True → delayed resharding → OOM
 
 ci:
+  # Retained for reproducibility; excluded from automatic GPU CI.
+  deprecated: true
+  cluster_tag: h100
   nodes: 8
   time: "00:30:00"
   env_vars:

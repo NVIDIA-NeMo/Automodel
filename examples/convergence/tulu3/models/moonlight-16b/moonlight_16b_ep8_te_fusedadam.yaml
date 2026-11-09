@@ -126,6 +126,7 @@ wandb:
 # so a higher score always passes. baseline/stderr are
 # from our measured run (see models/moonlight-16b/run_te_fusedadam.md).
 ci:
+  cluster_tag: h100
   recipe_owner: athitten
   nodes: 1
   time: "02:00:00"                     # full 1000-step train + IFEval

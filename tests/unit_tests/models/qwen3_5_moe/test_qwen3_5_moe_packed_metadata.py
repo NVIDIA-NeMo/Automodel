@@ -28,7 +28,12 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5Moe
 
 from nemo_automodel.components.datasets.packing import build_packed_sequence_metadata
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeTextModelBackend
+from nemo_automodel.components.models.common.packing import configure_packing
+from nemo_automodel.components.models.qwen3_5_moe.model import (
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5MoeTextModelBackend,
+)
 
 
 def test_reuses_packed_metadata_across_checkpointed_moe_layers(monkeypatch):
@@ -112,3 +117,15 @@ def test_reuses_packed_metadata_across_checkpointed_moe_layers(monkeypatch):
             torch.equal(call.kwargs["seq_idx"], expected_seq_idx)
             for call in linear_attn.causal_conv1d_fn.call_args_list
         )
+
+
+@pytest.mark.parametrize("model_type", [Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration])
+def test_packed_te_is_rejected_before_installing_hooks(model_type):
+    # Validation depends on the declared model interface, not optional TE kernels.
+    model = model_type.__new__(model_type)
+    torch.nn.Module.__init__(model)
+    with pytest.raises(ValueError, match="full-attention blocks do not gather/scatter"):
+        configure_packing("te", model=model)
+    assert not model._forward_pre_hooks
+    model.validate_packed_attention_backend("sdpa")
+    model.validate_packed_attention_backend("fa4")

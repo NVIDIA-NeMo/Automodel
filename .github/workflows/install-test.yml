@@ -53,8 +53,8 @@ jobs:
         run: bash .github/scripts/select-uv-install-modes.sh
 
   pip-test:
-    runs-on: ${{ matrix.arch }}
-    name: Pip - Python${{ matrix.python-version }} - ${{ matrix.arch == 'ubuntu-latest' && 'AMD64/Linux' || (matrix.arch == 'ubuntu-24.04-arm' && 'ARM64/Linux' || 'ARM64/Darwin') }} - No CUDA
+    runs-on: ${{ matrix.platform.runner }}
+    name: Pip - Python${{ matrix.python-version }} - ${{ matrix.platform.name }} - No CUDA
     needs: [pre-flight]
     if: |
       !((needs.pre-flight.outputs.docs_only == 'true' && github.event_name == 'push')
@@ -62,8 +62,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ["ubuntu-latest", "macos-latest"] # After setting the repo to public: "ubuntu-24.04-arm"]
-        python-version: ["3.10", "3.11", "3.12"]
+        platform:
+          - runner: ubuntu-latest
+            name: AMD64/Linux
+          - runner: macos-latest
+            name: ARM64/Darwin
+          - runner: windows-latest
+            name: AMD64/Windows
+          # Add ubuntu-24.04-arm (ARM64/Linux) after the repository becomes public.
+        python-version: ["3.11", "3.12"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -90,6 +97,9 @@ jobs:
 
       - name: Check imports for nemo_automodel
         uses: ./FW-CI-templates/.github/actions/check-imports
+        env:
+          # The checker's Unicode summary must also work with Windows stdout pipes.
+          PYTHONIOENCODING: utf-8
         with:
           package-name: nemo_automodel
           python-binary: python
@@ -533,6 +543,8 @@ jobs:
         uses: astral-sh/setup-uv@162b8acf397cb069dec09a3f5a9847cf71cfa46a # v1
         with:
           version: 0.9.26
+          # Ubuntu 26.04 limits /tmp with a per-user quota; keep large wheels on disk.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
 
       - name: Install dependencies with UV
         env:

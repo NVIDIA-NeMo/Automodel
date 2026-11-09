@@ -237,7 +237,7 @@ def _load_custom_model_pipeline(cfg, model_id, mesh_context, torch_dtype):
     checkpoint = getattr(cfg.model, "checkpoint", None)
     lora_weights = getattr(cfg.model, "lora_weights", None)
     # LoRA is injected before sharding, as in training, so the adapter loads into sharded LoRA weights.
-    peft_cfg = PeftConfig.from_dict(load_automodel_peft_config_dict(lora_weights)) if lora_weights else None
+    peft_cfg = PeftConfig(**load_automodel_peft_config_dict(lora_weights)) if lora_weights else None
     pipe = NeMoAutoDiffusionPipeline.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
@@ -424,6 +424,7 @@ def load_lora_weights_into_pipeline(pipe, cfg):
         return
 
     import json
+    from dataclasses import fields
 
     from safetensors.torch import load_file
 
@@ -442,7 +443,8 @@ def load_lora_weights_into_pipeline(pipe, cfg):
     if "dropout" not in peft_config_dict and "lora_dropout" in peft_config_dict:
         peft_config_dict["dropout"] = peft_config_dict["lora_dropout"]
 
-    peft_config = PeftConfig.from_dict(peft_config_dict)
+    config_fields = {field.name for field in fields(PeftConfig)}
+    peft_config = PeftConfig(**{key: value for key, value in peft_config_dict.items() if key in config_fields})
     num_lora_modules = apply_lora_to_linear_modules(pipe.transformer, peft_config, skip_freeze=True)
     if num_lora_modules == 0:
         raise RuntimeError(f"No transformer modules matched LoRA config from {lora_path / 'adapter_config.json'}")
@@ -734,6 +736,7 @@ def run_inference(pipe, cfg, is_rank0):
             prompt for image-conditioned pipelines.
         is_rank0: Whether this is the main process (for saving outputs).
     """
+    from diffusers import ModularPipeline
     from diffusers.utils import export_to_video, load_image
 
     output_type = detect_output_type(pipe)
@@ -773,10 +776,20 @@ def run_inference(pipe, cfg, is_rank0):
     if extra_kwargs is not None:
         pipe_kwargs.update(extra_kwargs.to_dict())
 
+    if isinstance(pipe, ModularPipeline) and "guidance_scale" in pipe_kwargs:
+        guidance_scale = pipe_kwargs.pop("guidance_scale")
+        pipe.update_components(guider=pipe.guider.new(guidance_scale=guidance_scale))
+        logger.info("Configured modular pipeline guidance_scale=%s", guidance_scale)
+
     if input_images is not None:
         if "image" in pipe_kwargs:
             raise ValueError("Set source images with inference.input_images, not inference.pipeline_kwargs.image")
-        if "image" not in inspect.signature(pipe.__call__).parameters:
+        input_names = (
+            pipe.blocks.input_names
+            if isinstance(pipe, ModularPipeline)
+            else inspect.signature(pipe.__call__).parameters
+        )
+        if "image" not in input_names:
             raise ValueError(
                 f"{type(pipe).__name__} does not accept image inputs, but inference.input_images is configured"
             )

@@ -16,6 +16,7 @@ import glob
 import json
 import os
 import shutil
+from dataclasses import fields
 from typing import TYPE_CHECKING, Protocol
 
 import torch
@@ -35,10 +36,12 @@ from nemo_automodel.components.moe.state_dict_mixin import (
     MoESplitExpertsStateDictMixin,
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from nemo_automodel.shared.peft_config import PeftConfig as _AutomodelPeftConfig
 
 if TYPE_CHECKING:
     from peft import PeftConfig
     from torch.distributed import ProcessGroup
+    from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 
 _MOE_LORA_PARAMETER_SUFFIXES = ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B")
@@ -127,7 +130,9 @@ class CheckpointAddon(Protocol):
 class _ConsolidatedHFMetadataExporter(Protocol):
     """Model-provided writer for consolidated Hugging Face metadata."""
 
-    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+    def validate(
+        self, *, tokenizer: "PreTrainedTokenizerBase | ProcessorMixin | None", original_model_path: str | None
+    ) -> None:
         """Validate exporter inputs before any distributed rank writes files."""
         ...
 
@@ -135,7 +140,7 @@ class _ConsolidatedHFMetadataExporter(Protocol):
         self,
         *,
         hf_metadata_dir: str,
-        tokenizer: object,
+        tokenizer: "PreTrainedTokenizerBase | ProcessorMixin | None",
         original_model_path: str | None,
         v4_compatible: bool,
     ) -> None:
@@ -381,7 +386,7 @@ def _get_paramwrapper_layout_stamp(adapter, v4_compatible: bool, legacy_paramwra
     return _PARAMWRAPPER_LAYOUT_LEGACY if legacy_paramwrapper_layout else _PARAMWRAPPER_LAYOUT_MODERN
 
 
-def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
+def _get_automodel_peft_metadata(peft_config: _AutomodelPeftConfig) -> dict:
     """
     Get the PEFT metadata in the format expected by Automodel.
 
@@ -394,12 +399,13 @@ def _get_automodel_peft_metadata(peft_config: "PeftConfig") -> dict:
     """
     PEFT_KEYS = {"dim", "alpha"}
     result = {}
-    for k, v in peft_config.to_dict().items():
-        if k in PEFT_KEYS:
+    for config_field in fields(peft_config):
+        if config_field.name in PEFT_KEYS:
             continue
+        v = getattr(peft_config, config_field.name)
         if isinstance(v, torch.dtype):
             v = str(v)
-        result[k] = v
+        result[config_field.name] = v
     return result
 
 
@@ -413,13 +419,16 @@ def load_automodel_peft_config_dict(model_path: str) -> dict:
         model_path: The checkpoint's ``model/`` directory.
 
     Returns:
-        A dict for ``PeftConfig.from_dict``.
+        Constructor kwargs for ``PeftConfig``, excluding checkpoint-only metadata
+        such as the expert ParamWrapper layout stamp.
     """
     with open(os.path.join(model_path, "automodel_peft_config.json")) as f:
-        fields = json.load(f)
+        metadata = json.load(f)
     with open(os.path.join(model_path, "adapter_config.json")) as f:
         hf_config = json.load(f)
-    return {**fields, "dim": hf_config["r"], "alpha": hf_config["lora_alpha"]}
+    config_fields = {field.name for field in fields(_AutomodelPeftConfig)}
+    config = {key: value for key, value in metadata.items() if key in config_fields}
+    return {**config, "dim": hf_config["r"], "alpha": hf_config["lora_alpha"]}
 
 
 def _has_trainable_moe_lora_parameters(
