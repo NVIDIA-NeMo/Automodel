@@ -16,11 +16,11 @@ import fnmatch
 import inspect
 import logging
 import os
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar, overload
 
 from nemo_automodel.shared.import_utils import safe_import
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
@@ -849,18 +849,38 @@ def cast_mixed_dtype_params_to_bf16(model: nn.Module) -> None:
             b.data = b.data.to(torch.bfloat16)
 
 
+# The caller's own ``**attn_kwargs`` mapping is updated in place and handed back,
+# so callers keep their declared mapping type for the values this helper does not touch.
+_ThdAttnKwargsT = TypeVar("_ThdAttnKwargsT", bound=MutableMapping[str, torch.Tensor | int | float | bool | str | None])
+
+
+@overload
+def squeeze_input_for_thd(
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor | None,
+    padding_mask: torch.Tensor | None,
+    attn_kwargs: _ThdAttnKwargsT,
+    seqlens_padding_value: int = -1000,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, _ThdAttnKwargsT]: ...
+
+
+@overload
+def squeeze_input_for_thd(
+    input_ids: None,
+    position_ids: torch.Tensor | None,
+    padding_mask: torch.Tensor | None,
+    attn_kwargs: _ThdAttnKwargsT,
+    seqlens_padding_value: int = -1000,
+) -> tuple[None, torch.Tensor, torch.Tensor | None, _ThdAttnKwargsT]: ...
+
+
 def squeeze_input_for_thd(
     input_ids: torch.Tensor | None,
-    position_ids: torch.Tensor,
+    position_ids: torch.Tensor | None,
     padding_mask: torch.Tensor | None,
-    attn_kwargs: dict[str, torch.Tensor | int | float | bool | str | None],
+    attn_kwargs: _ThdAttnKwargsT,
     seqlens_padding_value: int = -1000,
-) -> tuple[
-    torch.Tensor | None,
-    torch.Tensor,
-    torch.Tensor | None,
-    dict[str, torch.Tensor | int | float | bool | str | None],
-]:
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None, _ThdAttnKwargsT]:
     """
     Squeeze batch dimension and prepare inputs for THD (total, hidden, depth) format.
 
@@ -884,7 +904,8 @@ def squeeze_input_for_thd(
             and analogous code paths), so this helper has nothing to squeeze and
             simply returns ``None`` for the ``input_ids`` slot.
         position_ids (torch.Tensor): Position IDs with shape [1, total_tokens].
-            The first dimension will be squeezed.
+            The first dimension will be squeezed. Model forwards declare it optional,
+            but THD inputs require it; ``None`` raises ``ValueError``.
         padding_mask (torch.Tensor): Padding mask with shape [1, total_tokens].
             The first dimension will be squeezed.
         attn_kwargs (dict): Dictionary of attention-related tensors. May contain:
@@ -930,6 +951,8 @@ def squeeze_input_for_thd(
         This function modifies attn_kwargs in-place. If you need to preserve the original
         dictionary, pass a copy.
     """
+    if position_ids is None:
+        raise ValueError("squeeze_input_for_thd requires position_ids for THD inputs")
     if input_ids is not None:
         input_ids = input_ids.squeeze(0)
     position_ids = position_ids.squeeze(0)

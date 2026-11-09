@@ -948,6 +948,23 @@ class TestSqueezeInputForThd:
         assert kw["cu_seqlens"].tolist() == [0, 3, 5]
         assert kw["cu_seqlens_padded"].tolist() == [0, 4, 6]
 
+    def test_returns_the_callers_kwargs_mapping(self):
+        """The kwargs mapping is updated in place and returned, so callers that rebind
+        their ``**attn_kwargs`` dict keep the same object and its untouched entries."""
+        position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        kwargs = self._attn_kwargs(with_max_seqlen=False)
+        kwargs["qkv_format"] = "thd"
+
+        _ids, _pos, _mask, kw = model_utils.squeeze_input_for_thd(None, position_ids, None, kwargs)
+
+        assert kw is kwargs
+        assert kw["qkv_format"] == "thd"
+
+    def test_position_ids_none_raises_value_error(self):
+        """Model forwards declare ``position_ids`` optional, but THD inputs need it."""
+        with pytest.raises(ValueError, match="requires position_ids"):
+            model_utils.squeeze_input_for_thd(None, None, None, self._attn_kwargs())
+
 
 # =============================================================================
 # Tests for enable_radio_vit_fused_attn
