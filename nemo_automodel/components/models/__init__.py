@@ -20,6 +20,7 @@ Currently includes:
 import importlib.abc
 import pathlib
 import sys
+from types import FunctionType, ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -55,7 +56,7 @@ def _make_upgrade_message(name: str) -> str:
     )
 
 
-def __getattr__(name: str) -> object:
+def __getattr__(name: str) -> ModuleType | FunctionType:
     """Load the public builder on demand, preserving model-upgrade diagnostics."""
     if name in ("build_gpt2_model", "gpt2"):
         module = importlib.import_module(".gpt2", __name__)
