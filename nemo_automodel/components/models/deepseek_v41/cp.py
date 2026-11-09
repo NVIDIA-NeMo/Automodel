@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contiguous context parallelism for the V4.1 text backbone."""
+"""Contiguous context parallelism for packed V4.1 text and image tokens."""
 
 import contextlib
 from collections.abc import Callable
@@ -21,14 +21,50 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.nn.functional import all_gather
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout, shard_batch_contiguous
 from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
 
 
+class _GatherSequence(torch.autograd.Function):
+    """Gather sequence-first storage once; backward sums all remote uses."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+        """Gather [batch, local_sequence, ...] into [batch, global_sequence, ...].
+
+        Args:
+            tensor: Equal-length local sequence shards with arbitrary trailing axes.
+            group: The group whose rank order defines the global sequence.
+
+        Returns:
+            Independently allocated global sequence; batch>1 can be noncontiguous.
+        """
+        ctx.group = group
+        ctx.local_sequence = tensor.shape[1]
+        source = tensor.movedim(1, 0).contiguous()
+        output = source.new_empty((source.shape[0] * dist.get_world_size(group), *source.shape[1:]))
+        dist.all_gather_into_tensor(output, source, group=group)
+        return output.movedim(0, 1)
+
+    @staticmethod
+    def backward(ctx, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Reduce [batch, global_sequence, ...] to its summed local sequence shard.
+
+        Args:
+            gradient: Gradient of every global token used by this rank.
+
+        Returns:
+            Local gradient [batch, local_sequence, ...] and no group gradient.
+        """
+        source = gradient.movedim(1, 0).contiguous()
+        local = source.new_empty((ctx.local_sequence, *source.shape[1:]))
+        dist.reduce_scatter_tensor(local, source, group=ctx.group)
+        return local.movedim(0, 1), None
+
+
 def gather_sequence(tensor: torch.Tensor, group: dist.ProcessGroup | None) -> torch.Tensor:
-    """Gather rank-ordered sequence shards, summing remote uses in backward.
+    """Gather rank-ordered sequence shards without a second full-sized concatenation.
 
     Args:
         tensor: Tensor of shape [batch, local_sequence, ...], with arbitrary
@@ -37,17 +73,47 @@ def gather_sequence(tensor: torch.Tensor, group: dist.ProcessGroup | None) -> to
 
     Returns:
         Tensor of shape [batch, global_sequence, ...]. Floating activations retain
-        autograd history; integer and boolean metadata are gathered without gradients.
-        At CP1 the result aliases the input. No input is mutated.
+        autograd history; backward sums all remote uses. Integer and boolean metadata
+        have no gradients. At CP1 the result aliases the input. Otherwise it owns
+        storage, can be noncontiguous for batch>1, and never mutates the input.
     """
     if group is None or dist.get_world_size(group) == 1:
         return tensor
-    if tensor.requires_grad:
-        parts = all_gather(tensor.contiguous(), group=group)
-    else:
-        parts = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
-        dist.all_gather(parts, tensor.contiguous(), group=group)
-    return torch.cat(parts, dim=1)
+    return _GatherSequence.apply(tensor, group)
+
+
+def gather_window(
+    tensor: torch.Tensor, group: dist.ProcessGroup | None, *, window_size: int
+) -> tuple[torch.Tensor, int]:
+    """Gather short shard suffixes and retain only the required left halo.
+
+    Args:
+        tensor: Local KV tensor [batch, local_sequence, head_dim].
+        group: CP group, or None for a local sequence.
+        window_size: Causal window width, including the query's own token.
+
+    Returns:
+        KV [batch, halo_sequence + local_sequence, head_dim] and the physical
+        global index of its first token. Rank zero has no halo. Gradients from
+        remote queries return to the owning rank and add to local uses.
+    """
+    if group is None or dist.get_world_size(group) == 1 or window_size == 1:
+        start = 0 if group is None else dist.get_rank(group) * tensor.shape[1]
+        return tensor, start
+    rank = dist.get_rank(group)
+    sequence = tensor.shape[1]
+    start = max(0, rank * sequence - window_size + 1)
+    if sequence < window_size - 1:
+        # Tiny shards can require more than one predecessor. Preserve that valid
+        # case with the general gather instead of silently truncating the window.
+        return gather_sequence(tensor, group)[:, start : (rank + 1) * sequence], start
+    halo_size = window_size - 1
+    # Reuse the existing collective communicator. Point-to-point halo exchange
+    # creates persistent NCCL peer buffers that can outweigh these small tails.
+    tails = gather_sequence(tensor[:, -halo_size:], group)
+    halo = tails[:, (rank - 1) * halo_size : rank * halo_size] if rank else tails[:, :0]
+    # Keep the empty rank-zero slice in the graph for the reverse reduce-scatter.
+    return torch.cat((halo, tensor), dim=1), start
 
 
 def shard_cp_batch(
@@ -81,8 +147,8 @@ def shard_cp_batch(
         Packed layouts retain original-to-aligned token coordinates [batch, original_sequence].
         Token tensors have independent storage; input tensor storage is never modified.
     """
-    if batch.get("pixel_values") is not None or batch.get("inputs_embeds") is not None:
-        raise ValueError("DeepSeek V4.1 context parallelism currently supports text input_ids only")
+    if batch.get("inputs_embeds") is not None:
+        raise ValueError("DeepSeek V4.1 CP requires input_ids and model-owned image fusion")
     padding_token_id = 0 if padding_token_id is None else padding_token_id
     packed = batch.get("seq_lens") is not None
     if not packed and (batch.get("cu_seqlens") is not None or batch.get("qkv_format") == "thd"):
@@ -103,7 +169,12 @@ def shard_cp_batch(
             minimum_length=int(length),
         )
         input_positions = layout.input_positions
-        for key, fill in (("input_ids", padding_token_id), ("labels", -100), ("loss_mask", 0)):
+        for key, fill in (
+            ("input_ids", padding_token_id),
+            ("labels", -100),
+            ("loss_mask", 0),
+            ("vision_token_types", -1),
+        ):
             if key in batch:
                 batch[key] = layout.pack(batch[key], fill=fill)
         if loss_mask is not None:
@@ -131,8 +202,8 @@ def shard_cp_batch(
             loss_mask=loss_mask,
             padding_token_id=padding_token_id,
             pad_multiple=pad_multiple,
-            extra_seq_keys={"packed_seq_ids": 1} if packed else None,
-            extra_pad_values={"packed_seq_ids": 0} if packed else None,
+            extra_seq_keys={"packed_seq_ids": 1, "vision_token_types": 1},
+            extra_pad_values={"packed_seq_ids": 0, "vision_token_types": -1},
         )
     if input_positions is not None:
         layout = ShardLayout(

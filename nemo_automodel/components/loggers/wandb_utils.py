@@ -11,14 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    import wandb
+    from wandb.sdk.wandb_run import Run
 
 
-def init_wandb_run(wandb_cfg: dict[str, Any], full_config: dict[str, Any], default_name: str = "") -> "wandb.Run":
+def init_wandb_run(wandb_cfg: dict[str, Any], full_config: dict[str, Any], default_name: str = "") -> Run | None:
     """Initialize a W&B run from a config dict.
 
     A recipe-agnostic counterpart to recipe-local ``build_wandb`` helpers: it

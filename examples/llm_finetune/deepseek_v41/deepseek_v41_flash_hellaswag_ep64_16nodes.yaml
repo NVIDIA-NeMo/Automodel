@@ -92,7 +92,7 @@ distributed:
   pp_size: 1
   cp_size: 1
   ep_size: 64
-  defer_fsdp_grad_sync: true
+  defer_fsdp_grad_sync: false
   sequence_parallel: false
   activation_checkpointing: true
   moe:

@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any, Self
 
 import torch
 import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.config.loader import ConfigNode
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +40,7 @@ class CometLogger:
         experiment_name: str | None = None,
         tags: list[str] | None = None,
         auto_metric_logging: bool = False,
-        **kwargs: Any,
+        **kwargs: object,
     ) -> None:
         """
         Initialize Comet ML logger.
@@ -114,19 +119,16 @@ class CometLogger:
             self.experiment.end()
             logger.info("Comet experiment ended successfully")
 
-    def __enter__(self) -> "CometLogger":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
     ) -> None:
         self.end()
 
 
-def build_comet(cfg: Any) -> CometLogger:
+def build_comet(cfg: ConfigNode) -> CometLogger:
     """Build a Comet logger from a raw config object.
 
     Back-compat shim. The logger-construction logic lives in
