@@ -15,10 +15,20 @@
 import importlib
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Protocol
 
 from nemo_automodel.components.launcher.base import Launcher
+
+
+class _Recipe(Protocol):
+    """Recipe operations used by the interactive launcher."""
+
+    def setup(self) -> None: ...
+
+    def run_train_validation_loop(self) -> int | None: ...
+
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +47,7 @@ def _get_repo_root() -> Path:
     return Path(__file__).parents[3]
 
 
-def resolve_recipe_cls(target_str: str):
+def resolve_recipe_cls(target_str: str) -> Callable[..., _Recipe]:
     """Import and return the recipe class from a dotted path.
 
     "  pip install nemo-automodel          # CPU/basic\n"
@@ -90,7 +100,8 @@ class InteractiveLauncher(Launcher):
         recipe_cls = resolve_recipe_cls(recipe_target)
         recipe = recipe_cls(config)
         recipe.setup()
-        return recipe.run_train_validation_loop()
+        result = recipe.run_train_validation_loop()
+        return 0 if result is None else result
 
     def launch(
         self,
