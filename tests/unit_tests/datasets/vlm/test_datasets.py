@@ -209,6 +209,44 @@ def test_make_medpix_dataset(monkeypatch):
         assert assistant_turn["content"][0] == {"type": "text", "text": answers[i]}
 
 
+@pytest.mark.parametrize("seed", [None, 0, 1234])
+def test_medpix_config_preserves_pairs_and_lazy_images(monkeypatch: pytest.MonkeyPatch, seed: int | None) -> None:
+    """A pinned, shuffled Arrow dataset keeps questions, answers and images paired."""
+    from unittest.mock import Mock
+
+    from datasets import Dataset, Features, Value
+    from datasets import Image as HFImage
+
+    images = [Image.new("RGB", (3, 5), (i, 0, 0)) for i in range(12)]
+    source = Dataset.from_dict(
+        {"image_id": images, "question": [f"q{i}" for i in range(12)], "answer": [f"a{i}" for i in range(12)]},
+        features=Features({"image_id": HFImage(), "question": Value("string"), "answer": Value("string")}),
+    )
+    loader = Mock(return_value=source)
+    monkeypatch.setattr(ds, "load_dataset", loader)
+    config = ds.MedPixDatasetConfig(path_or_dataset="medpix-fixture", split="train", revision="pinned", seed=seed)
+
+    def forbid_pixel_decode(image: Image.Image) -> None:
+        raise AssertionError("Dataset building and row formatting must not decode image pixels")
+
+    with monkeypatch.context() as lazy:
+        lazy.setattr(Image.Image, "load", forbid_pixel_decode)
+        result = config.build()
+        rows = [result[i]["conversation"] for i in range(len(result))]
+    loader.assert_called_once_with("medpix-fixture", split="train", revision="pinned")
+
+    expected = source if seed is None else source.shuffle(seed=seed)
+    questions = list(expected["question"])
+    assert [row[0]["content"][1]["text"] for row in rows] == questions
+    for row, question in zip(rows, questions, strict=True):
+        index = int(question[1:])
+        assert row[1]["content"][0]["text"] == f"a{index}"
+        assert row[0]["content"][0]["image"].getpixel((0, 0)) == (index, 0, 0)
+    assert list(source["question"]) == [f"q{i}" for i in range(12)]
+    repeated = config.build()
+    assert [repeated[i]["conversation"][0]["content"][1]["text"] for i in range(12)] == questions
+
+
 class _FakeHFDataset:
     """Minimal stand-in for ``datasets.Dataset`` covering the slice of API
     ``make_tulu3_magicoder_text_mix_dataset`` uses: ``column_names``,
