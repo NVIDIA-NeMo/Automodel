@@ -45,7 +45,7 @@ import logging
 import math
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Required, TypedDict
 
@@ -106,7 +106,22 @@ class ParamGroupOverride:
             raise ValueError("param_group_overrides LR/WD multipliers must be finite and nonnegative.")
 
 
-def _coerce_param_group_overrides(overrides: list[Any]) -> list[ParamGroupOverride]:
+class _ParamGroupOverrideValues(TypedDict, total=False):
+    """YAML fields accepted when constructing a parameter-group override."""
+
+    pattern: Required[str]
+    lr_mult: float
+    wd_mult: float
+
+
+# Torch optimizers consume mutable dictionaries and add their own defaults.
+# Before construction these groups contain only parameters and LR/WD multipliers.
+_InitialParamGroup = dict[str, list[torch.nn.Parameter] | float]
+
+
+def _coerce_param_group_overrides(
+    overrides: Sequence[ParamGroupOverride | _ParamGroupOverrideValues],
+) -> list[ParamGroupOverride]:
     """Coerce a list of dicts (as delivered by YAML) or objects into ``ParamGroupOverride``."""
     coerced: list[ParamGroupOverride] = []
     for override in overrides:
@@ -122,7 +137,7 @@ def _coerce_param_group_overrides(overrides: list[Any]) -> list[ParamGroupOverri
 def _build_param_groups(
     named_params: list[tuple[str, torch.nn.Parameter]],
     overrides: list[ParamGroupOverride],
-) -> list[dict[str, Any]]:
+) -> list[_InitialParamGroup]:
     """Partition ``named_params`` into optimizer groups by name-pattern ``overrides``.
 
     Each parameter joins the group of the first override whose ``pattern`` matches
@@ -156,7 +171,7 @@ def _build_param_groups(
         else:
             default_params.append(param)
 
-    groups: list[dict[str, Any]] = []
+    groups: list[_InitialParamGroup] = []
     if default_params:
         groups.append({"params": default_params})
     for idx, override in enumerate(overrides):
@@ -167,7 +182,9 @@ def _build_param_groups(
     return groups
 
 
-def _trainable_params_or_groups(part: torch.nn.Module, overrides: list[ParamGroupOverride]) -> list:
+def _trainable_params_or_groups(
+    part: torch.nn.Module, overrides: list[ParamGroupOverride]
+) -> list[torch.nn.Parameter] | list[_InitialParamGroup]:
     """Return one model part's trainable params, grouped by ``overrides`` when set.
 
     Without overrides this is the flat trainable-parameter list (unchanged
