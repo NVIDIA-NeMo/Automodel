@@ -64,6 +64,7 @@ include = [
     "nemo_automodel/components/attention/**",
     "nemo_automodel/components/_peft/**",
     "nemo_automodel/components/config/**",
+    "nemo_automodel/components/flow_matching/**",
     "nemo_automodel/components/launcher/**",
     "nemo_automodel/components/loggers/**",
     "nemo_automodel/components/optim/**",
