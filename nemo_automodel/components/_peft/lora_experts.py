@@ -788,7 +788,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
             if self.expert_bias:
                 assert self.gate_up_proj_bias is not None
-                gate_up_proj_bias = _to_local(self.gate_up_proj_bias).to(compute_dtype)
+                gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
 
             output1 = self.expert_activation(output1, activation_probs)
@@ -801,7 +801,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
             if self.expert_bias:
                 assert self.down_proj_bias is not None
-                down_bias = _to_local(self.down_proj_bias).to(compute_dtype)
+                down_bias = _to_local(self.down_proj_bias)
                 output2 = _apply_bias(
                     output2, down_bias, tokens_per_expert, None if apply_after_down else permuted_probs
                 )
