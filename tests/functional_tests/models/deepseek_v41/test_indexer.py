@@ -164,3 +164,50 @@ def test_packed_cp2_replacement_preserves_selection_outputs_and_gradients(tmp_pa
     if torch.cuda.device_count() < 2:
         pytest.skip("Real CP2 collective and checkpoint ordering require two CUDA devices.")
     mp.spawn(_cp_worker, args=(str(tmp_path / "rendezvous"), ac), nprocs=2, join=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA TileLang indexer")
+def test_long_packed_document_query_tiles_and_decoder_candidates():
+    """Match full BF16 scores and document-local top-k across multiple query tiles."""
+    from nemo_automodel.components.models.deepseek_v41.attention import DeepseekV41AttentionState, _Indexer
+    from tests.unit_tests.models.deepseek_v41.test_attention import _config
+
+    torch.manual_seed(805)
+    config = _config()
+    config.index_n_heads = 4
+    config.index_head_dim = 32
+    config.index_topk = 7
+    config.candidate_block_size = 8
+    source = _Indexer(config, layer_idx=3, dtype=torch.bfloat16, attn_backend="tilelang").cuda()
+    consumer = _Indexer(config, layer_idx=4, dtype=torch.bfloat16, attn_backend="tilelang").cuda()
+    sequence, width = 273, 16384
+    q = torch.randn(1, sequence, 4, 32, device="cuda", dtype=torch.bfloat16).abs()
+    k = torch.randn(1, width, 32, device="cuda", dtype=torch.bfloat16)
+    k[:, 20:24] = 10  # Equal high scores exercise ties without changing the key width.
+    w = torch.randn(1, sequence, 4, device="cuda", dtype=torch.bfloat16).abs()
+    positions = torch.arange(width - sequence, width, device="cuda").unsqueeze(0)
+    documents = torch.ones(1, sequence, dtype=torch.long, device="cuda")
+    state = DeepseekV41AttentionState(
+        compression_ratio=1,
+        compressed_seq_ids=torch.ones(1, width, dtype=torch.long, device="cuda"),
+        compressed_valid=torch.ones(1, width, dtype=torch.bool, device="cuda"),
+    )
+    scores = torch.einsum("bshd,btd->bsht", q, k).relu()
+    scores = (scores * w.unsqueeze(-1)).sum(2)
+    allowed = torch.arange(width, device="cuda")[None, None] <= positions.unsqueeze(-1)
+    scores = scores.masked_fill(~allowed, -torch.inf)
+    expected = scores.topk(config.index_topk, sorted=False).indices.sort(-1).values
+    block_scores = scores.unflatten(-1, (-1, config.candidate_block_size)).amax(-1)
+    last = positions.unsqueeze(-1) // config.candidate_block_size
+    block_scores = block_scores.masked_fill(torch.arange(block_scores.shape[-1], device="cuda") == last, torch.inf)
+    selected = block_scores.topk(config.candidate_topk_blocks, dim=-1)
+    keep = torch.zeros_like(block_scores, dtype=torch.bool).scatter(-1, selected.indices, selected.values > -torch.inf)
+    dense_candidates = keep.repeat_interleave(config.candidate_block_size, -1)
+    expected_reindex = (
+        scores.masked_fill(~dense_candidates, -torch.inf).topk(config.index_topk, sorted=False).indices.sort(-1).values
+    )
+    actual = source._select_queries(q, k, w, positions, documents, state)
+    reindexed = consumer._select_queries(q, k, w, positions, documents, actual)
+    torch.testing.assert_close(actual.topk_indices, expected, atol=0, rtol=0)
+    torch.testing.assert_close(reindexed.topk_indices, expected_reindex, atol=0, rtol=0)
+    torch.testing.assert_close(actual.candidates, keep, atol=0, rtol=0)

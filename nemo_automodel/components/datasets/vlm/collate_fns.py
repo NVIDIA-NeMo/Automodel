@@ -1710,6 +1710,15 @@ def neat_packed_vlm_collater(
         "position_ids": position_ids,
         "mm_token_type_ids": mm_token_type_ids,
     }
+    if any(x.get("vision_token_types") is not None for x in batch):
+        result["vision_token_types"] = torch.stack(
+            [
+                _pad_1d(x["vision_token_types"], -1, max_len)
+                if x.get("vision_token_types") is not None
+                else torch.full_like(input_ids[0], -1)
+                for x in batch
+            ]
+        )
     if packed_mask_type == "block_causal" and not materialize_4d_mask:
         # Native CP consumes compact IDs and constructs its local attention policy.
         result["attention_mask"] = attention_mask
@@ -1743,6 +1752,7 @@ def neat_packed_vlm_collater(
 
     for key in (
         "image_grid_thw",
+        "image_grid_hws",
         "image_position_ids",
         "video_grid_thw",
         "second_per_grid_ts",
@@ -1828,6 +1838,17 @@ def packed_sequence_thd_vlm_collater(
     input_ids = torch.stack([_pad_seq(x["input_ids"], padding_idx, max_len) for x in batch])
     labels = torch.stack([_pad_seq(x["labels"], LABEL_PAD, max_len) for x in batch])
 
+    vision_types = None
+    if any(x.get("vision_token_types") is not None for x in batch):
+        vision_types = torch.stack(
+            [
+                _pad_seq(x["vision_token_types"], -1, max_len)
+                if x.get("vision_token_types") is not None
+                else torch.full_like(input_ids[0], -1)
+                for x in batch
+            ]
+        )
+
     seq_lens_list: list[list[int]] = []
     seq_lens_padded_list: list[list[int]] = []
     for x in batch:
@@ -1896,6 +1917,7 @@ def packed_sequence_thd_vlm_collater(
 
     for key in (
         "image_grid_thw",
+        "image_grid_hws",
         "image_position_ids",
         "video_grid_thw",
         "second_per_grid_ts",
@@ -1916,6 +1938,8 @@ def packed_sequence_thd_vlm_collater(
     if any(count > 0 for count in video_counts):
         result["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
+    if vision_types is not None:
+        result["vision_token_types"] = vision_types
     return result
 
 
