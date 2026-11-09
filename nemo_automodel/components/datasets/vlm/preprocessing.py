@@ -15,21 +15,25 @@
 """Shared document/media assembly for native and streaming VLM pipelines."""
 
 from collections.abc import Mapping, Sequence
+from typing import TypeAlias
 
 import torch
 
 from nemo_automodel.components.datasets.vlm.media import pad_image_tensors
 
+# Token fields, per-document lengths/counts and processor-owned image/video tensors.
+VlmDocumentValue: TypeAlias = torch.Tensor | Sequence[torch.Tensor] | Sequence[int] | int | None
+
 
 def merge_vlm_documents(
-    samples: Sequence[Mapping[str, object]],
+    samples: Sequence[Mapping[str, VlmDocumentValue]],
     *,
     padding_idx: int,
     has_mrope: bool = False,
     sequence_alignment: int = 1,
     return_labels: bool = True,
     return_attention_mask: bool = True,
-) -> dict[str, object]:
+) -> dict[str, VlmDocumentValue]:
     """Assemble ordered VLM documents without shifting or selecting bins.
 
     Native packing supplies already shifted documents; a streaming pipeline can

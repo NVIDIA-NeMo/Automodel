@@ -36,7 +36,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str) -> object:
+def __getattr__(name: str) -> type:
     """Load configuration only when requested, keeping worker helpers lightweight."""
     if name not in __all__:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

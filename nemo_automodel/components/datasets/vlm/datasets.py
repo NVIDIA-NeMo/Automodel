@@ -1539,17 +1539,21 @@ class EncodedVlmDocument(TypedDict):
     image_position_ids: NotRequired[torch.Tensor]
     image_sizes: NotRequired[torch.Tensor]
     mm_token_type_ids: NotRequired[torch.Tensor]
+    position_ids: NotRequired[torch.Tensor]
     vision_token_types: NotRequired[torch.Tensor]
 
 
 def encode_vlm_document(
-    example: dict[str, object],
+    example: ConversationSample,
     processor: ProcessorMixin,
     *,
     max_length: int | None = None,
     truncate: bool = False,
     inject_fake_images: bool = True,
-    post_tokenize_hook: Callable[[dict[str, object], ProcessorMixin], dict[str, object]] | None = None,
+    post_tokenize_hook: (
+        Callable[[dict[str, torch.Tensor | list[list[int]]], ProcessorMixin], dict[str, torch.Tensor | list[list[int]]]]
+        | None
+    ) = None,
 ) -> EncodedVlmDocument:
     """Encode one conversation without shifting, packing, retrying or choosing another document.
 
@@ -1630,6 +1634,9 @@ def encode_vlm_document(
     )
     chat_template = resolve_chat_template_string(chat_template)
     template_has_generation_kwd = bool(chat_template and GENERATION_REGEX.search(chat_template))
+    # Only request assistant spans when the template supplies them; some processors reject the unused option.
+    if template_has_generation_kwd:
+        template_kwargs["return_assistant_tokens_mask"] = True
     # The processor owns media expansion and special-token handling in either path.
     if type(processor).__name__ == "MistralCommonBackend":
         # MistralCommonBackend owns the HF token API and takes no media kwargs.
@@ -1640,7 +1647,6 @@ def encode_vlm_document(
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
-            return_assistant_tokens_mask=template_has_generation_kwd,
             processor_kwargs=processor_kwargs,
             **template_kwargs,
         )
