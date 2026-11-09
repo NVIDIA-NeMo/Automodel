@@ -227,3 +227,59 @@ def test_generation_config_sampling_fields_are_all_reachable_from_the_bench_cli(
         parser = module._build_parser()
         for field in sorted(sampling_fields):
             assert parser.get_default(field) is not None, f"{module.__name__} does not expose {field}"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "response,expected_tokens",
+    [({"usage": {"completion_tokens": 7}}, 7), ({"usage": {"completion_tokens": "7"}}, 0), ({}, 0), ([], 0)],
+)
+def test_workload_with_real_aiohttp_preserves_nested_messages(response, expected_tokens):
+    """Exercise the typed HTTP boundary against aiohttp, including malformed usage."""
+    import asyncio
+    import socket
+
+    from aiohttp import web
+
+    from nemo_automodel.components.speculative.bench_common import _run_workload
+    from nemo_automodel.components.speculative.regenerate import GenerationConfig
+
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+        {"role": "tool", "content": None, "tool_call_id": "call_1"},
+    ]
+
+    async def run():
+        received = []
+
+        async def complete(request: web.Request) -> web.Response:
+            received.append(await request.json())
+            return web.json_response(response)
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", complete)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            try:
+                await web.SockSite(runner, sock).start()
+                result = await _run_workload(
+                    f"http://127.0.0.1:{port}/v1",
+                    [messages],
+                    GenerationConfig(model="test", max_new_tokens=8, temperature=0.0, top_p=1.0, top_k=5),
+                    concurrency=1,
+                    timeout_s=5.0,
+                    max_retries=0,
+                )
+            finally:
+                await runner.cleanup()
+        assert received == [
+            {"model": "test", "messages": messages, "max_tokens": 8, "temperature": 0.0, "top_p": 1.0, "top_k": 5}
+        ]
+        assert result.completed == 1
+        assert result.failed == 0
+        assert result.output_tokens == expected_tokens
+
+    asyncio.run(run())
