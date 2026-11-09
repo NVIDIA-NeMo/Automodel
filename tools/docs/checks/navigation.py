@@ -27,7 +27,7 @@ from tools.docs.build.coverage_tables import (
     _load_model_releases,
     _resolve_model_card_routes,
 )
-from tools.docs.cards import _frontmatter_slug, _model_card_aliases, _model_card_paths
+from tools.docs.cards import _family_checkpoints, _frontmatter_slug, _model_card_aliases, _model_card_paths
 from tools.docs.catalog import (
     MAX_TOTAL_ENCODED_BYTES,
     PROVIDER_ORGS,
@@ -223,6 +223,9 @@ def _validate_provider_sections(repo_root: Path) -> None:
                     offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
                 hf_checkpoints = re.findall("https://huggingface\\.co/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", document)
                 canonical_publishers = {owner for (owner, checkpoint) in hf_checkpoints if checkpoint == model_id}
+                family_ids = _family_checkpoints(model_path)
+                if family_ids:
+                    canonical_publishers = {checkpoint.split("/", 1)[0] for checkpoint in family_ids}
                 if not canonical_publishers:
                     offenders.append(f"{path}: URL model ID {model_id!r} is not linked by the card")
                 expected_publisher = PROVIDER_ORGS.get(provider_slug)
@@ -286,18 +289,35 @@ def _validate_recipe_routes(repo_root: Path) -> None:
         raise ValueError(f"Duplicate model names within one provider index: {duplicates}")
     docs_config = yaml.safe_load((repo_root / "docs" / "fern" / "docs.yml").read_text(encoding="utf-8"))
     redirects = {redirect["source"]: redirect["destination"] for redirect in docs_config["redirects"]}
+    config_path = repo_root / "docs/fern/versions/nightly.yml"
+    navigation = yaml.safe_load(config_path.read_text(encoding="utf-8"))["navigation"]
+    navigated_routes = _collect_fern_routes(navigation, config_dir=config_path.parent)
     destinations_by_group: dict[tuple[str, tuple[str, str]], set[str]] = {}
     destination_groups: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    family_routes = {
+        f"/{_frontmatter_slug(path)}": checkpoints
+        for path in _model_card_paths(repo_root)
+        if (checkpoints := _family_checkpoints(path))
+    }
     missing = []
     for release in releases:
         destination = model_card_routes[release.hf_model_id, release.model_type]
+        if not destination.startswith("/model-coverage/"):
+            # The resolver verifies that this guide documents the exact checkpoint.
+            if release.model_type not in {"Embedding", "Reranking"} or destination not in navigated_routes:
+                raise ValueError(f"Invalid retrieval training guide destination: {destination}")
+            continue
         provider_href = destination.rsplit("/", 1)[0]
         if destination not in index_routes.get(provider_href, set()):
             missing.append((release.model_type, release.hf_model_id, f"provider index card {destination}"))
             continue
         group = (release.model_type, _model_size_key(release.hf_model_id))
         destinations_by_group.setdefault(group, set()).add(destination)
-        destination_groups.setdefault((release.model_type, destination), set()).add(group[1])
+        if destination in family_routes:
+            if release.hf_model_id not in family_routes[destination]:
+                raise ValueError(f"Family page {destination} does not declare checkpoint {release.hf_model_id}")
+        else:
+            destination_groups.setdefault((release.model_type, destination), set()).add(group[1])
     split_groups = {
         group: destinations for (group, destinations) in destinations_by_group.items() if len(destinations) != 1
     }

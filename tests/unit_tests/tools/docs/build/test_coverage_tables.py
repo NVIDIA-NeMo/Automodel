@@ -255,6 +255,43 @@ def test_recipe_model_redirects_are_case_insensitive(tmp_path):
     assert routes == {("org/Model", "LLM"): model_doc.docs_page}
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model_type", ["Embedding", "Reranking"])
+@pytest.mark.parametrize("guide_checkpoint", ["org/Base-1B", "other/Base-1B", None])
+def test_retrieval_base_checkpoint_redirect_requires_matching_guide(
+    tmp_path: Path, model_type: str, guide_checkpoint: str | None
+) -> None:
+    category = "embedding-models" if model_type == "Embedding" else "reranking-models"
+    route = "/recipes-e2e-examples/retrieval-base-models"
+    docs_config = tmp_path / "docs/fern/docs.yml"
+    docs_config.parent.mkdir(parents=True)
+    docs_config.write_text(
+        yaml.safe_dump(
+            {
+                "redirects": [
+                    {
+                        "source": f"/nemo/automodel/model-coverage/{category}/org/Base-1B",
+                        "destination": f"/nemo/automodel/nightly{route}",
+                    }
+                ]
+            }
+        )
+    )
+    if guide_checkpoint is not None:
+        guide = tmp_path / "docs/guides/retrieval-base-models.mdx"
+        guide.parent.mkdir(parents=True)
+        guide.write_text(
+            f'---\ntitle: "Train from a Base Checkpoint"\nslug: {route.lstrip("/")}\n---\n'
+            f"[Starting checkpoint](https://huggingface.co/{guide_checkpoint})\n"
+        )
+    release = _ModelRelease("2026-01-01", "org/Base-1B", "", model_type, "recipe.yaml")
+    if guide_checkpoint == "org/Base-1B":
+        assert _resolve_model_card_routes(tmp_path, [release], {}, []) == {("org/Base-1B", model_type): route}
+    else:
+        with pytest.raises(ValueError, match="missing:"):
+            _resolve_model_card_routes(tmp_path, [release], {}, [])
+
+
 def test_case_insensitive_redirect_cannot_shadow_a_canonical_card(tmp_path):
     docs_config_path = tmp_path / "docs" / "fern" / "docs.yml"
     docs_config_path.parent.mkdir(parents=True)
