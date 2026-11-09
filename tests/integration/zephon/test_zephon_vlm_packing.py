@@ -29,13 +29,13 @@ from nemo_automodel.components.datasets.zephon.vlm import (
     model_positions,
 )
 from nemo_automodel.components.models.qwen2_5_vl.preprocessing import Qwen2_5_VLPositionState
-from tests.utils.vlm_fixtures import inputs as inputs
+from tests.utils.vlm_fixtures import embedded_inputs as embedded_inputs
 from tests.utils.vlm_fixtures import processor as processor
 from tests.utils.vlm_fixtures import tiny_vlm_config
 
 
-def _pipeline(inputs, algorithm, runner, *, on_media_error="raise"):
-    processor_path, documents = inputs
+def _pipeline(embedded_inputs, algorithm, runner, *, on_media_error="raise"):
+    processor_path, documents = embedded_inputs
     source = StaticMixtureWorkSource(
         [Dataset.from_dict("images", {0: InMemoryShard(documents)})],
         {"images": 1.0},
@@ -76,8 +76,8 @@ def _convert(batch):
 
 
 @pytest.mark.parametrize("algorithm,runner", [("first_fit", "inline"), ("best_fit", "process")])
-def test_real_processor_packing_fields_and_replay(inputs, algorithm, runner):
-    pipeline = _pipeline(inputs, algorithm, runner)
+def test_real_processor_packing_fields_and_replay(embedded_inputs, algorithm, runner):
+    pipeline = _pipeline(embedded_inputs, algorithm, runner)
     pipeline.validate(strict=True)
     baseline = [_convert(batch) for batch in pipeline]
     assert len(baseline) >= 2  # Resume must have a nonempty suffix.
@@ -94,21 +94,21 @@ def test_real_processor_packing_fields_and_replay(inputs, algorithm, runner):
         assert not torch.equal(batch["pixel_values"], batch["pixel_values"].bfloat16().float())
         assert batch["labels"][batch["input_ids"].eq(9)].eq(-100).all()
         assert not batch["processor_attention_mask"][batch["padding_mask"]].any()
-    first = _pipeline(inputs, algorithm, runner)
+    first = _pipeline(embedded_inputs, algorithm, runner)
     with closing(iter(first)) as iterator:
         prefix = [_convert(next(iterator))]
         checkpoint = json.loads(json.dumps(first.checkpoint()))
-    resumed = _pipeline(inputs, algorithm, runner)
+    resumed = _pipeline(embedded_inputs, algorithm, runner)
     resumed.restore(checkpoint)
     actual = prefix + [_convert(batch) for batch in resumed]
     torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
 
 
-def test_corrupt_media_drop_survives_packing_and_checkpoint_replay(inputs, tmp_path):
-    processor_path, documents = inputs
+def test_corrupt_media_drop_survives_packing_and_checkpoint_replay(embedded_inputs, tmp_path):
+    processor_path, documents = embedded_inputs
     corrupt = tmp_path / "corrupt.png"
     corrupt.write_bytes(b"unreadable image")
-    invalid = {"conversation": [{"role": "user", "content": [{"type": "image", "image": str(corrupt)}]}]}
+    invalid = {"conversation": [{"role": "user", "content": [{"type": "image", "image": corrupt.read_bytes()}]}]}
     # Nine source records form complete three-record source chunks.
     corpus = processor_path, [invalid, *documents[:3], invalid, *documents[3:], invalid]
     baseline = [_convert(batch) for batch in _pipeline(corpus, "first_fit", "process", on_media_error="drop")]

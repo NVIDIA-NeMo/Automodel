@@ -14,10 +14,11 @@
 
 """Real native Qwen3-VL DeepStack consumption through the shared Zephon loader."""
 
-import json
 from copy import deepcopy
 from dataclasses import replace
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -48,20 +49,20 @@ from nemo_automodel.components.models.qwen3_vl.model import (
 from tests.utils.qwen3_vlm_fixtures import processor as processor
 from tests.utils.qwen3_vlm_fixtures import qwen2_processor as qwen2_processor
 from tests.utils.qwen3_vlm_fixtures import tiny_qwen3_vl_config
-from tests.utils.vlm_fixtures import inputs as inputs
+from tests.utils.vlm_fixtures import embedded_inputs as embedded_inputs
 from tests.utils.zephon_attention import compare_decoder_attention
 from tests.utils.zephon_positions import assert_joined_position_ranges
 
 
 @pytest.fixture
-def config(tmp_path, inputs):
+def config(tmp_path, embedded_inputs):
     directory = tmp_path / "corpus"
     directory.mkdir()
-    (directory / "images.jsonl").write_text("".join(json.dumps(document) + "\n" for document in inputs[1] * 3))
+    pq.write_table(pa.Table.from_pylist(embedded_inputs[1] * 3), directory / "images.parquet", row_group_size=3)
     return ZephonVlmDataloaderConfig(
         dataset_config=ZephonVlmDatasetConfig(
             zephon=ZephonVlmOptions(
-                sources=(ZephonSource(name="images", path=str(directory), fmt="jsonl"),),
+                sources=(ZephonSource(name="images", path=str(directory)),),
                 packing=ZephonPackingOptions(
                     seq_len=63,
                     pack_algorithm="first_fit",
@@ -71,7 +72,11 @@ def config(tmp_path, inputs):
                     shuffle_after_pack=False,
                 ),
                 source=ZephonSourceOptions(
-                    chunk_size=3, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                    chunk_size=3,
+                    shuffle_shards=False,
+                    shuffle_within_shard=False,
+                    shuffle_block_size=None,
+                    token_estimation=None,
                 ),
                 workers=ZephonWorkerOptions(tokenize_parallelism=1),
                 runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
@@ -89,9 +94,9 @@ def _model(backend="sdpa"):
     return cls(config).float().train()
 
 
-def _loader(config, inputs, model, *, packing_contract=PackingCapabilities("block_causal")):
+def _loader(config, embedded_inputs, model, *, packing_contract=PackingCapabilities("block_causal")):
     return config.build(
-        pretrained_model_name_or_path=inputs[0],
+        pretrained_model_name_or_path=embedded_inputs[0],
         dp_rank=0,
         dp_world_size=1,
         batch_size=2,
@@ -110,11 +115,11 @@ def _loss(logits, labels):
     return torch.nn.functional.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction="sum")
 
 
-def test_native_deepstack_packed_matches_separate_logits_loss_and_gradients(config, inputs):
+def test_native_deepstack_packed_matches_separate_logits_loss_and_gradients(config, embedded_inputs):
     torch.manual_seed(84)
     packed_model = _model()
     separate_model = deepcopy(packed_model)
-    packed_loader = _loader(config, inputs, packed_model)
+    packed_loader = _loader(config, embedded_inputs, packed_model)
     separate_loader = _loader(
         replace(
             config,
@@ -126,7 +131,7 @@ def test_native_deepstack_packed_matches_separate_logits_loss_and_gradients(conf
                 ),
             ),
         ),
-        inputs,
+        embedded_inputs,
         separate_model,
     )
     try:
@@ -169,7 +174,7 @@ def test_native_deepstack_packed_matches_separate_logits_loss_and_gradients(conf
 
 
 @pytest.mark.parametrize("backend", ["sdpa", "eager"])
-def test_xdoc_joins_coordinates_and_preserves_native_deepstack(config, inputs, backend):
+def test_xdoc_joins_coordinates_and_preserves_native_deepstack(config, embedded_inputs, backend):
     torch.manual_seed(85)
     model = _model(backend)
     config = replace(
@@ -178,7 +183,7 @@ def test_xdoc_joins_coordinates_and_preserves_native_deepstack(config, inputs, b
             config.dataset_config, zephon=replace(config.dataset_config.zephon, inject_fake_images=True)
         ),
     )
-    off_loader = _loader(config, inputs, model)
+    off_loader = _loader(config, embedded_inputs, model)
     on_loader = _loader(
         replace(
             config,
@@ -190,7 +195,7 @@ def test_xdoc_joins_coordinates_and_preserves_native_deepstack(config, inputs, b
                 ),
             ),
         ),
-        inputs,
+        embedded_inputs,
         model,
     )
     try:
@@ -218,7 +223,7 @@ def test_xdoc_joins_coordinates_and_preserves_native_deepstack(config, inputs, b
         on_loader.close()
 
 
-def test_process_worker_checkpoint_replays_expanded_qwen3_documents(config, inputs):
+def test_process_worker_checkpoint_replays_expanded_qwen3_documents(config, embedded_inputs):
     model = _model()
     config = replace(
         config,
@@ -231,7 +236,7 @@ def test_process_worker_checkpoint_replays_expanded_qwen3_documents(config, inpu
             ),
         ),
     )
-    original, restored = _loader(config, inputs, model), _loader(config, inputs, model)
+    original, restored = _loader(config, embedded_inputs, model), _loader(config, embedded_inputs, model)
     try:
         next(original)
         state = original.state_dict()
@@ -245,7 +250,7 @@ def test_process_worker_checkpoint_replays_expanded_qwen3_documents(config, inpu
         restored.close()
 
 
-def test_native_deepstack_flash_metadata_matches_dense_attention(config, inputs, monkeypatch):
+def test_native_deepstack_flash_metadata_matches_dense_attention(config, embedded_inputs, monkeypatch):
     model = _model()
     vision_calls = []
 
@@ -266,7 +271,7 @@ def test_native_deepstack_flash_metadata_matches_dense_attention(config, inputs,
             ),
         )
         loaders = [
-            _loader(selected, inputs, model, packing_contract=PackingCapabilities(kind))
+            _loader(selected, embedded_inputs, model, packing_contract=PackingCapabilities(kind))
             for kind in ("block_causal", "flash_varlen")
         ]
         try:

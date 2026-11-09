@@ -28,18 +28,19 @@ from nemo_automodel.components.datasets.zephon.vlm import (
     image_pixels,
     merge_image_documents,
 )
+from nemo_automodel.components.datasets.zephon.vlm_input import normalize_image_document
 from nemo_automodel.components.models.qwen2_5_vl.preprocessing import Qwen2_5_VLPositionState
-from tests.utils.vlm_fixtures import inputs as inputs
+from tests.utils.vlm_fixtures import embedded_inputs as embedded_inputs
 from tests.utils.vlm_fixtures import processor as processor
 from tests.utils.vlm_fixtures import tiny_vlm_config
 
 
-def test_position_state_matches_actual_model_and_operator_preserves_lineage(inputs, processor):
-    processor_path, documents = inputs
+def test_position_state_matches_actual_model_and_operator_preserves_lineage(embedded_inputs, processor):
+    processor_path, documents = embedded_inputs
     config = tiny_vlm_config()
     state = Qwen2_5_VLPositionState(config)
     model = Qwen2_5_VLForConditionalGeneration(config)
-    encoded = encode_vlm_document(documents[1], processor)
+    encoded = encode_vlm_document(normalize_image_document(documents[1]), processor)
     expected, _ = model.model.get_rope_index(
         encoded["input_ids"].unsqueeze(0),
         mm_token_type_ids=encoded["mm_token_type_ids"].unsqueeze(0),
@@ -156,10 +157,10 @@ def test_fake_prefix_preserves_shifted_targets_without_masking_other_document_st
     assert fake["labels"].tolist() == [-100, -100]
 
 
-def test_encoder_caps_only_independent_worker_threads(inputs, monkeypatch):
+def test_encoder_caps_only_independent_worker_threads(embedded_inputs, monkeypatch):
     from nemo_automodel.components.datasets.zephon import vlm
 
-    processor_path, _ = inputs
+    processor_path, _ = embedded_inputs
     operator = VlmEncoderConfig().build(
         pretrained_model_name_or_path=processor_path, positions=Qwen2_5_VLPositionState(tiny_vlm_config())
     )
@@ -178,13 +179,13 @@ def test_encoder_caps_only_independent_worker_threads(inputs, monkeypatch):
     assert vlm.os.environ["OMP_NUM_THREADS"] == "1" and vlm.os.environ["MKL_NUM_THREADS"] == "1"
 
 
-def test_encoder_fails_on_corrupt_media_without_dropping_or_replacing(inputs, tmp_path):
-    processor_path, documents = inputs
+def test_encoder_fails_on_corrupt_media_without_dropping_or_replacing(embedded_inputs, tmp_path):
+    processor_path, documents = embedded_inputs
     corrupt = tmp_path / "corrupt.png"
     corrupt.write_bytes(b"not an image")
     document = {
         "conversation": [
-            {"role": "user", "content": [{"type": "image", "image": str(corrupt)}]},
+            {"role": "user", "content": [{"type": "image", "image": corrupt.read_bytes()}]},
             {"role": "assistant", "content": [{"type": "text", "text": "the answer"}]},
         ]
     }
@@ -206,11 +207,13 @@ def test_encoder_fails_on_corrupt_media_without_dropping_or_replacing(inputs, tm
         operator.teardown()
 
 
-def test_encoder_media_drop_is_record_pure_and_does_not_hide_processor_failures(inputs, tmp_path, monkeypatch, caplog):
-    processor_path, documents = inputs
+def test_encoder_media_drop_is_record_pure_and_does_not_hide_processor_failures(
+    embedded_inputs, tmp_path, monkeypatch, caplog
+):
+    processor_path, documents = embedded_inputs
     corrupt = tmp_path / "corrupt.png"
     corrupt.write_bytes(b"not an image")
-    document = {"conversation": [{"role": "user", "content": [{"type": "image", "image": str(corrupt)}]}]}
+    document = {"conversation": [{"role": "user", "content": [{"type": "image", "image": corrupt.read_bytes()}]}]}
     operator = VlmEncoderConfig(on_media_error="drop").build(
         pretrained_model_name_or_path=processor_path, positions=Qwen2_5_VLPositionState(tiny_vlm_config())
     )
@@ -258,10 +261,10 @@ def test_media_token_mismatch_has_a_narrow_droppable_type(processor):
 
 
 @pytest.mark.parametrize("media_type", ["video", "audio"])
-def test_unsupported_media_is_rejected_before_encoding_even_with_drop_policy(inputs, monkeypatch, media_type):
+def test_unsupported_media_is_rejected_before_encoding_even_with_drop_policy(embedded_inputs, monkeypatch, media_type):
     from nemo_automodel.components.datasets.zephon import vlm
 
-    processor_path, _ = inputs
+    processor_path, _ = embedded_inputs
     operator = VlmEncoderConfig(on_media_error="drop").build(
         pretrained_model_name_or_path=processor_path, positions=Qwen2_5_VLPositionState(tiny_vlm_config())
     )
@@ -323,3 +326,29 @@ def test_encoder_parallelism_can_use_zephon_default(parallelism):
     operator = VlmEncoderConfig(parallelism=parallelism).build(pretrained_model_name_or_path="unused", positions=state)
     default_traits = OpTraits(preserves_cursor_order=True)
     assert operator.traits().parallelism == (default_traits.parallelism if parallelism is None else parallelism)
+
+
+def test_encoder_resolves_input_schema_from_work_source_ids(embedded_inputs):
+    from zephon.io import Dataset, InMemoryShard
+
+    from nemo_automodel.components.datasets.zephon.vlm_input import VlmInputOptions
+
+    processor_path, documents = embedded_inputs
+    image = documents[0]["conversation"][0]["content"][0]["image"]
+    payload = {"photo": image, "prompt": "Describe image", "response": "the answer"}
+    operator = VlmEncoderConfig(
+        on_media_error="drop",
+        inputs={
+            "captions": VlmInputOptions(column_mapping={"images": "photo", "question": "prompt", "answer": "response"})
+        },
+    ).build(pretrained_model_name_or_path=processor_path, positions=Qwen2_5_VLPositionState(tiny_vlm_config()))
+    dataset = Dataset.from_dict("captions", {0: InMemoryShard([payload])})
+    operator.setup(OpContext({"datasets_by_id": {7: dataset}}))
+    meta = SampleMeta(sample_id=(7, 0, 0), lane_id=0, chunk_id=0)
+    try:
+        record = operator.process_one(SampleRecord(meta=meta, payload=payload))[0]
+        assert record.meta is meta and record.payload["image_grid_thw"].tolist() == [[1, 6, 4]]
+        with pytest.raises(ValueError, match="captions: .*self-contained"):
+            operator.process_one(SampleRecord(meta=meta, payload={**payload, "photo": "/missing.png"}))
+    finally:
+        operator.teardown()

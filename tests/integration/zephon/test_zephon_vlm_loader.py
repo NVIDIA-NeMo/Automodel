@@ -19,6 +19,8 @@ from contextlib import closing
 from dataclasses import asdict, replace
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 import yaml
@@ -48,26 +50,30 @@ from nemo_automodel.components.models.common.packing import (
     configure_packing,
 )
 from nemo_automodel.recipes._typed_config import RecipeConfig
-from tests.utils.vlm_fixtures import inputs as inputs
+from tests.utils.vlm_fixtures import embedded_inputs as embedded_inputs
 from tests.utils.vlm_fixtures import processor as processor
 from tests.utils.vlm_fixtures import tiny_vlm_config
 from tests.utils.zephon_positions import assert_joined_position_ranges
 
 
 @pytest.fixture
-def config(tmp_path, inputs):
-    processor_path, documents = inputs
+def config(tmp_path, embedded_inputs):
+    processor_path, documents = embedded_inputs
     directory = tmp_path / "corpus"
     directory.mkdir()
-    (directory / "images.jsonl").write_text("".join(json.dumps(document) + "\n" for document in documents * 3))
+    pq.write_table(pa.Table.from_pylist(documents * 3), directory / "images.parquet", row_group_size=3)
     return ZephonVlmDatasetConfig(
         zephon=ZephonVlmOptions(
-            sources=(ZephonSource(name="images", path=str(directory), fmt="jsonl"),),
+            sources=(ZephonSource(name="images", path=str(directory)),),
             packing=ZephonPackingOptions(
                 seq_len=63, pack_algorithm="first_fit", pack_num_bins=2, shuffle_after_pack=False
             ),
             source=ZephonSourceOptions(
-                chunk_size=3, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                chunk_size=3,
+                shuffle_shards=False,
+                shuffle_within_shard=False,
+                shuffle_block_size=None,
+                token_estimation=None,
             ),
             workers=ZephonWorkerOptions(tokenize_parallelism=1),
             runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
@@ -75,14 +81,14 @@ def config(tmp_path, inputs):
     )
 
 
-def _build(config, inputs, *, pp_n_microbatches=None):
+def _build(config, embedded_inputs, *, pp_n_microbatches=None):
     model_config = tiny_vlm_config()
     model = Qwen2_5_VLForConditionalGeneration(model_config)
     if isinstance(config, ZephonVlmDatasetConfig):
         config = ZephonVlmDataloaderConfig(dataset_config=config)
     return config.build(
         training_schedule=DatasetBuildSchedule(2, 2, 10, None),
-        pretrained_model_name_or_path=inputs[0],
+        pretrained_model_name_or_path=embedded_inputs[0],
         dp_rank=0,
         dp_world_size=1,
         batch_size=2,
@@ -91,10 +97,10 @@ def _build(config, inputs, *, pp_n_microbatches=None):
     ).dataloader
 
 
-def test_example_yaml_route_reads_actual_local_image_source(config, inputs):
+def test_example_yaml_route_reads_actual_local_image_source(config, embedded_inputs):
     path = Path(__file__).resolve().parents[3] / "examples/vlm_finetune/zephon/train.yaml"
     values = yaml.safe_load(path.read_text())
-    values["model"]["pretrained_model_name_or_path"] = inputs[0]
+    values["model"]["pretrained_model_name_or_path"] = embedded_inputs[0]
     values["processor"] = {}
     settings = values["dataset"]["zephon"]
     settings["sources"] = [asdict(source) for source in config.zephon.sources]
@@ -104,16 +110,16 @@ def test_example_yaml_route_reads_actual_local_image_source(config, inputs):
     assert isinstance(resolved, VlmDataloaderConfig)
     assert isinstance(resolved, ZephonVlmDataloaderConfig)
     assert isinstance(resolved.dataset_config, ZephonVlmDatasetConfig)
-    with closing(_build(resolved, inputs)) as loader:
+    with closing(_build(resolved, embedded_inputs)) as loader:
         batch = next(loader)
         assert batch["input_ids"].shape == (2, 40)
         assert batch["labels"].ne(-100).any()
         assert batch["image_grid_thw"].shape[0] > 0
 
 
-def test_real_loader_checkpoint_and_expanded_media(config, inputs):
+def test_real_loader_checkpoint_and_expanded_media(config, embedded_inputs):
     config = replace(config, zephon=replace(config.zephon, runtime=replace(config.zephon.runtime, runner="process")))
-    original, restored = _build(config, inputs), _build(config, inputs)
+    original, restored = _build(config, embedded_inputs), _build(config, embedded_inputs)
     try:
         first = next(original)
         state = original.state_dict()
@@ -143,12 +149,12 @@ def _forward(model, batch):
 
 
 @pytest.mark.parametrize("attention", ["sdpa", "eager"])
-def test_actual_adapter_xdoc_policy_and_backward(config, inputs, attention):
+def test_actual_adapter_xdoc_policy_and_backward(config, embedded_inputs, attention):
     torch.manual_seed(123)
     model_config = tiny_vlm_config()
     model_config._attn_implementation = attention
     model = Qwen2_5_VLForConditionalGeneration(model_config).train()
-    off_loader = _build(config, inputs)
+    off_loader = _build(config, embedded_inputs)
     on_loader = _build(
         replace(
             config,
@@ -156,7 +162,7 @@ def test_actual_adapter_xdoc_policy_and_backward(config, inputs, attention):
                 config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=True)
             ),
         ),
-        inputs,
+        embedded_inputs,
     )
     try:
         off, on = next(off_loader), next(on_loader)
@@ -189,7 +195,7 @@ def test_actual_adapter_xdoc_policy_and_backward(config, inputs, attention):
         on_loader.close()
 
 
-def test_unsupported_modes_fail_before_iteration(config, inputs):
+def test_unsupported_modes_fail_before_iteration(config, embedded_inputs):
     with pytest.raises(ValueError, match="first_fit or best_fit"):
         replace(
             config,
@@ -204,7 +210,7 @@ def test_unsupported_modes_fail_before_iteration(config, inputs):
         config.validate_parallelism(cp_size=2)
     config.validate_parallelism(cp_size=1)
     with pytest.raises(ValueError, match="evenly divide"):
-        _build(config, inputs, pp_n_microbatches=3)
+        _build(config, embedded_inputs, pp_n_microbatches=3)
     with pytest.raises(ValueError, match="no certified"):
         resolve_image_position_state(
             LlamaForCausalLM(
@@ -220,10 +226,10 @@ def test_unsupported_modes_fail_before_iteration(config, inputs):
         )
 
 
-def test_text_only_without_fake_images_omits_media(config, inputs, tmp_path):
+def test_text_only_without_fake_images_omits_media(config, embedded_inputs, tmp_path):
     directory = tmp_path / "text-only"
     directory.mkdir()
-    document = inputs[1][2]
+    document = embedded_inputs[1][2]
     (directory / "text.jsonl").write_text("".join(json.dumps(document) + "\n" for _ in range(12)))
     config = replace(
         config,
@@ -233,7 +239,7 @@ def test_text_only_without_fake_images_omits_media(config, inputs, tmp_path):
             sources=(ZephonSource(name="text", path=str(directory), fmt="jsonl"),),
         ),
     )
-    with closing(_build(config, inputs)) as loader:
+    with closing(_build(config, embedded_inputs)) as loader:
         batch = next(loader)
         assert "pixel_values" not in batch and "image_grid_thw" not in batch
         model_config = tiny_vlm_config()
@@ -241,9 +247,9 @@ def test_text_only_without_fake_images_omits_media(config, inputs, tmp_path):
         assert torch.isfinite(_forward(Qwen2_5_VLForConditionalGeneration(model_config), batch)).all()
 
 
-def test_pipeline_media_ownership_preserves_packed_documents(config, inputs):
-    ordinary = _build(config, inputs)
-    pipeline = _build(config, inputs, pp_n_microbatches=2)
+def test_pipeline_media_ownership_preserves_packed_documents(config, embedded_inputs):
+    ordinary = _build(config, embedded_inputs)
+    pipeline = _build(config, embedded_inputs, pp_n_microbatches=2)
     try:
         expected, actual = next(ordinary), next(pipeline)
         chunks = actual.pop("_vlm_pp_media_chunks")
@@ -259,7 +265,7 @@ def test_pipeline_media_ownership_preserves_packed_documents(config, inputs):
         pipeline.close()
 
 
-def test_parent_position_factory_and_processor_context_do_not_enter_workers(config, inputs, monkeypatch):
+def test_parent_position_factory_and_processor_context_do_not_enter_workers(config, embedded_inputs, monkeypatch):
     import os
     import threading
     from contextlib import contextmanager
@@ -297,7 +303,7 @@ def test_parent_position_factory_and_processor_context_do_not_enter_workers(conf
     monkeypatch.setattr(pipeline_module, "create_source_pipeline", create_source_after_context)
     result = ZephonVlmDataloaderConfig(dataset_config=config).build(
         training_schedule=DatasetBuildSchedule(2, 2, 10, None),
-        pretrained_model_name_or_path=inputs[0],
+        pretrained_model_name_or_path=embedded_inputs[0],
         dp_rank=0,
         dp_world_size=1,
         batch_size=2,
@@ -316,7 +322,7 @@ def test_parent_position_factory_and_processor_context_do_not_enter_workers(conf
 
     with pytest.raises(ValueError, match="context parallel"):
         ZephonVlmDataloaderConfig(dataset_config=config).build(
-            pretrained_model_name_or_path=inputs[0],
+            pretrained_model_name_or_path=embedded_inputs[0],
             dp_rank=0,
             dp_world_size=1,
             batch_size=2,
@@ -325,13 +331,13 @@ def test_parent_position_factory_and_processor_context_do_not_enter_workers(conf
         )
 
 
-def test_thd_image_pipeline_keeps_expanded_positions_pixels_and_shifted_labels(config, inputs):
+def test_thd_image_pipeline_keeps_expanded_positions_pixels_and_shifted_labels(config, embedded_inputs):
     from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
 
     config = replace(config, zephon=replace(config.zephon, inject_fake_images=False))
     with (
-        closing(_build(config, inputs)) as batched,
-        closing(_build(replace(config, output_format="thd"), inputs)) as thd,
+        closing(_build(config, embedded_inputs)) as batched,
+        closing(_build(replace(config, output_format="thd"), embedded_inputs)) as thd,
     ):
         expected, actual = next(batched), next(thd)
         assert actual["qkv_format"] == "thd"

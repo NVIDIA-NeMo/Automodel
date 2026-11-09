@@ -14,10 +14,11 @@
 
 """Leading fake segments preserve whole documents and unblock mixed-data Flash."""
 
-import json
 from contextlib import closing
 from dataclasses import replace
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 from PIL import Image
@@ -39,6 +40,7 @@ from nemo_automodel.components.datasets.zephon.vlm_config import (
     ZephonVlmDatasetConfig,
     ZephonVlmOptions,
 )
+from nemo_automodel.components.datasets.zephon.vlm_input import normalize_image_document
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import configure_packing
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
@@ -89,7 +91,7 @@ def _source(tmp_path, processor):
             "conversation": [
                 {
                     "role": "user",
-                    "content": ([{"type": "image", "image": str(image)}] if with_image else [])
+                    "content": ([{"type": "image", "image": image.read_bytes()}] if with_image else [])
                     + [{"type": "text", "text": "Describe image"}],
                 },
                 {"role": "assistant", "content": [{"type": "text", "text": "the answer"}]},
@@ -104,11 +106,11 @@ def _source(tmp_path, processor):
     ]
     corpus = tmp_path / "corpus"
     corpus.mkdir()
-    (corpus / "images.jsonl").write_text("".join(json.dumps(item) + "\n" for item in documents * 2))
+    pq.write_table(pa.Table.from_pylist(documents * 2), corpus / "images.parquet", row_group_size=2)
     return documents, ZephonVlmDataloaderConfig(
         dataset_config=ZephonVlmDatasetConfig(
             zephon=ZephonVlmOptions(
-                sources=(ZephonSource(name="images", path=str(corpus), fmt="jsonl"),),
+                sources=(ZephonSource(name="images", path=str(corpus)),),
                 packing=ZephonPackingOptions(
                     seq_len=255,
                     pack_algorithm="first_fit",
@@ -118,7 +120,11 @@ def _source(tmp_path, processor):
                     shuffle_after_pack=False,
                 ),
                 source=ZephonSourceOptions(
-                    chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                    chunk_size=4,
+                    shuffle_shards=False,
+                    shuffle_within_shard=False,
+                    shuffle_block_size=None,
+                    token_estimation=None,
                 ),
                 workers=ZephonWorkerOptions(fetch_parallelism=1, tokenize_parallelism=1),
                 runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
@@ -155,7 +161,10 @@ def test_leading_fake_only_for_all_text_packs_preserves_source_accounting_and_ou
     position_state = resolve_image_position_state(model)
     fake = prepare_fake_image_document(processor, position_state)
     fake_length = len(fake["input_ids"])
-    raw_documents = [encode_vlm_document(document, processor, inject_fake_images=False) for document in documents]
+    raw_documents = [
+        encode_vlm_document(normalize_image_document(document), processor, inject_fake_images=False)
+        for document in documents
+    ]
     from nemo_automodel.components.datasets.zephon import vlm as vlm_module
 
     collated_inputs = []
@@ -275,18 +284,20 @@ def test_reserved_fake_capacity_validation_oversized_policy_and_process_resume(f
             {"role": "assistant", "content": [{"type": "text", "text": "the answer"}]},
         ]
     }
-    length = len(encode_vlm_document(oversized, processor, inject_fake_images=False)["input_ids"])
+    length = len(
+        encode_vlm_document(normalize_image_document(oversized), processor, inject_fake_images=False)["input_ids"]
+    )
     assert capacity < length <= full_capacity  # Fits full capacity, but not after the explicit reserve.
     corpus = tmp_path / "oversized"
     corpus.mkdir()
-    (corpus / "images.jsonl").write_text("".join(json.dumps(oversized) + "\n" for _ in range(4)))
+    pq.write_table(pa.Table.from_pylist([oversized] * 4), corpus / "images.parquet", row_group_size=2)
     selected = replace(
         config,
         dataset_config=replace(
             config.dataset_config,
             zephon=replace(
                 config.dataset_config.zephon,
-                sources=(ZephonSource(name="images", path=str(corpus), fmt="jsonl"),),
+                sources=(ZephonSource(name="images", path=str(corpus)),),
                 packing=replace(config.dataset_config.zephon.packing, seq_len=full_capacity - 1, drop_oversized=False),
             ),
         ),

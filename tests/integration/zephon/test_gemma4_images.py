@@ -15,9 +15,10 @@
 """Real Gemma4 image encoding, packed attention and process-worker replay on CPU."""
 
 import copy
-import json
 from contextlib import closing
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 from PIL import Image
@@ -38,6 +39,7 @@ from nemo_automodel.components.datasets.zephon.vlm_config import (
     ZephonVlmDatasetConfig,
     ZephonVlmOptions,
 )
+from nemo_automodel.components.datasets.zephon.vlm_input import normalize_image_document
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     validate_hf_model_for_pipeline_support,
 )
@@ -61,7 +63,7 @@ def source(tmp_path):
     for color in ("red", "blue"):
         path = tmp_path / f"{color}.png"
         Image.new("RGB", (8, 8), color).save(path)
-        images.append(str(path))
+        images.append(path.read_bytes())
     documents = []
     for paths in ([images[0]], [images[1]], [], images):
         documents.append(
@@ -78,7 +80,7 @@ def source(tmp_path):
         )
     corpus = tmp_path / "corpus"
     corpus.mkdir()
-    (corpus / "images.jsonl").write_text("".join(json.dumps(document) + "\n" for document in documents * 2))
+    pq.write_table(pa.Table.from_pylist(documents * 2), corpus / "images.parquet", row_group_size=2)
     return tmp_path, documents, processor
 
 
@@ -100,7 +102,7 @@ def _loader(source, model, *, runner="inline", fake=False, max_documents=2, xdoc
     config = ZephonVlmDataloaderConfig(
         dataset_config=ZephonVlmDatasetConfig(
             zephon=ZephonVlmOptions(
-                sources=(ZephonSource(name="images", path=str(directory / "corpus"), fmt="jsonl"),),
+                sources=(ZephonSource(name="images", path=str(directory / "corpus")),),
                 packing=ZephonPackingOptions(
                     seq_len=255,
                     pack_algorithm="first_fit",
@@ -110,7 +112,11 @@ def _loader(source, model, *, runner="inline", fake=False, max_documents=2, xdoc
                     shuffle_after_pack=False,
                 ),
                 source=ZephonSourceOptions(
-                    chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                    chunk_size=4,
+                    shuffle_shards=False,
+                    shuffle_within_shard=False,
+                    shuffle_block_size=None,
+                    token_estimation=None,
                 ),
                 training=ZephonTrainingOptions(mask_segment_starts=True, allow_cross_document_attention=xdoc),
                 workers=ZephonWorkerOptions(tokenize_parallelism=1),
@@ -152,7 +158,10 @@ def test_packed_images_match_separate_native_documents_and_gradients(source, bac
     with closing(_loader(source, model)) as loader:
         batch = next(loader)
     _, documents, processor = source
-    encoded = [encode_vlm_document(document, processor, inject_fake_images=False) for document in documents[:2]]
+    encoded = [
+        encode_vlm_document(normalize_image_document(document), processor, inject_fake_images=False)
+        for document in documents[:2]
+    ]
     valid = batch["_packed_seq_ids"].gt(0)
     expected_ids = torch.cat([document["input_ids"] for document in encoded])
     torch.testing.assert_close(batch["input_ids"][valid], expected_ids)

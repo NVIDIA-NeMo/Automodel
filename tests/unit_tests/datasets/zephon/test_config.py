@@ -32,10 +32,12 @@ from nemo_automodel.components.datasets.loader import (
     make_dataset_config,
 )
 from nemo_automodel.components.datasets.zephon.config import (
+    ZephonCacheOptions,
     ZephonDataloaderConfig,
     ZephonInstructionDatasetConfig,
     ZephonOptions,
     ZephonPackingOptions,
+    ZephonParquetRGCacheOptions,
     ZephonPrefetchOptions,
     ZephonPretokenizedTextDatasetConfig,
     ZephonRuntimeOptions,
@@ -985,3 +987,46 @@ def test_source_prefetch_toml_overrides_preserve_fields_and_allow_disabling(tmp_
         dataset = ZephonTextDatasetConfig(zephon=values)
         assert dataset.zephon.source.prefetch == expected
         assert values == original
+
+
+def test_cache_overrides_preserve_automatic_defaults_and_explicit_disable() -> None:
+    from zephon.io import StoreOptions
+
+    assert ZephonCacheOptions().build() == StoreOptions.from_any(None)
+    options = ZephonCacheOptions(
+        cache_dir="/cache",
+        cache_limit_bytes="80gb",
+        parquet_rg_cache=ZephonParquetRGCacheOptions(enabled=False, limit_bytes="8gb", min_free_bytes=0),
+    ).build()
+    assert options.cache.enabled and options.cache.limit_bytes == 80 * 1024**3
+    assert options.parquet.rg_cache.enabled is False
+    assert options.parquet.rg_cache.limit_bytes == 8 * 1024**3
+    assert options.parquet.rg_cache.min_free_bytes == 0
+    decoded_only = ZephonCacheOptions(parquet_rg_cache=ZephonParquetRGCacheOptions(root="/decoded")).build()
+    assert not decoded_only.cache.enabled
+    assert str(decoded_only.parquet.rg_cache.root) == "/decoded"
+
+
+def test_decoded_cache_rejects_invalid_budgets_through_zephon() -> None:
+    with pytest.raises(ValueError, match="limit_bytes must be positive"):
+        ZephonParquetRGCacheOptions(limit_bytes=0).build()
+    with pytest.raises(ValueError, match="min_free_bytes cannot be negative"):
+        ZephonParquetRGCacheOptions(min_free_bytes=-1).build()
+
+
+def test_nested_decoded_cache_toml_overrides_preserve_fields_and_resolve_paths(tmp_path: Path) -> None:
+    path = tmp_path / "data.toml"
+    path.write_text(
+        '[cache.parquet_rg_cache]\nroot="decoded"\nlimit_bytes="2gb"\n[[sources]]\nname="text"\npath="corpus"\n'
+    )
+    values = {"data_config": str(path), "cache": {"parquet_rg_cache": {"enabled": False, "min_free_bytes": 0}}}
+    original = deepcopy(values)
+    options = ZephonTextDatasetConfig(zephon=values).zephon.cache.parquet_rg_cache
+    assert options == ZephonParquetRGCacheOptions(
+        root=str(tmp_path / "decoded"), limit_bytes="2gb", enabled=False, min_free_bytes=0
+    )
+    assert values == original
+    disabled = ZephonTextDatasetConfig(zephon={"data_config": str(path), "cache": {"parquet_rg_cache": None}})
+    assert disabled.zephon.cache.parquet_rg_cache is None
+    with pytest.raises(ValueError, match="Unexpected Zephon cache.parquet_rg_cache"):
+        ZephonTextDatasetConfig(zephon={"cache": {"parquet_rg_cache": {"limit": 17}}})

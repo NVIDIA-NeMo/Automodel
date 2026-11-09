@@ -14,11 +14,11 @@
 
 """Real offline Pixtral encoding, Zephon packing and native Mistral3 TP/PP."""
 
-import json
 from contextlib import closing
 from datetime import timedelta
 from pathlib import Path
 
+import pyarrow.parquet as pq
 import pytest
 import torch
 import torch.distributed as dist
@@ -26,6 +26,7 @@ import yaml
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoConfig, Mistral3ForConditionalGeneration
 
+from examples.vlm_finetune.zephon.prepare_data import export_jsonl
 from nemo_automodel._transformers.registry import resolve_image_position_state
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
@@ -48,6 +49,7 @@ from nemo_automodel.components.datasets.zephon.vlm_config import (
     ZephonVlmDatasetConfig,
     ZephonVlmOptions,
 )
+from nemo_automodel.components.datasets.zephon.vlm_input import normalize_image_document
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.models.common.packing import (
     PackingCapabilities,
@@ -69,6 +71,7 @@ from tests.utils.zephon_positions import assert_joined_position_ranges
 @pytest.fixture
 def source(tmp_path):
     prepare(tmp_path, count=12)
+    export_jsonl(tmp_path / "corpus/images.jsonl", tmp_path / "embedded-corpus")
     return tmp_path
 
 
@@ -92,7 +95,7 @@ def _loader(
     config = ZephonVlmDataloaderConfig(
         dataset_config=ZephonVlmDatasetConfig(
             zephon=ZephonVlmOptions(
-                sources=(ZephonSource(name="images", path=str(Path(source) / "corpus"), fmt="jsonl"),),
+                sources=(ZephonSource(name="images", path=str(Path(source) / "embedded-corpus")),),
                 packing=ZephonPackingOptions(
                     seq_len=63,
                     pack_algorithm="first_fit",
@@ -102,7 +105,11 @@ def _loader(
                     shuffle_after_pack=False,
                 ),
                 source=ZephonSourceOptions(
-                    chunk_size=4, shuffle_shards=False, shuffle_within_shard=False, shuffle_block_size=None
+                    chunk_size=4,
+                    shuffle_shards=False,
+                    shuffle_within_shard=False,
+                    shuffle_block_size=None,
+                    token_estimation=None,
                 ),
                 workers=ZephonWorkerOptions(tokenize_parallelism=1),
                 runtime=ZephonRuntimeOptions(runner="inline", mtp_mode=False),
@@ -147,8 +154,9 @@ def test_training_recipe_uses_local_processor_and_preserves_expanded_images(sour
         "pretrained_model_name_or_path": str(source / "processor"),
     }
     settings = values["dataset"]["zephon"]
-    settings["sources"] = [{"name": "images", "path": str(source / "corpus")}]
+    settings["sources"] = [{"name": "images", "path": str(source / "embedded-corpus")}]
     settings["packing"]["seq_len"] = 63
+    settings.setdefault("source", {})["chunk_size"] = 4
     settings.setdefault("runtime", {}).update(runner="inline", mtp_mode=False)
     settings["checkpoint"].update(aggregate_store=None, run_id=None)
     resolved = RecipeConfig(ConfigNode(values)).vlm_dataloader
@@ -179,7 +187,7 @@ def test_training_recipe_uses_local_processor_and_preserves_expanded_images(sour
 @pytest.mark.parametrize("backend", ["sdpa", "eager"])
 def test_native_processor_fields_and_packed_attention_policy(source, backend):
     processor = build_processor()
-    document = json.loads((source / "corpus/images.jsonl").read_text().splitlines()[2])
+    document = pq.read_table(source / "embedded-corpus").to_pylist()[2]
     native = processor.apply_chat_template(
         document["conversation"],
         tokenize=True,
@@ -187,7 +195,7 @@ def test_native_processor_fields_and_packed_attention_policy(source, backend):
         return_tensors="pt",
         return_assistant_tokens_mask=True,
     )
-    encoded = encode_vlm_document(document, processor, inject_fake_images=False)
+    encoded = encode_vlm_document(normalize_image_document(document), processor, inject_fake_images=False)
     torch.testing.assert_close(encoded["image_sizes"], native["image_sizes"])
     torch.testing.assert_close(encoded["pixel_values"], native["pixel_values"])
     torch.testing.assert_close(encoded["input_ids"], native["input_ids"][0])

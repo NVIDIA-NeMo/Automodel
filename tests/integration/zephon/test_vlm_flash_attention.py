@@ -29,14 +29,14 @@ from tests.integration.zephon.test_mistral3_images import _loader as mistral_loa
 from tests.integration.zephon.test_mistral3_images import _model as mistral_model
 from tests.integration.zephon.test_mistral3_images import source as source
 from tests.integration.zephon.test_zephon_vlm_loader import config as config
-from tests.utils.vlm_fixtures import inputs as inputs
+from tests.utils.vlm_fixtures import embedded_inputs as embedded_inputs
 from tests.utils.vlm_fixtures import processor as processor
 from tests.utils.vlm_fixtures import tiny_vlm_config
 from tests.utils.zephon_attention import compare_decoder_attention
 
 
 @pytest.mark.parametrize("backend", ["sdpa", "flash_attention_2"])
-def test_vlm_configured_backend_reaches_packed_loader(config, inputs, backend, monkeypatch):
+def test_vlm_configured_backend_reaches_packed_loader(config, embedded_inputs, backend, monkeypatch):
     from types import SimpleNamespace
 
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -69,7 +69,7 @@ def test_vlm_configured_backend_reaches_packed_loader(config, inputs, backend, m
     loader_config = ZephonVlmDataloaderConfig(dataset_config=config)
     with closing(
         loader_config.build(
-            pretrained_model_name_or_path=inputs[0],
+            pretrained_model_name_or_path=embedded_inputs[0],
             dp_rank=0,
             dp_world_size=1,
             batch_size=2,
@@ -92,7 +92,7 @@ def test_vlm_configured_backend_reaches_packed_loader(config, inputs, backend, m
             assert received["cu_seq_lens_q"].numel() > 3
 
 
-def test_qwen_mrope_and_media_reach_flash_decoder_unchanged(config, inputs, monkeypatch):
+def test_qwen_mrope_and_media_reach_flash_decoder_unchanged(config, embedded_inputs, monkeypatch):
     torch.manual_seed(84)
     model = Qwen2_5_VLForConditionalGeneration(tiny_vlm_config()).train()
     for xdoc in (False, True):
@@ -107,7 +107,7 @@ def test_qwen_mrope_and_media_reach_flash_decoder_unchanged(config, inputs, monk
         loader_config = ZephonVlmDataloaderConfig(dataset_config=selected)
         loaders = [
             loader_config.build(
-                pretrained_model_name_or_path=inputs[0],
+                pretrained_model_name_or_path=embedded_inputs[0],
                 dp_rank=0,
                 dp_world_size=1,
                 batch_size=2,
@@ -148,7 +148,7 @@ def test_mistral_images_and_scalar_positions_reach_flash_decoder_unchanged(sourc
 
 
 @pytest.mark.parametrize("xdoc", [False, True])
-def test_flash_accepts_default_fake_policy_for_mixed_documents(config, inputs, xdoc):
+def test_flash_accepts_default_fake_policy_for_mixed_documents(config, embedded_inputs, xdoc):
     config = replace(
         config,
         zephon=replace(config.zephon, training=replace(config.zephon.training, allow_cross_document_attention=xdoc)),
@@ -157,7 +157,7 @@ def test_flash_accepts_default_fake_policy_for_mixed_documents(config, inputs, x
     loader_config = ZephonVlmDataloaderConfig(dataset_config=config)
     with closing(
         loader_config.build(
-            pretrained_model_name_or_path=inputs[0],
+            pretrained_model_name_or_path=embedded_inputs[0],
             dp_rank=0,
             dp_world_size=1,
             batch_size=2,
