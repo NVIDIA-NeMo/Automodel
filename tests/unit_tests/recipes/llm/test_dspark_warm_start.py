@@ -185,3 +185,20 @@ def test_an_earlier_run_with_other_settings_is_refused(tmp_path, overrides, fiel
         _load(draft, _write_earlier_run(tmp_path), **overrides)
 
     torch.testing.assert_close(draft.fc.weight.detach(), fc_before, rtol=0, atol=0)
+
+
+def test_a_file_inside_an_earlier_run_is_checked_too(tmp_path):
+    consolidated = _write_earlier_run(tmp_path)
+
+    with pytest.raises(ValueError, match="mask_token_id"):
+        _load(_Draft(), f"{consolidated}/model.safetensors", mask=6)
+
+
+def test_an_earlier_run_without_recorded_settings_loads(tmp_path):
+    consolidated = _write_earlier_run(tmp_path)
+    torch.save({}, tmp_path / "epoch_0_step_8" / "dspark_meta.pt")
+    draft = _Draft()
+
+    _load(draft, consolidated)
+
+    assert (draft.fc.weight == 5).all()
