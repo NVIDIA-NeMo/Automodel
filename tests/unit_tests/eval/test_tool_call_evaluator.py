@@ -307,3 +307,72 @@ def test_sample_shard_property_round_trips_and_drives_sharding(monkeypatch):
 
     evaluator._samples_cache = [{"i": i} for i in range(8)]
     assert evaluator._iter_my_samples() == [{"i": 1}, {"i": 5}]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("output_kind", ["model_output", "tensor", "tuple", "list"])
+def test_manual_greedy_matches_real_transformers_model(output_kind):
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    torch.manual_seed(17)
+    model = GPT2LMHeadModel(
+        GPT2Config(
+            vocab_size=16,
+            n_positions=16,
+            n_embd=8,
+            n_layer=1,
+            n_head=1,
+            eos_token_id=None,
+            pad_token_id=0,
+            bos_token_id=1,
+        )
+    ).eval()
+    input_ids = torch.tensor([[1, 3], [1, 4]])
+    attention_mask = torch.ones_like(input_ids)
+    original_ids, original_mask = input_ids.clone(), attention_mask.clone()
+
+    def forward(*, input_ids, attention_mask):
+        output = model(input_ids=input_ids, attention_mask=attention_mask)
+        if output_kind == "tensor":
+            return output.logits
+        if output_kind == "tuple":
+            return (output.logits,)
+        if output_kind == "list":
+            return [output.logits]
+        return output
+
+    evaluator = ToolCallAccuracyEvaluator(path="unused.jsonl")
+    with torch.inference_mode():
+        actual = evaluator._greedy_generate_manual(forward, input_ids, attention_mask, 3, None)
+        expected = model.generate(
+            input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=3, do_sample=False, use_cache=False
+        )
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(input_ids, original_ids)
+    torch.testing.assert_close(attention_mask, original_mask)
+    assert actual.shape == (2, 5)
+    assert evaluator._greedy_generate_manual(forward, input_ids, attention_mask, 0, None) is input_ids
+
+
+@pytest.mark.cpu
+def test_render_prompt_with_real_transformers_tokenizer():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1, "assistant": 2}, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    tokenizer.chat_template = (
+        "{% for message in messages %}{{ message['content'] }} {% endfor %}"
+        "{% if add_generation_prompt %}assistant{% endif %}"
+    )
+    evaluator = ToolCallAccuracyEvaluator(path="unused.jsonl")
+    assert evaluator._render_prompt_ids(
+        tokenizer,
+        {
+            "prompt_messages": [{"role": "user", "content": "hello"}],
+            "tools": None,
+        },
+    ) == [1, 2]
