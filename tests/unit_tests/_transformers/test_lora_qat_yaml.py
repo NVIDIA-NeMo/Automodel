@@ -38,6 +38,7 @@ def test_example_ci_preserves_supported_smoke_topology(path: Path) -> None:
     raw = load_yaml_config(path).raw_config
     ci = raw["ci"]
     assert isinstance(ci["recipe_owner"], str) and ci["recipe_owner"].strip()
+    assert ci["cluster_tag"] == "h100"
     hours, minutes, seconds = (int(part) for part in ci["time"].split(":"))
     assert hours >= 0 and 0 <= minutes < 60 and 0 <= seconds < 60
     assert hours * 3600 + minutes * 60 + seconds > 0

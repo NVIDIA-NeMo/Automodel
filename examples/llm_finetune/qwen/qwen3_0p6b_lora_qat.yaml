@@ -105,6 +105,7 @@ checkpoint:
 
 ci:
   recipe_owner: hasuoshenyun
+  cluster_tag: h100
   time: "00:15:00"
   nodes: 1
   # This reference smoke requires exactly one rank, regardless of cluster defaults.

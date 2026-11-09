@@ -144,6 +144,7 @@ checkpoint:
 
 ci:
   recipe_owner: hasuoshenyun
+  cluster_tag: h100
   time: "00:30:00"
   # EP32 requires exactly 4 x 8 ranks; do not scale nodes with the cluster default.
   nodes: 4
