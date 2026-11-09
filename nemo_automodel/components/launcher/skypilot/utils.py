@@ -39,7 +39,7 @@ _CLOUD_CLASSES = {
 
 
 def _get_cloud(cloud_name: str) -> sky.Cloud:
-    """Return a sky cloud object for the given cloud name string."""
+    """Return the SkyPilot cloud instance for the given cloud name string."""
     import sky
 
     cls_name = _CLOUD_CLASSES[cloud_name.lower()]
