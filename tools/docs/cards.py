@@ -14,11 +14,42 @@
 
 """Discover model cards by route, preserving their published source paths."""
 
+import re
 from pathlib import Path
 
 import yaml
 
 from tools.docs.catalog import MODEL_TYPE_ROUTE_CATEGORIES
+
+
+def _family_checkpoints(path: Path) -> set[str]:
+    """Read and validate the explicit checkpoint membership of a model family page."""
+    document = path.read_text(encoding="utf-8")
+    if not document.startswith("---\n"):
+        return set()
+    metadata = yaml.safe_load(document.split("---", 2)[1]) or {}
+    if "checkpoints" not in metadata:
+        return set()
+    checkpoints = metadata["checkpoints"]
+    title = metadata.get("title", "")
+    if (
+        not isinstance(checkpoints, list)
+        or not checkpoints
+        or not all(isinstance(item, str) for item in checkpoints)
+        or len(set(checkpoints)) != len(checkpoints)
+    ):
+        raise ValueError(f"{path}: checkpoints must be a nonempty list of unique Hugging Face model IDs")
+    linked = set(re.findall(r"https://huggingface\.co/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)", document))
+    for checkpoint in checkpoints:
+        if (
+            re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", checkpoint) is None
+            or not checkpoint.split("/", 1)[1].startswith(f"{title}-")
+            or checkpoint not in linked
+        ):
+            raise ValueError(f"{path}: family checkpoint {checkpoint!r} must match the title and have an exact HF link")
+    if len({checkpoint.split("/", 1)[0] for checkpoint in checkpoints}) != 1:
+        raise ValueError(f"{path}: family checkpoints must share one publisher")
+    return set(checkpoints)
 
 
 def _frontmatter_slug(path: Path) -> str | None:
