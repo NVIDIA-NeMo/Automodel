@@ -17,6 +17,8 @@
 import argparse
 import json
 import math
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -237,6 +239,8 @@ def main() -> int:
         parser.error("--min-negatives must be non-negative")
 
     input_path = Path(args.input_file)
+    if args.output is not None and Path(args.output).resolve() == input_path.resolve():
+        parser.error("--output must differ from input_file; write a separate cleaned copy")
     with open(input_path, "r") as f:
         training_data = json.load(f)
 
@@ -251,8 +255,30 @@ def main() -> int:
     payload = {"summary": summary, "findings": findings}
     if args.output is not None:
         output_path = Path(args.output)
-        with open(output_path, "w") as f:
-            json.dump(cleaned_training_data, f, indent=2)
+        if output_path.resolve().parent != input_path.resolve().parent:
+            corpus = cleaned_training_data.get("corpus", [])
+            entries = [corpus] if isinstance(corpus, dict) else corpus
+            relocated_entries = []
+            for entry in entries:
+                relocated = dict(entry)
+                corpus_path = entry.get("path")
+                if corpus_path and not Path(corpus_path).is_absolute() and "://" not in corpus_path:
+                    target = (input_path.resolve().parent / corpus_path).resolve()
+                    relocated["path"] = os.path.relpath(target, output_path.resolve().parent)
+                relocated_entries.append(relocated)
+            if "corpus" in cleaned_training_data:
+                cleaned_training_data["corpus"] = (
+                    relocated_entries[0] if isinstance(corpus, dict) else relocated_entries
+                )
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", dir=output_path.parent, prefix=".audit.", delete=False) as f:
+                temporary_path = Path(f.name)
+                json.dump(cleaned_training_data, f, indent=2)
+            temporary_path.replace(output_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
         if args.drop_invalid_negatives:
             remaining_summary, _, remaining_findings = audit_training_data(

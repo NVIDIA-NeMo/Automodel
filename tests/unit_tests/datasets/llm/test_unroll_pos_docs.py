@@ -85,3 +85,20 @@ def test_unroll_raises_for_missing_document_id():
 
     with pytest.raises(ValueError, match="missing an id"):
         unroll_training_data(records)
+
+
+def test_unroll_preserves_query_metadata_and_original_lineage():
+    record = {
+        "question_id": "q0",
+        "original_question_id": "root",
+        "question": "Which documents?",
+        "corpus_id": "demo",
+        "pos_doc": [{"id": "1"}, {"id": "2"}],
+        "query_instruction": "Find evidence",
+        "source": "curated",
+    }
+    rows = unroll_training_data([record])
+    assert len(rows) == 2
+    assert all(row["query_instruction"] == "Find evidence" for row in rows)
+    assert all(row["source"] == "curated" and row["original_question_id"] == "root" for row in rows)
+    assert record["question_id"] == "q0"

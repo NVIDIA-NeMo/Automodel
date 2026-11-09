@@ -15,6 +15,8 @@
 import json
 import sys
 
+import pytest
+
 from examples.retrieval.data_utils.audit_mined_negatives import audit_training_data
 from examples.retrieval.data_utils.audit_mined_negatives import main as audit_main
 
@@ -226,3 +228,51 @@ def test_audit_cli_min_negatives_catches_rows_cleaned_to_empty(tmp_path, monkeyp
 
     assert report["remaining_summary"]["rows_with_too_few_negatives"] == 1
     assert report["remaining_findings"][0]["issue"] == "too_few_negatives"
+
+
+@pytest.mark.parametrize("corpus", [{"path": "./corpus", "weight": 2}, [{"path": "./corpus", "weight": 2}]])
+def test_audit_moved_output_preserves_corpus_target(tmp_path, monkeypatch, corpus):
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    input_file = source / "mined.json"
+    output_file = destination / "cleaned.json"
+    input_file.write_text(json.dumps({"corpus": corpus, "data": []}))
+    monkeypatch.setattr(sys, "argv", ["audit", str(input_file), "--output", str(output_file)])
+    assert audit_main() == 0
+    cleaned = json.loads(output_file.read_text())
+    entry = cleaned["corpus"][0] if isinstance(corpus, list) else cleaned["corpus"]
+    assert (output_file.parent / entry["path"]).resolve() == (source / "corpus").resolve()
+    assert entry["weight"] == 2
+    assert json.loads(input_file.read_text())["corpus"] == corpus
+
+
+def test_audit_refuses_to_replace_input(tmp_path, monkeypatch):
+    input_file = tmp_path / "mined.json"
+    content = '{"data": []}'
+    input_file.write_text(content)
+    monkeypatch.setattr(sys, "argv", ["audit", str(input_file), "--output", str(input_file)])
+    with pytest.raises(SystemExit) as exc:
+        audit_main()
+    assert exc.value.code == 2
+    assert input_file.read_text() == content
+
+
+def test_audit_interrupted_write_preserves_existing_output(tmp_path, monkeypatch):
+    from examples.retrieval.data_utils import audit_mined_negatives as audit
+
+    input_file = tmp_path / "mined.json"
+    input_file.write_text('{"data": []}')
+    output_file = tmp_path / "cleaned.json"
+    output_file.write_text("previous output")
+    monkeypatch.setattr(sys, "argv", ["audit", str(input_file), "--output", str(output_file)])
+
+    def fail_dump(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(audit.json, "dump", fail_dump)
+    with pytest.raises(OSError, match="disk full"):
+        audit_main()
+    assert output_file.read_text() == "previous output"
+    assert not list(tmp_path.glob(".audit.*"))

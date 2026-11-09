@@ -16,8 +16,10 @@ import json
 import sys
 
 import pytest
+from datasets import config as datasets_config
 
 from examples.retrieval.data_utils import materialize_hf_retrieval_subset
+from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
 
 
 class _FakeCorpusInfo:
@@ -68,6 +70,11 @@ def test_materialize_hf_retrieval_subset_writes_local_corpus_json(tmp_path, monk
     assert metadata["class"] == "TextQADataset"
     assert metadata["corpus_id"] == "demo"
     assert (tmp_path / "FEVER_corpus" / "train.parquet").exists()
+    monkeypatch.setattr(datasets_config, "HF_DATASETS_CACHE", tmp_path / "hf_cache")
+    reloaded, corpora = load_datasets(str(tmp_path / "train.json"))
+    assert list(reloaded) == data_list
+    assert corpora["demo"].get_document_by_id("d0")["text"] == "document d0"
+    assert corpora["demo"].metadata["query_instruction"] == "query:"
 
 
 def test_materialize_hf_retrieval_subset_rejects_non_empty_output_dir(tmp_path, monkeypatch):
