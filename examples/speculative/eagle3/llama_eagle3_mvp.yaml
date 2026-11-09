@@ -81,3 +81,6 @@ checkpoint:
 #   project: eagle3
 #   entity: my-team
 #   name: ""   # empty -> defaults to eagle3_<target-model-name>
+
+ci:
+  cluster_tag: h100

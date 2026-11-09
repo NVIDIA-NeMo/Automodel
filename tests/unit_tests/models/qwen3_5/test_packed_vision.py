@@ -14,19 +14,28 @@
 
 """Packed text boundaries must not override HF image/video frame boundaries."""
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
+import yaml
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from transformers.vision_utils import get_vision_attention_seqlens
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.utils import neat_packed_collater
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
+from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig
+from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import configure_packing_for_models
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5.model import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 from nemo_automodel.components.models.qwen3_5_moe.model import Qwen3_5MoeForConditionalGeneration
+from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
 def _model(
@@ -193,7 +202,10 @@ def check_packed_media_parity(
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     torch.testing.assert_close(batch["cu_seqlens"], original_boundaries)
 
-    upstream = torch.randn_like(actual) / actual.numel()
+    # Static loss scaling, as fp16 training uses: linear-attention gate gradients are otherwise
+    # small enough to land in fp16's subnormal range. Gradients are unscaled before comparing.
+    loss_scale = 1024.0 if dtype == torch.float16 else 1.0
+    upstream = torch.randn_like(actual) * loss_scale / actual.numel()
     actual.backward(upstream)
     expected.backward(upstream)
     for name, param in model.named_parameters():
@@ -202,8 +214,10 @@ def check_packed_media_parity(
             assert param.grad is None, name
         else:
             assert param.grad is not None, name
+            grad = param.grad.float() / loss_scale
+            reference_grad = reference_grad.float() / loss_scale
             torch.testing.assert_close(
-                param.grad,
+                grad,
                 reference_grad,
                 rtol=1e-4 if dtype == torch.float32 else rtol,
                 atol=2e-6 if dtype == torch.float32 else atol,
@@ -211,8 +225,8 @@ def check_packed_media_parity(
             )
             # Elementwise atol alone can accept an entirely missing small gradient.
             # Bound each tensor's relative L2 error without an absolute floor too.
-            grad_error = torch.linalg.vector_norm(param.grad.float() - reference_grad.float())
-            grad_scale = torch.linalg.vector_norm(reference_grad.float())
+            grad_error = torch.linalg.vector_norm(grad - reference_grad)
+            grad_scale = torch.linalg.vector_norm(reference_grad)
             assert grad_error <= (1e-4 if dtype == torch.float32 else rtol) * grad_scale, (
                 f"{name}: gradient L2 error {grad_error.item()} exceeds relative tolerance "
                 f"for reference norm {grad_scale.item()}"
@@ -234,7 +248,7 @@ def test_packing_contract_selects_collator_mask(causal_lm: bool, attn: str) -> N
     # Inspect the data contract without constructing optional TE kernels on CPU.
     model.backend.attn = attn
     contract = configure_packing_for_models([model])
-    assert contract.requires_packed_sequence_metadata
+    assert contract.return_packed_sequence_metadata
     assert contract.packed_mask_type == ("document_ids" if attn == "te" else "block_causal")
 
     pack = {
@@ -248,3 +262,38 @@ def test_packing_contract_selects_collator_mask(causal_lm: bool, attn: str) -> N
     torch.testing.assert_close(batch["cu_seqlens"], torch.tensor([[0, 2, 3]], dtype=torch.int32))
     if attn == "te":
         torch.testing.assert_close(batch["attention_mask"], pack["attention_mask"].unsqueeze(0))
+
+
+@pytest.mark.parametrize("recipe", ["qwen3_5_4b_neat_packing.yaml", "qwen3_5_4b_neat_packing_b300.yaml"])
+def test_packed_recipe_preserves_compact_document_boundaries(recipe: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = Path(__file__).resolve().parents[4] / "examples/vlm_finetune/qwen3_5" / recipe
+    raw = yaml.safe_load(path.read_text())
+    config = RecipeConfig(ConfigNode(raw)).vlm_dataloader
+    # Inspect the real model's data contract without requiring TE/FA4 kernels on CPU.
+    model = _model()
+    model.backend = ConfigNode(raw["model"]["backend"]).instantiate()
+    contract = configure_packing_for_models([model])
+    sample = {
+        "input_ids": torch.tensor([3, 4, 5, 0]),
+        "labels": torch.tensor([4, -100, -100, -100]),
+        "position_ids": torch.tensor([[0, 1, 0, 0]] * 3),
+        "attention_mask": torch.tensor([1, 1, 2, 0]),
+    }
+    # Only media preprocessing is replaced; run the recipe-selected collator with
+    # the contract resolved from the Qwen3.5 model and the recipe's native backend.
+    monkeypatch.setattr(type(config.dataset_config), "build", lambda self: [sample])
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
+    config.processor_config = VlmProcessorConfig(factory=lambda: SimpleNamespace(tokenizer=None))
+    result = config.build(
+        pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1, packing_contract=contract
+    )
+    batch = result.dataloader.collate_fn([sample])
+
+    # Compact IDs preserve both documents and padding, without a quadratic mask
+    # or an externally flattened THD batch that Qwen3.5 cannot consume.
+    torch.testing.assert_close(batch["attention_mask"], torch.tensor([[1, 1, 2, 0]]))
+    torch.testing.assert_close(batch["cu_seqlens"], torch.tensor([[0, 2, 3]], dtype=torch.int32))
+    torch.testing.assert_close(batch["packed_token_indices"], torch.tensor([[0, 1, 2, -1]]))
+    assert batch["input_ids"].shape == (1, 4)
+    assert "qkv_format" not in batch

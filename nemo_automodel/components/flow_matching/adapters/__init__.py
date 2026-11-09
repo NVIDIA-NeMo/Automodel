@@ -23,6 +23,8 @@ Available Adapters:
 - HunyuanAdapter: For HunyuanVideo 1.5 style models
 - SimpleAdapter: For simple transformer models (e.g., Wan)
 - FluxAdapter: For FLUX.1 text-to-image models
+- Flux2Adapter: For FLUX.2 text-to-image models
+- Flux3Adapter: For FLUX.3 text-to-image and image-to-image models
 - QwenImageAdapter: For Qwen-Image text-to-image models
 - QwenImage21Adapter: For Qwen-Image-2.1 text-to-image models
 - LTX2Adapter: For LTX-2 dual-stream video+audio models
@@ -37,6 +39,7 @@ Usage:
 from .base import FlowMatchingContext, ModelAdapter
 from .flux import FluxAdapter
 from .flux2 import Flux2Adapter
+from .flux3 import Flux3Adapter
 from .hunyuan import HunyuanAdapter
 from .ltx2 import LTX2Adapter
 from .qwen_image import QwenImageAdapter
@@ -48,6 +51,7 @@ __all__ = [
     "ModelAdapter",
     "FluxAdapter",
     "Flux2Adapter",
+    "Flux3Adapter",
     "HunyuanAdapter",
     "LTX2Adapter",
     "QwenImageAdapter",

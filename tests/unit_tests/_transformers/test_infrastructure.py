@@ -110,6 +110,26 @@ class TestShouldLoadBeforeShard:
         assert _should_load_before_shard(**{**self._DEFAULTS, "ep_size": 1}) is True
 
 
+@pytest.mark.parametrize("lm_head_precision", [torch.float32, "float32"])
+def test_frozen_storage_preparation_skips_conflicting_moe_compute_policy(lm_head_precision):
+    from nemo_automodel._transformers.infrastructure import _get_frozen_storage_compute_dtype
+
+    strategy_config = SimpleNamespace(mp_policy=SimpleNamespace(param_dtype=torch.bfloat16))
+    assert (
+        _get_frozen_storage_compute_dtype(strategy_config, SimpleNamespace(moe_parallel_config=None)) == torch.bfloat16
+    )
+
+    mesh = SimpleNamespace(moe_parallel_config=SimpleNamespace(mp_policy=SimpleNamespace(param_dtype=torch.float32)))
+    assert _get_frozen_storage_compute_dtype(strategy_config, mesh) is None
+
+    mesh = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(
+            mp_policy=SimpleNamespace(param_dtype=torch.bfloat16), lm_head_precision=lm_head_precision
+        )
+    )
+    assert _get_frozen_storage_compute_dtype(strategy_config, mesh) is None
+
+
 def test_moe_infrastructure_routes_fsdp2_through_model_parallelizer_contract():
     """EP and FSDP2 share the model-owned parallelization contract."""
     from nemo_automodel._transformers.infrastructure import instantiate_infrastructure, parallelize_for_pp

@@ -20,7 +20,7 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
-``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
+``apply()``: ``wandb``/``trackio``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
 ``embedding_row_repair``/``mfu``/``domain_mixture`` map to component config
 dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
@@ -44,9 +44,9 @@ import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
-from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
+from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, TrackioConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
-    from nemo_automodel.components.datasets.loader import DataloaderConfig
+    from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetConfig
     from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
     from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
     from nemo_automodel.components.loss.loss import LossConfig
@@ -69,6 +69,29 @@ if TYPE_CHECKING:
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
 _STEP_SCHEDULER_RUNTIME_KEYS = ("local_batch_size", "dp_size", "dataloader")
+_LoaderConfig = TypeVar("_LoaderConfig")
+
+
+def _loader_config_class(
+    target: str | type[_LoaderConfig] | None, base: type[_LoaderConfig], *, dataset_config: DatasetConfig
+) -> type[_LoaderConfig]:
+    """Resolve an explicit loader target or its dataset-owned default."""
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.datasets.loader import StreamDatasetConfig
+
+    if target is None:
+        if not isinstance(dataset_config, StreamDatasetConfig):
+            return base
+        target = dataset_config.dataloader_config_type
+        if target is None:
+            return base
+
+    # ConfigNode restores dotted targets serialized by to_dict() using the same
+    # resolution rules as the recipe's other _target_ sections.
+    resolved = ConfigNode({"_target_": target})._target_
+    if not isinstance(resolved, type) or not issubclass(resolved, base):
+        raise ValueError(f"Unsupported dataloader _target_ {target!r}; expected a {base.__name__} subclass")
+    return resolved
 
 
 def _section_kwargs(node: Any) -> dict[str, Any]:
@@ -133,7 +156,7 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
-    ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
+    ``wandb``, ``trackio``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
     ``loss_fn``, ``domain_mixture`` and ``checkpoint`` are exposed as typed objects (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
@@ -158,6 +181,11 @@ class RecipeConfig:
         return WandbConfig.from_kwargs(**_section_kwargs(node)) if node else None
 
     @cached_property
+    def trackio(self) -> TrackioConfig | None:
+        node = self._raw.get("trackio", None)
+        return TrackioConfig.from_kwargs(**_section_kwargs(node)) if node else None
+
+    @cached_property
     def mlflow(self) -> MLflowConfig | None:
         node = self._raw.get("mlflow", None)
         return MLflowConfig(**_section_kwargs(node)) if node else None
@@ -180,15 +208,25 @@ class RecipeConfig:
         node = self._raw.get("lr_scheduler", None)
         return LRSchedulerConfig(**_section_kwargs(node)) if node else None
 
-    @cached_property
-    def optimizer(self) -> "OptimizerConfig" | None:
+    def _optimizer_config(self, section: str) -> "OptimizerConfig" | None:
+        """Resolve one optimizer section through the shared typed boundary."""
         from nemo_automodel.components.optim.optimizer import build_optimizer_config
 
-        node = self._raw.get("optimizer", None)
+        node = self._raw.get(section, None)
         if node is None:
             return None
         factory, kwargs = _callable_and_kwargs(node)
         return build_optimizer_config(factory, kwargs)
+
+    @cached_property
+    def optimizer(self) -> "OptimizerConfig" | None:
+        """Return the primary model's configured optimizer policy."""
+        return self._optimizer_config("optimizer")
+
+    @cached_property
+    def head_optimizer(self) -> "OptimizerConfig" | None:
+        """Return the separately configured replicated decision-head optimizer."""
+        return self._optimizer_config("head_optimizer")
 
     @cached_property
     def dataloader(self) -> "DataloaderConfig" | None:
@@ -236,6 +274,7 @@ class RecipeConfig:
             DataloaderConfig,
             DatasetBuildSchedule,
             ScheduledDatasetConfig,
+            StreamDatasetConfig,
             make_collate_fn,
             make_dataset_config,
         )
@@ -243,20 +282,24 @@ class RecipeConfig:
         target, dataset_kwargs = _callable_and_kwargs(dataset_node)
         dataset_kwargs.pop("tokenizer", None)
         dataset_config = make_dataset_config(target, dataset_kwargs)
-
         loader_kwargs = _as_dict(dataloader_node)
         loader_target = loader_kwargs.pop("_target_", None)
         supported_loader_targets = {
-            None,
             "torch.utils.data.DataLoader",
             "torchdata.stateful_dataloader.StatefulDataLoader",
             DataLoader,
             StatefulDataLoader,
         }
-        if loader_target not in supported_loader_targets:
-            raise ValueError(
-                f"Unsupported dataloader _target_ {loader_target!r}; typed recipes use ParallelAwareDataloader"
-            )
+        config_class = (
+            DataloaderConfig
+            if loader_target in supported_loader_targets
+            else _loader_config_class(loader_target, DataloaderConfig, dataset_config=dataset_config)
+        )
+        dataset_config = config_class.adapt_dataset_config(dataset_config)
+        # Validate the adapted config too: selecting a stream backend cannot
+        # silently replace native packing, even when it was explicitly disabled.
+        if isinstance(dataset_config, StreamDatasetConfig) and self._raw.get("packed_sequence", None) is not None:
+            raise ValueError("Stream datasets own packing; remove native packed_sequence configuration")
         collate = make_collate_fn(*_target_kwargs(loader_kwargs.pop("collate_fn", None)))
 
         schedule = DatasetBuildSchedule(
@@ -295,7 +338,7 @@ class RecipeConfig:
         if unknown:
             raise TypeError(f"Unexpected dataloader config field(s): {', '.join(unknown)}")
 
-        return DataloaderConfig(
+        return config_class(
             dataset_config=dataset_config,
             packing=self._packing_config(),
             batch_sampler_config=batch_sampler_config,
@@ -637,9 +680,14 @@ class RecipeConfig:
         # output / get_mtp_loss_scaling_factor; ignore_index comes from the loss)
         # and are not exposed via YAML. This typed accessor lets recipes build MTP through
         # the typed-config boundary like the other sections.
+        # distillation_mode is the one experimental exception: an opt-in YAML
+        # `mtp:` block lets a test config select the soft-distillation prototype
+        # without touching the model-driven fields.
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
-        return MTPLossConfig()
+        node = self._raw.get("mtp", None)
+        distillation_mode = _section_kwargs(node).get("distillation_mode", "hard") if node is not None else "hard"
+        return MTPLossConfig(distillation_mode=distillation_mode)
 
     @cached_property
     def prewarm(self) -> "PrewarmConfig | None":

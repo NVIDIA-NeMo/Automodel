@@ -17,7 +17,8 @@
 # Env required: CONFIG_PATH, PIPELINE_DIR, TEST_NAME, TEST_LEVEL, TEST_SCRIPT_PATH,
 #   TEST_NODE_COUNT, NPROC_PER_NODE, MASTER_ADDR, MASTER_PORT, SLURM_JOB_ID, HAS_ROBUSTNESS
 # Env optional: EXEC_CMD, RDZV_TIMEOUT, MAX_STEPS, LOCAL_BATCH_SIZE,
-#   CONFIG_NPROC_PER_NODE, FINETUNE_ARGS, NEMO_CI_PATH, WANDB_AUTOMODEL_API_KEY, TIME
+#   CONFIG_NPROC_PER_NODE, FINETUNE_ARGS, NEMO_CI_PATH, WANDB_AUTOMODEL_API_KEY, TIME,
+#   TORCHRUN_NUMA_BINDING
 
 cd /opt/Automodel
 
@@ -66,6 +67,13 @@ CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --rdzv_conf=read_timeout=${RDZV_TIMEOUT:-600},join_timeout=${RDZV_TIMEOUT:-600}"
 if [ "$EXEC_CMD" = "python" ]; then CMD="python"; fi
 if [ "$EXEC_CMD" = "uv_python" ]; then CMD="uv run python"; fi
+if [[ "$CMD" == torchrun* && -n "${TORCHRUN_NUMA_BINDING:-}" ]]; then
+  # Use torchrun's topology-aware CPU binding; keep its default when unset.
+  case "$TORCHRUN_NUMA_BINDING" in
+    node|socket|exclusive|core-complex) CMD+=" --numa-binding=$TORCHRUN_NUMA_BINDING" ;;
+    *) echo "Invalid TORCHRUN_NUMA_BINDING: expected node, socket, exclusive or core-complex" >&2; exit 2 ;;
+  esac
+fi
 
 # --- Finetune ---
 FINETUNE_ENTRYPOINT="${TEST_SCRIPT_PATH}"

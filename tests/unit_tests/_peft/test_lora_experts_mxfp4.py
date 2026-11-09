@@ -144,7 +144,8 @@ def test_mxfp4_module_packs_base_weights(moe_config, device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_mxfp4_forward_backward_matches_bf16(moe_config, device):
+@pytest.mark.parametrize("with_callback", [False, True])
+def test_mxfp4_forward_backward_matches_bf16(moe_config: MoEConfig, device: torch.device, with_callback: bool) -> None:
     """With fp4-representable base weights, the packed module must match the bf16 module."""
     orig = GroupedExperts(moe_config).to(device)
     orig.use_torch_mm = True
@@ -161,8 +162,9 @@ def test_mxfp4_forward_backward_matches_bf16(moe_config, device):
     x_ref, token_mask, weights, indices = _routing_inputs(moe_config, 32, device, torch.bfloat16)
     x_mx = x_ref.detach().clone().requires_grad_(True)
 
-    y_ref = ref(x_ref, token_mask, weights, indices)
-    y_mx = mx(x_mx, token_mask, weights, indices)
+    callback = torch.tanh if with_callback else None
+    y_ref = ref(x_ref, token_mask, weights, indices, post_expert_output=callback)
+    y_mx = mx(x_mx, token_mask, weights, indices, post_expert_output=callback)
     torch.testing.assert_close(y_mx, y_ref, atol=1e-6, rtol=1e-6)
 
     y_ref.float().pow(2).sum().backward()
@@ -191,6 +193,47 @@ def test_mxfp4_no_routed_tokens(moe_config, device):
     assert y.shape == x.shape
     y.float().sum().backward()
     assert x.grad is not None
+
+
+@pytest.mark.parametrize("callback", [None, torch.sigmoid], ids=["no_callback", "sigmoid"])
+def test_mxfp4_no_routed_tokens_cpu(moe_config, callback):
+    """Nonexistent routes contribute zero values and attached zero gradients."""
+    moe_config.dtype = torch.float32
+    orig = GroupedExperts(moe_config).cpu()
+    orig.use_torch_mm = True
+    with torch.no_grad():
+        orig.init_weights(buffer_device=torch.device("cpu"))
+    mx = GroupedExpertsLoRAMXFP4(orig, lora_dim=8, alpha=16)
+    # Exercise every adapter gradient, including A factors whose B defaults to zero.
+    with torch.no_grad():
+        mx.lora_gate_and_up_B.normal_()
+        mx.lora_down_B.normal_()
+    x, _, weights, indices = _routing_inputs(moe_config, 8, torch.device("cpu"), torch.float32)
+    token_mask = torch.zeros(8, dtype=torch.bool)
+
+    y = mx(x, token_mask, weights, indices, post_expert_output=callback)
+    torch.testing.assert_close(y, torch.zeros_like(x), atol=0, rtol=0)
+    y.sum().backward()
+    assert x.grad is not None
+    torch.testing.assert_close(x.grad, torch.zeros_like(x), atol=0, rtol=0)
+    for parameter in mx.parameters():
+        if parameter.requires_grad:
+            assert parameter.grad is not None
+            torch.testing.assert_close(parameter.grad, torch.zeros_like(parameter), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mxfp4_active_sigmoid_is_not_zeroed(moe_config, device):
+    """Two active zero-valued routes each contribute sigmoid(0) per feature."""
+    orig = GroupedExperts(moe_config).to(device)
+    orig.use_torch_mm = True
+    with torch.no_grad():
+        orig.gate_and_up_projs.zero_()
+        orig.down_projs.zero_()
+    mx = GroupedExpertsLoRAMXFP4(orig, lora_dim=8, alpha=16)
+    x, token_mask, weights, indices = _routing_inputs(moe_config, 8, device, torch.bfloat16)
+    y = mx(x, token_mask, weights, indices, post_expert_output=torch.sigmoid)
+    torch.testing.assert_close(y, torch.ones_like(y), atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

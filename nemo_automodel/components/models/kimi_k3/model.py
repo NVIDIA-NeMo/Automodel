@@ -19,15 +19,17 @@ from __future__ import annotations
 import copy
 import inspect
 import math
+import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
     postprocess_output_for_attn,
@@ -35,6 +37,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
+from nemo_automodel.components.models.common.cudnn_sparse_attention import cudnn_sparse_attention
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.packing import (
     flatten_packed_sequence_metadata,
@@ -45,6 +48,10 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
+from nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa import (
+    CudnnDsaPackedMetadata,
+    cudnn_indexer_topk,
+)
 from nemo_automodel.components.models.kimi_k3.config import KimiK3Config, KimiK3TextConfig
 from nemo_automodel.components.models.kimi_k3.cp import (
     KimiPackedContext,
@@ -53,8 +60,10 @@ from nemo_automodel.components.models.kimi_k3.cp import (
     build_fla_cp_context,
     doc_ids_from_attention_mask,
     doc_ids_from_cu_seqlens,
+    document_causal_allowed,
     document_causal_flex_attention,
     shard_batch_for_kimi_cp,
+    sparse_keep_block_mask,
 )
 from nemo_automodel.components.models.kimi_k3.kda_fused import fused_chunk_kda, fused_kda_unsupported_reason
 from nemo_automodel.components.models.kimi_k3.situ import (
@@ -72,6 +81,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import FakeBalancedGate, Gate, MoE
+from nemo_automodel.components.moe.router_replay import replay_selection
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.embedding_padding import zero_embedding_row_
 from nemo_automodel.shared.import_utils import UnavailableError, safe_import_from
@@ -79,11 +89,15 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 _FLA_MSG = "Kimi K3 requires the flash-linear-attention/fla extra. Install with `uv sync --extra fla`."
 _SHORT_CONV_OK, ShortConvolution = safe_import_from("fla.modules", "ShortConvolution", msg=_FLA_MSG)
+_CAUSAL_CONV_OK, causal_conv1d = safe_import_from("fla.modules.conv.causal_conv1d", "causal_conv1d", msg=_FLA_MSG)
 _FUSED_RMSNORM_GATED_OK, FusedRMSNormGated = safe_import_from(
     "fla.modules",
     "FusedRMSNormGated",
     msg=_FLA_MSG,
 )
+if TYPE_CHECKING:
+    from fla.ops.cp import FLACPContext
+
 _CHUNK_KDA_OK, chunk_kda = safe_import_from("fla.ops.kda", "chunk_kda", msg=_FLA_MSG)
 _RECURRENT_KDA_OK, fused_recurrent_kda = safe_import_from("fla.ops.kda", "fused_recurrent_kda", msg=_FLA_MSG)
 _CHUNK_KDA_HAS_DISABLE_RECOMPUTE = _CHUNK_KDA_OK and "disable_recompute" in inspect.signature(chunk_kda).parameters
@@ -112,7 +126,9 @@ except (TypeError, ValueError):
 
 
 def _require_fla() -> None:
-    if not all((_SHORT_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, _KDA_GATE_OK)):
+    if not all(
+        (_SHORT_CONV_OK, _CAUSAL_CONV_OK, _FUSED_RMSNORM_GATED_OK, _CHUNK_KDA_OK, _RECURRENT_KDA_OK, _KDA_GATE_OK)
+    ):
         raise UnavailableError(_FLA_MSG)
 
 
@@ -376,8 +392,198 @@ class KimiK3MLP(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=init_std)
 
 
+class KimiDSAIndexerLayerNorm(nn.Module):
+    """Biased LayerNorm on the DSA indexer key, computed in fp32 and cast back to the input dtype."""
+
+    def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype = torch.bfloat16) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize the last axis.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+        Returns:
+            Tensor with the shape and dtype of ``hidden_states``.
+        """
+        return F.layer_norm(
+            hidden_states.float(),
+            (hidden_states.shape[-1],),
+            self.weight.float(),
+            self.bias.float(),
+            self.eps,
+        ).type_as(hidden_states)
+
+    def reset_parameters(self) -> None:
+        nn.init.ones_(self.weight)
+        nn.init.zeros_(self.bias)
+
+
+class KimiDSAIndexer(nn.Module):
+    """Lightning indexer of a Kimi K3.1 gated DSA layer.
+
+    Scores every (query, key) pair as ``sum_h relu(q_h . k) * w_h`` with per-head queries
+    ``wq_b(q_resid)``, one shared key ``k_norm(wk(x))`` and per-head weights
+    ``weights_proj(x) * (index_head_dim * index_num_heads) ** -0.5``, then keeps the
+    ``index_topk`` highest-scoring visible keys of every query. The selection is a hard top-k,
+    so the language-model loss sends no gradient into the indexer: it runs without autograd
+    and its parameters are frozen (``requires_grad=False``) at their checkpoint values, which
+    keeps DDP unused-parameter checks and optimizers from tracking them. The infrastructure
+    reapplies this freeze after PEFT injection and parameter replacement, including any adapters.
+    Parameter names match the checkpoint
+    (``self_attn.indexer.{wq_b,wk,weights_proj,k_norm}``).
+    """
+
+    # Query rows scored per step, bounding the fp32 score buffer to [batch, chunk, keys].
+    _query_chunk_size = 2048
+
+    def __init__(self, config: KimiK3TextConfig, dtype: torch.dtype) -> None:
+        super().__init__()
+        dsa_config = config.dsa_config
+        self.num_heads = int(dsa_config["index_num_heads"])
+        self.head_dim = int(dsa_config["index_head_dim"])
+        self.index_topk = int(dsa_config["index_topk"])
+        self.score_scale = (self.head_dim * self.num_heads) ** -0.5
+        query_input_size = config.q_lora_rank if config.q_lora_rank is not None else config.hidden_size
+        self.wq_b = nn.Linear(query_input_size, self.num_heads * self.head_dim, bias=False, dtype=dtype)
+        self.wk = nn.Linear(config.hidden_size, self.head_dim, bias=False, dtype=dtype)
+        self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False, dtype=dtype)
+        if dsa_config["index_k_norm_type"] == "layernorm":
+            self.k_norm = KimiDSAIndexerLayerNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
+        else:
+            self.k_norm = KimiRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
+        self.requires_grad_(False)
+
+    def project_keys(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project the shared indexer key.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+
+        Returns:
+            Tensor of shape [batch, sequence, index_head_dim].
+        """
+        with torch.no_grad():
+            return self.k_norm(self.wk(hidden_states))
+
+    @torch.no_grad()
+    def select(
+        self,
+        hidden_states: torch.Tensor,
+        query_input: torch.Tensor,
+        index_keys: torch.Tensor,
+        allowed: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pick the top-k visible keys of every query.
+
+        Args:
+            hidden_states: Query-side tensor of shape [batch, query_sequence, hidden].
+            query_input: Query-side ``q_a_layernorm(q_a_proj(x))`` of shape
+                [batch, query_sequence, q_lora_rank] (``x`` itself when ``q_lora_rank`` is None).
+            index_keys: Tensor of shape [batch, key_sequence, index_head_dim] from :meth:`project_keys`.
+            allowed: Boolean tensor of shape [batch, query_sequence, key_sequence] marking the keys
+                each query may see (causal, same document).
+
+        Returns:
+            Boolean tensor of shape [batch, query_sequence, key_sequence]: the selected keys, a
+            subset of ``allowed`` holding ``min(index_topk, visible keys)`` entries per query.
+        """
+        key_length = index_keys.shape[1]
+        if key_length <= self.index_topk:
+            # Every visible key fits in the budget: sparse attention equals dense attention.
+            return allowed
+        batch_size, query_length = query_input.shape[:2]
+        queries = self.wq_b(query_input).view(batch_size, query_length, self.num_heads, self.head_dim)
+        weights = self.weights_proj(hidden_states).float() * self.score_scale
+        keys_t = index_keys.float().transpose(1, 2)
+        selected = torch.zeros_like(allowed)
+        with torch.autocast(device_type=queries.device.type, enabled=False):
+            for start in range(0, query_length, self._query_chunk_size):
+                end = min(start + self._query_chunk_size, query_length)
+                chunk_allowed = allowed[:, start:end]
+                # Score only up to the last key any query of this chunk can see (causality
+                # leaves the rest of the row masked), which halves the work of a causal sequence.
+                visible_keys = chunk_allowed.flatten(0, 1).any(0).nonzero(as_tuple=True)[0]
+                if visible_keys.numel() == 0:
+                    continue
+                key_end = int(visible_keys[-1]) + 1
+                if key_end <= self.index_topk:
+                    selected[:, start:end] = chunk_allowed
+                    continue
+                chunk_allowed = chunk_allowed[..., :key_end]
+                scores = torch.zeros(batch_size, end - start, key_end, device=queries.device, dtype=torch.float32)
+                for head in range(self.num_heads):
+                    logits = torch.bmm(queries[:, start:end, head].float(), keys_t[..., :key_end])
+                    scores.addcmul_(logits.relu_(), weights[:, start:end, head, None])
+                scores.masked_fill_(~chunk_allowed, float("-inf"))
+                topk = scores.topk(self.index_topk, dim=-1)
+                # Rows with fewer visible keys than index_topk also pick masked (-inf) keys; drop them.
+                selected[:, start:end, :key_end].scatter_(-1, topk.indices, topk.values.isfinite())
+        return selected
+
+    @torch.no_grad()
+    def select_indices(
+        self,
+        hidden_states: torch.Tensor,
+        query_input: torch.Tensor,
+        index_keys: torch.Tensor,
+        metadata: CudnnDsaPackedMetadata,
+    ) -> torch.Tensor:
+        """Compute cuDNN top-k coordinates without materializing an attention mask.
+
+        Args:
+            hidden_states: Local query states [query_tokens, hidden].
+            query_input: Local query latent [query_tokens, q_lora_rank].
+            index_keys: Gathered indexer keys [key_tokens, index_head_dim].
+            metadata: Cached document layout for these local queries and global keys.
+
+        Returns:
+            Int32 global key indices [query_tokens, 1, index_topk], with -1 padding.
+        """
+        if metadata.max_seqlen_k <= self.index_topk:
+            positions = torch.arange(self.index_topk, dtype=torch.int32, device=query_input.device)
+            valid = metadata.query_valid[:, None] & (positions < metadata.causal_lengths[:, None])
+            indices = torch.where(valid, metadata.starts[:, None] + positions, -1)
+            return indices.unsqueeze(1).contiguous()
+        queries = self.wq_b(query_input).view(-1, self.num_heads, self.head_dim)
+        weights = self.weights_proj(hidden_states).float() * self.score_scale
+        return cudnn_indexer_topk(
+            queries,
+            index_keys,
+            weights,
+            metadata.segment_cu_k,
+            self.index_topk,
+            packed_metadata=metadata,
+        )
+
+    @torch.no_grad()
+    def init_weights(self, init_std: float) -> None:
+        for module in (self.wq_b, self.wk, self.weights_proj):
+            nn.init.normal_(module.weight, mean=0.0, std=init_std)
+        self.k_norm.reset_parameters()
+
+
+def freeze_kimi_k3_indexer_params(model: nn.Module) -> None:
+    """Keep discrete DSA indexers frozen after adapters or replacement parameters are installed.
+
+    Args:
+        model: Model, wrapper, or pipeline stage containing Kimi K3 DSA indexers.
+    """
+    for module in model.modules():
+        if isinstance(module, KimiDSAIndexer):
+            module.requires_grad_(False)
+
+
 class KimiMLAAttention(nn.Module):
-    """Kimi MLA full-attention layer copied from the HF reference math."""
+    """Kimi MLA full-attention layer copied from the HF reference math.
+
+    On a Kimi K3.1 DSA layer (``config.is_dsa_layer(layer_idx)``) the same gated MLA attends
+    only to the keys its :class:`KimiDSAIndexer` selects for each query.
+    """
 
     def __init__(self, config: KimiK3TextConfig, layer_idx: int, backend: BackendConfig) -> None:
         super().__init__()
@@ -434,9 +640,21 @@ class KimiMLAAttention(nn.Module):
                 bias=False,
                 dtype=dtype,
             )
+        self.indexer = KimiDSAIndexer(config, dtype) if config.is_dsa_layer(layer_idx) else None
         self.attn_module = None
         self.attn_func = None
-        if backend.attn != "eager":
+        if backend.attn == "cudnn":
+            if self.indexer is None:
+                raise ValueError("Kimi cuDNN sparse attention requires a DSA indexer on every MLA layer.")
+            if self.kv_lora_rank != 512 or self.qk_rope_head_dim != 64:
+                raise ValueError("Kimi cuDNN sparse attention requires kv_lora_rank=512 and qk_rope_head_dim=64.")
+            if self.attention_dropout != 0.0:
+                raise ValueError("Kimi cuDNN sparse attention does not support attention dropout.")
+            if self.indexer.head_dim != 128 or self.indexer.num_heads not in (32, 64):
+                raise ValueError("Kimi cuDNN DSA requires index_head_dim=128 and index_num_heads in (32, 64).")
+            if self.indexer.index_topk > 2048:
+                raise ValueError("Kimi cuDNN DSA supports index_topk <= 2048.")
+        elif backend.attn != "eager":
             if backend.attn not in ("te", "sdpa"):
                 raise ValueError(f"Kimi K3 MLA does not support backend.attn={backend.attn!r}.")
             attention_kwargs = {"attention_dropout": self.attention_dropout} if backend.attn == "te" else {}
@@ -486,17 +704,37 @@ class KimiMLAAttention(nn.Module):
             Tensor of shape [batch, sequence, hidden].
         """
         del kwargs
+        if self.backend.attn == "cudnn":
+            if attention_mask is not None:
+                raise ValueError("Kimi cuDNN DSA consumes packed_context or padding_mask, not a dense attention mask.")
+            if packed_context is None:
+                doc_ids = torch.ones(hidden_states.shape[:2], dtype=torch.int32, device=hidden_states.device)
+                if padding_mask is not None:
+                    doc_ids.masked_fill_(padding_mask, 0)
+                packed_context = KimiPackedContext(doc_ids)
+            return self._forward_cudnn(hidden_states, packed_context)
         if packed_context is not None and packed_context.cp_enabled:
             return self._forward_with_cp(hidden_states, packed_context)
         batch_size, seq_length = hidden_states.shape[:-1]
         query_shape = (batch_size, seq_length, -1, self.q_head_dim)
         key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
 
-        if self.q_lora_rank is not None:
-            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        else:
-            q_states = self.q_proj(hidden_states)
+        query_input, q_states = self._project_queries(hidden_states)
         q_states = q_states.view(query_shape).transpose(1, 2)
+        sparse_keep = None
+        # With no more keys than index_topk the selection keeps every visible key, so the layer
+        # takes the dense path (and its fused causal kernels) unchanged.
+        if self.indexer is not None and seq_length > self.indexer.index_topk:
+            if attention_mask is None:
+                allowed = torch.ones(seq_length, seq_length, dtype=torch.bool, device=hidden_states.device).tril_()
+                allowed = allowed.expand(batch_size, -1, -1)
+            else:
+                allowed = attention_mask[:, 0, :, :seq_length].eq(0)
+            sparse_keep = self._select_sparse_keys(hidden_states, query_input, allowed).unsqueeze(1)
+            if self.backend.attn == "eager":
+                attention_mask = torch.zeros(
+                    sparse_keep.shape, dtype=hidden_states.dtype, device=hidden_states.device
+                ).masked_fill_(~sparse_keep, torch.finfo(hidden_states.dtype).min)
         q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
@@ -525,7 +763,18 @@ class KimiMLAAttention(nn.Module):
             key_states = key_states.transpose(1, 2).contiguous()
             value_states = value_states.transpose(1, 2).contiguous()
 
-            if packed_context is not None and packed_context.has_multiple_documents:
+            if sparse_keep is not None:
+                if self.backend.attn == "te":
+                    attention_kwargs = {"attention_mask": sparse_keep.logical_not(), "attn_mask_type": "arbitrary"}
+                else:
+                    query_states, key_states, value_states, attention_kwargs = preprocess_args_and_kwargs_for_attn(
+                        query_states,
+                        key_states,
+                        value_states,
+                        sparse_keep,
+                        self.backend.attn,
+                    )
+            elif packed_context is not None and packed_context.has_multiple_documents:
                 if self.backend.attn != "te":
                     backend_attention_mask = attention_mask
                     query_states, key_states, value_states, attention_kwargs = preprocess_args_and_kwargs_for_attn(
@@ -560,6 +809,108 @@ class KimiMLAAttention(nn.Module):
         if self.use_output_gate:
             attn_output = attn_output * self.g_proj(hidden_states).sigmoid()
         return self.o_proj(attn_output)
+
+    def _forward_cudnn(self, hidden_states: torch.Tensor, packed_context: KimiPackedContext) -> torch.Tensor:
+        """Run the existing fused indexer and sparse latent MLA kernels.
+
+        Args:
+            hidden_states: Local query states [batch, local_sequence, hidden].
+            packed_context: Global document layout and this rank's contiguous query offset.
+
+        Returns:
+            Gated, projected attention values [batch, local_sequence, hidden].
+        """
+        batch_size, local_length = hidden_states.shape[:2]
+        query_input, queries = self._project_queries(hidden_states)
+        queries = queries.view(batch_size, local_length, self.num_heads, self.q_head_dim)
+        query_nope, query_shared = queries.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        latent, key_shared = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        latent_kv = torch.cat((self.kv_a_layernorm(latent), key_shared), dim=-1)
+        index_keys = self.indexer.project_keys(hidden_states)
+        if packed_context.cp_enabled:
+            if self._cp_mesh is None:
+                raise RuntimeError("Kimi cuDNN DSA context parallelism requires a configured CP mesh.")
+            group = self._cp_mesh.get_group()
+            latent_kv = all_gather_sequence(latent_kv, group, dim=1)
+            index_keys = all_gather_sequence(index_keys, group, dim=1)
+
+        # Absorb K's expansion into Q, attend to the shared latent, then expand V.
+        # Materialize the effective LoRA weight so both adapter factors receive gradients.
+        if isinstance(self.kv_b_proj, LinearLoRA) and self.kv_b_proj._lora_token_gate is not None:
+            raise ValueError("Kimi cuDNN DSA cannot absorb token-dependent kv_b_proj LoRA weights.")
+        weight = (
+            self.kv_b_proj.materialize_effective_weight()
+            if isinstance(self.kv_b_proj, LinearLoRA)
+            else self.kv_b_proj.weight
+        )
+        weight = weight.view(self.num_key_value_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
+        if self.num_key_value_groups > 1:
+            weight = weight.repeat_interleave(self.num_key_value_groups, dim=0)
+        key_weight, value_weight = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        absorbed_query = torch.einsum("bqhd,hdc->bqhc", query_nope, key_weight.to(query_nope.dtype))
+        sparse_query = torch.cat((absorbed_query, query_shared), dim=-1).to(torch.bfloat16)
+        outputs = []
+        for row in range(batch_size):
+            metadata = packed_context.cudnn_dsa_metadata(row)
+            indices = self.indexer.select_indices(hidden_states[row], query_input[row], index_keys[row], metadata)
+            lengths = (indices[:, 0] >= 0).sum(-1, dtype=torch.int32).contiguous()
+            latent_output = cudnn_sparse_attention(
+                sparse_query[row].contiguous(),
+                latent_kv[row].unsqueeze(1).to(torch.bfloat16).contiguous(),
+                indices,
+                self.scaling,
+                topk_length=lengths,
+                all_rows_nonempty=metadata.all_rows_nonempty,
+                valid_row_indices=metadata.valid_row_indices,
+            )
+            outputs.append(torch.einsum("qhc,hvc->qhv", latent_output, value_weight.to(latent_output.dtype)))
+        attention_output = torch.stack(outputs).reshape(batch_size, local_length, -1)
+        if self.use_output_gate:
+            attention_output = attention_output * self.g_proj(hidden_states).sigmoid()
+        return self.o_proj(attention_output)
+
+    def _project_queries(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project MLA queries.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+
+        Returns:
+            The indexer query input (``q_a_layernorm(q_a_proj(x))``, or ``x`` without a query
+            LoRA) and the flat MLA queries of shape [batch, sequence, heads * q_head_dim].
+        """
+        if self.q_lora_rank is None:
+            return hidden_states, self.q_proj(hidden_states)
+        query_input = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        return query_input, self.q_b_proj(query_input)
+
+    def _select_sparse_keys(
+        self,
+        hidden_states: torch.Tensor,
+        query_input: torch.Tensor,
+        allowed: torch.Tensor,
+        cp_group: Any = None,
+    ) -> torch.Tensor:
+        """Run the DSA indexer of this layer.
+
+        Args:
+            hidden_states: Tensor of shape [batch, query_sequence, hidden]; the local shard under
+                context parallelism.
+            query_input: Indexer query input of shape [batch, query_sequence, q_lora_rank].
+            allowed: Boolean tensor of shape [batch, query_sequence, key_sequence] marking the keys
+                each query may see; ``key_sequence`` is the full sequence.
+            cp_group: Context-parallel process group whose indexer keys are all-gathered along the
+                sequence; None without context parallelism.
+
+        Returns:
+            Boolean tensor of shape [batch, query_sequence, key_sequence], true where a query attends.
+        """
+        index_keys = self.indexer.project_keys(hidden_states)
+        if cp_group is not None:
+            # Local queries score the all-gathered indexer keys (index_head_dim values per token).
+            index_keys = all_gather_sequence(index_keys, cp_group, dim=1)
+        return self.indexer.select(hidden_states, query_input, index_keys, allowed)
 
     def _expand_key_value_groups(
         self,
@@ -615,10 +966,7 @@ class KimiMLAAttention(nn.Module):
         cp_group = self._cp_mesh.get_group()
         batch_size, local_seq_length = hidden_states.shape[:-1]
 
-        if self.q_lora_rank is not None:
-            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        else:
-            q_states = self.q_proj(hidden_states)
+        query_input, q_states = self._project_queries(hidden_states)
         q_states = q_states.view(batch_size, local_seq_length, -1, self.q_head_dim).transpose(1, 2)
         q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -637,13 +985,22 @@ class KimiMLAAttention(nn.Module):
         key_states = torch.cat((k_pass, k_rot), dim=-1)
         key_states, value_states = self._expand_key_value_groups(key_states, value_states, full_seq_length)
 
+        if self.indexer is None or full_seq_length <= self.indexer.index_topk:
+            block_mask = packed_context.mla_block_mask
+        else:
+            allowed = document_causal_allowed(
+                packed_context.local_doc_ids,
+                packed_context.doc_ids,
+                q_global_start=packed_context.seq_start,
+            )
+            sparse_keep = self._select_sparse_keys(hidden_states, query_input, allowed, cp_group)
+            block_mask = sparse_keep_block_mask(sparse_keep)
         attn_output = document_causal_flex_attention(
             query_states,
             key_states,
             value_states,
             q_doc_ids=packed_context.local_doc_ids,
-            kv_doc_ids=packed_context.doc_ids,
-            q_global_start=packed_context.seq_start,
+            block_mask=block_mask,
             scale=self.scaling,
         )
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, local_seq_length, -1)
@@ -665,6 +1022,8 @@ class KimiMLAAttention(nn.Module):
             for module in modules:
                 nn.init.normal_(module.weight, mean=0.0, std=init_std)
             self.kv_a_layernorm.reset_parameters()
+            if self.indexer is not None:
+                self.indexer.init_weights(init_std)
 
 
 class _KimiKDAFp32Param:
@@ -686,6 +1045,109 @@ class _KimiKDAFp32Param:
         if param is not None:
             return param
         raise AttributeError(f"{type(obj).__name__} has no KDA fp32 parameter {self.name!r}.")
+
+
+class _ContiguousConvolutionGradient(torch.autograd.Function):
+    """Normalize cotangent layout before FLA kernels that assume dense storage."""
+
+    @staticmethod
+    def forward(ctx: torch.autograd.function.FunctionCtx, value: torch.Tensor) -> torch.Tensor:
+        """Preserve convolution values while controlling their backward layout.
+
+        Args:
+            ctx: Autograd context.
+            value: Tensor of shape [batch, sequence, channels].
+
+        Returns:
+            Tensor of shape [batch, sequence, channels], aliasing value.
+        """
+        return value
+
+    @staticmethod
+    def backward(ctx: torch.autograd.function.FunctionCtx, gradient: torch.Tensor) -> torch.Tensor:
+        """Materialize strided or broadcast convolution cotangents.
+
+        Args:
+            ctx: Autograd context.
+            gradient: Tensor of shape [batch, sequence, channels], with arbitrary strides.
+
+        Returns:
+            Contiguous tensor of shape [batch, sequence, channels].
+        """
+        return gradient.contiguous()
+
+
+class KimiTrainingShortConvolution(nn.Conv1d):
+    """Differentiable FLA convolution, including one-token training documents.
+
+    FLA ShortConvolution dispatches all-singleton batches to its inference-only
+    update kernel. With no cache and output_final_state=False that path returns
+    zero, and it cannot train the convolution. Use the functional training path
+    for every length while retaining the checkpoint's [channels, 1, width] weight.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int,
+        activation: str = "silu",
+        bias: bool = False,
+        dtype: torch.dtype = torch.float32,
+        backend: str = "triton",
+    ) -> None:
+        super().__init__(
+            hidden_size, hidden_size, kernel_size, groups=hidden_size, padding=kernel_size - 1, bias=bias, dtype=dtype
+        )
+        if activation != "silu":
+            raise ValueError(f"K3 short convolution requires silu activation, got {activation!r}.")
+        if backend not in ("triton", "cuda"):
+            raise ValueError(f"Unsupported K3 short-convolution backend: {backend!r}.")
+        self.activation = activation
+        self.backend = backend
+        if backend == "cuda":
+            cuda_available, _ = safe_import_from("causal_conv1d", "causal_conv1d_fn")
+            if not cuda_available:
+                warnings.warn("causal_conv1d is unavailable; using the FLA Triton convolution backend.", stacklevel=2)
+                self.backend = "triton"
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        cache: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        cp_context: FLACPContext | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Convolve token features without crossing document or CP boundaries.
+
+        Args:
+            x: Features with shape [batch, sequence, channels].
+            cache: Optional preceding state of shape [documents, channels, kernel_size].
+            output_final_state: Whether to return the final convolution state.
+            cu_seqlens: Cumulative packed document offsets of shape [documents + 1].
+            cp_context: FLA metadata for the context-parallel partition.
+
+        Returns:
+            Convolved features of shape [batch, sequence, channels] and optional
+            final state of shape [documents, channels, kernel_size]. The output
+            keeps the input dtype; weights retain the checkpoint's FP32 storage.
+        """
+        output, final_state = causal_conv1d(
+            x=x,
+            weight=self.weight.squeeze(1),
+            bias=self.bias,
+            initial_state=cache,
+            output_final_state=output_final_state,
+            activation=self.activation,
+            backend=self.backend,
+            cu_seqlens=cu_seqlens,
+            cp_context=cp_context,
+        )
+        # FLA's convolution backward does not handle expanded/strided dy.
+        # An identity autograd node preserves forward values while materializing
+        # such cotangents (e.g. from sum()) before the external kernel reads them.
+        return _ContiguousConvolutionGradient.apply(output), final_state
 
 
 class _KimiFp32Module(nn.Module):
@@ -774,7 +1236,7 @@ class KimiDeltaAttention(nn.Module):
         # causal-conv1d CUDA kernels when that package is installed (FLA falls back to Triton otherwise).
         conv_kwargs = _short_conv_backend_kwargs(getattr(config, "kda_conv_backend", "triton"))
         self.q_conv1d = _KimiFp32Module(
-            ShortConvolution(
+            KimiTrainingShortConvolution(
                 hidden_size=projection_k_size,
                 kernel_size=self.conv_size,
                 activation="silu",
@@ -783,7 +1245,7 @@ class KimiDeltaAttention(nn.Module):
             )
         )
         self.k_conv1d = _KimiFp32Module(
-            ShortConvolution(
+            KimiTrainingShortConvolution(
                 hidden_size=projection_k_size,
                 kernel_size=self.conv_size,
                 activation="silu",
@@ -792,7 +1254,7 @@ class KimiDeltaAttention(nn.Module):
             )
         )
         self.v_conv1d = _KimiFp32Module(
-            ShortConvolution(
+            KimiTrainingShortConvolution(
                 hidden_size=projection_size,
                 kernel_size=self.conv_size,
                 activation="silu",
@@ -1101,7 +1563,8 @@ class KimiK3Gate(Gate):
             [tokens, activated_experts], and ``None`` for auxiliary loss.
         """
         del token_mask, cp_mesh
-        logits = F.linear(hidden_states.float(), self.weight.float(), None)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            logits = F.linear(hidden_states.float(), self.weight.float(), None)
         if self.score_func == "sigmoid_with_bias":
             scores = logits.sigmoid()
         elif self.score_func == "softmax_with_bias":
@@ -1122,6 +1585,7 @@ class KimiK3Gate(Gate):
             scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
         indices = scores_for_choice.topk(self.topk, dim=-1, sorted=False)[1]
+        indices = replay_selection(self.router_replay, indices)
         weights = scores.gather(1, indices)
         if self.topk > 1 and self.norm_topk_prob:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
@@ -1702,12 +2166,38 @@ class KimiK3TextModel(nn.Module):
         )
         # Packed attention consumes document metadata, but MoE routing still
         # needs a separate mask for padding tokens, including in full-attention layers.
+        if packed_context is not None and packed_context.cp_enabled:
+            # FLA uses a process-global tensor cache. PP interleaves microbatches,
+            # so a cache hit in forward can become a miss during selective AC
+            # recomputation. Build metadata outside checkpointed decoder layers
+            # and retain it on this microbatch's context for the entire backward.
+            for layer in self.layers.values():
+                attention = layer.self_attn
+                if isinstance(attention, KimiDeltaAttention):
+                    if attention._cp_mesh is None:
+                        raise RuntimeError("Kimi KDA CP requires a configured process group.")
+                    for row in range(packed_context.doc_ids.shape[0]):
+                        build_fla_cp_context(packed_context, row, attention._cp_mesh.get_group(), attention.conv_size)
+                elif isinstance(attention, KimiMLAAttention) and attention.backend.attn != "cudnn":
+                    # Pipeline microbatches must not evict another microbatch's
+                    # mask between forward and selective-AC recomputation.
+                    _ = packed_context.mla_block_mask
+
+        if self.backend.attn == "cudnn":
+            if packed_context is None:
+                doc_ids = torch.ones(inputs_embeds.shape[:2], dtype=torch.int32, device=inputs_embeds.device)
+                if padding_mask is not None:
+                    doc_ids.masked_fill_(padding_mask, 0)
+                packed_context = KimiPackedContext(doc_ids)
+            # Prepare outside selective activation checkpointing, once per microbatch.
+            for row in range(packed_context.doc_ids.shape[0]):
+                packed_context.cudnn_dsa_metadata(row)
         if padding_mask is None and packed_context is not None:
             padding_mask = packed_context.local_doc_ids == 0
         linear_attn_mask = None if has_packed_inputs else self._update_linear_attn_mask(attention_mask, cache_position)
         causal_mask = (
             None
-            if packed_context is not None and packed_context.cp_enabled
+            if self.backend.attn == "cudnn" or (packed_context is not None and packed_context.cp_enabled)
             else _make_causal_mask(inputs_embeds, packed_context, dtype=inputs_embeds.dtype)
         )
         hidden_states = inputs_embeds
@@ -1805,6 +2295,9 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # (contiguous slices, as FLA's CP kernels require) and each layer type carries
     # its own transport, so CP does not depend on the attention backend.
     requires_packed_sequence_metadata = True
+    # Batch callback of the CP sharder built by prepare_model_inputs_for_cp; the
+    # VLM overrides it to keep media token streams whole until embedding.
+    _cp_batch_sharder = staticmethod(shard_batch_for_kimi_cp)
     packed_mask_type = "document_ids"
     _owns_cp_attention = True
     # Packed documents are masked by the model itself: MLA gets a document-blocked
@@ -1871,6 +2364,15 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 layer_idx for layer_idx in linear_attn_config["full_attn_layers"] if layer_idx <= num_hidden_layers
             ]
             text_config.linear_attn_config = linear_attn_config
+            if text_config.dsa_config is not None:
+                text_config.dsa_config = {
+                    **text_config.dsa_config,
+                    "dsa_layers": [
+                        layer_idx
+                        for layer_idx in text_config.dsa_config["dsa_layers"]
+                        if layer_idx <= num_hidden_layers
+                    ],
+                }
         if kda_mode is not None:
             text_config.kda_mode = kda_mode
         text_config._validate()
@@ -2129,7 +2631,7 @@ class KimiK3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         del batch, num_chunks
         return {
             "cp_sharder": ContextParallelSharder(
-                shard_batch=shard_batch_for_kimi_cp,
+                shard_batch=self._cp_batch_sharder,
                 local_token_global_indices=contiguous_local_indices,
             )
         }

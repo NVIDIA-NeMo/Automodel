@@ -1,0 +1,148 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Benchmarking config for the full 92-layer Step 5 Preview language backbone.
+# 16 nodes x 8 H100: EP32 / PP4 / CP1, 1F1B with 24 microbatches, 8K mock
+# sequences, fake balanced static MoE routing and learned CSA selection.
+# Multi-token prediction layers are disabled; weights are randomly initialized.
+#
+# To run this recipe:
+#   automodel examples/llm_benchmark/step/step_5_preview_full92_mock_h100.yaml --nproc-per-node 8
+
+recipe: BenchmarkingRecipeForNextTokenPrediction
+
+benchmark:
+  flops_scope: model
+  json_output_path: outputs/step5-full92-mock-h100/benchmark.json
+  nsys_end: -1
+  nsys_ranks: []
+  nsys_start: -1
+  peak_tflops: 989
+  warmup_steps: 7
+checkpoint:
+  checkpoint_dir: outputs/step5-full92-mock-h100/checkpoints
+  enabled: false
+clip_grad_norm:
+  max_norm: 1.0
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: null
+  num_workers: 0
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  batch_size: 24
+  exclude_token_ids:
+  - 1
+  num_samples: 100000
+  seq_len: 8192
+  tokenizer:
+    _target_: transformers.PreTrainedTokenizerFast.from_pretrained
+    pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16
+  vocab_size: 128896
+dist_env:
+  backend: nccl
+  timeout_minutes: 20
+distributed:
+  activation_checkpointing: true
+  cp_size: 1
+  defer_fsdp_grad_sync: false
+  dp_size: 32
+  enable_fsdp2_prefetch: false
+  ep_size: 32
+  moe:
+    ignore_router_for_ac: true
+    mp_policy:
+      _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+      cast_forward_inputs: false
+      output_dtype: null
+      param_dtype: bfloat16
+      reduce_dtype: float32
+    reshard_after_forward: true
+    wrap_outer_model: true
+  pipeline:
+    pp_microbatch_size: 1
+    pp_schedule: 1f1b
+    pp_seq_len: 8192
+    scale_grads_in_schedule: false
+  pp_size: 4
+  reshard_after_forward: true
+  sequence_parallel: false
+  strategy: fsdp2
+  tp_size: 1
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+lr_scheduler:
+  lr_decay_style: constant
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  backend:
+    _target_: nemo_automodel.components.models.step5.configuration.Step5BackendConfig
+    attn: fa4
+    benchmark_static_routing: true
+    compile_norm: true
+    compile_router_weight: true
+    csa_forward_full_blocks: true
+    dispatcher: hybridep
+    dispatcher_hybridep_compact_routing: false
+    dispatcher_hybridep_permute_fusion: false
+    enable_fsdp_optimizations: true
+    enable_hf_state_dict_adapter: true
+    experts: torch_mm
+    fake_balanced_gate: true
+    fake_gate_noise: 0.0
+    gate_precision: float32
+    linear: te
+    rms_norm: torch_fp32
+    swa_varlen: true
+    csa_backward_full_blocks: true
+  config:
+    _target_: nemo_automodel.components.models.step5.configuration.Step5Config.from_pretrained
+    pretrained_model_name_or_path: stepfun-ai/Step-5-Preview-BF16
+    num_nextn_predict_layers: 0
+  torch_dtype: bfloat16
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+  lr: 1.0e-05
+  master_weights: true
+  store_param_remainders: true
+  weight_decay: 0.1
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  ranked: true
+  seed: 42
+seed: 42
+step_scheduler:
+  ckpt_every_steps: 1000
+  gc_every_steps: 5
+  global_batch_size: 768
+  local_batch_size: 24
+  log_remote_every_steps: 1
+  max_steps: 17
+  num_epochs: 1
+  save_checkpoint_every_epoch: false
+  val_every_steps: 1000
+wandb:
+  enable: false
+
+ci:
+  recipe_owner: HuiyingLi
+  nodes: 16
+  cluster_tag: h100
+  time: "00:40:00"

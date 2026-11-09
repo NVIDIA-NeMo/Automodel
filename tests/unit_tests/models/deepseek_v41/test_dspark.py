@@ -20,7 +20,7 @@ from safetensors.torch import save_file
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41TextConfig
+from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41DSparkConfig, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone, DeepseekV41DSparkModel
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
 
@@ -63,6 +63,30 @@ def _model(attn: str = "eager") -> DeepseekV41DSparkBackbone:
     model = DeepseekV41DSparkBackbone(_config(), backend)
     model.initialize_weights(torch.device("cpu"))
     return model
+
+
+@pytest.mark.parametrize("backward_impl", ["atomic", "deterministic"])
+def test_dense_draft_does_not_inherit_sparse_backward(backward_impl: str) -> None:
+    """Building the dense draft must preserve the target's sparse selection."""
+    target = _config()
+    target.sparse_attention_backward = backward_impl
+    draft = DeepseekV41DSparkConfig(
+        text_config=target,
+        num_draft_layers=3,
+        target_layer_ids=(0, 1),
+        block_size=5,
+        num_anchors=1,
+        mask_token_id=31,
+        markov_rank=4,
+        markov_head_type="vanilla",
+        confidence_head_alpha=1.0,
+        confidence_head_with_markov=True,
+    ).build()
+    assert target.sparse_attention_backward == backward_impl
+    assert draft.config.sparse_attention_backward == "atomic"
+    assert len(draft.mtp) == 3
+    assert all(layer.attn.backend.attn == "sdpa" for layer in draft.mtp)
+    assert all(layer.attn.sparse_attention_backward == "atomic" for layer in draft.mtp)
 
 
 def _official_attention_reference(
@@ -430,3 +454,26 @@ def test_draft_schedule_must_cover_all_native_stages() -> None:
     backend = BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32")
     with pytest.raises(ValueError, match="compress_ratios"):
         DeepseekV41DSparkBackbone(config, backend)
+
+
+def test_draft_declares_the_same_cross_block_fsdp_holders_as_the_base_model() -> None:
+    """When the draft is sharded on its own, its attention sinks take the cross-block FSDP unit like the base
+    model's (HuiyingLi on #4285); every declared name resolves to fp32 parameters in each draft block."""
+    from nemo_automodel.components.models.deepseek_v41.model import DeepseekV41ForCausalLM
+
+    assert list(DeepseekV41DSparkModel._fsdp_shard_across_blocks) == list(
+        DeepseekV41ForCausalLM._fsdp_shard_across_blocks
+    )
+    model = DeepseekV41DSparkModel(
+        _config(),
+        BackendConfig(attn="eager", linear="torch", rms_norm="torch_fp32", experts="torch", dispatcher="torch"),
+        num_anchors=1,
+        enable_confidence_head=True,
+    )
+    blocks = [m for m in model.modules() if type(m).__name__ == "_DeepseekV41DSparkBlock"]
+    assert blocks
+    for name in DeepseekV41DSparkModel._fsdp_shard_across_blocks:
+        for block in blocks:
+            holders = [m for n, m in block.named_modules() if n == name or n.endswith("." + name)]
+            assert holders, (name, [n for n, _ in block.named_modules()][:8])
+            assert {p.dtype for h in holders for p in h.parameters()} == {torch.float32}

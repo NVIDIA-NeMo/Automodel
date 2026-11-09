@@ -193,9 +193,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         self._kd_loss_buffer = []
         self._ce_loss_buffer = []
 
-    def _configure_packing(self) -> PackingCapabilities:
+    @property
+    def _packing_contract(self) -> PackingCapabilities:
         """Emit metadata for the teacher as well as the student."""
-        return replace(super()._configure_packing(), requires_packed_sequence_metadata=True)
+        return replace(super()._packing_contract, return_packed_sequence_metadata=True)
 
     def _configure_teacher_packing(self) -> None:
         """Configure the teacher after construction and check its mask contract."""
@@ -629,6 +630,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
         if _HAS_WANDB and wandb.run is not None:
             wandb.log(log_data.to_dict(), step=log_data.step)
+        trackio_logger = getattr(self, "trackio_logger", None)
+        if trackio_logger is not None:
+            trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_valid.log(log_data)
 
@@ -663,6 +667,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         if self.step_scheduler.is_remote_logging_step:
             if _HAS_WANDB and wandb.run is not None:
                 wandb.log(log_data.to_dict(), step=log_data.step)
+            trackio_logger = getattr(self, "trackio_logger", None)
+            if trackio_logger is not None:
+                trackio_logger.log_metrics(log_data.to_dict(), step=log_data.step)
 
         self.metric_logger_train.log(log_data)
 

@@ -101,4 +101,5 @@ freeze_config:
   freeze_language_model: false
 
 ci:
+  cluster_tag: h100
   time: "00:20:00"

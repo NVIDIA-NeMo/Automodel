@@ -575,6 +575,55 @@ def _module_of(tensor_key: str) -> str:
 _FORMATS = [pytest.param(False, id="v5"), pytest.param(True, id="v4")]
 
 
+@pytest.mark.parametrize("adapter_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("use_dora", [False, True], ids=["lora", "dora"])
+def test_adapter_storage_restoration_and_bf16_inference(
+    adapter_dtype: torch.dtype, use_dora: bool, tmp_path: Path, peft_process_group
+):
+    """Preserve saved FP32/BF16 LoRA and DoRA values across training and inference reloads."""
+    from peft import PeftModel, get_peft_model_state_dict
+    from safetensors.torch import load_file
+
+    family = _Family(
+        "llama",
+        _build_llama,
+        {"target_modules": ["*.q_proj", "*.v_proj"], "use_dora": use_dora, "lora_dtype": adapter_dtype},
+    )
+    model, reference, peft_config = _adapted_model(family, tmp_path / "source")
+    adapter_dir = _save_through_checkpointer(model, peft_config, tmp_path)
+    exported = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    assert exported and all(value.dtype == adapter_dtype for value in exported.values())
+    source_state = ModelState(model, is_peft=True).state_dict()
+    assert set(exported) == set(source_state)
+    for name, value in exported.items():
+        torch.testing.assert_close(value, source_state[name], rtol=0, atol=0)
+
+    restored = PeftModel.from_pretrained(
+        reference.bfloat16(), adapter_dir, is_trainable=True, autocast_adapter_dtype=True
+    )
+    restored_state = get_peft_model_state_dict(restored, save_embedding_layers=False)
+    assert set(restored_state) == set(exported)
+    for name, value in exported.items():
+        torch.testing.assert_close(restored_state[name], value.float(), rtol=0, atol=0)
+    restored(_INPUT_IDS).logits.float().square().mean().backward()
+    for parameter in restored.parameters():
+        if parameter.requires_grad:
+            assert parameter.dtype == parameter.grad.dtype == torch.float32
+            assert torch.isfinite(parameter.grad).all()
+
+    inference_base, _ = _build_llama()
+    inference_model = PeftModel.from_pretrained(
+        inference_base.bfloat16(), adapter_dir, autocast_adapter_dtype=False
+    ).eval()
+    inference_state = get_peft_model_state_dict(inference_model, save_embedding_layers=False)
+    assert set(inference_state) == set(exported)
+    for name, value in exported.items():
+        torch.testing.assert_close(inference_state[name], value.bfloat16(), rtol=0, atol=0)
+    with torch.inference_mode():
+        logits = inference_model(_INPUT_IDS).logits
+    assert logits.dtype == torch.bfloat16 and torch.isfinite(logits).all()
+
+
 @pytest.mark.parametrize("v4_compatible", _FORMATS)
 @pytest.mark.parametrize("family", _params())
 def test_exported_adapter_loads_into_hf_peft(family: _Family, v4_compatible: bool, tmp_path: Path, peft_process_group):

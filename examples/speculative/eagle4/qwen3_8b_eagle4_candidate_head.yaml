@@ -1,0 +1,64 @@
+recipe: TrainEagle3Recipe
+
+# EAGLE-4 stage 2: train the low-rank candidate head of the stage-1 draft
+# (qwen3_8b_eagle4.yaml). Every stage-1 parameter is frozen; the two rank-r
+# factors start from the truncated SVD of the draft lm_head and are fit, at
+# every TTT depth, to the full head's distribution (forward KL). The logged
+# ``acc`` is candidate recall: how often the full head's top-1 token is among
+# the low-rank head's top ``num_candidates``.
+#
+# Export the result for an EAGLE-4 serving engine with
+#   python -m nemo_automodel.components.speculative.eagle.export_eagle4 \
+#       ./outputs/eagle4_qwen3_8b_candidate_head/checkpoints/<step>/model/consolidated \
+#       --output-dir ./outputs/eagle4_qwen3_8b_export
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-8B
+  draft_attn_implementation: flash_attention_2
+  train_data_path: ./cache/dataset/perfectblend-qwen3-8b-regen-messages
+  val_data_path: null
+  train_split: null
+  val_split: null
+  output_dir: ./outputs/eagle4_qwen3_8b_candidate_head
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 7
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+  packed_sequence_size: 4096
+
+  # Must match the stage-1 run.
+  fc_norm: true
+  norm_output: true
+
+  # The stage-1 consolidated checkpoint (replace <step> with its final step directory).
+  draft_weights_path: ./outputs/eagle4_qwen3_8b/checkpoints/<step>/model/consolidated
+
+  eagle4:
+    sliding_window: 2048  # must match the stage-1 run (checked at startup)
+    candidate_head:
+      rank: 128
+      num_candidates: 128
+
+optimizer:
+  lr: 1.0e-3
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle4_qwen3_8b_candidate_head/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final
+
+ci:
+  cluster_tag: h100

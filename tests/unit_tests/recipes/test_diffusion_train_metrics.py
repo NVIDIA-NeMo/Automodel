@@ -41,6 +41,8 @@ from nemo_automodel.recipes.diffusion.train import (
     build_diffusion_pipeline,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_get_diffusion_microbatch_size_prefers_video_latents():
     batch = {
@@ -741,6 +743,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     monkeypatch.setattr(diffusion_train.wandb, "run", None, raising=False)
 
     recipe.dist_env = SimpleNamespace(is_main=True)
+    recipe.trackio_logger = None
     recipe.global_batch_size = 5
     recipe.local_batch_size = 2
     recipe.num_nodes = 1
@@ -1263,6 +1266,7 @@ def test_run_train_validation_loop_validates_only_with_a_val_dataloader(monkeypa
 
     recipe = object.__new__(TrainDiffusionRecipe)
     recipe.dist_env = SimpleNamespace(is_main=True)
+    recipe.trackio_logger = None
     recipe.global_batch_size = 2
     recipe.local_batch_size = 2
     recipe.num_nodes = 1

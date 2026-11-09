@@ -257,6 +257,18 @@ class TestCorruptUniformRandom:
         assert replacements.numel() > 0
         assert replacements.unique().numel() > 1, "replacements collapsed to a single id (looks like a mask token)"
 
+    def test_eps_one_corrupts_every_supervised_position(self, inputs):
+        """eps=1 gives Uno's full uniform noise: every response token is replaced, the prompt is untouched."""
+        input_ids, loss_mask = inputs
+        generator = torch.Generator().manual_seed(3)
+        noisy, noise_mask, p_mask = corrupt_uniform_random(
+            input_ids, loss_mask, VOCAB_SIZE, block_size=None, eps=1.0, generator=generator
+        )
+        assert torch.equal(noise_mask, loss_mask.bool())
+        assert torch.equal(noisy[~noise_mask], input_ids[~noise_mask])
+        assert ((noisy[noise_mask] >= 0) & (noisy[noise_mask] < VOCAB_SIZE)).all()
+        assert torch.equal(p_mask, torch.ones(B, L))
+
     def test_per_block_t_differs(self):
         """Per-block sampling: different blocks get different corruption levels.
 

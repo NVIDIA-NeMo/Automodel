@@ -135,6 +135,7 @@ wandb:
   mode: online
 
 ci:
+  cluster_tag: h100
   time: "00:15:00"
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   nodes: 16

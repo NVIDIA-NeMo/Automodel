@@ -871,10 +871,31 @@ def _freqs(tokens: int, rope_dim: int) -> torch.Tensor:
     return torch.polar(torch.ones_like(angles), angles)
 
 
-def test_cudnn_indexer_layer_preserves_fp32_reference_scaling(monkeypatch: pytest.MonkeyPatch) -> None:
+def _plain_linear_stand_in(
+    linear_impl: str,
+    in_features: int,
+    out_features: int,
+    bias: bool = False,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.nn.Linear:
+    """Stand in for ``initialize_linear_module`` so an FP8 (``linear='te'``) backend builds without TE."""
+    return torch.nn.Linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
+
+
+@pytest.mark.parametrize("fp8_recipe", [False, True])
+def test_cudnn_indexer_layer_preserves_fp32_reference_scaling(
+    monkeypatch: pytest.MonkeyPatch, fp8_recipe: bool
+) -> None:
     """The layer must fold both index scales exactly once before adapter dispatch."""
     config = _small_dsa_config()
-    backend = BackendConfig(attn="cudnn", linear="torch", rms_norm="torch", rope_fusion=False)
+    if fp8_recipe:
+        monkeypatch.setattr(layer_mod, "initialize_linear_module", _plain_linear_stand_in)
+        backend = BackendConfig(
+            attn="cudnn", linear="te", rms_norm="torch", rope_fusion=False, te_fp8={"recipe": "mxfp8"}
+        )
+    else:
+        backend = BackendConfig(attn="cudnn", linear="torch", rms_norm="torch", rope_fusion=False)
     indexer = GlmMoeDsaIndexer(config, backend)
     captured: dict[str, object] = {}
     expected_topk = torch.zeros(4, 1, config.index_topk, dtype=torch.int32)
@@ -895,7 +916,10 @@ def test_cudnn_indexer_layer_preserves_fp32_reference_scaling(monkeypatch: pytes
     monkeypatch.setattr(layer_mod, "cudnn_indexer_topk", fake_indexer)
     x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16)
     q_resid = torch.randn(4, config.q_lora_rank, dtype=torch.bfloat16)
-    expected_weights = indexer.weights_proj(x).float() * config.index_n_heads**-0.5 * config.index_head_dim**-0.5
+    # Independent oracle: the head weights are an fp32 GEMM over the bf16 weight in every configuration
+    # (never FP8 themselves, never the bf16 rounding).
+    projection = torch.nn.functional.linear(x.float(), indexer.weights_proj.weight.float())
+    expected_weights = projection * config.index_n_heads**-0.5 * config.index_head_dim**-0.5
     packed_metadata = (
         torch.zeros(4, dtype=torch.int32),
         torch.arange(1, 5, dtype=torch.int32),

@@ -128,10 +128,9 @@ class MiMoV2Config(PretrainedConfig):
         self.swa_v_head_dim = swa_v_head_dim if swa_v_head_dim is not None else self.swa_head_dim
         self.swa_rope_theta = swa_rope_theta if swa_rope_theta is not None else rope_theta
 
-        if sliding_window is None:
-            sliding_window = sliding_window_size
-        self.sliding_window = sliding_window
-        self.sliding_window_size = sliding_window_size if sliding_window_size is not None else sliding_window
+        # Hub size counts previous tokens; our masks also count the query (HF #49170).
+        self.sliding_window = sliding_window_size + 1 if sliding_window_size is not None else sliding_window
+        self.sliding_window_size = sliding_window_size
         self.attention_chunk_size = attention_chunk_size
         self.add_full_attention_sink_bias = add_full_attention_sink_bias
         self.add_swa_attention_sink_bias = add_swa_attention_sink_bias
