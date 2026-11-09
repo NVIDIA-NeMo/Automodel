@@ -49,6 +49,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     qsa_gqa_attention,
     qsa_route_replay,
     qsa_route_selection_region,
+    select_qsa_cuda_kernel,
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
 from nemo_automodel.components.moe.config import MoEConfig
@@ -566,13 +567,14 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     def __init__(self, config: Qwen3_8_FlashNextTextConfig, layer_idx: int, backend: BackendConfig) -> None:
         # QSA owns its sparse-attention dispatch. The inherited constructor is
         # reused only for projections/norms, but its generic attention factory
-        # does not implement ``flex`` or ``cute``. Give it an isolated SDPA
+        # does not implement ``flex``, ``fa4`` or ``cudnn``. Give it an isolated SDPA
         # copy, then discard the unused callable and retain the real backend.
         parent_backend = replace(backend, attn="sdpa")
         super().__init__(config, layer_idx, parent_backend)
         self.backend = backend
         self.attn_module = None
         self.attn_func = None
+        self.qsa_cuda_kernel = select_qsa_cuda_kernel(backend.attn)
         self._cp_mesh: DeviceMesh | None = None
         self.indexer = Qwen3_8_FlashNextQSAIndexer(config, backend)
         if backend.attn == "cudnn" and (self.indexer.compress_ratio != 4 or self.indexer.token_budget > 2048):
@@ -688,7 +690,7 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             key,
             value,
             selected_token_ids,
-            backend=self.backend.attn,
+            cuda_kernel=self.qsa_cuda_kernel,
             softmax_scale=self.scaling,
             flex_mask=flex_mask,
         )
