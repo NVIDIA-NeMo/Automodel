@@ -1,10 +1,10 @@
-# Training a DeepSeek-V4-Flash DSpark Drafter
+# Train a DeepSeek-V4-Flash DSpark Drafter
 
 DSpark draft training for a frozen **DeepSeek-V4-Flash** target, using the same
-semi-autoregressive method and three-term objective as the Qwen3 / Gemma4 DSpark
-configs. The V4 target is loaded frozen using the V4 finetune recipe's distributed
+semi-autoregressive method and three-term objective as the Qwen3 and Gemma4 DSpark
+configs. The V4 target is loaded frozen using the V4 fine-tuning recipe's distributed
 path (expert-parallel and FSDP2): the 256 routed experts shard across ranks and the
-FP8/FP4 base weights dequantize to bf16 on load. The draft is a small dense
+FP8 or FP4 base weights dequantize to bf16 on load. The draft is a small dense
 V4-attention stack and hidden states are captured online (no offline cache).
 
 ## Hardware Requirements for the Full Target
@@ -16,31 +16,31 @@ dequantizes them to bf16 (2 byte/param) for the grouped-expert GEMM, a **4x**
 expansion. The routed experts alone are ~500 GiB in bf16, so per-rank expert
 memory is ~`500 GiB / ep_size`:
 
-| ep_size | nodes (x8) | experts/rank | fits 80 GB? |
+| `ep_size` | Nodes (x8) | Experts/Rank | Fits 80 GB? |
 |--------:|-----------:|-------------:|:------------|
 | 8       | 1          | ~63 GiB      | **No**: OOMs at load (a resident-weight peak), before the first forward |
 | 16      | 2          | ~32 GiB      | **Yes** (~50 GiB/rank total); the default in `deepseek_v4_flash_dspark.yaml` |
-| 32      | 4          | ~16 GiB      | Yes, with more headroom for longer sequences |
+| 32      | 4          | ~16 GiB      | **Yes**, with more headroom for longer sequences |
 
 `ep_size` must divide `n_routed_experts` (256) and should equal `world_size`
 (`nnodes * 8`). The OOM at `ep_size=8` is **not** fixable by lowering `seq_length`
 or enabling `activation_checkpointing`: it is a resident-weight peak in the expert
 dequant, not an activation peak. Expert parallelism is data-parallel-compatible:
-each rank forwards its own data shard and the MoE all-to-all routes tokens to the
+each rank forwards its own data shard and the Mixture-of-Experts (MoE) all-to-all routes tokens to the
 expert-owning ranks, so a larger `ep_size` only shards experts more finely.
 
 ## Prerequisites
 
 - **DeepEP** (or HybridEP) installed. The V4 MoE token dispatcher requires it;
   without it `setup()` raises `ImportError: HybridEP is not installed`.
-- For full training: 2 or more nodes of 8 x 80 GiB or larger GPUs (see the table above).
-  For the smoke: a single 8 x 80 GiB or larger node (the target is reduced to 4 layers).
+- For full training: 2 or more nodes of 8 x 80 GB or larger GPUs (see the table above).
+  For the smoke: a single 8 x 80 GB or larger node (the target is reduced to 4 layers).
 - A local DeepSeek-V4-Flash checkpoint (or the hub id `deepseek-ai/DeepSeek-V4-Flash`).
 
 ## Prepare Data (and the Chat Template)
 
 DSpark is teacher-forced, so regenerate the responses with the **target** first
-to avoid a train/inference distribution mismatch (as in the DSpark paper). Take
+to avoid a training and inference distribution mismatch (as in the DSpark paper). Take
 Open-PerfectBlend prompts, generate responses with V4-Flash, and write
 OpenAI-format `messages` rows to a JSONL file:
 
@@ -55,7 +55,7 @@ so the messages cannot be rendered without one and `ChatDataset` errors. Set
 `recipe_args.chat_template` to an inline Jinja string or a template-file path. It
 **must match** the template you used to regenerate the responses, and should mark
 the assistant span with `{% generation %}` so only those tokens carry loss. The
-configs ship a DeepSeek-style default; replace it if your data-gen format differs
+configs ship a DeepSeek-style default; replace it if your data-generation format differs
 (for example, thinking mode). If `chat_template` is unset and the tokenizer has none, the
 recipe fails fast with a clear message instead of silently mislabeling tokens.
 
@@ -86,11 +86,11 @@ Run the **same** command on every node, varying only `--node-rank`; node 0 is th
 rendezvous master and `<NODE0_IP>` is its address reachable from the other nodes:
 
 ```
-torchrun --nnodes=2 --node-rank=0 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/deepseek_v4_flash_dspark.yaml
+torchrun --nnodes=2 --node-rank=0 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.speculative_decoding.train_dspark -c examples/speculative/dspark/deepseek_v4_flash_dspark.yaml
 ```
 
 ```
-torchrun --nnodes=2 --node-rank=1 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/deepseek_v4_flash_dspark.yaml
+torchrun --nnodes=2 --node-rank=1 --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.speculative_decoding.train_dspark -c examples/speculative/dspark/deepseek_v4_flash_dspark.yaml
 ```
 
 For 4 nodes, set `ep_size: 32` in the YAML and `--nnodes=4` with `--node-rank` 0..3.
@@ -101,10 +101,10 @@ on every node: `NCCL_IB_DISABLE=1 NCCL_SOCKET_IFNAME=<iface>`. Per-step metrics
 
 ### Attention Backend
 
-`target_attn_backend` defaults to `eager` (the model's Torch attention/indexer
+`target_attn_backend` defaults to `eager` (the model's Torch attention and indexer
 path): reliable everywhere and correct, just slower than the fused kernels. Set it
-to `tilelang` for speed **if** your TileLang build JIT-compiles the V4
-sparse/indexer/Sinkhorn kernels. Some versions fail with
+to `tilelang` for speed if your TileLang build JIT-compiles the V4
+sparse, indexer, and Sinkhorn kernels. Some versions fail with
 `AttributeError: '_NestedLoopCheckVisitor' object has no attribute '_inst'`.
 
 ### Sequence Packing
@@ -114,22 +114,22 @@ into rows of that many tokens. The frozen target starts every document on a
 128-token compression-group boundary (the least common multiple of the CSA and
 HCA ratios), so no compressed group or indexer score mixes documents, and the
 draft keeps every block inside its anchor's document. Packing needs the online
-path (no `cached_target_path`), `cp_size: 1` and the colocated target
+path (no `cached_target_path`), `cp_size: 1`, and the colocated target
 (`target_model_backend: colocated`, the default).
 
 ## Validation Status
 
-- **Verified**: CPU unit tests for the draft / config / registry / RoPE `inv_freq`
-  fp32 pin, and the new chat-template / target-layer-reduction recipe knobs
+- **Verified**: CPU unit tests for the draft, config, registry, RoPE `inv_freq`
+  fp32 pin, and the new chat-template and target-layer-reduction recipe knobs
   (`tests/unit_tests/speculative/`).
 - **Smoke-validated on 8 x H100 80 GB** (community): the reduced 4-layer EP path with
   `target_attn_backend: eager` trains end to end (loss decreases, ~16 GiB/rank).
   The full 43-layer target OOMs on a single 8 x 80 GB node, which is why full training
   uses `ep_size>=16` across 2 or more nodes.
 - **Needs a first multi-node run**: the full 43-layer distributed target load and
-  cross-shard hidden capture at `ep_size>=16`. Points to eyeball during it:
-  1. FP8/FP4 base weights dequantize to bf16 on load (target forward stays finite).
+  cross-shard hidden capture at `ep_size>=16`. Points to check during it:
+  1. FP8 or FP4 base weights dequantize to bf16 on load (target forward stays finite).
   2. Captured hidden states are full per-rank (not a sharded DTensor that needs an all-gather).
   3. The frozen V4 target forward runs with a 2D mask and `use_cache=False`.
-  4. `ep_size` divides `n_routed_experts` (256); 16 gives 16 experts/rank.
+  4. `ep_size` divides `n_routed_experts` (256); 16 gives 16 experts per rank.
   5. Per-rank weight memory is ~32 GiB of experts and ~12 GiB dense (watch `nvidia-smi`).
