@@ -15,6 +15,7 @@
 """Load public dataset factories without initializing unrelated backends."""
 
 import importlib
+from types import FunctionType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -92,7 +93,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str) -> object:
+def __getattr__(name: str) -> type | FunctionType:
     """Resolve and cache an existing public export from its owning module."""
     if name not in _LAZY_ATTRS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
