@@ -70,6 +70,7 @@ include = [
     "nemo_automodel/components/launcher/**",
     "nemo_automodel/components/loggers/**",
     "nemo_automodel/components/optim/**",
+    "nemo_automodel/components/quantization/**",
     "nemo_automodel/components/training/**",
 ]
 
