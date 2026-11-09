@@ -1292,6 +1292,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         vocab_size = getattr(config, "vocab_size", None)
         if vocab_size is not None and not all(0 <= i < vocab_size for i in self.gated_mtp.mask_token_ids):
             raise ValueError(f"gated_mtp.mask_token_ids must lie in the model vocabulary of size {vocab_size}.")
+        if any(getattr(m, "sliding_window", None) for m in model.modules()):
+            raise NotImplementedError(
+                "gated_mtp does not support models with sliding-window attention layers yet: the gated-MTP mask "
+                "is full causal, so a layer that is supplied an explicit mask stops applying its own window."
+            )
 
     def _gated_mtp_attention_mask(
         self, model: nn.Module, valid_mask: torch.Tensor

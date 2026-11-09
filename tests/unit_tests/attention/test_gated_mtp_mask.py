@@ -42,6 +42,9 @@ def _reference_gated_mtp_mask(num_depths, valid_mask):
                 else:
                     # mask keys: only from mask queries of the same anchor at the same or a deeper depth
                     allowed = depth_q > 0 and anchor_k == anchor_q and depth_k <= depth_q
+                if depth_q == 0 and not bool(valid_mask[b, anchor_q]) and q == k:
+                    # a padded clean query has no valid key above; let it attend only itself
+                    allowed = True
                 mask[b, 0, q, k] = allowed
     return mask
 
@@ -62,6 +65,13 @@ def test_sdpa_mask_has_no_fully_masked_rows():
     valid_mask = torch.tensor([[1, 1, 0, 0]])
     sdpa = create_gated_mtp_sdpa_mask(2, valid_mask, dtype=torch.float32)
     assert (sdpa == 0.0).any(dim=-1)[0, 0, valid_mask.shape[1] :].all()
+
+
+def test_sdpa_mask_left_padding_has_no_fully_masked_rows():
+    # A left-padded clean query has no earlier valid clean key; it must still attend itself.
+    valid_mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]])
+    sdpa = create_gated_mtp_sdpa_mask(2, valid_mask, dtype=torch.float32)
+    assert (sdpa == 0.0).any(dim=-1).all()
 
 
 def test_block_mask_matches_sdpa_mask_on_cpu():

@@ -56,6 +56,25 @@ def _gated_mtp_allowed(q_idx: torch.Tensor, kv_idx: torch.Tensor, seq_len: int) 
     return clean_to_clean | mask_to_clean | mask_to_block
 
 
+def _padded_clean_query(valid_mask: torch.Tensor, num_depths: int) -> torch.Tensor:
+    """Extend the clean padding mask to the concatenated queries, True only at padded clean positions.
+
+    Mask-token queries are never padded this way: their own anchor's padding only empties the keys they would
+    attend, which :func:`_key_valid` already keeps non-empty.
+
+    Args:
+        valid_mask: Padding-validity mask over the clean copy, Tensor of shape [batch, sequence] (non-zero = real
+            token).
+        num_depths: Number of MTP depths ``D``.
+
+    Returns:
+        Bool Tensor of shape [batch, sequence * (1 + D)].
+    """
+    batch, seq_len = valid_mask.shape
+    mask_queries = torch.zeros(batch, seq_len * num_depths, dtype=torch.bool, device=valid_mask.device)
+    return torch.cat([~valid_mask.bool(), mask_queries], dim=1)
+
+
 def _key_valid(valid_mask: torch.Tensor, num_depths: int) -> torch.Tensor:
     """Extend the clean padding mask to the concatenated keys.
 
@@ -96,8 +115,13 @@ def create_gated_mtp_sdpa_mask(
     batch, seq_len = valid_mask.shape
     total = seq_len * (1 + num_depths)
     idx = torch.arange(total, device=valid_mask.device)
+    self_diag = idx.view(-1, 1) == idx.view(1, -1)
     allowed = _gated_mtp_allowed(idx.view(-1, 1), idx.view(1, -1), seq_len)
     allowed = allowed.view(1, 1, total, total) & _key_valid(valid_mask, num_depths).view(batch, 1, 1, total)
+    # A padded clean query would otherwise have no valid key (every clean key before it is also padding),
+    # which turns its whole row -inf and NaNs the eager/sdpa softmax; let it attend only to itself instead.
+    padded_query = _padded_clean_query(valid_mask, num_depths)
+    allowed = allowed | (padded_query.view(batch, 1, total, 1) & self_diag.view(1, 1, total, total))
     zero = torch.zeros((), device=valid_mask.device, dtype=dtype)
     neg_inf = torch.full((), float("-inf"), device=valid_mask.device, dtype=dtype)
     return torch.where(allowed, zero, neg_inf)
@@ -126,9 +150,16 @@ def create_gated_mtp_block_mask(
     batch, seq_len = valid_mask.shape
     total = seq_len * (1 + num_depths)
     key_valid = _key_valid(valid_mask, num_depths)
+    padded_query = _padded_clean_query(valid_mask, num_depths)
 
     def gated_mtp_mask_mod(b, h, q_idx, kv_idx):
-        return _gated_mtp_allowed(q_idx, kv_idx, seq_len) & key_valid[b, kv_idx]
+        # See create_gated_mtp_sdpa_mask: a padded clean query attends only itself, never nothing.
+        return (_gated_mtp_allowed(q_idx, kv_idx, seq_len) & key_valid[b, kv_idx]) | (
+            padded_query[b, q_idx] & (q_idx == kv_idx)
+        )
+
+    # Disambiguate from other calls' closures under the shared compiled create_block_mask.
+    gated_mtp_mask_mod.__name__ = f"gated_mtp_mask_mod_b{batch}_s{seq_len}_d{num_depths}"
 
     builder = _get_compiled_create_block_mask() if use_compile else create_block_mask
     return builder(gated_mtp_mask_mod, B=batch, H=None, Q_LEN=total, KV_LEN=total, device=valid_mask.device)

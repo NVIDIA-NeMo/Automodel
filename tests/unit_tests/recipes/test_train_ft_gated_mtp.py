@@ -230,3 +230,11 @@ def test_validate_rejects_setups_that_break_losslessness(monkeypatch):
     object.__setattr__(recipe, "mesh_context", SimpleNamespace(cp_size=2, tp_size=1))
     with pytest.raises(NotImplementedError, match="context, or tensor parallelism"):
         recipe._validate_gated_mtp(is_packed=False)
+
+    object.__setattr__(recipe, "mesh_context", SimpleNamespace(cp_size=1, tp_size=1))
+    model.model.layers[0].self_attn.sliding_window = 4
+    try:
+        with pytest.raises(NotImplementedError, match="sliding-window"):
+            recipe._validate_gated_mtp(is_packed=False)
+    finally:
+        model.model.layers[0].self_attn.sliding_window = None
