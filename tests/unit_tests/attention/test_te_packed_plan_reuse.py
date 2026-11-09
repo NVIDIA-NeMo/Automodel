@@ -14,6 +14,7 @@
 
 """CPU contract coverage through the production TE factory/callable."""
 
+import sys
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Callable, Unpack
@@ -67,7 +68,7 @@ def factory() -> _Factory:
             FP8GlobalStateManager=SimpleNamespace(is_fp8_enabled=lambda: state.enabled)
         ),
     }
-    with patch("nemo_automodel.components.attention.utils.safe_import", side_effect=lambda name: (True, modules[name])):
+    with patch.dict(sys.modules, modules):
         module, call = initialize_attn_module_and_func("te", 2, 8, 8, 8**-0.5, qkv_format="thd")
     return module, call, state
 

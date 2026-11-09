@@ -142,12 +142,10 @@ def initialize_attn_module_and_func(
 ) -> tuple[nn.Module | None, Callable[..., torch.Tensor]]:
     """Initialize an attention backend module and callable."""
     if attn_impl == "te":
-        have_te, te_attention = safe_import("transformer_engine.pytorch.attention")
-        have_quantization, te_quantization = safe_import("transformer_engine.pytorch.quantization")
-        if not have_te or not have_quantization:
-            raise ImportError("attn_impl='te' requires Transformer Engine attention and quantization support")
+        from transformer_engine.pytorch.attention import DotProductAttention
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
-        attn_module = te_attention.DotProductAttention(
+        attn_module = DotProductAttention(
             num_attention_heads=num_attention_heads,
             kv_channels=(num_qk_channels, num_v_channels),
             attn_mask_type=attn_mask_type,
@@ -158,7 +156,7 @@ def initialize_attn_module_and_func(
         )
         # Keep the native module and state-dict paths unchanged. A partial also
         # preserves the module reference correctly when its owner is deep-copied.
-        attn_func = partial(_call_te_attention, attn_module, te_quantization.FP8GlobalStateManager.is_fp8_enabled)
+        attn_func = partial(_call_te_attention, attn_module, FP8GlobalStateManager.is_fp8_enabled)
         return attn_module, attn_func
     elif attn_impl == "sdpa":
         supported_sdpa_kwargs = {"attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa"}
