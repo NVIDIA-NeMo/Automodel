@@ -41,4 +41,11 @@ class PeftConfig:
     # Storage mode, not a torch dtype: "unquantized" uses the ordinary floating-point
     # experts with the model's configured precision (including FP32). "mxfp4"
     # stores frozen expert bases as fp4-e2m1 + e8m0 scales and requires torch_mm.
-    expert_weight_format: Literal["unquantized", "mxfp4"] = "unquantized"
+    # "nvfp4" keeps them in the ModelOpt NVFP4 checkpoint format (fp4-e2m1 + e4m3 block
+    # scales + per-tensor scale), loaded as-is from an experts-only NVFP4 export
+    # (group_size 16; dense projections, attention, router, norms and embeddings stay in
+    # floating point). Packed formats require backend.experts='torch_mm' (with the torch,
+    # DeepEP or HybridEP expert dispatcher) and, on several ranks, expert parallelism over
+    # the whole non-pipeline mesh (ep_size == world_size // pp_size): see
+    # validate_packed_expert_topology.
+    expert_weight_format: Literal["unquantized", "mxfp4", "nvfp4"] = "unquantized"
