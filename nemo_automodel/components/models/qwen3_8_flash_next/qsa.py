@@ -27,6 +27,7 @@ import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -38,11 +39,15 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
+from nemo_automodel.components.models.qwen3_8_flash_next.cudnn_qsa import cudnn_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import FlexQSAMask, flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 
 # The gathered implementation is a numerical oracle and CPU fallback, not the
 # production CUDA path. Keep its workspace bounded without exposing a model or
@@ -457,8 +462,10 @@ def qsa_gqa_attention(
         key: Tensor [batch, global_keys, kv_heads, head_dim].
         value: Tensor with key's layout. Q/K/V share one dtype and device.
         selected_token_ids: Signed IDs [batch, local_queries, routes] in global
-            K/V coordinates; invalid CUDA IDs are padding and duplicates collapse.
-        backend: CUDA backend, "flex" or "cute". FA4 requires SM90 BF16 D256.
+            K/V coordinates. Flex/FA4 collapse duplicates. cuDNN requires the
+            ratio-four indexer's distinct complete blocks and causal tails.
+        backend: CUDA backend, "flex", "cute", or "cudnn". FA4 requires SM90
+            BF16 D256; cuDNN requires SM100/SM103 BF16 D256 and equal Q/KV extents.
         softmax_scale: Optional positive QK score multiplier.
         flex_mask: Optional FlexAttention mask already built from ``selected_token_ids``
             (see :func:`build_flex_qsa_mask`); used by the flex backend only.
@@ -477,9 +484,11 @@ def qsa_gqa_attention(
         )
     if backend == "cute":
         return fa4_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
+    if backend == "cudnn":
+        return cudnn_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
     if backend != "flex":
         raise RuntimeError(
-            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex' or 'cute', got {backend!r}; "
+            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex', 'cute', or 'cudnn', got {backend!r}; "
             "call gathered_qsa_gqa_attention directly for a numerical oracle"
         )
     if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
@@ -546,7 +555,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
     ``[B, floor(S / c), 1, D_index]`` before K RMSNorm and group-start RoPE.
     """
 
-    def __init__(self, config: object, backend: BackendConfig) -> None:
+    def __init__(self, config: Qwen3_8_FlashNextTextConfig, backend: BackendConfig) -> None:
         super().__init__()
         self.hidden_size = int(getattr(config, "hidden_size"))
         self.num_query_heads = int(getattr(config, "indexer_n_heads"))

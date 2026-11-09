@@ -38,6 +38,11 @@ from nemo_automodel.shared.tied_weights import (
     has_local_tied_lm_head as has_local_tied_lm_head,
 )
 
+# Values consumed by the checkpoint resolver: scalar download options, proxy maps,
+# and an optional in-memory tensor state dictionary.
+_CheckpointLoadValue = str | bool | os.PathLike[str] | Mapping[str, str] | Mapping[str, torch.Tensor] | None
+
+
 logger = logging.getLogger(__name__)
 _AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_(\d+)_step_(\d+)$")
 _CHECKPOINT_STEP_RE = re.compile(r"step_(\d+)$")
@@ -510,7 +515,7 @@ def materialize_missing_tied_lm_head(
 def _get_checkpoint_tensor_dtypes(
     pretrained_model_name_or_path: str,
     hf_config: Any,
-    load_kwargs: Mapping[str, object] | None = None,
+    load_kwargs: Mapping[str, _CheckpointLoadValue] | None = None,
 ) -> dict[str, torch.dtype]:
     """Inspect checkpoint tensors and return their exact dtypes by key.
 

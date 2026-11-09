@@ -1,10 +1,10 @@
 ---
 title: "Beam-1.0-501B-A23B"
-description: "Fine-tune Beam-1.0-501B-A23B, Reflection AI's 501B sparse MoE language model, with NeMo AutoModel: a one-node LoRA recipe and an 8-node full-parameter recipe."
+description: "Fine-tune Beam-1.0-501B-A23B, Reflection AI's 501B sparse MoE, with NeMo AutoModel: one-node LoRA, LoRA on NVFP4-resident experts, and 8-node full-parameter SFT."
 slug: model-coverage/large-language-models/reflection/Beam-1.0-501B-A23B
 ---
 
-[Beam-1.0-501B-A23B](https://huggingface.co/reflection/Beam-1.0-501B-A23B) is Reflection AI's text-only sparse Mixture-of-Experts (MoE) language model: 501.3B total parameters with 23.4B activated per token. NeMo AutoModel trains it with a native implementation on the shared MoE stack, with expert, pipeline and context parallelism, packed sequences, and a Hugging Face state-dict adapter.
+[Beam-1.0-501B-A23B](https://huggingface.co/reflection/Beam-1.0-501B-A23B) is Reflection AI's text-only sparse Mixture-of-Experts (MoE) language model: 501.3B total parameters with 23.4B activated per token. NeMo AutoModel trains it with a native implementation on the shared MoE stack, with expert parallelism, pipeline parallelism, context parallelism, packed sequences, and a Hugging Face state-dict adapter.
 
 <Info>
 
@@ -13,29 +13,45 @@ slug: model-coverage/large-language-models/reflection/Beam-1.0-501B-A23B
 | **Task** | Text Generation (MoE, mixed sliding-window and full attention) |
 | **Architecture** | `BeamForCausalLM` (`model_type: beam`) |
 | **Parameters** | 501B total, 23B activated per token |
-| **Validated hardware** | LoRA: 1 node, 8 H200 GPUs, EP8; full-parameter SFT: 8 nodes, 64 H200 GPUs, EP64 |
+| **Validated hardware** | LoRA: 1 node, 8 H200 GPUs, EP8; LoRA with NVFP4-resident experts: 1 node, 8 H200 GPUs, EP8, and 4 nodes, 32 H200 GPUs, EP32; full-parameter SFT: 8 nodes, 64 H200 GPUs, EP64 |
 | **HF Org** | [reflection](https://huggingface.co/reflection) |
 
 </Info>
 
 ## Fine-Tune Beam
 
-Follow the [installation instructions](/get-started/installation), then run the LoRA recipe from the repository root on one node of 8xH200 GPUs (141 GB VRAM):
+Follow the [installation instructions](/get-started/installation), then run the LoRA recipe from the repository root on one node of 8x H200 GPUs (141 GB VRAM):
 
 ```bash
 uv run automodel --nproc-per-node=8 examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml
 ```
 
-The recipe trains rank-32 LoRA adapters on the attention and dense-MLP projections and on the routed experts with EP8, packed 2048-token sequences of the Tulu-3 SFT mixture, and a global batch of 64 packs.
+The recipe trains rank-32 LoRA adapters on the attention and dense-MLP projections and on the routed experts with EP8, packed 2,048-token sequences of the Tulu-3 SFT mixture, and a global batch of 64 packs.
 
-For full-parameter SFT, run the 8-node recipe on each of 8 nodes of 8xH200 GPUs, with `NODE_RANK` 0-7 and `MASTER_ADDR` set to the first node:
+To train the same adapters against the frozen experts of an NVFP4 checkpoint instead of the BF16 weights, run the NVFP4 LoRA recipe, which points at [Beam-1.0-501B-A23B-NVFP4](https://huggingface.co/reflection/Beam-1.0-501B-A23B-NVFP4), an experts-only NVFP4 export of the model quantized with NVIDIA ModelOpt (`hf_quant_config.json` with `quant_algo: NVFP4` and `group_size: 16`):
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_nvfp4_ep8.yaml
+```
+
+With `peft.expert_weight_format: nvfp4`, the packed FP4 expert weights, their E4M3 block scales, and per-tensor scales load as stored. The packed format uses 0.56 bytes per expert parameter instead of 2 bytes. The grouped expert GEMMs dequantize the weights, so no FP4 tensor cores are needed, and the adapters train against the same expert weights that an NVFP4 inference engine serves. The rest of the checkpoint (dense projections, attention, router, norms, and embeddings) stays in floating point and loads as usual.
+
+This format has the following requirements:
+
+- Set `backend.experts: torch_mm`. The torch, DeepEP, and HybridEP expert dispatchers all work; the recipe dispatches with HybridEP like the BF16 LoRA recipe.
+- On more than one GPU, use expert parallelism over the whole non-pipeline mesh. Set `ep_size` equal to the number of GPUs per pipeline stage, both within a node and across nodes.
+- Save adapters only. Keep `checkpoint.save_consolidated: false` and merge the adapter into a floating-point checkpoint offline.
+
+The recipe keeps FP32 master weights and FP32 Adam moments for the BF16 adapters with TE FusedAdam.
+
+For full-parameter SFT, run the 8-node recipe on each of 8 nodes of 8x H200 GPUs, with `NODE_RANK` set from 0 to 7 and `MASTER_ADDR` set to the first node:
 
 ```bash
 uv run torchrun --nnodes=8 --nproc-per-node=8 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR --master-port=29500 \
   -m nemo_automodel.cli.app examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml
 ```
 
-It trains all weights with EP64 on the same Tulu-3 data, packed to 4096 tokens, with a global batch of 64 packs. TE FusedAdam keeps fp32 master weights and Adam moments while the model weights and checkpoints stay bf16. Each checkpoint holds about 6 TB, so `checkpoint_dir` must be on a shared filesystem.
+It trains all weights with EP64 on the same Tulu-3 data, using 4,096-token packing and a global batch of 64 packs. TE FusedAdam keeps FP32 master weights and Adam moments while the model weights and checkpoints stay BF16. Each checkpoint holds about 6 TB, so `checkpoint_dir` must be on a shared filesystem.
 
 ## Choose a Workflow
 
@@ -43,6 +59,7 @@ It trains all weights with EP64 on the same Tulu-3 data, packed to 4096 tokens, 
 | --- | --- |
 | Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml). |
 | Run full-parameter SFT on 8 nodes | Use the [full-parameter recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml). |
+| Train LoRA against NVFP4-resident experts | Use the [NVFP4 LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_nvfp4_ep8.yaml) with an experts-only ModelOpt NVFP4 export. |
 | Prepare your environment | Follow the [installation instructions](/get-started/installation). |
 
 ### Configuration
@@ -55,6 +72,8 @@ It trains all weights with EP64 on the same Tulu-3 data, packed to 4096 tokens, 
 | Features | Checkpointing (enabled=true), Activation checkpointing (activation_checkpointing=true), LoRA, Packed sequences (packed_sequence_size=2048), Transformer Engine, HybridEP (dispatcher=hybridep) |
 | Advanced | bfloat16, attention=te, linear=torch, experts=torch_mm, dispatcher=hybridep |
 
+The NVFP4 LoRA recipe keeps this configuration and changes only the checkpoint (an experts-only NVFP4 export) and `peft.expert_weight_format: nvfp4`.
+
 ## Model Reference
 
 ### Model Architecture
@@ -66,37 +85,61 @@ It trains all weights with EP64 on the same Tulu-3 data, packed to 4096 tokens, 
 | Attention | GQA, 48 query / 8 KV heads, head dim 128, q/k RMSNorm, sigmoid output gate per head |
 | Attention layout | 43 sliding-window layers (window 512, RoPE) and 9 full-attention layers (NoPE with scalable-softmax query scaling) |
 | MoE | 256 routed experts, top-8, no shared expert, expert FFN 2560 (SwiGLU) |
-| Router | Sigmoid scores with an `e_score_correction_bias` for selection, grouped top-k (8 groups, top 4), normalized weights, scaling factor 2.5, computed in fp32 |
+| Router | Sigmoid scores with an `e_score_correction_bias` for selection, grouped top-k (8 groups, top 4), normalized weights, scaling factor 2.5, computed in FP32 |
 | Norms | Sandwich RMSNorm around attention and MLP, depth-scaled residual adds |
 | Vocabulary | 151,936, untied embeddings and LM head |
 | Output | Final logit soft-capping at 30.0 |
 
 ## Architecture
 
-- `BeamStateDictAdapter` converts the per-expert `gate_proj` / `up_proj` / `down_proj` weights of the Hugging Face checkpoint to the grouped expert layout and back, so exports keep the Hugging Face layout.
-- The router weight and `e_score_correction_bias` stay fp32 through the model cast, checkpoint load, FSDP2 sharding (their own fp32 unit) and export.
-- Parallelism: EP, FSDP2, PP and CP are supported; TP is not. Context parallelism requires the TE attention backend. Full-attention layers use TE's `p2p` exchange; sliding-window layers use `all_gather`, or `a2a` for packed (THD) input, which needs the CP size to divide the 48 query and 8 KV heads (CP 2, 4 or 8).
-- Backends: attention `te`, `sdpa` or `flex`, linear `torch` or `te`, experts `torch` or `torch_mm`. `flex` handles only unpadded, unpacked batches: it rejects a padding `attention_mask` and packed (THD) input, so use `te` or `sdpa` for padded or packed data. FP8 uses the existing torchao and TE paths; the grouped experts stay bf16.
+- `BeamStateDictAdapter` converts the per-expert `gate_proj`, `up_proj`, and `down_proj` weights of the Hugging Face checkpoint to the grouped expert layout and back, so exports keep the Hugging Face layout.
+- The router weight and `e_score_correction_bias` stay FP32 through the model cast, checkpoint load, FSDP2 sharding (their own FP32 unit), and export.
+- Parallelism: EP, FSDP2, PP, and CP are supported; TP is not. Context parallelism requires the TE attention backend. Full-attention layers use TE's `p2p` exchange; sliding-window layers use `all_gather`, or `a2a` for packed (THD) input, which needs the CP size to divide the 48 query and 8 KV heads (CP 2, 4, or 8).
+- NVFP4-resident experts (`peft.expert_weight_format: nvfp4`): the routed experts are kept in the ModelOpt NVFP4 checkpoint format (packed FP4 E2M1 codes, one `float8_e4m3fn` scale per 16 columns, one FP32 scale per tensor) as frozen packed parameters; the Beam state-dict adapter maps the per-expert ModelOpt tensors onto them, so the standard base-checkpoint load fills them in place, also on the expert-parallel sharded path, and the grouped GEMMs dequantize them on the fly in the forward and backward passes. The format needs `torch_mm` experts, expert parallelism over the whole non-pipeline mesh on several ranks, and adapter-only saves; merged PEFT export and consolidated saves refuse packed experts.
+- Backends: attention `te`, `sdpa`, or `flex`, linear `torch` or `te`, experts `torch` or `torch_mm`. `flex` handles only unpadded, unpacked batches: it rejects a padding `attention_mask` and packed (THD) input, so use `te` or `sdpa` for padded or packed data. FP8 uses the existing torchao and TE paths; the grouped experts stay BF16.
 
 ## Validated Configuration
 
 | Area | Validated Configuration |
 | --- | --- |
 | Training | Full-parameter SFT with FSDP2 and activation checkpointing |
-| Optimizer | TE FusedAdam with fp32 master weights (bf16 weights plus 16-bit remainders) and fp32 Adam moments |
+| Optimizer | TE FusedAdam with FP32 master weights (BF16 weights plus 16-bit remainders) and FP32 Adam moments |
 | Distributed setup | EP64 / CP1, TP1 / PP1 |
 | Workload | `allenai/tulu-3-sft-mixture`, packed 4,096-token sequences |
 | Batch | Local batch size 1; global batch size 64 |
 | Scale | 8 nodes / 64 H200 GPUs |
 | Duration | 100 optimizer steps |
 
-The [full-parameter recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml) reduced training loss from 0.6622 at step 0 to 0.5137 at step 99, with a mean of 0.5183 over steps 10-99, and the validation loss from 0.4832 after 25 steps to 0.4682 after 100. Peak logged memory was 117.0 GiB per GPU. The run completed without non-finite losses or gradient norms and saved the model and optimizer state after 50 and 100 steps, about 6 TB per checkpoint. Resuming from the checkpoint saved after 50 steps on the same 8 nodes reproduced the next step's loss bit-exactly, stayed within 0.05% of the uninterrupted run over the following 10 steps, and did not raise peak memory. This validates the training mechanics, not model convergence.
+The [full-parameter recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_ep64_8nodes.yaml) reduced training loss from 0.6622 at step 0 to 0.5137 at step 99. The mean was 0.5183 over steps 10 to 99, and validation loss fell from 0.4832 after 25 steps to 0.4682 after 100. Peak logged memory was 117.0 GiB per GPU. The run completed without non-finite losses or gradient norms and saved the model and optimizer state after 50 and 100 steps, with about 6 TB per checkpoint. Resuming from the checkpoint saved after 50 steps on the same 8 nodes reproduced the next step's loss bit-exactly. It stayed within 0.05% of the uninterrupted run over the following 10 steps and did not raise peak memory. This validates the training mechanics, not model convergence.
+
+### NVFP4-Resident Experts
+
+| Area | Validated Configuration |
+| --- | --- |
+| Training | Rank-128 per-expert LoRA (alpha 256) on the attention and dense-MLP projections and on every routed expert, FSDP2 with activation checkpointing |
+| Expert storage | Experts-only ModelOpt NVFP4 export (`quant_algo: NVFP4`, `group_size: 16`), loaded packed; the BF16-expert control uses the same adapters on the BF16 checkpoint |
+| Optimizer | TE FusedAdam with FP32 master weights and FP32 Adam moments on the adapters, learning rate 1e-4 constant |
+| Distributed setup | EP32 / CP1, TP1 / PP1, `torch` expert dispatcher |
+| Workload | `allenai/tulu-3-sft-mixture`, packed 4,096-token sequences, the full-parameter recipe's data, batch, and validation settings |
+| Batch | Local batch size 1; global batch size 64 |
+| Scale | 4 nodes / 32 H200 GPUs per LoRA run; the full-parameter reference ran on 8 nodes / 64 H200 GPUs |
+| Duration | 100 optimizer steps |
+
+On the full-parameter recipe's Tulu-3 workload, LoRA on the NVFP4-resident experts tracked LoRA on the BF16 experts and the full-parameter run step for step (the three runs consumed the same tokens at every step):
+
+| Run | Resources | Peak Logged Memory | Mean Loss, Steps 90 to 99 | Validation Loss After 25 / 50 / 75 / 100 Steps | Median Step Time |
+| --- | ---: | ---: | ---: | --- | ---: |
+| Full-parameter SFT | 8 nodes / 64 H200s | 117.0 GiB | 0.5166 | 0.4832 / 0.4752 / 0.4711 / 0.4682 | 13.4 s |
+| LoRA, BF16 experts | 4 nodes / 32 H200s | 53.9 GiB | 0.5156 | 0.4784 / 0.4727 / 0.4694 / 0.4672 | 13.6 s |
+| LoRA, NVFP4 experts | 4 nodes / 32 H200s | 33.3 GiB | 0.5162 | 0.4789 / 0.4732 / 0.4698 / 0.4675 | 14.8 s |
+
+Across the 100 matched steps, the NVFP4 training loss differed from the BF16-expert LoRA by a mean absolute difference of 0.0006 (maximum 0.0018), and the validation loss differed by at most 0.0006. The on-the-fly dequantization added about 9% to the step time at EP32 (14.8 s compared to 13.6 s). On one node of 8 H200 GPUs (EP8), the base load of the experts-only NVFP4 export (274 GB, 47 GB per rank) took 186 s from a cold network filesystem. The packed experts take 32 GiB per GPU, and a rank-128 run peaked at 94.5 GiB per GPU. The BF16 experts (114 GiB per GPU) do not fit in this configuration.
 
 ## Numerical Validation
 
 ### Hugging Face Logit Parity
 
-Logits of the native implementation against the Hugging Face reference on 4 held-out Tulu-3 conversations of 4096 tokens (16,384 positions, full vocabulary). Truncated models keep the first N decoder layers plus embeddings, final norm and LM head.
+Logits of the native implementation against the Hugging Face reference on four held-out Tulu-3 conversations of 4,096 tokens (16,384 positions, full vocabulary). Truncated models keep the first `N` decoder layers plus embeddings, final norm, and LM head.
 
 | Model | Compute | Mean KL | Logits cosine | Top-1 agreement |
 | --- | --- | ---: | ---: | ---: |
@@ -104,11 +147,11 @@ Logits of the native implementation against the Hugging Face reference on 4 held
 | First 6 layers | BF16 | 0.0012 | 0.99995 | 90.7% |
 | Full model, 52 layers | BF16 | 0.0053 | 0.9927 | 98.4% |
 
-The FP32 row shows numerical equivalence; the BF16 rows measure rounding noise, which grows with depth and with near-tie expert selection. Loading the full checkpoint maps all 38,366 tensors with no missing or mismatched entries, and a load, sharded save and offline consolidation round trip reproduces all 38,366 tensors bit-exactly at EP1, EP2 and EP8.
+The FP32 row shows numerical equivalence; the BF16 rows measure rounding noise, which grows with depth and with near-tie expert selection. Loading the full checkpoint maps all 38,366 tensors with no missing or mismatched entries, and a load, sharded save, and offline consolidation round trip reproduces all 38,366 tensors bit-exactly at EP1, EP2, and EP8.
 
 ### 100-Step LoRA Training
 
-The LoRA recipe, [`beam_1_0_501b_a23b_tulu3_lora_ep8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml), trained for 100 steps on 1 node / 8 H200 GPUs.
+The LoRA recipe, [`beam_1_0_501b_a23b_tulu3_lora_ep8.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/beam/beam_1_0_501b_a23b_tulu3_lora_ep8.yaml), trained for 100 steps on one node with 8 H200 GPUs.
 
 | Metric | Result |
 | --- | ---: |
@@ -120,9 +163,9 @@ The LoRA recipe, [`beam_1_0_501b_a23b_tulu3_lora_ep8.yaml`](https://github.com/N
 
 The validation loss on 256 held-out conversations fell at every evaluation. The run completed without non-finite losses or gradient norms.
 
-### Packed CP1 / CP4 / CP8 Training Parity
+### Packed CP1, CP4, and CP8 Training Parity
 
-The full model trained for 100 steps with the same Tulu-3 workload, global batch size 64, EP64, TP1 and PP1, using torch AdamW with bf16 optimizer state. The CP1 reference packs documents with the same per-document alignment as the CP runs.
+The full model trained for 100 steps with the same Tulu-3 workload, global batch size 64, EP64, TP1, and PP1, using torch AdamW with BF16 optimizer state. The CP1 reference packs documents with the same per-document alignment as the CP runs.
 
 | Run | Resources | Peak Logged Memory | Step 99 Loss |
 | --- | ---: | ---: | ---: |
@@ -135,7 +178,8 @@ Across all 100 matched steps, the CP4 loss curve differed from CP1 by a mean abs
 ## Current Scope
 
 - Tensor parallelism is not supported, and the LM head must stay untied from the embeddings.
-- Packed context parallelism needs CP 2, 4 or 8.
+- Packed context parallelism needs CP 2, 4, or 8.
+- NVFP4-resident experts need an experts-only ModelOpt export with 16-column blocks and `torch_mm` experts (torch, DeepEP, or HybridEP dispatch); on several ranks `ep_size` must equal the number of GPUs per pipeline stage, and the run saves adapters only (no merged export or consolidated save).
 
 ## Related Resources
 
