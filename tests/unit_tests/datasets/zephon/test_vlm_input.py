@@ -104,3 +104,27 @@ def test_custom_normalizer_is_revalidated_and_no_unknown_media_is_dropped():
             normalize_image_document(payload, source_name="my source")
     with pytest.raises(ValueError, match="Unknown VLM"):
         VlmInputOptions(column_mapping={"typo": "value"})
+
+
+def test_pointer_columns_and_late_pointers_fail_before_any_image_decode(monkeypatch):
+    def must_not_decode(*args, **kwargs):
+        raise AssertionError("schema validation must happen before image decode")
+
+    monkeypatch.setattr(Image, "open", must_not_decode)
+    for payload in (
+        {"image_path": "/data/p.png", "question": "q", "answer": "a"},
+        {"messages": [{"role": "user", "content": "<image><image>"}], "images": [b"corrupt", "/data/p.png"]},
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": b"corrupt"},
+                        {"type": "image", "image": {"path": "s3://bucket/p.png"}},
+                    ],
+                }
+            ]
+        },
+    ):
+        with pytest.raises(ValueError, match="self-contained Parquet or LitData"):
+            normalize_image_document(payload)

@@ -63,16 +63,23 @@ def decode_embedded_image(value: MediaValue | bytearray | memoryview) -> Image.I
     are never opened. Corrupt bytes raise VlmMediaDecodeError; an unsupported
     storage/schema raises ValueError and is never silently dropped.
     """
-    if isinstance(value, dict) and value.get("bytes") is not None:
-        value = value["bytes"]
+    image = _embedded_image(value)
     try:
-        if isinstance(value, Image.Image):
-            return value.convert("RGB")
-        if isinstance(value, (bytes, bytearray, memoryview)):
-            with Image.open(io.BytesIO(bytes(value))) as image:
-                return image.convert("RGB")
+        if isinstance(image, Image.Image):
+            return image.convert("RGB")
+        with Image.open(io.BytesIO(bytes(image))) as decoded:
+            return decoded.convert("RGB")
     except (OSError, Image.DecompressionBombError) as exc:
         raise VlmMediaDecodeError("Cannot decode embedded image bytes") from exc
+
+
+def _embedded_image(value: MediaValue | bytearray | memoryview) -> Image.Image | bytes:
+    if isinstance(value, dict) and value.get("bytes") is not None:
+        value = value["bytes"]
+    if isinstance(value, (Image.Image, bytes)):
+        return value
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
     raise ValueError(
         "Zephon VLM requires embedded image bytes or materialized PIL images, not paths/URLs. "
         "Export external media into self-contained Parquet or LitData shards before training; "
@@ -118,7 +125,11 @@ def normalize_image_document(
 
 def _normalize(payload: Mapping[str, MediaValue], options: VlmInputOptions) -> ConversationSample:
     messages = _column(payload, options, "messages", ("conversation", "messages", "conversations"))
-    images = _column(payload, options, "images", ("images", "image"))
+    # Recognize common pointer-column names so they fail with migration guidance
+    # instead of making an image/question/answer record appear text-only.
+    images = _column(
+        payload, options, "images", ("images", "image", "image_path", "image_paths", "image_url", "image_urls")
+    )
     pending = list(images) if isinstance(images, (list, tuple)) else ([] if images is None else [images])
     if messages is None:
         question = _column(payload, options, "question", ("question",))
@@ -150,6 +161,8 @@ def _normalize(payload: Mapping[str, MediaValue], options: VlmInputOptions) -> C
                     raise ValueError(
                         f"Zephon image conversations support only image and text content; got {block.get('type')!r}"
                     )
+    for image in pending:
+        _embedded_image(image)
     cursor = 0
 
     def take_image() -> MediaValue:
@@ -168,7 +181,7 @@ def _normalize(payload: Mapping[str, MediaValue], options: VlmInputOptions) -> C
                 if text:
                     result.append({"type": "text", "text": text})
                 if index < len(parts) - 1:
-                    result.append({"type": "image", "image": decode_embedded_image(take_image())})
+                    result.append({"type": "image", "image": _embedded_image(take_image())})
             return result
         if not isinstance(value, list):
             raise ValueError("Message content must be a string or a list of text/image blocks")
@@ -181,9 +194,7 @@ def _normalize(payload: Mapping[str, MediaValue], options: VlmInputOptions) -> C
                 result.extend(content_blocks(block["text"]))
             elif kind == "image":
                 image = block.get("image")
-                result.append(
-                    {"type": "image", "image": decode_embedded_image(take_image() if image is None else image)}
-                )
+                result.append({"type": "image", "image": _embedded_image(take_image() if image is None else image)})
             else:
                 raise ValueError("Zephon image conversations support only image and text content blocks")
         return result
@@ -211,4 +222,12 @@ def _normalize(payload: Mapping[str, MediaValue], options: VlmInputOptions) -> C
         if not isinstance(tokens, int):
             raise ValueError("_text_tokens must be an integer")
         result["_text_tokens"] = tokens
+    # Validate the entire document before decoding any image: corrupt-media drop
+    # must never conceal a later schema error (such as a second image pointer).
+    for message in conversation:
+        content = message["content"]
+        assert isinstance(content, list)
+        for block in content:
+            if block["type"] == "image":
+                block["image"] = decode_embedded_image(block["image"])
     return result
