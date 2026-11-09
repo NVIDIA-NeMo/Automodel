@@ -22,6 +22,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     ShardLayout,
+    THDBatchConsumer,
     identity_local_indices,
     round_robin_local_indices,
     shard_batch_identity,
@@ -393,7 +394,8 @@ def _prepare_cp_sharder(
 
     The model hook may return a ContextParallelSharder; otherwise this
     function resolves a framework-owned sharder from the live model's attention
-    backend and the batch's token layout. When CP is active and the model exposes
+    backend and the batch's token layout. A THDBatchConsumer can request shared
+    CP1 normalization without constructing or importing a sharder. When CP is active and the model exposes
     ``prepare_model_inputs_for_cp``, that sharder-only hook is invoked directly as
     a plain method (it constructs a sharder and touches no weights; embed / vision
     splice / sequence shard run in the model's own forward per microbatch).
@@ -439,6 +441,17 @@ def _prepare_cp_sharder(
         prepared = model.prepare_model_inputs_for_cp(batch, num_chunks=num_chunks)
         cp_sharder = prepared.get("cp_sharder")
         batch.update({key: value for key, value in prepared.items() if key != "cp_sharder"})
+
+    if (
+        batch_is_thd
+        and invoke_pre_embed
+        and cp_sharder is None
+        and isinstance(model, THDBatchConsumer)
+        and model.requires_thd_batch_preparation
+    ):
+        if effective_cp_size > 1 or num_chunks != 1:
+            raise ValueError("Shared THD batch preparation requires CP1 and a single non-pipeline chunk")
+        backend_uses_thd = True
 
     cp_mesh = _get_submesh(device_mesh, "cp")
     if backend_uses_thd and extra_seq_buffers:

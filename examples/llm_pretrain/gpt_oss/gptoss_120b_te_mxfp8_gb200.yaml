@@ -62,7 +62,8 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.streaming_text.StreamingTextConfig
   path: HuggingFaceFW/fineweb-edu
   name: sample-10BT
-  revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9
+  # Public dataset revision; retained for reproducible input data.
+  revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9  # pragma: allowlist secret
   seq_length: 4096
   tokenizer:
     _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
@@ -81,7 +82,7 @@ optimizer:
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
-  foreach: false
+  foreach: true
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG
   seed: 1234

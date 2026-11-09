@@ -28,6 +28,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.packing import prepare_packed_metadata
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
     reject_unsupported_tie_word_embeddings,
@@ -169,6 +170,24 @@ class GptOssModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Run decoder layers, preparing private FA4 metadata once per model call.
+
+        Args:
+            input_ids: Token IDs [batch, sequence] or physical THD IDs [tokens].
+            position_ids: Optional positions with the same token layout.
+            attention_mask: Optional BSHD padding mask [batch, sequence].
+            padding_mask: Optional bool [tokens] mask, True at physical THD padding.
+            **attn_kwargs: Original THD offsets [documents + 1], maxima and layout;
+                private FA4 offsets index compact valid tokens. Inputs are not mutated.
+
+        Returns:
+            Hidden states [batch, sequence, hidden] or [physical_tokens, hidden].
+        """
+        if self.backend.attn == "fa4" and attn_kwargs.get("qkv_format") == "thd":
+            prepared = prepare_packed_metadata(self, (input_ids,), {**attn_kwargs, "padding_mask": padding_mask})
+            if prepared is not None:
+                _, attn_kwargs = prepared
+                attn_kwargs.pop("padding_mask")
         if position_ids is None:
             if input_ids.ndim == 1:
                 position_ids = torch.arange(0, input_ids.shape[0], device=input_ids.device)
@@ -220,6 +239,7 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    _packed_cp_attn_backends = ("te",)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -229,6 +249,21 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = False
         supports_pp: bool = False
         supports_ep: bool = True
+        supports_thd: bool = True
+
+    @property
+    def _owns_packed_attention(self) -> bool:
+        """Declare only this model's bounded FA4 THD input path."""
+        return self.backend.attn == "fa4"
+
+    @property
+    def requires_thd_batch_preparation(self) -> bool:
+        """Request framework-owned raw token/label flattening for the FA4 path.
+
+        This requests CP1 batch conversion only, not context or pipeline
+        parallelism. TE retains its existing backend-owned preparation.
+        """
+        return self.backend.attn == "fa4"
 
     @classmethod
     def from_config(

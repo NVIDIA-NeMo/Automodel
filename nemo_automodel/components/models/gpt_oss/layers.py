@@ -43,6 +43,45 @@ def _has_thd_metadata(attn_kwargs: dict[str, Any]) -> bool:
     )
 
 
+def _use_physical_fa4_layout(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kwargs: dict[str, Any]) -> bool:
+    """Restrict physical THD dispatch to the measured SM100 kernel geometry.
+
+    Args:
+        q: Query tensor of shape [physical_tokens, heads, head_dim].
+        k: Key tensor of shape [physical_tokens, kv_heads, head_dim].
+        v: Value tensor of shape [physical_tokens, kv_heads, head_dim].
+        kwargs: Prepared metadata: ``_fa4_seqused`` is int32 [documents],
+            ``_fa4_physical_cu_seqlens`` is int32 [documents + 1],
+            ``packed_token_indices`` is int64 [valid_tokens], and
+            ``learnable_sink`` is BF16 [heads]. No input is mutated.
+
+    Returns:
+        Whether the shape, dtype, device, window and prefix metadata fall in
+        the validated scope. Other supported inputs retain compact dispatch.
+    """
+    used = kwargs.get("_fa4_seqused")
+    sink = kwargs.get("learnable_sink")
+    indices = kwargs.get("packed_token_indices")
+    return (
+        q.shape == (32768, 64, 64)
+        and k.shape == v.shape == (32768, 8, 64)
+        and q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and q.is_cuda
+        and torch.cuda.get_device_capability(q.device) == (10, 0)
+        and used is not None
+        and used.numel() > 1
+        and indices is not None
+        and indices.numel() > 128
+        and kwargs.get("_fa4_physical_cu_seqlens") is not None
+        and sink is not None
+        and sink.shape == (64,)
+        and sink.dtype == torch.bfloat16
+        and sink.device == q.device
+        and kwargs.get("window_size", (-1, 0)) in ((-1, 0), (129, 0))
+        and kwargs.get("softcap") in (None, 0.0)
+    )
+
+
 class GptOssAttention(nn.Module):
     def __init__(self, config: "GptOssConfig", backend: BackendConfig, use_sliding_attention: bool = False):
         super().__init__()
@@ -77,8 +116,9 @@ class GptOssAttention(nn.Module):
         else:
             self.yarn_concentration = None
 
-        assert backend.attn in ("flex", "te"), "Only Flex and TE Attention are supported for GPT-OSS"
-        if backend.attn == "te" and not is_te_min_version("2.8.0"):
+        if backend.attn not in ("flex", "te", "fa4"):
+            raise ValueError("GPT-OSS requires Flex, TE or FA4 attention")
+        if backend.attn in ("te", "fa4") and not is_te_min_version("2.8.0"):
             raise ValueError(
                 "Transformer Engine DotProductAttention for GPT-OSS is only supported for TE version 2.8.0 or higher"
             )
@@ -103,6 +143,20 @@ class GptOssAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        """Attend with the configured backend and the original learned sink parameter.
+
+        Args:
+            x: Hidden states [batch, sequence, hidden] or [physical_tokens, hidden].
+            freqs_cis: Non-fused cosine/sine tensor [batch, sequence, rotary_dim]
+                or [physical_tokens, rotary_dim]; fused angles have shape
+                [sequence, 1, 1, rotary_dim]. rotary_dim is even and at most head_dim.
+            attention_mask: Optional BSHD padding mask [batch, sequence].
+            **attn_kwargs: Logical/physical offsets [documents + 1] and optional
+                private compact FA4 indices [valid_tokens], prepared at model entry.
+
+        Returns:
+            Projected states with the same layout as x. Physical padding remains present.
+        """
         # Detect THD format: either 2D [T, hidden], explicit THD metadata, or
         # 3D [1, T, hidden] with cu_seqlens from PP schedule splitting.
         explicit_thd = attn_kwargs.get("qkv_format") == "thd" or _has_thd_metadata(attn_kwargs)
@@ -151,12 +205,21 @@ class GptOssAttention(nn.Module):
                 "enable_gqa": True,
             }
         else:
-            updated_attn_kwargs = attn_kwargs
+            updated_attn_kwargs = dict(attn_kwargs)
+            if self.backend.attn == "fa4":
+                sink = self.attn_module.softmax_offset
+                updated_attn_kwargs["learnable_sink"] = sink.to_local() if isinstance(sink, DTensor) else sink
             if qkv_format == "thd":
                 updated_attn_kwargs = {**updated_attn_kwargs, "qkv_format": "thd"}
                 attention_mask = None
             if self.sliding_window is not None:
-                updated_attn_kwargs["window_size"] = (self.sliding_window, 0)
+                # TE uses a left distance; shared FA4 preprocessing subtracts one
+                # from an inclusive-current width. Preserve the existing TE distance.
+                window = self.sliding_window + (1 if self.backend.attn == "fa4" else 0)
+                updated_attn_kwargs["window_size"] = (window, 0)
+
+        if self.backend.attn == "fa4" and qkv_format == "thd":
+            updated_attn_kwargs["fa4_physical_layout"] = _use_physical_fa4_layout(q, k, v, updated_attn_kwargs)
 
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
             q, k, v, attention_mask, self.backend.attn, **updated_attn_kwargs
