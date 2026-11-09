@@ -35,6 +35,7 @@ from nemo_automodel.components.datasets.packing import (
     PackedSequenceContract,
 )
 from nemo_automodel.components.datasets.vlm.datasets import (
+    EncodedVlmDocument,
     VlmMediaDecodeError,
     VlmMediaTokenMismatchError,
     encode_vlm_document,
@@ -207,7 +208,7 @@ class _EncodeImageDocuments(BaseOp):
         return output
 
 
-def prepare_fake_image_document(processor: ProcessorMixin, positions: ImagePositionState) -> dict[str, object]:
+def prepare_fake_image_document(processor: ProcessorMixin, positions: ImagePositionState) -> EncodedVlmDocument:
     """Encode one attention-excluded leading segment for all-text packs.
 
     Args:
@@ -242,8 +243,8 @@ def prepare_fake_image_document(processor: ProcessorMixin, positions: ImagePosit
 
 
 def merge_image_documents(
-    documents: list[dict[str, object]], *, fake_document: dict[str, object] | None = None
-) -> dict[str, object]:
+    documents: list[EncodedVlmDocument], *, fake_document: EncodedVlmDocument | None = None
+) -> dict[str, torch.Tensor | int | None]:
     """Assemble complete documents chosen by ``pack_sequences`` without shifting.
 
     Args:
