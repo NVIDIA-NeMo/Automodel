@@ -67,9 +67,7 @@ include = [
     "nemo_automodel/components/launcher/**",
     "nemo_automodel/components/loggers/**",
     "nemo_automodel/components/optim/**",
-    "nemo_automodel/components/quantization/fp8.py",
-    "nemo_automodel/components/quantization/qat.py",
-    "nemo_automodel/components/quantization/qlora.py",
+    "nemo_automodel/components/quantization/**",
 ]
 
 [overrides.rules]
