@@ -17,7 +17,7 @@ inference engine (SGLang or vLLM). The training code lives in
 |---|---|---|---|
 | **EAGLE-1** | Single decoder block that predicts the next target hidden state. Supervised by SmoothL1 hidden-state loss and a token loss through the frozen target `lm_head`. | `TrainEagle1Recipe` | `eagle1/` |
 | **EAGLE-2** | Same training objective as EAGLE-1 (it differs only in the inference-time tree policy), so the recipe is a thin subclass. | `TrainEagle2Recipe` | `eagle2/` |
-| **EAGLE-3** | Draft with its own `lm_head` over a (optionally compressed) draft vocab, fed three auxiliary target hidden states, trained with a **test-time-training (TTT)** unroll. | `TrainEagle3Recipe` | `eagle3/` |
+| **EAGLE-3** | Draft with its own `lm_head` over an optionally compressed draft vocab, fed three auxiliary target hidden states, trained with a **test-time-training (TTT)** unroll. | `TrainEagle3Recipe` | `eagle3/` |
 | **EAGLE-3.1** | EAGLE-3 with two drafter toggles (`fc_norm`, `norm_output`), matching the vLLM EAGLE-3.1 architecture. | `TrainEagle3Recipe` | `eagle3_1/` |
 | **EAGLE-4** | EAGLE-3.1 with a sliding-window draft layer and a low-rank candidate head over the full vocabulary, trained in two stages (draft, then candidate head) and exported to the `LlamaForCausalLMEagle4` layout. | `TrainEagle3Recipe` (`eagle4:`) | `eagle4/` |
 | **P-EAGLE** | Parallel-drafting EAGLE-3: predicts all `num_depths` tokens in one forward over a COD-subsampled sequence instead of the TTT unroll. Serves on vLLM only. | `TrainEagle3Recipe` (`parallel_drafting: true`) | `p-eagle/` |
@@ -59,7 +59,7 @@ The shipped example configs only cover a subset.
 - **EAGLE-1, EAGLE-2, and EAGLE-3 (and the EAGLE-3.1 and P-EAGLE toggles on top of EAGLE-3)**:
   `LlamaForCausalLM`, `Phi3ForCausalLM`, `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`.
 - **gpt-oss** (`GptOssForCausalLM`): EAGLE-3 only, using a dedicated draft class.
-- **DeepSeek-V3** (`DeepseekV3ForCausalLM`): EAGLE-3 only, using a dedicated MLA
+- **DeepSeek-V3** (`DeepseekV3ForCausalLM`): EAGLE-3 only, using a dedicated multi-head latent attention (MLA)
   draft class (eager attention, sequence packing not supported yet).
 - **Gemma4** (`Gemma4ForConditionalGeneration`): EAGLE-3 only, using a dedicated
   draft class that reconciles the Gemma4 text config (`hidden_activation`, nested
@@ -70,7 +70,7 @@ The shipped example configs only cover a subset.
   `gemma4_e4b_eagle3.yaml`, `gemma4_31b_eagle3.yaml`, `gemma4_26b_a4b_eagle3.yaml`.
 - **Kimi K3** (`KimiK3ForCausalLM`, `KimiK3ForConditionalGeneration`): EAGLE-3,
   using a dedicated no-positional-embedding (NoPE) MLA draft class (eager attention, no context or
-  tensor parallelism, and no sequence packing, see
+  tensor parallelism and no sequence packing, see
   `eagle3/README-kimi-k3.md`).
 - **DFlash, DFlash 2, Domino, and JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForCausalLM`,
@@ -87,13 +87,15 @@ The shipped example configs only cover a subset.
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
   (`Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration`),
   and MiniMax M3 VL (`MiniMaxM3SparseForConditionalGeneration`, including a
-  multimodal data path through `recipe_args.multimodal: true`).
+  multimodal data path through `recipe_args.multimodal: true`). MiniMax-M3.1-Flash
+  ships `dspark/config.json`, so its draft follows that contract and exports the
+  released layout (`dspark/minimax_m3_1_flash_dspark.yaml`).
 
 Qwen3-MoE is handled exactly like a dense target: the draft only consumes
 post-block hidden states, never per-expert routing. gpt-oss uses a dedicated
 draft class that reuses the target's YaRN rotary embedding but keeps the on-disk
 `architectures` string as the Llama EAGLE-3 draft so inference engines load it
-unchanged. The large Mixture-of-Experts (MoE) DSpark targets (DeepSeek-V4, GLM-5.2, and MiniMax M3) load
+unchanged. The large mixture-of-experts (MoE) DSpark targets (DeepSeek-V4, GLM-5.2, MiniMax M3) load
 frozen through the same expert-parallel and FSDP paths their fine-tuning recipes use.
 Per-target notes are in `dspark/README-*.md`.
 
@@ -168,7 +170,7 @@ unset when the draft vocab is uncompressed.
 
 ### FP8 Draft Training
 
-All spec-decode recipes (EAGLE-1, EAGLE-2, EAGLE-3, P-EAGLE, DFlash, Domino,
+All spec-decode recipes (EAGLE-1/2, EAGLE-3, P-EAGLE, DFlash, Domino,
 JetSpec, and DSpark) accept the same top-level `fp8:` block as the SFT recipes (see
 `components/quantization/fp8.py`). When enabled, the draft's `nn.Linear` layers
 are swapped to torchao `Float8Linear` before the DDP or FSDP2 wrap, so the
@@ -213,7 +215,7 @@ draft to `model/consolidated` (serve-ready, same layout as full fine-tuning runs
 no external merge step is needed. Not supported with `parallel_drafting`
 (P-EAGLE trains `mask_hidden` and the embeddings, which the LoRA freeze would
 lock), with `freeze_embeddings: false` (same freeze conflict), with `fp8:`,
-or in the DFlash-family, DSpark, or EAGLE-1 and EAGLE-2 recipes (rejected explicitly.
+or in the DFlash-family, DSpark, and EAGLE-1/2 recipes (rejected explicitly.
 Their drafts carry trainable non-LoRA heads that the freeze would silently
 lock, and only EAGLE-3 implements the warm start). See
 `eagle3/qwen3_eagle3_lora.yaml`.
@@ -268,8 +270,8 @@ The server listens on `target_server.host` and `target_server.port` (default
 `0.0.0.0:8001`) and runs the target in a single process. The DSpark remote
 backend does not prefetch (`target_prefetch_depth` is EAGLE-3 only) and does not
 support sequence packing, multimodal targets, context parallelism, or
-`cached_target_path`. Issue #4325 tracks serving for targets that need an expert-parallel mesh across
-several GPUs: DeepSeek V4, DeepSeek V4.1, GLM-5.2, and Kimi K3.
+`cached_target_path`. Serving targets that need an expert-parallel mesh across
+several GPUs (DeepSeek V4 and V4.1, GLM-5.2, and Kimi K3) is tracked in issue #4325.
 
 The loss-mask options live under `recipe_args` in the speculative recipes (not under a
 `dataset:` block): `mask_reasoning_content` drops rendered reasoning traces from the loss, and
@@ -376,7 +378,7 @@ OpenAI-compatible server works too.
 
 For each sample the script loads the `messages` column (HF Hub id, local
 parquet, or JSON/JSONL, same loader as `ChatDataset`), drops every trailing
-`assistant` turn while keeping the leading `system`, `user`, and later-turn context
+`assistant` turn while keeping the leading `system`, `user`, and later context
 (intermediate assistant turns in multi-turn conversations are kept), calls
 `/v1/chat/completions` on the target with that prompt, appends the response as the
 new assistant turn, and writes the rebuilt conversations to `shard-NNNNNN.parquet`
@@ -570,7 +572,7 @@ as an error row and excluded from the aggregate rather than aborting the sweep.
 
 **`--engine sglang` caveat with more than one dataset:** SGLang's
 `avg_spec_accept_length` is a server-cumulative running average with no
-reset/delta API, so sweeping several datasets against one live SGLang server
+reset or delta API, so sweeping several datasets against one live SGLang server
 means every dataset after the first reports a blend with prior datasets'
 traffic, not an independent number (a warning is logged when this applies).
 Restart the server between datasets for independent numbers, or use
@@ -695,7 +697,7 @@ nemo_automodel/components/speculative/
   dflash/       core, dflash2_core, domino_core, jetspec_core, draft_qwen3,
                 draft_qwen3_dflash2, registry, target
   dspark/       core, draft_qwen3, draft_deepseek_v4, draft_glm_5_2,
-                draft_gemma4, draft_minimax_m3, markov_head, registry, target,
+                draft_gemma4, markov_head, registry, target,
                 remote                      # remote target server logic + client
   regenerate.py            # dataset regeneration with the target model
   regen_loop.py            # on-policy regeneration during training (regen block)

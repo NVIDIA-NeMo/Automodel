@@ -72,7 +72,6 @@ from nemo_automodel.components.speculative.dspark.config import (
     build_gemma4_draft_config,
     build_glm_5_2_draft_config,
     build_kimi_k3_draft_config,
-    build_minimax_m3_draft_config,
 )
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
 from nemo_automodel.components.speculative.dspark.registry import (
@@ -1061,10 +1060,8 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
                 confidence_head_stop_gradient=bool(recipe_cfg.get("confidence_head_stop_gradient", False)),
             )
             draft_model = target_config.build_dspark_draft(margs)
-        elif (
-            is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target or is_kimi_k3_target
-        ):
-            # Gemma4, DeepSeek V4, GLM-5.2, MiniMax M3, and Kimi K3 drafts share one typed
+        elif is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_kimi_k3_target:
+            # Gemma4, DeepSeek V4, GLM-5.2, and Kimi K3 drafts share one typed
             # draft-config builder that takes the same DSpark model-args bundle.
             margs = _DraftArgs(
                 num_draft_layers=draft_num_hidden_layers,
@@ -1087,10 +1084,6 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
                 draft_config_obj = build_glm_5_2_draft_config(target_config, margs)
             elif is_kimi_k3_target:
                 draft_config_obj = build_kimi_k3_draft_config(target_config, margs)
-            elif is_minimax_m3_target:
-                # MiniMax M3 draft is built from the target's text sub-config (text_config).
-                draft_config_obj = build_minimax_m3_draft_config(target_config, margs)
-                draft_config_obj._attn_implementation = attention_backend
             else:
                 # Gemma4 draft is built from the target's text sub-config (text_config).
                 draft_config_obj = build_gemma4_draft_config(target_config, margs)
