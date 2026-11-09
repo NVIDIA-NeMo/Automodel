@@ -25,7 +25,21 @@ layout, with visibility supplied entirely by the DFlash additive/block
 attention mask. There is no block-sparse indexer and no MoE here: M3's sparse
 attention and routed experts belong to the target model, not this draft (the
 draft is always dense, matching the DeepSeek V4 DSpark draft's convention).
+
+A target checkpoint that ships ``dspark/config.json`` (MiniMax-M3.1-Flash) fixes
+the draft contract: the FFN width, the sliding window, and the other settings
+named by ``MiniMaxM3DSparkReleasedConfig``. Such a draft exports the released
+key layout and config, so inference engines load it the way they load the
+released ``dspark/`` folder. Without that file the draft keeps its native keys
+and its FFN width comes from the target's ``intermediate_size``.
 """
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -39,7 +53,9 @@ from nemo_automodel.components.models.gpt_oss.rope_utils import (
     apply_rotary_emb,
     position_ids_to_freqs_cis,
 )
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3DSparkReleasedConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3RMSNorm, swiglu_oai
+from nemo_automodel.components.models.minimax_m3_vl.state_dict_adapter import MiniMaxM3DSparkStateDictAdapter
 from nemo_automodel.components.speculative.dspark._sampling import sample_tokens
 from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,
@@ -50,6 +66,11 @@ from nemo_automodel.components.speculative.dspark.common import (
     sample_anchor_positions,
 )
 from nemo_automodel.components.speculative.dspark.markov_head import build_markov_head
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase, ProcessorMixin
+
+logger = logging.getLogger(__name__)
 
 _minimax_m3_flex_attention_compiled = torch.compile(
     flex_attention,
@@ -63,6 +84,32 @@ def _minimax_m3_flex_attention(q, k, v, *, block_mask, scale):
     compile_supported = q.is_cuda and q.shape[-1] >= 16 and k.shape[-1] >= 16 and v.shape[-1] >= 16
     flex = _minimax_m3_flex_attention_compiled if compile_supported else flex_attention
     return flex(q, k, v, block_mask=block_mask, scale=scale)
+
+
+class _ReleasedDraftMetadataExporter:
+    """Write the released draft config next to consolidated draft weights."""
+
+    def __init__(self, released: MiniMaxM3DSparkReleasedConfig) -> None:
+        self._released = released
+
+    def validate(
+        self, *, tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None, original_model_path: str | None
+    ) -> None:
+        """Accept every input: the export only depends on the released config."""
+
+    def save(
+        self,
+        *,
+        hf_metadata_dir: str,
+        tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None,
+        original_model_path: str | None,
+        v4_compatible: bool,
+    ) -> None:
+        """Write ``config.json`` and the tokenizer the recipe passes, if any."""
+        with open(os.path.join(hf_metadata_dir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(self._released.exported_config, f, indent=2)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(hf_metadata_dir)
 
 
 class MiniMaxM3DSparkMLP(nn.Module):
@@ -229,9 +276,10 @@ class MiniMaxM3DSparkModel(nn.Module):
 
     _no_split_modules = ["MiniMaxM3DSparkDecoderLayer"]
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, released: MiniMaxM3DSparkReleasedConfig | None = None) -> None:
         super().__init__()
         self.config = config
+        self.released = released
         required_fields = (
             "target_layer_ids",
             "mask_token_id",
@@ -318,6 +366,15 @@ class MiniMaxM3DSparkModel(nn.Module):
         # factory producing bf16 params next to fp32 Linear layers).
         self.to(torch.float32)
 
+        if released is not None:
+            self.state_dict_adapter = MiniMaxM3DSparkStateDictAdapter()
+            self._pre_shard_hf_state_dict_keys = self.state_dict_adapter.get_hf_state_dict_keys(self.state_dict())
+            logger.info(
+                "MiniMax M3 DSpark draft follows the target's released contract: FFN width %d, window %d.",
+                released.ffn_hidden_size,
+                released.sliding_window,
+            )
+
     def _apply(self, fn, recurse: bool = True):
         """Keep the rotary module's device in sync across ``.to()`` calls.
 
@@ -343,6 +400,12 @@ class MiniMaxM3DSparkModel(nn.Module):
                 rotary_emb._compute_concentration_and_inv_freq.cache_clear()
         return module
 
+    def _get_consolidated_hf_metadata_exporter(
+        self, *, tokenizer: PreTrainedTokenizerBase | ProcessorMixin | None, original_model_path: str | None
+    ) -> _ReleasedDraftMetadataExporter | None:
+        """Return the released-config writer, or None to use the generated config."""
+        return None if self.released is None else _ReleasedDraftMetadataExporter(self.released)
+
     def initialize_embeddings_and_head(
         self,
         *,
@@ -350,6 +413,11 @@ class MiniMaxM3DSparkModel(nn.Module):
         lm_head: nn.Module,
         freeze: bool = True,
     ):
+        if self.released is not None and not freeze:
+            raise ValueError(
+                "The released MiniMax M3 DSpark layout shares the target's embedding and LM head and does "
+                "not export them, so freeze_embeddings must be true."
+            )
         assert self.embed_tokens.weight.shape == embed_tokens.weight.shape
         assert self.lm_head.weight.shape == lm_head.weight.shape
         with torch.no_grad():
@@ -482,13 +550,25 @@ class MiniMaxM3DSparkModel(nn.Module):
         context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         draft_position_ids = create_position_ids(anchor_positions, self.block_size)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        sliding_window = None if self.released is None else self.released.sliding_window
         if self.config._attn_implementation == "flex_attention":
             dspark_attn_mask = create_dflash_block_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+                device,
+                sliding_window=sliding_window,
             )
         else:
             dspark_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device, noise_embedding.dtype
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+                device,
+                noise_embedding.dtype,
+                sliding_window=sliding_window,
             )
         output_hidden = self._forward_backbone(
             position_ids=full_position_ids,

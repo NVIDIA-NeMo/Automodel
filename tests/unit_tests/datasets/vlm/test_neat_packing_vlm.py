@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import io
 import logging
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     _shift_sample,
     neat_pack_dataset_vlm,
 )
+from nemo_automodel.components.models.common.packing import get_packing_capabilities
 
 
 class _FakeDataset:
@@ -360,7 +362,7 @@ class TestNeatPackedVlmCollater:
                 "image_grid_thw": torch.tensor([[1, 224, 224], [1, 224, 224]]),
             },
         ]
-        result = neat_packed_vlm_collater(batch)
+        result = neat_packed_vlm_collater(batch, packing=get_packing_capabilities("sdpa"))
 
         assert result["input_ids"].shape == (2, 4)
         assert result["labels"].shape == (2, 4)
@@ -390,7 +392,9 @@ class TestNeatPackedVlmCollater:
                 "position_ids": torch.tensor([0, 1, 2, 3]),
             },
         ]
-        result = neat_packed_vlm_collater(batch, attn_implementation="flash_attention_2")
+        result = neat_packed_vlm_collater(
+            batch, attn_implementation="flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
+        )
 
         # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
         assert "attention_mask" not in result
@@ -535,7 +539,7 @@ class TestMRoPESupport:
                 "n_videos": 0,
             },
         ]
-        result = neat_packed_vlm_collater(batch)
+        result = neat_packed_vlm_collater(batch, packing=get_packing_capabilities("sdpa"))
 
         # position_ids should be [3, B=2, S=4]
         assert result["position_ids"].shape == (3, 2, 4)
@@ -647,6 +651,45 @@ class TestVariableResolutionImagePacking:
         result = _build_packed_vlm_sample(samples, pack_size=4, padding_idx=0)
         assert isinstance(result["pixel_values"], torch.Tensor)
         assert tuple(result["pixel_values"].shape) == (3, 3, 8, 8)
+
+
+def test_image_sizes_and_ownership_survive_native_packing_and_collation():
+    from nemo_automodel.components.datasets.vlm.neat_packing_vlm import PackedDatasetWrapper
+    from nemo_automodel.components.datasets.vlm.pp_media import VLM_PP_MEDIA_KEY, prepare_vlm_media_for_pp
+
+    documents = [
+        {
+            "input_ids": torch.tensor([1, 2, 3]),
+            "labels": torch.tensor([1, 2, 3]),
+            "attention_mask": torch.ones(3, dtype=torch.long),
+            "pixel_values": torch.ones(2, 3, 8, 8),
+            "image_sizes": torch.tensor([[8, 8], [8, 8]]),
+        },
+        {
+            "input_ids": torch.tensor([3, 4]),
+            "labels": torch.tensor([3, 4]),
+            "attention_mask": torch.ones(2, dtype=torch.long),
+            "pixel_values": torch.full((1, 3, 12, 4), 2.0),
+            "image_sizes": torch.tensor([[12, 4]]),
+        },
+    ]
+    packed = PackedDatasetWrapper(documents, bins=[[0, 1]], pack_size=4)[0]
+    assert packed["n_images"] == 3
+    assert packed["pixel_values"].shape == (3, 3, 12, 8)
+    torch.testing.assert_close(packed["image_sizes"], torch.tensor([[8, 8], [8, 8], [12, 4]]))
+    separate = PackedDatasetWrapper(documents, bins=[[0], [1]], pack_size=4)
+    separate_packs = [separate[0], separate[1]]
+    batch = neat_packed_vlm_collater(separate_packs, padding_idx=0, packing=get_packing_capabilities("sdpa"))
+    assert batch["pixel_values"].shape == (3, 3, 12, 8)
+    torch.testing.assert_close(batch["n_images_per_sample"], torch.tensor([2, 1]))
+    torch.testing.assert_close(batch["image_sizes"], packed["image_sizes"])
+    prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
+    media = batch[VLM_PP_MEDIA_KEY]
+    assert [value.shape[0] for value in media["pixel_values"]] == [2, 1]
+    torch.testing.assert_close(media["image_grid_hws"][0], documents[0]["image_sizes"])
+    torch.testing.assert_close(media["image_grid_hws"][1], documents[1]["image_sizes"])
+    assert documents[0]["pixel_values"].shape == (2, 3, 8, 8)
+    assert documents[1]["pixel_values"].shape == (1, 3, 12, 4)
 
 
 # Qwen2-VL-style processor geometry: 14px patches merged 2x2, i.e. 28px per token side.

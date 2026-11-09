@@ -85,6 +85,7 @@ def test_vlm_setup_nvtx_preserves_forward_backward(monkeypatch, nvtx_ranges, nvt
         loss_fn=SimpleNamespace(build=lambda: torch.nn.MSELoss()),
         checkpoint=SimpleNamespace(build=lambda **_: object(), load_metadata_with_gloo=False),
         optimizer=SimpleNamespace(build=lambda *a, **k: object()),
+        vlm_dataloader=SimpleNamespace(is_packed=False, output_format="batched"),
     )
     if nvtx is not None:
         recipe.cfg.nvtx = nvtx
