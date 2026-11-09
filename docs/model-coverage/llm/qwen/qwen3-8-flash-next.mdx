@@ -20,7 +20,7 @@ straight-through gradient.
 |---|---|
 | **Task** | Text generation (MoE, hybrid attention, Engram N-gram Embedding) |
 | **Architecture** | `Qwen3_8_FlashNextForConditionalGeneration` |
-| **Parameters** | 125B backbone with 6B activated per token, plus the 51.2B Engram table; the checkpoint's 4B MTP head is not loaded |
+| **Parameters** | 125B backbone with 6B activated per token, plus the 51.2B Engram table; the checkpoint's 4B Multi-Token Prediction (MTP) head is not loaded |
 | **Decoder** | 48 layers: 36 GatedDeltaNet and 12 QSA sparse-attention layers |
 | **Experts** | 512 routed experts, top-10 routing, plus one shared expert per layer |
 | **Engram** | One 51.2B-parameter N-gram Embedding table in decoder layer 2 |
@@ -65,7 +65,7 @@ sends IDs to owners, and a second autograd-aware All-to-All returns values.
 Each rank looks up only its contiguous local DTensor shard, and the backward
 pass reverses the value route so only the owner stores and updates each row's
 gradient. The
-validated cluster runs used NCCL's internal IB transport
+validated cluster runs used NCCL's internal InfiniBand (IB) transport
 (`NCCL_NET_PLUGIN=none` and `NCCL_NET=IB`).
 
 ## Numerical Validation
@@ -81,8 +81,8 @@ The QSA routing path was also compared with SGLang on a fixed
 4,096-token input. Rows through position 2,050 matched the reference routing
 exactly. Replaying the exact SGLang layer input through NeMo AutoModel produced the
 same selected-token sets at the first sparse row (2,051) and the last row
-(4,095), and relative L2 error 0.0041 for the projected sparse-attention
-output. Positional ordering after top-k is not compared because the reference
+(4,095). The relative L2 error for the projected sparse-attention output was
+0.0041. Positional ordering after top-k is not compared because the reference
 CUDA kernel does not define a stable order. A full-model EP8 run executing sparse QSA in
 all 12 QSA layers produced final logits with cosine similarity
 0.99952, relative L2 error 0.03175, and the same top-1 and top-5 tokens as the
@@ -102,12 +102,12 @@ was 0.00054, and the maximum absolute difference was 0.00267. Final losses were
 
 Packed (THD) context parallelism was validated the same way at world size 64
 with EP64: CP1 (DP64/GA2) and CP8 (DP8/GA16) trained 100 optimizer steps over
-identical THD packs (packing is topology-independent for the model-owned CP
+identical THD packs (packing is topology independent for the model-owned CP
 path, so both runs consume byte-identical pack sequences). Loss-curve cosine
-similarity was 0.999999925, mean absolute difference 0.00024, and maximum
-absolute difference 0.00069; final losses were 0.56053 for CP1 and 0.56011
+similarity was 0.999999925, mean absolute difference was 0.00024, and the maximum
+absolute difference was 0.00069; final losses were 0.56053 for CP1 and 0.56011
 for CP8. A world-64 single-forward probe also matched CP8 against CP1 with exact
-per-row routing IDs and passing Engram/GDN/QSA activation gates.
+per-row routing IDs, and the Engram, GatedDeltaNet, and QSA activation gates passed.
 
 ## Example Recipe
 
@@ -129,12 +129,33 @@ setup.
   `BlockMask`, avoiding materialized dense per-head attention scores; the same
   code path serves dense, packed, and context-parallel layouts. CPU execution
   retains a bounded-workspace PyTorch numerical oracle; tests can also call
-  that oracle directly. CUDA execution requires the `flex` backend and never
-  silently falls back. The
+  that oracle directly. CUDA execution never silently falls back. The
   discrete QSA indexers are frozen because the supplied inference reference
   and checkpoint define neither an indexer auxiliary loss nor a
   straight-through estimator; main attention Q/K/V and the rest of the
   backbone remain trainable.
+- `model.backend.attn=cudnn` selects experimental cuDNN Frontend indexed QSA forward and
+  backward on Blackwell SM100/SM103. Install the optional runtime with
+  `uv pip install "nvidia-cudnn-frontend[cutedsl]>=1.32.1"`. It requires BF16,
+  head dimension 256, 24Q/2KV (or 12Q/1KV),
+  `indexer_compress_ratio=4`, `indexer_budget<=2048`, and `CP=1`. The existing
+  frozen indexer, route IDs, softmax scale, and projection weights are retained.
+  Packed document offsets, right-tail padding, and empty route rows are supported.
+  The adapter pads route width to a multiple of four and packs batch-local IDs;
+  it does not build a quadratic token-membership bitmap. The 24Q/2KV geometry
+  runs two independent 12Q/1KV calls and includes their packing and copying costs.
+  First-order autograd saves cuDNN's original FP32 output and natural-log LSE;
+  backward uses atomic accumulation and is not bitwise deterministic.
+  This adapter explicitly uses the general backward path; the specialized
+  `causal_topk` backward is not enabled. Numerical tests compare output and
+  gradients against independent FP64 attention using the existing BF16
+  relative L2 bound of 0.004. Small-shape GB200 tests pass; target-length FP64
+  validation remains untested. Differences from `flex` are diagnostic and are
+  not an additional numerical acceptance criterion.
+  Deterministic training requests and `CP>1` are rejected explicitly. Use `flex`
+  for context parallelism. Kernel support does not establish model FLOPs
+  utilization (MFU) for the full model or training-convergence parity; validate
+  those for the intended recipe before changing its backend.
 - Context parallelism uses contiguous rank-ordered sequence shards. QSA keeps
   queries local and gathers compressed index keys plus differentiable main
   K/V; GatedDeltaNet uses FLA's contiguous CP recurrence; Engram hashes replicated
@@ -144,10 +165,11 @@ setup.
   owns Engram remains eager because replaying its mutable owner-sharded
   All-to-All collectives during recomputation is not supported.
 - Native distributed checkpoints store the Engram parameter and optimizer tensors
-  under their global DTensor FQNs, so DCP can reshard them when the owner world
-  size changes. Checkpoints from the earlier rank-local owner format are not
+  under their global DTensor fully qualified names (FQNs), so PyTorch Distributed
+  Checkpoint (DCP) can reshard them when the owner world size changes.
+  Checkpoints from the earlier rank-local owner format are not
   supported; resume from a native DTensor checkpoint or restart the optimizer.
-- CP is limited to language-only inputs with TP=PP=1. Non-packed
+- CP is limited to language-only inputs with `TP=PP=1`. Non-packed
   right-tail-padded batches and packed (THD) batches with `cu_seqlens` (or
   loader `seq_lens`) are both supported; the same FlexAttention path serves
   packed CUDA training, and packing is performed topology-independently.
