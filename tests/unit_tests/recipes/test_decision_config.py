@@ -23,7 +23,16 @@ import yaml
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 
 
-@pytest.mark.parametrize("filename", ["clm_soc_triage.yaml", "clef_soc_triage_lora.yaml", "clef_soc_triage_heads.yaml"])
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "clm_soc_triage.yaml",
+        "clef_soc_triage_lora.yaml",
+        "clef_soc_triage_heads.yaml",
+        "deciffusion_soc_triage_lora.yaml",
+        "deciffusion_support_routing_lora.yaml",
+    ],
+)
 def test_example_recipe_targets_resolve(filename):
     root = Path(__file__).resolve().parents[3]
     config = yaml.safe_load((root / "examples" / "decision" / filename).read_text())
@@ -347,3 +356,35 @@ def test_clef_training_rejects_disabled_checkpoints_before_training_or_loading_o
     assert observed == []
     assert not (output / "metrics_test.json").exists()
     assert (output / "LOWEST_VAL").is_symlink() == stale_pointer
+
+
+def test_deciffusion_selection_prefers_accuracy_then_lower_cross_entropy():
+    from nemo_automodel.recipes.decision.train_deciffusion import selection_value
+
+    assert selection_value(0.9, 5.0) < selection_value(0.8999, 0.01)  # one row in 10^4 outranks any CE
+    assert selection_value(0.9, 0.3) < selection_value(0.9, 0.4)
+    assert selection_value(0.9, 1000.0) < selection_value(0.8999, 0.0)
+
+
+@pytest.mark.parametrize("batch,world", [(0, 1), (6, 4), (-4, 2)])
+def test_deciffusion_rejects_batches_that_do_not_split_over_dp(batch, world):
+    from nemo_automodel.recipes.decision.train_deciffusion import TrainDeciffusionDecisionRecipe
+
+    recipe = TrainDeciffusionDecisionRecipe.__new__(TrainDeciffusionDecisionRecipe)
+    recipe.cfg = {"train.global_batch_size": batch}
+    recipe._get_dp_group_size = lambda: world
+    recipe._get_dp_rank = lambda: 0
+    with pytest.raises(ValueError, match="global_batch_size"):
+        recipe._train()
+
+
+def test_deciffusion_examples_keep_the_reference_training_contract():
+    root = Path(__file__).resolve().parents[3] / "examples" / "decision"
+    for name in ("deciffusion_soc_triage_lora.yaml", "deciffusion_support_routing_lora.yaml"):
+        config = yaml.safe_load((root / name).read_text())
+        assert config["model"]["dlm_paradigm"] == "bidirectional"
+        assert (config["peft"]["dim"], config["peft"]["alpha"], config["peft"]["dropout"]) == (32, 64, 0.0)
+        assert config["optimizer"]["lr"] == 1.0e-4 and config["optimizer"]["betas"] == [0.9, 0.95]
+        assert config["seed"] == 101 and config["train"]["global_batch_size"] == 16
+        assert config["train"]["canonical_fraction"] == 0.5 and config["train"]["kl_weight"] == 0.0
+        assert not any("head" in module or "embed" in module for module in config["peft"]["target_modules"])
