@@ -256,6 +256,57 @@ _TE_RECIPE_NAMES = ("current", "block", "mxfp8", "nvfp4")
 
 
 @dataclass(kw_only=True)
+class TENvfp4Config:
+    """Options of the Transformer Engine NVFP4BlockScaling recipe (``te_fp8.recipe: nvfp4``).
+
+    The defaults are the recipe defaults for training. ``row_scaled_activation`` and ``four_over_six``
+    change how forward activations are quantized; Transformer Engine supports them
+    only without the random Hadamard transform.
+    """
+
+    random_hadamard_transform: bool = True
+    """Rotate the operands of the weight-gradient GEMM with a 16x16 Hadamard matrix before quantizing."""
+    stochastic_rounding: bool = True
+    """Round gradients stochastically instead of to nearest."""
+    weight_blocks_2d: bool = True
+    """Share one block scale per 16x16 weight block instead of per 16 values of a row."""
+    row_scaled_activation: bool = False
+    """Scale forward activations per row (one FP32 scale per token) instead of per tensor."""
+    four_over_six: Literal["none", "weights", "activations", "all"] = "none"
+    """Tensors whose blocks map their maximum to 4 or to 6, whichever quantizes the block with less error."""
+
+    def __post_init__(self) -> None:
+        """Reject option values and combinations that Transformer Engine does not implement."""
+        if self.four_over_six not in ("none", "weights", "activations", "all"):
+            raise ValueError(
+                "te_fp8.nvfp4.four_over_six must be one of 'none', 'weights', 'activations' or 'all', "
+                f"got {self.four_over_six!r}"
+            )
+        if self.random_hadamard_transform and (
+            self.row_scaled_activation or self.four_over_six in ("activations", "all")
+        ):
+            raise ValueError(
+                "te_fp8.nvfp4: row_scaled_activation and four_over_six on activations require "
+                "random_hadamard_transform=False"
+            )
+
+    def recipe_kwargs(self) -> dict[str, bool | str]:
+        """Keyword arguments of ``NVFP4BlockScaling`` for the options that differ from its defaults."""
+        kwargs: dict[str, bool | str] = {}
+        if not self.random_hadamard_transform:
+            kwargs["disable_rht"] = True
+        if not self.stochastic_rounding:
+            kwargs["disable_stochastic_rounding"] = True
+        if not self.weight_blocks_2d:
+            kwargs["disable_2d_quantization"] = True
+        if self.row_scaled_activation:
+            kwargs["row_scaled_activation"] = True
+        if self.four_over_six != "none":
+            kwargs["nvfp4_4over6"] = self.four_over_six
+        return kwargs
+
+
+@dataclass(kw_only=True)
 class TEFp8Config:
     """Configuration for Transformer Engine low-precision (FP8 or FP4) quantization.
 
@@ -272,11 +323,13 @@ class TEFp8Config:
     ``"nvfp4"`` selects TE's :class:`NVFP4BlockScaling` recipe: 4-bit e2m1 data with one e4m3 scale per
     16 values and one FP32 scale per tensor. Parameters keep the model dtype and are quantized for each
     GEMM. The recipe defaults quantize weights in 16x16 blocks, apply random Hadamard transforms to the
-    operands of the weight-gradient GEMM and round gradients stochastically; pass a pre-built
-    ``NVFP4BlockScaling(...)`` to change them. It requires compute capability 10.0+ (Blackwell).
+    operands of the weight-gradient GEMM and round gradients stochastically; the ``nvfp4`` block
+    changes them. It requires compute capability 10.0+ (Blackwell).
     """
 
     recipe: "Literal['current', 'block', 'mxfp8', 'nvfp4'] | Recipe" = "current"
+    nvfp4: TENvfp4Config | None = None
+    """Options of the ``"nvfp4"`` recipe; ``None`` keeps the Transformer Engine defaults."""
     exclude_fqns: tuple[str, ...] = ("lm_head",)
     """Module names kept out of the FP8 autocast (their GEMMs run in the model dtype).
 
@@ -294,6 +347,10 @@ class TEFp8Config:
                 f"te_fp8.recipe must be one of {_TE_RECIPE_NAMES} or a Transformer Engine recipe object, "
                 f"got {self.recipe!r}"
             )
+        if isinstance(self.nvfp4, dict):
+            self.nvfp4 = TENvfp4Config(**self.nvfp4)
+        if self.nvfp4 is not None and self.recipe != "nvfp4":
+            raise ValueError(f"te_fp8.nvfp4 options require te_fp8.recipe='nvfp4', got {self.recipe!r}")
         if isinstance(self.exclude_fqns, str):
             self.exclude_fqns = (self.exclude_fqns,)
         self.exclude_fqns = tuple(self.exclude_fqns)
@@ -377,7 +434,7 @@ class TEFp8Config:
                     "te_fp8.recipe='nvfp4' requires transformer_engine.common.recipe.NVFP4BlockScaling "
                     "(TE >= 2.7). The installed TE does not provide it; rebuild on a newer TE image."
                 ) from e
-            return NVFP4BlockScaling()
+            return NVFP4BlockScaling(**(self.nvfp4.recipe_kwargs() if self.nvfp4 is not None else {}))
         if self.recipe == "block":
             return Float8BlockScaling()
         return Float8CurrentScaling()

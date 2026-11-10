@@ -246,6 +246,46 @@ class TestTEFp8Config:
             assert TEFp8Config(recipe=recipes["NVFP4BlockScaling"]()).uses_nvfp4()
             assert not TEFp8Config(recipe=recipes["MXFP8BlockScaling"]()).uses_nvfp4()
 
+    def test_nvfp4_options_reach_the_te_recipe(self):
+        options = {
+            "random_hadamard_transform": False,
+            "stochastic_rounding": False,
+            "weight_blocks_2d": False,
+            "row_scaled_activation": True,
+            "four_over_six": "activations",
+        }
+        with _fake_te_recipes() as recipes:
+            recipes["NVFP4BlockScaling"].__init__ = lambda self, **kwargs: setattr(self, "kwargs", kwargs)
+            default = TEFp8Config(recipe="nvfp4").build_recipe()
+            custom = BackendConfig(
+                te_fp8={"recipe": "nvfp4", "nvfp4": options}, experts="te", dispatcher="deepep"
+            ).te_fp8.build_recipe()
+        assert default.kwargs == {}
+        assert custom.kwargs == {
+            "disable_rht": True,
+            "disable_stochastic_rounding": True,
+            "disable_2d_quantization": True,
+            "row_scaled_activation": True,
+            "nvfp4_4over6": "activations",
+        }
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"row_scaled_activation": True},
+            {"four_over_six": "activations"},
+            {"four_over_six": "all"},
+            {"four_over_six": "sometimes", "random_hadamard_transform": False},
+        ],
+    )
+    def test_nvfp4_options_reject_unsupported_combinations(self, options):
+        with pytest.raises(ValueError, match="te_fp8.nvfp4"):
+            TEFp8Config(recipe="nvfp4", nvfp4=options)
+
+    def test_nvfp4_options_need_the_nvfp4_recipe(self):
+        with pytest.raises(ValueError, match="te_fp8.nvfp4 options require"):
+            TEFp8Config(recipe="mxfp8", nvfp4={"stochastic_rounding": False})
+
     def test_unknown_recipe_name_is_rejected(self):
         with pytest.raises(ValueError, match="te_fp8.recipe"):
             TEFp8Config(recipe="fp4")
