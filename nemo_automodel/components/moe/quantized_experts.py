@@ -38,6 +38,7 @@ import torch.distributed.nn.functional as dist_nn_f
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
+from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
@@ -63,6 +64,8 @@ from nemo_automodel.components.quantization.nvfp4 import (
 
 if TYPE_CHECKING:
     from transformer_engine.pytorch import GroupedLinear
+
+    from nemo_automodel.components.models.common.utils import BackendConfig
 
 logger = logging.getLogger(__name__)
 
@@ -882,69 +885,58 @@ class GroupedExpertsDeepEPNVFP4(NVFP4ExpertStorageMixin, GroupedExpertsDeepEP):
 
 
 class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
-    """Frozen Transformer Engine experts that run on the packed NVFP4 weights of the checkpoint.
+    """Transformer Engine experts whose weights are NVFP4 tensors, loaded from an NVFP4 checkpoint as they are.
 
-    The packed codes, E4M3 block scales and row scales of this rank's experts are parameters with the names
-    and layout of ``NVFP4ExpertStorageMixin``, so the model's state-dict adapter fills them from an NVFP4
-    checkpoint without quantizing anything. Before the first forward every expert weight becomes a
-    Transformer Engine ``NVFP4Tensor`` whose row-wise codes are a view of those parameters; the block scales are
-    a view too unless Transformer Engine pads them (to 128 rows and 4 columns), in which case they are copied.
-    Transformer Engine uses an already quantized weight as it is, so the forward GEMM multiplies the
-    checkpoint's FP4 operands.
+    Selected by ``te_fp8.nvfp4.resident_weights``. The packed codes, E4M3 block scales and row scales of this
+    rank's experts are parameters with the names and layout of ``NVFP4ExpertStorageMixin``, so the model's
+    state-dict adapter fills them from an NVFP4 checkpoint without quantizing anything and saves them the same
+    way. Once loaded, every expert weight is a Transformer Engine ``NVFP4Tensor`` parameter whose row-wise
+    codes are a view of the packed codes; the block scales are a view too unless Transformer Engine pads them
+    (to 128 rows and 4 columns), in which case they are copied. Transformer Engine uses an already quantized
+    weight as it is, so the forward GEMM multiplies the checkpoint operands.
 
-    A checkpoint holds no column-wise copy of the weights, which the backward GEMM over the activations
-    needs; it is quantized once from the dequantized weights. A Transformer Engine NVFP4 weight has one
-    outer scale, so all output rows of one expert projection must carry the same row scale.
+    The weights are trainable. Their gradients are floating point; the optimizer must keep FP32 master weights
+    and write the re-quantized weights back after each step, which Transformer Engine ``FusedAdam`` does with
+    ``master_weights=True``. ``state_dict`` returns the packed form of the current weights.
+
+    A checkpoint holds no column-wise copy of the weights, which the backward GEMM over the activations needs;
+    it is quantized from the dequantized weights. A Transformer Engine NVFP4 weight has one outer scale, so
+    all output rows of one expert projection must carry the same row scale.
     """
 
-    # False while the base constructor builds its floating-point projections, before the settings of the
-    # replaced module are adopted.
+    # False while the base constructor builds its floating-point projections.
     _packed_storage_ready = False
 
-    def __init__(self, orig_module: GroupedExpertsTE) -> None:
-        """Create packed placeholders for the experts of a ``GroupedExpertsTE`` module that is still on meta.
-
-        Args:
-            orig_module: Transformer Engine experts configured with the NVFP4 recipe.
-        """
-        if orig_module.te_fp8 is None or not orig_module.te_fp8.uses_nvfp4():
-            raise NotImplementedError(
-                "nvfp4-resident Transformer Engine experts require te_fp8.recipe='nvfp4'; with another recipe use "
-                "backend.experts='torch_mm'."
-            )
-        if orig_module.use_grouped_tensor:
-            raise NotImplementedError("nvfp4-resident Transformer Engine experts require te_grouped_tensor=False.")
-        if orig_module.expert_bias:
-            raise NotImplementedError("nvfp4-resident Transformer Engine experts do not support expert biases.")
-        if not all(param.is_meta for param in orig_module.parameters()):
-            raise NotImplementedError(
-                "nvfp4-resident Transformer Engine experts are filled from an NVFP4 checkpoint; converting "
-                "materialized floating-point weights is not implemented."
-            )
+    def __init__(
+        self,
+        config: MoEConfig,
+        backend: "BackendConfig | None" = None,
+        dispatcher_backend: str = "deepep",
+        dispatcher_num_sms: int = 20,
+        dispatcher_share_token_dispatcher: bool = True,
+        dispatcher_async_dispatch: bool = False,
+    ) -> None:
+        """Create the projections and the packed placeholders; the arguments are those of ``GroupedExpertsTE``."""
+        if backend is None or backend.te_fp8 is None or not backend.te_fp8.uses_nvfp4():
+            raise NotImplementedError("NVFP4 expert weights require te_fp8.recipe='nvfp4'.")
+        if backend.te_grouped_tensor:
+            raise NotImplementedError("NVFP4 expert weights require te_grouped_tensor=False.")
+        if config.expert_bias:
+            raise NotImplementedError("NVFP4 expert weights do not support expert biases.")
         super().__init__(
-            orig_module.config,
-            backend=None,
-            dispatcher_backend=orig_module.dispatcher_backend,
-            dispatcher_num_sms=orig_module.dispatcher_num_sms,
-            dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
-            dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
+            config,
+            backend=backend,
+            dispatcher_backend=dispatcher_backend,
+            dispatcher_num_sms=dispatcher_num_sms,
+            dispatcher_share_token_dispatcher=dispatcher_share_token_dispatcher,
+            dispatcher_async_dispatch=dispatcher_async_dispatch,
         )
-        # Settings the base constructor reads from BackendConfig.
-        self.te_fp8 = orig_module.te_fp8
-        self.nvfp4 = orig_module.nvfp4
-        self.static_routing = orig_module.static_routing
-        self.dispatcher_hybridep_permute_fusion = orig_module.dispatcher_hybridep_permute_fusion
-        self.dispatcher_hybridep_compact_routing = orig_module.dispatcher_hybridep_compact_routing
-        self.dispatcher_hybridep_num_sms_preprocessing = orig_module.dispatcher_hybridep_num_sms_preprocessing
-        self.dispatcher_hybridep_num_blocks_permute = orig_module.dispatcher_hybridep_num_blocks_permute
-        self.dispatcher_hybridep_num_blocks_unpermute = orig_module.dispatcher_hybridep_num_blocks_unpermute
-        self.dispatcher_hybridep_max_tokens_per_rank = orig_module.dispatcher_hybridep_max_tokens_per_rank
-        self.dispatcher_recompute_cache = orig_module.dispatcher_recompute_cache
-        # Models may install their own expert activation on the module they construct.
-        self.expert_activation = orig_module.expert_activation
         # The shared expert initializer skips modules whose weights come from the checkpoint.
         self._nvfp4_resident = True
+        self._weights_trainable = True
         self._te_weights_built = False
+        # Outer scale every expert weight was built with, per projection: [local experts].
+        self._built_amax: dict[str, torch.Tensor] = {}
         self._packed_storage_ready = True
         self._init_grouped_layers(self.num_local_experts)
 
@@ -991,16 +983,29 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
             return linear.locate(index)
         return linear, index
 
+    def _projections(self) -> tuple[tuple[str, "GroupedLinear | _ChunkedGroupedLinear"], ...]:
+        """Packed base name and Transformer Engine module of both projections."""
+        return (("gate_and_up_projs", self.gate_up_linear), ("down_projs", self.down_linear))
+
+    def _packed_storage_loaded(self) -> bool:
+        """Whether the packed parameters are materialized."""
+        return not any(self.get_parameter(name).is_meta for name in self.packed_parameter_names())
+
     @torch.no_grad()
     def _build_te_weights(self) -> None:
         """Turn the loaded packed parameters into the NVFP4 weights of the Transformer Engine projections."""
-        for name, linear in (("gate_and_up_projs", self.gate_up_linear), ("down_projs", self.down_linear)):
+        for name, linear in self._projections():
             packed_name, scales_name, global_name = self.nvfp4_parameter_names(name)
             packed = getattr(self, packed_name).data
             scales = getattr(self, scales_name).data
             row_scale = getattr(self, global_name).data
             if packed.is_meta:
                 raise RuntimeError(f"{packed_name} is still on meta: the NVFP4 expert weights were not loaded.")
+            if not torch.isfinite(row_scale).all():
+                raise RuntimeError(
+                    f"{global_name} holds non-finite row scales: the NVFP4 expert weights were not loaded."
+                )
+            built_amax = torch.empty(linear.num_gemms, dtype=torch.float32, device=packed.device)
             for index in range(linear.num_gemms):
                 if not torch.equal(row_scale[index], row_scale[index, :1].expand_as(row_scale[index])):
                     raise NotImplementedError(
@@ -1012,7 +1017,8 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
                 quantizer = owner._get_weight_quantizers()[local]
                 quantizer.set_usage(rowwise=True, columnwise=True)
                 dequantized = dequantize_nvfp4(packed[index], scales[index], row_scale[index], self.config.dtype)
-                owner.register_parameter(f"weight{local}", nn.Parameter(quantizer(dequantized), requires_grad=False))
+                parameter = nn.Parameter(quantizer(dequantized), requires_grad=self._weights_trainable)
+                owner.register_parameter(f"weight{local}", parameter)
                 weight = getattr(owner, f"weight{local}")
                 block_scales = scales[index].view(torch.uint8)
                 stored_scales = weight._rowwise_scale_inv
@@ -1036,7 +1042,44 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
                     # replace the unpadded part of the tensor it allocated.
                     stored_scales[:rows, :blocks].copy_(block_scales)
                 weight._amax_rowwise = (row_scale[index, :1] * (E2M1_MAX * E4M3_MAX)).contiguous()
+                built_amax[index] = weight._amax_rowwise[0]
+            self._built_amax[name] = built_amax
         self._te_weights_built = True
+
+    @torch.no_grad()
+    def _sync_packed_parameters(self) -> None:
+        """Write the current NVFP4 weights to the packed parameters wherever those are not views of them.
+
+        An optimizer step re-quantizes a trained weight in place: the codes (and unpadded block scales) are
+        the packed parameters themselves, the outer scale and padded block scales are not. An expert whose
+        outer scale is unchanged keeps the row scale it was loaded with.
+        """
+        for name, linear in self._projections():
+            packed_name, scales_name, global_name = self.nvfp4_parameter_names(name)
+            packed = getattr(self, packed_name).data
+            scales = getattr(self, scales_name).data
+            row_scale = getattr(self, global_name).data
+            amax = torch.empty_like(self._built_amax[name])
+            for index in range(linear.num_gemms):
+                owner, local = self._weight_owner(linear, index)
+                weight = getattr(owner, f"weight{local}")
+                if weight._rowwise_data.data_ptr() != packed[index].data_ptr():
+                    packed[index].copy_(weight._rowwise_data)
+                block_scales = scales[index].view(torch.uint8)
+                if weight._rowwise_scale_inv.data_ptr() != block_scales.data_ptr():
+                    block_scales.copy_(weight._rowwise_scale_inv[: block_scales.shape[0], : block_scales.shape[1]])
+                amax[index] = weight._amax_rowwise.reshape(-1)[0]
+            changed = amax != self._built_amax[name]
+            row_scale[changed] = (amax[changed] / (E2M1_MAX * E4M3_MAX)).unsqueeze(-1).expand(-1, row_scale.shape[1])
+            self._built_amax[name] = amax
+
+    def requires_grad_(self, requires_grad: bool = True) -> "GroupedExpertsTENVFP4":
+        """Freeze or unfreeze the expert weights; the packed parameters are storage and never require gradients."""
+        self._weights_trainable = requires_grad
+        for _, linear in self._projections():
+            for parameter in linear.parameters():
+                parameter.requires_grad_(requires_grad)
+        return self
 
     def forward(
         self,
@@ -1046,8 +1089,12 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
         indices: torch.Tensor,
         post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Run ``GroupedExpertsTE.forward`` on the checkpoint weights; the arguments and result are the same."""
+        """Run ``GroupedExpertsTE.forward`` on the NVFP4 weights; the arguments and result are the same."""
         if not self._te_weights_built:
+            # A load that never called load_state_dict on this module (every key written in place).
+            logger.warning(
+                "NVFP4 expert weights are built at the first forward; an optimizer created earlier does not hold them."
+            )
             self._build_te_weights()
         return super().forward(x, token_mask, weights, indices, post_expert_output)
 
@@ -1056,6 +1103,8 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
 
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False, **kwargs) -> dict[str, torch.Tensor]:
         """Return the packed parameters of this rank's experts, as EP DTensors that alias the module storage."""
+        if self._te_weights_built:
+            self._sync_packed_parameters()
         state = {}
         for name in self.packed_parameter_names():
             tensor = self._to_ep_dtensor(getattr(self, name))
@@ -1075,7 +1124,12 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        """Copy packed codes, block scales and row scales of this rank's experts into the module storage."""
+        """Copy packed codes, block scales and row scales into the module storage and build the NVFP4 weights.
+
+        A checkpoint load that wrote through ``state_dict()`` hands back this very storage; row scales the
+        adapter completed in place may be absent from ``state_dict``. The weights are rebuilt as new
+        parameters, so the checkpoint must be loaded before the optimizer is created.
+        """
         for name in self.packed_parameter_names():
             key = prefix + name
             if key not in state_dict:
@@ -1089,11 +1143,44 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
                     f"{key}: expected {parameter.dtype} {tuple(parameter.shape)}, got {value.dtype} {tuple(value.shape)}"
                 )
                 continue
-            # A checkpoint load that wrote through state_dict() hands back this very storage.
             if value.data_ptr() != parameter.data_ptr():
                 with torch.no_grad():
                     parameter.copy_(value)
         self._te_weights_built = False
+        if self._packed_storage_loaded():
+            self._build_te_weights()
+
+
+def select_nvfp4_expert_storage_format(model: nn.Module) -> None:
+    """Make state-dict adapters load packed NVFP4 expert tensors as they are, wherever experts wait for them.
+
+    A model part whose NVFP4-resident experts still hold meta placeholders is filled by the base checkpoint
+    load; its adapter must map the checkpoint's packed expert tensors onto the packed parameters.
+
+    Args:
+        model: Model, or pipeline wrapper exposing ``parts``, before distributed sharding.
+
+    Raises:
+        NotImplementedError: If the adapter of such a part cannot select the NVFP4 expert storage format.
+    """
+    model_parts = list(model.parts) if hasattr(model, "parts") else [model]
+    for model_part in model_parts:
+        waiting = any(
+            module.get_parameter(name).is_meta
+            for module in model_part.modules()
+            if isinstance(module, NVFP4ExpertStorageMixin)
+            for name in module.packed_parameter_names()
+        )
+        if not waiting:
+            continue
+        adapter = getattr(model_part, "state_dict_adapter", None)
+        set_storage_format = getattr(adapter, "set_expert_storage_format", None)
+        if not callable(set_storage_format):
+            raise NotImplementedError(
+                "Loading an NVFP4 expert checkpoint requires the model state-dict adapter to implement "
+                "set_expert_storage_format()."
+            )
+        set_storage_format("nvfp4")
 
 
 def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:
@@ -1102,9 +1189,9 @@ def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:
     Call this after LoRA injection and before distributed sharding. LoRA-targeted
     experts that are already NVFP4-resident are preserved; remaining plain
     ``GroupedExperts`` and ``GroupedExpertsDeepEP`` modules are replaced in place.
-    Transformer Engine experts are converted when they run the NVFP4 recipe (their GEMMs then
-    multiply the packed weights directly) and rejected otherwise: with another recipe the packed
-    storage implements the ``torch_mm`` experts backend (torch, DeepEP or HybridEP dispatch) only.
+    Transformer Engine experts are rejected: this conversion implements the ``torch_mm`` experts
+    backend (torch, DeepEP or HybridEP dispatch) only. Transformer Engine experts hold NVFP4 weights
+    when the model is built with ``te_fp8.nvfp4.resident_weights``; those are left as they are.
 
     Meta experts receive packed placeholders for direct checkpoint loading, and
     their model state-dict adapter must opt into the NVFP4 expert storage format.
@@ -1121,14 +1208,13 @@ def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:
         name
         for model_part in model_parts
         for name, module in model_part.named_modules()
-        if isinstance(module, GroupedExpertsTE)
-        and not isinstance(module, GroupedExpertsTENVFP4)
-        and (module.te_fp8 is None or not module.te_fp8.uses_nvfp4())
+        if isinstance(module, GroupedExpertsTE) and not isinstance(module, GroupedExpertsTENVFP4)
     ]
     if unsupported:
         raise NotImplementedError(
-            "NVFP4-resident expert weights support Transformer Engine expert modules only with "
-            f"te_fp8.recipe='nvfp4'; otherwise use backend.experts='torch_mm' (modules: {unsupported[:3]})."
+            "expert_weight_format='nvfp4' does not convert Transformer Engine expert modules; use "
+            "backend.experts='torch_mm', or build the model with te_fp8.nvfp4.resident_weights=True "
+            f"(modules: {unsupported[:3]})."
         )
 
     for model_part in model_parts:
@@ -1137,11 +1223,6 @@ def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:
             for module in model_part.modules()
             if isinstance(module, (GroupedExperts, GroupedExpertsDeepEP))
             for param in module.parameters(recurse=False)
-        ) or any(
-            param.is_meta
-            for module in model_part.modules()
-            if isinstance(module, GroupedExpertsTE)
-            for param in module.parameters()
         )
         if needs_checkpoint:
             adapter = getattr(model_part, "state_dict_adapter", None)
@@ -1156,7 +1237,6 @@ def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:
     frozen_conversions = {
         GroupedExperts: GroupedExpertsNVFP4,
         GroupedExpertsDeepEP: GroupedExpertsDeepEPNVFP4,
-        GroupedExpertsTE: GroupedExpertsTENVFP4,
     }
     num_converted = 0
     for model_part in model_parts:

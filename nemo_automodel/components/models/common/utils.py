@@ -274,6 +274,11 @@ class TENvfp4Config:
     """Scale forward activations per row (one FP32 scale per token) instead of per tensor."""
     four_over_six: Literal["none", "weights", "activations", "all"] = "none"
     """Tensors whose blocks map their maximum to 4 or to 6, whichever quantizes the block with less error."""
+    resident_weights: bool = False
+    """Hold the expert weights as NVFP4 tensors instead of floating point. An NVFP4 checkpoint fills them
+    unchanged and they are saved in the same form. Training them needs an optimizer that keeps FP32 master
+    weights and writes the re-quantized weights back after each step (Transformer Engine ``FusedAdam`` with
+    ``master_weights=True``)."""
 
     def __post_init__(self) -> None:
         """Reject option values and combinations that Transformer Engine does not implement."""
@@ -399,6 +404,10 @@ class TEFp8Config:
             return self.recipe == "nvfp4"
         have_nvfp4, nvfp4_recipe = safe_import_from("transformer_engine.common.recipe", "NVFP4BlockScaling")
         return have_nvfp4 and isinstance(self.recipe, nvfp4_recipe)
+
+    def resident_nvfp4_weights(self) -> bool:
+        """Whether the experts hold their weights as NVFP4 tensors (``nvfp4.resident_weights``)."""
+        return self.uses_nvfp4() and self.nvfp4 is not None and self.nvfp4.resident_weights
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
