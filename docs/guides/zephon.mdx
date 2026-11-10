@@ -32,15 +32,23 @@ your prepared, unshifted token sequences.
 Run from the repository root:
 
 ```bash
-uv run automodel examples/llm_pretrain/qwen/zephon.yaml --nproc-per-node 1
+uv run automodel examples/llm_pretrain/qwen/zephon.yaml --nproc-per-node 8
 ```
 
 The recipes continue pretraining `Qwen/Qwen3-0.6B-Base` and
 `meta-llama/Llama-3.2-1B`, respectively. Obtain access to the Llama checkpoint
-before using its recipe. Both examples use a 2,048-token training window and
-Scaled Dot-Product Attention (SDPA). FSDP2 keeps fp32 master weights and optimizer
-state with bf16 compute. Choose a CUDA GPU with enough memory for the model,
-optimizer and activations; these YAMLs do not measure convergence or throughput.
+before using its recipe. The examples use the optimizer, learning-rate schedule,
+64/8 global/local batch sizes, seed and model defaults from the checked-in
+[Qwen3 HellaSwag recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml)
+and [Llama 3.2 SQuAD recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml).
+Their 1,024-token packing windows follow the existing packed examples for those
+models. The CP/TE configuration in those packing examples is not enabled here.
+
+Zephon requires an explicit step cap because its stream has no known length.
+Qwen's 624 and Llama's 1,369 steps retain the native references' one-epoch update
+budgets: `ceil(39905 / 64)` and `ceil(87599 / 64)`. These are upper bounds, not
+epoch counts for TinyStories or your prepacked corpus. Choose CUDA GPUs with
+enough memory for the model, optimizer and activations.
 
 The source is finite: the recipe reads it once and stops when it runs out.
 `step_scheduler.max_steps` is an upper bound, so there is no need to repeat a
@@ -193,7 +201,7 @@ matching online recipe. Both online examples use EOS insertion per source
 document (`tokenize_special_tokens: eos`). Export unshifted `input_ids`, aligned
 `positions` from the packer, and an optional aligned binary `loss_mask` to JSONL
 or Parquet shards. Preserve the final token needed for next-token prediction:
-a 2,048-token training window accepts up to 2,049 unshifted tokens. Do not export
+a 1,024-token training window accepts up to 1,025 unshifted tokens. Do not export
 training batches with shifted labels or padded framework cache tensors.
 
 Put Qwen packs in `work/zephon-prepacked/qwen3/` or Llama packs in
@@ -202,7 +210,7 @@ Token IDs are specific to their tokenizer; do not reuse one family's packs with
 the other family. Run, for example:
 
 ```bash
-uv run automodel examples/llm_pretrain/qwen/zephon_prepacked.yaml --nproc-per-node 1
+uv run automodel examples/llm_pretrain/qwen/zephon_prepacked.yaml --nproc-per-node 8
 ```
 
 These recipes explicitly disable online packing:
@@ -216,7 +224,7 @@ dataset:
     - {name: offline-packs, path: /data/prepacked, fmt: jsonl}
     packing:
       pack_algorithm: null
-      seq_len: 2048
+      seq_len: 1024
 ```
 
 Each supplied token sequence is one document unless it includes Zephon's
@@ -284,8 +292,15 @@ the model tokenizer's chat template, assistant-only supervision, whole-document
 | `meta-llama/Llama-3.2-1B-Instruct` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/zephon.yaml) |
 
 ```bash
-uv run automodel examples/llm_finetune/qwen/zephon.yaml --nproc-per-node 1
+uv run automodel examples/llm_finetune/qwen/zephon.yaml --nproc-per-node 8
 ```
+
+Qwen keeps the optimizer and 64/8 global/local batch sizes from its native
+HellaSwag example, with a 1,024-token packing window from the packed Qwen recipe.
+Llama Instruct follows `customizer_llama_3_2_1b_full_sft.yaml`: Adam at `5e-6`,
+cosine decay with no warmup, 8/1 global/local batches, a 2,048-token window and
+13 steps. Its example runs on one GPU. The Alpaca source and Zephon chat packing
+remain independent of those training settings.
 
 ## How the Integration Works
 

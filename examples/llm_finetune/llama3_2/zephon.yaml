@@ -14,21 +14,31 @@
 
 # Fine-tune on Alpaca Cleaned using the model chat template and assistant supervision.
 # Run: uv run automodel examples/llm_finetune/llama3_2/zephon.yaml --nproc-per-node 1
+# Training reference: examples/llm_finetune/llama3_2/customizer_llama_3_2_1b_full_sft.yaml
 recipe: TrainFinetuneRecipeForNextTokenPrediction
-seed: 42
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
 step_scheduler:
-  global_batch_size: 4
+  global_batch_size: 8
   local_batch_size: 1
-  max_steps: 100
-  ckpt_every_steps: 20
+  max_steps: 13
+  num_epochs: 2
+  val_every_steps: 12
+  ckpt_every_steps: 12
 model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B-Instruct
-  dtype: float32
+  torch_dtype: auto
+  trust_remote_code: false
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   attn_implementation: sdpa
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonInstructionDatasetConfig
-  column_mapping: {context: input, question: instruction, answer: output}
+  column_mapping:
+    context: input
+    question: instruction
+    answer: output
   use_hf_chat_template: true
   zephon:
     sources:
@@ -40,20 +50,38 @@ dataset:
     checkpoint:
       run_id: zephon-llama3_2-sft
 distributed:
+  dp_size: 1
+  tp_size: 1
+  pp_size: 1
+  cp_size: 1
+  ep_size: null
+  sequence_parallel: false
   strategy: fsdp2
-optimizer:
-  _target_: torch.optim.AdamW
-  lr: 0.00001
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 5.0e-06
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
 checkpoint:
   enabled: true
+  model_save_format: safetensors
   checkpoint_dir: checkpoints/zephon-llama3_2-sft
+  save_consolidated: true
+  dequantize_base_checkpoint: true
 dist_env:
   backend: nccl
+  timeout_minutes: 30
 ci:
   cluster_tag: h100
   recipe_owner: MaxiBoether
-  time: "00:30:00"
+  time: 00:30:00
   nodes: 1
   nproc_per_node: 1
