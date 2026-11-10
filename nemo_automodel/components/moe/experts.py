@@ -2043,6 +2043,8 @@ class GroupedExpertsTE(nn.Module):
         # Under NVFP4, more local experts than Transformer Engine quantizes in one grouped call run as
         # consecutive GroupedLinear chunks (see _ChunkedGroupedLinear).
         self.nvfp4 = backend is not None and backend.te_fp8 is not None and backend.te_fp8.uses_nvfp4()
+        # Kept so a storage variant of this module can rebuild the projections under the same recipe.
+        self.te_fp8 = backend.te_fp8 if backend is not None else None
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
