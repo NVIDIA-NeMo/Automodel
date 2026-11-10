@@ -31,7 +31,7 @@ YAML / dict parsing belongs in the recipe layer — see
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple, overload
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple, TypedDict, overload
 
 from nemo_automodel.components.distributed.config import ActivationCheckpointingMode, DistributedStrategyConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
@@ -65,6 +65,22 @@ class MeshAxisName(str, Enum):
 
 #: All values accepted as ``DeviceMesh`` axis names.
 _VALID_AXIS_NAMES: frozenset[MeshAxisName] = frozenset(MeshAxisName)
+
+
+class _ParallelizeAxisKwargs(TypedDict):
+    """Axis-name keyword arguments of a ``parallelize_fn`` (EP/FSDP, no pipeline axis)."""
+
+    dp_axis_names: tuple[str, ...]
+    cp_axis_name: str | None
+    tp_axis_name: str | None
+    ep_axis_name: str | None
+    ep_shard_axis_names: tuple[str, ...] | None
+
+
+class _PipelineAxisKwargs(_ParallelizeAxisKwargs):
+    """Axis-name keyword arguments of ``AutoPipeline``: the ``parallelize_fn`` axes plus the pipeline axis."""
+
+    pp_axis_name: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -198,14 +214,15 @@ class MeshContext:
         return (MeshAxisName.DP_SHARD_CP,)
 
     # @akoumpa: we will deprecate `pipeline_axis_kwargs` in 26.04.
-    def pipeline_axis_kwargs(self) -> dict[str, str | tuple[str, ...] | None]:
+    def pipeline_axis_kwargs(self) -> _PipelineAxisKwargs:
         """Axis-name kwargs for ``AutoPipeline``."""
         return {
             "pp_axis_name": MeshAxisName.PP,
-        } | self.parallelize_axis_kwargs()
+            **self.parallelize_axis_kwargs(),
+        }
 
     # @akoumpa: we will deprecate `parallelize_axis_kwargs` in 26.04.
-    def parallelize_axis_kwargs(self) -> dict[str, str | tuple[str, ...] | None]:
+    def parallelize_axis_kwargs(self) -> _ParallelizeAxisKwargs:
         """Axis-name kwargs for ``parallelize_fn`` (EP/FSDP, no ``pp_axis_name``)."""
         return {
             "dp_axis_names": self._dp_axis_names(),

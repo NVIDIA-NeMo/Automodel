@@ -1286,11 +1286,11 @@ class TestApplyFsdpShardingRecursively:
         # Call the function without offload_policy
         apply_fsdp2_sharding_recursively(module=mock_module_list, mesh=mock_mesh, mp_policy=mock_mp_policy)
 
-        # Verify fully_shard was called with None offload_policy
+        # Verify fully_shard was called without offload_policy, so it keeps its default (no offloading)
         calls = mock_fully_shard.call_args_list
         for call in calls:
             args, kwargs = call
-            assert kwargs["offload_policy"] is None
+            assert "offload_policy" not in kwargs
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_module_list_respects_explicit_reshard_override(

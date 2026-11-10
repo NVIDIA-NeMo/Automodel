@@ -143,14 +143,13 @@ class ColwiseParallelLora(ColwiseParallel):
             return output
 
         if hasattr(module, "lora_A"):
-            lora_a = module.get_submodule("lora_A")
-            lora_a.register_forward_hook(lora_a_output_hook)
+            module.get_submodule("lora_A").register_forward_hook(lora_a_output_hook)
             # lora_A/lora_B are nn.Linear sub-modules whose weights are now DTensors.
             # Convert to TPLinear so torch.compile sees matmul-based forward and
             # avoids the aten.view recursion in the backward.
-            lora_a.__class__ = TPLinear
+            module.lora_A.__class__ = TPLinear
         if hasattr(module, "lora_B"):
-            module.get_submodule("lora_B").__class__ = TPLinear
+            module.lora_B.__class__ = TPLinear
 
         # Plain nn.Linear (not a LinearLoRA subclass): same conversion needed.
         # LinearLoRA already uses _dtensor_linear (matmul) in its own forward.
@@ -183,12 +182,10 @@ class RowwiseParallelLora(RowwiseParallel):
         if getattr(module, "bias", None) is not None:
             _distribute_param(module, "bias", device_mesh, self.src_data_rank, [Replicate()])
         if hasattr(module, "lora_A"):
-            lora_a = module.get_submodule("lora_A")
-            lora_b = module.get_submodule("lora_B")
-            _distribute_param(lora_a, "weight", device_mesh, self.src_data_rank, [Shard(1)])
-            _distribute_param(lora_b, "weight", device_mesh, self.src_data_rank, [Shard(1)])
-            lora_a.__class__ = TPLinear
-            lora_b.__class__ = TPLinear
+            _distribute_param(module.get_submodule("lora_A"), "weight", device_mesh, self.src_data_rank, [Shard(1)])
+            _distribute_param(module.get_submodule("lora_B"), "weight", device_mesh, self.src_data_rank, [Shard(1)])
+            module.lora_A.__class__ = TPLinear
+            module.lora_B.__class__ = TPLinear
         # Plain nn.Linear: convert to TPLinear for compile safety.
         # LinearLoRA subclasses are already handled by their own _dtensor_linear forward.
         if type(module) is nn.Linear:

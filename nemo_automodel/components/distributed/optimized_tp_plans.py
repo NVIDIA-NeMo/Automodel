@@ -38,23 +38,15 @@ from nemo_automodel.components.distributed.parallel_styles import ReplicatedWith
 # the whole transformers model zoo -- transformers.models.gemma3 alone pulls sklearn ->
 # pandas/scipy plus torchvision and opentelemetry, which measured longer than
 # `import torch` itself. The registry below therefore spells the qualnames out as
-# literals, and plan functions receive the dispatched model as an ``nn.Module``.
+# literals, and plan functions type the dispatched model structurally.
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from typing import TypeGuard
 
     from torch import nn
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.tensor.placement_types import Placement
     from transformers import PretrainedConfig
-
-
-class TensorParallelPlanFactory(Protocol):
-    """Build the module-FQN to ``ParallelStyle`` TP plan for one registered model class."""
-
-    def __call__(self, model: nn.Module, sequence_parallel: bool = False) -> dict[str, ParallelStyle]:
-        """Return the plan for ``model``, adding sequence-parallel styles when requested."""
-        ...
 
 
 class _NemotronNASAttentionConfig(Protocol):
@@ -732,26 +724,6 @@ def _parallelize_phi(
     return base_model_tp_plan
 
 
-def _parallelize_phi_for_causal_lm(
-    model: nn.Module,
-    sequence_parallel: bool = False,
-) -> dict[str, ParallelStyle]:
-    """Build the Phi-2 plan for a model dispatched under the ``PhiForCausalLM`` qualname.
-
-    The registry matches class names as strings, so confirm the class before
-    :func:`_parallelize_phi` reads ``config.qk_layernorm``. The import is cheap:
-    this runs only after a Phi model has already loaded its modeling module.
-
-    Raises:
-        TypeError: If ``model`` is not a ``PhiForCausalLM`` instance.
-    """
-    from transformers.models.phi.modeling_phi import PhiForCausalLM
-
-    if not isinstance(model, PhiForCausalLM):
-        raise TypeError(f"The Phi TP plan requires a PhiForCausalLM model, got {type(model).__name__}.")
-    return _parallelize_phi(model, sequence_parallel)
-
-
 # Phi3: fused attention cannot be sharded; shard MLP as in HF guidance
 def _parallelize_phi3(
     model: nn.Module,
@@ -869,8 +841,11 @@ def _parallelize_falcon_h1(
     }
 
 
-# Keyed by qualified class name — see _get_class_qualname for why.
-PARALLELIZE_FUNCTIONS: dict[str, TensorParallelPlanFactory] = {
+# Keyed by qualified class name — see _get_class_qualname for why. Each factory is called as
+# ``factory(model, sequence_parallel)`` with the model whose class matched its key, and types that
+# model by what it reads (``_parallelize_phi`` needs ``config.qk_layernorm``, which ``nn.Module``
+# does not declare). No single parameter type admits every factory, so the parameters stay open.
+PARALLELIZE_FUNCTIONS: dict[str, Callable[..., dict[str, ParallelStyle]]] = {
     "nemo_automodel.components.models.baichuan.model.BaichuanForCausalLM": _parallelize_baichuan,
     "transformers.models.qwen2.modeling_qwen2.Qwen2ForCausalLM": _parallelize_qwen,
     "transformers.models.qwen3.modeling_qwen3.Qwen3ForCausalLM": _parallelize_qwen,
@@ -900,7 +875,7 @@ PARALLELIZE_FUNCTIONS: dict[str, TensorParallelPlanFactory] = {
     "transformers.models.gemma3.modeling_gemma3.Gemma3ForCausalLM": _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     "transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration": _parallelize_gemma3,
-    "transformers.models.phi.modeling_phi.PhiForCausalLM": _parallelize_phi_for_causal_lm,
+    "transformers.models.phi.modeling_phi.PhiForCausalLM": _parallelize_phi,
     "transformers.models.phi3.modeling_phi3.Phi3ForCausalLM": _parallelize_phi3,
     "nemo_automodel.components.models.llama.model.LlamaForCausalLM": _parallelize_llama,
     # Register native Qwen classes without importing their checkpoint adapters into the distributed component.

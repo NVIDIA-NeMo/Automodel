@@ -136,6 +136,83 @@ class FullyShardKwargs(TypedDict, total=False):
     ignored_params: set[nn.Parameter] | None
 
 
+class _TorchFullyShardKwargs(TypedDict, total=False):
+    """``fully_shard`` options as it declares them; an omitted key keeps ``fully_shard``'s default."""
+
+    mesh: DeviceMesh
+    mp_policy: MixedPrecisionPolicy
+    offload_policy: OffloadPolicy
+    reshard_after_forward: bool | int
+    ignored_params: set[nn.Parameter]
+
+
+def torch_fully_shard_kwargs(
+    *,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None,
+    reshard_after_forward: bool | int | None,
+    ignored_params: set[nn.Parameter] | None,
+) -> _TorchFullyShardKwargs:
+    """Translate optional FSDP options to ``fully_shard`` keyword arguments.
+
+    ``fully_shard`` declares its policies as non-optional. An unset (``None``) option
+    is therefore omitted so ``fully_shard`` applies its own default: no offloading,
+    no mixed-precision casts, and automatic ``reshard_after_forward``.
+
+    Args:
+        mesh: FSDP data-parallel mesh.
+        mp_policy: Mixed-precision policy, or ``None`` for ``fully_shard``'s default.
+        offload_policy: Offload policy, or ``None`` for ``fully_shard``'s default.
+        reshard_after_forward: Reshard override, or ``None`` to let FSDP2 decide.
+        ignored_params: Parameters of arbitrary shapes already owned by another unit, or ``None``.
+
+    Returns:
+        The keyword arguments for ``fully_shard``, holding only the options that are set.
+    """
+    kwargs: _TorchFullyShardKwargs = {"mesh": mesh}
+    if mp_policy is not None:
+        kwargs["mp_policy"] = mp_policy
+    if offload_policy is not None:
+        kwargs["offload_policy"] = offload_policy
+    if reshard_after_forward is not None:
+        kwargs["reshard_after_forward"] = reshard_after_forward
+    if ignored_params is not None:
+        kwargs["ignored_params"] = ignored_params
+    return kwargs
+
+
+def _default_fully_shard(
+    module: nn.Module | list[nn.Module],
+    *,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy | None = None,
+    offload_policy: OffloadPolicy | None = None,
+    reshard_after_forward: bool | int | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
+) -> None:
+    """Shard with ``fully_shard`` when no model parallelizer owns the FSDP primitive.
+
+    Args:
+        module: Module, or list of modules that become one FSDP unit, sharded in place.
+        mesh: FSDP data-parallel mesh.
+        mp_policy: Mixed-precision policy; ``None`` keeps ``fully_shard``'s default.
+        offload_policy: Offload policy; ``None`` keeps ``fully_shard``'s default (no offloading).
+        reshard_after_forward: Reshard override; ``None`` lets FSDP2 decide.
+        ignored_params: Parameters of arbitrary shapes already owned by another unit.
+    """
+    fully_shard(
+        module,
+        **torch_fully_shard_kwargs(
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params,
+        ),
+    )
+
+
 class _UnusedParamReduceScatter(Protocol):
     """FSDP unit with PyTorch's public unused-parameter reduce-scatter switch (absent in older releases)."""
 
@@ -509,7 +586,7 @@ def fully_shard_across_blocks(
     mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy | None,
     offload_policy: OffloadPolicy | None,
-    shard_module: FullyShardFn[list[nn.Module]] = fully_shard,
+    shard_module: FullyShardFn[list[nn.Module]] = _default_fully_shard,
 ) -> set[nn.Parameter]:
     """Put every block's instance of the named fp32 parameter holders into one FSDP unit.
 
@@ -534,7 +611,7 @@ def fully_shard_across_blocks(
         mp_policy: The blocks' mixed-precision policy; the unit computes and reduces in fp32 and returns its
             natural fp32 outputs (the policy's ``output_dtype`` is cleared, as for every internal unit).
         offload_policy: Parameter/gradient offload policy.
-        shard_module: FSDP primitive (``fully_shard`` or a model parallelizer's override).
+        shard_module: FSDP primitive (a model parallelizer's override); defaults to ``fully_shard``.
 
     Returns:
         The parameters now owned by the cross-block units. Callers pass them as ``ignored_params``
@@ -635,7 +712,7 @@ def fully_shard_by_dtype(
             FSDP primitive.
     """
     shard_module: FullyShardFn[nn.Module] = (
-        fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
+        _default_fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
     )
     ignored_params = set(ignored_params or ())
     ignored_param_ids = {id(param) for param in ignored_params}

@@ -143,40 +143,39 @@ _megatron_fsdp_nan_check_noop_warned = False
 _dtensor_spec_symint_hash_patched = False
 
 
-class _TorchFullyShardKwargs(TypedDict, total=False):
-    """``fully_shard`` options as it declares them; an omitted key keeps ``fully_shard``'s default."""
-
-    mesh: DeviceMesh
-    mp_policy: MixedPrecisionPolicy
-    offload_policy: OffloadPolicy
-    reshard_after_forward: bool | int
-    ignored_params: set[nn.Parameter]
-
-
-def _torch_fully_shard_kwargs(
+def _fully_shard_unit(
+    module: nn.Module,
     *,
     mesh: DeviceMesh,
-    mp_policy: MixedPrecisionPolicy | None,
-    offload_policy: OffloadPolicy | None,
-    reshard_after_forward: bool | int | None,
-    ignored_params: set[nn.Parameter] | None,
-) -> _TorchFullyShardKwargs:
-    """Translate optional FSDP options to ``fully_shard`` keyword arguments.
+    mp_policy: MixedPrecisionPolicy | None = None,
+    offload_policy: OffloadPolicy | None = None,
+    reshard_after_forward: bool | int | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
+) -> nn.Module:
+    """Apply ``fully_shard`` to one FSDP unit, leaving unset options at ``fully_shard``'s defaults.
 
-    ``fully_shard`` declares its policies as non-optional. An unset (``None``) option
-    is therefore omitted so ``fully_shard`` applies its own default: no offloading,
-    no mixed-precision casts, and automatic ``reshard_after_forward``.
+    Args:
+        module: Module to shard in place as one FSDP unit.
+        mesh: FSDP data-parallel mesh.
+        mp_policy: Mixed-precision policy; ``None`` keeps ``fully_shard``'s default.
+        offload_policy: Offload policy; ``None`` keeps ``fully_shard``'s default (no offloading).
+        reshard_after_forward: Reshard override; ``None`` lets FSDP2 decide.
+        ignored_params: Parameters of arbitrary shapes already owned by another unit.
+
+    Returns:
+        ``module``, which ``fully_shard`` converts to an FSDP module in place.
     """
-    kwargs: _TorchFullyShardKwargs = {"mesh": mesh}
-    if mp_policy is not None:
-        kwargs["mp_policy"] = mp_policy
-    if offload_policy is not None:
-        kwargs["offload_policy"] = offload_policy
-    if reshard_after_forward is not None:
-        kwargs["reshard_after_forward"] = reshard_after_forward
-    if ignored_params is not None:
-        kwargs["ignored_params"] = ignored_params
-    return kwargs
+    fully_shard(
+        module,
+        **parallelizer_utils.torch_fully_shard_kwargs(
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params,
+        ),
+    )
+    return module
 
 
 class _HFGradientCheckpointingModel(Protocol):
@@ -284,22 +283,19 @@ class ModelParallelizer:
             mp_policy: Mixed-precision policy; ``None`` keeps ``fully_shard``'s default.
             offload_policy: Offload policy; ``None`` keeps ``fully_shard``'s default (no offloading).
             reshard_after_forward: Reshard override; ``None`` lets FSDP2 decide.
-            ignored_params: Parameters already owned by another unit.
+            ignored_params: Parameters of arbitrary shapes already owned by another unit.
 
         Returns:
             ``module``, which ``fully_shard`` converts to an FSDP module in place.
         """
-        fully_shard(
+        return _fully_shard_unit(
             module,
-            **_torch_fully_shard_kwargs(
-                mesh=mesh,
-                mp_policy=mp_policy,
-                offload_policy=offload_policy,
-                reshard_after_forward=reshard_after_forward,
-                ignored_params=ignored_params,
-            ),
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params,
         )
-        return module
 
     def _fully_shard_untied_input_output_embeddings(
         self,
@@ -809,7 +805,7 @@ def apply_fsdp2_sharding_recursively(
         FSDP2-subclassed versions.
     """
     frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(frozen_multimodal_sharding)
-    shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
+    shard_module = _fully_shard_unit if model_parallelizer is None else model_parallelizer._fully_shard_module
     pp_enabled = "pp" in (mesh.mesh_dim_names or ()) and mesh["pp"].size() > 1
 
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
