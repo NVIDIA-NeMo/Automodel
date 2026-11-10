@@ -37,6 +37,9 @@ model:
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonPretokenizedTextDatasetConfig
   zephon:
+    source:
+      # Keep enough source chunks to give every data-parallel rank work.
+      chunk_size: 512
     sources:
     - name: packs
       path: work/zephon-prepacked/llama3_2

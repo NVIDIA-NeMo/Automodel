@@ -51,9 +51,9 @@ dataset:
     packing:
       seq_len: 1024
     cache:
-      # Remote shards are fetched through Zephon's bounded disk cache.
-      cache_dir: .cache/zephon
-      cache_limit_bytes: 32GiB
+      # Use fast node-local SSD/NVMe storage for downloaded shards, not a shared filesystem.
+      cache_dir: /tmp/zephon-cache
+      cache_limit_bytes: 32gb
     checkpoint:
       run_id: zephon-llama3_2-text
 distributed:
