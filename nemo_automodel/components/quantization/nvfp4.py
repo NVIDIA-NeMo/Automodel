@@ -28,6 +28,8 @@ during LoRA training. No FP4 tensor cores are needed: the GEMM runs on the dequa
 operand, on Hopper or Blackwell alike.
 """
 
+from typing import Protocol
+
 import torch
 from torch.autograd.function import FunctionCtx
 
@@ -157,6 +159,13 @@ def quantize_nvfp4_modelopt(weight: torch.Tensor) -> tuple[torch.Tensor, torch.T
     return packed, block_scale, tensor_scale.reshape(())
 
 
+class _NVFP4Context(Protocol):
+    """Autograd context retaining the 4 packed-weight tensors for backward."""
+
+    @property
+    def saved_tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+
 class NVFP4GroupedMM(torch.autograd.Function):
     """Grouped GEMM over NVFP4-packed frozen weights with dequantization on the fly.
 
@@ -198,17 +207,18 @@ class NVFP4GroupedMM(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx: FunctionCtx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
+    def backward(ctx: _NVFP4Context, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
         """Backpropagate through the activations while keeping the packed base frozen.
 
         Args:
-            grad_out: Tensor of shape [tokens, out_dim] with the activation dtype, grouped by local expert like
-                the forward input.
+            grad_outputs: Exactly one gradient tensor of shape [tokens, out_dim] with the activation dtype,
+                grouped by local expert like the forward input.
 
         Returns:
             Tuple of (grad_x of shape [tokens, in_dim] in the activation dtype, None for packed, scales,
             global_scale and offs, which receive no gradient).
         """
+        (grad_out,) = grad_outputs
         packed, scales, global_scale, offs = ctx.saved_tensors
         w_t = dequantize_nvfp4(packed, scales, global_scale, grad_out.dtype)  # [E, N, K] == W^T
         grad_x = torch._grouped_mm(grad_out.contiguous(), w_t, offs=offs)
