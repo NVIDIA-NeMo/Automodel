@@ -28,8 +28,8 @@ uv run automodel examples/llm_pretrain/qwen/zephon.yaml --nproc-per-node 8
 ```
 
 The online recipes mix web, code and arXiv documents; prepacked recipes need
-your prepared tokens. Check the recipe's process count and training budget,
-and obtain access to gated checkpoints before running.
+your prepared tokens. Check the recipe's process count and training budget.
+You might need to obtain access to gated checkpoints before running.
 
 ## Datasets, work sources and pipelines
 
@@ -37,14 +37,18 @@ There are three parts to a Zephon data-loading setup:
 
 - A **dataset** describes stored documents and their shards. A source `path`
   can point to a local dataset directory, object storage or Hugging Face, such
-  as `hf://org/dataset/subset/train`. Zephon discovers the shard format;
-  set `fmt` only when an override is needed.
+  as `hf://org/dataset/subset/train`. Zephon discovers the shard format.
 - A **work source** chooses which documents the pipeline processes, in what
   order and from which datasets. A `StaticMixtureWorkSource` uses your source
   weights to define the requested mixture.
 - A **pipeline** prepares those documents using **operators**, such as fetching,
   tokenizing, packing and batching. AutoModel constructs the pipeline from
   your recipe.
+
+You can think of a pipeline as stream processing: samples flow through
+operators and change representation along the way. A text string becomes
+a sequence of tokens, which packing can split into several training
+sequences or combine with tokens from other documents.
 
 See [datasets and storage](https://docs.zephon.io/datasets/storage_backends_and_shard_cache.html),
 [mixing datasets](https://docs.zephon.io/worksources/mixing_datasets.html) and
@@ -164,8 +168,8 @@ dataset:
         limit_bytes: 8gb
 ```
 
-The decoded Parquet row-group cache has its own budget; neither disk budget
-bounds pipeline RAM. See [storage and shard caching](https://docs.zephon.io/datasets/storage_backends_and_shard_cache.html)
+In case your shards are in Parquet format, a separate row-group cache stores
+decoded data and has its own budget. Neither disk budget bounds pipeline RAM. See [storage and shard caching](https://docs.zephon.io/datasets/storage_backends_and_shard_cache.html)
 and [Parquet](https://docs.zephon.io/datasets/parquet.html) for sizing and behavior.
 
 Tune operator parallelism under `dataset.zephon.workers` and execution/queue
@@ -175,7 +179,10 @@ and the config reference below for tuning and defaults.
 
 ## Stopping and resuming
 
-Set a positive `step_scheduler.max_steps`; Zephon streams have no known length.
+Set a positive `step_scheduler.max_steps`. Operators can split one document
+into several sequences, combine documents or drop them, so the number of
+training batches cannot be inferred from the source document count. Zephon
+therefore does not expose a precomputed pipeline length.
 Training stops at this upper bound or when the work source finishes. By default,
 a mixture ends after every source completes a pass; exhausted sources may repeat
 to maintain the mixture while others finish. Configure `source.exhausted_policy`,
@@ -214,6 +221,13 @@ config constructs a Zephon pipeline; its loader supplies batches directly
 to the recipe.
 The work source owns selection and mixing, operators own preparation, and
 Zephon's `to_training()` performs final shifting, padding and collation.
+
+The dataset config chooses how documents are prepared and reuses the same
+source, cache, packing and batching setup. AutoModel supplies runtime inputs
+such as the tokenizer, batch size, input-length limit and distributed rank
+information. The pipeline runs independently of the training model; its
+configuration and the work source's progress are enough to replay the
+stream when AutoModel restores a checkpoint.
 
 After `to_training()`, the loader adapts the result to AutoModel's layout and
 attention interface. AutoModel supplies model-specific position requirements;
