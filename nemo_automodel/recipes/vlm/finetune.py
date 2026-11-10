@@ -112,7 +112,7 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
-    from torch.optim import Optimizer
+    pass
 
 
 logger = logging.getLogger(__name__)
@@ -240,7 +240,7 @@ def build_model(
     *,
     load_metadata_with_gloo: bool = False,
     has_packed_sequence: bool = False,
-) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
+) -> nn.Module | AutoPipeline:
     """Build and initialize a model for VLM.
 
     Args:
@@ -999,7 +999,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             prepare_host_metadata = getattr(self.model_parts[0], "prepare_host_batch_metadata", None)
             if prepare_host_metadata is not None:
                 batch = {**batch, **prepare_host_metadata(batch)}
-        batch = move_batch_to_device(batch, self.dist_env.device)
+        batch = move_batch_to_device(batch, self.dist_env.device or torch.device("cpu"))
         if _cp_active and not _is_first_or_no_pp and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
             # Non-first PP stages don't embed; drop raw multimodal inputs so their
             # forwards see only text.
@@ -1365,7 +1365,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             total_tokens = 0
             total_num_label_tokens = 0
             for batch in val_dataloader:
-                batch = move_batch_to_device(batch, self.dist_env.device)
+                batch = move_batch_to_device(batch, self.dist_env.device or torch.device("cpu"))
                 num_label_tokens = _count_label_tokens(
                     batch["labels"], _get_loss_ignore_index(getattr(self, "loss_fn", None))
                 )

@@ -174,7 +174,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         if not self.separate_meshes:
             self.kd_mesh_bridge = None
             return self.kd_distributed_setups.student
-        self.kd_mesh_bridge = KDMeshBridge(self.kd_distributed_setups, device=self.dist_env.device)
+        self.kd_mesh_bridge = KDMeshBridge(
+            self.kd_distributed_setups, device=self.dist_env.device or torch.device("cpu")
+        )
         self._training_process_group = self.kd_mesh_bridge.student_group
         if self.kd_mesh_bridge.is_student:
             setup = self.kd_distributed_setups.student

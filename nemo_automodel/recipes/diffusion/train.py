@@ -759,7 +759,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.moe_mesh = mesh_context.moe_mesh
         self.pp_enabled = False
 
-        self.model = self.pipe.transformer
+        transformer = self.pipe.transformer
+        if transformer is None:
+            raise ValueError("The diffusion pipeline has no transformer to train")
+        self.model = transformer
         # LoRA and random-pretraining parameters are initialized before TP is
         # applied. Align their replicated local storage before the optimizer
         # captures the sharded model parameters.

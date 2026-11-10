@@ -97,6 +97,7 @@ from nemo_automodel.components.models.common.packing import (
     configure_packing_for_models,
     validate_thd_packing_support,
 )
+from nemo_automodel.components.models.common.utils import TEFp8Config
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
@@ -127,7 +128,7 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
-    from torch.optim import Optimizer
+    pass
 
 
 logger = logging.getLogger(__name__)
@@ -269,7 +270,7 @@ def build_model(
     device_mesh=None,
     *,
     load_metadata_with_gloo: bool = False,
-) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
+) -> nn.Module | AutoPipeline:
     """Build and initialize a model.
 
     Args:
@@ -809,7 +810,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
 
         # Extract TE FP8 config from model backend (set after model construction)
-        self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
+        te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
+        self.te_fp8 = te_fp8 if isinstance(te_fp8, TEFp8Config) else None
         if self.te_fp8 is not None:
             # Modules named in te_fp8.exclude_fqns (lm_head by default) run outside the FP8 autocast.
             for part in self.model_parts:
@@ -1284,7 +1286,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_batches: Number of microbatches in the accumulation window.
             is_train: Whether to backpropagate the combined main and MTP loss.
         """
-        batch = move_batch_to_device(batch, self.dist_env.device)
+        batch = move_batch_to_device(batch, self.dist_env.device or torch.device("cpu"))
         model = self.model_parts[0] if hasattr(self, "model_parts") else None
         ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         mtp_cp_enabled = not self.pp_enabled and self._get_cp_group_size() > 1 and model.supports.mtp_enabled
