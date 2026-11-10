@@ -779,3 +779,33 @@ class TestCreateRingUlyssesMesh:
 
         with pytest.raises(ValueError, match="must equal"):
             mesh_utils.create_ring_ulysses_mesh(device_mesh, ring_degree=2, ulysses_degree=4)
+
+
+def test_init_named_mesh_with_ranks_passes_one_backend_override_per_dimension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``DeviceMesh`` takes one ``(backend, options)`` pair per mesh dimension, in axis order."""
+    captured: dict = {}
+    fake_mesh = Mock()
+
+    def fake_device_mesh(**kwargs):
+        captured.update(kwargs)
+        return fake_mesh
+
+    monkeypatch.setattr(mesh_utils, "DeviceMesh", fake_device_mesh)
+    monkeypatch.setattr(mesh_utils, "_mesh_device_type", lambda: "cuda")
+    monkeypatch.setattr(mesh_utils, "_register_flattened_axes_for_rank_subset", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mesh_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mesh_utils.dist, "get_backend", lambda: "nccl")
+    monkeypatch.setattr(mesh_utils.dist, "get_world_size", lambda: 8)
+
+    spec = _MeshSpec(shape=(2, 2), axes=(MeshAxisName.PP, MeshAxisName.DP_SHARD))
+    result = _init_named_mesh(spec, timeout_minutes=30, ranks=[4, 5, 6, 7])
+
+    assert result is fake_mesh
+    override = captured["backend_override"]
+    assert isinstance(override, tuple)
+    assert len(override) == len(spec.axes)
+    for backend, options in override:
+        assert backend == "nccl"
+        assert options._timeout == datetime.timedelta(minutes=30)
