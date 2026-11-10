@@ -43,7 +43,7 @@ dataset:
   zephon:
     source:
       # Keep enough source chunks to give every data-parallel rank work.
-      chunk_size: 512
+      chunk_size: 1000
     sources:
     - name: instructions
       path: hf://yahma/alpaca-cleaned/train
