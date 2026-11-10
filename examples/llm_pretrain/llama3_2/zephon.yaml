@@ -50,6 +50,10 @@ dataset:
       weight: 0.1
     packing:
       seq_len: 1024
+    cache:
+      # Remote shards are fetched through Zephon's bounded disk cache.
+      cache_dir: .cache/zephon
+      cache_limit_bytes: 32GiB
     checkpoint:
       run_id: zephon-llama3_2-text
 distributed:
