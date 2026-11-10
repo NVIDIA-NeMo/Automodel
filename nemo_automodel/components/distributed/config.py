@@ -201,7 +201,7 @@ class MoEParallelizerConfig:
     wrap_outer_model: bool = True
     mp_policy: MixedPrecisionPolicy | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
@@ -365,7 +365,7 @@ class FSDP2Config:
         if not isinstance(self.multimodal, MultimodalDistributedConfig):
             raise TypeError("FSDP2Config.multimodal must be a MultimodalDistributedConfig instance.")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """Convert config to dictionary (shallow, preserves policy objects)."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
@@ -429,7 +429,7 @@ class MegatronFSDPConfig:
     fsdp_double_buffer: bool = False
     activation_checkpointing: bool = False
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """Convert config to dictionary (shallow, preserves objects)."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
@@ -477,7 +477,7 @@ class DDPConfig:
             self.activation_checkpointing_scope
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """Convert config to dictionary."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
