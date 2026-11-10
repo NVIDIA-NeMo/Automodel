@@ -46,6 +46,9 @@ processor:
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonVlmDatasetConfig
   zephon:
+    source:
+      # MedPix has fewer samples than the default 16384-sample source chunk.
+      chunk_size: 512
     sources:
     - name: medpix
       path: hf://mmoukouba/MedPix-VQA/train
@@ -55,6 +58,10 @@ dataset:
     packing:
       # Drop oversized conversations instead of truncating text or image tokens.
       seq_len: 8192
+    cache:
+      # Remote shards are fetched through Zephon's bounded disk cache.
+      cache_dir: .cache/zephon
+      cache_limit_bytes: 32GiB
     checkpoint:
       run_id: zephon-gemma4
 distributed:
