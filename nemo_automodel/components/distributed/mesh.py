@@ -28,10 +28,10 @@ YAML / dict parsing belongs in the recipe layer — see
 ``nemo_automodel.recipes._dist_utils``.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple, TypedDict, overload
+from typing import TYPE_CHECKING, Optional, TypedDict, overload
 
 from nemo_automodel.components.distributed.config import ActivationCheckpointingMode, DistributedStrategyConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
@@ -202,7 +202,7 @@ class MeshContext:
         return _get_axis_size(self.device_mesh, MeshAxisName.DP_SHARD, default=1)
 
     # Axis-name helpers (used by AutoPipeline and parallelize_model)
-    def _dp_axis_names(self) -> Tuple[str, ...]:
+    def _dp_axis_names(self) -> tuple[str, ...]:
         """DP axis names for FSDP mesh slicing."""
         if self.device_mesh is not None:
             names = _axis_names(self.device_mesh)

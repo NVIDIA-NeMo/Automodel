@@ -33,7 +33,7 @@ import os
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import ModuleType
-from typing import TYPE_CHECKING, List, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -680,7 +680,7 @@ def _wrap_first_existing_attr(
 
 
 def apply_submodule_checkpointing(
-    layers: List[nn.Module],
+    layers: list[nn.Module],
     has_kv_sharing: bool,
     *,
     context_fn: Callable[[], tuple[AbstractContextManager[object], AbstractContextManager[object]]] | None = (
@@ -769,7 +769,7 @@ def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Mo
     return False
 
 
-def apply_full_layer_checkpointing_to_layers(model: nn.Module, layers: List[nn.Module]) -> None:
+def apply_full_layer_checkpointing_to_layers(model: nn.Module, layers: list[nn.Module]) -> None:
     """Wrap transformer layers with non-reentrant activation checkpointing."""
     context_fn = functools.partial(
         transformer_engine_attention_backend_snapshot_context_fn,
@@ -825,7 +825,7 @@ def detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
 
 def apply_selective_checkpointing_to_layers(
     model: nn.Module,
-    layers: List[nn.Module],
+    layers: list[nn.Module],
     has_kv_sharing: bool,
     *,
     enable_compile: bool = False,

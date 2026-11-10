@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING, Any, Dict, Literal, Union
+from typing import TYPE_CHECKING, Any, Literal, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
@@ -197,7 +197,7 @@ class MoEParallelizerConfig:
     # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
-    lm_head_precision: Union[str, torch.dtype] | None = None
+    lm_head_precision: str | torch.dtype | None = None
     wrap_outer_model: bool = True
     mp_policy: MixedPrecisionPolicy | None = None
 
@@ -483,7 +483,7 @@ class DDPConfig:
 
 
 _StrategyConfigClass = type[FSDP2Config] | type[MegatronFSDPConfig] | type[DDPConfig]
-_STRATEGY_MAP: Dict[str, _StrategyConfigClass] = {
+_STRATEGY_MAP: dict[str, _StrategyConfigClass] = {
     "fsdp2": FSDP2Config,
     "megatron_fsdp": MegatronFSDPConfig,
     "megatron-fsdp": MegatronFSDPConfig,

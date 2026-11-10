@@ -19,7 +19,8 @@ This module provides utilities for handling tensor operations across different d
 and distributed tensor types, with optimizations for performance in distributed training scenarios.
 """
 
-from typing import Iterable, TypeVar, Union, overload
+from collections.abc import Iterable
+from typing import TypeVar, overload
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -29,7 +30,7 @@ _T = TypeVar("_T")
 
 @torch.no_grad()
 def get_cpu_state_dict(
-    state_generator: Iterable[tuple[str, Union[torch.Tensor, DTensor]]],
+    state_generator: Iterable[tuple[str, torch.Tensor | DTensor]],
     pin_memory: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Copy the state dict generator to CPU memory.
@@ -110,7 +111,7 @@ def to_cpu(v: torch.Tensor | _T) -> torch.Tensor | _T:
         return v
 
 
-def to_local_if_dtensor(tensor: Union[torch.Tensor, DTensor]) -> torch.Tensor:
+def to_local_if_dtensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
     """Returns the local shard of the given tensor if it is a DTensor.
 
     Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/605f618f237cda8fa80132bc2ccff933512d5a0d/megatron/core/utils.py#L746

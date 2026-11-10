@@ -16,11 +16,11 @@ import importlib
 import inspect
 import logging
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
-from typing import TYPE_CHECKING, Dict, Generator, List, Protocol, Sequence, Tuple, TypedDict, TypeGuard, Union
+from typing import TYPE_CHECKING, Protocol, TypedDict, TypeGuard
 
 import torch
 from torch import nn
@@ -383,7 +383,7 @@ class ModelParallelizer:
         offload_policy: OffloadPolicy | None = None,
         sequence_parallel: bool = False,
         activation_checkpointing: ActivationCheckpointingMode = False,
-        tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
+        tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
         dp_replicate_mesh_name: str = "dp_replicate",
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
@@ -983,7 +983,7 @@ def import_class_from_path(name: str) -> object:
     return cls_instance
 
 
-def import_classes_from_paths(class_paths: List[str]) -> list[type[nn.Module]]:
+def import_classes_from_paths(class_paths: list[str]) -> list[type[nn.Module]]:
     """
     Helper function to import module classes from string paths.
 
@@ -1153,7 +1153,7 @@ def validate_tp_mesh(model: nn.Module, tp_mesh: DeviceMesh) -> None:
         raise ValueError(f"num_attention_heads ({num_attention_heads}) must be divisible by TP size ({tp_size})")
 
 
-def _reduce_attrs(model: nn.Module, fqns: Sequence[str]) -> List[nn.Module]:
+def _reduce_attrs(model: nn.Module, fqns: Sequence[str]) -> list[nn.Module]:
     ans = []
     for fqn in fqns:
         parts = fqn.split(".")
@@ -1167,7 +1167,7 @@ def _reduce_attrs(model: nn.Module, fqns: Sequence[str]) -> List[nn.Module]:
     return ans
 
 
-def _extend_layers(layers: List[nn.Module], modules: Sequence[nn.Module]) -> None:
+def _extend_layers(layers: list[nn.Module], modules: Sequence[nn.Module]) -> None:
     for m in modules:
         if isinstance(m, nn.ModuleList):
             layers.extend(m)
@@ -1177,7 +1177,7 @@ def _extend_layers(layers: List[nn.Module], modules: Sequence[nn.Module]) -> Non
             layers.append(m)
 
 
-def _discover_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
+def _discover_layer_groups(model: nn.Module) -> dict[str, list[nn.Module]]:
     """Discover language, vision, and audio layer containers structurally."""
     candidates: dict[str, list[tuple[int, str, nn.ModuleList | nn.ModuleDict]]] = {}
     seen_containers: set[int] = set()
@@ -1206,22 +1206,22 @@ def _discover_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
             group = "language"
         candidates.setdefault(group, []).append((len(module), path, module))
 
-    groups: Dict[str, List[nn.Module]] = {}
+    groups: dict[str, list[nn.Module]] = {}
     for group, group_candidates in candidates.items():
         _, _, container = max(group_candidates, key=lambda item: (item[0], -item[1].count(".")))
         groups[group] = list(container.values()) if isinstance(container, nn.ModuleDict) else list(container)
     return groups
 
 
-def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
+def _extract_model_layer_groups(model: nn.Module) -> dict[str, list[nn.Module]]:
     """Extract transformer layers grouped by model role."""
     model_cls = type(model)
     layer_group_specs = getattr(model, "parallel_layer_groups", None)
 
-    layer_groups: Dict[str, List[nn.Module]] = {}
+    layer_groups: dict[str, list[nn.Module]] = {}
     if layer_group_specs is not None:
         for group_name, fqns in layer_group_specs.items():
-            layers: List[nn.Module] = []
+            layers: list[nn.Module] = []
             # Candidate FQNs are alternative locations of the same container
             # across transformers versions; take the first that resolves so
             # deprecated alias properties (e.g. top-level `visual` on
@@ -1256,7 +1256,7 @@ def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     return layer_groups
 
 
-def get_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
+def get_model_layer_groups(model: nn.Module) -> dict[str, list[nn.Module]]:
     """Return transformer layers grouped by model role (e.g. ``language``, ``vision``).
 
     Public accessor over the per-model layer-group mapping used for FSDP wrapping
@@ -1272,7 +1272,7 @@ def get_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     return _extract_model_layer_groups(model)
 
 
-def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
+def _extract_model_layers(model: nn.Module) -> list[nn.Module]:
     """
     Extract layers from different model architectures for parallelization.
 
@@ -1284,8 +1284,8 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     return [layer for group_layers in layer_groups.values() for layer in group_layers]
 
 
-def _dedupe_layers(layers: Sequence[nn.Module]) -> List[nn.Module]:
-    deduped: List[nn.Module] = []
+def _dedupe_layers(layers: Sequence[nn.Module]) -> list[nn.Module]:
+    deduped: list[nn.Module] = []
     seen: set[int] = set()
     for layer in layers:
         layer_id = id(layer)
@@ -1301,9 +1301,9 @@ def _has_trainable_parameters(module: nn.Module) -> bool:
 
 
 def _filter_layer_groups_for_activation_checkpointing(
-    layer_groups: Dict[str, List[nn.Module]],
+    layer_groups: dict[str, list[nn.Module]],
     activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
-) -> Tuple[List[nn.Module], Tuple[str, ...]]:
+) -> tuple[list[nn.Module], tuple[str, ...]]:
     """Select trainable activation-checkpointed layers from grouped model layers."""
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     all_layers = [layer for group_layers in layer_groups.values() for layer in group_layers]
@@ -1345,8 +1345,8 @@ def _filter_layer_groups_for_activation_checkpointing(
 
 def _should_use_hf_native_gradient_checkpointing(
     model: nn.Module,
-    layer_groups: Dict[str, List[nn.Module]],
-    scopes: Tuple[str, ...],
+    layer_groups: dict[str, list[nn.Module]],
+    scopes: tuple[str, ...],
     *,
     enable_compile: bool = False,
 ) -> TypeGuard[_HFGradientCheckpointingModel]:
@@ -1426,9 +1426,9 @@ def _uses_custom_moe_modules(model: nn.Module) -> bool:
 def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
-    tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
+    tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
     tp_size: int = 1,
-) -> Dict[str, ParallelStyle]:
+) -> dict[str, ParallelStyle]:
     """
     Select the tensor-parallel plan for the given model.
 
@@ -1643,7 +1643,7 @@ def fsdp2_strategy_parallelize(
     offload_policy: CPUOffloadPolicy | None = None,
     sequence_parallel: bool = False,
     activation_checkpointing: bool = False,
-    tp_shard_plan: Union[Dict[str, ParallelStyle], str] | None = None,
+    tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
     dp_replicate_mesh_name: str = "dp_replicate",
     dp_shard_cp_mesh_name: str = "dp_shard_cp",
     tp_mesh_name: str = "tp",
@@ -1850,8 +1850,8 @@ def megatron_fsdp_strategy_parallelize(
     model: nn.Module,
     device_mesh: DeviceMesh,
     optimizer: torch.optim.Optimizer | None = None,
-    megatron_fsdp_unit_modules: List[str] | None = None,
-    tp_shard_plan: Dict[str, ParallelStyle] | None = None,
+    megatron_fsdp_unit_modules: list[str] | None = None,
+    tp_shard_plan: dict[str, ParallelStyle] | None = None,
     zero_dp_strategy: int = 3,
     init_fsdp_with_meta_device: bool = False,
     grad_reduce_in_fp32: bool = False,

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -21,8 +20,8 @@ from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtens
 
 
 def clip_grad_by_total_norm_(
-    parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
-    max_grad_norm: Union[int, float],
+    parameters: list[torch.Tensor | DTensor] | torch.Tensor | DTensor,
+    max_grad_norm: int | float,
     total_norm: float,
     dtype: torch.dtype = torch.float32,
 ) -> None:
@@ -54,10 +53,10 @@ def clip_grad_by_total_norm_(
 
 
 def get_grad_norm(
-    parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
+    parameters: list[torch.Tensor | DTensor] | torch.Tensor | DTensor,
     dp_cp_group: torch.distributed.ProcessGroup,
     tp_group: torch.distributed.ProcessGroup,
-    norm_type: Union[int, float] = 2,
+    norm_type: int | float = 2,
     dtype: torch.dtype = torch.float32,
 ) -> float:
     """Calculate the norm of gradients.

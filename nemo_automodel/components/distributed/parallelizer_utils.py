@@ -14,20 +14,13 @@
 
 import logging
 from collections import defaultdict
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from copy import copy
 from typing import (
     TYPE_CHECKING,
-    Callable,
-    Dict,
-    Iterator,
-    List,
     Literal,
     Protocol,
     Required,
-    Sequence,
-    Set,
-    Tuple,
     TypedDict,
     TypeGuard,
     Union,
@@ -64,7 +57,7 @@ if TYPE_CHECKING:
 _GroupKeyT = TypeVar("_GroupKeyT", bound=Hashable, default=torch.dtype)
 _ShardTargetT_contra = TypeVar("_ShardTargetT_contra", contravariant=True)
 
-UniformSubtreeItem = Union[Tuple[nn.Module, Hashable], Tuple[str, nn.Module, Hashable]]
+UniformSubtreeItem = Union[tuple[nn.Module, Hashable], tuple[str, nn.Module, Hashable]]
 
 __all__ = [
     "fully_shard_by_dtype",
@@ -296,7 +289,7 @@ def iter_maximal_uniform_dtype_subtrees(
     tensor_pred: Callable[[torch.Tensor], bool] | None = None,
     dtype_of: Callable[[torch.Tensor], _GroupKeyT] | None = None,
     return_paths: Literal[False] = False,
-) -> Iterator[Tuple[nn.Module, _GroupKeyT]]: ...
+) -> Iterator[tuple[nn.Module, _GroupKeyT]]: ...
 
 
 @overload
@@ -307,7 +300,7 @@ def iter_maximal_uniform_dtype_subtrees(
     tensor_pred: Callable[[torch.Tensor], bool] | None = None,
     dtype_of: Callable[[torch.Tensor], _GroupKeyT] | None = None,
     return_paths: Literal[True],
-) -> Iterator[Tuple[str, nn.Module, _GroupKeyT]]: ...
+) -> Iterator[tuple[str, nn.Module, _GroupKeyT]]: ...
 
 
 def iter_maximal_uniform_dtype_subtrees(
@@ -339,8 +332,8 @@ def iter_maximal_uniform_dtype_subtrees(
     if dtype_of is None:
         dtype_of = lambda t: t.dtype
 
-    def _local_dtype_set(m: nn.Module) -> Set[Hashable]:
-        ds: Set[Hashable] = set()
+    def _local_dtype_set(m: nn.Module) -> set[Hashable]:
+        ds: set[Hashable] = set()
         for p in m.parameters(recurse=False):
             if tensor_pred(p):
                 ds.add(dtype_of(p))
@@ -350,10 +343,10 @@ def iter_maximal_uniform_dtype_subtrees(
                     ds.add(dtype_of(b))
         return ds
 
-    def _visit(m: nn.Module, path: Tuple[str, ...]) -> Tuple[Set[Hashable], List[UniformSubtreeItem]]:
+    def _visit(m: nn.Module, path: tuple[str, ...]) -> tuple[set[Hashable], list[UniformSubtreeItem]]:
         local = _local_dtype_set(m)
-        subtree_dtypes: Set[Hashable] = set(local)
-        collected: List[UniformSubtreeItem] = []
+        subtree_dtypes: set[Hashable] = set(local)
+        collected: list[UniformSubtreeItem] = []
 
         # Recurse into children
         for name, child in m.named_children():
@@ -385,7 +378,7 @@ def _group_params_by_dtype(
     layer: nn.Module,
     dtype_of: None = None,
     ignored_params: set[nn.Parameter] | None = None,
-) -> Dict[torch.dtype, List[nn.Parameter]]: ...
+) -> dict[torch.dtype, list[nn.Parameter]]: ...
 
 
 @overload
@@ -393,18 +386,18 @@ def _group_params_by_dtype(
     layer: nn.Module,
     dtype_of: Callable[[torch.Tensor], _GroupKeyT],
     ignored_params: set[nn.Parameter] | None = None,
-) -> Dict[_GroupKeyT, List[nn.Parameter]]: ...
+) -> dict[_GroupKeyT, list[nn.Parameter]]: ...
 
 
 def _group_params_by_dtype(
     layer: nn.Module,
     dtype_of: Callable[[torch.Tensor], Hashable] | None = None,
     ignored_params: set[nn.Parameter] | None = None,
-) -> Dict[Hashable, List[nn.Parameter]]:
+) -> dict[Hashable, list[nn.Parameter]]:
     if dtype_of is None:
         dtype_of = lambda t: t.dtype
     ignored_param_ids = {id(param) for param in ignored_params or ()}
-    ans: Dict[Hashable, List[nn.Parameter]] = {}
+    ans: dict[Hashable, list[nn.Parameter]] = {}
     for name, param in layer.named_parameters():
         if id(param) in ignored_param_ids:
             continue
@@ -525,7 +518,7 @@ def get_internal_fsdp_mp_policy(
 def _make_compute_dtype_fn(
     module: nn.Module,
     mp_policy: MixedPrecisionPolicy | None,
-    fp32_compute_module_names: Tuple[str, ...],
+    fp32_compute_module_names: tuple[str, ...],
     ignored_params: set[nn.Parameter] | None = None,
 ) -> Callable[[torch.Tensor], torch.dtype]:
     """Build the per-parameter *compute* dtype resolver used to group FSDP units.
@@ -555,7 +548,7 @@ def _make_compute_dtype_fn(
 
     ignored_param_ids = {id(param) for param in ignored_params or ()}
 
-    pinned_ids: Set[int] = set()
+    pinned_ids: set[int] = set()
     if fp32_compute_module_names:
         for name, tensor in (*module.named_parameters(), *module.named_buffers()):
             name = canonical_parameter_fqn(name)
@@ -669,7 +662,7 @@ def fully_shard_by_dtype(
     mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy | None,
     offload_policy: OffloadPolicy | None,
-    fp32_compute_module_names: Tuple[str, ...] = (),
+    fp32_compute_module_names: tuple[str, ...] = (),
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
     model_parallelizer: "ModelParallelizer | None" = None,
