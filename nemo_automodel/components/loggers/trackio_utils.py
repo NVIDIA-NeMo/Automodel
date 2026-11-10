@@ -39,7 +39,7 @@ class TrackioLogger:
         run: The ``trackio.Run`` to log to.
     """
 
-    def __init__(self, run: Any):
+    def __init__(self, run: Any) -> None:
         self.run = run
 
     def log_metrics(self, metrics: Mapping[str, Any], step: int) -> None:

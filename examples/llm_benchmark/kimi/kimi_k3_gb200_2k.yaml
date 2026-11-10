@@ -89,6 +89,10 @@
 # tokens per row halves the per-token kernel-launch tax, and K3's KDA linear
 # attention does not penalize longer rows.
 #
+# backend.attn: fa4 runs MLA on FlashAttention 4 instead (native QK/V 192/128,
+# no S x S score tensor; needs flash_attn.cute, installed by docker/Dockerfile
+# with INSTALL_FA4). It has not been measured against attn: te with this stack.
+#
 # Other benchmark regime notes match examples/llm_benchmark/kimi/kimi_k3_gb200.yaml.
 #
 #   To run on 64 GB200 NVL72 nodes:

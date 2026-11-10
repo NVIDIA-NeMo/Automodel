@@ -20,7 +20,7 @@
 # --node-rank; node 0 is the rendezvous master:
 #   torchrun --nnodes=8 --node-rank=0 --nproc_per_node=8 \
 #     --master-addr=<NODE0_IP> --master-port=29500 \
-#     -m nemo_automodel.recipes.llm.precompute_dspark_dist \
+#     -m nemo_automodel.recipes.speculative_decoding.precompute_dspark_dist \
 #     -c examples/speculative/dspark/glm_5.2_dspark_precompute.yaml
 #
 # To sanity-check on ONE node, set recipe_args.target_num_hidden_layers small (e.g. 4)

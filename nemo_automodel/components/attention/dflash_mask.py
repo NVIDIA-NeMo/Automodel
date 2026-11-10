@@ -41,6 +41,8 @@ branch follows the target model's autoregressive order (paper §2.2). Offset 0
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
@@ -55,7 +57,7 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 _compiled_create_block_mask = None
 
 
-def _get_compiled_create_block_mask():
+def _get_compiled_create_block_mask() -> Callable[..., BlockMask]:
     """Lazy-initialise a compiled ``create_block_mask`` and cache it."""
     global _compiled_create_block_mask
     if _compiled_create_block_mask is None:
@@ -163,7 +165,7 @@ def build_dflash_mask_mod(
     ctx_doc_id: torch.Tensor | None = None,
     anchor_doc_id: torch.Tensor | None = None,
     sliding_window: int | None = None,
-):
+) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """Return the FlexAttention ``mask_mod`` closure encoding the DFlash mask.
 
     Factored out of :func:`create_dflash_block_mask` so the doc-aware gating can be
@@ -175,7 +177,7 @@ def build_dflash_mask_mod(
     N = num_blocks
     doc_aware = ctx_doc_id is not None
 
-    def dflash_mask_mod(b, h, q_idx, kv_idx):
+    def dflash_mask_mod(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
         q_block = q_idx // block_size
         safe_q_block = q_block.clamp(max=N - 1)
         anchor = anchor_positions[b, safe_q_block]

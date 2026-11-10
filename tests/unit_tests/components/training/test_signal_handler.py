@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import signal
+from collections import UserList
 from typing import Any
 
 import pytest
@@ -226,3 +227,9 @@ def test_signal_handler_rejects_duplicates_and_empty():
         sutils.DistributedSignalHandler(sig=[signal.SIGUSR1, "USR1"])
     with pytest.raises(ValueError, match="At least one"):
         sutils.DistributedSignalHandler(sig=[])
+
+
+def test_signal_handler_accepts_non_list_sequence() -> None:
+    """Any supported Sequence of signal specifications is resolved elementwise."""
+    handler = sutils.DistributedSignalHandler(sig=UserList(["USR1", int(signal.SIGUSR2)]))
+    assert handler.sigs == [signal.SIGUSR1, signal.SIGUSR2]

@@ -799,8 +799,8 @@ class DFlashStrategy(DLLMStrategy):
 
     ``loss_type="dflash"`` here uses ``normalize="tokens"`` (a real, globally
     all-reduced token count, ``num_diffusion_tokens``), while
-    ``nemo_automodel.recipes.llm.train_dflash.TrainDFlashRecipe`` -- the
-    dedicated DFlash recipe built on the same loss class -- hardcodes
+    ``nemo_automodel.recipes.speculative_decoding.train_dflash.TrainDFlashRecipe`` (the
+    dedicated DFlash recipe built on the same loss class) hardcodes
     ``normalize="mean"`` (``batch_size * num_anchors`` blocks, not tokens) for
     it. The two therefore divide by denominators that differ by about
     ``block_size - 1``, so the *same* ``loss_decay_gamma`` / learning rate is
