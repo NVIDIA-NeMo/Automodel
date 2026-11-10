@@ -259,8 +259,9 @@ def _build_teacher_model_with_pp(
         for p in part.parameters():
             p.requires_grad_(False)
 
-    # Attach capture reference so the recipe can read teacher logits after eval.
-    teacher_model._teacher_logits_capture = teacher_logits_capture
+    # Attach capture reference so the recipe can read teacher logits after eval. Neither
+    # nn.Module nor AutoPipeline declares this attribute; the readers use getattr likewise.
+    setattr(teacher_model, "_teacher_logits_capture", teacher_logits_capture)
     return teacher_model
 
 
