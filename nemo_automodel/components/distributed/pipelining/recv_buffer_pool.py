@@ -45,13 +45,19 @@ Native interleaved 1F1B uses a separate, instance-local implementation in
 microbatch independent input and gradient storage before receive-slot reuse.
 """
 
+from __future__ import annotations
+
 import logging
 from collections import deque
 from types import MethodType
+from typing import TYPE_CHECKING
 
 import torch
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B, _Action, _ComputationType
+
+if TYPE_CHECKING:
+    from torch.distributed.pipelining.stage import _PipelineStageBase
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +84,7 @@ def schedule_supports_recv_pool(pp_schedule: str | None) -> bool:
     return pp_schedule is not None and pp_schedule.lower() in _SUPPORTED_SCHEDULES
 
 
-def _ring_size(stage, num_microbatches: int, slack: int) -> int:
+def _ring_size(stage: _PipelineStageBase, num_microbatches: int, slack: int) -> int:
     """Number of real buffer sets for a stage: in-flight depth plus slack.
 
     Args:
@@ -126,7 +132,7 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         logger.warning("recv_buffer_pool: torch internals mismatch, not installing: %s", exc)
         return False
 
-    def _alias_fwd_ring(self, k, num_microbatches):
+    def _alias_fwd_ring(self: _PipelineStageBase, k: int, num_microbatches: int) -> None:
         # Forward setup does not touch self.chunks in any known layout; restore
         # it defensively anyway so a layout that does cannot leave it at k.
         self.chunks = num_microbatches
@@ -139,7 +145,7 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
             num_microbatches,
         )
 
-    def _alias_bwd_ring(self, k, num_microbatches):
+    def _alias_bwd_ring(self: _PipelineStageBase, k: int, num_microbatches: int) -> None:
         # The callee set self.chunks to the value we passed; the schedule uses
         # it to detect the final chunk for grad sync — restore the true count.
         self.chunks = num_microbatches
@@ -158,23 +164,23 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         # num_microbatches, has_backward) and the base class in
         # _setup_backward_recv_info(num_microbatches).
         layout = "per-direction-setup"
-        orig_fwd = manual_cls._setup_forward_recv_info
-        orig_bwd = base_cls._setup_backward_recv_info
+        orig_setup_fwd = manual_cls._setup_forward_recv_info
+        orig_setup_bwd = base_cls._setup_backward_recv_info
 
-        def pooled_setup_forward_recv_info(self, num_microbatches, has_backward):
+        def pooled_setup_forward_recv_info(self: PipelineStage, num_microbatches: int, has_backward: bool) -> None:
             k = _ring_size(self, num_microbatches, slack)
             if self.is_first or k >= num_microbatches:
-                return orig_fwd(self, num_microbatches, has_backward)
-            orig_fwd(self, k, has_backward)
+                return orig_setup_fwd(self, num_microbatches, has_backward)
+            orig_setup_fwd(self, k, has_backward)
             _alias_fwd_ring(self, k, num_microbatches)
 
-        def pooled_setup_backward_recv_info(self, num_microbatches):
+        def pooled_setup_backward_recv_info(self: _PipelineStageBase, num_microbatches: int) -> None:
             if not isinstance(self, manual_cls) or self.is_last:
-                return orig_bwd(self, num_microbatches)
+                return orig_setup_bwd(self, num_microbatches)
             k = _ring_size(self, num_microbatches, slack)
             if k >= num_microbatches:
-                return orig_bwd(self, num_microbatches)
-            orig_bwd(self, k)
+                return orig_setup_bwd(self, num_microbatches)
+            orig_setup_bwd(self, k)
             _alias_bwd_ring(self, k, num_microbatches)
 
         manual_cls._setup_forward_recv_info = pooled_setup_forward_recv_info
@@ -185,24 +191,29 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         # _prepare_forward_infra(num_microbatches, args, kwargs) and the base
         # class's _prepare_backward_infra(num_microbatches).
         layout = "prepare-infra"
-        orig_fwd = manual_cls._prepare_forward_infra
-        orig_bwd = base_cls._prepare_backward_infra
+        orig_prepare_fwd = manual_cls._prepare_forward_infra
+        orig_prepare_bwd = base_cls._prepare_backward_infra
 
-        def pooled_prepare_forward_infra(self, num_microbatches, args, kwargs=None):
+        def pooled_prepare_forward_infra(
+            self: PipelineStage,
+            num_microbatches: int,
+            args: tuple[object, ...],
+            kwargs: dict[str, object] | None = None,
+        ) -> tuple[torch.Tensor, ...]:
             k = _ring_size(self, num_microbatches, slack)
             if self.is_first or k >= num_microbatches:
-                return orig_fwd(self, num_microbatches, args, kwargs)
-            outputs = orig_fwd(self, k, args, kwargs)
+                return orig_prepare_fwd(self, num_microbatches, args, kwargs)
+            outputs = orig_prepare_fwd(self, k, args, kwargs)
             _alias_fwd_ring(self, k, num_microbatches)
             return outputs
 
-        def pooled_prepare_backward_infra(self, num_microbatches):
+        def pooled_prepare_backward_infra(self: _PipelineStageBase, num_microbatches: int) -> None:
             if not isinstance(self, manual_cls) or self.is_last:
-                return orig_bwd(self, num_microbatches)
+                return orig_prepare_bwd(self, num_microbatches)
             k = _ring_size(self, num_microbatches, slack)
             if k >= num_microbatches:
-                return orig_bwd(self, num_microbatches)
-            result = orig_bwd(self, k)
+                return orig_prepare_bwd(self, num_microbatches)
+            result = orig_prepare_bwd(self, k)
             _alias_bwd_ring(self, k, num_microbatches)
             return result
 

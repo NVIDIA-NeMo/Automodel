@@ -14,7 +14,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Literal, Self
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,7 @@ from torch.utils._pytree import tree_map
 
 from nemo_automodel.components.distributed.pipelining.functional import (
     ParallelizeFnProtocol,
+    PipelineLossFn,
     pipeline_model,
     reset_pp_stage_shapes,
 )
@@ -89,7 +90,7 @@ class AutoPipeline:
         # P2P recv-buffer pooling (see components.distributed.pipelining.recv_buffer_pool)
         pp_recv_buffer_pool: bool = False,
         pp_recv_buffer_pool_slack: int = 2,
-    ):
+    ) -> None:
         # Validation
         if pp_schedule_csv is None and pp_schedule is None:
             raise ValueError("Either pipeline_parallel_schedule or pipeline_parallel_schedule_csv must be provided")
@@ -144,9 +145,9 @@ class AutoPipeline:
         self,
         model: nn.Module,
         *,
-        loss_fn: Callable | None = None,
+        loss_fn: PipelineLossFn | None = None,
         parallelize_fn: ParallelizeFnProtocol | None = None,
-    ):
+    ) -> Self:
         """Build the pipeline: validate -> init meta -> split -> schedule."""
         # 0. Validation
         assert loss_fn is not None, "loss_fn must be provided"
@@ -237,11 +238,13 @@ class AutoPipeline:
             seq_len: Sequence length of the upcoming batch (``input_ids.shape[1]``).
         """
         if seq_len != self._pp_current_seq_len:
-            if self._model_config is None:
+            schedule = self._info.schedule
+            stages = self._info.stages
+            if self._model_config is None or schedule is None or stages is None:
                 raise RuntimeError("AutoPipeline.build() must be called before update_seq_len()")
             self._pp_runtime_num_tokens = reset_pp_stage_shapes(
-                self._info.schedule,
-                self._info.stages,
+                schedule,
+                stages,
                 self._model_config,
                 self.pp_microbatch_size,
                 seq_len,
@@ -258,7 +261,7 @@ class AutoPipeline:
                 device=self.device,
             )
 
-    def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    def _get_schedule_kwargs_chunk_spec(self, kwargs: dict[str, object]) -> dict[str, Any] | None:
         """Build pipeline microbatch chunking metadata for keyword inputs.
 
         PyTorch's default schedule chunking splits every tensor kwarg on dim 0.
@@ -292,7 +295,7 @@ class AutoPipeline:
         if not custom_chunk_dims:
             return None
 
-        def default_spec(value):
+        def default_spec(value: object) -> TensorChunkSpec | ReplicateChunkSpec:
             if isinstance(value, (torch.Tensor, BlockMask)):
                 return TensorChunkSpec(0)
             return ReplicateChunkSpec()
@@ -308,8 +311,8 @@ class AutoPipeline:
         *,
         target: torch.Tensor | None = None,
         losses: list[torch.Tensor] | None = None,
-        **kwargs: Any,
-    ) -> Any:
+        **kwargs: object,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """Run one pipeline schedule step with model-owned input chunking.
 
         Args:
@@ -324,7 +327,9 @@ class AutoPipeline:
                 nonstandard batch axis.
 
         Returns:
-            The value returned by the underlying PyTorch pipeline schedule.
+            The value returned by the underlying PyTorch pipeline schedule: the
+            last stage's merged output (a tensor or tuple of tensors) on the rank
+            holding it, otherwise ``None``.
         """
         schedule = self._info.schedule
         if schedule is None:
@@ -371,7 +376,11 @@ class AutoPipeline:
         from torch.distributed.pipelining._schedule_visualizer import get_schedule_ops, visualize_schedule
 
         schedule = self._info.schedule
-        ops = get_schedule_ops(schedule, self.pp_mesh.size(), self.pp_microbatch_size, len(self._info.stages))
+        stages = self._info.stages
+        if schedule is None or stages is None:
+            raise RuntimeError("Autopipeline not built. Call build() first.")
+        # get_schedule_ops takes a schedule name or class, not a schedule instance.
+        ops = get_schedule_ops(type(schedule), self.pp_mesh.size(), self.pp_microbatch_size, len(stages))
         visualize_schedule(ops, filename)
 
     @staticmethod

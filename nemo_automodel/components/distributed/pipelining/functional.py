@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import enum
 import functools
 import inspect
 import logging
@@ -20,10 +21,12 @@ import math
 import os
 import time
 import types
-from typing import Callable, Protocol
+from collections.abc import Callable, Iterable
+from typing import Literal, Protocol, overload
 
 import torch
 import torch.nn as nn
+from torch.distributed import Work
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import (
@@ -38,6 +41,7 @@ from torch.distributed.pipelining.schedules import (
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     MULTIMODAL_SUFFIXES,
     TEXT_MODULE_ATTRS,
+    _child_module,
     get_text_module,
     model_keeps_self_forward,
     patch_hf_model_for_pp,
@@ -46,7 +50,51 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
 logger = logging.getLogger(__name__)
 
 
-def _get_optional_hook(module: nn.Module, name: str) -> Callable | None:
+class _StageMetasHook(Protocol):
+    """Model hook returning a stage's static pipeline input and output metadata."""
+
+    def __call__(
+        self, *, is_first: bool, microbatch_size: int, seq_len: int, dtype: torch.dtype
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Return ``(inputs_meta, outputs_meta)`` meta tensors for one microbatch."""
+        ...
+
+
+class _StageModulesHook(Protocol):
+    """Model hook rewriting the generated per-stage module FQNs."""
+
+    def __call__(
+        self, module_names_per_stage: list[list[str]], /, *, layers_prefix: str, text_model: nn.Module
+    ) -> list[list[str]] | None:
+        """Return replacement module FQNs per stage, or None to keep the generated split."""
+        ...
+
+
+class _StaticMetadataStage(Protocol):
+    """PyTorch >= 2.12 pipeline stage whose metadata inference mode is chosen by the schedule."""
+
+    _inference_mode: enum.Enum | None
+
+
+class PipelineLossFn(Protocol):
+    """Loss the schedule applies to each last-stage microbatch output and its target."""
+
+    def __call__(self, output: torch.Tensor | tuple[torch.Tensor, ...], target: torch.Tensor, /) -> torch.Tensor:
+        """Return the scalar loss for one microbatch."""
+        ...
+
+
+@overload
+def _get_optional_hook(module: nn.Module, name: Literal["get_pipeline_stage_metas"]) -> _StageMetasHook | None: ...
+
+
+@overload
+def _get_optional_hook(
+    module: nn.Module, name: Literal["customize_pipeline_stage_modules"]
+) -> _StageModulesHook | None: ...
+
+
+def _get_optional_hook(module: nn.Module, name: str) -> _StageMetasHook | _StageModulesHook | None:
     try:
         inspect.getattr_static(module, name)
     except AttributeError:
@@ -62,7 +110,7 @@ class ParallelizeFnProtocol(Protocol):
         self,
         model: torch.nn.Module,
         world_mesh: DeviceMesh,
-        moe_mesh: DeviceMesh,
+        moe_mesh: DeviceMesh | None,
         *,
         dp_axis_names: tuple[str, ...],
         cp_axis_name: str | None = None,
@@ -83,7 +131,9 @@ def scale_grads_by_divisor(
             stage.scale_grads(divisor)
 
 
-def stage_ids_this_rank(pp_rank: int, pp_size: int, num_stages: int, style: str = "loop") -> tuple[int]:
+def stage_ids_this_rank(
+    pp_rank: int, pp_size: int, num_stages: int, style: Literal["loop", "v"] = "loop"
+) -> tuple[int, ...]:
     """Compute the stage ids for the stages that will run on this pp rank for either a looped or V style schedule"""
     assert num_stages % pp_size == 0, f"num_stages {num_stages} must be evenly divisible by pp_size {pp_size}"
     stages_per_rank = num_stages // pp_size
@@ -247,7 +297,7 @@ def calculate_virtual_stages(
     return num_virtual_stages, stages_per_rank
 
 
-def _get_hidden_and_vocab_size(model_config) -> tuple[int, int]:
+def _get_hidden_and_vocab_size(model_config: object) -> tuple[int, int]:
     """Extract hidden_size and vocab_size from a model config.
 
     Handles both flat configs (LLM) and nested configs where these attributes
@@ -307,7 +357,7 @@ def _set_stage_metas(
 
 def _precompute_stage_shapes(
     stages: list[PipelineStage],
-    model_config,
+    model_config: object,
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
@@ -342,7 +392,7 @@ def _precompute_stage_shapes(
         return microbatch_size * seq_len
 
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
-    local_token_counts = []
+    local_token_counts: list[int] = []
 
     for stage in stages:
         if tensor_dtype is None:
@@ -396,11 +446,21 @@ def _precompute_stage_shapes(
     return max(local_token_counts, default=microbatch_size * seq_len)
 
 
+def _wait_for_p2p(work: Work | None) -> None:
+    """Wait for a point-to-point request; torch returns None only to ranks outside the group."""
+    if work is None:
+        raise RuntimeError("Pipeline stage P2P warmup was issued by a rank outside the stage process group")
+    work.wait()
+
+
 def _warmup_pipeline_stage_neighbors(stage: PipelineStage) -> None:
     """Initialize the pairwise NCCL communicators used by a pipeline stage."""
+    group = stage.group
+    if group is None:
+        raise ValueError("Pipeline stage neighbor warmup requires the stage's explicit process group")
     warmup_tensor = torch.zeros(1, device=stage.device)
-    group_rank = stage.group.rank()
-    group_ranks = torch.distributed.get_process_group_ranks(stage.group)
+    group_rank = group.rank()
+    group_ranks = torch.distributed.get_process_group_ranks(group)
     local_world_size = max(torch.cuda.device_count(), 1)
 
     # Stagger PP replicas by their first node to avoid overloading NCCL communicator bootstrap.
@@ -427,9 +487,9 @@ def _warmup_pipeline_stage_neighbors(stage: PipelineStage) -> None:
             for lower_rank, higher_rank in phase:
                 src_rank, dst_rank = (higher_rank, lower_rank) if reverse else (lower_rank, higher_rank)
                 if group_rank == src_rank:
-                    torch.distributed.isend(warmup_tensor, group=stage.group, group_dst=dst_rank).wait()
+                    _wait_for_p2p(torch.distributed.isend(warmup_tensor, group=group, group_dst=dst_rank))
                 elif group_rank == dst_rank:
-                    torch.distributed.irecv(warmup_tensor, group=stage.group, group_src=src_rank).wait()
+                    _wait_for_p2p(torch.distributed.irecv(warmup_tensor, group=group, group_src=src_rank))
 
     torch.cuda.synchronize(stage.device)
 
@@ -448,7 +508,12 @@ def _use_static_pipeline_stage_metadata(schedule: _PipelineSchedule, stages: lis
     if any(InferenceMode.needs_dynamic(stage_meta, has_backward) for stage_meta in stage_metas):
         return
 
-    def _warmup_static_stages(self, pipeline_stages, has_backward, p2p_done) -> None:
+    def _warmup_static_stages(
+        self: _PipelineSchedule,
+        pipeline_stages: Iterable[_StaticMetadataStage],
+        has_backward: bool,
+        p2p_done: bool,
+    ) -> None:
         del self, has_backward, p2p_done
         for stage in pipeline_stages:
             stage._inference_mode = InferenceMode.STATIC
@@ -489,7 +554,7 @@ def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
         if cleanup is None:
             continue
 
-        def _cleanup_preserving_grads(self, *, _cleanup=cleanup) -> None:
+        def _cleanup_preserving_grads(self: PipelineStage, *, _cleanup: Callable[[], None] = cleanup) -> None:
             if getattr(self, "_inference_mode", None) is not InferenceMode.STATIC:
                 _cleanup()
                 return
@@ -504,7 +569,7 @@ def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
 def reset_pp_stage_shapes(
     schedule: _PipelineSchedule,
     stages: list[PipelineStage],
-    model_config,
+    model_config: object,
     microbatch_size: int,
     seq_len: int,
     tensor_dtype: torch.dtype | None = None,
@@ -605,7 +670,7 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
         return
 
     @functools.wraps(original_forward)
-    def _pp_tensor_forward(*args, **kwargs):
+    def _pp_tensor_forward(*args: object, **kwargs: object) -> torch.Tensor | tuple[torch.Tensor, ...]:
         output = original_forward(*args, **kwargs)
         if isinstance(output, ModelOutput):
             return output.logits
@@ -646,7 +711,7 @@ def split_model_into_stages(
     pp_size = pp_mesh.size()
     # Detect model structure
     has_model_attr = hasattr(model, "model")
-    text_model = get_text_module(model.model if has_model_attr else model)
+    text_model = get_text_module(_child_module(model.model) if has_model_attr else model)
     text_model_attr_name = ""
     for attr_name in TEXT_MODULE_ATTRS:
         if hasattr(model, attr_name) or hasattr(model.model, attr_name):
@@ -662,7 +727,7 @@ def split_model_into_stages(
 
     if text_model_has_model_attr:
         # Models like LlamaForCausalLM have model.layers
-        num_layers = len(text_model.model.layers)
+        num_layers = len(_child_module(text_model.model).layers)
     else:
         # Direct model access
         num_layers = len(text_model.layers)
@@ -751,7 +816,7 @@ def split_model_into_stages(
         logger.info(f"PP Rank {pp_rank}: Stage {stage_idx}: Keeping modules: {modules_sorted}")
 
         # Helper function to handle nested module removal
-        def _process_module(parent_module, parent_name=""):
+        def _process_module(parent_module: nn.Module, parent_name: str = "") -> None:
             for name, module in list(parent_module.named_children()):
                 full_name = f"{parent_name}.{name}" if parent_name else name
 
@@ -822,8 +887,8 @@ def split_model_into_stages(
     schedule_class = get_schedule_class(pp_schedule)
     style = "v" if schedule_class == ScheduleZBVZeroBubble else "loop"
 
-    stages = []
-    models = []
+    stages: list[PipelineStage] = []
+    models: list[nn.Module] = []
 
     total_stages = len(module_names_per_stage)
     assert total_stages % pp_size == 0, f"Total stages {total_stages} must be divisible by PP size {pp_size}"
@@ -846,7 +911,7 @@ def build_pipeline_schedule(
     microbatch_size: int,
     local_batch_size: int,
     stages: list[PipelineStage],
-    loss_fn: Callable,
+    loss_fn: PipelineLossFn | None,
     scale_grads: bool = False,
 ) -> _PipelineSchedule:
     """Builds a pipeline schedule for the given job configuration and stages.
@@ -857,7 +922,7 @@ def build_pipeline_schedule(
         microbatch_size (int): The microbatch size.
         local_batch_size (int): The local batch size.
         stages (list[PipelineStage]): The stages to be scheduled.
-        loss_fn (Callable): The loss function.
+        loss_fn (PipelineLossFn | None): The loss function, or None for a forward-only schedule.
 
     Returns:
         _PipelineSchedule: The pipeline schedule for the given stages.
@@ -869,6 +934,8 @@ def build_pipeline_schedule(
         if not os.path.isfile(pp_schedule_csv):
             raise FileNotFoundError(f"The specified path {pp_schedule_csv} does not exist or is not a file.")
         schedule_class = _PipelineScheduleRuntime
+    elif pipeline_parallel_schedule is None:
+        raise ValueError("Either pipeline_parallel_schedule or pipeline_parallel_schedule_csv must be provided")
     else:
         schedule_class = get_schedule_class(pipeline_parallel_schedule)
 
@@ -917,7 +984,7 @@ def build_pipeline_schedule(
 def pipeline_model(
     model: torch.nn.Module,
     world_mesh: DeviceMesh,
-    moe_mesh: DeviceMesh,
+    moe_mesh: DeviceMesh | None,
     *,
     pp_axis_name: str,
     dp_axis_names: tuple[str, ...],
@@ -931,8 +998,8 @@ def pipeline_model(
     microbatch_size: int,
     local_batch_size: int,
     device: torch.device,
-    loss_fn: Callable = None,
-    parallelize_fn: Callable | None = None,
+    loss_fn: PipelineLossFn | None = None,
+    parallelize_fn: ParallelizeFnProtocol | None = None,
     module_fqns_per_model_part: list[list[str]] | None = None,
     patch_inner_model: bool = True,
     patch_causal_lm_model: bool = True,
@@ -946,6 +1013,8 @@ def pipeline_model(
     """HF-specific pipeline model splitting."""
     pp_size = world_mesh[pp_axis_name].size()
     assert pp_size > 1, "Pipeline parallelism is not enabled"
+    if pipeline_parallel_schedule is None:
+        raise ValueError("pipeline_parallel_schedule is required to split the model into pipeline stages")
 
     # Use HF-specific pipeline split
     stages, model_parts = split_model_into_stages(

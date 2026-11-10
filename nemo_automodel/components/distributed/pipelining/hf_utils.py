@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 import types
-from collections.abc import MutableMapping
-from typing import TYPE_CHECKING, Callable, Union
+from collections.abc import Iterable, MutableMapping
+from typing import TYPE_CHECKING, Protocol, TypeAlias, TypedDict
 
 import torch
 import torch.nn as nn
@@ -23,7 +25,16 @@ import torch.nn as nn
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 
 if TYPE_CHECKING:
-    pass
+    from torch.nn.attention.flex_attention import BlockMask
+    from transformers.cache_utils import Cache
+    from transformers.configuration_utils import PreTrainedConfig
+    from transformers.modeling_outputs import BaseModelOutputWithPast
+
+    # Attention-type name ("full_attention", "sliding_attention") -> complete mask, as built by
+    # transformers.masking_utils; None lets attention run without an explicit mask.
+    _CausalMaskMapping: TypeAlias = dict[str, torch.Tensor | BlockMask | None]
+    # (sequence length, dtype, device) of the stage input; the inputs that determine an unpadded mask.
+    _CausalMaskCacheKey: TypeAlias = tuple[int, torch.dtype, torch.device]
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +62,201 @@ MULTIMODAL_SUFFIXES = (
 )
 
 
+class _CausalMaskKwargs(TypedDict):
+    """Arguments shared by Hugging Face's full and sliding-window causal-mask builders."""
+
+    config: PreTrainedConfig
+    inputs_embeds: torch.Tensor
+    attention_mask: torch.Tensor | None
+    past_key_values: Cache | None
+    position_ids: torch.Tensor | None
+
+
+class _CausalMaskOwner(Protocol):
+    """Decoder module whose config selects the mask implementation and which owns the stage mask cache."""
+
+    config: PreTrainedConfig
+    _pp_causal_mask_cache: MutableMapping[_CausalMaskCacheKey, _CausalMaskMapping]
+
+
+class _CausalLMStage(Protocol):
+    """Causal-LM wrapper; submodules owned by other pipeline stages are pruned to None."""
+
+    config: PreTrainedConfig
+    model: nn.Module | None
+    lm_head: nn.Module | None
+
+
+class _Gemma4TextStage(Protocol):
+    """Gemma4 text decoder; submodules owned by other pipeline stages are pruned to None."""
+
+    config: PreTrainedConfig
+    embed_tokens: nn.Module | None
+    rotary_emb: nn.Module | None
+    layers: nn.ModuleList | nn.ModuleDict | None
+    norm: nn.Module | None
+
+
+class _PooledImageFeatures(Protocol):
+    """Vision-tower output whose pooled features are one tensor per image."""
+
+    pooler_output: tuple[torch.Tensor, ...]
+
+
+class _Gemma4VLMConfig(Protocol):
+    """Composite Gemma4 VLM config."""
+
+    text_config: PreTrainedConfig
+    image_token_id: int
+
+
+class _Gemma4VLMBackbone(Protocol):
+    """Gemma4 VLM inner model holding the vision tower and the text decoder."""
+
+    language_model: nn.Module
+
+    def get_image_features(
+        self, pixel_values: torch.Tensor, /, *, image_position_ids: torch.Tensor | None, return_dict: bool
+    ) -> _PooledImageFeatures:
+        """Encode images [images, ...] into one pooled feature tensor per image."""
+        ...
+
+
+class _Gemma4VLMStage(Protocol):
+    """Gemma4ForConditionalGeneration-style stage; lm_head is None before the last stage."""
+
+    config: _Gemma4VLMConfig
+    model: _Gemma4VLMBackbone
+    lm_head: nn.Module | None
+
+
+class _Mistral3VLMBackbone(Protocol):
+    """Mistral3 VLM inner model holding the vision tower, projector and the text decoder."""
+
+    language_model: nn.Module
+
+    def get_image_features(
+        self,
+        *,
+        pixel_values: torch.Tensor,
+        vision_feature_layer: int | list[int] | None,
+        image_sizes: torch.Tensor | None,
+        return_dict: bool,
+    ) -> _PooledImageFeatures:
+        """Encode images [images, channels, height, width] into one pooled feature tensor per image."""
+        ...
+
+    def get_placeholder_mask(
+        self, input_ids: torch.Tensor | None, /, *, inputs_embeds: torch.Tensor, image_features: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the bool mask [batch, sequence, hidden] of image-token embedding slots."""
+        ...
+
+
+class _Mistral3VLMStage(Protocol):
+    """Mistral3ForConditionalGeneration-style stage; lm_head is None before the last stage."""
+
+    config: PreTrainedConfig
+    model: _Mistral3VLMBackbone
+    lm_head: nn.Module | None
+
+
+class _InnerPipelineForward(Protocol):
+    """Pipeline forward bound to a decoder backbone (or a module nesting one)."""
+
+    def __call__(
+        self,
+        module: nn.Module,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+        causal_mask_mapping: _CausalMaskMapping | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | BaseModelOutputWithPast: ...
+
+
+class _CausalLMPipelineForward(Protocol):
+    """Pipeline forward bound to a causal-LM wrapper."""
+
+    def __call__(
+        self,
+        module: _CausalLMStage,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: object,
+    ) -> torch.Tensor: ...
+
+
+class _Gemma4TextPipelineForward(Protocol):
+    """Pipeline forward bound to a Gemma4 text decoder."""
+
+    def __call__(
+        self,
+        module: _Gemma4TextStage,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor: ...
+
+
+class _Gemma4VLMPipelineForward(Protocol):
+    """Pipeline forward bound to a Gemma4 VLM."""
+
+    def __call__(
+        self,
+        module: _Gemma4VLMStage,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor: ...
+
+
+class _Mistral3VLMPipelineForward(Protocol):
+    """Pipeline forward bound to a Mistral3 VLM."""
+
+    def __call__(
+        self,
+        module: _Mistral3VLMStage,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_sizes: torch.Tensor | None = None,
+        vision_feature_layer: int | list[int] | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor: ...
+
+
 def get_text_module(model: nn.Module) -> nn.Module:
     """Return the nested text/LLM module if present, else the model itself."""
     if model is None:
@@ -65,7 +271,41 @@ def get_text_module(model: nn.Module) -> nn.Module:
     return model
 
 
-def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_position, position_ids):
+def _child_module(value: torch.Tensor | nn.Module) -> nn.Module:
+    """Narrow an ``nn.Module.__getattr__`` result that names a child module.
+
+    ``nn.Module.__getattr__`` also resolves registered parameters and buffers; the
+    pipeline helpers read only children here (inner models, embeddings, rotary
+    embeddings and norms).
+
+    Raises:
+        TypeError: If the attribute is a parameter or buffer.
+    """
+    if isinstance(value, torch.Tensor):
+        raise TypeError(f"Expected a submodule, got a {type(value).__name__}")
+    return value
+
+
+def _decoder_layers(layers: torch.Tensor | nn.Module) -> Iterable[nn.Module]:
+    """Iterate decoder layers held in an ``nn.ModuleList`` or, after stage pruning, an ``nn.ModuleDict``.
+
+    Raises:
+        TypeError: If ``layers`` is not a module container.
+    """
+    if isinstance(layers, nn.ModuleDict):
+        return layers.values()
+    if isinstance(layers, (nn.ModuleList, nn.Sequential)):
+        return layers
+    raise TypeError(f"Expected decoder layers in an nn.ModuleList or nn.ModuleDict, got {type(layers).__name__}")
+
+
+def _build_or_reuse_pp_causal_mask(
+    module: _CausalMaskOwner,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | _CausalMaskMapping | None,
+    cache_position: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> _CausalMaskMapping:
     """Build a stage's ``causal_mask_mapping``, caching it per stage when safe.
 
     Under pipeline parallelism the mask precomputed in the data pipeline only reaches
@@ -77,6 +317,18 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
     so it is built once per stage and reused. With an explicit ``attention_mask`` (which
     may encode per-batch padding) it is rebuilt each call. Behavior is identical to the
     previous recompute; only the redundant recomputation is removed.
+
+    Args:
+        module: Decoder module whose config selects the mask implementation.
+        inputs_embeds: Hidden states [batch, sequence, hidden]; only shape, dtype and
+            device are read.
+        attention_mask: Padding mask [batch, sequence], a complete mask, or an already
+            built attention-type -> mask mapping.
+        cache_position: Sequence offsets [sequence].
+        position_ids: Positions [batch, sequence].
+
+    Returns:
+        Mapping from attention type to its mask.
     """
     # An ``attention_mask`` that is already a mask-mapping dict is used as-is.
     if isinstance(attention_mask, dict):
@@ -93,14 +345,14 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
         return cache[cache_key]
 
     # Note: inputs_embeds is only used for shape and dtype, not values.
-    mask_kwargs = {
+    mask_kwargs: _CausalMaskKwargs = {
         "config": module.config,
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
         "past_key_values": None,  # Training-only: no KV cache
         "position_ids": position_ids,
     }
-    causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+    causal_mask_mapping: _CausalMaskMapping = {"full_attention": create_causal_mask(**mask_kwargs)}
     if getattr(module, "has_sliding_layers", False) is True:
         causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
@@ -112,23 +364,30 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
     return causal_mask_mapping
 
 
-def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callable:
+def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> _InnerPipelineForward:
     """Create a pipeline-compatible forward method for HuggingFace inner models."""
-    from transformers.cache_utils import Cache
     from transformers.modeling_outputs import BaseModelOutputWithPast
 
     def pipeline_forward(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: nn.Module,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
+        position_ids: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
-        causal_mask_mapping: dict | None = None,
-        **kwargs,
-    ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        cache_position: torch.Tensor | None = None,
+        causal_mask_mapping: _CausalMaskMapping | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | BaseModelOutputWithPast:
+        """Run this stage's decoder layers.
+
+        ``input_ids`` holds token ids [batch, sequence] on the first stage, or the
+        previous stage's floating-point hidden states [batch, sequence, hidden] on a
+        stage without ``embed_tokens``; ``inputs_embeds`` is [batch, sequence, hidden].
+        ``position_ids`` is [batch, sequence] and ``cache_position`` is [sequence].
+        Returns hidden states [batch, sequence, hidden] for ``"PipelineStage"``.
+        """
         # For VLM models the text components (embed_tokens, layers, norm) live on a
         # nested text module (e.g. model.language_model) rather than directly on self.
         # get_text_module returns self when no nesting exists (e.g. LlamaModel).
@@ -139,7 +398,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
             if hasattr(text_module, "embed_tokens") and text_module.embed_tokens is not None:
                 if input_ids is None:
                     raise ValueError("You must provide either input_ids or inputs_embeds")
-                inputs_embeds = text_module.embed_tokens(input_ids)
+                inputs_embeds = _child_module(text_module.embed_tokens)(input_ids)
             else:
                 if (
                     input_ids is not None
@@ -181,13 +440,13 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         position_embeddings = None
         rotary_emb = get_text_module(self).rotary_emb
         if rotary_emb is not None:
-            position_embeddings = rotary_emb(hidden_states, position_ids)
+            position_embeddings = _child_module(rotary_emb)(hidden_states, position_ids)
 
         if hasattr(text_module, "layers") and text_module.layers is not None:
             # Preserve the public FlashAttention metadata for this microbatch.
             flash_kwargs = {key: kwargs[key] for key in _FLASH_VARLEN_KWARGS if key in kwargs}
             # Works for dict-like or list-like containers
-            layer_iter = text_module.layers.values() if hasattr(text_module.layers, "values") else text_module.layers
+            layer_iter = _decoder_layers(text_module.layers)
             for decoder_layer in layer_iter:
                 layer_attention_mask = causal_mask_mapping.get("full_attention")
                 if hasattr(decoder_layer, "attention_type"):
@@ -208,7 +467,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
         if hasattr(text_module, "norm") and text_module.norm is not None:
-            hidden_states = text_module.norm(hidden_states)
+            hidden_states = _child_module(text_module.norm)(hidden_states)
 
         if model_class_name == "PipelineStage":
             return hidden_states
@@ -221,26 +480,25 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
     return pipeline_forward
 
 
-def create_pipeline_forward_causal_lm() -> Callable:
+def create_pipeline_forward_causal_lm() -> _CausalLMPipelineForward:
     """Create a pipeline-compatible forward method for causal LM wrappers."""
-    from transformers.cache_utils import Cache
     from transformers.modeling_outputs import BaseModelOutputWithPast
 
     def pipeline_forward_causal_lm(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: _CausalLMStage,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
+        position_ids: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        labels: torch.LongTensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs,
-    ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        cache_position: torch.Tensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: object,
+    ) -> torch.Tensor:
         """Pipeline-stage forward for a causal-LM wrapper.
 
         B=microbatch, S=seq, H=hidden, V=vocab. Non-first stages take input
@@ -297,7 +555,7 @@ def create_pipeline_forward_causal_lm() -> Callable:
     return pipeline_forward_causal_lm
 
 
-def create_pipeline_forward_gemma4_text() -> Callable:
+def create_pipeline_forward_gemma4_text() -> _Gemma4TextPipelineForward:
     """Pipeline-compatible forward for the Gemma4 text decoder backbone.
 
     Works for both HF Gemma4TextModel (dense path) and Gemma4MoETextModelBackend (MoE path).
@@ -308,14 +566,14 @@ def create_pipeline_forward_gemma4_text() -> Callable:
     """
 
     def pipeline_forward_gemma4_text(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: _Gemma4TextStage,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
-        position_ids: torch.LongTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        **kwargs,
+        **kwargs: object,
     ) -> torch.Tensor:
         """Run retained decoder layers with native or model-prepared masks.
 
@@ -361,7 +619,7 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-            mask_kwargs = {
+            mask_kwargs: _CausalMaskKwargs = {
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
@@ -374,7 +632,7 @@ def create_pipeline_forward_gemma4_text() -> Callable:
             }
 
         # Per-layer-type rotary embeddings: Gemma4RotaryEmbedding takes (x, pos_ids, layer_type)
-        position_embeddings_map: dict = {}
+        position_embeddings_map: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         if hasattr(self, "rotary_emb") and self.rotary_emb is not None:
             for lt in set(getattr(self.config, "layer_types", ["full_attention"])):
                 try:
@@ -392,9 +650,9 @@ def create_pipeline_forward_gemma4_text() -> Callable:
         # mirroring HF's Gemma4TextModel.forward. gemma-4-31B, 26B-A4B have num_kv_shared_layers=0
         # (no readers, store is a harmless no-op write); for a kv-sharing model split
         # across PP stages only within-stage sharing would work here.
-        shared_kv_states: dict = {}
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         if hasattr(self, "layers") and self.layers is not None:
-            layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+            layer_iter = _decoder_layers(self.layers)
             for decoder_layer in layer_iter:
                 # Prefer config.layer_types[layer_idx] over decoder_layer attribute — the
                 # attribute lookup defaults to "full_attention" and mis-assigns position
@@ -427,7 +685,7 @@ def create_pipeline_forward_gemma4_text() -> Callable:
     return pipeline_forward_gemma4_text
 
 
-def create_pipeline_forward_gemma4_vlm() -> Callable:
+def create_pipeline_forward_gemma4_vlm() -> _Gemma4VLMPipelineForward:
     """Pipeline-compatible forward for Gemma4ForConditionalGeneration (VLM top-level).
 
     Stage 0: embeds text tokens, merges image features from vision tower (if pixel_values
@@ -437,17 +695,23 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
     """
 
     def pipeline_forward_gemma4_vlm(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: _Gemma4VLMStage,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
-        position_ids: torch.LongTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        pixel_values: torch.FloatTensor | None = None,
-        image_position_ids: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.LongTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
-        **kwargs,
-    ):
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Return logits [batch, sequence, vocab] on the last stage, else hidden states.
+
+        ``input_ids`` holds token ids [batch, sequence] on the first stage and hidden
+        states [batch, sequence, hidden] on later stages. ``pixel_values`` and
+        ``image_position_ids`` use the Gemma4 processor layouts.
+        """
         if (
             kwargs.get("_packed_seq_ids") is not None
             and attention_mask is None
@@ -537,7 +801,7 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
     return pipeline_forward_gemma4_vlm
 
 
-def create_pipeline_forward_mistral3_vlm() -> Callable:
+def create_pipeline_forward_mistral3_vlm() -> _Mistral3VLMPipelineForward:
     """Pipeline-compatible forward for Mistral3ForConditionalGeneration (VLM top-level).
 
     Stage 0: embeds text tokens, runs vision_tower + multi_modal_projector for
@@ -553,17 +817,23 @@ def create_pipeline_forward_mistral3_vlm() -> Callable:
     """
 
     def pipeline_forward_mistral3_vlm(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: _Mistral3VLMStage,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        pixel_values: torch.FloatTensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
         image_sizes: torch.Tensor | None = None,
-        vision_feature_layer=None,
-        cache_position: torch.LongTensor | None = None,
-        **kwargs,
-    ):
+        vision_feature_layer: int | list[int] | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Return logits [batch, sequence, vocab] on the last stage, else hidden states.
+
+        ``input_ids`` holds token ids [batch, sequence] on the first stage and hidden
+        states [batch, sequence, hidden] on later stages. ``pixel_values`` is
+        [images, channels, height, width] and ``image_sizes`` is [images, 2].
+        """
         inner = self.model
         lang_model = inner.language_model
         embed_tokens = getattr(lang_model, "embed_tokens", None)
@@ -670,7 +940,7 @@ def model_keeps_self_forward(model: torch.nn.Module) -> bool:
     return bool(getattr(type(model), "_pp_keep_self_forward", False))
 
 
-def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
+def patch_hf_model_for_pp(model: nn.Module, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
     """Patch a HF model/module to produce pipeline-compatible forward.
 
     The caller is responsible for skipping this function when the model
