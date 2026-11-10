@@ -292,8 +292,15 @@ the model tokenizer's chat template, assistant-only supervision, whole-document
 | `meta-llama/Llama-3.2-1B-Instruct` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/zephon.yaml) |
 
 ```bash
-uv run automodel examples/llm_finetune/qwen/zephon.yaml --nproc-per-node 1
+uv run automodel examples/llm_finetune/qwen/zephon.yaml --nproc-per-node 8
 ```
+
+Qwen keeps the optimizer and 64/8 global/local batch sizes from its native
+HellaSwag example, with a 1,024-token packing window from the packed Qwen recipe.
+Llama Instruct follows `customizer_llama_3_2_1b_full_sft.yaml`: Adam at `5e-6`,
+cosine decay with no warmup, 8/1 global/local batches, a 2,048-token window and
+13 steps. Its example runs on one GPU. The Alpaca source and Zephon chat packing
+remain independent of those training settings.
 
 ## How the Integration Works
 
