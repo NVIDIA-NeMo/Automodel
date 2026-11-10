@@ -43,14 +43,30 @@ place of eager/SDPA/flash for convergence-parity comparisons.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, Unpack, overload
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.context_parallel.utils import _make_cp_batch_and_ctx, make_cp_batch_for_te
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ShardContextFactory,
+    ShardedBatch,
+    THDBatch,
+    TokenBatch,
+)
+from nemo_automodel.components.distributed.context_parallel.utils import (
+    _make_cp_batch_and_ctx,
+    _thd_tensor,
+    make_cp_batch_for_te,
+)
+
+if TYPE_CHECKING:
+    from magi_attention.api import DistAttnRuntimeKey
+    from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +74,7 @@ _MAGI_REGISTERED = False
 # Default dispatch chunk size used by the load-balancing solver.
 DEFAULT_CHUNK_SIZE = 512
 # Self-key path: id(cp_group) -> last sequence length a key was built for.
-_MAGI_SELF_KEY_LEN: dict = {}
+_MAGI_SELF_KEY_LEN: dict[int, int] = {}
 # Active CP group for the custom-model attention factory (set by the recipe).
 # The custom factory's attn_func is a closure with no access to the attention
 # module, so it reads the cp_group from here. One CP group is active per process.
@@ -91,8 +107,12 @@ def get_active_cp_group() -> "dist.ProcessGroup" | None:
 # Active mask spec for the custom-model attn_func (set per step by the caller;
 # None -> plain causal self-key). Keyed implicitly by the single active cp_group.
 _ACTIVE_ATTN_SPEC: "AttnMaskSpec" | None = None
+# Hashable identity of an AttnMaskSpec: (total_seqlen, q_ranges, k_ranges, mask_types).
+AttnMaskFingerprint: TypeAlias = tuple[int, tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...], tuple[str, ...]]
 # id(cp_group) -> (spec_fingerprint, built_key), so all layers in a step reuse one key.
-_FLEX_KEY_CACHE: dict = {}
+_FLEX_KEY_CACHE: dict[int, tuple[AttnMaskFingerprint, DistAttnRuntimeKey]] = {}
+# Collator-emitted prefix-tree structure: (node_lengths, sample_paths).
+PrefixTree: TypeAlias = tuple[list[int], list[list[int]]]
 
 
 @dataclass
@@ -106,12 +126,12 @@ class AttnMaskSpec:
         total_seqlen: total number of tokens in the (flat) sequence.
     """
 
-    q_ranges: list
-    k_ranges: list
-    mask_types: list
+    q_ranges: list[list[int]]
+    k_ranges: list[list[int]]
+    mask_types: list[str]
     total_seqlen: int
 
-    def fingerprint(self) -> tuple:
+    def fingerprint(self) -> AttnMaskFingerprint:
         """Hashable identity used to cache the built key across layers."""
         return (
             self.total_seqlen,
@@ -137,7 +157,9 @@ class AttnMaskSpec:
         return cls(q_ranges, k_ranges, mask_types, off)
 
     @classmethod
-    def prefix_tree(cls, node_lengths: list[int], sample_paths: list[list[int]]):
+    def prefix_tree(
+        cls, node_lengths: list[int], sample_paths: list[list[int]]
+    ) -> tuple["AttnMaskSpec", list[list[list[int]]]]:
         """Build a prefix-tree mask over a flat deduplicated token layout.
 
         Args:
@@ -197,8 +219,13 @@ def get_active_attn_spec() -> "AttnMaskSpec" | None:
 
 
 def build_flex_key(
-    spec: "AttnMaskSpec", *, num_heads_q, num_heads_kv, head_dim, cp_group
-):  # pragma: no cover - requires GPU + magi_attention
+    spec: "AttnMaskSpec",
+    *,
+    num_heads_q: int,
+    num_heads_kv: int,
+    head_dim: int,
+    cp_group: dist.ProcessGroup | None,
+) -> DistAttnRuntimeKey:  # pragma: no cover - requires GPU + magi_attention
     """Build a magi dist-attn key for an arbitrary AttnSlice mask (no extra padding)."""
     from magi_attention.api import magi_attn_flex_key
     from magi_attention.common import AttnRanges
@@ -219,8 +246,8 @@ def build_flex_key(
 
 
 def _flex_key_for(
-    cp_group, spec, *, num_heads_q, num_heads_kv, head_dim
-):  # pragma: no cover - requires GPU + magi_attention
+    cp_group: dist.ProcessGroup, spec: AttnMaskSpec, *, num_heads_q: int, num_heads_kv: int, head_dim: int
+) -> DistAttnRuntimeKey:  # pragma: no cover - requires GPU + magi_attention
     """Return the flex key for ``spec``, rebuilding only when the mask changes."""
     fp = spec.fingerprint()
     cached = _FLEX_KEY_CACHE.get(id(cp_group))
@@ -238,8 +265,14 @@ def _flex_key_for(
 
 
 def _build_self_key(
-    cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, device
-):  # pragma: no cover - requires GPU + magi_attention
+    cp_group: dist.ProcessGroup,
+    *,
+    seqlen: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    head_dim: int,
+    device: torch.device,
+) -> DistAttnRuntimeKey:  # pragma: no cover - requires GPU + magi_attention
     """Build a cp=1 causal varlen key matching the actual q length (no dispatch)."""
     from magi_attention.api import magi_attn_varlen_key
 
@@ -258,8 +291,14 @@ def _build_self_key(
 
 
 def _self_key_for(
-    cp_group, *, seqlen, num_heads_q, num_heads_kv, head_dim, device
-):  # pragma: no cover - requires GPU + magi_attention
+    cp_group: dist.ProcessGroup,
+    *,
+    seqlen: int,
+    num_heads_q: int,
+    num_heads_kv: int,
+    head_dim: int,
+    device: torch.device,
+) -> DistAttnRuntimeKey:  # pragma: no cover - requires GPU + magi_attention
     """Return a causal self-key for ``seqlen``, (re)building only when it changes.
 
     All attention layers in one forward share the same sequence length, so the
@@ -284,7 +323,40 @@ def _self_key_for(
     return key
 
 
-def make_magi_attn_func(softmax_scale: float | None = None):  # pragma: no cover - requires GPU + magi_attention
+class MagiAttnKwargs(TypedDict, total=False):
+    """Mask metadata that ``preprocess_args_and_kwargs_for_attn`` forwards to the magi attn_func."""
+
+    magi_attn_spec: AttnMaskSpec
+    cu_seqlens: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    window_size: int | tuple[int | None, ...] | list[int | None]
+
+
+class MagiAttnFunc(Protocol):
+    """Backend ``attn_func`` built by :func:`make_magi_attn_func`."""
+
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **call_kwargs: Unpack[MagiAttnKwargs]
+    ) -> torch.Tensor:
+        """Run MagiAttention (or the causal SDPA fallback) on one attention call.
+
+        Args:
+            q: Queries of shape [tokens, heads, head_dim] (THD) or [1, sequence, heads,
+                head_dim] (BSHD).
+            k: Keys with the layout of ``q`` and ``kv_heads`` heads.
+            v: Values with the layout of ``k``.
+            **call_kwargs: Optional mask metadata; ``cu_seqlens`` / ``cu_seqlens_q`` are
+                int tensors of shape [documents + 1].
+
+        Returns:
+            Attention output with the layout of ``q``.
+        """
+        ...
+
+
+def make_magi_attn_func(
+    softmax_scale: float | None = None,
+) -> MagiAttnFunc:  # pragma: no cover - requires GPU + magi_attention
     """Build the attn_func used by the custom-model attention factory.
 
     The returned callable accepts q/k/v in either THD ``[t, nh, hd]`` or BSHD
@@ -305,7 +377,10 @@ def make_magi_attn_func(softmax_scale: float | None = None):  # pragma: no cover
     from einops import rearrange
     from magi_attention.api import calc_attn, get_most_recent_key
 
-    def magi_attn_func(q, k, v, **call_kwargs):
+    def magi_attn_func(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **call_kwargs: Unpack[MagiAttnKwargs]
+    ) -> torch.Tensor:
+        """Implement :class:`MagiAttnFunc`, whose docstring defines the q/k/v layouts."""
         cp_group = get_active_cp_group()
         if cp_group is None:
             import torch.nn.functional as F
@@ -316,8 +391,8 @@ def make_magi_attn_func(softmax_scale: float | None = None):  # pragma: no cover
             return F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, scale=softmax_scale, enable_gqa=True)
 
         bshd = q.dim() == 4
+        b = q.shape[0]
         if bshd:
-            b = q.shape[0]
             qf, kf, vf = (rearrange(e, "b s nh hd -> (b s) nh hd") for e in (q, k, v))
         else:
             qf, kf, vf = q, k, v
@@ -405,15 +480,36 @@ def register_magi_attention() -> None:  # pragma: no cover - requires GPU + magi
 
     def magi_attention_forward(
         module: torch.nn.Module,
-        query: torch.Tensor,  # (b, num_heads, seq, head_dim)
+        query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         dropout: float = 0.0,
         scaling: float | None = None,
         is_causal: bool | None = None,
-        **kwargs: Any,
-    ):
+        position_bias: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, None]:
+        """HF attention-interface forward running MagiAttention FFA on stamped modules.
+
+        Args:
+            module: The attention module; a stamped ``cp_group`` selects magi.
+            query: Queries of shape [batch, heads, sequence, head_dim].
+            key: Keys of shape [batch, kv_heads, sequence, head_dim].
+            value: Values of shape [batch, kv_heads, sequence, head_dim].
+            attention_mask: Optional mask forwarded to the SDPA fallback only.
+            dropout: Dropout probability for the SDPA fallback.
+            scaling: Softmax scale (None -> 1/sqrt(head_dim)).
+            is_causal: Causal flag for the SDPA fallback.
+            position_bias: Optional additive bias forwarded to the SDPA fallback only.
+            **kwargs: Remaining attention-interface keyword arguments, forwarded to
+                the SDPA fallback.
+
+        Returns:
+            ``(output, None)``. The magi path returns output of shape [batch, sequence,
+            heads * head_dim]; the SDPA fallback returns transformers' [batch, sequence,
+            heads, head_dim]. Callers reshape either to [batch, sequence, hidden].
+        """
         cp_group = getattr(module, "cp_group", None)
         if cp_group is None:
             # Not a magi-managed (causal LM) attention -> fall back to SDPA. This
@@ -432,6 +528,7 @@ def register_magi_attention() -> None:  # pragma: no cover - requires GPU + magi
                 dropout=dropout,
                 scaling=scaling,
                 is_causal=is_causal,
+                position_bias=position_bias,
                 **kwargs,
             )
 
@@ -472,7 +569,7 @@ def register_magi_attention() -> None:  # pragma: no cover - requires GPU + magi
     logger.info("Registered 'magi' attention backend (MagiAttention FFA) in transformers.")
 
 
-def get_cp_group(device_mesh) -> dist.ProcessGroup | None:
+def get_cp_group(device_mesh: DeviceMesh | None) -> dist.ProcessGroup | None:
     """Return the CP process group from the device mesh (size-1 group is fine)."""
     if device_mesh is None:
         return None
@@ -482,7 +579,15 @@ def get_cp_group(device_mesh) -> dist.ProcessGroup | None:
     return None
 
 
-def _get_head_config(model) -> tuple[int, int, int]:
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the module a DDP-style container wraps as ``.module``, else ``model``."""
+    inner = model.module if hasattr(model, "module") else model
+    if not isinstance(inner, torch.nn.Module):
+        raise TypeError(f"expected the wrapped model to be an nn.Module, got {type(inner).__name__}")
+    return inner
+
+
+def _get_head_config(model: torch.nn.Module | PretrainedConfig) -> tuple[int, int, int]:
     """Extract (num_heads_q, num_heads_kv, head_dim) from an HF model/config.
 
     For VLMs the text attention dims live under ``config.text_config``; prefer that
@@ -498,7 +603,7 @@ def _get_head_config(model) -> tuple[int, int, int]:
     return int(num_heads_q), int(num_heads_kv), int(head_dim)
 
 
-def _set_cp_group_on_attention(model, cp_group) -> None:
+def _set_cp_group_on_attention(model: torch.nn.Module, cp_group: dist.ProcessGroup | None) -> None:
     """Stamp ``cp_group`` on every attention sub-module so the FFA forward finds the key."""
     for module in model.modules():
         if "Attention" in type(module).__name__:
@@ -506,11 +611,11 @@ def _set_cp_group_on_attention(model, cp_group) -> None:
 
 
 def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
-    model,
-    batch: dict,
+    model: torch.nn.Module,
+    batch: TokenBatch,
     cp_group: dist.ProcessGroup | None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-):
+) -> tuple[TokenBatch, DistAttnRuntimeKey]:
     """Dispatch a (batch_size==1) sequence for MagiAttention on the HF path.
 
     Builds a causal varlen dist-attn key over the single sequence and dispatches
@@ -547,7 +652,7 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     seqlen = input_ids.shape[1]
     cp_size = cp_group.size() if cp_group is not None else 1
 
-    num_heads_q, num_heads_kv, head_dim = _get_head_config(model.module if hasattr(model, "module") else model)
+    num_heads_q, num_heads_kv, head_dim = _get_head_config(_unwrap_model(model))
 
     # Single full causal sequence -> cu_seqlens = [0, S].
     cu_seqlens = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
@@ -568,7 +673,7 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     local_input = dispatch(input_ids.squeeze(0), key=key).unsqueeze(0)  # [1, local_S]
     position_ids = get_position_ids(key).unsqueeze(0).to(device)  # [1, local_S]
 
-    _set_cp_group_on_attention(model.module if hasattr(model, "module") else model, cp_group)
+    _set_cp_group_on_attention(_unwrap_model(model), cp_group)
 
     new_batch = dict(batch)
     new_batch["input_ids"] = local_input
@@ -582,7 +687,7 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     return new_batch, key
 
 
-def _packed_cp_doc_seqlens(batch: dict, total_len: int) -> list:
+def _packed_cp_doc_seqlens(batch: TokenBatch, total_len: int) -> list[int]:
     """Resolve per-document lengths spanning the *padded* THD layout of length ``total_len``.
 
     The TE collater pads each document for the THD layout, so ``cu_seqlens_padded``
@@ -594,6 +699,15 @@ def _packed_cp_doc_seqlens(batch: dict, total_len: int) -> list:
     real tokens from attending the trailing per-document pad, and pad-token rows are
     dropped by the loss (labels == ignore_index), so this is numerically equivalent
     to attending only the real tokens.
+
+    Args:
+        batch: Global THD batch whose ``cu_seqlens_padded`` (or ``cu_seqlens``) is an
+            int tensor of cumulative document boundaries, any shape that flattens to
+            [documents + 1], with negative padding sentinels allowed.
+        total_len: Flat token count of ``input_ids`` the documents must span.
+
+    Returns:
+        Per-document token counts over the padded layout.
 
     Raises:
         ValueError: if the resolved document layout does not span ``total_len``.
@@ -612,7 +726,9 @@ def _packed_cp_doc_seqlens(batch: dict, total_len: int) -> list:
     return seqlens
 
 
-def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - requires GPU + magi_attention
+def magi_prepare_packed_cp(
+    model: torch.nn.Module, batch: TokenBatch, cp_group: dist.ProcessGroup | None
+) -> tuple[THDBatch, DistAttnRuntimeKey]:  # pragma: no cover - requires GPU + magi_attention
     """Context-parallel prep for a packed (THD) batch on the custom-model path.
 
     Takes a *global* THD batch (flat ``input_ids``/``labels``/``position_ids`` plus
@@ -624,16 +740,24 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - 
     each rank computes a per-shard loss that the recipe's cross-CP reduction sums
     into the global loss (like TE-CP).
 
+    Args:
+        model: The (possibly DDP-wrapped) custom model whose config supplies head sizes.
+        batch: Global THD batch: ``input_ids``/``labels`` of shape [tokens] (or any
+            shape flattening to it) and ``cu_seqlens_padded``/``cu_seqlens``
+            boundaries of shape [documents + 1].
+        cp_group: CP process group the key dispatches over.
+
     Returns:
         (new_batch, key): ``new_batch`` has the local ``input_ids``/``position_ids``
-        and local ``labels``; ``key`` is the dist-attn runtime key.
+        and local ``labels`` (each of shape [local_tokens]) plus ``qkv_format="thd"``;
+        ``key`` is the dist-attn runtime key.
     """
     from magi_attention.api import dispatch, get_position_ids
 
     input_ids = batch["input_ids"].reshape(-1)  # global flat (padded THD) [T]
     seqlens = _packed_cp_doc_seqlens(batch, int(input_ids.numel()))
     spec = AttnMaskSpec.varlen(seqlens, causal=True)
-    num_heads_q, num_heads_kv, head_dim = _get_head_config(model.module if hasattr(model, "module") else model)
+    num_heads_q, num_heads_kv, head_dim = _get_head_config(_unwrap_model(model))
     key = build_flex_key(
         spec,
         num_heads_q=num_heads_q,
@@ -649,7 +773,7 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - 
     # every CP rank compute the full loss redundantly -> the reduction would
     # double-count it by a factor of cp_size.)
     local_labels = dispatch(batch["labels"].reshape(-1), key=key)
-    new_batch = {
+    new_batch: THDBatch = {
         "input_ids": local_input,
         "position_ids": local_pos,
         "labels": local_labels,
@@ -662,14 +786,14 @@ def magi_prepare_packed_cp(model, batch: dict, cp_group):  # pragma: no cover - 
     return new_batch, key
 
 
-def _iter_language_model_attention(model):
+def _iter_language_model_attention(model: torch.nn.Module) -> Iterator[torch.nn.Module]:
     """Yield attention sub-modules belonging to the *language* backbone only.
 
     For VLMs we must leave the vision tower on its own (bidirectional) attention.
     HF VLMs nest the text stack under a ``language_model``/``model.language_model``
     attribute; we walk only that subtree. Falls back to the whole model for plain
     LLMs (no language_model attribute)."""
-    root = model.module if hasattr(model, "module") else model
+    root = _unwrap_model(model)
     lm = None
     for attr in ("language_model", "model"):
         sub = getattr(root, attr, None)
@@ -684,10 +808,10 @@ def _iter_language_model_attention(model):
 
 
 def magi_prepare_vlm(
-    model,
-    batch: dict,
+    model: torch.nn.Module,
+    batch: TokenBatch,
     cp_group: dist.ProcessGroup | None,
-):
+) -> tuple[TokenBatch, None]:
     """Prepare a VLM (bs==1) step for MagiAttention on the language backbone.
 
     Unlike the LLM path, the VLM merges image features into ``inputs_embeds``
@@ -699,6 +823,11 @@ def magi_prepare_vlm(
 
     Returns the (unchanged) batch and ``None`` (the key is built lazily in the
     attention forward from the real query length).
+
+    Args:
+        model: The (possibly DDP-wrapped) VLM whose language-backbone attention is stamped.
+        batch: Token tensors with ``input_ids`` of shape [1, sequence].
+        cp_group: CP process group; only size 1 is supported.
     """
     input_ids = batch.get("input_ids")
     if input_ids is None or input_ids.shape[0] != 1:
@@ -731,7 +860,7 @@ class MagiState:
     cp_group: "dist.ProcessGroup" | None = None
     cp_size: int = 1
     domain: str = "llm"  # recipe domain ("llm" | "vlm"), bound at setup
-    device_mesh: Any | None = None  # full device mesh, bound at setup (cp=1 THD conversion)
+    device_mesh: DeviceMesh | None = None  # full device mesh, bound at setup (cp=1 THD conversion)
 
     @property
     def hf_dispatch(self) -> bool:
@@ -743,9 +872,16 @@ class MagiState:
         """
         return self.enabled and not self.custom
 
-    def prepare_llm_batch(
-        self, model, batch, *, device_mesh, is_thd, pad_id, num_chunks
-    ):  # pragma: no cover - requires GPU + magi_attention
+    def prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
+        self,
+        model: torch.nn.Module | None,
+        batch: TokenBatch,
+        *,
+        device_mesh: DeviceMesh | None,
+        is_thd: bool,
+        pad_id: int,
+        num_chunks: int,
+    ) -> tuple[ShardContextFactory, ShardedBatch, torch.Tensor | None]:
         """Per-step batch prep for the LLM recipe (assumes ``enabled``).
 
         Returns ``(train_ctx, batch, local_indices)``. magi does its own CP, so
@@ -754,13 +890,28 @@ class MagiState:
         local token on the paths that dispatch the sequence (magi's
         ``get_position_ids``), None otherwise; the framework installs it on
         the magi ContextParallelSharder for the token-tensor verbs.
+
+        Args:
+            model: The model part whose attention receives the dispatch key;
+                required on the dispatching paths.
+            batch: Full-sequence token tensors such as ``input_ids`` of shape
+                [1, sequence]; an optional ``prefix_tree`` entry (collator
+                ``(node_lengths, sample_paths)`` lists) is popped.
+            device_mesh: Full device mesh for the cp=1 THD conversion.
+            is_thd: THD-packed collator is active.
+            pad_id: Pad sentinel for ``input_ids``.
+            num_chunks: THD chunk count.
+
+        Raises:
+            TypeError: If a dispatching path receives no model or a malformed
+                ``prefix_tree``.
         """
         # cp=1 prefix-tree mask: the datasets layer cannot import this module (component
         # independence), so the collate attaches the tree structure and the spec is built
         # and activated here, out-of-band, for the magi attn_func. Setting it every step
         # (a spec or None) is self-clearing, so a stale spec never leaks into the next
         # batch; plain batches omit "prefix_tree".
-        prefix_tree = batch.pop("prefix_tree", None)
+        prefix_tree: object = batch.pop("prefix_tree", None)
         if prefix_tree is not None and self.hf_dispatch:
             # The prefix-tree mask is handed to the attn_func out-of-band (the HF
             # attention interface has a fixed signature and cannot receive a custom
@@ -774,54 +925,104 @@ class MagiState:
                 "the out-of-band AttnMaskSpec, so the mask would be silently dropped. Load a "
                 "model registered in MODEL_ARCH_MAPPING and set model.backend.attn='magi'."
             )
-        node_lengths, sample_paths = prefix_tree if prefix_tree is not None else (None, None)
-        spec = AttnMaskSpec.prefix_tree(node_lengths, sample_paths)[0] if prefix_tree is not None else None
+        spec = None
+        if prefix_tree is not None:
+            if not (isinstance(prefix_tree, (tuple, list)) and len(prefix_tree) == 2):
+                raise TypeError("prefix_tree must be a (node_lengths, sample_paths) pair")
+            node_lengths, sample_paths = prefix_tree
+            if not (isinstance(node_lengths, list) and isinstance(sample_paths, list)):
+                raise TypeError("prefix_tree node_lengths and sample_paths must be lists")
+            spec = AttnMaskSpec.prefix_tree(node_lengths, sample_paths)[0]
         set_active_attn_spec(spec)
         local_indices = None
+        prepared: ShardedBatch = batch
         if self.hf_dispatch:
+            if model is None:
+                raise TypeError("magi HF dispatch requires the model")
             # HF path: dispatch the (single causal) sequence across the CP group.
-            batch, _ = magi_prepare_batch(model, batch, self.cp_group)
+            prepared, _ = magi_prepare_batch(model, batch, self.cp_group)
             # The dispatched position_ids ARE magi's get_position_ids(key): the
             # global stream position of every local token.
-            local_indices = batch["position_ids"]
+            local_indices = prepared["position_ids"]
         elif self.custom and self.cp_size > 1 and is_thd:
+            if model is None:
+                raise TypeError("magi packed context parallelism requires the model")
             # Custom-model CP packed path: build the *global* THD layout (no TE
             # sharding) then dispatch it with magi's own load-balancing solver.
-            batch = make_cp_batch_for_te(None, batch, qkv_format="thd", padding_token_id=pad_id, num_chunks=1)
-            batch, _ = magi_prepare_packed_cp(model, batch, self.cp_group)
-            local_indices = batch["position_ids"]
+            global_batch = make_cp_batch_for_te(None, batch, qkv_format="thd", padding_token_id=pad_id, num_chunks=1)
+            prepared, _ = magi_prepare_packed_cp(model, global_batch, self.cp_group)
+            local_indices = _thd_tensor(prepared, "position_ids")
         elif is_thd:
             # cp=1 packing: THD conversion (no sharding) so the batch carries
             # cu_seqlens -> the magi attn_func builds the per-document mask.
             # position_ids here are per-document RoPE positions, not stream
             # indices, so no index map is exposed.
-            _, batch, _ = _make_cp_batch_and_ctx(
+            _, prepared, _ = _make_cp_batch_and_ctx(
                 device_mesh, batch, use_te=True, padding_token_id=pad_id, num_chunks=num_chunks
             )
-        return nullcontext, batch, local_indices
+        return nullcontext, prepared, local_indices
 
-    def prepare_vlm_batch(self, model, batch):
+    def prepare_vlm_batch(
+        self, model: torch.nn.Module | None, batch: TokenBatch
+    ) -> tuple[ShardContextFactory, TokenBatch]:
         """Per-step batch prep for the VLM recipe (assumes ``enabled``).
 
         HF VLMs stamp the cp_group on the language-backbone attention; custom VLMs
         use the factory attn_func with the active cp_group set in :func:`setup_magi`
         (the vision tower stays on SDPA either way). Returns ``(train_ctx, batch)``.
+
+        Args:
+            model: The VLM part whose language-backbone attention is stamped;
+                required unless the custom-model factory owns the attention.
+            batch: Token tensors with ``input_ids`` of shape [1, sequence],
+                returned unchanged.
+
+        Raises:
+            TypeError: If the HF path receives no model.
         """
         if not self.custom:
+            if model is None:
+                raise TypeError("magi HF VLM preparation requires the model")
             batch, _ = magi_prepare_vlm(model, batch, self.cp_group)
         return nullcontext, batch
 
+    @overload
     def make_cp_batch(
         self,
-        cp_mesh,
-        batch,
+        cp_mesh: DeviceMesh | None,
+        batch: TokenBatch,
+        *,
+        padding_token_id: int = ...,
+        num_chunks: int = ...,
+        is_thd: bool = ...,
+        model: torch.nn.Module | None = ...,
+        return_local_indices: Literal[False] = ...,
+    ) -> ShardedBatch: ...
+
+    @overload
+    def make_cp_batch(
+        self,
+        cp_mesh: DeviceMesh | None,
+        batch: TokenBatch,
+        *,
+        padding_token_id: int = ...,
+        num_chunks: int = ...,
+        is_thd: bool = ...,
+        model: torch.nn.Module | None = ...,
+        return_local_indices: Literal[True],
+    ) -> tuple[ShardedBatch, torch.Tensor | None]: ...
+
+    def make_cp_batch(
+        self,
+        cp_mesh: DeviceMesh | None,
+        batch: TokenBatch,
         *,
         padding_token_id: int = 0,
         num_chunks: int = 1,
         is_thd: bool = False,
-        model=None,
+        model: torch.nn.Module | None = None,
         return_local_indices: bool = False,
-    ):
+    ) -> ShardedBatch | tuple[ShardedBatch, torch.Tensor | None]:
         """Backend-owned per-step batch prep, shaped like ``make_cp_batch_for_te``.
 
         Called by the CP dispatch at the same rung
@@ -835,7 +1036,8 @@ class MagiState:
             cp_mesh: The context-parallel submesh. Unused — magi owns its
                 bound ``cp_group``; accepted for signature symmetry with
                 ``make_cp_batch_for_te``.
-            batch: The full-sequence batch.
+            batch: The full-sequence batch of token tensors, e.g. ``input_ids``
+                of shape [1, sequence].
             padding_token_id: Pad sentinel for ``input_ids``.
             num_chunks: THD chunk count.
             is_thd: THD-packed collator is active.
@@ -851,10 +1053,11 @@ class MagiState:
         """
         del cp_mesh
         local_indices = None
+        prepared: ShardedBatch
         if self.domain == "vlm":
-            _, batch = self.prepare_vlm_batch(model, batch)
+            _, prepared = self.prepare_vlm_batch(model, batch)
         else:
-            _, batch, local_indices = self.prepare_llm_batch(
+            _, prepared, local_indices = self.prepare_llm_batch(
                 model,
                 batch,
                 device_mesh=self.device_mesh,
@@ -862,10 +1065,20 @@ class MagiState:
                 pad_id=padding_token_id,
                 num_chunks=num_chunks,
             )
-        return (batch, local_indices) if return_local_indices else batch
+        return (prepared, local_indices) if return_local_indices else prepared
 
 
-def setup_magi(cfg, device_mesh, *, domain: str = "llm", label: str = "") -> MagiState:
+class _ConfigLookup(Protocol):
+    """Dotted-key lookup of a recipe config (``ConfigNode`` / ``RecipeConfig``)."""
+
+    def get(self, key: str, default: str, /) -> object:
+        """Return the value at a dotted key, or ``default`` when it is absent."""
+        ...
+
+
+def setup_magi(
+    cfg: _ConfigLookup, device_mesh: DeviceMesh | None, *, domain: str = "llm", label: str = ""
+) -> MagiState:
     """Resolve MagiAttention from config: register the backend and CP group.
 
     Enabled when the model is configured with ``attn_implementation="magi"`` (HF) or
