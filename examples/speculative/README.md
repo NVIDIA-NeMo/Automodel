@@ -24,7 +24,7 @@ inference engine (SGLang or vLLM). The training code lives in
 | **DFlash** | Block-parallel drafting: drafts a whole block of `block_size` tokens in one non-causal "denoising" forward over `[anchor, MASK, MASK, ...]`. | `TrainDFlashRecipe` (LLM) / `DiffusionLMSFTRecipe` (DLLM SFT) | `dflash/`, `../dllm_sft/*dflash*` |
 | **DFlash 2** | DFlash backbone plus a two-tap dynamic convolution around every draft sublayer (removes suffix decay) and a pairwise path selector that walks one coherent path through each position's top-k candidates. | `TrainDFlash2Recipe` | `dflash/qwen3_dflash2.yaml`, `dflash/qwen3_8_27b_dflash2.yaml` |
 | **DSpine** | DFlash backbone with causal in-block attention plus an adjacent causal injection after every draft layer (each position receives a gated message from its predecessor's code), and an exact-sender refinement that rescores each position's top-k candidates with the previously chosen token. | `TrainDSpineRecipe` | `dflash/qwen3_dspine.yaml`, `dflash/qwen3_8_27b_dspine.yaml` |
-| **Domino** | DFlash backbone plus a serial GRU correction head (`prefix_gru` / `embed_proj`) that refines each block position on the previous ones. | `TrainDominoRecipe` | `dflash/qwen3_domino.yaml` |
+| **Domino** | DFlash backbone plus a serial gated recurrent unit (GRU) correction head (`prefix_gru` / `embed_proj`) that refines each block position on the previous ones. | `TrainDominoRecipe` | `dflash/qwen3_domino.yaml` |
 | **JetSpec** | DFlash backbone trained as a *causal* parallel tree drafter: causal in-block attention plus forward-KL distillation against the target distribution. | `TrainJetSpecRecipe` | `jetspec/` |
 | **DSpark** | Semi-autoregressive parallel drafting: a parallel backbone drafts the block, a lightweight serial Markov head adds intra-block dependency, and a confidence head predicts per-position acceptance. | `TrainDSparkRecipe` | `dspark/` |
 
@@ -54,9 +54,9 @@ is nothing to launch. The recipe and data pipeline are a follow-up change.
 A target's `config.architectures` string selects the draft architecture through a
 registry (`eagle/registry.py`, `dflash/registry.py`, `dspark/registry.py`).
 Capability is per registry, not per (method, target) pair: the EAGLE-3.1
-(`fc_norm` and `norm_output`) and P-EAGLE (`parallel_drafting`) toggles ride on the
+(`fc_norm` and `norm_output`) and P-EAGLE (`parallel_drafting`) toggles use the
 same EAGLE-3 dense draft, so they apply to any target the EAGLE-3 registry maps.
-The shipped example configs only cover a subset.
+The shipped example configs only cover a subset. The following list shows the supported targets for each method:
 
 - **EAGLE-1, EAGLE-2, and EAGLE-3 (and the EAGLE-3.1 and P-EAGLE toggles on top of EAGLE-3)**:
   `LlamaForCausalLM`, `Phi3ForCausalLM`, `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`.
@@ -97,7 +97,7 @@ Qwen3-MoE is handled exactly like a dense target: the draft only consumes
 post-block hidden states, never per-expert routing. gpt-oss uses a dedicated
 draft class that reuses the target's YaRN rotary embedding but keeps the on-disk
 `architectures` string as the Llama EAGLE-3 draft so inference engines load it
-unchanged. The large mixture-of-experts (MoE) DSpark targets (DeepSeek-V4, GLM-5.2, MiniMax M3) load
+unchanged. The large Mixture-of-Experts (MoE) DSpark targets (DeepSeek-V4, GLM-5.2, MiniMax M3) load
 frozen through the same expert-parallel and FSDP paths their fine-tuning recipes use.
 Per-target notes are in `dspark/README-*.md`.
 
@@ -124,7 +124,7 @@ SFT entry script:
 torchrun --nproc-per-node 8 examples/dllm_sft/finetune.py -c examples/dllm_sft/qwen3_4b_dflash.yaml
 ```
 
-Each config family ships an `*_mvp.yaml` (tiny single-GPU smoke with placeholder
+Each config family ships an `*_mvp.yaml` (tiny single-GPU basic verification run with placeholder
 data paths) and a `*_perfectblend.yaml` (real run on
 `frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct`).
 
@@ -175,8 +175,8 @@ unset when the draft vocab is uncompressed.
 All spec-decode recipes (EAGLE-1/2, EAGLE-3, P-EAGLE, DFlash, Domino,
 JetSpec, and DSpark) accept the same top-level `fp8:` block as the SFT recipes (see
 `components/quantization/fp8.py`). When enabled, the draft's `nn.Linear` layers
-are swapped to torchao `Float8Linear` before the DDP or FSDP2 wrap, so the
-draft's forward and backward GEMMs run in FP8. Requires SM89+ (H100 or newer);
+are swapped to torchao `Float8Linear` before the Distributed Data Parallel (DDP) or FSDP2 wrap, so the
+draft's forward and backward GEMMs run in FP8. FP8 training requires SM89+ (H100 or newer).
 `emulate: true` runs the FP8 numerics on older GPUs for testing. The frozen
 target model is never converted (it already supports FP8-quantized checkpoints
 through dequant-on-load in the DSpark V4 and GLM paths). Linears with a weight dim not
@@ -356,7 +356,7 @@ Use it when you want a drafter for a specific target but your only conversationa
 data came from a different model, or when you have a curated prompts dataset
 (ShareGPT, UltraChat, an internal corpus) and want its answer distribution
 aligned with the target. If a regenerated set already exists on the Hub (for
-example `frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct`), skip this
+example, `frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct`), skip this
 and point `recipe_args.train_data_path` straight at it.
 
 ### Two-Step Flow
@@ -411,13 +411,14 @@ recipe_args:
 | `--max-new-tokens` | 1024 | Cap per-answer length. |
 | `--temperature` | 0.0 | Greedy by default; drafters are typically trained against argmax answers. |
 | `--top-p` | 1.0 | Only relevant with `temperature > 0`. |
-| `--timeout-s` | 600 | Per-request timeout; bump for very long generations. |
+| `--timeout-s` | 600 | Per-request timeout; increase for very long generations. |
 | `--max-retries` | 3 | Retries on 5xx, 429, and transport errors with exponential backoff. |
-| `--split` | `train` | Supports HF slice syntax, e.g., `train[:10000]`. |
+| `--split` | `train` | Supports HF slice syntax, for example, `train[:10000]`. |
 | `--shuffle-seed` | unset | Optional shuffle before slicing. |
 
 ### Regeneration Pitfalls
 
+The following issues can cause regeneration to fail or produce misaligned training data:
 - **Wrong model name.** `--model` is the name sent in the OpenAI payload. It must
   match what the server serves. SGLang uses `--model-path` as the served name by
   default, so mirror `--served-model-name` here if you set it.
@@ -438,8 +439,9 @@ training. The draft's attention runs as a differentiable ring
 (`eagle/ring_attention.py`, with a load-balanced zig-zag layout in
 `zigzag_ring_attention.py`). `target_cp.py` prepares the target-side inputs.
 
-The constraints are enforced, not advisory: every combination below raises at
-setup rather than training something subtly wrong.
+The following constraints are enforced during setup. If a listed combination is
+present, setup raises an error instead of allowing a training run with invalid
+results:
 
 | Constraint | Applies To |
 |---|---|
