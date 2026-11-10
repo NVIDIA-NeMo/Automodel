@@ -15,6 +15,7 @@
 """Fetched image normalization, including storage ownership and schema errors."""
 
 import io
+from array import array
 
 import pytest
 from PIL import Image
@@ -43,7 +44,15 @@ def test_bytes_hf_struct_and_pil_are_owned_and_paths_are_never_opened(monkeypatc
         return real_open(value, *args, **kwargs)
 
     monkeypatch.setattr(Image, "open", memory_only)
-    for value in (data, bytearray(data), memoryview(data), {"bytes": data, "path": "s3://ignored/image"}, original):
+    for value in (
+        data,
+        bytearray(data),
+        memoryview(data),
+        array("B", data),
+        {"bytes": data, "path": "s3://ignored/image"},
+        {"bytes": array("B", data), "path": "s3://ignored/image"},
+        original,
+    ):
         image = decode_embedded_image(value)
         assert image.mode == "RGB" and image.size == (3, 5) and image is not original
         assert image.getpixel((0, 0)) == ((40, 40, 40) if value is original else (255, 0, 0))

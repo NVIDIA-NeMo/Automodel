@@ -20,12 +20,15 @@ import io
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from PIL import Image
 
 from nemo_automodel.components.datasets.vlm.conversation import ConversationMessage, ConversationSample, MediaValue
 from nemo_automodel.components.datasets.vlm.datasets import VlmMediaDecodeError
+
+if TYPE_CHECKING:
+    from typing_extensions import Buffer
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -56,8 +59,8 @@ class VlmInputOptions:
             raise TypeError("VLM input normalizer must be a callable")
 
 
-def decode_embedded_image(value: MediaValue | bytearray | memoryview) -> Image.Image:
-    """Decode embedded bytes or a PIL image into an owned, materialized RGB image.
+def decode_embedded_image(value: object) -> Image.Image:
+    """Decode an embedded byte buffer or PIL image into an owned RGB image.
 
     HF image structs use their bytes even when a path is present. Paths and URLs
     are never opened. Corrupt bytes raise VlmMediaDecodeError; an unsupported
@@ -73,15 +76,23 @@ def decode_embedded_image(value: MediaValue | bytearray | memoryview) -> Image.I
         raise VlmMediaDecodeError("Cannot decode embedded image bytes") from exc
 
 
-def _embedded_image(value: MediaValue | bytearray | memoryview) -> Image.Image | bytes:
+def _embedded_image(value: object) -> Image.Image | bytes:
     if isinstance(value, dict) and value.get("bytes") is not None:
         value = value["bytes"]
     if isinstance(value, (Image.Image, bytes)):
         return value
     if isinstance(value, (bytearray, memoryview)):
         return bytes(value)
+    # Process workers can deliver shared-memory bytes through the buffer protocol.
+    try:
+        with memoryview(cast("Buffer", value)) as buffer:
+            if buffer.ndim == 1 and buffer.itemsize == 1:
+                return buffer.tobytes()
+    except TypeError:
+        pass
     raise ValueError(
         "Zephon VLM requires embedded image bytes or materialized PIL images, not paths/URLs. "
+        f"Received {type(value).__name__}. "
         "Export external media into self-contained Parquet or LitData shards before training; "
         "see docs/guides/zephon-images.mdx."
     )
