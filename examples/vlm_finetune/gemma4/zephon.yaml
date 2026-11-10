@@ -14,20 +14,31 @@
 
 # Image SFT on embedded MedPix-VQA records; see /datasets/zephon in the docs.
 # Run: uv run automodel examples/vlm_finetune/gemma4/zephon.yaml --nproc-per-node 8
+# Training reference: examples/vlm_finetune/gemma4/gemma4_31b.yaml
+# Streaming step cap: 2 * ceil(1000 / 8) = 250.
+# This retains the reference update budget, not its epoch boundaries on the different source.
+# The native reference is unpacked and has no fixed input length.
+# Online packing uses the 8192-token window from qwen3_vl_4b_neat_packing.yaml.
 recipe: FinetuneRecipeForVLM
-seed: 42
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  max_steps: 100
-  ckpt_every_steps: 20
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  num_epochs: 2
+  max_steps: 250
   preemption_signal: null
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: google/gemma-4-31B-it
-  dtype: float32
-  attn_implementation: sdpa
+  torch_dtype: torch.bfloat16
+  use_liger_kernel: true
   use_sdpa_patching: false
+  attn_implementation: eager
   text_config:
     use_cache: false
 processor:
@@ -39,31 +50,45 @@ dataset:
     - name: medpix
       path: hf://mmoukouba/MedPix-VQA/train
       input:
-        column_mapping: {images: image_id}
+        column_mapping:
+          images: image_id
     packing:
-      seq_len: 1024
+      seq_len: 8192
     checkpoint:
       run_id: zephon-gemma4
 distributed:
   strategy: fsdp2
-  reshard_after_forward: true
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
   activation_checkpointing: true
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-  reduction: sum
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 0.00001
+  lr: 1e-5
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
+lr_scheduler:
+  lr_decay_style: cosine
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/zephon-gemma4
+  model_save_format: torch_save
+  save_consolidated: false
 dist_env:
   backend: nccl
-  timeout_minutes: 10
-
+  timeout_minutes: 60
 ci:
   cluster_tag: h100
   recipe_owner: MaxiBoether
-  time: "00:30:00"
+  time: 00:30:00
   nodes: 1
   nproc_per_node: 8

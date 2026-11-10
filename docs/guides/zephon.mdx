@@ -351,22 +351,37 @@ LitData shards. Export path-only images before training using the
 
 | Model | Image instruction-tuning recipe | Example processes |
 | --- | --- | --- |
-| `Qwen/Qwen3-VL-2B-Instruct` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/zephon.yaml) | 1 |
+| `Qwen/Qwen3-VL-2B-Instruct` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/zephon.yaml) | 8 |
 | `google/gemma-4-31B-it` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/zephon.yaml) | 8 |
-| `mistralai/Ministral-3-3B-Instruct-2512-BF16` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/zephon.yaml) | 2 |
+| `mistralai/Ministral-3-3B-Instruct-2512-BF16` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/zephon.yaml) | 8 |
 
 ```bash
-uv run automodel examples/vlm_finetune/qwen3/zephon.yaml --nproc-per-node 1
+uv run automodel examples/vlm_finetune/qwen3/zephon.yaml --nproc-per-node 8
 ```
 
-Use the corresponding process count for Gemma or Ministral. The examples target
-H100-class GPUs with FSDP2, bf16 compute, fp32 master weights and optimizer state,
-and activation checkpointing. Actual memory depends on image resolution and
-packed input length. Gemma uses the supported dense 31B architecture; the 12B
-Unified architecture, E-series, shared-KV and MoE variants require separate support.
-Ministral uses its BF16 checkpoint and padded image tensors with `image_sizes`.
-All three examples use SDPA; this is a recipe choice rather than a Zephon backend
-requirement.
+All three examples use eight processes and preserve their native model-family
+references' 8/1 global/local batches, AdamW settings (`lr: 1e-5`,
+`betas: [0.9, 0.95]`, `weight_decay: 0.01`) and frozen vision towers.
+Qwen follows `qwen3_vl_4b_neat_packing.yaml`, including Flash Attention 2,
+image-resolution bounds and an 8,192-token packing window. Gemma follows
+`gemma4_31b.yaml`, including eager attention, cosine decay and activation
+checkpointing. Ministral follows `ministral3_3b_medpix.yaml`, including eager
+attention and padded image tensors with `image_sizes`. Zephon does not impose
+one attention backend or optimizer policy.
+
+The native Gemma and Ministral examples are unpacked, so they have no fixed pack
+length to copy. These online-packed examples use the existing Qwen VLM example's
+8,192-token window. Their explicit step caps retain the reference update budgets:
+Gemma uses `2 * ceil(1000 / 8) = 250`, and Ministral uses
+`ceil(1000 / 8) = 125`. The Zephon examples read the full fetched MedPix source;
+these caps do not reproduce the native `train[:1000]` selection or its epoch
+boundaries. Qwen retains its existing 100-step cap.
+
+The selected checkpoints remain Qwen3-VL-2B-Instruct and Ministral3-Instruct-BF16,
+while the native references use different variants. Gemma uses the supported
+dense 31B architecture; the 12B Unified architecture, E-series, shared-KV and MoE
+variants require separate support. Actual GPU memory depends on the checkpoint,
+image resolution, attention backend and packed input length.
 
 The recipe selects `ZephonVlmDatasetConfig`. When `dataloader._target_` is omitted,
 AutoModel selects `ZephonVlmDataloaderConfig` automatically. The `processor`
