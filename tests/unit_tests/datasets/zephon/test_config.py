@@ -199,6 +199,21 @@ def test_pretraining_examples_select_matching_source_and_preparation(family: str
         assert dataset.zephon.sources[0].path == "hf://roneneldan/TinyStories/train"
 
 
+@pytest.mark.parametrize("family", ["qwen", "llama3_2"])
+def test_instruction_examples_select_chat_tokenization_and_whole_documents(family: str) -> None:
+    import yaml
+
+    path = Path(__file__).resolve().parents[4] / "examples/llm_finetune" / family / "zephon.yaml"
+    config = RecipeConfig(ConfigNode(yaml.safe_load(path.read_text()))).dataloader
+    assert isinstance(config, ZephonDataloaderConfig)
+    dataset = config.dataset_config
+    assert isinstance(dataset, ZephonInstructionDatasetConfig)
+    assert dataset.use_hf_chat_template and dataset.answer_only_loss_mask
+    assert dataset.column_mapping == {"context": "input", "question": "instruction", "answer": "output"}
+    assert dataset.zephon.packing.pack_algorithm == "best_fit"
+    assert dataset.zephon.sources[0].path == "hf://yahma/alpaca-cleaned/train"
+
+
 def test_explicit_instruction_config_selects_sft_without_native_translation():
     from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
         ColumnMappedTextInstructionDatasetConfig,

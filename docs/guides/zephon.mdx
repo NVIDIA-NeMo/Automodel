@@ -272,15 +272,20 @@ Its loader is selected automatically, and options live under `dataset.zephon`.
 Use the source fields above for a single dataset, or `dataset.zephon.sources`
 for an explicit mixture.
 
-The local example uses plain formatting and Flash Attention:
+The instruction recipes read
+[Alpaca Cleaned](https://huggingface.co/datasets/yahma/alpaca-cleaned), mapping
+`input`, `instruction`, and `output` to context, question, and answer. They use
+the model tokenizer's chat template, assistant-only supervision, whole-document
+`best_fit` packing, and SDPA.
+
+| Model | Instruction-tuning recipe |
+| --- | --- |
+| `Qwen/Qwen3-0.6B` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/zephon.yaml) |
+| `meta-llama/Llama-3.2-1B-Instruct` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/zephon.yaml) |
 
 ```bash
-uv run python examples/llm_pretrain/zephon/prepare_tiny.py
-uv run automodel examples/llm_pretrain/zephon/sft.yaml --nproc-per-node 1
+uv run automodel examples/llm_finetune/qwen/zephon.yaml --nproc-per-node 1
 ```
-
-Install the matching Flash Attention dependencies, or select Scaled Dot-Product Attention (SDPA) with
-`--model.attn_implementation sdpa`.
 
 ## How the Integration Works
 
