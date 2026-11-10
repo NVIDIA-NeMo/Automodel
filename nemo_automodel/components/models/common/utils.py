@@ -21,7 +21,7 @@ import warnings
 from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import torch
 from torch import nn
@@ -35,6 +35,9 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from transformer_engine.common.recipe import Recipe
 
 logger = logging.getLogger(__name__)
 
@@ -248,21 +251,32 @@ def _forward_outside_fp8(module: nn.Module, *args, **kwargs):
         return type(module).forward(module, *args, **kwargs)
 
 
+_TE_RECIPE_NAMES = ("current", "block", "mxfp8", "nvfp4")
+"""String shorthands accepted by :attr:`TEFp8Config.recipe`."""
+
+
 @dataclass(kw_only=True)
 class TEFp8Config:
-    """Configuration for Transformer Engine FP8 quantization.
+    """Configuration for Transformer Engine low-precision (FP8 or FP4) quantization.
 
-    When present (not None) in BackendConfig, FP8 is enabled.
-    The ``recipe`` field accepts either a string shorthand (``"current"``, ``"block"``,
-    or ``"mxfp8"``) or a pre-built TE recipe object (e.g. ``Float8CurrentScaling(fp8_dpa=True)``).
+    When present (not None) in BackendConfig, the Transformer Engine modules quantize the operands of
+    their GEMMs with the selected recipe. The ``recipe`` field accepts either a string shorthand
+    (``"current"``, ``"block"``, ``"mxfp8"`` or ``"nvfp4"``) or a pre-built TE recipe object (e.g.
+    ``Float8CurrentScaling(fp8_dpa=True)``).
 
     ``"mxfp8"`` selects TE's :class:`MXFP8BlockScaling` recipe (e4m3 data + e8m0 block
     scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
     e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
     ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
+
+    ``"nvfp4"`` selects TE's :class:`NVFP4BlockScaling` recipe: 4-bit e2m1 data with one e4m3 scale per
+    16 values and one FP32 scale per tensor. Parameters keep the model dtype and are quantized for each
+    GEMM. The recipe defaults quantize weights in 16x16 blocks, apply random Hadamard transforms to the
+    operands of the weight-gradient GEMM and round gradients stochastically; pass a pre-built
+    ``NVFP4BlockScaling(...)`` to change them. It requires compute capability 10.0+ (Blackwell).
     """
 
-    recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    recipe: "Literal['current', 'block', 'mxfp8', 'nvfp4'] | Recipe" = "current"
     exclude_fqns: tuple[str, ...] = ("lm_head",)
     """Module names kept out of the FP8 autocast (their GEMMs run in the model dtype).
 
@@ -274,7 +288,12 @@ class TEFp8Config:
     """
 
     def __post_init__(self) -> None:
-        """Normalize ``exclude_fqns`` from YAML lists or a single string into a tuple of names."""
+        """Validate ``recipe`` names and normalize ``exclude_fqns`` into a tuple of module names."""
+        if isinstance(self.recipe, str) and self.recipe not in _TE_RECIPE_NAMES:
+            raise ValueError(
+                f"te_fp8.recipe must be one of {_TE_RECIPE_NAMES} or a Transformer Engine recipe object, "
+                f"got {self.recipe!r}"
+            )
         if isinstance(self.exclude_fqns, str):
             self.exclude_fqns = (self.exclude_fqns,)
         self.exclude_fqns = tuple(self.exclude_fqns)
@@ -317,12 +336,19 @@ class TEFp8Config:
             logger.info("te_fp8: %d module(s) kept out of the FP8 autocast: %s", len(excluded), ", ".join(excluded))
         return excluded
 
+    def uses_nvfp4(self) -> bool:
+        """Whether the recipe is NVFP4: the ``"nvfp4"`` shorthand or an ``NVFP4BlockScaling`` object."""
+        if isinstance(self.recipe, str):
+            return self.recipe == "nvfp4"
+        have_nvfp4, nvfp4_recipe = safe_import_from("transformer_engine.common.recipe", "NVFP4BlockScaling")
+        return have_nvfp4 and isinstance(self.recipe, nvfp4_recipe)
+
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
 
         If ``recipe`` is already a TE recipe object (e.g. ``Float8CurrentScaling(...)``),
-        it is returned directly.  String values ``"current"``, ``"block"``, and
-        ``"mxfp8"`` are mapped to the corresponding TE recipe class.
+        it is returned directly.  String values ``"current"``, ``"block"``, ``"mxfp8"`` and
+        ``"nvfp4"`` are mapped to the corresponding TE recipe class.
         """
         if not HAVE_TE:
             return None
@@ -343,6 +369,15 @@ class TEFp8Config:
                 ) from e
             logger.warning("te_fp8.recipe='mxfp8': using TE MXFP8BlockScaling (mature MXFP8 backward).")
             return MXFP8BlockScaling()
+        if self.recipe == "nvfp4":
+            try:
+                from transformer_engine.common.recipe import NVFP4BlockScaling
+            except ImportError as e:  # TE too old for NVFP4 (added in v2.7)
+                raise ImportError(
+                    "te_fp8.recipe='nvfp4' requires transformer_engine.common.recipe.NVFP4BlockScaling "
+                    "(TE >= 2.7). The installed TE does not provide it; rebuild on a newer TE image."
+                ) from e
+            return NVFP4BlockScaling()
         if self.recipe == "block":
             return Float8BlockScaling()
         return Float8CurrentScaling()

@@ -14,7 +14,7 @@
 
 from contextlib import nullcontext
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -1876,6 +1876,104 @@ def _torch_mm_experts_fwd(
     return output2
 
 
+_TE_NVFP4_MAX_GROUPED_TENSORS = 64
+"""Most tensors Transformer Engine's NVFP4 grouped quantization kernels accept in one call."""
+
+
+class _ChunkedGroupedLinear(nn.Module):
+    """Consecutive TE ``GroupedLinear`` modules used as one grouped projection.
+
+    Transformer Engine's NVFP4 grouped quantization accepts at most 64 tensors per call, so a projection
+    over more local experts runs as several ``GroupedLinear`` chunks of near-equal size. The chunks cover
+    the local experts in order and their outputs are concatenated in that order.
+    """
+
+    def __init__(
+        self,
+        num_gemms: int,
+        in_features: int,
+        out_features: int,
+        *,
+        max_gemms: int,
+        bias: bool,
+        params_dtype: torch.dtype,
+        device: str,
+    ) -> None:
+        """Create the chunks.
+
+        Args:
+            num_gemms: Number of local experts covered by the projection.
+            in_features: Input width of every expert.
+            out_features: Output width of every expert.
+            max_gemms: Largest number of experts in one chunk.
+            bias: Whether every expert has a bias.
+            params_dtype: Parameter dtype.
+            device: Device the parameters are created on.
+        """
+        from transformer_engine.pytorch import GroupedLinear
+
+        super().__init__()
+        num_chunks = -(-num_gemms // max_gemms)
+        sizes = [num_gemms // num_chunks + (index < num_gemms % num_chunks) for index in range(num_chunks)]
+        self.chunks = nn.ModuleList(
+            GroupedLinear(
+                num_gemms=size,
+                in_features=in_features,
+                out_features=out_features,
+                bias=bias,
+                params_dtype=params_dtype,
+                device=device,
+            )
+            for size in sizes
+        )
+        self.num_gemms = num_gemms
+        self.out_features = out_features
+        self.use_bias = bias
+        self._chunk_starts = [sum(sizes[:index]) for index in range(num_chunks)]
+        # Local expert index -> (chunk index, expert index inside the chunk).
+        self._owners = [(chunk, local) for chunk, size in enumerate(sizes) for local in range(size)]
+
+    def locate(self, index: int) -> tuple["GroupedLinear", int]:
+        """Return the chunk that owns local expert ``index`` and the expert's index inside it."""
+        chunk, local = self._owners[index]
+        return self.chunks[chunk], local
+
+    def forward(self, inp: torch.Tensor, m_splits: list[int]) -> torch.Tensor:
+        """Apply every chunk to the rows of its experts.
+
+        Args:
+            inp: Tensor of shape [sum(m_splits), in_features], rows grouped by local expert in order.
+            m_splits: Number of rows of each of the ``num_gemms`` local experts.
+
+        Returns:
+            Tensor of shape [sum(m_splits), out_features] in the same row order. A chunk without
+            rows is skipped, so its parameters receive no gradient from this call.
+        """
+        outputs = []
+        row = 0
+        for chunk, start in zip(self.chunks, self._chunk_starts):
+            splits = m_splits[start : start + chunk.num_gemms]
+            rows = sum(splits)
+            if rows > 0:
+                outputs.append(chunk(inp[row : row + rows], splits))
+            row += rows
+        return torch.cat(outputs)
+
+    def reset_parameters(self) -> None:
+        """Reinitialize the parameters of every chunk."""
+        for chunk in self.chunks:
+            chunk.reset_parameters()
+
+
+def _grouped_parameter(
+    linear: "GroupedLinear | _ChunkedGroupedLinear", name: Literal["weight", "bias"], index: int
+) -> nn.Parameter:
+    """Return the ``name`` parameter of local expert ``index`` of a grouped projection."""
+    if isinstance(linear, _ChunkedGroupedLinear):
+        linear, index = linear.locate(index)
+    return getattr(linear, f"{name}{index}")
+
+
 class GroupedExpertsTE(nn.Module):
     """
     MoE experts using TE's GroupedLinear module directly.
@@ -1942,6 +2040,9 @@ class GroupedExpertsTE(nn.Module):
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
+        # Under NVFP4, more local experts than Transformer Engine quantizes in one grouped call run as
+        # consecutive GroupedLinear chunks (see _ChunkedGroupedLinear).
+        self.nvfp4 = backend is not None and backend.te_fp8 is not None and backend.te_fp8.uses_nvfp4()
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -1988,26 +2089,38 @@ class GroupedExpertsTE(nn.Module):
         grouped_linear_kwargs = {"use_grouped_tensor": True} if self.use_grouped_tensor else {}
         gate_up_out_features = self.config.moe_inter_dim * 2 if self.is_gated else self.config.moe_inter_dim
 
+        chunked = self.nvfp4 and num_local_experts > _TE_NVFP4_MAX_GROUPED_TENSORS
+        if chunked and self.use_grouped_tensor:
+            raise ValueError(
+                f"te_grouped_tensor=True supports at most {_TE_NVFP4_MAX_GROUPED_TENSORS} local experts per rank "
+                f"under NVFP4, got {num_local_experts}. Set te_grouped_tensor=False or use a larger ep_size."
+            )
+
+        def grouped_projection(in_features: int, out_features: int) -> "GroupedLinear | _ChunkedGroupedLinear":
+            if chunked:
+                return _ChunkedGroupedLinear(
+                    num_local_experts,
+                    in_features,
+                    out_features,
+                    max_gemms=_TE_NVFP4_MAX_GROUPED_TENSORS,
+                    bias=self.expert_bias,
+                    params_dtype=self.config.dtype,
+                    device="meta",
+                )
+            return GroupedLinear(
+                num_gemms=num_local_experts,
+                in_features=in_features,
+                out_features=out_features,
+                bias=self.expert_bias,
+                params_dtype=self.config.dtype,
+                device="meta",
+                **grouped_linear_kwargs,
+            )
+
         # Create both projections on meta for the current local expert count.
-        self.gate_up_linear = GroupedLinear(
-            num_gemms=num_local_experts,
-            in_features=self.config.expert_dim,
-            out_features=gate_up_out_features,
-            bias=self.expert_bias,
-            params_dtype=self.config.dtype,
-            device="meta",
-            **grouped_linear_kwargs,
-        )
+        self.gate_up_linear = grouped_projection(self.config.expert_dim, gate_up_out_features)
         # down_linear: [moe_inter_dim] -> [dim]
-        self.down_linear = GroupedLinear(
-            num_gemms=num_local_experts,
-            in_features=self.config.moe_inter_dim,
-            out_features=self.config.expert_dim,
-            bias=self.expert_bias,
-            params_dtype=self.config.dtype,
-            device="meta",
-            **grouped_linear_kwargs,
-        )
+        self.down_linear = grouped_projection(self.config.moe_inter_dim, self.config.expert_dim)
 
         # Recreate padding with the same local expert count after EP repartitioning.
         from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding
@@ -2017,10 +2130,12 @@ class GroupedExpertsTE(nn.Module):
         self.native_fp8_padding = Fp8Padding(num_local_experts, align_size=128) if self.use_grouped_tensor else None
         self.native_fp8_unpadding = Fp8Unpadding(num_local_experts, align_size=128) if self.use_grouped_tensor else None
 
-    def _get_stacked_weight(self, linear: "GroupedLinear", transpose: bool = False) -> torch.Tensor:
+    def _get_stacked_weight(
+        self, linear: "GroupedLinear | _ChunkedGroupedLinear", transpose: bool = False
+    ) -> torch.Tensor:
         weights = []
         for i in range(linear.num_gemms):
-            w = getattr(linear, f"weight{i}")
+            w = _grouped_parameter(linear, "weight", i)
             if isinstance(w, DTensor):
                 w = w.to_local()
             weights.append(w)
@@ -2029,31 +2144,33 @@ class GroupedExpertsTE(nn.Module):
             stacked = stacked.transpose(-1, -2)  # [num_experts, in, out]
         return stacked
 
-    def _get_stacked_bias(self, linear: "GroupedLinear") -> torch.Tensor | None:
+    def _get_stacked_bias(self, linear: "GroupedLinear | _ChunkedGroupedLinear") -> torch.Tensor | None:
         if not linear.use_bias:
             return None
         biases = []
         for i in range(linear.num_gemms):
-            b = getattr(linear, f"bias{i}")
+            b = _grouped_parameter(linear, "bias", i)
             if isinstance(b, DTensor):
                 b = b.to_local()
             biases.append(b)
         return torch.stack(biases, dim=0)  # [num_experts, out_features]
 
-    def _set_stacked_weight(self, linear: "GroupedLinear", stacked: torch.Tensor, transpose: bool = False):
+    def _set_stacked_weight(
+        self, linear: "GroupedLinear | _ChunkedGroupedLinear", stacked: torch.Tensor, transpose: bool = False
+    ):
         if transpose:
             stacked = stacked.transpose(-1, -2)  # [num_experts, out, in]
         for i in range(linear.num_gemms):
-            weight_param = getattr(linear, f"weight{i}")
+            weight_param = _grouped_parameter(linear, "weight", i)
             if isinstance(weight_param, DTensor):
                 weight_param = weight_param.to_local()
             weight_param.data.copy_(stacked[i])
 
-    def _set_stacked_bias(self, linear: "GroupedLinear", stacked: torch.Tensor):
+    def _set_stacked_bias(self, linear: "GroupedLinear | _ChunkedGroupedLinear", stacked: torch.Tensor):
         if not linear.use_bias or stacked is None:
             return
         for i in range(linear.num_gemms):
-            bias_param = getattr(linear, f"bias{i}")
+            bias_param = _grouped_parameter(linear, "bias", i)
             if isinstance(bias_param, DTensor):
                 bias_param = bias_param.to_local()
             bias_param.data.copy_(stacked[i])
@@ -2441,9 +2558,11 @@ class GroupedExpertsTE(nn.Module):
                     return tensor
 
             # Cast like the TE path above: FP32 master weights meet BF16 tokens here too.
-            output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).to(x.dtype).T)
+            output1 = torch.matmul(
+                x[0] * 0, to_local(_grouped_parameter(self.gate_up_linear, "weight", 0)).to(x.dtype).T
+            )
             output1_ = self.expert_activation(output1, permuted_probs)
-            output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).to(x.dtype).T)
+            output2 = torch.matmul(output1_, to_local(_grouped_parameter(self.down_linear, "weight", 0)).to(x.dtype).T)
             all_expert_dependency = output2.new_zeros(())
             for grouped_linear in (self.gate_up_linear, self.down_linear):
                 for parameter in grouped_linear.parameters():

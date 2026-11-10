@@ -170,6 +170,27 @@ def _fake_te_autocast():
         yield entered
 
 
+@contextmanager
+def _fake_te_recipes(missing: tuple[str, ...] = ()):
+    """Stand in for ``transformer_engine.common.recipe`` with one empty class per recipe name."""
+    names = ("Float8CurrentScaling", "Float8BlockScaling", "MXFP8BlockScaling", "NVFP4BlockScaling")
+    recipes = {name: type(name, (), {}) for name in names if name not in missing}
+    recipe_module = types.ModuleType("transformer_engine.common.recipe")
+    for name, recipe_class in recipes.items():
+        setattr(recipe_module, name, recipe_class)
+    te_common = types.ModuleType("transformer_engine.common")
+    te_common.recipe = recipe_module
+    te_root = types.ModuleType("transformer_engine")
+    te_root.common = te_common
+    modules = {
+        "transformer_engine": te_root,
+        "transformer_engine.common": te_common,
+        "transformer_engine.common.recipe": recipe_module,
+    }
+    with patch("nemo_automodel.components.models.common.utils.HAVE_TE", True), patch.dict("sys.modules", modules):
+        yield recipes
+
+
 class TestTEFp8Config:
     def test_default_recipe(self):
         cfg = TEFp8Config()
@@ -197,6 +218,39 @@ class TestTEFp8Config:
         cfg = TEFp8Config()
         with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
             assert cfg.build_recipe() is None
+
+    @pytest.mark.parametrize(
+        ("name", "te_recipe"),
+        [
+            ("current", "Float8CurrentScaling"),
+            ("block", "Float8BlockScaling"),
+            ("mxfp8", "MXFP8BlockScaling"),
+            ("nvfp4", "NVFP4BlockScaling"),
+        ],
+    )
+    def test_build_recipe_maps_each_name_to_its_te_recipe(self, name, te_recipe):
+        with _fake_te_recipes() as recipes:
+            built = TEFp8Config(recipe=name).build_recipe()
+        assert type(built) is recipes[te_recipe]
+
+    def test_nvfp4_recipe_needs_te_with_nvfp4(self):
+        """A TE build without NVFP4BlockScaling is reported instead of falling back to an FP8 recipe."""
+        with _fake_te_recipes(missing=("NVFP4BlockScaling",)):
+            with pytest.raises(ImportError, match="NVFP4BlockScaling"):
+                TEFp8Config(recipe="nvfp4").build_recipe()
+
+    def test_uses_nvfp4_for_the_shorthand_and_for_recipe_objects(self):
+        assert TEFp8Config(recipe="nvfp4").uses_nvfp4()
+        assert not TEFp8Config(recipe="mxfp8").uses_nvfp4()
+        with _fake_te_recipes() as recipes:
+            assert TEFp8Config(recipe=recipes["NVFP4BlockScaling"]()).uses_nvfp4()
+            assert not TEFp8Config(recipe=recipes["MXFP8BlockScaling"]()).uses_nvfp4()
+
+    def test_unknown_recipe_name_is_rejected(self):
+        with pytest.raises(ValueError, match="te_fp8.recipe"):
+            TEFp8Config(recipe="fp4")
+        with pytest.raises(ValueError, match="te_fp8.recipe"):
+            BackendConfig(te_fp8={"recipe": "nvfp4_typo"}, experts="te", dispatcher="deepep")
 
     def test_exclude_fqns_default_and_normalization(self):
         assert TEFp8Config().exclude_fqns == ("lm_head",)
