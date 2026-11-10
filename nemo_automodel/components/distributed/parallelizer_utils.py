@@ -14,8 +14,25 @@
 
 import logging
 from collections import defaultdict
+from collections.abc import Hashable
 from copy import copy
-from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Sequence, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Protocol,
+    Required,
+    Sequence,
+    Set,
+    Tuple,
+    TypedDict,
+    TypeGuard,
+    Union,
+    overload,
+)
 
 import torch
 import torch.nn as nn
@@ -26,6 +43,7 @@ from torch.distributed.fsdp import (
     OffloadPolicy,
     fully_shard,
 )
+from typing_extensions import TypeVar
 
 from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_restore_unused_param_grads as _patch_fsdp_restore_unused_param_grads,
@@ -41,7 +59,12 @@ from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
-UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
+# Key used to group tensors into dtype-uniform FSDP units: ``torch.dtype`` by default,
+# or whatever a caller's ``dtype_of`` returns (e.g. a (storage, compute) dtype pair).
+_GroupKeyT = TypeVar("_GroupKeyT", bound=Hashable, default=torch.dtype)
+_ShardTargetT_contra = TypeVar("_ShardTargetT_contra", contravariant=True)
+
+UniformSubtreeItem = Union[Tuple[nn.Module, Hashable], Tuple[str, nn.Module, Hashable]]
 
 __all__ = [
     "fully_shard_by_dtype",
@@ -53,13 +76,86 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-def reject_unsupported_mtp_cp(model: nn.Module) -> None:
+class _MTPCapabilities(Protocol):
+    """MTP capability flags of AutoModel's ``model.supports`` descriptor."""
+
+    @property
+    def mtp_enabled(self) -> bool:
+        """Whether MTP is active for this model instance."""
+        ...
+
+    @property
+    def supports_mtp_cp(self) -> bool:
+        """Whether the model owns an MTP training path under context parallelism."""
+        ...
+
+    @property
+    def supports_mtp_cp_pp(self) -> bool:
+        """Whether the model owns an MTP training path with both CP and PP."""
+        ...
+
+
+class MTPCapableModel(Protocol):
+    """Model carrying AutoModel's ``supports`` capability descriptor."""
+
+    @property
+    def supports(self) -> _MTPCapabilities:
+        """Return the capability descriptor."""
+        ...
+
+
+class FullyShardFn(Protocol[_ShardTargetT_contra]):
+    """FSDP2 sharding primitive: ``fully_shard`` or a model parallelizer's ``_fully_shard_module``.
+
+    The type parameter is what one call shards: one module, or a list of modules that
+    become a single FSDP unit. Callers ignore the return value.
+    """
+
+    def __call__(
+        self,
+        module: _ShardTargetT_contra,
+        /,
+        *,
+        mesh: DeviceMesh,
+        mp_policy: MixedPrecisionPolicy | None,
+        offload_policy: OffloadPolicy | None,
+        reshard_after_forward: bool | int | None = ...,
+        ignored_params: set[nn.Parameter] | None = ...,
+    ) -> object:
+        """Shard ``module`` in place."""
+        ...
+
+
+class FullyShardKwargs(TypedDict, total=False):
+    """Keyword arguments of one ``FullyShardFn`` call."""
+
+    mesh: Required[DeviceMesh]
+    mp_policy: Required[MixedPrecisionPolicy | None]
+    offload_policy: Required[OffloadPolicy | None]
+    reshard_after_forward: bool | int | None
+    ignored_params: set[nn.Parameter] | None
+
+
+class _UnusedParamReduceScatter(Protocol):
+    """FSDP unit with PyTorch's public unused-parameter reduce-scatter switch (absent in older releases)."""
+
+    def set_reduce_scatter_unused_params(self, enabled: bool, /, *, recurse: bool = ...) -> None:
+        """Reduce-scatter zero gradients for parameters this rank did not use."""
+        ...
+
+
+def _has_unused_param_reduce_scatter(fsdp_modules: list[FSDPModule]) -> TypeGuard[list[_UnusedParamReduceScatter]]:
+    """Return whether the installed PyTorch exposes the unused-parameter reduce-scatter API on FSDP units."""
+    return hasattr(fsdp_modules[0], "set_reduce_scatter_unused_params")
+
+
+def reject_unsupported_mtp_cp(model: MTPCapableModel) -> None:
     """Reject enabled MTP when the model has not declared CP support."""
     if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
         raise RuntimeError(f"{type(model).__name__} does not support MTP with context parallelism")
 
 
-def reject_unsupported_mtp_cp_pp(model: nn.Module, *, pp_size: int | None = None) -> None:
+def reject_unsupported_mtp_cp_pp(model: MTPCapableModel, *, pp_size: int | None = None) -> None:
     """Reject unsupported MTP+CP+PP before parallelizing the model.
 
     Call only when context parallelism is active.
@@ -97,7 +193,7 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     Returns:
         Number of FSDP units configured.
     """
-    fsdp_modules = [candidate for candidate in module.modules() if isinstance(candidate, FSDPModule)]
+    fsdp_modules: list[FSDPModule] = [candidate for candidate in module.modules() if isinstance(candidate, FSDPModule)]
     if not fsdp_modules:
         return 0
 
@@ -105,7 +201,7 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     # dtype and must be aligned with the peers' reduce-dtype accumulations before
     # the group reaches ``foreach_reduce``.
     _patch_fsdp_uniform_reduce_dtype()
-    if hasattr(fsdp_modules[0], "set_reduce_scatter_unused_params"):
+    if _has_unused_param_reduce_scatter(fsdp_modules):
         for fsdp_module in fsdp_modules:
             fsdp_module.set_reduce_scatter_unused_params(True, recurse=False)
     else:
@@ -115,12 +211,34 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     return len(fsdp_modules)
 
 
+@overload
 def iter_maximal_uniform_dtype_subtrees(
     module: nn.Module,
     *,
     include_buffers: bool = True,
     tensor_pred: Callable[[torch.Tensor], bool] | None = None,
-    dtype_of: Callable[[torch.Tensor], torch.dtype] | None = None,
+    dtype_of: Callable[[torch.Tensor], _GroupKeyT] | None = None,
+    return_paths: Literal[False] = False,
+) -> Iterator[Tuple[nn.Module, _GroupKeyT]]: ...
+
+
+@overload
+def iter_maximal_uniform_dtype_subtrees(
+    module: nn.Module,
+    *,
+    include_buffers: bool = True,
+    tensor_pred: Callable[[torch.Tensor], bool] | None = None,
+    dtype_of: Callable[[torch.Tensor], _GroupKeyT] | None = None,
+    return_paths: Literal[True],
+) -> Iterator[Tuple[str, nn.Module, _GroupKeyT]]: ...
+
+
+def iter_maximal_uniform_dtype_subtrees(
+    module: nn.Module,
+    *,
+    include_buffers: bool = True,
+    tensor_pred: Callable[[torch.Tensor], bool] | None = None,
+    dtype_of: Callable[[torch.Tensor], Hashable] | None = None,
     return_paths: bool = False,
 ) -> Iterator[UniformSubtreeItem]:
     """
@@ -131,7 +249,8 @@ def iter_maximal_uniform_dtype_subtrees(
                    Example: tensor_pred=torch.is_floating_point  (to consider only FP tensors)
     - dtype_of: maps a tensor to the dtype used for unification (default: its storage
                 dtype ``t.dtype``). Pass a custom function to group by *compute* dtype
-                rather than storage dtype.
+                rather than storage dtype; any hashable key (e.g. a dtype pair) works,
+                and it is yielded in place of the dtype.
     - return_paths: if True, yields (qualified_name, module, dtype); else (module, dtype).
 
     Notes:
@@ -143,8 +262,8 @@ def iter_maximal_uniform_dtype_subtrees(
     if dtype_of is None:
         dtype_of = lambda t: t.dtype
 
-    def _local_dtype_set(m: nn.Module) -> Set[torch.dtype]:
-        ds: Set[torch.dtype] = set()
+    def _local_dtype_set(m: nn.Module) -> Set[Hashable]:
+        ds: Set[Hashable] = set()
         for p in m.parameters(recurse=False):
             if tensor_pred(p):
                 ds.add(dtype_of(p))
@@ -154,9 +273,9 @@ def iter_maximal_uniform_dtype_subtrees(
                     ds.add(dtype_of(b))
         return ds
 
-    def _visit(m: nn.Module, path: Tuple[str, ...]) -> Tuple[Set[torch.dtype], List[UniformSubtreeItem]]:
+    def _visit(m: nn.Module, path: Tuple[str, ...]) -> Tuple[Set[Hashable], List[UniformSubtreeItem]]:
         local = _local_dtype_set(m)
-        subtree_dtypes: Set[torch.dtype] = set(local)
+        subtree_dtypes: Set[Hashable] = set(local)
         collected: List[UniformSubtreeItem] = []
 
         # Recurse into children
@@ -184,15 +303,31 @@ def iter_maximal_uniform_dtype_subtrees(
         yield it
 
 
+@overload
 def _group_params_by_dtype(
     layer: nn.Module,
-    dtype_of: Callable[[torch.Tensor], torch.dtype] | None = None,
+    dtype_of: None = None,
     ignored_params: set[nn.Parameter] | None = None,
-) -> Dict[torch.dtype, List[nn.Parameter]]:
+) -> Dict[torch.dtype, List[nn.Parameter]]: ...
+
+
+@overload
+def _group_params_by_dtype(
+    layer: nn.Module,
+    dtype_of: Callable[[torch.Tensor], _GroupKeyT],
+    ignored_params: set[nn.Parameter] | None = None,
+) -> Dict[_GroupKeyT, List[nn.Parameter]]: ...
+
+
+def _group_params_by_dtype(
+    layer: nn.Module,
+    dtype_of: Callable[[torch.Tensor], Hashable] | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
+) -> Dict[Hashable, List[nn.Parameter]]:
     if dtype_of is None:
         dtype_of = lambda t: t.dtype
     ignored_param_ids = {id(param) for param in ignored_params or ()}
-    ans: Dict[torch.dtype, List[nn.Parameter]] = {}
+    ans: Dict[Hashable, List[nn.Parameter]] = {}
     for name, param in layer.named_parameters():
         if id(param) in ignored_param_ids:
             continue
@@ -217,7 +352,7 @@ def _fully_shard(
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
     *,
-    shard_module: Callable[..., None],
+    shard_module: FullyShardFn[nn.Module],
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
@@ -250,9 +385,9 @@ def _call_fully_shard(
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
     *,
-    shard_module: Callable[..., None],
+    shard_module: FullyShardFn[nn.Module],
 ) -> None:
-    kwargs = {
+    kwargs: FullyShardKwargs = {
         "mesh": mesh,
         "mp_policy": mp_policy,
         "offload_policy": offload_policy,
@@ -374,7 +509,7 @@ def fully_shard_across_blocks(
     mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy | None,
     offload_policy: OffloadPolicy | None,
-    shard_module: Callable[..., None] = fully_shard,
+    shard_module: FullyShardFn[list[nn.Module]] = fully_shard,
 ) -> set[nn.Parameter]:
     """Put every block's instance of the named fp32 parameter holders into one FSDP unit.
 
@@ -499,7 +634,9 @@ def fully_shard_by_dtype(
         model_parallelizer: Optional model sidecar that owns the
             FSDP primitive.
     """
-    shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
+    shard_module: FullyShardFn[nn.Module] = (
+        fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
+    )
     ignored_params = set(ignored_params or ())
     ignored_param_ids = {id(param) for param in ignored_params}
     compute_dtype_of = _make_compute_dtype_fn(
@@ -599,7 +736,7 @@ def fully_shard_by_dtype(
             )
 
         for path, key, _ in selected_subtrees:
-            subtree_kwargs = {
+            subtree_kwargs: FullyShardKwargs = {
                 "mesh": mesh,
                 "mp_policy": get_internal_fsdp_mp_policy(_mp_policy_with_param_dtype(mp_policy, key[1])),
                 "offload_policy": offload_policy,
