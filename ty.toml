@@ -73,7 +73,7 @@ include = [
     "nemo_automodel/components/utils/**",
     "nemo_automodel/components/quantization/**",
     "nemo_automodel/components/training/**",
-    "nemo_automodel/components/distributed/config.py",
+    "nemo_automodel/components/distributed/**",
 ]
 
 [overrides.rules]
