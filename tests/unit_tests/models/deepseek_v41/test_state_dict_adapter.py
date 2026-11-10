@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,7 @@ def _adapter(
     second_engram_rows: int | None = None,
     dtype: torch.dtype = torch.float32,
     experts: str = "torch_mm",
+    dispatcher: str = "torch",
     dim: int = 32,
 ) -> DeepseekV41StateDictAdapter:
     engram_layers = [] if engram_rows is None else [1]
@@ -114,7 +116,7 @@ def _adapter(
     return DeepseekV41StateDictAdapter(
         DeepseekV41Config(text_config=text),
         moe,
-        BackendConfig(linear="torch", attn="sdpa", dispatcher="torch", experts=experts),
+        BackendConfig(linear="torch", attn="sdpa", dispatcher=dispatcher, experts=experts),
         dtype=dtype,
     )
 
@@ -492,8 +494,19 @@ def _quantized_checkpointer_worker(rank: int, rendezvous: str, expert_shard_size
             process_group=dist.group.WORLD,
             moe_mesh=expert_mesh,
         )
+        parts_logs: list[str] = []
+        parts_handler = logging.Handler()
+        parts_handler.emit = lambda record: parts_logs.append(f"{record.name}: {record.getMessage()}")  # type: ignore[method-assign]
+        parts_root_logger = logging.getLogger()
+        parts_root_logger.addHandler(parts_handler)
+        parts_root_logger.setLevel(logging.INFO)
         try:
             checkpointer.load_model(model, str(checkpoint), is_init_step=True)
+            # Pin the load path: a silent fallback to the full-state conversion would keep every
+            # numerical assertion below green while regressing the bounded-memory guarantee.
+            assert any(" checkpoint in " in message and " parts over " in message for message in parts_logs), (
+                "quantized init load did not take the part-by-part path; adapter silently declined"
+            )
             for key, tensor in model.state_dict().items():
                 reference = local_expected[key]
                 assert tensor.dtype == reference.dtype and tensor.to_local().dtype == reference.dtype
@@ -557,3 +570,205 @@ def test_generic_checkpoint_keys_and_optional_tower_weights_are_preserved() -> N
     assert adapter.forced_hf_dtype_mapping(native) == {
         key: "float32" for key, value in source.items() if value.dtype == torch.float32
     }
+
+
+def test_iter_checkpoint_load_parts_decodes_into_final_storage() -> None:
+    """The part-by-part path decodes FP8 temporaries straight into final model storage.
+
+    Builds a tiny model state dict (shared norm, one quantized attention weight, one
+    rowwise Engram table, one MoE layer's grouped experts), fills each part's
+    temporary FP8/scale destinations the way DCP would, and asserts ``finish``
+    installs decoded values - including the gate|up transposed layout inside the
+    grouped expert slices - while non-quantized tensors keep their final storage as
+    the read destination.
+    """
+    dim, inter, n_experts, engram_rows = 32, 32, 2, 64
+    adapter = _adapter(engram_rows=engram_rows)
+    model_state = {
+        "model.norm.weight": torch.ones(dim),
+        "model.layers.1.attn.wq_a.weight": torch.zeros(dim, dim, dtype=adapter.dtype),
+        "model.layers.1.engram.embed.weight": torch.zeros(64, dim, dtype=adapter.dtype),
+        "model.layers.1.ffn.experts.gate_and_up_projs": torch.zeros(n_experts, dim, 2 * inter),
+        "model.layers.1.ffn.experts.down_projs": torch.zeros(n_experts, inter, dim),
+    }
+
+    parts = list(adapter.iter_checkpoint_load_parts(model_state, None))
+    assert len(parts) == 2  # layer-1 group + shared group
+
+    covered: set[str] = set()
+    for part in parts:
+        covered |= set(part.model_keys)
+        # Non-quantized destinations alias final model storage.
+        if "model.norm.weight" in part.model_keys:
+            assert part.checkpoint_tensors["norm.weight"] is model_state["model.norm.weight"]
+        for key, destination in part.checkpoint_tensors.items():
+            if key in part.temporary_checkpoint_keys:
+                if key.endswith(".scale"):
+                    destination.copy_(torch.tensor(4.0).to(destination.dtype))
+                elif destination.dtype == torch.int8:
+                    # 0x11 packs E2M1 (0.5, 0.5) into low/high nibbles.
+                    destination.copy_(torch.full(destination.shape, 0x11, dtype=torch.uint8).view(torch.int8))
+                else:
+                    destination.copy_(torch.ones_like(destination, dtype=torch.float8_e4m3fn))
+        part.finish()
+
+    assert covered == set(model_state)
+    # Attention weight: block-scale decode of all-ones FP8 with scale 4.
+    assert (model_state["model.layers.1.attn.wq_a.weight"] == 4.0).all()
+    # Engram table: per-row scales use the same 4.0.
+    assert (model_state["model.layers.1.engram.embed.weight"] == 4.0).all()
+    gate_up = model_state["model.layers.1.ffn.experts.gate_and_up_projs"]
+    down = model_state["model.layers.1.ffn.experts.down_projs"]
+    for expert in range(n_experts):
+        # FP4 nibbles (0.5, 0.5) with per-row scale 4 decode to 2.0, transposed into place.
+        assert (gate_up[expert, :, :inter] == 2.0).all()
+        assert (gate_up[expert, :, inter:] == 2.0).all()
+        assert (down[expert] == 2.0).all()
+
+
+def test_iter_checkpoint_load_parts_targets_every_model_key() -> None:
+    """Destination shapes derive from the model tensors; every model key is served.
+
+    A checkpoint that cannot serve a destination rejects in the loader's
+    missing-tensor check instead of silently keeping initialization. V4.1 registers
+    ``tie_word_embeddings_support = UNTIED_ONLY``, so ``lm_head.weight`` is an
+    ordinary direct destination rather than a tied head to skip.
+    """
+    adapter = _adapter()
+    model_state = {"model.norm.weight": torch.ones(32)}
+    parts = adapter.iter_checkpoint_load_parts(model_state, None)
+    assert parts is not None
+    parts = list(adapter.iter_checkpoint_load_parts(model_state | {"lm_head.weight": torch.ones(32, 32)}, None))
+    covered = set().union(*(part.model_keys for part in parts))
+    assert covered == set(model_state) | {"lm_head.weight"}
+    assert any("head.weight" in part.checkpoint_tensors for part in parts)
+
+
+def test_part_loading_rejects_incomplete_checkpoints_in_the_loader(tmp_path: Path) -> None:
+    """Incomplete checkpoints reject in the loader's missing-tensor check before any read.
+
+    Destination shapes derive from the model tensors, so corruption surfaces where
+    the DCP metadata is available: ``_load_model_in_parts`` raises ``RuntimeError``
+    naming the load part and the missing tensors. This single-process probe mirrors
+    the full-state conversion's failure mode for the same corrupt checkpoints.
+
+    One semantic shift is pinned here: a scale whose companion weight is absent from
+    both the model and the checkpoint's served destinations is dead checkpoint data
+    - nothing requests it, so the load succeeds. Strict orphan-scale rejection would
+    require enumerating checkpoint keys inside the adapter, the protocol expansion
+    this rework deliberately drops (see the PR discussion).
+    """
+    dim = 32
+    adapter = _adapter(dtype=torch.bfloat16)
+    # Match the released checkpoint metadata used to select quantized DCP load targets.
+    adapter.config.quantization_config = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [32, 32],
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+    }
+
+    def _source() -> dict[str, torch.Tensor]:
+        source: dict[str, torch.Tensor] = {
+            "layers.0.attn.wq_a.weight": torch.ones(dim, dim).to(torch.float8_e4m3fn),
+            "layers.0.attn.wq_a.scale": torch.ones(1, 1).to(torch.float8_e8m0fnu),
+        }
+        for expert in range(2):
+            for projection in (1, 2, 3):
+                raw = torch.full((dim, dim // 2), 0x11, dtype=torch.uint8).view(torch.int8)
+                # E8M0 scale 4.0 turns the packed (0.5, 0.5) nibbles into 2.0 rows.
+                scales = torch.full((dim, dim // 32), 4.0).to(torch.float8_e8m0fnu)
+                source[f"layers.0.ffn.experts.{expert}.w{projection}.weight"] = raw
+                source[f"layers.0.ffn.experts.{expert}.w{projection}.scale"] = scales
+        return source
+
+    def _load(model: torch.nn.Module, drop_keys: set[str], dump_name: str) -> list[str]:
+        source = _source()
+        for key in drop_keys:
+            del source[key]
+        checkpoint = tmp_path / dump_name
+        checkpoint.mkdir()
+        save_file(source, checkpoint / "model.safetensors")
+        (checkpoint / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": dict.fromkeys(source, "model.safetensors")})
+        )
+        adapter.config.save_pretrained(checkpoint)
+        logs: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda record: logs.append(record.getMessage())  # type: ignore[method-assign]
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        root_logger.setLevel(logging.INFO)
+        checkpointer = Checkpointer(
+            CheckpointingConfig(
+                checkpoint_dir=str(tmp_path),
+                model_save_format="safetensors",
+                save_consolidated=False,
+                model_cache_dir=str(tmp_path / "cache"),
+                model_repo_id="test/deepseek-v41",
+                dequantize_base_checkpoint=True,
+            ),
+            dp_rank=0,
+            tp_rank=0,
+            pp_rank=0,
+        )
+        try:
+            checkpointer.load_model(model, str(checkpoint), is_init_step=True)
+        finally:
+            checkpointer.close()
+            root_logger.removeHandler(handler)
+        return logs
+
+    model_tensors = {
+        "model.layers.0.attn.wq_a.weight": torch.full((dim, dim), -101, dtype=torch.bfloat16),
+        "model.layers.0.ffn.experts.gate_and_up_projs": torch.full((2, dim, 2 * dim), -101, dtype=torch.bfloat16),
+        "model.layers.0.ffn.experts.down_projs": torch.full((2, dim, dim), -101, dtype=torch.bfloat16),
+    }
+    model = _CheckpointOnlyV41(adapter.config, model_tensors)
+    model.state_dict_adapter = adapter
+
+    with pytest.raises(RuntimeError, match=r"missing 1 tensors required by load part"):
+        _load(model, {"layers.0.ffn.experts.0.w1.scale"}, "dump_expert_scale")
+    with pytest.raises(RuntimeError, match=r"missing 1 tensors required by load part"):
+        _load(model, {"layers.0.attn.wq_a.scale"}, "dump_dense_scale")
+    # The model owns wq_a, so deleting its weight leaves the destination unserved too.
+    with pytest.raises(RuntimeError, match=r"missing 1 tensors required by load part"):
+        _load(model, {"layers.0.attn.wq_a.weight"}, "dump_dense_weight")
+
+    # Without the wq_a destination, the orphan scale is never requested and the load
+    # completes through the part-by-part path with every destination decoded.
+    # Tensor-valued *_extra_state entries (FSDP2 bookkeeping, absent from released
+    # checkpoints) must be excluded from part destinations rather than rejected.
+    lean_tensors = {key: value for key, value in model_tensors.items() if "wq_a" not in key}
+    lean_tensors["model.norm._extra_state"] = torch.full((8,), -77.0)
+    lean = _CheckpointOnlyV41(adapter.config, lean_tensors)
+    lean.state_dict_adapter = adapter
+    logs = _load(lean, {"layers.0.attn.wq_a.weight"}, "dump_orphan_scale")
+    assert any(" checkpoint in " in message and " parts over " in message for message in logs), (
+        "the benign orphan-scale load did not take the part-by-part path; adapter silently declined"
+    )
+    gate_up = lean_tensors["model.layers.0.ffn.experts.gate_and_up_projs"]
+    assert (gate_up == 2.0).all(), "expert projections must be decoded away from the -101 sentinel"
+    assert (lean_tensors["model.norm._extra_state"] == -77).all(), "extra_state bookkeeping keeps its value"
+
+
+def _stacked_expert_storage_worker(rank: int, rendezvous: str) -> None:
+    """At world size 2, TE grouped experts must decline while torch_mm experts stay served."""
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        model_state = {"model.layers.1.ffn.experts.gate_and_up_projs": torch.zeros(2, 32, 64)}
+        te = _adapter(experts="te", dispatcher="hybridep")
+        assert te.iter_checkpoint_load_parts(model_state, None) is None, (
+            "GroupedExpertsTE exposes grouped experts as stacked copies at world size > 1; "
+            "part destinations would never reach model storage"
+        )
+        torch_mm = _adapter(experts="torch_mm", dispatcher="hybridep")
+        assert torch_mm.iter_checkpoint_load_parts(model_state, None) is not None
+    finally:
+        dist.destroy_process_group()
+
+
+def test_part_loading_declines_when_expert_state_dict_does_not_alias_model_storage(tmp_path: Path) -> None:
+    """GroupedExpertsTE state-dict tensors are stacked copies; parts must decline at world > 1."""
+    mp.spawn(_stacked_expert_storage_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)
