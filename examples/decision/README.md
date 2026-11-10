@@ -7,6 +7,10 @@
 | `clef_soc_triage_lora.yaml` | `TrainClefDecisionRecipe` | Clef 27B: LoRA + joint schema head with FSDP2, eval / SFT / RL, stage chaining with `init_from` |
 | `d1_posttrain.py` | `D1PostTraining` | Experimental frozen-backbone D1-3B answer-token rows or Omni marker-head adaptation, with a publisher-baseline gate |
 | `export_clef_release.py` | — | Merge a Clef stage (LoRA + head) into a directory with the `Cloudflare/clef` release layout |
+| `deciffusion_soc_triage_lora.yaml` | `TrainDeciffusionDecisionRecipe` | Nemotron Deciffusion: LoRA (or full) post-training on fictional SOC triage, one question per serving prompt |
+| `deciffusion_support_routing_lora.yaml` | `TrainDeciffusionDecisionRecipe` | The same recipe on the synthetic support-routing example |
+| `prepare_deciffusion_data.py` | — | Convert SystemOne records or one-decision JSONL to one-question rows with group-disjoint splits |
+| `export_deciffusion.py` | — | Export a Deciffusion stage (merged LoRA or full weights) as a complete servable checkpoint |
 
 From the repository root, prepare fresh fictional data first (128 train, 32 validation, and 32 test records):
 
@@ -69,3 +73,47 @@ divisible by `local_batch_size * DP world size`, and small enough to fit at leas
 processes). An undersized split fails rather than producing a successful zero-step run. Losses normalize over
 eligible question weights across the complete accumulation window and DP group. A rank with no local supervision
 participates with zero local loss; a globally feedback-free window fails on every rank before backward.
+
+## Nemotron Deciffusion decision post-training
+
+`TrainDeciffusionDecisionRecipe` adapts a bidirectional text Nemotron Deciffusion checkpoint
+(`NemotronLabsDiffusionModel`) through its serving read. Each training row is one question: the serving prompt
+(fixed system message, JSON `{"state", "question", "options"}` user turn, position-ordered options with single-token
+codes, special tokens in user text neutralized) followed by one mask token. One bidirectional pass reads it, and the
+frozen diffusion head's logits at the mask, restricted to the option codes, are the answer distribution. No extra
+readout parameters are trained, so an exported checkpoint is scored by the unchanged serving path.
+
+* Loss: cross-entropy against `soft_labels` when a row has them, otherwise against the gold label;
+  `train.kl_weight > 0` switches to gold cross-entropy plus a weighted KL to the soft labels.
+* `train.canonical_fraction` (default 0.5) of training reads keep the serving option order; the rest are shuffled and
+  re-coded by position, so the model learns option meanings rather than codes.
+* LoRA (rank 32, alpha 64) adapts the attention and MLP projections. `peft: null` fully fine-tunes the decoder layers
+  and final norm. Embeddings and the diffusion head stay frozen in both modes.
+* Rows longer than `data.max_tokens` are skipped and counted. Long-state compaction is not implemented, so serve with
+  compaction disabled when you compare against training.
+* Only bidirectional text checkpoints are accepted. Block-causal, vision, and quantized variants fail at setup instead
+  of running with the wrong attention graph or storage format.
+
+```bash
+# fictional SOC triage: SystemOne records -> one row per question
+PYTHONPATH=tutorials/decision_models uv run --no-project python -m decision_tutorial.data \
+    --output-dir data/soc_triage --seed 7
+uv run python examples/decision/prepare_deciffusion_data.py systemone --input-dir data/soc_triage \
+    --output data/soc_triage_rows
+automodel examples/decision/deciffusion_soc_triage_lora.yaml --mode eval --output_dir runs/soc/base
+automodel examples/decision/deciffusion_soc_triage_lora.yaml --output_dir runs/soc/lora
+uv run python examples/decision/export_deciffusion.py --base /path/to/deciffusion-checkpoint \
+    --stage runs/soc/lora/LOWEST_VAL --output exports/soc_lora
+```
+
+For one-decision-per-line JSONL (`state`, `question`, `type`, `options`, `label`, optional `soft_labels` and
+`group`), use `prepare_deciffusion_data.py simple`. `--split three-way` writes group-disjoint
+`train`/`validation`/`test` files. `--split reference` writes the two-way `train`/`heldout` split (fraction 0.2,
+seed `0`); because its held-out file selects checkpoints, treat it as validation, not as a final test.
+
+Validation selects the published stage (`LOWEST_VAL`): highest accuracy, then lowest cross-entropy. For LoRA the
+starting checkpoint (step 0) is eligible. Each run writes `training.jsonl`, `validation.jsonl`, `selected.json`, and
+`metrics_{validation,test}.json` (with per-row probabilities). Stages record a fingerprint of the base checkpoint,
+and `init_from` and the export refuse a stage trained from a different base. The export removes
+`deciffusion_shared_context` from the exported configuration because these runs train single-question reads, not
+shared-context packing.

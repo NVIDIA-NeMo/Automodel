@@ -1,0 +1,107 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LoRA post-training of a Nemotron Deciffusion decision checkpoint on the synthetic support-routing example
+# (fictional help-desk tickets: choice + yes/no decisions, about a quarter with soft labels).
+#
+#   uv run python examples/decision/prepare_deciffusion_data.py simple --input support_routing.jsonl \
+#       --split three-way --output data/support_routing
+#   # before: score the starting checkpoint
+#   automodel examples/decision/deciffusion_support_routing_lora.yaml --mode eval --output_dir runs/support/base
+#   # train (validation selects the stage; test is reported separately)
+#   automodel examples/decision/deciffusion_support_routing_lora.yaml --output_dir runs/support/lora
+#   # export a complete servable checkpoint
+#   uv run python examples/decision/export_deciffusion.py --base <checkpoint> \
+#       --stage runs/support/lora/LOWEST_VAL --output exports/support_lora
+#
+# Supported checkpoints: bidirectional text Nemotron Deciffusion checkpoints (NemotronLabsDiffusionModel with
+# dlm_paradigm=bidirectional). Block-causal, vision and quantized variants are rejected at setup.
+# For full fine-tuning set peft: null, optimizer.lr: 1.0e-6, model.torch_dtype: float32 and
+# checkpoint.save_consolidated: every (decoder layers and final norm train; embeddings and head stay frozen).
+
+recipe: nemo_automodel.recipes.decision.train_deciffusion.TrainDeciffusionDecisionRecipe
+
+mode: train            # eval | train
+seed: 101
+output_dir: runs/support/lora
+init_from: null        # a published stage of the same base and method, e.g. runs/.../LOWEST_VAL
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /path/to/deciffusion-checkpoint   # a bidirectional text checkpoint directory
+  torch_dtype: bfloat16
+  trust_remote_code: true
+  dlm_paradigm: bidirectional
+  attn_implementation: sdpa
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  target_modules:
+    - "*.q_proj"
+    - "*.k_proj"
+    - "*.v_proj"
+    - "*.o_proj"
+    - "*.gate_proj"
+    - "*.up_proj"
+    - "*.down_proj"
+  dim: 32
+  alpha: 64
+  dropout: 0.0
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+lr_scheduler:
+  lr_decay_style: cosine   # warmup and decay steps are set from train.* below
+
+checkpoint:
+  enabled: true
+  save_consolidated: false  # LoRA stages save adapters; export_deciffusion.py merges them
+
+data:
+  train: data/support_routing/train.jsonl
+  validation: data/support_routing/validation.jsonl
+  test: data/support_routing/test.jsonl
+  max_tokens: 8192       # rows whose prompt + mask is longer are skipped and counted (no compaction)
+
+train:
+  global_batch_size: 16  # rows per optimizer step over all ranks (one row per forward)
+  epochs: 1.0
+  max_steps: 50          # the reference example: 50 steps of 16 rows
+  warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
+  min_lr_ratio: 0.1
+  canonical_fraction: 0.5  # share of training reads in serving option order; the rest are shuffled and re-coded
+  kl_weight: 0.0         # 0: soft/hard cross-entropy; > 0: CE(gold) + kl_weight * KL(soft || p)
+  soft_gold_mask: false
+  max_grad_norm: 1.0
+  val_every_steps: 25
+
+ci:
+  cluster_tag: h100
