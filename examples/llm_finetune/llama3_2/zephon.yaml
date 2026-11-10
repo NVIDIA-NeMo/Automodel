@@ -48,6 +48,10 @@ dataset:
       seq_len: 2048
       # Drop oversized conversations instead of truncating them.
       pack_algorithm: best_fit
+    cache:
+      # Remote shards are fetched through Zephon's bounded disk cache.
+      cache_dir: .cache/zephon
+      cache_limit_bytes: 32GiB
     checkpoint:
       run_id: zephon-llama3_2-sft
 distributed:
