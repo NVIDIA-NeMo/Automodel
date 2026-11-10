@@ -16,17 +16,27 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Concatenate, ParamSpec, TypeVar
 
 from nemo_automodel.shared.import_utils import get_torch_version
+
+if TYPE_CHECKING:
+    import torch
+    from torch.distributed import ProcessGroup
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 # torch 2.15 removed FSDPParam.to_accumulated_grad_if_needed: FSDP2 sets ``grad_dtype`` on the
 # unsharded param, so autograd accumulates in the reduce dtype and there is no grad to upcast.
 _FSDP_ACCUMULATED_GRAD_REMOVED_VERSION = (2, 15)
 
 
-def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
+def _widest_float_dtype(dtypes: Iterable[torch.dtype]) -> torch.dtype:
     """Return the float dtype among ``dtypes`` that every other one converts into losslessly.
 
     Args:
@@ -39,6 +49,51 @@ def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
     import torch
 
     return max(dtypes, key=lambda dtype: (torch.finfo(dtype).bits, dtype is torch.float32))
+
+
+def _with_uniform_grad_dtype(
+    foreach_reduce: Callable[Concatenate[list[FSDPParam], list[torch.Tensor], _P], _R],
+) -> Callable[Concatenate[list[FSDPParam], list[torch.Tensor], _P], _R]:
+    """Wrap FSDP2's ``foreach_reduce`` so each call receives local gradients of one dtype.
+
+    The wrapper keeps ``foreach_reduce``'s signature: the arguments after ``unsharded_grads``
+    differ across PyTorch releases and are forwarded unchanged.
+    """
+
+    def foreach_reduce_uniform_dtype(
+        fsdp_params: list[FSDPParam], unsharded_grads: list[torch.Tensor], *args: _P.args, **kwargs: _P.kwargs
+    ) -> _R:
+        """Localize and widen ``unsharded_grads`` in place, then run the wrapped ``foreach_reduce``.
+
+        Args:
+            fsdp_params: Parameters of one reduce-scatter group, in reduction order.
+            unsharded_grads: One gradient per entry of ``fsdp_params``, each with the shape of that
+                parameter's unsharded local tensor. Entries are local tensors, except that PyTorch
+                2.13a0 can pass a ``DTensor`` zero for an unused parameter. Rewritten in place.
+            *args: The remaining positional arguments of the wrapped ``foreach_reduce``.
+            **kwargs: The remaining keyword arguments of the wrapped ``foreach_reduce``.
+
+        Returns:
+            The wrapped ``foreach_reduce`` result.
+        """
+        from torch.distributed.tensor import DTensor
+
+        # PyTorch 2.13a0's unused-parameter branch can append a DTensor zero
+        # directly, while gradients from used parameters are already local
+        # tensors. Besides making ``fsdp.chunk_cat`` reject the mixed list, the
+        # DTensor's global numel makes FSDP size a global-shape staging buffer.
+        # Current PyTorch routes the zero through ``_get_grad_inner_tensor``;
+        # localizing here is the equivalent compatibility path for that build.
+        unsharded_grads[:] = [grad.to_local() if isinstance(grad, DTensor) else grad for grad in unsharded_grads]
+        dtypes = {grad.dtype for grad in unsharded_grads}
+        if len(dtypes) > 1 and all(dtype.is_floating_point for dtype in dtypes):
+            target = _widest_float_dtype(dtypes)
+            # Mutate in place: ``foreach_reduce`` frees the gradients by clearing
+            # this list, and that must still release the caller's references.
+            unsharded_grads[:] = [grad if grad.dtype is target else grad.to(target) for grad in unsharded_grads]
+        return foreach_reduce(fsdp_params, unsharded_grads, *args, **kwargs)
+
+    return foreach_reduce_uniform_dtype
 
 
 def patch_fsdp_uniform_reduce_dtype() -> None:
@@ -80,30 +135,13 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
     if getattr(original_foreach_reduce, "_automodel_uniform_reduce_dtype", False):
         return
 
-    def foreach_reduce_uniform_dtype(fsdp_params, unsharded_grads, *args, **kwargs):
-        from torch.distributed.tensor import DTensor
-
-        # PyTorch 2.13a0's unused-parameter branch can append a DTensor zero
-        # directly, while gradients from used parameters are already local
-        # tensors. Besides making ``fsdp.chunk_cat`` reject the mixed list, the
-        # DTensor's global numel makes FSDP size a global-shape staging buffer.
-        # Current PyTorch routes the zero through ``_get_grad_inner_tensor``;
-        # localizing here is the equivalent compatibility path for that build.
-        unsharded_grads[:] = [grad.to_local() if isinstance(grad, DTensor) else grad for grad in unsharded_grads]
-        dtypes = {grad.dtype for grad in unsharded_grads}
-        if len(dtypes) > 1 and all(dtype.is_floating_point for dtype in dtypes):
-            target = _widest_float_dtype(dtypes)
-            # Mutate in place: ``foreach_reduce`` frees the gradients by clearing
-            # this list, and that must still release the caller's references.
-            unsharded_grads[:] = [grad if grad.dtype is target else grad.to(target) for grad in unsharded_grads]
-        return original_foreach_reduce(fsdp_params, unsharded_grads, *args, **kwargs)
-
+    foreach_reduce_uniform_dtype = _with_uniform_grad_dtype(original_foreach_reduce)
     foreach_reduce_uniform_dtype._automodel_uniform_reduce_dtype = True
     collectives.foreach_reduce = foreach_reduce_uniform_dtype
     param_group.foreach_reduce = foreach_reduce_uniform_dtype
 
 
-def _has_local_unsharded_grad(fsdp_param: Any) -> bool:
+def _has_local_unsharded_grad(fsdp_param: FSDPParam) -> bool:
     """Whether this rank's backward produced a gradient for ``fsdp_param`` since its last reduction."""
     if not hasattr(fsdp_param, "_unsharded_param"):
         return False
@@ -142,7 +180,7 @@ def patch_fsdp_unused_param_reduction() -> None:
             "a zero fill wrapped outside the usage probe would make every parameter look used."
         )
 
-    def _post_backward_with_unused_param_reduction(self, *args, **kwargs):
+    def _post_backward_with_unused_param_reduction(self: FSDPParamGroup, *args: object, **kwargs: object) -> None:
         if self.reduce_grads and self._training_state == TrainingState.PRE_BACKWARD:
             for fsdp_param in self.fsdp_params:
                 if not hasattr(fsdp_param, "_unsharded_param") or _has_local_unsharded_grad(fsdp_param):
@@ -161,7 +199,7 @@ def patch_fsdp_unused_param_reduction() -> None:
     FSDPParamGroup.post_backward = _post_backward_with_unused_param_reduction
 
 
-def _fsdp_state_param_groups(state: Any) -> list[Any]:
+def _fsdp_state_param_groups(state: FSDPState) -> list[FSDPParamGroup]:
     """Return an FSDP2 state's parameter groups across PyTorch versions that keep one or several."""
     groups = getattr(state, "_fsdp_param_groups", None)
     if groups is not None:
@@ -170,7 +208,7 @@ def _fsdp_state_param_groups(state: Any) -> list[Any]:
     return [group] if group is not None else []
 
 
-def _restore_unused_param_grads(param_groups: list[Any]) -> None:
+def _restore_unused_param_grads(param_groups: list[FSDPParamGroup]) -> None:
     """Reset the gradients that a reduction created for parameters no rank of its domain used.
 
     Args:
@@ -181,7 +219,9 @@ def _restore_unused_param_grads(param_groups: list[Any]) -> None:
     import torch.distributed as dist
     from torch.distributed.fsdp._fully_shard._fsdp_common import DDPMeshInfo, FSDPMeshInfo
 
-    entries_by_domain: dict[tuple[Any, Any, Any], list[tuple[Any, bool, bool]]] = {}
+    entries_by_domain: dict[
+        tuple[ProcessGroup | None, ProcessGroup | None, torch.device], list[tuple[FSDPParam, bool, bool]]
+    ] = {}
     for group in param_groups:
         reduce_scatter_group = (
             group._reduce_scatter_process_group if isinstance(group.mesh_info, FSDPMeshInfo) else None
@@ -247,7 +287,7 @@ def patch_fsdp_restore_unused_param_grads() -> None:
     original_post_backward = FSDPParamGroup.post_backward
     legacy_fill = getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False)
 
-    def _post_backward_recording_param_usage(self, *args, **kwargs):
+    def _post_backward_recording_param_usage(self: FSDPParamGroup, *args: object, **kwargs: object) -> None:
         zero_fills = legacy_fill or getattr(self, "reduce_scatter_unused_params", False)
         if zero_fills and self.reduce_grads and self._training_state != TrainingState.POST_BACKWARD:
             # An HSDP reduction whose all-reduce was deferred holds earlier micro-batches' real
@@ -270,9 +310,9 @@ def patch_fsdp_restore_unused_param_grads() -> None:
             self._automodel_unused_param_probe = None
             raise
 
-    def _root_post_backward_final_callback_restoring_unused_grads(self, *args, **kwargs):
+    def _root_post_backward_final_callback_restoring_unused_grads(self: FSDPState) -> None:
         try:
-            return original_final_callback(self, *args, **kwargs)
+            return original_final_callback(self)
         finally:
             # Also on failure: callers that tolerate a never-forwarded root still step the optimizer.
             _restore_unused_param_grads(
@@ -314,7 +354,7 @@ def patch_fsdp_accumulated_grad_guard() -> None:
     if getattr(orig, "_nemo_automodel_guarded", False):
         return
 
-    def guarded(self):
+    def guarded(self: FSDPParam) -> None:
         try:
             return orig(self)
         except AttributeError as exc:

@@ -25,7 +25,7 @@ def clip_grad_by_total_norm_(
     max_grad_norm: Union[int, float],
     total_norm: float,
     dtype: torch.dtype = torch.float32,
-):
+) -> None:
     """Clips gradient of an iterable of parameters by total norm.
 
     Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/a695b2bd2a0ca9ca63385a48c41a1c5a033cdd1e/megatron/core/optimizer/clip_grads.py#L138
@@ -107,6 +107,6 @@ def get_grad_norm(
         torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group)
 
         torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=tp_group)
-        total_norm = total_norm.item() ** (1.0 / norm_type)  # type: ignore
+        total_norm = total_norm.item() ** (1.0 / norm_type)
 
     return total_norm

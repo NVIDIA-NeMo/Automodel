@@ -15,9 +15,10 @@
 """FSDP policy helpers for multimodal submodules."""
 
 from collections.abc import Callable, Iterator
-from typing import Literal, cast
+from typing import Literal
 
 import torch.nn as nn
+from typing_extensions import TypeIs
 
 FrozenMultimodalSharding = Literal["root", "per_layer", "replicate"]
 
@@ -82,7 +83,7 @@ def normalize_frozen_multimodal_sharding(value: str) -> FrozenMultimodalSharding
     if normalized not in VALID_FROZEN_MULTIMODAL_SHARDING:
         valid = ", ".join(VALID_FROZEN_MULTIMODAL_SHARDING)
         raise ValueError(f"distributed.multimodal.frozen_sharding must be one of: {valid}. Got {value!r}.")
-    return cast(FrozenMultimodalSharding, normalized)
+    return normalized
 
 
 def is_multimodal_module_name(name: str) -> bool:
@@ -101,11 +102,11 @@ def module_is_fully_frozen(module: nn.Module) -> bool:
     return bool(params) and not any(param.requires_grad for param in params)
 
 
-def _is_module_container(module: nn.Module) -> bool:
+def _is_module_container(module: nn.Module) -> TypeIs[nn.ModuleList | nn.ModuleDict]:
     return isinstance(module, (nn.ModuleList, nn.ModuleDict))
 
 
-def _container_items(module: nn.Module) -> list[tuple[str | int, nn.Module]]:
+def _container_items(module: nn.ModuleList | nn.ModuleDict) -> list[tuple[str | int, nn.Module]]:
     if isinstance(module, nn.ModuleDict):
         return list(module.items())
     return list(enumerate(module))

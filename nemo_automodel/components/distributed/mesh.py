@@ -31,7 +31,7 @@ YAML / dict parsing belongs in the recipe layer — see
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple, overload
 
 from nemo_automodel.components.distributed.config import ActivationCheckpointingMode, DistributedStrategyConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
@@ -64,7 +64,7 @@ class MeshAxisName(str, Enum):
 
 
 #: All values accepted as ``DeviceMesh`` axis names.
-_VALID_AXIS_NAMES: frozenset = frozenset(MeshAxisName)
+_VALID_AXIS_NAMES: frozenset[MeshAxisName] = frozenset(MeshAxisName)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -189,7 +189,7 @@ class MeshContext:
     def _dp_axis_names(self) -> Tuple[str, ...]:
         """DP axis names for FSDP mesh slicing."""
         if self.device_mesh is not None:
-            names = self.device_mesh.mesh_dim_names
+            names = _axis_names(self.device_mesh)
             if (
                 MeshAxisName.DP_REPLICATE in names
                 and _get_axis_size(self.device_mesh, MeshAxisName.DP_SHARD_CP, default=None) is not None
@@ -323,12 +323,32 @@ class MeshContext:
 
 
 # misc utils
-def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) -> int | None:
+def _axis_names(mesh: "DeviceMesh") -> tuple[str, ...]:
+    """Return *mesh*'s axis names.
+
+    Raises:
+        TypeError: If *mesh* was created without ``mesh_dim_names``; name-based lookups need named axes.
+    """
+    names = mesh.mesh_dim_names
+    if names is None:
+        raise TypeError("Expected a DeviceMesh with mesh_dim_names; axis lookups by name need named axes")
+    return names
+
+
+@overload
+def _get_axis_size(mesh: "DeviceMesh | None", axis: MeshAxisName, default: int = 1) -> int: ...
+
+
+@overload
+def _get_axis_size(mesh: "DeviceMesh | None", axis: MeshAxisName, default: None) -> int | None: ...
+
+
+def _get_axis_size(mesh: "DeviceMesh | None", axis: MeshAxisName, default: int | None = 1) -> int | None:
     """Return the size of *axis* if present in *mesh*, else *default*."""
     if mesh is None:
         return default
     # Check mesh axes and _flatten() results on root mesh.
-    if axis in mesh.mesh_dim_names:
+    if axis in _axis_names(mesh):
         return mesh[axis].size()
     if hasattr(mesh, "_get_root_mesh"):
         root = mesh._get_root_mesh()
@@ -341,7 +361,7 @@ def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) 
 
 def _optional_axis(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> str | None:
     """Return *axis* if present in *mesh*, else ``None``."""
-    if mesh is not None and axis in mesh.mesh_dim_names:
+    if mesh is not None and axis in _axis_names(mesh):
         return axis
     return None
 

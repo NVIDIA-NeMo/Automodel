@@ -15,6 +15,7 @@
 import warnings
 from collections.abc import Callable
 
+import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -65,7 +66,13 @@ def _patch_is_packed_sequence_for_training() -> None:
         if getattr(_fa_utils, "_is_packed_sequence_patched", False):
             return  # already patched
 
-        def _is_packed_sequence_no_sync(position_ids, batch_size):
+        def _is_packed_sequence_no_sync(position_ids: torch.Tensor | None, batch_size: int) -> bool:
+            """Report that the batch is not packed, matching ``_is_packed_sequence``'s signature.
+
+            Args:
+                position_ids: Token positions, shape ``[batch, seq]``, or ``None``; not inspected.
+                batch_size: Number of sequences in the batch; not inspected.
+            """
             # Non-packed training: position_ids is always a simple arange -- never packed.
             return False
 
@@ -103,7 +110,7 @@ class FSDP2Manager:
         device_mesh: DeviceMesh,
         moe_mesh: DeviceMesh | None = None,
         moe_config: MoEParallelizerConfig | None = None,
-    ):
+    ) -> None:
         warnings.warn(
             "FSDP2Manager is deprecated and will be removed in 0.8; pass FSDP2Config through the "
             "config-driven infrastructure and use ModelParallelizer for model-owned behavior.",
@@ -115,7 +122,7 @@ class FSDP2Manager:
         self.moe_mesh = moe_mesh
         self.moe_config = moe_config
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> object:
         if name == "frozen_multimodal_sharding":
             return self.config.multimodal.frozen_sharding
         return getattr(self.config, name)
@@ -141,7 +148,7 @@ class FSDP2Manager:
             self.moe_mesh,
             strategy_config=self.config,
             moe_parallel_config=self.moe_config,
-            activation_checkpointing=self.activation_checkpointing,
+            activation_checkpointing=self.config.activation_checkpointing,
             reapply_trainability=reapply_trainability,
         )
         model = parallelize_model(
@@ -151,13 +158,13 @@ class FSDP2Manager:
 
         return model
 
-    def maybe_compile(self, model):
+    def maybe_compile(self, model: nn.Module) -> None:
         """Apply per-layer compile after sharding, alongside whole-model compile_model()."""
         mesh_context = MeshContext.from_meshes(
             self.device_mesh,
             self.moe_mesh,
             strategy_config=self.config,
             moe_parallel_config=self.moe_config,
-            activation_checkpointing=self.activation_checkpointing,
+            activation_checkpointing=self.config.activation_checkpointing,
         )
         compile_parallelized_model(model, mesh_context)

@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import atexit
 import datetime
 import os
 import signal
 import tempfile
 from dataclasses import dataclass
+from typing import TypedDict
 
 import torch
 import torch.distributed
@@ -77,21 +80,32 @@ class DistInfo:
         backend (str): The backend used for torch.distributed (e.g., 'nccl').
         rank (int): The rank of the current process.
         world_size (int): The total number of processes.
-        device (torch.device): The device assigned to the current process.
+        device (torch.device | None): The CUDA device assigned to the current process, or ``None``
+            when no CUDA device is visible.
         is_main (bool): True if the process is the main process (rank 0).
     """
 
     backend: str
     rank: int
     world_size: int
-    device: torch.device
+    device: torch.device | None
     is_main: bool
 
 
+class _InitProcessGroupKwargs(TypedDict, total=False):
+    """Keyword arguments ``initialize_distributed`` forwards to ``torch.distributed.init_process_group``."""
+
+    backend: str
+    world_size: int
+    rank: int
+    timeout: datetime.timedelta
+    store: torch.distributed.Store
+
+
 def initialize_distributed(
-    backend,
-    timeout_minutes=1,
-):
+    backend: str,
+    timeout_minutes: int = 1,
+) -> DistInfo:
     """Initialize the torch.distributed environment and core model parallel infrastructure.
 
     This function sets the device based on the local rank, configures the process group,
@@ -114,13 +128,13 @@ def initialize_distributed(
                 flush=True,
             )
         if device_count > 0:
-            device = torch.cuda.current_device()
+            device = torch.device("cuda", torch.cuda.current_device())
     else:
         if get_rank_safe() == 0:
             print("> initializing torch distributed with {} workers.".format(get_world_size_safe()), flush=True)
 
         # Call the init process
-        init_pg_kwargs = {
+        init_pg_kwargs: _InitProcessGroupKwargs = {
             "backend": backend,
             "world_size": get_world_size_safe(),
             "rank": get_rank_safe(),
@@ -158,7 +172,7 @@ def initialize_distributed(
     return DistInfo(backend, rank, world_size, device, rank == 0)
 
 
-def destroy_global_state():
+def destroy_global_state() -> None:
     """Destroy the torch.distributed process group during cleanup.
 
     This function is registered to execute at exit to ensure the process group is properly destroyed.

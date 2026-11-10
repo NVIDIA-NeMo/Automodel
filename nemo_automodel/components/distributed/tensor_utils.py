@@ -19,10 +19,12 @@ This module provides utilities for handling tensor operations across different d
 and distributed tensor types, with optimizations for performance in distributed training scenarios.
 """
 
-from typing import Iterable, Union
+from typing import Iterable, TypeVar, Union, overload
 
 import torch
 from torch.distributed.tensor import DTensor
+
+_T = TypeVar("_T")
 
 
 @torch.no_grad()
@@ -57,7 +59,15 @@ def get_cpu_state_dict(
     return new_state_dict
 
 
-def to_cpu(v):
+@overload
+def to_cpu(v: torch.Tensor) -> torch.Tensor: ...
+
+
+@overload
+def to_cpu(v: _T) -> _T: ...
+
+
+def to_cpu(v: torch.Tensor | _T) -> torch.Tensor | _T:
     """
     Move a tensor or distributed tensor to the CPU.
 
@@ -71,7 +81,9 @@ def to_cpu(v):
 
     Returns:
         Tensor | any: The corresponding CPU tensor if `v` is a `DTensor` or `Tensor`,
-                    otherwise returns `v` unchanged.
+                    otherwise returns `v` unchanged. A plain tensor keeps its shape; a CUDA
+                    `DTensor` is gathered to its full global shape, while a CPU `DTensor`
+                    returns its local shard.
 
     Raises:
         ValueError: If `v` is a `DTensor` but its device is neither 'cuda' nor 'cpu'.

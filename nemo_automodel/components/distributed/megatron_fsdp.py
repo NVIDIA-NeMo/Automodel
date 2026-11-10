@@ -141,7 +141,7 @@ class MegatronFSDPManager:
         self,
         config: MegatronFSDPConfig,
         device_mesh: DeviceMesh,
-    ):
+    ) -> None:
         warnings.warn(
             "MegatronFSDPManager is deprecated and will be removed in 0.8; pass MegatronFSDPConfig through the "
             "config-driven infrastructure and use ModelParallelizer for model-owned behavior.",
@@ -151,7 +151,7 @@ class MegatronFSDPManager:
         self.config = config
         self.device_mesh = device_mesh
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> object:
         return getattr(self.config, name)
 
     def parallelize(
@@ -202,9 +202,9 @@ def fully_shard_optimizer(
     wheel's own ``__init__`` logic) on the current distributed params right before
     deferred sharding so the separate sequence matches the combined entry point.
     """
-    if not isinstance(model, MegatronFSDP):
+    if MegatronFSDP is None or not isinstance(model, MegatronFSDP):
         return optimizer
-    if not HAS_MEGATRON_FSDP:
+    if not HAS_MEGATRON_FSDP or megatron_fsdp_fully_shard_optimizer is None:
         raise ImportError(
             "MegatronFSDP is not installed, please visit https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src for more information"
         )
@@ -214,7 +214,7 @@ def fully_shard_optimizer(
     return megatron_fsdp_fully_shard_optimizer(optimizer)
 
 
-def snapshot_distributed_param_attrs(model: nn.Module) -> "dict[str, dict] | None":
+def snapshot_distributed_param_attrs(model: nn.Module) -> "dict[str, dict[str, object]] | None":
     """Snapshot the per-parameter attributes Megatron-FSDP stamps on distributed params.
 
     ``MegatronFSDP.__init__`` decorates each distributed ``Parameter`` with plain
@@ -240,12 +240,12 @@ def snapshot_distributed_param_attrs(model: nn.Module) -> "dict[str, dict] | Non
         A mapping from parameter name to a copy of its ``__dict__``, or ``None`` when
         ``model`` is not a Megatron-FSDP model (nothing to snapshot).
     """
-    if not HAS_MEGATRON_FSDP or not isinstance(model, MegatronFSDP):
+    if MegatronFSDP is None or not isinstance(model, MegatronFSDP):
         return None
     return {name: dict(param.__dict__) for name, param in model.module.named_parameters(remove_duplicate=False)}
 
 
-def restore_distributed_param_attrs(model: nn.Module, snapshot: "dict[str, dict] | None") -> None:
+def restore_distributed_param_attrs(model: nn.Module, snapshot: "dict[str, dict[str, object]] | None") -> None:
     """Re-apply Megatron-FSDP per-parameter attributes dropped by a post-wrap rebuild.
 
     Companion to :func:`snapshot_distributed_param_attrs`. For each current parameter
@@ -259,7 +259,7 @@ def restore_distributed_param_attrs(model: nn.Module, snapshot: "dict[str, dict]
         snapshot: The mapping returned by :func:`snapshot_distributed_param_attrs`, or
             ``None`` (no-op).
     """
-    if snapshot is None or not HAS_MEGATRON_FSDP or not isinstance(model, MegatronFSDP):
+    if snapshot is None or MegatronFSDP is None or not isinstance(model, MegatronFSDP):
         return
     for name, param in model.module.named_parameters(remove_duplicate=False):
         saved = snapshot.get(name)

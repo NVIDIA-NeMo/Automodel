@@ -14,9 +14,13 @@
 
 """Device mesh construction and access utilities for distributed training."""
 
+from __future__ import annotations
+
 import datetime
 import itertools
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, TypeAlias
 
 import torch
 import torch.distributed as dist
@@ -28,7 +32,13 @@ from nemo_automodel.components.distributed.config import (
     FSDP2Config,
     MegatronFSDPConfig,
 )
-from nemo_automodel.components.distributed.mesh import MeshAxisName, ParallelismSizes
+from nemo_automodel.components.distributed.mesh import MeshAxisName, ParallelismSizes, _axis_names
+
+if TYPE_CHECKING:
+    from torch._C._distributed_c10d import Backend as C10dBackend
+
+    # One mesh axis' override as accepted by ``init_device_mesh`` and ``DeviceMesh._unflatten``.
+    _AxisBackendOverride: TypeAlias = str | C10dBackend.Options | tuple[str, C10dBackend.Options]
 
 __all__ = [
     "_create_device_meshes",
@@ -65,7 +75,7 @@ def _create_device_meshes(
     *,
     world_size: int,
     timeout_minutes: int | None = None,
-    ranks: list[int] | tuple[int, ...] | None = None,
+    ranks: Sequence[int] | None = None,
 ) -> tuple[DeviceMesh | None, DeviceMesh | None]:
     """Create raw device meshes based on distributed config type."""
     if (
@@ -132,16 +142,17 @@ def _init_named_mesh(
     spec: _MeshSpec,
     *,
     timeout_minutes: int | None = None,
-    ranks: list[int] | tuple[int, ...] | None = None,
+    ranks: Sequence[int] | None = None,
 ) -> DeviceMesh:
     _validate_mesh_spec(spec)
     device_type = _mesh_device_type()
     backend_override = _nccl_backend_override(spec.axes, device_type=device_type, timeout_minutes=timeout_minutes)
     if ranks is None:
+        mesh_backend_override: dict[int | str, _AxisBackendOverride] | None = None
         if backend_override is not None:
             # A world-sized axis reuses the default process group, which already has the
             # configured timeout. Overriding it would allocate another world-sized communicator.
-            backend_override = {
+            mesh_backend_override = {
                 axis: backend_override[axis]
                 for axis, size in zip(spec.axes, spec.shape)
                 if not _can_reuse_default_group(size)
@@ -150,7 +161,7 @@ def _init_named_mesh(
             device_type=device_type,
             mesh_shape=spec.shape,
             mesh_dim_names=spec.axes,
-            backend_override=backend_override,
+            backend_override=mesh_backend_override,
         )
     else:
         expected_size = 1
@@ -164,7 +175,8 @@ def _init_named_mesh(
             device_type=device_type,
             mesh=torch.tensor(ranks, dtype=torch.int64).reshape(spec.shape),
             mesh_dim_names=spec.axes,
-            backend_override=backend_override,
+            # DeviceMesh.__init__ takes one (backend, options) pair per mesh dimension, in axis order.
+            backend_override=None if backend_override is None else tuple(backend_override[axis] for axis in spec.axes),
         )
     if ranks is None:
         _register_flattened_axes(device_mesh, spec.flattened_axes, timeout_minutes=timeout_minutes)
@@ -183,20 +195,24 @@ def _nccl_backend_override(
     *,
     device_type: str,
     timeout_minutes: int | None,
-):
+) -> dict[str, tuple[str, C10dBackend.Options]] | None:
     """Create per-axis timeout options without replacing the default backend.
 
     ``init_process_group(timeout=...)`` configures the default process group, but
     ``init_device_mesh`` creates additional per-axis process groups. Without a
     backend override those groups keep PyTorch's default NCCL timeout.
     Preserve composite backends so CPU-offloaded tensors can still use Gloo.
+
+    Returns:
+        ``{axis: (backend, options)}`` for every axis in ``axes``, or ``None`` when no
+        timeout is configured or the mesh is not on CUDA.
     """
     if timeout_minutes is None or device_type != "cuda":
         return None
 
     timeout = datetime.timedelta(minutes=timeout_minutes)
     backend = dist.get_backend() if dist.is_initialized() else "nccl"
-    override = {}
+    override: dict[str, tuple[str, C10dBackend.Options]] = {}
     for axis in axes:
         options = dist.ProcessGroupNCCL.Options()
         options._timeout = timeout
@@ -248,7 +264,7 @@ def _register_flattened_axes_for_rank_subset(
     device_mesh: DeviceMesh,
     spec: _MeshSpec,
     *,
-    ranks: list[int] | tuple[int, ...],
+    ranks: Sequence[int],
     timeout_minutes: int | None,
 ) -> None:
     """Register flattened axes without slicing a mesh on non-member ranks.
@@ -273,7 +289,7 @@ def _register_flattened_axes_for_rank_subset(
         local_group = None
         first_ranks = None
         for other_coordinate in itertools.product(*(range(size) for size in other_shapes)):
-            index = [slice(None)] * len(spec.axes)
+            index: list[slice[None, None, None] | int] = [slice(None)] * len(spec.axes)
             for axis_index, coordinate in zip(other_indices, other_coordinate):
                 index[axis_index] = coordinate
             subgroup_ranks = rank_tensor[tuple(index)].reshape(-1).tolist()
@@ -299,7 +315,7 @@ def _create_fsdp2_device_mesh(
     *,
     world_size: int,
     timeout_minutes: int | None = None,
-    ranks: list[int] | tuple[int, ...] | None = None,
+    ranks: Sequence[int] | None = None,
 ) -> tuple[DeviceMesh, DeviceMesh | None]:
     """Create the FSDP2 root mesh and optional MoE mesh."""
     tp_size = _degree(parallelism.tp_size)
@@ -368,7 +384,7 @@ def _create_megatron_fsdp_device_mesh(
     *,
     world_size: int,
     timeout_minutes: int | None = None,
-    ranks: list[int] | tuple[int, ...] | None = None,
+    ranks: Sequence[int] | None = None,
 ) -> DeviceMesh:
     """Create the Megatron FSDP mesh."""
     tp_size = _degree(parallelism.tp_size)
@@ -399,17 +415,20 @@ def _create_moe_mesh(
     ep_size: int,
     pp_size: int = 1,
     timeout_minutes: int | None = None,
-    ranks: list[int] | tuple[int, ...] | None = None,
+    ranks: Sequence[int] | None = None,
 ) -> DeviceMesh:
     non_pp_axes = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
     if ranks is not None:
         current_rank = dist.get_rank()
         ranks_per_stage = ep_shard_size * ep_size
-        backend_override = _nccl_backend_override(
-            (MeshAxisName.EP_SHARD, MeshAxisName.EP),
+        moe_axes = (MeshAxisName.EP_SHARD, MeshAxisName.EP)
+        axis_overrides = _nccl_backend_override(
+            moe_axes,
             device_type=device_mesh.device_type,
             timeout_minutes=timeout_minutes,
         )
+        # DeviceMesh.__init__ takes one (backend, options) pair per mesh dimension, in axis order.
+        backend_override = None if axis_overrides is None else tuple(axis_overrides[axis] for axis in moe_axes)
         local_mesh = None
         first_mesh = None
         for stage in range(pp_size):
@@ -417,7 +436,7 @@ def _create_moe_mesh(
             stage_mesh = DeviceMesh(
                 device_mesh.device_type,
                 mesh=torch.tensor(stage_ranks, dtype=torch.int64).reshape(ep_shard_size, ep_size),
-                mesh_dim_names=(MeshAxisName.EP_SHARD, MeshAxisName.EP),
+                mesh_dim_names=moe_axes,
                 backend_override=backend_override,
             )
             if first_mesh is None:
@@ -439,8 +458,8 @@ def _create_moe_mesh(
 def _unflatten_compat(
     flat_mesh: DeviceMesh,
     axis: int,
-    sizes: tuple,
-    names: tuple,
+    sizes: tuple[int, ...],
+    names: tuple[str, ...],
     *,
     timeout_minutes: int | None = None,
 ) -> DeviceMesh:
@@ -452,14 +471,15 @@ def _unflatten_compat(
     allocating another NCCL communicator.
     """
     if hasattr(flat_mesh, "_unflatten"):
-        if timeout_minutes is not None and flat_mesh.device_type == "cuda":
-            backend_override = _nccl_backend_override(
-                names,
-                device_type=flat_mesh.device_type,
-                timeout_minutes=timeout_minutes,
-            )
-            backend_override = {
-                name: backend_override[name] for name, size in zip(names, sizes) if not _can_reuse_default_group(size)
+        # ``None`` unless a timeout is configured on a CUDA mesh.
+        axis_overrides = _nccl_backend_override(
+            names,
+            device_type=flat_mesh.device_type,
+            timeout_minutes=timeout_minutes,
+        )
+        if axis_overrides is not None:
+            backend_override: dict[str, _AxisBackendOverride] = {
+                name: axis_overrides[name] for name, size in zip(names, sizes) if not _can_reuse_default_group(size)
             }
             if backend_override:
                 return flat_mesh._unflatten(
@@ -485,7 +505,7 @@ def get_flat_mesh(device_mesh: "DeviceMesh", name: str) -> "DeviceMesh":
         device_mesh: Any DeviceMesh (root or submesh).
         name: Parallelism dimension name.
     """
-    if name in device_mesh.mesh_dim_names:
+    if name in _axis_names(device_mesh):
         return device_mesh[name]
     # _get_root_mesh() was added in PyTorch 2.10; fall back for 2.9.x.
     if hasattr(device_mesh, "_get_root_mesh"):
@@ -500,7 +520,7 @@ def get_flat_mesh(device_mesh: "DeviceMesh", name: str) -> "DeviceMesh":
     )
 
 
-def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
+def get_submesh(device_mesh: "DeviceMesh", names: tuple[str, ...]) -> "DeviceMesh":
     """Access a submesh by parallelism dim names.
 
     Handles all cases: single dims, multi-dim slices, and combinations that
@@ -514,7 +534,7 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
     """
     if len(names) == 1:
         return get_flat_mesh(device_mesh, names[0])
-    if all(n in device_mesh.mesh_dim_names for n in names):
+    if all(n in _axis_names(device_mesh) for n in names):
         return device_mesh[names]
 
     # Some dims were created via _flatten(); resolve sizes and unflatten from parent.
@@ -582,10 +602,9 @@ def get_fsdp_dp_mesh(
     dp_shard_name = MeshAxisName.DP_SHARD
     cp_name = MeshAxisName.CP
 
+    mesh_axis_names = _axis_names(device_mesh)
     native_dims_available = (
-        dp_replicate_name in device_mesh.mesh_dim_names
-        and dp_shard_name in device_mesh.mesh_dim_names
-        and cp_name in device_mesh.mesh_dim_names
+        dp_replicate_name in mesh_axis_names and dp_shard_name in mesh_axis_names and cp_name in mesh_axis_names
     )
     if native_dims_available:
         cp_size = device_mesh[cp_name].size()

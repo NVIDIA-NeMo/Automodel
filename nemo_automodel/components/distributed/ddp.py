@@ -15,6 +15,7 @@
 import logging
 import warnings
 from collections.abc import Callable
+from typing import TypedDict
 
 import torch
 import torch.distributed as dist
@@ -34,6 +35,17 @@ from nemo_automodel.components.distributed.parallelizer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _DDPKwargs(TypedDict, total=False):
+    """Keyword arguments ``parallelize_ddp`` forwards to ``DistributedDataParallel``."""
+
+    device_ids: list[torch.device] | None
+    broadcast_buffers: bool
+    find_unused_parameters: bool
+    static_graph: bool
+    gradient_as_bucket_view: bool
+    bucket_cap_mb: float
 
 
 def _resolve_ddp_device() -> torch.device:
@@ -107,7 +119,7 @@ def parallelize_ddp(
             )
             apply_submodule_checkpointing(layers, has_kv_sharing)
 
-    ddp_kwargs = {
+    ddp_kwargs: _DDPKwargs = {
         "device_ids": [device] if device.type == "cuda" else None,
         "broadcast_buffers": config.broadcast_buffers,
         "find_unused_parameters": config.find_unused_parameters,
@@ -139,7 +151,7 @@ class DDPManager:
 
     """
 
-    def __init__(self, config: DDPConfig):
+    def __init__(self, config: DDPConfig) -> None:
         warnings.warn(
             "DDPManager is deprecated and will be removed in 0.8; pass DDPConfig through the "
             "config-driven infrastructure and use ModelParallelizer for model-owned behavior.",
@@ -149,10 +161,10 @@ class DDPManager:
         self.config = config
         self._setup_distributed()
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> object:
         return getattr(self.config, name)
 
-    def _setup_distributed(self):
+    def _setup_distributed(self) -> None:
         """
         Initialize device configuration for DDP.
 
