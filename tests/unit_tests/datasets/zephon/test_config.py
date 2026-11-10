@@ -195,7 +195,7 @@ def test_pretraining_examples_select_matching_source_and_preparation(family: str
         assert isinstance(dataset, ZephonTextDatasetConfig)
         assert dataset.tokenize_special_tokens == "eos"
         assert dataset.zephon.packing.pack_algorithm == "wrap"
-        assert dataset.zephon.source.token_estimation == "auto"
+        assert dataset.zephon.source.token_estimation == {"calibration_shards_max": 6}
         assert dataset.zephon.sources == (
             ZephonSource(name="web", path="hf://HuggingFaceFW/fineweb-edu/sample-10BT/train", weight=0.7),
             ZephonSource(
