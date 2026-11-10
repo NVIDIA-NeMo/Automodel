@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Mapping
 
 import torch
 import torch.distributed as dist
@@ -26,6 +27,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
 )
 from nemo_automodel.components.distributed.thd_utils import (
+    batch_tensor,
     split_batch_into_thd_chunks,
     thd_padding_mask_from_token_ids,
 )
@@ -59,22 +61,23 @@ def glm_dsa_cp_all_gather(tensor: torch.Tensor, *, dim: int, cp_group) -> torch.
 
 
 def _slice_thd_chunk_for_cp(
-    chunk: dict[str, torch.Tensor],
+    chunk: Mapping[str, object],
     *,
     cp_mesh,
     cp_group,
     cp_size: int,
     cp_rank: int,
     padding_token_id: int,
-) -> dict[str, torch.Tensor]:
-    total_tokens = int(chunk["input_ids"].shape[0])
-    query_indices = contiguous_local_indices(cp_mesh, total_tokens, chunk["input_ids"].device)
+) -> dict[str, torch.Tensor | int | str | dist.ProcessGroup]:
+    input_ids = batch_tensor(chunk, "input_ids")
+    total_tokens = int(input_ids.shape[0])
+    query_indices = contiguous_local_indices(cp_mesh, total_tokens, input_ids.device)
 
     out: dict[str, torch.Tensor | int | str | dist.ProcessGroup] = {
-        "input_ids": chunk["input_ids"].index_select(0, query_indices).to(torch.int64).contiguous(),
-        "labels": chunk["labels"].index_select(0, query_indices).to(torch.int64).contiguous(),
-        "position_ids": chunk["position_ids"].index_select(0, query_indices).to(torch.int64).contiguous(),
-        "cu_seqlens": chunk["cu_seqlens"].to(torch.int32).contiguous(),
+        "input_ids": input_ids.index_select(0, query_indices).to(torch.int64).contiguous(),
+        "labels": batch_tensor(chunk, "labels").index_select(0, query_indices).to(torch.int64).contiguous(),
+        "position_ids": batch_tensor(chunk, "position_ids").index_select(0, query_indices).to(torch.int64).contiguous(),
+        "cu_seqlens": batch_tensor(chunk, "cu_seqlens").to(torch.int32).contiguous(),
         "qkv_format": "thd",
         "cp_size": cp_size,
         "cp_rank": cp_rank,
@@ -82,17 +85,19 @@ def _slice_thd_chunk_for_cp(
         "glm_dsa_cp_query_indices": query_indices.to(torch.int32).contiguous(),
     }
     if "max_seqlen" in chunk:
-        out["max_seqlen"] = chunk["max_seqlen"].to(torch.int32).contiguous()
+        out["max_seqlen"] = batch_tensor(chunk, "max_seqlen").to(torch.int32).contiguous()
     if "cu_seqlens_padded" in chunk:
-        out["cu_seqlens_padded"] = chunk["cu_seqlens_padded"].to(torch.int32).contiguous()
+        out["cu_seqlens_padded"] = batch_tensor(chunk, "cu_seqlens_padded").to(torch.int32).contiguous()
     # Slice the pack-derived mask rather than re-deriving it from token values:
     # GLM's pad id is <|endoftext|>, which is also its first eos_token_id, so a
     # value comparison would drop every document-final eos from the MoE experts.
     if "padding_mask" in chunk:
-        out["padding_mask"] = chunk["padding_mask"].index_select(0, query_indices).bool().contiguous()
+        out["padding_mask"] = batch_tensor(chunk, "padding_mask").index_select(0, query_indices).bool().contiguous()
     else:
-        out["padding_mask"] = thd_padding_mask_from_token_ids(out["input_ids"], padding_token_id).contiguous()
-    return out  # type: ignore[return-value]
+        out["padding_mask"] = thd_padding_mask_from_token_ids(
+            batch_tensor(out, "input_ids"), padding_token_id
+        ).contiguous()
+    return out
 
 
 def _packed_cp_layout(batch, *, num_chunks: int) -> ShardLayout | None:
@@ -165,7 +170,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
     stacked: dict[str, torch.Tensor | int | str | dist.ProcessGroup] = {}
     for key, value in chunks[0].items():
         if isinstance(value, torch.Tensor):
-            stacked[key] = torch.stack([chunk[key] for chunk in chunks])  # type: ignore[list-item]
+            stacked[key] = torch.stack([batch_tensor(chunk, key) for chunk in chunks])
         else:
             stacked[key] = value
     return contextlib.nullcontext, stacked
