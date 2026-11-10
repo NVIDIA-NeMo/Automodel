@@ -83,7 +83,7 @@ def _embedded_image(value: MediaValue | bytearray | memoryview) -> Image.Image |
     raise ValueError(
         "Zephon VLM requires embedded image bytes or materialized PIL images, not paths/URLs. "
         "Export external media into self-contained Parquet or LitData shards before training; "
-        "see examples/vlm_finetune/zephon/data.md."
+        "see docs/guides/zephon-images.mdx."
     )
 
 

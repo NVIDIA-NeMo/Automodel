@@ -146,8 +146,9 @@ def test_image_recipe_rejects_explicit_non_image_packing(algorithm):
         RecipeConfig(ConfigNode(values)).vlm_dataloader
 
 
-def test_image_example_config_resolves():
-    path = Path(__file__).resolve().parents[4] / "examples/vlm_finetune/zephon/train.yaml"
+@pytest.mark.parametrize("family", ["qwen3", "gemma4", "mistral"])
+def test_image_example_config_resolves(family: str) -> None:
+    path = Path(__file__).resolve().parents[4] / f"examples/vlm_finetune/{family}/zephon.yaml"
     recipe = RecipeConfig(ConfigNode(yaml.safe_load(path.read_text())))
     config = recipe.vlm_dataloader
     assert isinstance(config, VlmDataloaderConfig)
@@ -155,6 +156,9 @@ def test_image_example_config_resolves():
     assert isinstance(config.dataset_config, ZephonVlmDatasetConfig)
     assert config.dataset_config.zephon.source.stop_after_passes is None
     assert config.dataset_config.zephon.packing.pack_algorithm == "first_fit"
+    source = config.dataset_config.zephon.sources[0]
+    assert source.path == "hf://mmoukouba/MedPix-VQA/train"
+    assert source.input.column_mapping == {"images": "image_id"}
 
 
 def test_vlm_toml_paths_and_inline_overrides_share_llm_rules(tmp_path):
