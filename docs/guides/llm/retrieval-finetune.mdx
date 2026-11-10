@@ -42,6 +42,27 @@ Start with a bi-encoder when you need embeddings for approximate nearest-neighbo
 the first pass if the model mostly sees easy negatives. Train a cross-encoder when a separate retriever already produces
 a small candidate set and you want a stronger reranking stage.
 
+## Choose a Released Checkpoint
+
+Start from a released embedding or reranking model when adapting retrieval to your data.
+The following examples load released checkpoints and preserve their task-specific model settings:
+
+| Task | Model | Configuration |
+| --- | --- | --- |
+| Text embedding distillation | Nemotron 3 Embed 1B with an 8B teacher | [Text distillation example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/distillation/nemotron3_embed_1b_distill.yaml) |
+| Multimodal embedding | Nemotron 3.5 Embed 8B | [Embedding example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/nemotron_3_5/embed_8b_multimodal.yaml) |
+| Multimodal reranking | Nemotron 3.5 Rerank 8B | [Reranking example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/nemotron_3_5/rerank_8b_multimodal.yaml) |
+| Text reranking | Qwen3-Reranker-4B | [Qwen3 fine-tuning example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/cross_encoder/qwen3_4b_reranker_agentir.yaml) |
+
+Follow the [Nemotron 3.5 README](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/nemotron_3_5/README.md)
+for multimodal data and launch instructions. For Qwen3, follow the
+[model page](/model-coverage/reranking-models/qwen/Qwen3-Reranker-4B), including its model-specific collator.
+These workflows adapt existing checkpoints; they do not reproduce the released models' original training pipelines.
+
+The Llama quickstart below illustrates the shared training workflow using a base language model.
+For additional backbone initialization examples, refer to
+[Train Retrieval Models from Base Checkpoints](/recipes-e2e-examples/retrieval-base-models).
+
 ## Quickstart
 
 Before running the examples:
@@ -104,6 +125,12 @@ GPU counts that do not divide `32` need an explicit `--step_scheduler.global_bat
 For example, a 6-GPU run can use `--step_scheduler.global_batch_size 120` or another multiple of `4 * 6`.
 
 ## Choose a Recipe
+
+Choose a released model from [Embedding Models](/model-coverage/embedding-models/overview)
+or [Reranking Models](/model-coverage/reranking-models/overview). To initialize a custom
+retrieval model from Llama or Ministral weights, follow
+[Train Retrieval Models from Base Checkpoints](/recipes-e2e-examples/retrieval-base-models).
+
 
 Choose the recipe that matches your retrieval stage:
 

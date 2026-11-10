@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Refer to README.md for the required starting checkpoint and data preparation.
+# Fine-tune the released checkpoint on your data. Refer to README.md for preparation.
 recipe: TrainBiEncoderRecipe
 seed: 42
 temperature: 0.02
@@ -23,7 +23,7 @@ dist_env:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
-  pretrained_model_name_or_path: &model_id <path/to/initialized-embed-8b>
+  pretrained_model_name_or_path: &model_id nvidia/Nemotron-3.5-Embed-8B-BF16
   pooling: avg
   l2_normalize: true
   is_causal: false

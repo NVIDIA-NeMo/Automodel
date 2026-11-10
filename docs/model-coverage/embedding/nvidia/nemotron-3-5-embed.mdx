@@ -1,0 +1,59 @@
+---
+title: "Nemotron-3.5-Embed"
+description: "Explore Nemotron-3.5-Embed multimodal models in NeMo AutoModel, with released checkpoints, 8B fine-tuning instructions, and original training context."
+slug: model-coverage/embedding-models/nvidia/Nemotron-3.5-Embed
+checkpoints:
+  - nvidia/Nemotron-3.5-Embed-1B-BF16
+  - nvidia/Nemotron-3.5-Embed-8B-BF16
+---
+
+Nemotron 3.5 Embed models encode text queries and documents containing an image,
+text, or both. They combine a Pixtral vision encoder with a language model from
+[Nemotron 3 Embed](/model-coverage/embedding-models/nvidia/Nemotron-3-Embed).
+
+## Released Checkpoints
+
+Choose a checkpoint according to your workflow. The linked model cards provide
+inference examples, processor settings, training data, and evaluation.
+
+| Variant | Hugging Face Checkpoint | Embedding Dimensions | AutoModel Example |
+| --- | --- | --- | --- |
+| 1B | [nvidia/Nemotron-3.5-Embed-1B-BF16](https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16) | 2,048 | Checkpoint reference; no dedicated fine-tuning or multimodal distillation example |
+| 8B | [nvidia/Nemotron-3.5-Embed-8B-BF16](https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16) | 4,096 | Multimodal contrastive fine-tuning |
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| **Architecture** | `Mistral3Model` |
+| AutoModel Backbone | `Mistral3BidirectionalModel` |
+| Task | Multimodal embedding and dense retrieval |
+| AutoModel Wrapper | `NeMoAutoModelBiEncoder` |
+| Inputs | Text queries; image, text, or combined image-text documents |
+
+## Fine-Tune the 8B Model
+
+The [8B multimodal embedding example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/nemotron_3_5/embed_8b_multimodal.yaml)
+trains the vision encoder and multimodal projector with a contrastive loss while
+keeping the language model frozen. Follow the
+[fine-tuning README](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/nemotron_3_5/README.md)
+for the starting checkpoint, dataset format, dependencies, and launch command.
+
+The example loads the released NVIDIA checkpoint and its processor directly.
+No text and vision checkpoint assembly is needed for this fine-tuning workflow.
+It adapts the existing model to your data; it does not reproduce the original
+training stages, data mixture, or reported results.
+
+## Original Training Approach
+
+The 8B model starts from a trained Nemotron 3 text component and Ministral 3 vision
+components, then trains the vision encoder and projector with the language model frozen.
+The 1B model uses distillation from the 8B multimodal teacher with a frozen language model.
+The [original training approach](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/nemotron_3_5/README.md#original-training-approach)
+explains initialization and which preparation steps the examples leave to you.
+The Nemotron 3 text distillation example covers a separate, text-only workflow.
+
+For second-stage relevance scoring, refer to
+[Nemotron 3.5 Rerank](/model-coverage/reranking-models/nvidia/Nemotron-3.5-Rerank).
