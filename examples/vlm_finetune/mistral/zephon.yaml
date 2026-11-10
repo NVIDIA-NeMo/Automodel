@@ -31,7 +31,7 @@ step_scheduler:
   ckpt_every_steps: 100
   val_every_steps: 100
   num_epochs: 1
-  max_steps: 125
+  max_steps: 125  # Adjust for your dataset and training budget.
   preemption_signal: null
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
