@@ -81,7 +81,23 @@ class PipelineLossFn(Protocol):
     """Loss the schedule applies to each last-stage microbatch output and its target."""
 
     def __call__(self, output: torch.Tensor | tuple[torch.Tensor, ...], target: torch.Tensor, /) -> torch.Tensor:
-        """Return the scalar loss for one microbatch."""
+        """Return the scalar loss for one microbatch.
+
+        Args:
+            output: The last stage's forward output for this microbatch, unchanged. A
+                Tensor such as logits of shape [microbatch, sequence, vocab] or, when the
+                stage defers ``lm_head`` to a fused linear cross-entropy, hidden states of
+                shape [microbatch, sequence, hidden]; or a tuple of Tensors whose layout the
+                last stage's model and the loss define, such as the MTP tuple
+                ``(logits, *mtp_per_depth_h[, seq_idx])`` handled by
+                ``PipelineCausalLMLoss``.
+            target: This microbatch's slice of the ``target`` passed to the schedule's
+                ``step``/``eval``, split along axis 0; for the causal-LM recipes, label
+                token ids of shape [microbatch, sequence].
+
+        Returns:
+            Scalar loss Tensor for the microbatch.
+        """
         ...
 
 

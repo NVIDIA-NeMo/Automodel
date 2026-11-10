@@ -506,7 +506,31 @@ class _ScaledDotProductAttention(Protocol):
         is_causal: bool = False,
         scale: float | None = None,
         enable_gqa: bool = False,
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Compute scaled dot-product attention with the PyTorch SDPA semantics.
+
+        Args:
+            query: Tensor of shape [..., L, E], where ``L`` is the query sequence length
+                and ``E`` the query/key head dimension, with arbitrary leading dimensions
+                (typically [batch, heads]).
+            key: Tensor of shape [..., S, E] with ``query``'s leading dimensions, where
+                ``S`` is the key/value sequence length; with ``enable_gqa`` its head axis
+                (-3) may be smaller than ``query``'s.
+            value: Tensor of shape [..., S, Ev] with ``key``'s leading dimensions, where
+                ``Ev`` is the value head dimension.
+            attn_mask: Optional boolean mask (``True`` = attend) or additive float mask
+                that broadcasts to [..., L, S].
+            dropout_p: Dropout probability applied to the attention weights.
+            is_causal: Apply a causal (lower-triangular) mask; mutually exclusive with
+                ``attn_mask``.
+            scale: Softmax scale; ``None`` uses ``E ** -0.5``.
+            enable_gqa: Allow ``key``/``value`` to carry fewer heads (axis -3) than
+                ``query`` for grouped-query attention.
+
+        Returns:
+            Tensor of shape [..., L, Ev] with ``query``'s leading dimensions.
+        """
+        ...
 
 
 @contextmanager

@@ -132,6 +132,19 @@ def _needed_only_kernel_succeeded_on_all_ranks(
     In particular, an all-padding rank returns a zero tensor without invoking
     FlashAttention/TE. It must nevertheless learn when a peer's real-token
     kernel returned ``None`` before either rank advances to another collective.
+
+    Args:
+        out: This rank's needed-only attention output, a Tensor of shape [batch,
+            query_heads, local_sequence, head_dim], or ``None`` when the varlen kernel
+            was unavailable. Only whether it is ``None`` is read; its values and layout
+            are not inspected.
+        group: The CP process group that must agree on the outcome.
+        device: Device of the one-element status tensor that is all-reduced.
+        diagnostic: Kernel metadata logged when creating the status tensor raises.
+
+    Returns:
+        True only when every rank of ``group`` produced an output (a MIN all-reduce of
+        the local flag when the group has more than one rank).
     """
     succeeded = out is not None
     if torch.distributed.is_initialized() and torch.distributed.get_world_size(group) > 1:

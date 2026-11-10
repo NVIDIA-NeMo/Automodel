@@ -98,7 +98,23 @@ class _AllGatherSeqDiff(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: _AllGatherSeqContext, x: torch.Tensor, group: ProcessGroup, seq_dim: int) -> torch.Tensor:
-        """All-gather ``x`` (this rank's shard) into the full sequence along ``seq_dim``."""
+        """All-gather ``x`` (this rank's shard) into the full sequence along ``seq_dim``.
+
+        Args:
+            ctx: Autograd context; stores ``group``, ``seq_dim`` and the group size.
+            x: This rank's sequence shard, Tensor of shape [batch, heads, local_sequence,
+                head_dim] with ``seq_dim == 2`` at the block-diagonal SDPA call site, where
+                ``heads`` stacks the key heads followed by the value heads. Tensors of any
+                rank are accepted; ``x`` must have the same shape on every rank of
+                ``group``. ``x`` is not modified.
+            group: Process group (the CP group) to gather over.
+            seq_dim: Axis of ``x`` that holds the sequence shard.
+
+        Returns:
+            Tensor shaped like ``x`` except that the ``seq_dim`` extent is
+            ``world * local_sequence`` (for example [batch, heads, world * local_sequence,
+            head_dim]), with the shards concatenated in group-rank order.
+        """
         ctx.group = group
         ctx.seq_dim = seq_dim
         world = torch.distributed.get_world_size(group)
@@ -202,7 +218,29 @@ class _LeftHaloExchange(torch.autograd.Function):
         prev_peer: int,
         next_peer: int,
     ) -> torch.Tensor:
-        """Exchange the chunk suffix; ``x_local`` is ``[B, C, L, D]``, returns ``[B, C, halo_size, D]``."""
+        """Exchange the chunk suffix; ``x_local`` is ``[B, C, L, D]``, returns ``[B, C, halo_size, D]``.
+
+        Args:
+            ctx: Autograd context; stores the group, ``halo_size``, both peers and
+                ``x_local``'s shape.
+            x_local: This rank's local sequence chunk, Tensor of shape [batch, channels,
+                local_sequence, head_dim] (``[B, C, L, D]``). At the call site ``channels``
+                stacks the key heads followed by the value heads. ``batch``, ``channels``
+                and ``head_dim`` must match on every rank, because the peer's suffix is
+                received into a buffer shaped from this rank's input. ``x_local`` is not
+                modified.
+            group: The CP process group.
+            halo_size: Number of trailing sequence positions sent to ``next_peer`` and
+                received from ``prev_peer``; uniform across ranks and at most
+                ``local_sequence``.
+            prev_peer: Global rank that sends this rank its chunk suffix.
+            next_peer: Global rank that receives this rank's chunk suffix.
+
+        Returns:
+            Tensor of shape [batch, channels, halo_size, head_dim] holding ``prev_peer``'s
+            last ``halo_size`` sequence positions in sequence order. Rank 0 receives the
+            last rank's suffix (the ring wraps around), which callers ignore.
+        """
         ctx.group = group
         ctx.halo_size = halo_size
         ctx.prev_peer = prev_peer
@@ -411,6 +449,27 @@ class _NeededKVExchange(torch.autograd.Function):
 
         ``send_index`` is the 1D int64 local token index (with duplication) of
         the send buffer, of shape ``[sum(in_splits)]``.
+
+        Args:
+            ctx: Autograd context; stores the group, both split lists, the local length
+                and ``send_index``.
+            x_local: This rank's local sequence chunk, Tensor of shape [batch, channels,
+                local_sequence, head_dim] (``[B, C, L, D]``). At the call site ``channels``
+                stacks the key heads followed by the value heads. ``batch``, ``channels``
+                and ``head_dim`` must match on every rank. ``x_local`` is not modified.
+            group: The CP process group.
+            in_splits: Number of sequence positions sent to each CP rank, in rank order.
+            out_splits: Number of sequence positions received from each CP rank, in rank
+                order.
+            send_index: Int64 Tensor of shape [sum(in_splits)] indexing ``x_local``'s
+                sequence axis (axis 2). Indices are grouped by destination rank in rank
+                order, and a position repeats once for every destination that needs it.
+                Saved for backward.
+
+        Returns:
+            Tensor of shape [batch, channels, R_recv, head_dim], where
+            ``R_recv = sum(out_splits)``: the received positions concatenated in
+            source-rank order, which is this rank's contiguous needed global K/V range.
         """
         ctx.group = group
         ctx.in_splits = in_splits

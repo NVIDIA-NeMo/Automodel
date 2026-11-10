@@ -137,6 +137,24 @@ class ColwiseParallelLora(ColwiseParallel):
         def lora_a_output_hook(
             module: nn.Module, input: tuple[torch.Tensor, ...], output: torch.Tensor
         ) -> torch.Tensor:
+            """All-gather ``lora_A``'s rank-sharded output so ``lora_B`` sees the full low-rank activation.
+
+            Args:
+                module: The ``lora_A`` linear (unused).
+                input: ``lora_A``'s positional inputs (unused): ``(x,)``, where ``x`` is the
+                    LoRA module's input after ``ColwiseParallel`` input preparation, a
+                    ``Replicate()`` DTensor of shape [..., in_features] with arbitrary
+                    leading dimensions (typically [batch, sequence] or [tokens]).
+                output: ``lora_A(x)``, Tensor of shape [..., lora_rank] with ``x``'s
+                    leading dimensions, where ``lora_rank`` is the LoRA rank. With the
+                    ``Shard(0)`` ``lora_A`` weight it is a DTensor sharded on its last
+                    (LoRA-rank) axis, each TP rank holding a contiguous slice of it.
+
+            Returns:
+                ``output`` redistributed to ``Replicate()`` on its own 1-D mesh when any
+                placement is ``Shard``, so every TP rank holds the full [..., lora_rank];
+                otherwise ``output`` unchanged (including plain tensors).
+            """
             if isinstance(output, DTensor):
                 if any(isinstance(p, Shard) for p in output.placements):
                     output = output.redistribute(device_mesh=output.device_mesh, placements=[Replicate()])

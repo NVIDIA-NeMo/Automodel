@@ -152,7 +152,27 @@ class SequenceParallelAllGatherActivation(SequenceParallel):
     def _prepare_output_fn(
         use_local_output: bool, mod: nn.Module, outputs: torch.Tensor, device_mesh: DeviceMesh
     ) -> torch.Tensor:
-        """Prepare outputs by redistributing sharded DTensors to replicated placement."""
+        """Prepare outputs by redistributing sharded DTensors to replicated placement.
+
+        ``SequenceParallel`` installs this as the forward hook of the module it
+        parallelizes (a norm layer), with ``use_local_output`` bound from the style.
+
+        Args:
+            use_local_output: Return the local tensor instead of the DTensor.
+            mod: The module that produced ``outputs``.
+            outputs: The module output, a DTensor on the 1-D TP mesh with global shape
+                [batch, sequence, hidden]. Under sequence parallelism it is sharded on the
+                sequence axis (``Shard(1)`` for the default ``sequence_dim``), so each TP
+                rank holds [batch, local_sequence, hidden]. A plain tensor raises
+                ``ValueError``.
+            device_mesh: The 1-D TP device mesh.
+
+        Returns:
+            When any placement of ``outputs`` is ``Shard``, the output all-gathered to
+            ``Replicate()``, so every TP rank holds the full [batch, sequence, hidden];
+            other placements are left unchanged. The local tensor when
+            ``use_local_output`` is True, else the DTensor.
+        """
         # If output is a DTensor with Shard placement, redistribute to Replicate
         if isinstance(outputs, DTensor):
             if any(isinstance(p, Shard) for p in outputs.placements):
@@ -192,6 +212,27 @@ class VocabParallelEmbedding(RowwiseParallel):
         inputs: tuple[torch.Tensor, ...],
         device_mesh: DeviceMesh,
     ) -> torch.Tensor:
+        """Save the original token ids on ``mod``, then prepare the input as ``RowwiseParallel`` does.
+
+        Args:
+            input_layouts: Placements of the incoming token ids on ``device_mesh``;
+                ``(Replicate(),)`` in every plan that uses this style.
+            desired_input_layouts: Placements the vocabulary-sharded lookup requires;
+                ``(Replicate(),)`` for ``nn.Embedding``.
+            mod: The embedding module. A clone of the local token ids, of shape [batch,
+                sequence], is stored on it as ``_vocab_parallel_saved_ids`` for
+                :meth:`_prepare_output_fn`.
+            inputs: The module's positional inputs; ``inputs[0]`` is the integer token-id
+                Tensor of shape [batch, sequence]. A plain tensor is this rank's local value
+                under ``input_layouts`` (with ``Replicate()``, the full ids on every TP
+                rank); for a DTensor, its local tensor is saved. Only ``inputs[0]`` is read
+                and returned.
+            device_mesh: The 1-D TP device mesh.
+
+        Returns:
+            The token ids as a DTensor of shape [batch, sequence] with
+            ``desired_input_layouts`` placements.
+        """
         # Save the original input_ids (before DTensor index-adjustment)
         # so we can recompute the mask in the output hook if needed.
         input_tensor = inputs[0]
@@ -210,6 +251,27 @@ class VocabParallelEmbedding(RowwiseParallel):
         outputs: torch.Tensor,
         device_mesh: DeviceMesh,
     ) -> torch.Tensor:
+        """Populate a missing ``MaskPartial`` mask, then prepare the output as ``RowwiseParallel`` does.
+
+        Args:
+            output_layouts: Target placements of the embedding output: ``(Replicate(),)``
+                (an all-reduce) or ``(Shard(1),)`` (a reduce-scatter over the sequence
+                axis, for sequence parallelism) in every plan that uses this style.
+            use_local_output: Return the local tensor instead of the DTensor.
+            mod: The embedding module; the token ids that :meth:`_prepare_input_fn` saved
+                on it are consumed and deleted here.
+            outputs: The embedding output, a DTensor of shape [batch, sequence, hidden]
+                with the pending vocabulary-parallel sum placement (``MaskPartial``): each
+                TP rank's local [batch, sequence, hidden] holds the rows of the token ids in
+                its vocabulary shard, and the placement's [batch, sequence] mask (True for
+                ids outside the shard) zeroes the other rows when the sum is reduced.
+            device_mesh: The 1-D TP device mesh.
+
+        Returns:
+            The output redistributed to ``output_layouts``, with global shape [batch,
+            sequence, hidden]; under ``Shard(1)`` each rank holds [batch, local_sequence,
+            hidden]. The local tensor when ``use_local_output`` is True, else the DTensor.
+        """
         saved_ids = getattr(mod, "_vocab_parallel_saved_ids", None)
         if saved_ids is not None:
             delattr(mod, "_vocab_parallel_saved_ids")
@@ -250,6 +312,26 @@ class RotaryEmbedParallel(SequenceParallel):
         inputs: tuple[torch.Tensor, ...],
         device_mesh: DeviceMesh,
     ) -> tuple[torch.Tensor, ...]:
+        """Annotate the rotary module's hidden-state and position inputs as DTensors.
+
+        Args:
+            sequence_sharding: Placements of the sequence-parallel activations,
+                ``(Shard(sequence_dim),)`` (``Shard(1)`` by default).
+            mod: The rotary embedding module.
+            inputs: The module's positional inputs ``(hidden_states, position_ids,
+                *rest)``. ``hidden_states`` has global shape [batch, sequence, hidden]; a
+                DTensor passes through, while a plain tensor is taken as this rank's
+                sequence shard [batch, local_sequence, hidden] and wrapped with
+                ``sequence_sharding`` (checked across ranks: every TP rank must hold the
+                same local shape). ``position_ids`` is a Tensor of shape [batch, sequence]
+                covering the full sequence; a plain tensor is wrapped as ``Replicate()``.
+                Further entries (for example a layer-type string) pass through unchanged.
+            device_mesh: The 1-D TP device mesh.
+
+        Returns:
+            ``inputs`` in its original container type, with its first two entries as
+            DTensors.
+        """
         new_inputs = list(inputs)
 
         if not isinstance(inputs[0], DTensor):
@@ -282,6 +364,23 @@ class RotaryEmbedParallel(SequenceParallel):
     def _prepare_output_fn(
         use_local_output: bool, mod: nn.Module, outputs: tuple[DTensor, ...], device_mesh: DeviceMesh
     ) -> tuple[torch.Tensor, ...]:
+        """Convert the rotary outputs to local tensors when ``use_local_output`` is True.
+
+        Args:
+            use_local_output: Convert each output with ``to_local()``.
+            mod: The rotary embedding module (unused).
+            outputs: The rotary module's ``(cos, sin)`` tuple of DTensors, each of shape
+                [batch, sequence, rotary_dim], where ``rotary_dim`` is the rotary width
+                (the head dimension for Qwen2 and Gemma3). They are computed from the
+                ``Replicate()`` ``position_ids``, so they are replicated and each rank's
+                local tensor covers the full sequence.
+            device_mesh: The TP device mesh (unused).
+
+        Returns:
+            ``(cos, sin)`` as local tensors of shape [batch, sequence, rotary_dim] when
+            ``use_local_output`` is True, else the DTensors unchanged; placements are not
+            redistributed.
+        """
         # ``outputs`` is the rotary module's ``(cos, sin)`` tuple of DTensors.
         return tuple(o.to_local() if use_local_output else o for o in outputs)
 

@@ -89,7 +89,18 @@ class _VisionTowerOutput(Protocol):
 
     pooler_output: torch.Tensor
 
-    def __setattr__(self, name: str, value: torch.Tensor | list[torch.Tensor], /) -> None: ...
+    def __setattr__(self, name: str, value: torch.Tensor | list[torch.Tensor], /) -> None:
+        """Replace one merged-token field of the output object.
+
+        Args:
+            name: ``"pooler_output"`` or ``"deepstack_features"``.
+            value: For ``pooler_output``, a Tensor of shape [merged_tokens, hidden]; for
+                ``deepstack_features``, a list with one Tensor of that shape per deepstack
+                level. ``merged_tokens`` counts merged visual tokens in entry order (this
+                rank's entries, or every entry after the gather) and ``hidden`` is the
+                vision output hidden size.
+        """
+        ...
 
 
 _VisionOutputT = TypeVar("_VisionOutputT", bound=_VisionTowerOutput)
@@ -110,7 +121,30 @@ class _FrameShardableVisionTower(Protocol[_VisionOutputT_co]):
 
     def __call__(
         self, pixel_values: torch.Tensor | None, *, grid_thw: torch.Tensor | None, return_dict: bool
-    ) -> _VisionOutputT_co: ...
+    ) -> _VisionOutputT_co:
+        """Encode the patch rows of the image/frame entries described by ``grid_thw``.
+
+        Args:
+            pixel_values: Tensor of shape [patch_rows, patch_dim] holding flattened patch
+                rows, frame-contiguous in entry order and then frame order within each
+                entry. On the sharded path it is this rank's contiguous slice of whole
+                frames, which may include zero-filled padding frames. ``None`` when the
+                batch has no media.
+            grid_thw: Integer Tensor of shape [entries, 3] holding each entry's
+                ``(time, height, width)`` patch grid; entry ``i`` owns
+                ``time * height * width`` rows of ``pixel_values``. When both inputs are
+                present it is on ``pixel_values``'s device. ``None`` when the batch has
+                no media.
+            return_dict: Always True; the tower returns an output object.
+
+        Returns:
+            Output whose ``pooler_output`` is a Tensor of shape
+            [patch_rows / spatial_merge_size**2, hidden], one merged token per
+            ``spatial_merge_size ** 2`` patch rows in entry order, where ``hidden`` is the
+            vision output hidden size; deepstack towers also return a
+            ``deepstack_features`` list of tensors with that shape.
+        """
+        ...
 
 
 @dataclass(frozen=True)
