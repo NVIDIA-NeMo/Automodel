@@ -52,17 +52,17 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.distributed._patching import set_undeclared_attr
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ShardContextFactory,
     ShardedBatch,
-    THDBatch,
     TokenBatch,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import (
     _make_cp_batch_and_ctx,
-    _thd_tensor,
     make_cp_batch_for_te,
 )
+from nemo_automodel.components.distributed.thd_utils import THDBatch, batch_tensor
 
 if TYPE_CHECKING:
     from magi_attention.api import DistAttnRuntimeKey
@@ -607,7 +607,9 @@ def _set_cp_group_on_attention(model: torch.nn.Module, cp_group: dist.ProcessGro
     """Stamp ``cp_group`` on every attention sub-module so the FFA forward finds the key."""
     for module in model.modules():
         if "Attention" in type(module).__name__:
-            module.cp_group = cp_group
+            # HF attention modules declare no ``cp_group``; the registered magi
+            # forward reads it back from the module it is handed.
+            set_undeclared_attr(module, "cp_group", cp_group)
 
 
 def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
@@ -687,7 +689,7 @@ def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
     return new_batch, key
 
 
-def _packed_cp_doc_seqlens(batch: TokenBatch, total_len: int) -> list[int]:
+def _packed_cp_doc_seqlens(batch: THDBatch[torch.Tensor], total_len: int) -> list[int]:
     """Resolve per-document lengths spanning the *padded* THD layout of length ``total_len``.
 
     The TE collater pads each document for the THD layout, so ``cu_seqlens_padded``
@@ -712,9 +714,7 @@ def _packed_cp_doc_seqlens(batch: TokenBatch, total_len: int) -> list[int]:
     Raises:
         ValueError: if the resolved document layout does not span ``total_len``.
     """
-    cu = batch.get("cu_seqlens_padded")
-    if cu is None:
-        cu = batch["cu_seqlens"]
+    cu = batch_tensor(batch, "cu_seqlens_padded" if batch.get("cu_seqlens_padded") is not None else "cu_seqlens")
     cu = cu.reshape(-1)
     cu = cu[cu >= 0]  # drop -1000 padding sentinels if present
     seqlens = (cu[1:] - cu[:-1]).tolist()
@@ -727,8 +727,8 @@ def _packed_cp_doc_seqlens(batch: TokenBatch, total_len: int) -> list[int]:
 
 
 def magi_prepare_packed_cp(
-    model: torch.nn.Module, batch: TokenBatch, cp_group: dist.ProcessGroup | None
-) -> tuple[THDBatch, DistAttnRuntimeKey]:  # pragma: no cover - requires GPU + magi_attention
+    model: torch.nn.Module, batch: THDBatch[torch.Tensor], cp_group: dist.ProcessGroup | None
+) -> tuple[THDBatch[torch.Tensor], DistAttnRuntimeKey]:  # pragma: no cover - requires GPU + magi_attention
     """Context-parallel prep for a packed (THD) batch on the custom-model path.
 
     Takes a *global* THD batch (flat ``input_ids``/``labels``/``position_ids`` plus
@@ -754,7 +754,7 @@ def magi_prepare_packed_cp(
     """
     from magi_attention.api import dispatch, get_position_ids
 
-    input_ids = batch["input_ids"].reshape(-1)  # global flat (padded THD) [T]
+    input_ids = batch_tensor(batch, "input_ids").reshape(-1)  # global flat (padded THD) [T]
     seqlens = _packed_cp_doc_seqlens(batch, int(input_ids.numel()))
     spec = AttnMaskSpec.varlen(seqlens, causal=True)
     num_heads_q, num_heads_kv, head_dim = _get_head_config(_unwrap_model(model))
@@ -772,8 +772,8 @@ def magi_prepare_packed_cp(
     # into the global loss. (Undispatching logits to global instead would make
     # every CP rank compute the full loss redundantly -> the reduction would
     # double-count it by a factor of cp_size.)
-    local_labels = dispatch(batch["labels"].reshape(-1), key=key)
-    new_batch: THDBatch = {
+    local_labels = dispatch(batch_tensor(batch, "labels").reshape(-1), key=key)
+    new_batch: THDBatch[torch.Tensor] = {
         "input_ids": local_input,
         "position_ids": local_pos,
         "labels": local_labels,
@@ -840,8 +840,8 @@ def magi_prepare_vlm(
     # forward builds the causal key from the actual post-merge query length. The
     # vision tower keeps no cp_group and falls back to SDPA.
     for module in _iter_language_model_attention(model):
-        module.cp_group = cp_group
-        module._magi_self_key = True
+        set_undeclared_attr(module, "cp_group", cp_group)
+        set_undeclared_attr(module, "_magi_self_key", True)
     return batch, None
 
 
@@ -951,7 +951,7 @@ class MagiState:
             # sharding) then dispatch it with magi's own load-balancing solver.
             global_batch = make_cp_batch_for_te(None, batch, qkv_format="thd", padding_token_id=pad_id, num_chunks=1)
             prepared, _ = magi_prepare_packed_cp(model, global_batch, self.cp_group)
-            local_indices = _thd_tensor(prepared, "position_ids")
+            local_indices = batch_tensor(prepared, "position_ids")
         elif is_thd:
             # cp=1 packing: THD conversion (no sharding) so the batch carries
             # cu_seqlens -> the magi attn_func builds the per-document mask.

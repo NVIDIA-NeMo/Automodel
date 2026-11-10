@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable, Generator
-from typing import Any
+from typing import TypeVar
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -26,9 +26,15 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.distributed.blockdiag_cp import kernels
 from nemo_automodel.components.distributed.blockdiag_cp import state as state_module
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+from nemo_automodel.components.distributed.thd_utils import batch_tensor, optional_tensor
+
+# Type of the batch entries the block-diagonal shard passes through unchanged (e.g. media).
+_V = TypeVar("_V")
 
 
-def _cp_blockdiag_doc_ids(batch: dict[str, Any], seq_len: int, device: torch.device, batch_size: int) -> torch.Tensor:
+def _cp_blockdiag_doc_ids(
+    batch: dict[str, _V | torch.Tensor | list[torch.Tensor]], seq_len: int, device: torch.device, batch_size: int
+) -> torch.Tensor:
     """Resolve per-position document ids ``[B, S]`` (0 == padding) for the mask.
 
     Prefers the collator's ``_packed_seq_ids`` (1-based document index per token,
@@ -47,10 +53,10 @@ def _cp_blockdiag_doc_ids(batch: dict[str, Any], seq_len: int, device: torch.dev
     Returns:
         Per-position document ids ``[B, S]`` (int64, 0 == padding).
     """
-    seq_ids = batch.get("_packed_seq_ids", None)
+    seq_ids = optional_tensor(batch.get("_packed_seq_ids", None), "_packed_seq_ids")
     if seq_ids is not None:
         return seq_ids.to(device=device, dtype=torch.long)
-    attn = batch.get("attention_mask", None)
+    attn = optional_tensor(batch.get("attention_mask", None), "attention_mask")
     if attn is not None and attn.dim() == 4:
         # [B, 1, S, S] block-causal bool -> diagonal gives per-position validity.
         valid = attn[:, 0].diagonal(dim1=-2, dim2=-1)  # [B, S]
@@ -62,14 +68,18 @@ def _cp_blockdiag_doc_ids(batch: dict[str, Any], seq_len: int, device: torch.dev
 
 
 def make_cp_blockdiag_batch_and_ctx(
-    cp_mesh: DeviceMesh,
+    cp_mesh: DeviceMesh | None,
     tp_mesh: DeviceMesh | None,
-    batch: dict[str, Any],
+    batch: dict[str, _V | torch.Tensor | list[torch.Tensor]],
     *,
     loss_mask: torch.Tensor | None = None,
     padding_token_id: int = 0,
     shard_primary: bool = True,
-) -> tuple[Callable[[], contextlib.AbstractContextManager[None]], dict[str, Any], ShardLayout | None]:
+) -> tuple[
+    Callable[[], contextlib.AbstractContextManager[None]],
+    dict[str, _V | torch.Tensor | list[torch.Tensor]],
+    ShardLayout | None,
+]:
     """Sequentially shard a batch for block-diagonal CP.
 
     Pads the sequence to a multiple of twice the CP world size, slices each
@@ -85,7 +95,8 @@ def make_cp_blockdiag_batch_and_ctx(
     whose batch verb is this callable.
 
     Args:
-        cp_mesh: The context-parallel device (sub)mesh.
+        cp_mesh: The context-parallel device (sub)mesh; required. The type admits
+            None because sharders pass their optional CP submesh.
         tp_mesh: Accepted for the shared sharder signature; unused
             (block-diagonal CP shards only the sequence dimension).
         batch: The training batch. Contains exactly one primary stream:
@@ -94,7 +105,9 @@ def make_cp_blockdiag_batch_and_ctx(
             place: ``attention_mask`` is dropped, ``padding_mask`` of shape
             ``[batch, sequence]`` (bool, True == pad) is added, and auxiliary
             sequence-aligned tensors are padded then sliced to this rank's
-            ``[row_offset, row_offset + sequence/cp)`` chunk.
+            ``[row_offset, row_offset + sequence/cp)`` chunk. Deepstack VLMs add
+            ``_deepstack_visual_embeds``, a list of [visual_tokens, hidden] tensors;
+            other entries pass through unchanged.
         loss_mask: Optional per-token loss mask ``[B, S]``; padded with 0 and
             sharded like the other sequence-aligned tensors (stored back into
             ``batch["loss_mask"]``).
@@ -109,14 +122,20 @@ def make_cp_blockdiag_batch_and_ctx(
         ``(train_ctx, batch, layout)``: a zero-arg callable returning the
         per-step context manager, the sharded batch, and its contiguous
         :class:`~nemo_automodel.components.distributed.context_parallel.sharder.ShardLayout`.
+
+    Raises:
+        TypeError: If ``cp_mesh`` is None, or a sharded entry has the wrong type.
     """
     from contextlib import nullcontext
 
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
+    if cp_mesh is None:
+        raise TypeError("make_cp_blockdiag_batch_and_ctx requires a context-parallel mesh, got None")
     world = cp_mesh.size()
     if world <= 1:
-        primary = batch.get("inputs_embeds", batch.get("input_ids"))
+        primary_name = "inputs_embeds" if "inputs_embeds" in batch else "input_ids"
+        primary = optional_tensor(batch.get(primary_name), primary_name)
         layout = None
         if primary is not None:
             layout = ShardLayout(original_seq_len=primary.shape[1], padded_seq_len=primary.shape[1])
@@ -130,7 +149,7 @@ def make_cp_blockdiag_batch_and_ctx(
     if has_inputs_embeds == has_input_ids:
         raise ValueError("block-diagonal CP requires exactly one of 'inputs_embeds' or 'input_ids' in the batch")
     primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
-    primary = batch[primary_key]
+    primary = batch_tensor(batch, primary_key)
     B, S = primary.shape[0], primary.shape[1]
     device = primary.device
 
@@ -262,7 +281,7 @@ def make_cp_blockdiag_batch_and_ctx(
     # sees matching counts. Computed from the FULL (padded) visual_pos_masks
     # before it is sharded.
     if "_deepstack_visual_embeds" in batch and "visual_pos_masks" in batch:
-        vpm = batch["visual_pos_masks"]  # [B, S] bool (packing -> B == 1)
+        vpm = batch_tensor(batch, "visual_pos_masks")  # [B, S] bool (packing -> B == 1)
         if pad_len:
             vpm = torch.cat(
                 [vpm, torch.zeros(vpm.shape[0], pad_len, dtype=vpm.dtype, device=vpm.device)],
@@ -270,7 +289,10 @@ def make_cp_blockdiag_batch_and_ctx(
             )
         v_start = int(vpm[0, :row_offset].sum())
         n_local = int(vpm[0, row_offset : row_offset + local_len].sum())
-        batch["_deepstack_visual_embeds"] = [d[v_start : v_start + n_local] for d in batch["_deepstack_visual_embeds"]]
+        deepstack_embeds = batch["_deepstack_visual_embeds"]
+        if not isinstance(deepstack_embeds, list):
+            raise TypeError("_deepstack_visual_embeds must be a list of per-layer visual embedding tensors")
+        batch["_deepstack_visual_embeds"] = [d[v_start : v_start + n_local] for d in deepstack_embeds]
 
     seq_aligned = (
         "inputs_embeds",
@@ -285,8 +307,9 @@ def make_cp_blockdiag_batch_and_ctx(
     for key in seq_aligned:
         if not shard_primary and key == primary_key:
             continue
-        if key in batch and isinstance(batch[key], torch.Tensor):
-            batch[key] = _shard(key, batch[key])
+        value = batch.get(key)
+        if isinstance(value, torch.Tensor):
+            batch[key] = _shard(key, value)
 
     runtime_config = state_module.cp_varlen_runtime_config()
     step_state: state_module._BlockdiagStepState = {

@@ -12,7 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TypeAlias, TypeVar
+
 import torch
+
+# Type of the source-batch entries that the THD conversion passes through unchanged
+# (e.g. ``qkv_format`` tags or VLM media such as ``pixel_values``).
+_V = TypeVar("_V")
+# Entries that THD conversion and CP sharding write: token and boundary tensors (e.g.
+# ``input_ids`` of shape [tokens], ``cu_seqlens`` of shape [sequences + 1]), the
+# ``pad_between_seqs`` flag, the ``qkv_format`` tag and ``cp_size``/``cp_rank`` ints added
+# by CP sharding, and None for absent optional metadata (``position_ids``, ``cu_seqlens``).
+THDBatchValue: TypeAlias = torch.Tensor | bool | int | str | None
+# A THD batch: the entries above plus the source batch's other entries, of type ``_V``.
+THDBatch: TypeAlias = dict[str, _V | THDBatchValue]
+
+
+def batch_tensor(batch: Mapping[str, object], key: str) -> torch.Tensor:
+    """Return the tensor stored under ``key`` in a batch that also holds non-tensor entries.
+
+    Source and THD batches mix token tensors with metadata (``qkv_format``,
+    ``pad_between_seqs``, ``cp_rank``), None placeholders and pass-through values, so
+    readers validate each entry they use as a tensor.
+
+    Args:
+        batch: Batch mapping names to tensors and other entries.
+        key: Name of a tensor entry, e.g. ``input_ids``.
+
+    Returns:
+        The tensor stored under ``key``, unchanged.
+
+    Raises:
+        KeyError: If ``key`` is absent.
+        TypeError: If the entry is not a tensor.
+    """
+    value = batch[key]
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"batch entry {key!r} must be a tensor, got {type(value).__name__}")
+    return value
+
+
+def optional_tensor(value: object, key: str) -> torch.Tensor | None:
+    """Validate a batch entry that is either a tensor or None.
+
+    Args:
+        value: The entry, e.g. ``batch["seq_lens"]`` or ``batch.get("labels")``.
+        key: Name of the entry, used in the error message.
+
+    Returns:
+        ``value`` unchanged.
+
+    Raises:
+        TypeError: If ``value`` is neither a tensor nor None.
+    """
+    if value is not None and not isinstance(value, torch.Tensor):
+        raise TypeError(f"batch entry {key!r} must be a tensor or None, got {type(value).__name__}")
+    return value
 
 
 def thd_padding_mask_from_token_ids(input_ids: torch.Tensor, padding_token_id: int) -> torch.Tensor:
@@ -83,10 +141,10 @@ def _thd_padding_mask(
 
 
 def process_input_for_thd(
-    batch: dict[str, torch.Tensor],
+    batch: Mapping[str, _V],
     seq_lens_padding_value: int = -1000,
     padding_token_id: int = 0,
-) -> dict[str, torch.Tensor]:
+) -> THDBatch[_V]:
     """
     Process inputs for THD (total, hidden, depth) format.
 
@@ -116,6 +174,8 @@ def process_input_for_thd(
                 matching attention boundaries. Zero marks padding.
             - Optional document_ids: Original membership [batch_size, seq_len] for
                 an explicit model consumer; it does not override attention or loss.
+            ``position_ids``, ``seq_lens`` and ``seq_lens_padded`` must be present but
+            may be None. Every other entry, tensor or not, is passed through.
         seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
             tensors that should be filtered out (default: -1000)
         padding_token_id: Filler token id. The padding mask is derived from the pack
@@ -148,7 +208,13 @@ def process_input_for_thd(
             - Optional _packed_seq_ids: Selected IDs [total_tokens], made distinct across
                 batch documents while preserving zero-valued padding. Optional
                 document_ids are transformed independently to the same layout.
-            - Non-tensor keys from input batch are preserved (e.g., 'qkv_format')
+            - Every other input entry except seq_lens/seq_lens_padded, unchanged
+                (e.g., 'qkv_format' or VLM media such as 'pixel_values')
+
+    Raises:
+        KeyError: If a required entry is absent.
+        TypeError: If ``input_ids``/``labels`` is not a tensor, or another consumed
+            entry is neither a tensor nor None.
 
     Example:
         >>> batch_size, seq_len = 2, 6
@@ -172,11 +238,11 @@ def process_input_for_thd(
         >>> # result['max_seqlen']: tensor(6, dtype=torch.int32)  # max slot width in cu_seqlens
         >>> # result['padding_mask'].shape: [12]
     """
-    input_ids = batch["input_ids"]
-    labels = batch["labels"]
-    position_ids = batch["position_ids"]
-    seq_lens = batch["seq_lens"]
-    seq_lens_padded = batch["seq_lens_padded"]
+    input_ids = batch_tensor(batch, "input_ids")
+    labels = batch_tensor(batch, "labels")
+    position_ids = optional_tensor(batch["position_ids"], "position_ids")
+    seq_lens = optional_tensor(batch["seq_lens"], "seq_lens")
+    seq_lens_padded = optional_tensor(batch["seq_lens_padded"], "seq_lens_padded")
 
     # Reshape to THD format: collapse batch dimension
     # Get total number of tokens from input_ids
@@ -262,7 +328,7 @@ def process_input_for_thd(
             device=input_ids_thd.device,
         )
 
-    result = {
+    result: THDBatch[_V] = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
         "cu_seqlens": cu_seqlens,
@@ -270,7 +336,7 @@ def process_input_for_thd(
         "padding_mask": padding_mask,
     }
     for key in ("_packed_seq_ids", "document_ids"):
-        document_ids = batch.get(key)
+        document_ids = optional_tensor(batch.get(key), key)
         if document_ids is not None:
             if document_ids.shape != labels.shape:
                 raise ValueError(f"THD {key} must match labels [batch, sequence]")
@@ -279,7 +345,8 @@ def process_input_for_thd(
             result[key] = torch.where(document_ids > 0, document_ids + offsets[:, None], 0).reshape(-1)
     # Physical boundaries are data, not a backend switch. Decide padding once
     # for this stream, comparing the entire arrays (including the final offset).
-    if cu_seqlens_padded is not None:
+    # Padded boundaries are only built alongside the real ones (both need seq_lens).
+    if cu_seqlens_padded is not None and cu_seqlens is not None:
         result["cu_seqlens_padded"] = cu_seqlens_padded
         result["pad_between_seqs"] = not torch.equal(cu_seqlens_padded, cu_seqlens)
     if max_seqlen is not None:
@@ -297,11 +364,11 @@ def process_input_for_thd(
 
 
 def split_batch_into_thd_chunks(
-    batch: dict[str, torch.Tensor],
+    batch: Mapping[str, _V],
     num_chunks: int,
     seq_lens_padding_value: int = -1000,
     padding_token_id: int = 0,
-) -> dict[str, torch.Tensor]:
+) -> THDBatch[_V]:
     """
     Process inputs for THD format by splitting batch into chunks for context parallelism.
 
@@ -391,7 +458,7 @@ def split_batch_into_thd_chunks(
             padded.append(t)
         return torch.stack(padded)
 
-    chunk_size = batch["input_ids"].shape[0] // num_chunks
+    chunk_size = batch_tensor(batch, "input_ids").shape[0] // num_chunks
 
     # Process all chunks
     chunk_results = [
@@ -406,24 +473,24 @@ def split_batch_into_thd_chunks(
         for i in range(num_chunks)
     ]
 
-    stacked: dict[str, torch.Tensor] = {
-        "input_ids": torch.stack([c["input_ids"] for c in chunk_results]),
-        "labels": torch.stack([c["labels"] for c in chunk_results]),
-        "position_ids": torch.stack([c["position_ids"] for c in chunk_results]),
-        "cu_seqlens": pad_and_stack([c["cu_seqlens"] for c in chunk_results], seq_lens_padding_value),
-        "padding_mask": torch.stack([c["padding_mask"] for c in chunk_results]),
+    stacked: THDBatch[_V] = {
+        "input_ids": torch.stack([batch_tensor(c, "input_ids") for c in chunk_results]),
+        "labels": torch.stack([batch_tensor(c, "labels") for c in chunk_results]),
+        "position_ids": torch.stack([batch_tensor(c, "position_ids") for c in chunk_results]),
+        "cu_seqlens": pad_and_stack([batch_tensor(c, "cu_seqlens") for c in chunk_results], seq_lens_padding_value),
+        "padding_mask": torch.stack([batch_tensor(c, "padding_mask") for c in chunk_results]),
     }
     # Stack physical boundaries independently of the per-microbatch padding decision.
     if any("cu_seqlens_padded" in c for c in chunk_results):
         stacked["cu_seqlens_padded"] = pad_and_stack(
-            [c.get("cu_seqlens_padded", c["cu_seqlens"]) for c in chunk_results],
+            [batch_tensor(c, "cu_seqlens_padded" if "cu_seqlens_padded" in c else "cu_seqlens") for c in chunk_results],
             seq_lens_padding_value,
         )
     if all("max_seqlen" in c for c in chunk_results):
-        stacked["max_seqlen"] = torch.stack([c["max_seqlen"] for c in chunk_results])
+        stacked["max_seqlen"] = torch.stack([batch_tensor(c, "max_seqlen") for c in chunk_results])
     for key in ("_packed_seq_ids", "document_ids"):
         if all(key in c for c in chunk_results):
-            stacked[key] = torch.stack([c[key] for c in chunk_results])
+            stacked[key] = torch.stack([batch_tensor(c, key) for c in chunk_results])
     stacked.update(
         {k: v for k, v in chunk_results[0].items() if not isinstance(v, torch.Tensor) and k != "pad_between_seqs"}
     )

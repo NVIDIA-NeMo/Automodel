@@ -713,6 +713,7 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                 from nemo_automodel.components.distributed.context_parallel.utils import (  # noqa: PLC0415
                     make_cp_batch_for_te,
                 )
+                from nemo_automodel.components.distributed.thd_utils import batch_tensor  # noqa: PLC0415
 
                 source_ids = local_batch.get("input_ids")
                 row_shape = tuple(source_ids.shape[:2]) if source_ids is not None and source_ids.ndim >= 2 else None
@@ -734,7 +735,7 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                         sharded[key] = value.unsqueeze(0)
                 if thd_num_chunks > 1:
                     cp_size = cp_mesh.size() if cp_mesh is not None else 1
-                    local_tokens = sharded["input_ids"].shape[-1]
+                    local_tokens = batch_tensor(sharded, "input_ids").shape[-1]
                     if cp_size > 1:
                         has_tex, tex = safe_import("transformer_engine_torch")
                         if not has_tex:
@@ -750,13 +751,15 @@ class MuseSpark1xOmniForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
                                     cp_size,
                                     sharded["cp_rank"],
                                 )
-                                for cu in sharded["cu_seqlens"]
+                                for cu in batch_tensor(sharded, "cu_seqlens")
                             ]
                         )
                     else:
                         local_indices = torch.arange(
-                            local_tokens, device=sharded["input_ids"].device, dtype=torch.long
+                            local_tokens, device=batch_tensor(sharded, "input_ids").device, dtype=torch.long
                         ).expand(thd_num_chunks, -1)
+                if local_indices is None:
+                    raise ValueError("Muse Spark THD sharding produced no local token index map")
                 if pp_stage:
                     # Match ordinary VLM PP: stage zero receives the full token
                     # stream, while labels, positions, and stage activations are

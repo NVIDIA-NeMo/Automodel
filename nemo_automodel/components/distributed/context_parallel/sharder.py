@@ -60,46 +60,59 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.distributed.thd_utils import THDBatch, batch_tensor, optional_tensor
+
 # Token-aligned batch tensors keyed by name, e.g. ``input_ids``/``labels`` of shape
-# [batch, sequence] or ``inputs_embeds`` of shape [batch, sequence, hidden]. This is
-# the CP shard input contract shared with ``thd_utils.split_batch_into_thd_chunks``.
+# [batch, sequence] or ``inputs_embeds`` of shape [batch, sequence, hidden].
 TokenBatch: TypeAlias = dict[str, torch.Tensor]
 # A caller's token batch, mutated in place and handed back by the in-place sharders.
 _TokenBatchT = TypeVar("_TokenBatchT", bound=TokenBatch)
-# Entries of a THD batch produced by the TE conversion: token tensors plus the
-# ``qkv_format`` tag, the ``pad_between_seqs`` flag and the ``cp_size``/``cp_rank``
-# scalars.
-THDBatchValue: TypeAlias = torch.Tensor | str | bool | int
-THDBatch: TypeAlias = dict[str, THDBatchValue]
+# Non-tensor entries (metadata tags, media lists, None placeholders) that a sharder
+# passes through unchanged next to the token tensors it pads and slices.
+_BatchValueT = TypeVar("_BatchValueT")
 # A sharded batch: token tensors only, or a THD batch with its metadata entries.
-ShardedBatch: TypeAlias = TokenBatch | THDBatch
+ShardedBatch: TypeAlias = TokenBatch | THDBatch[torch.Tensor]
 # Zero-argument factory of the forward context (``contextlib.nullcontext`` when the
 # backend owns its transport).
 ShardContextFactory: TypeAlias = Callable[[], AbstractContextManager[None]]
 # ``(cp_mesh, padded_seq_len, device) -> LongTensor [local_tokens]`` index map.
 LocalTokenIndicesFn: TypeAlias = Callable[[DeviceMesh | None, int, torch.device | None], torch.Tensor]
+# What a ``shard_batch`` accepts and returns. Each strategy owns its batch schema (token
+# tensors, packed THD metadata, model-owned media or attention plans) and its mesh
+# requirement: framework strategies accept a missing ``cp`` axis (None), while a strategy
+# a model installs for its own CP layout may require the submesh.
+_MeshContraT = TypeVar("_MeshContraT", bound=DeviceMesh | None, contravariant=True)
+_BatchContraT = TypeVar("_BatchContraT", contravariant=True)
+_ShardedCoT = TypeVar("_ShardedCoT", covariant=True)
+_BatchT = TypeVar("_BatchT")
+_ShardedT = TypeVar("_ShardedT")
 
 
-class ShardBatchFn(Protocol):
-    """Callable contract of :attr:`ContextParallelSharder.shard_batch`."""
+class ShardBatchFn(Protocol[_MeshContraT, _BatchContraT, _ShardedCoT]):
+    """Callable contract of :attr:`ContextParallelSharder.shard_batch`.
+
+    Generic in the CP mesh it accepts (``DeviceMesh`` or ``DeviceMesh | None``),
+    the batch it shards, and the sharded batch it returns.
+    """
 
     def __call__(
         self,
-        cp_mesh: DeviceMesh | None,
+        cp_mesh: _MeshContraT,
         tp_mesh: DeviceMesh | None,
-        batch: TokenBatch,
+        batch: _BatchContraT,
         /,
         *,
         loss_mask: torch.Tensor | None,
         padding_token_id: int,
-    ) -> tuple[ShardContextFactory, ShardedBatch, ShardLayout | None]:
+    ) -> tuple[ShardContextFactory, _ShardedCoT, ShardLayout | None]:
         """Pad and shard ``batch`` and report the layout it applied.
 
         Args:
-            cp_mesh: Context-parallel submesh, or None when the mesh has no ``cp`` axis.
+            cp_mesh: Context-parallel submesh; the sharder passes None when its mesh
+                has no ``cp`` axis.
             tp_mesh: Tensor-parallel submesh, or None when the mesh has no ``tp`` axis.
-            batch: Full-sequence token tensors, e.g. ``input_ids`` of shape
-                [batch, sequence]; THD sources are flattened by the backend.
+            batch: Full-sequence batch in the strategy's schema, e.g. ``input_ids`` of
+                shape [batch, sequence]; THD sources are flattened by the backend.
             loss_mask: Optional per-token mask of shape [batch, sequence].
             padding_token_id: Pad sentinel for ``input_ids``.
 
@@ -344,6 +357,9 @@ class ContextParallelSharder:
             the layout never leaks across steps.
     """
 
+    # Left unparameterized: the strategy, and with it the mesh requirement and batch
+    # schema, is chosen at runtime (model hook or attention backend), and :meth:`shard`
+    # hands it the caller's batch.
     shard_batch: ShardBatchFn
     local_token_global_indices: LocalTokenIndicesFn | None
     shard_layout: ShardLayout | None
@@ -358,7 +374,7 @@ class ContextParallelSharder:
         device_mesh: DeviceMesh | None = None,
         batch: dict[str, Any] | None = None,
         *,
-        shard_batch: ShardBatchFn | None = None,
+        shard_batch: ShardBatchFn[DeviceMesh, _BatchT, _ShardedT] | None = None,
         local_token_global_indices: LocalTokenIndicesFn | None = None,
         shard_layout: ShardLayout | None = None,
         padding_token_id: int = 0,
@@ -382,8 +398,10 @@ class ContextParallelSharder:
                 ``qkv_format="thd"`` and are flattened during :meth:`shard`.
                 Model hook metadata is merged into this mapping in place.
             shard_batch: Optional backend callback for direct strategy
-                construction. It accepts token tensors with backend-defined
-                layouts and returns the sharded batch plus its layout.
+                construction. It accepts a batch in its own schema (token tensors
+                with backend-defined layouts plus metadata) and returns the
+                sharded batch plus its layout. A strategy a model installs for
+                its own CP layout may require the CP submesh.
             local_token_global_indices: Optional callback returning a tensor of
                 shape [local_tokens] with each local token's global position.
             shard_layout: Optional captured layout for direct strategy
@@ -620,7 +638,7 @@ def _pad_position_ids_seq_dim_(position_ids: torch.Tensor, seq_dim: int, pad_len
     return torch.cat((position_ids, last_position + increments), dim=seq_dim)
 
 
-def convert_attention_mask_to_padding_mask(batch: TokenBatch) -> None:
+def convert_attention_mask_to_padding_mask(batch: dict[str, _BatchValueT | torch.Tensor]) -> None:
     """Pop ``attention_mask`` and derive ``padding_mask`` (True == pad) in place.
 
     Preserves padding semantics for modules such as MoE routers after the
@@ -628,12 +646,16 @@ def convert_attention_mask_to_padding_mask(batch: TokenBatch) -> None:
     ``padding_mask`` already exists or there is no ``attention_mask``.
 
     Args:
-        batch: Token tensors, mutated in place. ``attention_mask`` is a [batch,
-            sequence] validity mask (nonzero == token) or a [batch, 1, sequence,
-            sequence] mask whose diagonal marks valid tokens; the derived
-            ``padding_mask`` is a bool tensor of shape [batch, sequence].
+        batch: Token tensors and pass-through entries, mutated in place.
+            ``attention_mask`` is a [batch, sequence] validity mask (nonzero ==
+            token) or a [batch, 1, sequence, sequence] mask whose diagonal marks
+            valid tokens; the derived ``padding_mask`` is a bool tensor of shape
+            [batch, sequence].
+
+    Raises:
+        TypeError: If ``attention_mask`` is neither a tensor nor None.
     """
-    attention_mask = batch.pop("attention_mask", None)
+    attention_mask = optional_tensor(batch.pop("attention_mask", None), "attention_mask")
     if attention_mask is not None and "padding_mask" not in batch:
         if attention_mask.ndim == 4:
             diagonal = torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
@@ -645,7 +667,7 @@ def convert_attention_mask_to_padding_mask(batch: TokenBatch) -> None:
 def shard_batch_contiguous(
     cp_mesh: DeviceMesh | None,
     tp_mesh: DeviceMesh | None,
-    batch: _TokenBatchT,
+    batch: dict[str, _BatchValueT | torch.Tensor],
     *,
     loss_mask: torch.Tensor | None = None,
     padding_token_id: int = 0,
@@ -653,7 +675,7 @@ def shard_batch_contiguous(
     extra_seq_keys: dict[str, int] | None = None,
     extra_pad_values: dict[str, float | int] | None = None,
     shard_primary: bool = True,
-) -> tuple[ShardContextFactory, _TokenBatchT, ShardLayout]:
+) -> tuple[ShardContextFactory, dict[str, _BatchValueT | torch.Tensor], ShardLayout]:
     """Prepare and contiguously shard a batch for model-owned CP.
 
     Normalizes the batch (mask conversion, position_ids, labels), pads the
@@ -677,7 +699,8 @@ def shard_batch_contiguous(
             hidden], ``labels`` [batch, sequence] (unless ``loss_mask`` stands in),
             and optional ``position_ids`` [batch, sequence] (or [1, sequence],
             expanded; [3, batch, sequence] for mRoPE), ``padding_mask`` and
-            ``attention_mask``.
+            ``attention_mask``. Other entries (e.g. media or format tags) pass
+            through unchanged.
         loss_mask: Optional per-token loss mask of shape [batch, sequence]; used
             as labels when the batch has none, otherwise sharded alongside the batch.
         padding_token_id: Pad sentinel for ``input_ids``.
@@ -698,7 +721,7 @@ def shard_batch_contiguous(
         ``padded_sequence / cp_size``.
 
     Raises:
-        TypeError: If ``cp_mesh`` is None.
+        TypeError: If ``cp_mesh`` is None, or a sharded entry is not a tensor.
     """
     # --- normalize: mask -> padding_mask, primary tensor, position_ids, labels
     convert_attention_mask_to_padding_mask(batch)
@@ -709,7 +732,7 @@ def shard_batch_contiguous(
         "the CP dispatch requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
     )
     primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
-    primary_seq_tensor = batch[primary_key]
+    primary_seq_tensor = batch_tensor(batch, primary_key)
     seq_len = primary_seq_tensor.shape[1]
 
     batch_size = primary_seq_tensor.shape[0]
@@ -718,14 +741,14 @@ def shard_batch_contiguous(
             torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
         )
     else:
-        position_ids = batch["position_ids"]
+        position_ids = batch_tensor(batch, "position_ids")
         if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
             batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
 
-    position_ids = batch["position_ids"]
+    position_ids = batch_tensor(batch, "position_ids")
     pos_seq_dim = 2 if position_ids.ndim == 3 else 1
 
-    labels = batch.get("labels")
+    labels = optional_tensor(batch.get("labels"), "labels")
     if labels is None and loss_mask is not None:
         labels = loss_mask
         loss_mask = None
@@ -759,7 +782,7 @@ def shard_batch_contiguous(
     if pad_len:
         for key, pad_val in seq_pad_values.items():
             if key in batch:
-                batch[key] = _pad_tensor_seq_dim_(batch[key], 1, pad_len, pad_val)
+                batch[key] = _pad_tensor_seq_dim_(batch_tensor(batch, key), 1, pad_len, pad_val)
         labels = _pad_tensor_seq_dim_(labels, 1, pad_len, -100)
         position_ids = _pad_position_ids_seq_dim_(position_ids, pos_seq_dim, pad_len)
         batch["position_ids"] = position_ids
@@ -767,7 +790,7 @@ def shard_batch_contiguous(
             loss_mask = _pad_tensor_seq_dim_(loss_mask, 1, pad_len, 0)
         for key in extra_metadata_keys:
             batch[key] = _pad_tensor_seq_dim_(
-                batch[key],
+                batch_tensor(batch, key),
                 metadata_seq_dims[key],
                 pad_len,
                 metadata_pad_values.get(key, 0),
@@ -785,7 +808,7 @@ def shard_batch_contiguous(
     # authoritative and keeps the divisibility guard meaningful; the aux-only shard
     # leaves the primary full-length, so use the intended padded length the model
     # will pad its own primary to.
-    padded_seq_len = batch[primary_key].shape[1] if shard_primary else seq_len + pad_len
+    padded_seq_len = batch_tensor(batch, primary_key).shape[1] if shard_primary else seq_len + pad_len
     if padded_seq_len % cp_size != 0:
         raise ValueError(
             f"CP sequence length must be divisible by cp_size after padding, got {padded_seq_len=} {cp_size=}"
@@ -797,9 +820,10 @@ def shard_batch_contiguous(
     def _slice_seq(key: str, seq_dim: int = 1) -> None:
         if key not in batch:
             return
-        slices = [slice(None)] * batch[key].ndim
+        tensor = batch_tensor(batch, key)
+        slices = [slice(None)] * tensor.ndim
         slices[seq_dim] = slice(seq_start, seq_end)
-        batch[key] = batch[key][tuple(slices)].contiguous()
+        batch[key] = tensor[tuple(slices)].contiguous()
 
     for key in seq_pad_values:
         _slice_seq(key, 1)

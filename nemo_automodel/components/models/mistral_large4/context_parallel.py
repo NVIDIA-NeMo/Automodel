@@ -30,7 +30,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     contiguous_local_indices,
     shard_batch_contiguous,
 )
-from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
+from nemo_automodel.components.distributed.thd_utils import batch_tensor, split_batch_into_thd_chunks
 
 # Recipe batch entries: token tensors, complete-image lists and the packed-format tag.
 CPBatch: TypeAlias = dict[str, torch.Tensor | list[torch.Tensor] | str | None]
@@ -210,7 +210,7 @@ def prepare_packed_cp_inputs(
         if not isinstance(ids, torch.Tensor) or ids.ndim != 2 or num_chunks < 1 or ids.shape[0] != num_chunks:
             raise ValueError("Mistral packed CP requires one packed row per microbatch")
         source_mask = loss_mask if loss_mask is not None else local_batch.get("loss_mask")
-        if source_mask is not None and source_mask.shape != ids.shape:
+        if source_mask is not None and (not isinstance(source_mask, torch.Tensor) or source_mask.shape != ids.shape):
             raise ValueError("Mistral packed CP loss_mask must match global input_ids")
         source = dict(local_batch)
         if source.get("position_ids") is None:
@@ -219,7 +219,7 @@ def prepare_packed_cp_inputs(
                 [torch.cat([torch.arange(int(n), device=ids.device) for n in row if int(n) >= 0]) for row in lengths]
             )
         converted = split_batch_into_thd_chunks(source, padding_token_id=padding_token_id, num_chunks=num_chunks)
-        cu = converted["cu_seqlens_padded"].reshape(num_chunks, -1)
+        cu = batch_tensor(converted, "cu_seqlens_padded").reshape(num_chunks, -1)
         documents = []
         for boundaries in cu:
             boundaries = boundaries[boundaries >= 0].to(device=ids.device, dtype=torch.long)
@@ -235,7 +235,7 @@ def prepare_packed_cp_inputs(
         for name in ("seq_lens_padded", "attention_mask", "loss_mask"):
             prepared.pop(name, None)
         for name in ("input_ids", "labels", "position_ids", "padding_mask"):
-            prepared[name] = converted[name].reshape_as(ids)
+            prepared[name] = batch_tensor(converted, name).reshape_as(ids)
         for name in ("attention_mask", "padding_mask"):
             mask = local_batch.get(name)
             if mask is not None:
