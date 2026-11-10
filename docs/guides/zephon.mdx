@@ -20,9 +20,23 @@ Install AutoModel in a CUDA training environment using the
 in the project dependencies.
 
 The pretraining recipes use the base checkpoints and tokenizers below. The online
-recipes read [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories)
-and tokenize and pack each document during training. The prepacked recipes read
-your prepared, unshifted token sequences.
+recipes tokenize and pack a mixture of public web, code and scientific documents:
+
+| Source | Dataset | Example token weight |
+| --- | --- | --- |
+| Web | [FineWeb-Edu, sample-10BT](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) | 70% |
+| Code | [The Stack Smol XL Readable, original subset](https://huggingface.co/datasets/BEE-spoke-data/the-stack-smol-xl-readable) | 20% |
+| arXiv | [arXiv Complete, paper_text subset](https://huggingface.co/datasets/secemp9/arxiv-complete) | 10% |
+
+All three supply documents in a `text` column in native Parquet shards. Code is
+repository source code filtered for readability; arXiv documents retain their
+LaTeX source, including macros and comments. The weights illustrate token-aware
+mixing and are not tuned training recommendations. With multiple text sources,
+token estimation is enabled automatically; no extra operator or setting is needed.
+
+The prepacked recipes are templates for your own prepared, unshifted token
+sequences. Their input corpus is independent of the online examples' mixture;
+prepare it using the [pretokenized and prepacked input guide](#use-pretokenized-and-prepacked-text).
 
 | Model | Online tokenization and packing | Prepacked input |
 | --- | --- | --- |
@@ -47,7 +61,7 @@ models. The CP/TE configuration in those packing examples is not enabled here.
 Zephon requires an explicit step cap because its stream has no known length.
 Qwen's 624 and Llama's 1,369 steps retain the native references' one-epoch update
 budgets: `ceil(39905 / 64)` and `ceil(87599 / 64)`. These are upper bounds, not
-epoch counts for TinyStories or your prepacked corpus. Choose CUDA GPUs with
+epoch counts for the mixed or prepacked corpus. Choose CUDA GPUs with
 enough memory for the model, optimizer and activations.
 
 The source is finite: the recipe reads it once and stops when it runs out.
@@ -187,6 +201,11 @@ Tokenization and online packing are independent choices:
 | Pretokenized documents | `ZephonPretokenizedTextDatasetConfig` | A packing algorithm | Pack only |
 | Pretokenized, prepacked sequences | `ZephonPretokenizedTextDatasetConfig` | `null` | Preserve supplied sequences |
 | Raw text | `ZephonTextDatasetConfig` | `null` | Tokenize each document separately |
+
+The prepacked examples require prepared input; they do not download a public
+pretokenized corpus. A public pretokenized source is usable only when its exact
+tokenizer, special-token policy and stored format match the selected recipe.
+A tokenizer name or an `input_ids` column alone does not establish compatibility.
 
 For pretokenized data, `tokens_field` defaults to `input_ids`, and the optional
 `loss_mask_field` defaults to `loss_mask`. Supply unshifted, unpadded token lists

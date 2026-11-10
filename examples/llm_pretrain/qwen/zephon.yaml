@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Continue pretraining on TinyStories with online tokenization and packing.
+# Continue pretraining on a token-aware web/code/arXiv mixture.
 # Run: uv run automodel examples/llm_pretrain/qwen/zephon.yaml --nproc-per-node 8
 # Training reference: examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml
 # Streaming step cap: 1 * ceil(39905 / 64) = 624.
@@ -37,9 +37,17 @@ dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
   tokenize_special_tokens: eos
   zephon:
+    # Weights target token proportions; estimation is automatic with multiple text sources.
     sources:
-    - name: stories
-      path: hf://roneneldan/TinyStories/train
+    - name: web
+      path: hf://HuggingFaceFW/fineweb-edu/sample-10BT/train
+      weight: 0.7
+    - name: code
+      path: hf://BEE-spoke-data/the-stack-smol-xl-readable/original/train
+      weight: 0.2
+    - name: arxiv
+      path: hf://secemp9/arxiv-complete/paper_text/train
+      weight: 0.1
     packing:
       seq_len: 1024
     checkpoint:
