@@ -196,7 +196,14 @@ def test_pretraining_examples_select_matching_source_and_preparation(family: str
         assert isinstance(dataset, ZephonTextDatasetConfig)
         assert dataset.tokenize_special_tokens == "eos"
         assert dataset.zephon.packing.pack_algorithm == "wrap"
-        assert dataset.zephon.sources[0].path == "hf://roneneldan/TinyStories/train"
+        assert dataset.zephon.source.token_estimation == "auto"
+        assert dataset.zephon.sources == (
+            ZephonSource(name="web", path="hf://HuggingFaceFW/fineweb-edu/sample-10BT/train", weight=0.7),
+            ZephonSource(
+                name="code", path="hf://BEE-spoke-data/the-stack-smol-xl-readable/original/train", weight=0.2
+            ),
+            ZephonSource(name="arxiv", path="hf://secemp9/arxiv-complete/paper_text/train", weight=0.1),
+        )
 
 
 @pytest.mark.parametrize("family", ["qwen", "llama3_2"])
