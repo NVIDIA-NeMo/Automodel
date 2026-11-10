@@ -49,6 +49,7 @@ from typing import TypedDict
 
 import torch
 
+from nemo_automodel.components.distributed._patching import set_undeclared_attr
 from nemo_automodel.components.distributed.blockdiag_cp import kernels, runtime, state
 
 
@@ -196,7 +197,7 @@ def attach_cp1_packed_varlen_hooks(model: torch.nn.Module) -> None:
     def _pre_hook(
         module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]
     ) -> tuple[tuple[object, ...], dict[str, object]]:
-        F_module.scaled_dot_product_attention = _packed_varlen_sdpa
+        set_undeclared_attr(F_module, "scaled_dot_product_attention", _packed_varlen_sdpa)
         return args, kwargs
 
     def _post_hook(module: torch.nn.Module, inputs: tuple[object, ...], output: object) -> None:

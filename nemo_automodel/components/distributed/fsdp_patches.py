@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Concatenate, ParamSpec, TypeVar
 
+from nemo_automodel.components.distributed._patching import get_undeclared_attr, set_undeclared_attr
 from nemo_automodel.shared.import_utils import get_torch_version
 
 if TYPE_CHECKING:
@@ -132,13 +134,13 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
         return
 
     original_foreach_reduce = collectives.foreach_reduce
-    if getattr(original_foreach_reduce, "_automodel_uniform_reduce_dtype", False):
+    if get_undeclared_attr(original_foreach_reduce, "_automodel_uniform_reduce_dtype") is True:
         return
 
     foreach_reduce_uniform_dtype = _with_uniform_grad_dtype(original_foreach_reduce)
-    foreach_reduce_uniform_dtype._automodel_uniform_reduce_dtype = True
-    collectives.foreach_reduce = foreach_reduce_uniform_dtype
-    param_group.foreach_reduce = foreach_reduce_uniform_dtype
+    set_undeclared_attr(foreach_reduce_uniform_dtype, "_automodel_uniform_reduce_dtype", True)
+    set_undeclared_attr(collectives, "foreach_reduce", foreach_reduce_uniform_dtype)
+    set_undeclared_attr(param_group, "foreach_reduce", foreach_reduce_uniform_dtype)
 
 
 def _has_local_unsharded_grad(fsdp_param: FSDPParam) -> bool:
@@ -172,9 +174,9 @@ def patch_fsdp_unused_param_reduction() -> None:
         ) from error
 
     original_post_backward = FSDPParamGroup.post_backward
-    if getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False):
+    if get_undeclared_attr(original_post_backward, "_automodel_reduce_scatter_unused_params") is True:
         return
-    if getattr(original_post_backward, "_automodel_unused_param_probe", False):
+    if get_undeclared_attr(original_post_backward, "_automodel_unused_param_probe") is True:
         raise RuntimeError(
             "patch_fsdp_unused_param_reduction must be installed before patch_fsdp_restore_unused_param_grads: "
             "a zero fill wrapped outside the usage probe would make every parameter look used."
@@ -195,7 +197,7 @@ def patch_fsdp_unused_param_reduction() -> None:
                     param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
         return original_post_backward(self, *args, **kwargs)
 
-    _post_backward_with_unused_param_reduction._automodel_reduce_scatter_unused_params = True
+    set_undeclared_attr(_post_backward_with_unused_param_reduction, "_automodel_reduce_scatter_unused_params", True)
     FSDPParamGroup.post_backward = _post_backward_with_unused_param_reduction
 
 
@@ -208,12 +210,30 @@ def _fsdp_state_param_groups(state: FSDPState) -> list[FSDPParamGroup]:
     return [group] if group is not None else []
 
 
+@dataclass(frozen=True)
+class _ParamUsageProbe:
+    """Gradient presence recorded by one FSDP2 parameter group's reducing post-backward.
+
+    :func:`patch_fsdp_restore_unused_param_grads` stores it on the group as
+    ``_automodel_unused_param_probe``; the root's final backward callback consumes it and resets
+    that attribute to ``None``.
+
+    Attributes:
+        entries: One ``(fsdp_param, used_locally, grad_was_none)`` entry per parameter that requires
+            a gradient, in the group's parameter order. ``used_locally`` records whether this rank's
+            backward produced a local gradient; ``grad_was_none`` records whether the reduction
+            creates the parameter's sharded gradient.
+    """
+
+    entries: list[tuple[FSDPParam, bool, bool]]
+
+
 def _restore_unused_param_grads(param_groups: list[FSDPParamGroup]) -> None:
     """Reset the gradients that a reduction created for parameters no rank of its domain used.
 
     Args:
-        param_groups: FSDP2 parameter groups holding a usage probe from this backward, in the same
-            order on every rank of their reduction domains.
+        param_groups: FSDP2 parameter groups of this backward, in the same order on every rank of
+            their reduction domains. Groups without a usage probe from this backward are skipped.
     """
     import torch
     import torch.distributed as dist
@@ -223,13 +243,16 @@ def _restore_unused_param_grads(param_groups: list[FSDPParamGroup]) -> None:
         tuple[ProcessGroup | None, ProcessGroup | None, torch.device], list[tuple[FSDPParam, bool, bool]]
     ] = {}
     for group in param_groups:
+        probe = get_undeclared_attr(group, "_automodel_unused_param_probe")
+        if not isinstance(probe, _ParamUsageProbe):
+            continue
         reduce_scatter_group = (
             group._reduce_scatter_process_group if isinstance(group.mesh_info, FSDPMeshInfo) else None
         )
         all_reduce_group = group._all_reduce_process_group if isinstance(group.mesh_info, DDPMeshInfo) else None
         domain = (reduce_scatter_group, all_reduce_group, group.device)
-        entries_by_domain.setdefault(domain, []).extend(group._automodel_unused_param_probe)
-        group._automodel_unused_param_probe = None
+        entries_by_domain.setdefault(domain, []).extend(probe.entries)
+        set_undeclared_attr(group, "_automodel_unused_param_probe", None)
 
     # Issue every domain's reduction before reading any back, so the backward pays one host sync.
     used_by_domain = []
@@ -282,10 +305,10 @@ def patch_fsdp_restore_unused_param_grads() -> None:
         ) from error
 
     original_final_callback = FSDPState._root_post_backward_final_callback
-    if getattr(original_final_callback, "_automodel_restore_unused_param_grads", False):
+    if get_undeclared_attr(original_final_callback, "_automodel_restore_unused_param_grads") is True:
         return
     original_post_backward = FSDPParamGroup.post_backward
-    legacy_fill = getattr(original_post_backward, "_automodel_reduce_scatter_unused_params", False)
+    legacy_fill = get_undeclared_attr(original_post_backward, "_automodel_reduce_scatter_unused_params") is True
 
     def _post_backward_recording_param_usage(self: FSDPParamGroup, *args: object, **kwargs: object) -> None:
         zero_fills = legacy_fill or getattr(self, "reduce_scatter_unused_params", False)
@@ -293,21 +316,24 @@ def patch_fsdp_restore_unused_param_grads() -> None:
             # An HSDP reduction whose all-reduce was deferred holds earlier micro-batches' real
             # contributions outside ``sharded_param.grad``, so this reduction does not create the gradient.
             pending_partial_reduce = self._partial_reduce_output is not None
-            self._automodel_unused_param_probe = [
-                (
-                    fsdp_param,
-                    _has_local_unsharded_grad(fsdp_param),
-                    fsdp_param.sharded_param.grad is None and not pending_partial_reduce,
-                )
-                for fsdp_param in self.fsdp_params
-                if fsdp_param.sharded_param.requires_grad
-            ]
+            probe = _ParamUsageProbe(
+                [
+                    (
+                        fsdp_param,
+                        _has_local_unsharded_grad(fsdp_param),
+                        fsdp_param.sharded_param.grad is None and not pending_partial_reduce,
+                    )
+                    for fsdp_param in self.fsdp_params
+                    if fsdp_param.sharded_param.requires_grad
+                ]
+            )
+            set_undeclared_attr(self, "_automodel_unused_param_probe", probe)
         try:
             return original_post_backward(self, *args, **kwargs)
         except BaseException:
             # A post-backward that failed reduced nothing; callers that tolerate the failure (a
             # never-forwarded group) must not leave this probe for a later backward.
-            self._automodel_unused_param_probe = None
+            set_undeclared_attr(self, "_automodel_unused_param_probe", None)
             raise
 
     def _root_post_backward_final_callback_restoring_unused_grads(self: FSDPState) -> None:
@@ -316,19 +342,16 @@ def patch_fsdp_restore_unused_param_grads() -> None:
         finally:
             # Also on failure: callers that tolerate a never-forwarded root still step the optimizer.
             _restore_unused_param_grads(
-                [
-                    group
-                    for state in self._state_ctx.all_states
-                    for group in _fsdp_state_param_groups(state)
-                    if getattr(group, "_automodel_unused_param_probe", None) is not None
-                ]
+                [group for state in self._state_ctx.all_states for group in _fsdp_state_param_groups(state)]
             )
 
     # Keep the fill's marker visible so a repeated fill install stays a no-op under this wrapper, and mark
     # the probe so a fill installed only now refuses to wrap outside it.
-    _post_backward_recording_param_usage._automodel_reduce_scatter_unused_params = legacy_fill
-    _post_backward_recording_param_usage._automodel_unused_param_probe = True
-    _root_post_backward_final_callback_restoring_unused_grads._automodel_restore_unused_param_grads = True
+    set_undeclared_attr(_post_backward_recording_param_usage, "_automodel_reduce_scatter_unused_params", legacy_fill)
+    set_undeclared_attr(_post_backward_recording_param_usage, "_automodel_unused_param_probe", True)
+    set_undeclared_attr(
+        _root_post_backward_final_callback_restoring_unused_grads, "_automodel_restore_unused_param_grads", True
+    )
     FSDPParamGroup.post_backward = _post_backward_recording_param_usage
     FSDPState._root_post_backward_final_callback = _root_post_backward_final_callback_restoring_unused_grads
 
@@ -351,7 +374,7 @@ def patch_fsdp_accumulated_grad_guard() -> None:
         return
 
     orig = FSDPParam.to_accumulated_grad_if_needed
-    if getattr(orig, "_nemo_automodel_guarded", False):
+    if get_undeclared_attr(orig, "_nemo_automodel_guarded") is True:
         return
 
     def guarded(self: FSDPParam) -> None:
@@ -362,10 +385,10 @@ def patch_fsdp_accumulated_grad_guard() -> None:
                 raise
             return None
 
-    setattr(guarded, "_nemo_automodel_guarded", True)
+    set_undeclared_attr(guarded, "_nemo_automodel_guarded", True)
     # Preserve the previous Gemma4 marker name for callers/tests that only need
     # idempotency and do not care which entry point installed the patch.
-    setattr(guarded, "_gemma4_guarded", True)
+    set_undeclared_attr(guarded, "_gemma4_guarded", True)
     FSDPParam.to_accumulated_grad_if_needed = guarded
 
 

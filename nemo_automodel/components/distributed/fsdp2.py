@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.distributed._patching import get_undeclared_attr, set_undeclared_attr
 from nemo_automodel.components.distributed.config import FSDP2Config, MoEParallelizerConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.mesh import MeshContext
@@ -63,7 +64,7 @@ def _patch_is_packed_sequence_for_training() -> None:
     try:
         import transformers.modeling_flash_attention_utils as _fa_utils
 
-        if getattr(_fa_utils, "_is_packed_sequence_patched", False):
+        if get_undeclared_attr(_fa_utils, "_is_packed_sequence_patched") is True:
             return  # already patched
 
         def _is_packed_sequence_no_sync(position_ids: torch.Tensor | None, batch_size: int) -> bool:
@@ -76,8 +77,8 @@ def _patch_is_packed_sequence_for_training() -> None:
             # Non-packed training: position_ids is always a simple arange -- never packed.
             return False
 
-        _fa_utils._is_packed_sequence = _is_packed_sequence_no_sync
-        _fa_utils._is_packed_sequence_patched = True
+        set_undeclared_attr(_fa_utils, "_is_packed_sequence", _is_packed_sequence_no_sync)
+        set_undeclared_attr(_fa_utils, "_is_packed_sequence_patched", True)
     except (ImportError, AttributeError):
         pass
 

@@ -48,6 +48,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointPolicy, SelectiveCheckpointContext, create_selective_checkpoint_contexts
 
+from nemo_automodel.components.distributed._patching import get_undeclared_attr, set_undeclared_attr
 from nemo_automodel.shared.import_utils import get_torch_version, safe_import
 
 if TYPE_CHECKING:
@@ -479,7 +480,11 @@ def _disable_dynamo_lru_cache() -> None:
     underlying API is private, so failures are swallowed.
     """
     try:
-        torch._C._dynamo.eval_frame._set_lru_cache(False)
+        # Present in torch 2.10 at runtime but missing from its type stubs.
+        set_lru_cache = get_undeclared_attr(torch._C._dynamo.eval_frame, "_set_lru_cache")
+        if not callable(set_lru_cache):
+            raise AttributeError("torch._C._dynamo.eval_frame has no callable _set_lru_cache")
+        set_lru_cache(False)
     except (AttributeError, RuntimeError):
         logger.debug("Could not disable dynamo LRU cache for selective AC + compile.", exc_info=True)
 
@@ -508,7 +513,7 @@ class _ScaledDotProductAttention(Protocol):
 def _restore_sdpa_state(sdpa: _ScaledDotProductAttention, backends: list[SDPBackend]) -> Generator[None, None, None]:
     """Temporarily restore the SDPA callable and backend set captured during forward."""
     backward_sdpa = F.scaled_dot_product_attention
-    F.scaled_dot_product_attention = sdpa
+    set_undeclared_attr(F, "scaled_dot_product_attention", sdpa)
     try:
         with sdpa_kernel(backends):
             yield

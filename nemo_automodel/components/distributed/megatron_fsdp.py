@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.distributed._patching import get_undeclared_attr, set_undeclared_attr
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.parallelizer import (
@@ -58,8 +59,10 @@ def parallelize_megatron_fsdp(
         logger.info("World size is 1, skipping parallelization.")
         model = model.to("cuda").to(torch.bfloat16)
         if config.activation_checkpointing:
-            if hasattr(model, "gradient_checkpointing_enable"):
-                model.gradient_checkpointing_enable()
+            # ``nn.Module`` does not declare Hugging Face's ``gradient_checkpointing_enable``.
+            enable_gradient_checkpointing = get_undeclared_attr(model, "gradient_checkpointing_enable")
+            if callable(enable_gradient_checkpointing):
+                enable_gradient_checkpointing()
             else:
                 logger.error("Model does not support gradient checkpointing. Skipping.")
         if reapply_trainability is not None:
@@ -201,16 +204,19 @@ def fully_shard_optimizer(
     aborting before the first optimizer step. Re-stamp the reference (mirroring the
     wheel's own ``__init__`` logic) on the current distributed params right before
     deferred sharding so the separate sequence matches the combined entry point.
+
+    Raises:
+        ImportError: If Megatron-FSDP is not installed.
     """
-    if MegatronFSDP is None or not isinstance(model, MegatronFSDP):
-        return optimizer
-    if not HAS_MEGATRON_FSDP or megatron_fsdp_fully_shard_optimizer is None:
+    if not HAS_MEGATRON_FSDP or MegatronFSDP is None or megatron_fsdp_fully_shard_optimizer is None:
         raise ImportError(
             "MegatronFSDP is not installed, please visit https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src for more information"
         )
+    if not isinstance(model, MegatronFSDP):
+        return optimizer
     model._replace_param_with_distributed_if_needed()
     for param in model.parameters():
-        param._megatron_fsdp_model = model
+        set_undeclared_attr(param, "_megatron_fsdp_model", model)
     return megatron_fsdp_fully_shard_optimizer(optimizer)
 
 
