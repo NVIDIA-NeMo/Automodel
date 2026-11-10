@@ -69,6 +69,8 @@ distributed:
   tp_size: 1
   cp_size: 1
   sequence_parallel: false
+  # Recompute activations to fit eager attention on the packed 8192-token inputs.
+  activation_checkpointing: true
 freeze_config:
   freeze_vision_tower: true
   freeze_language_model: false
