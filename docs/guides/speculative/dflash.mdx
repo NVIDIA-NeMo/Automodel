@@ -62,8 +62,8 @@ reaches first) dominate the loss.
 Paper `loss_decay_gamma` values track the block size: 7 for `block_size` 16, 5
 for 10, and 4 for 8.
 
-Set `loss_type: variable_prefix` to train the VP-Drafter objective from D2SD, the Dual Diffusion Draft Models
-paper ([arXiv:2606.04446](https://arxiv.org/abs/2606.04446)), instead: each block draws
+Set `loss_type: variable_prefix` to train the Dual Diffusion Speculative Decoding (D2SD) VP-Drafter objective
+([arXiv:2606.04446](https://arxiv.org/abs/2606.04446)) instead: each block draws
 a visible-prefix length from a truncated geometric prior
 (`prefix_weight_base`, default 0.9), only the masked suffix is supervised, and
 the decay restarts at the prefix boundary. This matches the regime a drafter
