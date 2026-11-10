@@ -1057,6 +1057,9 @@ navigation:
       - page: "Zephon"
         path: ../../guides/zephon.mdx
         slug: zephon
+      - page: "Zephon Image Data"
+        path: ../../guides/zephon-images.mdx
+        slug: zephon-images
       - page: "Text Dataset"
         path: ../../guides/llm/dataset.mdx
         slug: text-dataset

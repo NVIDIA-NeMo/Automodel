@@ -1,6 +1,6 @@
 ---
 title: "Zephon"
-description: "Use Zephon for streaming, packed text training in NeMo AutoModel."
+description: "Use Zephon for streaming, packed text and image training in NeMo AutoModel."
 ---
 
 [Zephon](https://zephon.io/) is a data loader for training at scale. It reads
@@ -319,11 +319,54 @@ remain independent. The separate `training.mask_segment_starts` option controls 
 next-token targets at subdocument boundaries contribute to the loss.
 
 For image training, AutoModel's processor expands image placeholders before
-Zephon measures and packs documents. AutoModel also supplies the model's
-position calculations, preserving image geometry. The same source, packing,
-execution, and checkpoint options apply. See the
-[image training guide](../../vlm_finetune/zephon/README.md) for examples and
-supported models.
+Zephon measures and packs documents. AutoModel supplies the model's position
+calculations, preserving image geometry. The same source, packing, execution,
+and checkpoint options apply.
+
+## Fine-Tune Image Models
+
+The image recipes use
+[MedPix-VQA](https://huggingface.co/datasets/mmoukouba/MedPix-VQA), whose Parquet
+records contain an `image_id` image column, `question`, and `answer`. The source's
+`input.column_mapping` maps `image_id` to the image input. Each fetched record
+contains the conversation and embedded image bytes; Zephon owns shard downloads,
+caching and eviction. For your own corpus, supply self-contained Parquet or
+LitData shards. Export path-only images before training using the
+[image data guide](/datasets/zephon-images).
+
+| Model | Image instruction-tuning recipe | Example processes |
+| --- | --- | --- |
+| `Qwen/Qwen3-VL-2B-Instruct` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/zephon.yaml) | 1 |
+| `google/gemma-4-31B-it` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/zephon.yaml) | 8 |
+| `mistralai/Ministral-3-3B-Instruct-2512-BF16` | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/mistral/zephon.yaml) | 2 |
+
+```bash
+uv run automodel examples/vlm_finetune/qwen3/zephon.yaml --nproc-per-node 1
+```
+
+Use the corresponding process count for Gemma or Ministral. The examples target
+H100-class GPUs with FSDP2, bf16 compute, fp32 master weights and optimizer state,
+and activation checkpointing. Actual memory depends on image resolution and
+packed input length. Gemma uses the supported dense 31B architecture; the 12B
+Unified architecture, E-series, shared-KV and MoE variants require separate support.
+Ministral uses its BF16 checkpoint and padded image tensors with `image_sizes`.
+All three examples use SDPA; this is a recipe choice rather than a Zephon backend
+requirement.
+
+The recipe selects `ZephonVlmDatasetConfig`. When `dataloader._target_` is omitted,
+AutoModel selects `ZephonVlmDataloaderConfig` automatically. The `processor`
+section and `dataset.chat_template` select the processor and conversation format.
+The same single-source `path_or_dataset_id` and `paths` shortcuts are available;
+they select a source without applying a native dataset class's Python transforms.
+The image adapter normalizes conversations, messages, ShareGPT conversations,
+and image/question/answer documents.
+
+The processor applies the chat template and expands image placeholders before
+Zephon measures and bin-packs whole documents. Training supervises assistant
+tokens. Packing defaults to `first_fit` with 64 bins; oversized documents are
+dropped by default. Image mixtures use sample-based weights: media-aware token
+estimation is unsupported. Qwen2.5-VL also remains supported even though these
+examples use Qwen3-VL. Video, audio and context parallelism are unsupported.
 
 ## Configure Checkpoints for Distributed Training
 

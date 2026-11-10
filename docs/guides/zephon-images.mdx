@@ -1,4 +1,7 @@
-# Prepare image documents for Zephon
+---
+title: "Zephon Image Data"
+description: "Prepare self-contained image conversations for Zephon cache-managed reads."
+---
 
 A Zephon document must contain the conversation and its image payloads. This is
 about storage, independently of sequence packing: the processor expands image
@@ -61,7 +64,7 @@ The small converter below supports the schemas above and resolves local image
 paths relative to `--media-root` (the JSONL directory by default):
 
 ```bash
-uv run python examples/vlm_finetune/zephon/prepare_data.py conversations.jsonl /data/embedded --media-root /data/images
+uv run python tools/zephon/prepare_images.py conversations.jsonl /data/embedded --media-root /data/images
 ```
 
 It streams the JSONL, validates image placement, materializes RGB images and
@@ -73,7 +76,7 @@ check that exported `bytes` are populated rather than retaining only paths.
 
 Source formats are normally auto-detected; use `fmt` only when discovery needs
 an override. Zephon cache options are described in the
-[integration guide](../../llm_pretrain/zephon/README.md). `cache.cache_limit_bytes`
+[integration guide](/datasets/zephon). `cache.cache_limit_bytes`
 bounds downloaded source shards; `cache.parquet_rg_cache.limit_bytes` bounds
 decoded row groups separately. Neither bounds processor tensors in memory.
 See the [Zephon User Guide](https://docs.zephon.io/) for storage, cache and API
