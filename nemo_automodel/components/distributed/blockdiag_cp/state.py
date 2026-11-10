@@ -24,10 +24,14 @@ synonyms or defaults.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Generic, NotRequired, TypedDict, TypeVar
 
 from torch import Tensor
 from torch.distributed import ProcessGroup
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.blockdiag_cp.exchange import _BlockdiagKvPlan
+    from nemo_automodel.components.distributed.blockdiag_cp.kernels import _VarlenMeta
 
 # Canonical value -> accepted synonyms (each canonical is also a synonym of itself).
 ATTN_BACKEND_SYNONYMS: dict[str, tuple[str, ...]] = {
@@ -70,11 +74,11 @@ _ATTN_BACKEND_REVERSE = {syn: canon for canon, syns in ATTN_BACKEND_SYNONYMS.ite
 _KV_EXCHANGE_REVERSE = {syn: canon for canon, syns in KV_EXCHANGE_SYNONYMS.items() for syn in syns}
 
 
-def _clean(value: Any) -> str:
+def _clean(value: str) -> str:
     return str(value).strip().lower().replace("-", "_")
 
 
-def normalize_attn_backend(value: Any) -> str:
+def normalize_attn_backend(value: str | None) -> str:
     """Canonicalize an attention-backend knob to one of ``ATTN_BACKEND_VALUES``.
 
     ``None``/``""``/``auto``/``default`` map to the default (``flash``).
@@ -101,7 +105,7 @@ def normalize_attn_backend(value: Any) -> str:
     )
 
 
-def normalize_kv_exchange(value: Any) -> str:
+def normalize_kv_exchange(value: str | None) -> str:
     """Canonicalize a KV-exchange knob to one of ``KV_EXCHANGE_VALUES``.
 
     ``None``/``""``/``auto``/``default`` map to the default (``allgather``).
@@ -177,7 +181,52 @@ def cp_varlen_runtime_config() -> dict[str, str]:
     }
 
 
-class _ThreadSharedVar:
+_T = TypeVar("_T")
+
+
+class _BlockdiagStepState(TypedDict):
+    """Per-step block-diagonal CP state published by the batch/context builder.
+
+    :func:`~nemo_automodel.components.distributed.blockdiag_cp.batch.make_cp_blockdiag_batch_and_ctx`
+    writes every required field. The runtime reads ``attn_backend``, ``kv_exchange``
+    and ``varlen_meta`` with ``.get`` so a manually published partial state (parity
+    tests) still falls back to the runtime configuration.
+
+    Attributes:
+        group: Process group that shards the sequence across context-parallel ranks.
+        doc_ids: Replicated per-position document ids of shape
+            ``[batch, padded_sequence]`` (0 == padding) over the full padded sequence.
+        packed_cu_seqlens: Global packed-document boundaries of shape
+            ``[num_documents + 1]`` on the compute device.
+        packed_cu_seqlens_cpu: CPU copy of ``packed_cu_seqlens``.
+        row_offset: Global position of this rank's first local query row.
+        seq_dim: Sequence dimension of the ``[batch, heads, sequence, head_dim]``
+            attention inputs.
+        attn_backend: Canonical varlen kernel backend snapshotted for this step.
+        kv_exchange: Canonical K/V delivery mode snapshotted for this step.
+        varlen_meta: This rank's precomputed varlen segmentation.
+        model_state: Typed model-facing view of the step.
+        kv_plan: Needed-only K/V exchange plan, memoized by the first attention layer.
+        _needed_only_preflight: Memoized ``(cache_key, all_available, reason)`` result
+            of the collective varlen-kernel preflight, keyed by
+            ``(backend, dtype, device, query_len, key_len)``.
+    """
+
+    group: ProcessGroup
+    doc_ids: Tensor
+    packed_cu_seqlens: Tensor
+    packed_cu_seqlens_cpu: Tensor
+    row_offset: int
+    seq_dim: int
+    attn_backend: str
+    kv_exchange: str
+    varlen_meta: _VarlenMeta
+    model_state: BlockdiagCpModelState
+    kv_plan: NotRequired[_BlockdiagKvPlan]
+    _needed_only_preflight: NotRequired[tuple[tuple[str, str, str, int, int], bool, str | None]]
+
+
+class _ThreadSharedVar(Generic[_T]):
     """A ``contextvars.ContextVar``-style get/set/reset holder visible ACROSS threads.
 
     The block-diagonal CP state must be readable inside the autograd worker thread
@@ -189,20 +238,20 @@ class _ThreadSharedVar:
     the slot.
     """
 
-    def __init__(self):
-        self._value = None
+    def __init__(self) -> None:
+        self._value: _T | None = None
 
-    def get(self):
+    def get(self) -> _T | None:
         """Return the current value (``None`` when unset)."""
         return self._value
 
-    def set(self, value):
+    def set(self, value: _T | None) -> _T | None:
         """Set the value; returns a token (the previous value) for :meth:`reset`."""
         token = self._value
         self._value = value
         return token
 
-    def reset(self, token):
+    def reset(self, token: _T | None) -> None:
         """Restore the value captured by a previous :meth:`set`."""
         self._value = token
 
@@ -210,7 +259,7 @@ class _ThreadSharedVar:
 # Per-step state read by the block-diagonal SDPA (set by make_cp_blockdiag_batch_and_ctx).
 # Holds internal runtime fields plus a typed ``model_state`` view for model-owned
 # recurrent-attention integrations.
-_CP_BLOCKDIAG_STATE = _ThreadSharedVar()
+_CP_BLOCKDIAG_STATE: _ThreadSharedVar[_BlockdiagStepState] = _ThreadSharedVar()
 
 # Sentinel: counts block-diagonal CP attention invocations (the CP path actually
 # running) so a recipe can fail loud if cp>1 but the hook never fired. A plain

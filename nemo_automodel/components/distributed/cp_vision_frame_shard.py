@@ -57,9 +57,9 @@ declared CP-only.  Under pure TP (``cp_size == 1``) the published group has size
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal, Protocol, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -76,6 +76,41 @@ logger = logging.getLogger(__name__)
 _LOGGED_ONCE = False
 _LOGGED_SMALL_FALLBACK = False
 _LOGGED_COST_ALPHAS: set[tuple[str, int, str]] = set()
+
+
+class _VisionTowerOutput(Protocol):
+    """Vision-tower output whose merged-token tensors :func:`maybe_distribute_visual` replaces.
+
+    ``pooler_output`` is the ``[merged_tokens, hidden]`` merged-token tensor. Outputs
+    of deepstack towers additionally carry a ``deepstack_features`` list of tensors
+    with the same layout; it is replaced through attribute assignment, which
+    Hugging Face ``ModelOutput`` (and any ordinary output object) supports.
+    """
+
+    pooler_output: torch.Tensor
+
+    def __setattr__(self, name: str, value: torch.Tensor | list[torch.Tensor], /) -> None: ...
+
+
+_VisionOutputT = TypeVar("_VisionOutputT", bound=_VisionTowerOutput)
+_VisionOutputT_co = TypeVar("_VisionOutputT_co", bound=_VisionTowerOutput, covariant=True)
+
+
+class _FrameShardableVisionTower(Protocol[_VisionOutputT_co]):
+    """Vision tower contract consumed by :func:`maybe_distribute_visual`.
+
+    The tower attends within each image/frame entry described by ``grid_thw`` rows
+    and merges ``spatial_merge_size ** 2`` patch rows into one output token.
+    """
+
+    @property
+    def spatial_merge_size(self) -> int: ...
+
+    def parameters(self) -> Iterator[torch.nn.Parameter]: ...
+
+    def __call__(
+        self, pixel_values: torch.Tensor | None, *, grid_thw: torch.Tensor | None, return_dict: bool
+    ) -> _VisionOutputT_co: ...
 
 
 @dataclass(frozen=True)
@@ -164,7 +199,7 @@ class _GroupHolder:
     and token-based restore handles nested callers.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._value: _GroupScope | None = None
 
     def get(self) -> _GroupScope | None:
@@ -183,6 +218,14 @@ class _GroupHolder:
 _CP_VISION_GROUP = _GroupHolder()
 
 
+class _AllGatherSeqContext(Protocol):
+    """Autograd context fields saved by :class:`_AllGatherSeqDiff`."""
+
+    group: dist.ProcessGroup
+    seq_dim: int
+    local_sequence: int
+
+
 class _AllGatherSeqDiff(torch.autograd.Function):
     """Differentiable all-gather of equal-size per-rank shards along ``seq_dim``.
 
@@ -195,7 +238,18 @@ class _AllGatherSeqDiff(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, group, seq_dim: int) -> torch.Tensor:
+    def forward(ctx: _AllGatherSeqContext, x: torch.Tensor, group: dist.ProcessGroup, seq_dim: int) -> torch.Tensor:
+        """Gather every rank's equal-length shard ``x`` along ``seq_dim`` in rank order.
+
+        Args:
+            ctx: Autograd context that keeps the group and local shard length.
+            x: This rank's shard; its ``seq_dim`` extent is equal on every rank.
+            group: Process group to gather over.
+            seq_dim: Dimension along which shards are concatenated.
+
+        Returns:
+            Tensor shaped like ``x`` with ``seq_dim`` extent ``world * x.shape[seq_dim]``.
+        """
         ctx.group = group
         ctx.seq_dim = seq_dim
         ctx.local_sequence = x.shape[seq_dim]
@@ -205,7 +259,17 @@ class _AllGatherSeqDiff(torch.autograd.Function):
         return gathered.movedim(0, seq_dim)
 
     @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
+    def backward(ctx: _AllGatherSeqContext, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Reduce-scatter(SUM) the gathered gradient back to this rank's shard.
+
+        Args:
+            ctx: Autograd context holding the group, ``seq_dim`` and local shard length.
+            grad_outputs: Exactly one gradient shaped like the gathered output.
+
+        Returns:
+            The gradient of this rank's shard, then ``None`` for ``group`` and ``seq_dim``.
+        """
+        (grad_out,) = grad_outputs
         source = grad_out.movedim(ctx.seq_dim, 0).contiguous()
         local = source.new_empty((ctx.local_sequence, *source.shape[1:]))
         dist.reduce_scatter_tensor(local, source, op=dist.ReduceOp.SUM, group=ctx.group)
@@ -303,7 +367,9 @@ def cp_vision_frame_sharding_active() -> bool:
     return dist.get_world_size(scope.group) > 1
 
 
-def _check_group_scope_for_trainable(visual: torch.nn.Module, scope: _GroupScope) -> None:
+def _check_group_scope_for_trainable(
+    visual: _FrameShardableVisionTower[_VisionTowerOutput], scope: _GroupScope
+) -> None:
     """Raise when a trainable vision tower is sharded over a group not declared CP-only.
 
     The ViT is replicated (not tensor-parallel) across TP ranks, so gathering frames
@@ -351,6 +417,8 @@ def _infer_vision_hidden_size(source: object | None) -> int | None:
 
     def _positive_int(value: object | None) -> int | None:
         if isinstance(value, bool) or value is None:
+            return None
+        if not isinstance(value, (int, float, str)):
             return None
         try:
             parsed = int(value)
@@ -596,10 +664,10 @@ def _raise_if_any_rank_failed(
 
 
 def maybe_distribute_visual(
-    visual: torch.nn.Module,
+    visual: _FrameShardableVisionTower[_VisionOutputT],
     pixel_values: torch.Tensor | None,
     grid_thw: torch.Tensor | None,
-) -> Any:
+) -> _VisionOutputT:
     """Run ``visual(pixel_values, grid_thw=grid_thw, return_dict=True)`` but distribute the
     forward across the CP group when enabled, returning an output object whose
     ``pooler_output`` (and ``deepstack_features`` list, if any) are the FULL gathered

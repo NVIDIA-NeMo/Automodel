@@ -17,7 +17,8 @@
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Callable, ContextManager
+from collections.abc import Callable, Generator
+from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -27,7 +28,7 @@ from nemo_automodel.components.distributed.blockdiag_cp import state as state_mo
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
 
 
-def _cp_blockdiag_doc_ids(batch: dict, seq_len: int, device, batch_size: int) -> torch.Tensor:
+def _cp_blockdiag_doc_ids(batch: dict[str, Any], seq_len: int, device: torch.device, batch_size: int) -> torch.Tensor:
     """Resolve per-position document ids ``[B, S]`` (0 == padding) for the mask.
 
     Prefers the collator's ``_packed_seq_ids`` (1-based document index per token,
@@ -68,7 +69,7 @@ def make_cp_blockdiag_batch_and_ctx(
     loss_mask: torch.Tensor | None = None,
     padding_token_id: int = 0,
     shard_primary: bool = True,
-) -> tuple[Callable[[], ContextManager], dict[str, Any], ShardLayout | None]:
+) -> tuple[Callable[[], contextlib.AbstractContextManager[None]], dict[str, Any], ShardLayout | None]:
     """Sequentially shard a batch for block-diagonal CP.
 
     Pads the sequence to a multiple of twice the CP world size, slices each
@@ -288,7 +289,7 @@ def make_cp_blockdiag_batch_and_ctx(
             batch[key] = _shard(key, batch[key])
 
     runtime_config = state_module.cp_varlen_runtime_config()
-    step_state = {
+    step_state: state_module._BlockdiagStepState = {
         "group": group,
         "doc_ids": doc_ids,
         "packed_cu_seqlens": packed_cu_seqlens,
@@ -314,7 +315,7 @@ def make_cp_blockdiag_batch_and_ctx(
     }
 
     @contextlib.contextmanager
-    def _ctx():
+    def _ctx() -> Generator[None, None, None]:
         token = state_module._CP_BLOCKDIAG_STATE.set(step_state)
         # EFFICIENT/MATH support arbitrary masks (flash does not); both are correct
         # on the local (non-DTensor) tensors produced by the K/V exchange.

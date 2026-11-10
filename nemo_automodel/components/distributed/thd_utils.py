@@ -372,8 +372,16 @@ def split_batch_into_thd_chunks(
     if num_chunks <= 1:
         return process_input_for_thd(batch, seq_lens_padding_value, padding_token_id)
 
-    def pad_and_stack(tensor_list, padding_value):
-        """Pad tensors to same length and stack them."""
+    def pad_and_stack(tensor_list: list[torch.Tensor], padding_value: int) -> torch.Tensor:
+        """Pad 1D tensors on the right to the longest length and stack them.
+
+        Args:
+            tensor_list: 1D tensors of shape ``[length_i]`` (e.g. per-chunk ``cu_seqlens``).
+            padding_value: Fill value for the right padding.
+
+        Returns:
+            Tensor of shape ``[len(tensor_list), max_i length_i]``.
+        """
         max_len = max(len(t) for t in tensor_list)
         padded = []
         for t in tensor_list:
@@ -398,7 +406,7 @@ def split_batch_into_thd_chunks(
         for i in range(num_chunks)
     ]
 
-    stacked: dict = {
+    stacked: dict[str, torch.Tensor] = {
         "input_ids": torch.stack([c["input_ids"] for c in chunk_results]),
         "labels": torch.stack([c["labels"] for c in chunk_results]),
         "position_ids": torch.stack([c["position_ids"] for c in chunk_results]),
