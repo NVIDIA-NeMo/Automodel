@@ -1890,15 +1890,11 @@ class Checkpointer:
         Args:
             state: Stateful object whose state dict maps keys to tensors of arbitrary shape/dtype or auxiliary
                 values. Tensor devices and DTensor mesh placements define the rank-local load destinations.
-            state_name: Subdirectory containing the saved state. Objects may
-                implement ``state_dict_template()`` to construct load destinations
-                without snapshotting or initializing their live runtime.
+            state_name: Subdirectory containing the saved state.
             path: Checkpoint root directory.
         """
         state_dir = os.path.join(path, state_name)
-        # Byte-valued state needs only its keys at load time, not a live snapshot.
-        template = getattr(state, "state_dict_template", state.state_dict)
-        state_dict = template()
+        state_dict = state.state_dict()
         process_group = self._get_load_process_group()
         process_group_kwargs = {"process_group": process_group} if process_group is not None else {}
         dcp.load(state_dict, checkpoint_id=state_dir, **process_group_kwargs)

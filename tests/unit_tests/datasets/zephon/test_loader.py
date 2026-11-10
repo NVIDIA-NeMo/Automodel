@@ -23,9 +23,11 @@ from nemo_automodel.components.datasets.packing import DEFAULT_PACKED_SEQUENCE_C
 from nemo_automodel.components.datasets.zephon.loader import ZephonDataLoader
 from nemo_automodel.recipes.base_recipe import is_dataloader, is_distributed_stateful
 
+pytestmark = pytest.mark.cpu_only
 
-@pytest.mark.parametrize("state", [{}, {"zephon": {}}, {"zephon": b""}])
-def test_checkpoint_rejects_missing_or_empty_bytes(state):
+
+@pytest.mark.parametrize("state", [{}, {"zephon": {}}, {"zephon": None}])
+def test_checkpoint_rejects_missing_or_non_bytes_state(state: dict[str, bytes | dict[str, str] | None]) -> None:
     pipeline = Mock()
     loader = ZephonDataLoader(
         pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
@@ -54,10 +56,10 @@ def test_checkpoint_passes_opaque_bytes_without_reserialization():
     loader = ZephonDataLoader(
         pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
     )
+    loader.load_state_dict({"zephon": checkpoint})
     state = loader.state_dict()
     assert state["zephon"] is checkpoint
-    pipeline.checkpoint.assert_called_once_with(as_bytes=True)
-    loader.load_state_dict(state)
+    pipeline.checkpoint.assert_not_called()
     pipeline.restore.assert_called_once_with(checkpoint)
 
 
@@ -67,13 +69,28 @@ def test_actual_base_recipe_checkpoint_route():
     assert is_distributed_stateful(loader)
 
 
-def test_load_template_does_not_initialize_or_checkpoint_pipeline():
+def test_initial_state_does_not_initialize_or_checkpoint_pipeline() -> None:
     pipeline = Mock()
     loader = ZephonDataLoader(
         pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
     )
-    assert loader.state_dict_template() == {"zephon": b""}
+    assert loader.state_dict() == {"zephon": b""}
+    loader.load_state_dict(loader.state_dict())
+    assert loader.state_dict() == {"zephon": b""}
     assert pipeline.mock_calls == []
+
+
+def test_initial_state_does_not_discard_a_pending_restore() -> None:
+    pipeline = Mock()
+    loader = ZephonDataLoader(
+        pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
+    )
+    loader.load_state_dict({"zephon": b"saved-progress"})
+    with pytest.raises(ValueError, match="fresh loader"):
+        loader.load_state_dict({"zephon": b""})
+    assert loader.state_dict() == {"zephon": b"saved-progress"}
+    pipeline.restore.assert_called_once_with(b"saved-progress")
+    pipeline.checkpoint.assert_not_called()
 
 
 def test_exhaustion_checkpoints_before_explicit_close():
@@ -92,6 +109,29 @@ def test_exhaustion_checkpoints_before_explicit_close():
     pipeline.checkpoint.assert_called_once_with(as_bytes=True)
     loader.close()
     pipeline.close.assert_called_once()
+    assert loader.state_dict() == {"zephon": b"terminal-checkpoint"}
+    assert pipeline.checkpoint.call_count == 2
+    with pytest.raises(ValueError, match="fresh loader"):
+        loader.load_state_dict({"zephon": b""})
+
+
+def test_iteration_checkpoints_new_progress_after_restore() -> None:
+    from unittest.mock import MagicMock
+
+    pipeline = MagicMock()
+    pipeline.__iter__.return_value = iter(())
+    pipeline.checkpoint.return_value = b"new-progress"
+    loader = ZephonDataLoader(
+        pipeline=pipeline, packing_contract=DEFAULT_PACKED_SEQUENCE_CONTRACT, convert_batch=Mock()
+    )
+    loader.load_state_dict({"zephon": b"saved-progress"})
+    assert list(loader) == []
+    assert loader.state_dict() == {"zephon": b"new-progress"}
+    pipeline.checkpoint.assert_called_once_with(as_bytes=True)
+    loader.close()
+    loader.load_state_dict({"zephon": b"another-checkpoint"})
+    assert loader.state_dict() == {"zephon": b"another-checkpoint"}
+    pipeline.checkpoint.assert_called_once_with(as_bytes=True)
 
 
 def test_pipeline_startup_error_closes_runtime():
