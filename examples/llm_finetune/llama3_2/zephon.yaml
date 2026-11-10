@@ -41,6 +41,9 @@ dataset:
     answer: output
   use_hf_chat_template: true
   zephon:
+    source:
+      # Keep enough source chunks to give every data-parallel rank work.
+      chunk_size: 512
     sources:
     - name: instructions
       path: hf://yahma/alpaca-cleaned/train
@@ -49,9 +52,9 @@ dataset:
       # Drop oversized conversations instead of truncating them.
       pack_algorithm: best_fit
     cache:
-      # Remote shards are fetched through Zephon's bounded disk cache.
-      cache_dir: .cache/zephon
-      cache_limit_bytes: 32GiB
+      # Use fast node-local SSD/NVMe storage for downloaded shards, not a shared filesystem.
+      cache_dir: /tmp/zephon-cache
+      cache_limit_bytes: 32gb
     checkpoint:
       run_id: zephon-llama3_2-sft
 distributed:
