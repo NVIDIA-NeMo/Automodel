@@ -911,6 +911,12 @@ navigation:
           - page: "Overview"
             path: ../../model-coverage/reranker/index.mdx
             slug: overview
+          - section: "Mistral AI"
+            slug: mistralai
+            path: ../../model-coverage/reranker/mistralai/index.mdx
+            contents:
+              - page: "Ministral-3-3B-Instruct-2512-BF16"
+                path: ../../model-coverage/reranker/mistralai/ministral3-vl.mdx
           - section: "NVIDIA"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRiACAABXRUJQVlA4TBQCAAAvE8AEAJfkqI0kScqsnnueQ2QZLH9Ic1QGDceR5MbNLgSAsv10OA7C+Qeim8A6biRJkapheX/rypp9PpxBzHc9VPMfiAVCIJABEUgEAFGRTCEIOnlLIUJUS+dtd19/MxO62rPJDFRIVUaTDgjy/NDNd96lkr4+MjNAJmQWmT+gkRrUUIr+oTOR6IIGgYBChasQGgCpoousYIAhCiAUDZAgAqsBJJC6kgBRRGaVElbSs4iCir7zKg9hWR9PUfZtN+qiZXgKKfkeYAIFCL4L/D+Y3JliW0dl6njP1jEYiylT52chCgPaZrtnbavZ1f+3W8fg+m5MMUdncrdkrwhALNmbwwjKFNvo2czkrkimEM3sZore8Z4t2ZvcmWJyN7mb3JmiTJnCFEv2RPj50YhBuVgsw1Z9nACibdumm/1wYttOldpGUtupbdu29cuNvyCi/xOAVGckEblYGCnilwKmptZgdc2nG1wUGLzZLc39I0OjjZBE4DlXgz8nM9fR1jdYEYmDvddZ780oqrUMh8sjgZO1BwrTB4Jp3b7OUBQexo5AcX5eidXWVRcFAuizCkrLvnrCYyESR/pv/q36+/mu9ICJoJhf0upUa+rVZWiwIAcgxOTm0cH98+H53snVxcr6O0QQ4u12+nh/52P7dHzj7Hp3S8myhJmJuamXx8Wnm8vp14fZuwWwSDBLLJGQJaGQiEgYIVUB"/></svg>'
             slug: nvidia
