@@ -37,6 +37,10 @@ dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
   tokenize_special_tokens: eos
   zephon:
+    source:
+      token_estimation:
+        # Bound calibration I/O while retaining the default document sample count.
+        calibration_shards_max: 6
     # Weights target token proportions; estimation is automatic with multiple text sources.
     sources:
     - name: web
@@ -53,7 +57,10 @@ dataset:
     cache:
       # Use fast node-local SSD/NVMe storage for downloaded shards, not a shared filesystem.
       cache_dir: /tmp/zephon-cache
-      cache_limit_bytes: 32gb
+      cache_limit_bytes: 256gb
+      # Cache decoded Parquet row groups separately from downloaded shards.
+      parquet_rg_cache:
+        limit_bytes: 64gb
     checkpoint:
       run_id: zephon-qwen3-text
 distributed:
