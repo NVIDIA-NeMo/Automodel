@@ -274,6 +274,12 @@ class TENvfp4Config:
     """Scale forward activations per row (one FP32 scale per token) instead of per tensor."""
     four_over_six: Literal["none", "weights", "activations", "all"] = "none"
     """Tensors whose blocks map their maximum to 4 or to 6, whichever quantizes the block with less error."""
+    backward: Literal["quantized", "high_precision", "dequantized"] = "quantized"
+    """Operands of the backward GEMMs. ``"quantized"`` quantizes them to NVFP4 (the recipe default; needs a
+    column-wise copy of the forward activations, which ``row_scaled_activation`` and ``four_over_six`` on
+    activations do not provide, so those options then only work with frozen weights). ``"high_precision"``
+    uses the original floating-point operands and ``"dequantized"`` the dequantized forward operands; the
+    forward is unchanged."""
     resident_weights: bool = False
     """Hold the expert weights as NVFP4 tensors instead of floating point. An NVFP4 checkpoint fills them
     unchanged and they are saved in the same form. Training them needs an optimizer that keeps FP32 master
@@ -286,6 +292,10 @@ class TENvfp4Config:
             raise ValueError(
                 "te_fp8.nvfp4.four_over_six must be one of 'none', 'weights', 'activations' or 'all', "
                 f"got {self.four_over_six!r}"
+            )
+        if self.backward not in ("quantized", "high_precision", "dequantized"):
+            raise ValueError(
+                f"te_fp8.nvfp4.backward must be one of quantized, high_precision or dequantized, got {self.backward!r}"
             )
         if self.random_hadamard_transform and (
             self.row_scaled_activation or self.four_over_six in ("activations", "all")
@@ -308,6 +318,8 @@ class TENvfp4Config:
             kwargs["row_scaled_activation"] = True
         if self.four_over_six != "none":
             kwargs["nvfp4_4over6"] = self.four_over_six
+        if self.backward != "quantized":
+            kwargs["backward_override"] = self.backward
         return kwargs
 
 

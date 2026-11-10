@@ -253,6 +253,8 @@ class TestTEFp8Config:
             "weight_blocks_2d": False,
             "row_scaled_activation": True,
             "four_over_six": "activations",
+            "backward": "high_precision",
+            "resident_weights": True,
         }
         with _fake_te_recipes() as recipes:
             recipes["NVFP4BlockScaling"].__init__ = lambda self, **kwargs: setattr(self, "kwargs", kwargs)
@@ -267,6 +269,7 @@ class TestTEFp8Config:
             "disable_2d_quantization": True,
             "row_scaled_activation": True,
             "nvfp4_4over6": "activations",
+            "backward_override": "high_precision",
         }
 
     @pytest.mark.parametrize(
@@ -276,6 +279,7 @@ class TestTEFp8Config:
             {"four_over_six": "activations"},
             {"four_over_six": "all"},
             {"four_over_six": "sometimes", "random_hadamard_transform": False},
+            {"backward": "float"},
         ],
     )
     def test_nvfp4_options_reject_unsupported_combinations(self, options):

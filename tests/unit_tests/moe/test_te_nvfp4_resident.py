@@ -38,8 +38,8 @@ EXPERTS, DIM, INTER, ROWS = 4, 64, 32, 128
 SHAPES = [(64, 32), (128, 64)]
 
 
-def _backend(recipe: str = "nvfp4", resident: bool = True) -> BackendConfig:
-    te_fp8: dict[str, str | dict[str, bool]] = {"recipe": recipe}
+def _backend(recipe: str = "nvfp4", resident: bool = True, row_scaled_forward: bool = False) -> BackendConfig:
+    te_fp8: dict[str, str | dict[str, bool | str]] = {"recipe": recipe}
     if recipe == "nvfp4":
         te_fp8["nvfp4"] = {
             "random_hadamard_transform": False,
@@ -47,6 +47,9 @@ def _backend(recipe: str = "nvfp4", resident: bool = True) -> BackendConfig:
             "weight_blocks_2d": False,
             "resident_weights": resident,
         }
+        if row_scaled_forward:
+            # Row-scaled four-over-six activations; the weight gradient then needs a floating-point backward.
+            te_fp8["nvfp4"].update(row_scaled_activation=True, four_over_six="activations", backward="high_precision")
     return BackendConfig(attn="sdpa", linear="te", rms_norm="torch", experts="te", dispatcher="deepep", te_fp8=te_fp8)
 
 
@@ -85,14 +88,17 @@ def _packed_state(uniform_rows: bool = True, dim: int = DIM, inter: int = INTER)
     return state
 
 
-def _experts(dim: int = DIM, inter: int = INTER) -> GroupedExpertsTENVFP4:
-    experts = GroupedExpertsTENVFP4(_config(dim, inter), backend=_backend(), dispatcher_backend="deepep")
+def _experts(dim: int = DIM, inter: int = INTER, row_scaled_forward: bool = False) -> GroupedExpertsTENVFP4:
+    backend = _backend(row_scaled_forward=row_scaled_forward)
+    experts = GroupedExpertsTENVFP4(_config(dim, inter), backend=backend, dispatcher_backend="deepep")
     experts.to_empty(device="cuda")
     return experts
 
 
-def _loaded(state: dict[str, torch.Tensor], dim: int = DIM, inter: int = INTER) -> GroupedExpertsTENVFP4:
-    experts = _experts(dim, inter)
+def _loaded(
+    state: dict[str, torch.Tensor], dim: int = DIM, inter: int = INTER, row_scaled_forward: bool = False
+) -> GroupedExpertsTENVFP4:
+    experts = _experts(dim, inter, row_scaled_forward)
     experts.load_state_dict({key: value.cuda() for key, value in state.items()}, strict=False)
     return experts
 
@@ -170,9 +176,10 @@ def test_projection_multiplies_each_expert_by_its_own_packed_weight() -> None:
         assert (out[block].float() - other).norm() / other.norm() > 0.8
 
 
-def test_training_step_updates_the_packed_weights_through_fp32_masters() -> None:
+@pytest.mark.parametrize("row_scaled_forward", [False, True])
+def test_training_step_updates_the_packed_weights_through_fp32_masters(row_scaled_forward: bool) -> None:
     state = _packed_state()
-    experts = _loaded(state)
+    experts = _loaded(state, row_scaled_forward=row_scaled_forward)
     trainable = [param for param in experts.parameters() if param.requires_grad]
     assert len(trainable) == 2 * EXPERTS
     optimizer = FusedAdam(trainable, lr=1e-2, master_weights=True)
