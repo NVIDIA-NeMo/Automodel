@@ -13,19 +13,26 @@
 # limitations under the License.
 
 # Continue pretraining on TinyStories with online tokenization and packing.
-# Run: uv run automodel examples/llm_pretrain/qwen/zephon.yaml --nproc-per-node 1
+# Run: uv run automodel examples/llm_pretrain/qwen/zephon.yaml --nproc-per-node 8
+# Training reference: examples/llm_finetune/qwen/qwen3_0p6b_hellaswag.yaml
+# Streaming step cap: 1 * ceil(39905 / 64) = 624.
+# This retains the reference update budget, not its epoch boundaries on the different source.
+# Packing window: examples/llm_finetune/qwen/qwen3_0p6b_packed_cp2.yaml; CP and its TE backend are not enabled here.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
-seed: 42
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
 step_scheduler:
-  global_batch_size: 4
-  local_batch_size: 1
-  max_steps: 100
-  ckpt_every_steps: 20
+  global_batch_size: 64
+  local_batch_size: 8
+  ckpt_every_steps: 200
+  val_every_steps: 100
+  num_epochs: 1
+  max_steps: 624
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-0.6B-Base
-  dtype: float32
-  attn_implementation: sdpa
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
   tokenize_special_tokens: eos
@@ -34,24 +41,36 @@ dataset:
     - name: stories
       path: hf://roneneldan/TinyStories/train
     packing:
-      seq_len: 2048
+      seq_len: 1024
     checkpoint:
       run_id: zephon-qwen3-text
 distributed:
   strategy: fsdp2
-optimizer:
-  _target_: torch.optim.AdamW
-  lr: 0.00001
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+optimizer:
+  _target_: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  lr: 1.0e-05
+  weight_decay: 0
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/zephon-qwen3-text
+  model_save_format: torch_save
+  save_consolidated: false
 dist_env:
   backend: nccl
+  timeout_minutes: 1
 ci:
   cluster_tag: h100
   recipe_owner: MaxiBoether
-  time: "00:30:00"
+  time: 00:30:00
   nodes: 1
-  nproc_per_node: 1
+  nproc_per_node: 8
