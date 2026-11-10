@@ -166,13 +166,37 @@ def test_invalid_recipe_configs_fail_before_source_build(override, message):
 def test_shipped_yaml_resolves(recipe_name):
     import yaml
 
-    path = Path(__file__).resolve().parents[4] / f"examples/llm_pretrain/zephon/{recipe_name}.yaml"
+    path = Path(__file__).resolve().parents[4] / f"tests/integration/zephon/fixtures/{recipe_name}.yaml"
     config = RecipeConfig(ConfigNode(yaml.safe_load(path.read_text())))
     assert isinstance(config.dataloader, DataloaderConfig)
     assert isinstance(config.dataloader, ZephonDataloaderConfig)
     assert config.dataloader.dataset_config.zephon.packing.seq_len == 63
     assert config.dataloader.dataset_config.zephon.source.stop_after_passes is None
     assert config.dataloader.batch_size == config.get("step_scheduler.local_batch_size")
+
+
+@pytest.mark.parametrize("family", ["qwen", "llama3_2"])
+@pytest.mark.parametrize("prepacked", [False, True])
+def test_pretraining_examples_select_matching_source_and_preparation(family: str, prepacked: bool) -> None:
+    import yaml
+
+    filename = "zephon_prepacked.yaml" if prepacked else "zephon.yaml"
+    path = Path(__file__).resolve().parents[4] / "examples/llm_pretrain" / family / filename
+    recipe = RecipeConfig(ConfigNode(yaml.safe_load(path.read_text())))
+    config = recipe.dataloader
+    assert isinstance(config, ZephonDataloaderConfig)
+    dataset = config.dataset_config
+    assert dataset.zephon.packing.seq_len == 2048
+    assert config.batch_size == 1
+    if prepacked:
+        assert isinstance(dataset, ZephonPretokenizedTextDatasetConfig)
+        assert dataset.zephon.packing.pack_algorithm is None
+        assert dataset.zephon.sources[0].path.startswith("work/zephon-prepacked/")
+    else:
+        assert isinstance(dataset, ZephonTextDatasetConfig)
+        assert dataset.tokenize_special_tokens == "eos"
+        assert dataset.zephon.packing.pack_algorithm == "wrap"
+        assert dataset.zephon.sources[0].path == "hf://roneneldan/TinyStories/train"
 
 
 def test_explicit_instruction_config_selects_sft_without_native_translation():

@@ -1054,6 +1054,9 @@ navigation:
       - page: "Overview"
         path: ../../guides/dataset-overview.mdx
         slug: overview
+      - page: "Zephon"
+        path: ../../guides/zephon.mdx
+        slug: zephon
       - page: "Text Dataset"
         path: ../../guides/llm/dataset.mdx
         slug: text-dataset

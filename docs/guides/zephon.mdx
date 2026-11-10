@@ -1,4 +1,7 @@
-# Zephon and NeMo AutoModel
+---
+title: "Zephon"
+description: "Use Zephon for streaming, packed text training in NeMo AutoModel."
+---
 
 [Zephon](https://zephon.io/) is a data loader for training at scale. It reads
 and mixes datasets, prepares and packs documents, and keeps data delivery
@@ -12,23 +15,36 @@ Zephon concepts, pipeline operations, and API questions, see the
 
 ## Get Started
 
-Start with an AutoModel checkout and a CUDA training environment, following the
-[AutoModel installation instructions](../../../README.md#getting-started).
-Zephon is included in this checkout's Python dependencies. Installing the project
-also installs Zephon 0.2.1 or later from PyPI.
+Install AutoModel in a CUDA training environment using the
+[installation guide](/get-started/installation). Zephon 0.2.1 or later is included
+in the project dependencies.
 
-The small text example creates a local tokenizer and corpus, then trains a tiny
-Llama model from random weights. Run both commands from the repository root:
+The pretraining recipes use the base checkpoints and tokenizers below. The online
+recipes read [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories)
+and tokenize and pack each document during training. The prepacked recipes read
+your prepared, unshifted token sequences.
+
+| Model | Online tokenization and packing | Prepacked input |
+| --- | --- | --- |
+| Qwen3 0.6B | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/qwen/zephon.yaml) | [zephon_prepacked.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/qwen/zephon_prepacked.yaml) |
+| Llama 3.2 1B | [zephon.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_2/zephon.yaml) | [zephon_prepacked.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_2/zephon_prepacked.yaml) |
+
+Run from the repository root:
 
 ```bash
-uv run python examples/llm_pretrain/zephon/prepare_tiny.py
-uv run automodel examples/llm_pretrain/zephon/tiny.yaml --nproc-per-node 1
+uv run automodel examples/llm_pretrain/qwen/zephon.yaml --nproc-per-node 1
 ```
 
-Training requires one CUDA GPU. The corpus is finite: the recipe reads it once
-and stops when it runs out. `step_scheduler.max_steps` is an upper bound, so
-there is no need to repeat a dataset to reach it. Incomplete final microbatches
-are dropped.
+The recipes continue pretraining `Qwen/Qwen3-0.6B-Base` and
+`meta-llama/Llama-3.2-1B`, respectively. Obtain access to the Llama checkpoint
+before using its recipe. Both examples use a 2,048-token training window and
+Scaled Dot-Product Attention (SDPA). FSDP2 keeps fp32 master weights and optimizer
+state with bf16 compute. Choose a CUDA GPU with enough memory for the model,
+optimizer and activations; these YAMLs do not measure convergence or throughput.
+
+The source is finite: the recipe reads it once and stops when it runs out.
+`step_scheduler.max_steps` is an upper bound, so there is no need to repeat a
+dataset to reach it. Incomplete final microbatches are dropped.
 
 ## Configure Your Data
 
@@ -172,7 +188,24 @@ and binary loss masks, and adds an all-ones mask only when absent. It does not
 retokenize or filter short or fully masked documents. Token-aware mixing counts
 the supplied tokens, including tokens excluded from loss, using `tokens_field`.
 
-For prepacked text, use the same source config and explicitly disable packing:
+For prepacked text, tokenize with the exact base model tokenizer used by the
+matching online recipe. Both online examples use EOS insertion per source
+document (`tokenize_special_tokens: eos`). Export unshifted `input_ids`, aligned
+`positions` from the packer, and an optional aligned binary `loss_mask` to JSONL
+or Parquet shards. Preserve the final token needed for next-token prediction:
+a 2,048-token training window accepts up to 2,049 unshifted tokens. Do not export
+training batches with shifted labels or padded framework cache tensors.
+
+Put Qwen packs in `work/zephon-prepacked/qwen3/` or Llama packs in
+`work/zephon-prepacked/llama3_2/`, or change the matching recipe's source path.
+Token IDs are specific to their tokenizer; do not reuse one family's packs with
+the other family. Run, for example:
+
+```bash
+uv run automodel examples/llm_pretrain/qwen/zephon_prepacked.yaml --nproc-per-node 1
+```
+
+These recipes explicitly disable online packing:
 
 ```yaml
 dataset:
