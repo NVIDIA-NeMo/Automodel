@@ -17,11 +17,12 @@ from __future__ import annotations
 import logging
 import types
 from collections.abc import Iterable, MutableMapping
-from typing import TYPE_CHECKING, Protocol, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, Protocol, TypeAlias, TypedDict, TypeVar
 
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.distributed._patching import get_undeclared_attr, set_undeclared_attr
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 
 if TYPE_CHECKING:
@@ -73,10 +74,37 @@ class _CausalMaskKwargs(TypedDict):
 
 
 class _CausalMaskOwner(Protocol):
-    """Decoder module whose config selects the mask implementation and which owns the stage mask cache."""
+    """Decoder module whose config selects the mask implementation.
+
+    It also owns the stage mask cache, an attribute this module attaches (``_pp_causal_mask_cache``).
+    """
 
     config: PreTrainedConfig
-    _pp_causal_mask_cache: MutableMapping[_CausalMaskCacheKey, _CausalMaskMapping]
+
+
+class _SubmoduleAttributes(Protocol):
+    """Module whose undeclared attributes resolve to its registered children, parameters or buffers.
+
+    This is ``nn.Module``'s attribute fallback. The pipeline forwards read decoder parts (embeddings,
+    layers, norm, rotary embedding) through it and narrow each result.
+    """
+
+    def __getattr__(self, name: str, /) -> torch.Tensor | nn.Module:
+        """Return the registered submodule, parameter or buffer called ``name``."""
+        ...
+
+
+class _DecoderStage(_SubmoduleAttributes, Protocol):
+    """Module the inner pipeline forward is bound to: a decoder backbone, or a module nesting one.
+
+    Its config selects the causal-mask implementation; decoder parts owned by other pipeline
+    stages are pruned to None.
+    """
+
+    config: PreTrainedConfig
+
+
+_ModuleT = TypeVar("_ModuleT", bound=_SubmoduleAttributes)
 
 
 class _CausalLMStage(Protocol):
@@ -166,7 +194,7 @@ class _InnerPipelineForward(Protocol):
 
     def __call__(
         self,
-        module: nn.Module,
+        module: _DecoderStage,
         /,
         input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -257,7 +285,7 @@ class _Mistral3VLMPipelineForward(Protocol):
     ) -> torch.Tensor: ...
 
 
-def get_text_module(model: nn.Module) -> nn.Module:
+def get_text_module(model: _ModuleT) -> _ModuleT | nn.Module:
     """Return the nested text/LLM module if present, else the model itself."""
     if model is None:
         return model
@@ -338,9 +366,8 @@ def _build_or_reuse_pp_causal_mask(
 
     cacheable = attention_mask is None
     cache_key = (inputs_embeds.shape[1], inputs_embeds.dtype, inputs_embeds.device)
-    cache = getattr(module, "_pp_causal_mask_cache", None)
-    if cache is not None and not isinstance(cache, MutableMapping):
-        cache = None
+    stored_cache = get_undeclared_attr(module, "_pp_causal_mask_cache")
+    cache = stored_cache if isinstance(stored_cache, MutableMapping) else None
     if cacheable and cache is not None and cache_key in cache:
         return cache[cache_key]
 
@@ -359,7 +386,7 @@ def _build_or_reuse_pp_causal_mask(
     if cacheable:
         if cache is None:
             cache = {}
-            module._pp_causal_mask_cache = cache
+            set_undeclared_attr(module, "_pp_causal_mask_cache", cache)
         cache[cache_key] = causal_mask_mapping
     return causal_mask_mapping
 
@@ -369,7 +396,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> _Inner
     from transformers.modeling_outputs import BaseModelOutputWithPast
 
     def pipeline_forward(
-        self: nn.Module,
+        self: _DecoderStage,
         input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
@@ -472,10 +499,15 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> _Inner
         if model_class_name == "PipelineStage":
             return hidden_states
         else:
-            return BaseModelOutputWithPast(
-                last_hidden_state=hidden_states,
-                past_key_values=past_key_values if use_cache else None,
-            )
+            # Hugging Face annotates last_hidden_state as torch.FloatTensor, the legacy float32 CPU tensor
+            # class, which hidden states in the model dtype are not. ModelOutput's mapping interface stores
+            # each field as the dataclass constructor does: attribute and entry, in field order, with None
+            # fields left out (use_cache implies past_key_values is set above).
+            output = BaseModelOutputWithPast()
+            output["last_hidden_state"] = hidden_states
+            if use_cache:
+                output["past_key_values"] = past_key_values
+            return output
 
     return pipeline_forward
 
@@ -656,10 +688,13 @@ def create_pipeline_forward_gemma4_text() -> _Gemma4TextPipelineForward:
             for decoder_layer in layer_iter:
                 # Prefer config.layer_types[layer_idx] over decoder_layer attribute — the
                 # attribute lookup defaults to "full_attention" and mis-assigns position
-                # embeddings (wrong head_dim) to sliding-window layers.
-                if config_layer_types is not None and hasattr(decoder_layer, "layer_idx"):
-                    idx = decoder_layer.layer_idx
-                    layer_type = config_layer_types[idx] if idx < len(config_layer_types) else "full_attention"
+                # embeddings (wrong head_dim) to sliding-window layers. Hugging Face decoder
+                # layers store their int index as a plain attribute nn.Module does not declare.
+                layer_idx = get_undeclared_attr(decoder_layer, "layer_idx")
+                if config_layer_types is not None and isinstance(layer_idx, int):
+                    layer_type = (
+                        config_layer_types[layer_idx] if layer_idx < len(config_layer_types) else "full_attention"
+                    )
                 else:
                     layer_type = getattr(decoder_layer, "attention_type", "full_attention")
                 layer_attention_mask = causal_mask_mapping.get(layer_type, causal_mask_mapping.get("full_attention"))
@@ -979,19 +1014,36 @@ def patch_hf_model_for_pp(model: nn.Module, patch_inner_model: bool = True, patc
             inner_model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), inner_model)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
-            model._pp_return_hidden_states_supported = True
+            # Recipes read this flag to keep the last stage's lm_head deferred to fused cross-entropy.
+            set_undeclared_attr(model, "_pp_return_hidden_states_supported", True)
     else:
         if patch_inner_model:
             model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model)
 
 
 def init_hf_model_buffers(model: torch.nn.Module, device: torch.device) -> None:
-    """Initialize HuggingFace model buffers needed before pipeline execution."""
-    if hasattr(getattr(model, "model", model), "rotary_emb"):
-        rotary_owner = getattr(model, "model", model)
-        if hasattr(rotary_owner.rotary_emb, "rope_init_fn"):
-            inv_freq, _ = rotary_owner.rotary_emb.rope_init_fn(rotary_owner.rotary_emb.config, device)
-            rotary_owner.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+    """Initialize HuggingFace model buffers needed before pipeline execution.
+
+    Recomputes the rotary embedding's ``inv_freq`` on ``device`` when the embedding module exposes
+    Hugging Face's ``rope_init_fn(config, device) -> (inv_freq, attention_scaling)`` attribute.
+
+    Raises:
+        TypeError: If ``rope_init_fn`` does not return a tuple.
+    """
+    rotary_owner = getattr(model, "model", model)
+    if not hasattr(rotary_owner, "rotary_emb"):
+        return
+    rotary_emb = rotary_owner.rotary_emb
+    if not isinstance(rotary_emb, nn.Module):
+        return
+    rope_init_fn = get_undeclared_attr(rotary_emb, "rope_init_fn")
+    if not callable(rope_init_fn):
+        return
+    rope_parameters = rope_init_fn(rotary_emb.config, device)
+    if not isinstance(rope_parameters, tuple):
+        raise TypeError(f"rope_init_fn must return (inv_freq, attention_scaling), got {type(rope_parameters).__name__}")
+    inv_freq, _ = rope_parameters
+    rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
 
 # VLM model_types whose vision routing is handled inside ``patch_hf_model_for_pp``

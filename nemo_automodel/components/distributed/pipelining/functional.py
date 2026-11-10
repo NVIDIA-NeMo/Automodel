@@ -21,7 +21,7 @@ import math
 import os
 import time
 import types
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sized
 from typing import Literal, Protocol, overload
 
 import torch
@@ -38,6 +38,7 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
+from nemo_automodel.components.distributed._patching import get_undeclared_attr, set_undeclared_attr
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
     MULTIMODAL_SUFFIXES,
     TEXT_MODULE_ATTRS,
@@ -518,7 +519,8 @@ def _use_static_pipeline_stage_metadata(schedule: _PipelineSchedule, stages: lis
         for stage in pipeline_stages:
             stage._inference_mode = InferenceMode.STATIC
 
-    schedule._warmup_p2p = types.MethodType(_warmup_static_stages, schedule)
+    # _warmup_p2p is PyTorch 2.12+ (newer than the stubs), probed above.
+    set_undeclared_attr(schedule, "_warmup_p2p", types.MethodType(_warmup_static_stages, schedule))
     logger.info("Using static pipeline metadata with preinitialized neighbor P2P communicators")
 
 
@@ -563,7 +565,10 @@ def _preserve_grads_across_stage_reinit(stages: list[PipelineStage]) -> None:
             for param, grad in saved:
                 param.grad = grad
 
-        stage._post_metadata_inference_cleanup = types.MethodType(_cleanup_preserving_grads, stage)
+        # The cleanup method is PyTorch 2.12+ (newer than the stubs); replace it on this stage instance.
+        set_undeclared_attr(
+            stage, "_post_metadata_inference_cleanup", types.MethodType(_cleanup_preserving_grads, stage)
+        )
 
 
 def reset_pp_stage_shapes(
@@ -612,10 +617,10 @@ def reset_pp_stage_shapes(
                 stage_meta.input_grads = None
                 stage_meta.output_grads = None
         if hasattr(stage, "_inference_mode"):
-            stage._inference_mode = None
+            set_undeclared_attr(stage, "_inference_mode", None)
         for attr_name in ("_fwd_outputs_for_bwd_meta", "_fwd_inputs_for_bwd_meta", "_fwd_kwargs_tensors_for_bwd_meta"):
             if hasattr(stage, attr_name):
-                setattr(stage, attr_name, None)
+                set_undeclared_attr(stage, attr_name, None)
         # Clear pre-allocated recv/send buffers; they will be reallocated by _prepare_forward_infra
         stage.args_recv_info = {}
         stage.grad_recv_info = {}
@@ -627,13 +632,14 @@ def reset_pp_stage_shapes(
     )
 
     # Trigger _initialize_stage(s) on the next step() call.
-    # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.
+    # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural; the _PipelineSchedule base declares
+    # neither.
     if hasattr(schedule, "_stage_forward_initialized"):
-        schedule._stage_forward_initialized = False
-        schedule._stage_backward_initialized = False
+        set_undeclared_attr(schedule, "_stage_forward_initialized", False)
+        set_undeclared_attr(schedule, "_stage_backward_initialized", False)
     if hasattr(schedule, "_stages_forward_initialized"):
-        schedule._stages_forward_initialized = False
-        schedule._stages_backward_initialized = False
+        set_undeclared_attr(schedule, "_stages_forward_initialized", False)
+        set_undeclared_attr(schedule, "_stages_backward_initialized", False)
     return local_num_tokens
 
 
@@ -666,7 +672,7 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
 
     original_forward = stage_model.forward
     # Idempotent: avoid double-wrapping if a stage module is processed twice.
-    if getattr(original_forward, "_pp_unwraps_model_output", False):
+    if get_undeclared_attr(original_forward, "_pp_unwraps_model_output") is True:
         return
 
     @functools.wraps(original_forward)
@@ -676,7 +682,7 @@ def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
             return output.logits
         return output
 
-    _pp_tensor_forward._pp_unwraps_model_output = True
+    set_undeclared_attr(_pp_tensor_forward, "_pp_unwraps_model_output", True)
     stage_model.forward = _pp_tensor_forward
 
 
@@ -725,12 +731,11 @@ def split_model_into_stages(
 
     text_model_has_model_attr = hasattr(text_model, "model")
 
-    if text_model_has_model_attr:
-        # Models like LlamaForCausalLM have model.layers
-        num_layers = len(_child_module(text_model.model).layers)
-    else:
-        # Direct model access
-        num_layers = len(text_model.layers)
+    # Models like LlamaForCausalLM have model.layers; others hold the layers directly.
+    layers = _child_module(text_model.model).layers if text_model_has_model_attr else text_model.layers
+    if not isinstance(layers, Sized):
+        raise TypeError(f"Expected the decoder layers in a sized container, got {type(layers).__name__}")
+    num_layers = len(layers)
 
     schedule_class = get_schedule_class(pp_schedule)
     is_single_stage_schedule = issubclass(schedule_class, PipelineScheduleSingle)
@@ -1076,8 +1081,10 @@ def pipeline_model(
         from nemo_automodel.components.moe.fsdp_mixin import patched_backward_maybe_with_nosync
 
         for stage in stages:
-            stage.backward_maybe_with_nosync = types.MethodType(patched_backward_maybe_with_nosync, stage)
-            stage._reduce_grad_per_microbatch = reduce_grad_per_microbatch
+            set_undeclared_attr(
+                stage, "backward_maybe_with_nosync", types.MethodType(patched_backward_maybe_with_nosync, stage)
+            )
+            set_undeclared_attr(stage, "_reduce_grad_per_microbatch", reduce_grad_per_microbatch)
 
         logger.info(
             "Patched pipeline stages with backward_maybe_with_nosync "

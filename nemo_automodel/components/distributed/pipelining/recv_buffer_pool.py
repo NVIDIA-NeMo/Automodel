@@ -56,6 +56,8 @@ import torch
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import ScheduleInterleaved1F1B, _Action, _ComputationType
 
+from nemo_automodel.components.distributed._patching import get_undeclared_attr, set_undeclared_attr
+
 if TYPE_CHECKING:
     from torch.distributed.pipelining.stage import _PipelineStageBase
 
@@ -162,29 +164,35 @@ def install_recv_buffer_pool(slack: int = 2) -> bool:
         # Layout "per-direction-setup" (torch release/2.12 and later): the
         # manual PipelineStage allocates in _setup_forward_recv_info(
         # num_microbatches, has_backward) and the base class in
-        # _setup_backward_recv_info(num_microbatches).
+        # _setup_backward_recv_info(num_microbatches). Both return None. The
+        # PyTorch 2.10 stubs predate them, hence the reflection adapter.
         layout = "per-direction-setup"
-        orig_setup_fwd = manual_cls._setup_forward_recv_info
-        orig_setup_bwd = base_cls._setup_backward_recv_info
+        orig_setup_fwd = get_undeclared_attr(manual_cls, "_setup_forward_recv_info")
+        orig_setup_bwd = get_undeclared_attr(base_cls, "_setup_backward_recv_info")
+        if not callable(orig_setup_fwd) or not callable(orig_setup_bwd):
+            raise AttributeError("recv_buffer_pool: torch lacks a callable per-direction recv setup pair")
 
         def pooled_setup_forward_recv_info(self: PipelineStage, num_microbatches: int, has_backward: bool) -> None:
             k = _ring_size(self, num_microbatches, slack)
             if self.is_first or k >= num_microbatches:
-                return orig_setup_fwd(self, num_microbatches, has_backward)
+                orig_setup_fwd(self, num_microbatches, has_backward)
+                return
             orig_setup_fwd(self, k, has_backward)
             _alias_fwd_ring(self, k, num_microbatches)
 
         def pooled_setup_backward_recv_info(self: _PipelineStageBase, num_microbatches: int) -> None:
             if not isinstance(self, manual_cls) or self.is_last:
-                return orig_setup_bwd(self, num_microbatches)
+                orig_setup_bwd(self, num_microbatches)
+                return
             k = _ring_size(self, num_microbatches, slack)
             if k >= num_microbatches:
-                return orig_setup_bwd(self, num_microbatches)
+                orig_setup_bwd(self, num_microbatches)
+                return
             orig_setup_bwd(self, k)
             _alias_bwd_ring(self, k, num_microbatches)
 
-        manual_cls._setup_forward_recv_info = pooled_setup_forward_recv_info
-        base_cls._setup_backward_recv_info = pooled_setup_backward_recv_info
+        set_undeclared_attr(manual_cls, "_setup_forward_recv_info", pooled_setup_forward_recv_info)
+        set_undeclared_attr(base_cls, "_setup_backward_recv_info", pooled_setup_backward_recv_info)
     elif hasattr(manual_cls, "_prepare_forward_infra"):
         # Layout "prepare-infra" (torch <= 2.11 and the pre-refactor 2.12
         # nightlies, e.g. the NGC 26.06 container): allocation inside
@@ -298,7 +306,10 @@ def _recv_slots(
 
 def _pool_stage_backward_recvs(stage: PipelineStage, slots: tuple[int, ...], count: int) -> None:
     """Install instance-local allocation and ownership rules before stage setup."""
-    original_setup = stage._setup_backward_recv_info
+    # _setup_backward_recv_info is PyTorch 2.12+ (newer than the stubs); the caller checked it exists.
+    original_setup = get_undeclared_attr(stage, "_setup_backward_recv_info")
+    if not callable(original_setup):
+        raise AttributeError("Backward recv pooling requires PipelineStage._setup_backward_recv_info")
     original_retrieve = stage._retrieve_recv_grads
 
     def setup(self: PipelineStage, num_microbatches: int) -> None:
@@ -316,14 +327,17 @@ def _pool_stage_backward_recvs(stage: PipelineStage, slots: tuple[int, ...], cou
         # NCCL and the copy observe normal PyTorch current-stream dependencies.
         return tuple(gradient.clone() if gradient is not None else None for gradient in original_retrieve(microbatch))
 
-    stage._setup_backward_recv_info = MethodType(setup, stage)
-    stage._retrieve_recv_grads = MethodType(retrieve, stage)
+    set_undeclared_attr(stage, "_setup_backward_recv_info", MethodType(setup, stage))
+    set_undeclared_attr(stage, "_retrieve_recv_grads", MethodType(retrieve, stage))
     logger.info("interleaved backward recv pool: stage %d uses %d/%d buffer sets", stage.stage_index, count, len(slots))
 
 
 def _pool_stage_forward_recvs(stage: PipelineStage, slots: tuple[int, ...], count: int) -> None:
     """Copy received inputs into independent leaves for each microbatch."""
-    original_setup = stage._setup_forward_recv_info
+    # _setup_forward_recv_info is PyTorch 2.12+ (newer than the stubs); the caller checked it exists.
+    original_setup = get_undeclared_attr(stage, "_setup_forward_recv_info")
+    if not callable(original_setup):
+        raise AttributeError("Forward recv pooling requires PipelineStage._setup_forward_recv_info")
     original_retrieve = stage._retrieve_recv_activations
 
     def setup(self: PipelineStage, num_microbatches: int, has_backward: bool) -> None:
@@ -343,8 +357,8 @@ def _pool_stage_forward_recvs(stage: PipelineStage, slots: tuple[int, ...], coun
             for activation in original_retrieve(microbatch)
         )
 
-    stage._setup_forward_recv_info = MethodType(setup, stage)
-    stage._retrieve_recv_activations = MethodType(retrieve, stage)
+    set_undeclared_attr(stage, "_setup_forward_recv_info", MethodType(setup, stage))
+    set_undeclared_attr(stage, "_retrieve_recv_activations", MethodType(retrieve, stage))
     logger.info("interleaved forward recv pool: stage %d uses %d/%d buffer sets", stage.stage_index, count, len(slots))
 
 
