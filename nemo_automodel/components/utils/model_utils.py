@@ -32,6 +32,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 
@@ -170,10 +171,13 @@ def filter_forward_kwargs(model: nn.Module, kwargs: dict) -> dict:
 
 def get_lm_head_module(model: nn.Module) -> nn.Module | None:
     """Return the model's LM head module, if one can be found."""
+    # ``get_output_embeddings`` is the Hugging Face head-lookup convention. ``nn.Module`` does not
+    # declare it, and native models implement it without a shared base class (some return a tied
+    # embedding or a per-stage head), so it is probed here and its result validated.
     get_output_embeddings = getattr(model, "get_output_embeddings", None)
-    if get_output_embeddings is not None:
+    if callable(get_output_embeddings):
         lm_head = get_output_embeddings()
-        if lm_head is not None:
+        if isinstance(lm_head, nn.Module):
             return lm_head
     for name, module in model.named_modules():
         if (name == "lm_head" or name.endswith(".lm_head")) and hasattr(module, "weight"):
@@ -181,17 +185,20 @@ def get_lm_head_module(model: nn.Module) -> nn.Module | None:
     return None
 
 
-def _full_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Gather a DTensor into a regular tensor; plain tensors pass through unchanged."""
-    full_tensor = getattr(tensor, "full_tensor", None)
-    return tensor if full_tensor is None else full_tensor()
+def _full_tensor(weight: torch.Tensor | nn.Module) -> torch.Tensor:
+    """Return ``weight`` as a regular tensor, gathering a DTensor; a module attribute is rejected."""
+    if isinstance(weight, DTensor):
+        return weight.full_tensor()
+    if isinstance(weight, torch.Tensor):
+        return weight
+    raise TypeError(f"LM-head weight must be a tensor, got {type(weight).__name__}")
 
 
 def get_lm_head_weight(model: nn.Module) -> torch.Tensor:
     """Return the model's LM-head weight, materializing DTensor weights when needed."""
     lm_head = get_lm_head_module(model)
     if lm_head is not None:
-        return _full_tensor(getattr(lm_head, "weight"))
+        return _full_tensor(lm_head.weight)
     for name, param in model.named_parameters(remove_duplicate=False):
         if "lm_head" in name and name.endswith(".weight"):
             return _full_tensor(param)
@@ -250,18 +257,23 @@ def _get_model_param_stats(model: nn.Module) -> tuple[int, int, float]:
 def skip_random_init() -> Generator[None, None, None]:
     """
     Context manager to skip random weight initialization when loading pretrained models.
+
+    Clears the module-level ``_init_weights`` flag that older transformers releases read.
+    Releases without that flag (including the pinned 5.18) are left unchanged.
     """
     try:
-        mod = __import__("transformers.initialization", fromlist=["_init_weights"])
+        import transformers.initialization as init_module
     except ImportError:
-        mod = __import__("transformers.modeling_utils", fromlist=["_init_weights"])
-    prev = getattr(mod, "_init_weights", True)
-    # Which transformers module defines the flag depends on the installed release.
-    setattr(mod, "_init_weights", False)
+        import transformers.modeling_utils as init_module
+    if not hasattr(init_module, "_init_weights"):
+        yield
+        return
+    previous = init_module._init_weights
+    init_module._init_weights = False
     try:
         yield
     finally:
-        setattr(mod, "_init_weights", prev)
+        init_module._init_weights = previous
 
 
 def resolve_trust_remote_code(pretrained_model_name_or_path: str | None) -> bool:
@@ -1008,9 +1020,9 @@ def init_empty_weights() -> Generator[None, None, None]:
     }
     old_register_parameter = nn.Module.register_parameter
 
-    def register_empty_parameter(module: nn.Module, name: str, param: nn.Parameter | None) -> None:
-        old_register_parameter(module, name, param)
-        registered = module._parameters[name]
+    def register_empty_parameter(self: nn.Module, name: str, param: nn.Parameter | None) -> None:
+        old_register_parameter(self, name, param)
+        registered = self._parameters[name]
         if param is not None and registered is not None:
             param_cls = type(registered)
             if HAVE_TORCHAO and isinstance(registered, torch_ao.float8.fsdp_utils.WeightWithDynamicFloat8CastTensor):
@@ -1029,13 +1041,12 @@ def init_empty_weights() -> Generator[None, None, None]:
                     kwargs = registered.__dict__.copy()
                     kwargs["requires_grad"] = param.requires_grad
                     is_hf_initialized = kwargs.pop("_is_hf_initialized", None)
-            module._parameters[name] = param_cls(registered.to(device), **kwargs)
+            self._parameters[name] = param_cls(registered.to(device), **kwargs)
             if is_hf_initialized is not None:
-                setattr(module._parameters[name], "_is_hf_initialized", is_hf_initialized)
+                setattr(self._parameters[name], "_is_hf_initialized", is_hf_initialized)
 
     try:
-        # Monkey-patch: assigning to a method of an external class cannot be expressed statically.
-        setattr(nn.Module, "register_parameter", register_empty_parameter)
+        nn.Module.register_parameter = register_empty_parameter
         yield
     finally:
-        setattr(nn.Module, "register_parameter", old_register_parameter)
+        nn.Module.register_parameter = old_register_parameter

@@ -14,7 +14,235 @@
 
 import warnings
 from collections.abc import Sequence
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, TypeVar
+
+from typing_extensions import TypeIs
+
+_ConfigT_co = TypeVar("_ConfigT_co", covariant=True)
+
+
+# ---------------------------------------------------------------------------
+# Config contracts. A formula's Protocol lists the fields it reads without a
+# fallback; fields that some config families omit go through the validated
+# readers below. Hugging Face configs and duck-typed equivalents both qualify.
+# ---------------------------------------------------------------------------
+
+
+class _ModelConfig(Protocol):
+    """Hidden width, read by every model and layer FLOPs formula."""
+
+    hidden_size: int
+
+
+class _TransformerConfig(_ModelConfig, Protocol):
+    """Depth and vocabulary of a transformer model."""
+
+    num_hidden_layers: int
+    vocab_size: int
+
+
+class _AttentionLayerConfig(_ModelConfig, Protocol):
+    """Multi-head attention layer."""
+
+    num_attention_heads: int
+
+
+class _MlpLayerConfig(_ModelConfig, Protocol):
+    """Dense MLP layer."""
+
+    intermediate_size: int
+
+
+class _AttentionConfig(_TransformerConfig, _AttentionLayerConfig, Protocol):
+    """Transformer model with multi-head attention."""
+
+
+class _DenseConfig(_AttentionConfig, _MlpLayerConfig, Protocol):
+    """Transformer model with multi-head attention and a dense MLP width."""
+
+
+class _GptOssConfig(_DenseConfig, Protocol):
+    """GPT-OSS router fan-out."""
+
+    num_experts_per_tok: int
+
+
+class _GatedDeltaNetConfig(_AttentionConfig, Protocol):
+    """Qwen3.5 hybrid model: Gated DeltaNet (linear attention) head shapes."""
+
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    linear_num_key_heads: int
+    linear_num_value_heads: int
+
+
+class _MLAConfig(_AttentionConfig, Protocol):
+    """Multi-Latent Attention (DeepSeek-V3 style) head shapes."""
+
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    qk_nope_head_dim: int
+    v_head_dim: int
+
+
+class _DeepseekV3Config(_MLAConfig, _MlpLayerConfig, Protocol):
+    """DeepSeek-V3 MoE width and router fan-out."""
+
+    moe_intermediate_size: int
+    num_experts_per_tok: int
+
+
+class _MambaLayerConfig(_ModelConfig, Protocol):
+    """Mamba-2 layer head width."""
+
+    mamba_head_dim: int
+
+
+class _MoELayerConfig(_ModelConfig, Protocol):
+    """Nemotron-H MoE layer."""
+
+    num_experts_per_tok: int
+    moe_intermediate_size: int
+    moe_shared_expert_intermediate_size: int
+    n_routed_experts: int
+
+
+class _NemotronHConfig(_AttentionLayerConfig, _MambaLayerConfig, _MlpLayerConfig, _MoELayerConfig, Protocol):
+    """Nemotron-H hybrid model; per-layer fields are read only for the layer types its pattern uses."""
+
+    vocab_size: int
+
+    # One character per layer: M (Mamba), * (attention), - (MLP), E (MoE). A read-only
+    # property on transformers' NemotronHConfig, derived from ``layers_block_type``.
+    @property
+    def hybrid_override_pattern(self) -> str: ...
+
+
+class _ClipViTConfig(Protocol):
+    """NeMo ``FLOPSConfig`` fields for CLIP ViT; a missing ``img_seq_len`` is derived and stored."""
+
+    gbs: int
+    layers: int
+    hs: int
+    img_h: int
+    img_w: int
+    patch_dim: int
+    class_token_len: int
+    in_channels: int
+    img_seq_len: float | None
+
+
+class _NevaProjectionConfig(Protocol):
+    """NeMo ``FLOPSConfig`` fields for the NeVA projector."""
+
+    projector_type: str
+    gbs: int
+    img_seq_len: int
+    ffn_hs: int
+    inp_s: int
+    hs: int
+
+
+class _FluxConfig(Protocol):
+    """NeMo ``FLOPSConfig`` fields for FLUX; ``layers`` holds the joint and single block counts."""
+
+    gbs: int
+    hs: int
+    layers: Sequence[int]
+    model_channels: int
+    inp_s: int
+    in_channels: int
+    vec_in_dim: int
+
+
+class _CompositeConfig(Protocol[_ConfigT_co]):
+    """Vision-language config that keeps its text backbone's fields on ``text_config``."""
+
+    @property
+    def text_config(self) -> _ConfigT_co: ...
+
+
+def _has_text_backbone(config: _ModelConfig | _CompositeConfig[_ModelConfig]) -> bool:
+    """Return whether ``config`` is a composite config whose text backbone lives on ``text_config``."""
+    return hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers")
+
+
+def _is_dense_composite(
+    config: _DenseConfig | _CompositeConfig[_DenseConfig],
+) -> TypeIs[_CompositeConfig[_DenseConfig]]:
+    """Narrow a dense-transformer argument to its composite (vision-language) form."""
+    return _has_text_backbone(config)
+
+
+def _is_gated_delta_net_composite(
+    config: _GatedDeltaNetConfig | _CompositeConfig[_GatedDeltaNetConfig],
+) -> TypeIs[_CompositeConfig[_GatedDeltaNetConfig]]:
+    """Narrow a Qwen3.5 argument to its composite (vision-language) form."""
+    return _has_text_backbone(config)
+
+
+def _is_mla_composite(config: _MLAConfig | _CompositeConfig[_MLAConfig]) -> TypeIs[_CompositeConfig[_MLAConfig]]:
+    """Narrow an MLA argument to its composite (vision-language) form."""
+    return _has_text_backbone(config)
+
+
+def _attr(config: _ModelConfig, name: str) -> object:
+    """Return field ``name`` of ``config``, or ``None`` when its config family omits that field."""
+    return getattr(config, name, None)
+
+
+def _optional_int_attr(config: _ModelConfig, name: str) -> int | None:
+    """Return integer field ``name``, or ``None`` when it is omitted or unset."""
+    value = _attr(config, name)
+    if value is None or isinstance(value, int):
+        return value
+    raise TypeError(f"{type(config).__name__}.{name} must be an int, got {type(value).__name__}")
+
+
+def _int_attr(config: _ModelConfig, name: str, default: int) -> int:
+    """Return integer field ``name``, or ``default`` when it is omitted or unset."""
+    value = _optional_int_attr(config, name)
+    return default if value is None else value
+
+
+def _optional_bool_attr(config: _ModelConfig, name: str) -> bool | None:
+    """Return boolean field ``name``, or ``None`` when it is omitted or unset."""
+    value = _attr(config, name)
+    if value is None or isinstance(value, bool):
+        return value
+    raise TypeError(f"{type(config).__name__}.{name} must be a bool, got {type(value).__name__}")
+
+
+def _optional_str_list_attr(config: _ModelConfig, name: str) -> list[str] | None:
+    """Return string-list field ``name``, or ``None`` when it is omitted or unset."""
+    value = _attr(config, name)
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        items = [item for item in value if isinstance(item, str)]
+        if len(items) == len(value):
+            return items
+    raise TypeError(f"{type(config).__name__}.{name} must be a list of str, got {value!r}")
+
+
+def _optional_int_list_attr(config: _ModelConfig, name: str) -> list[int] | None:
+    """Return integer-list field ``name``, or ``None`` when it is omitted or unset."""
+    value = _attr(config, name)
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        items = [item for item in value if isinstance(item, int)]
+        if len(items) == len(value):
+            return items
+    raise TypeError(f"{type(config).__name__}.{name} must be a list of int, got {value!r}")
+
+
+def _moe_layer_freq_attr(config: _ModelConfig) -> int | list[int] | None:
+    """Return ``moe_layer_freq``: a MoE layer interval, a per-layer 0/1 list, or ``None`` when omitted."""
+    value = _attr(config, "moe_layer_freq")
+    if isinstance(value, int):
+        return value
+    return _optional_int_list_attr(config, "moe_layer_freq")
 
 
 def calculate_mfu(
@@ -47,11 +275,11 @@ def calculate_mfu(
     return mfu * 100
 
 
-def gpt3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def gpt3_flops(config: _TransformerConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for GPT3 family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     hs = config.hidden_size
     layers = config.num_hidden_layers
@@ -63,16 +291,16 @@ def gpt3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     ) + (6 * gbs * seq_len * hs * vocab_size)
 
 
-def llama2_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def llama2_flops(config: _DenseConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for llama2 family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", attention_heads)
     ffn_hs = config.intermediate_size
     vocab_size = config.vocab_size
     causal_self_attn = True
@@ -93,16 +321,16 @@ def llama2_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float
     )
 
 
-def llama3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def llama3_flops(config: _DenseConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for llama3 family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", attention_heads)
     ffn_hs = config.intermediate_size
     vocab_size = config.vocab_size
     causal_self_attn = True
@@ -123,16 +351,16 @@ def llama3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float
     )
 
 
-def nemotron_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def nemotron_flops(config: _DenseConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for nemotron family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", attention_heads)
     ffn_hs = config.intermediate_size
     vocab_size = config.vocab_size
     causal_self_attn = True
@@ -153,19 +381,19 @@ def nemotron_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> flo
     )
 
 
-def mixtral_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def mixtral_flops(config: _DenseConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for mixtral family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", attention_heads)
     ffn_hs = config.intermediate_size
     vocab_size = config.vocab_size
-    moe_router_topk = config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 2
+    moe_router_topk = _int_attr(config, "num_experts_per_tok", 2)
     causal_self_attn = True
 
     return (
@@ -184,30 +412,32 @@ def mixtral_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
     )
 
 
-def qwen3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def qwen3_flops(
+    config: _DenseConfig | _CompositeConfig[_DenseConfig], gbs: int = 1, seq_len: int | None = None
+) -> float:
     """Model FLOPs for Qwen3 family - accepts either AutoConfig or normalized config"""
 
     # For VL composite configs, use the text_config sub-config
-    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+    if _is_dense_composite(config):
         config = config.text_config
 
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", attention_heads)
     vocab_size = config.vocab_size
     # Calculate head_dim if not present (for Qwen2) or use directly (for Qwen3)
-    head_dim = config.head_dim if hasattr(config, "head_dim") else (hs // attention_heads)
+    head_dim = _int_attr(config, "head_dim", hs // attention_heads)
     query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
 
     # MoE fields - Qwen3 uses "moe_topk" if present, else dense (1)
-    moe_router_topk = config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 1
-    moe_ffn_hidden_size = (
-        config.moe_intermediate_size if hasattr(config, "moe_intermediate_size") else config.intermediate_size
-    )
+    moe_router_topk = _int_attr(config, "num_experts_per_tok", 1)
+    moe_ffn_hidden_size = _optional_int_attr(config, "moe_intermediate_size")
+    if moe_ffn_hidden_size is None:
+        moe_ffn_hidden_size = config.intermediate_size
 
     causal_self_attn = True
     hidden_size = hs
@@ -248,11 +478,11 @@ def qwen3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     return attention_flops + mlp_flops + vocab_flops
 
 
-def bert_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def bert_flops(config: _TransformerConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for BERT family - accepts either AutoConfig or normalized config"""
 
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 512
+        seq_len = _int_attr(config, "max_position_embeddings", 512)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
@@ -261,13 +491,13 @@ def bert_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
     return 72 * gbs * layers * seq_len * hs * hs * (1 + (seq_len / (6 * hs)) + (vocab_size / (12 * hs * layers)))
 
 
-def transformer_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def transformer_flops(config: _DenseConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Calculate FLOPs for a standard Transformer model - accepts either AutoConfig or normalized config.
     Note: This does not cover encoder-decoder models.
     """
     batch_size = gbs
     if seq_len is None:
-        seq_length = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_length = _int_attr(config, "max_position_embeddings", 2048)
     else:
         seq_length = seq_len
 
@@ -278,9 +508,9 @@ def transformer_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> 
     vocab_size = config.vocab_size
 
     # Handle optional parameters with reasonable defaults
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else num_attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", num_attention_heads)
     causal_self_attn = True  # Default to causal for decoder models
-    moe_router_topk = config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 0
+    moe_router_topk = _int_attr(config, "num_experts_per_tok", 0)
     kv_channels = hidden_size // num_attention_heads  # Standard dimension per head
 
     # Calculate query projection size and ratio
@@ -362,19 +592,19 @@ def transformer_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> 
     return total_flops
 
 
-def clip_vit_l_flops(config: Any) -> float:
+def clip_vit_l_flops(config: _ClipViTConfig) -> float:
     """Model FLOPs for CLIP ViT"""
 
-    if config.img_seq_len is None:
-        config.img_seq_len = (config.img_h * config.img_w) / (
-            config.patch_dim * config.patch_dim
-        ) + config.class_token_len
-    return config.gbs * config.layers * config.hs * config.hs * config.img_seq_len * (
-        24 + (4 * config.img_seq_len / config.hs)
-    ) + (2 * config.gbs * config.hs * config.in_channels * config.img_h * config.img_w)
+    img_seq_len = config.img_seq_len
+    if img_seq_len is None:
+        img_seq_len = (config.img_h * config.img_w) / (config.patch_dim * config.patch_dim) + config.class_token_len
+        config.img_seq_len = img_seq_len
+    return config.gbs * config.layers * config.hs * config.hs * img_seq_len * (24 + (4 * img_seq_len / config.hs)) + (
+        2 * config.gbs * config.hs * config.in_channels * config.img_h * config.img_w
+    )
 
 
-def neva_projection_flops(config: Any) -> float:
+def neva_projection_flops(config: _NevaProjectionConfig) -> float:
     """Model FLOPs for NeVA Projection"""
 
     if "mlp" in config.projector_type:
@@ -388,7 +618,7 @@ def neva_projection_flops(config: Any) -> float:
         )
 
 
-def flux_flops(config: Any) -> float:
+def flux_flops(config: _FluxConfig) -> float:
     """Model FLOPs for FLUX"""
 
     hs = config.hs
@@ -435,7 +665,7 @@ def flux_flops(config: Any) -> float:
     return joint_layer_flops + single_layer_flops + other_flops
 
 
-def deepseekv3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def deepseekv3_flops(config: _DeepseekV3Config, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for DeepSeek V3 - accepts either AutoConfig or normalized config"""
     if seq_len is None:
         raise ValueError("deepseekv3_flops requires seq_len")
@@ -447,10 +677,10 @@ def deepseekv3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> f
     vocab_size = config.vocab_size
 
     # DeepSeek V3 specific fields
-    q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+    q_lora_rank = _optional_int_attr(config, "q_lora_rank")
     kv_lora_rank = config.kv_lora_rank
     qk_rope_head_dim = config.qk_rope_head_dim
-    qk_nope_head_dim = config.qk_nope_head_dim if hasattr(config, "qk_nope_head_dim") else None
+    qk_nope_head_dim = config.qk_nope_head_dim
 
     v_head_dim = config.v_head_dim
 
@@ -461,19 +691,18 @@ def deepseekv3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> f
     moe_router_topk = config.num_experts_per_tok
 
     # MoE layer pattern
-    first_k_dense_replace = config.first_k_dense_replace if hasattr(config, "first_k_dense_replace") else 0
-    if hasattr(config, "moe_layer_freq"):
-        moe_layer_freq = config.moe_layer_freq
-    else:
+    first_k_dense_replace = _int_attr(config, "first_k_dense_replace", 0)
+    moe_layer_freq = _moe_layer_freq_attr(config)
+    if moe_layer_freq is None:
         moe_layer_freq = [0] * first_k_dense_replace + [1] * (layers - first_k_dense_replace)
 
     # MTP layers (optional)
-    mtp_num_layers = config.mtp_num_layers if hasattr(config, "mtp_num_layers") else None
+    mtp_num_layers = _optional_int_attr(config, "mtp_num_layers")
 
     # DSA / sparse attention (DeepSeek V3.2)
-    index_topk = getattr(config, "index_topk", None)
-    index_n_heads = getattr(config, "index_n_heads", 0)
-    index_head_dim = getattr(config, "index_head_dim", 0)
+    index_topk = _optional_int_attr(config, "index_topk")
+    index_n_heads = _int_attr(config, "index_n_heads", 0)
+    index_head_dim = _int_attr(config, "index_head_dim", 0)
 
     # self-attention flops
     if index_topk is not None and index_topk > 0:
@@ -543,12 +772,12 @@ def deepseekv3_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> f
     return (per_input_attention_flops + per_input_linear_flops + per_input_vocab_flops) * gbs
 
 
-def _nemotronh_mlp_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
+def _nemotronh_mlp_layer_flops(config: _MlpLayerConfig, gbs: int, seq_len: int) -> float:
     """Model FLOPs for MLP layer. Assume gated linear unit."""
     return 6 * gbs * seq_len * config.hidden_size * config.intermediate_size * 3
 
 
-def _nemotronh_moe_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
+def _nemotronh_moe_layer_flops(config: _MoELayerConfig, gbs: int, seq_len: int) -> float:
     """Model FLOPs for a MoE layer in Nemotron V3/Super V3 (hybrid Mamba/Attention/MoE).
 
     Nemotron V3 uses relu2 (non-gated) for both routed and shared experts,
@@ -568,7 +797,7 @@ def _nemotronh_moe_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
     num_tokens = gbs * seq_len
 
     # Determine if latent MoE is used
-    moe_latent_size = getattr(config, "moe_latent_size", None)
+    moe_latent_size = _optional_int_attr(config, "moe_latent_size")
 
     if moe_latent_size is not None:
         # Latent MoE: experts operate in reduced latent space
@@ -592,7 +821,7 @@ def _nemotronh_moe_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
 
 
 def _nemotronh_mtp_flops(
-    config: Any,
+    config: _NemotronHConfig,
     gbs: int,
     seq_len: int,
     num_mtp_layers: int,
@@ -647,11 +876,11 @@ def _nemotronh_mtp_flops(
     return block_flops + eh_proj_flops + lm_head_flops
 
 
-def _non_mla_attn_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
+def _non_mla_attn_layer_flops(config: _AttentionLayerConfig, gbs: int, seq_len: int) -> float:
     """Model FLOPs for attention layer"""
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", attention_heads)
 
     return (
         6
@@ -667,7 +896,7 @@ def _non_mla_attn_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
     )
 
 
-def _mamba_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
+def _mamba_layer_flops(config: _MambaLayerConfig, gbs: int, seq_len: int) -> float:
     """Model FLOPs for Mamba layer.
 
     Three components:
@@ -678,24 +907,20 @@ def _mamba_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
     and 7 * 3 = 21 for scan (non-GEMM kernel, higher op count per element).
     """
     hs = config.hidden_size
-    if hasattr(config, "mamba_state_dim"):
-        mamba_state_dim = config.mamba_state_dim
-    elif hasattr(config, "ssm_state_size"):
-        mamba_state_dim = config.ssm_state_size
-    else:
+    mamba_state_dim = _optional_int_attr(config, "mamba_state_dim")
+    if mamba_state_dim is None:
+        mamba_state_dim = _optional_int_attr(config, "ssm_state_size")
+    if mamba_state_dim is None:
         raise ValueError("Expected config to have 'mamba_state_dim' or 'ssm_state_size'")
     mamba_head_dim = config.mamba_head_dim
-    if hasattr(config, "mamba_num_groups"):
-        mamba_num_groups = config.mamba_num_groups
-    elif hasattr(config, "n_groups"):
-        mamba_num_groups = config.n_groups
-    else:
+    mamba_num_groups = _optional_int_attr(config, "mamba_num_groups")
+    if mamba_num_groups is None:
+        mamba_num_groups = _optional_int_attr(config, "n_groups")
+    if mamba_num_groups is None:
         raise ValueError("Expected config to have 'mamba_num_groups' or 'n_groups'")
 
-    if hasattr(config, "mamba_num_heads") and config.mamba_num_heads:
-        nheads = config.mamba_num_heads
-    else:
-        nheads = 2 * hs // mamba_head_dim  # default expand is 2
+    # default expand is 2
+    nheads = _optional_int_attr(config, "mamba_num_heads") or 2 * hs // mamba_head_dim
     d_in = nheads * mamba_head_dim
 
     in_proj = 6 * gbs * seq_len * hs * (2 * d_in + 2 * mamba_num_groups * mamba_state_dim + nheads)
@@ -704,12 +929,13 @@ def _mamba_layer_flops(config: Any, gbs: int, seq_len: int) -> float:
     return in_proj + scan + out_proj
 
 
-def _hybrid_model_flops(config: Any, gbs: int, seq_len: int) -> float:
+def _hybrid_model_flops(config: _NemotronHConfig, gbs: int, seq_len: int) -> float:
     """Model FLOPs for hybrid model"""
-    if hasattr(config, "is_hybrid_model"):
-        if not config.is_hybrid_model:
+    is_hybrid_model = _optional_bool_attr(config, "is_hybrid_model")
+    if is_hybrid_model is not None:
+        if not is_hybrid_model:
             raise ValueError("Config must have is_hybrid_model=True")
-    elif not hasattr(config, "hybrid_override_pattern"):
+    elif _attr(config, "hybrid_override_pattern") is None:
         raise ValueError("Expected config to have `is_hybrid_model` or `hybrid_override_pattern`")
 
     hybrid_override_pattern = config.hybrid_override_pattern
@@ -739,10 +965,10 @@ def _hybrid_model_flops(config: Any, gbs: int, seq_len: int) -> float:
     return total
 
 
-def nemotronh_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def nemotronh_flops(config: _NemotronHConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for NemotronH"""
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     return _hybrid_model_flops(config, gbs, seq_len)
 
@@ -847,7 +1073,7 @@ def gpt_oss_flops_calculator(
     return flops
 
 
-def gpt_oss_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def gpt_oss_flops(config: _GptOssConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for GPT-OSS"""
     if seq_len is None:
         raise ValueError("gpt_oss_flops requires seq_len")
@@ -855,19 +1081,20 @@ def gpt_oss_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
     num_layers = config.num_hidden_layers
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
-    num_query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else num_attention_heads
+    num_query_groups = _int_attr(config, "num_key_value_heads", num_attention_heads)
     vocab_size = config.vocab_size
 
     # GPT-OSS specific fields
-    moe_ffn_hidden_size = (
-        config.moe_ffn_hidden_size if hasattr(config, "moe_ffn_hidden_size") else config.intermediate_size
-    )
+    moe_ffn_hidden_size = _optional_int_attr(config, "moe_ffn_hidden_size")
+    if moe_ffn_hidden_size is None:
+        moe_ffn_hidden_size = config.intermediate_size
     moe_router_topk = config.num_experts_per_tok
-    kv_channels = getattr(config, "head_dim", None)
+    kv_channels = _optional_int_attr(config, "head_dim")
     if kv_channels is None:
-        kv_channels = getattr(config, "kv_channels", hidden_size // num_attention_heads)
-    swa_window_size = config.window_size[0] if hasattr(config, "window_size") and config.window_size else 128
-    window_attn_skip_freq = config.window_attn_skip_freq if hasattr(config, "window_attn_skip_freq") else 2
+        kv_channels = _int_attr(config, "kv_channels", hidden_size // num_attention_heads)
+    window_size = _optional_int_list_attr(config, "window_size")
+    swa_window_size = window_size[0] if window_size else 128
+    window_attn_skip_freq = _int_attr(config, "window_attn_skip_freq", 2)
 
     return gpt_oss_flops_calculator(
         gbs=gbs,
@@ -885,27 +1112,27 @@ def gpt_oss_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
     )
 
 
-def glm4_moe_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def glm4_moe_flops(config: _DenseConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Estimate FLOPs for GLM4 MoE model configurations."""
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", attention_heads)
     vocab_size = config.vocab_size
 
     # GLM4 MoE attention config
-    head_dim = getattr(config, "head_dim", hs // attention_heads)
+    head_dim = _int_attr(config, "head_dim", hs // attention_heads)
     query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
 
     # MoE config
     ffn_hs = config.intermediate_size  # for dense layers
-    moe_intermediate_size = config.moe_intermediate_size if hasattr(config, "moe_intermediate_size") else ffn_hs
-    moe_router_topk = config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 1
-    n_shared_experts = config.n_shared_experts if hasattr(config, "n_shared_experts") else 0
-    first_k_dense_replace = config.first_k_dense_replace if hasattr(config, "first_k_dense_replace") else 0
+    moe_intermediate_size = _int_attr(config, "moe_intermediate_size", ffn_hs)
+    moe_router_topk = _int_attr(config, "num_experts_per_tok", 1)
+    n_shared_experts = _int_attr(config, "n_shared_experts", 0)
+    first_k_dense_replace = _int_attr(config, "first_k_dense_replace", 0)
 
     causal_self_attn = True
     hidden_size = hs
@@ -970,7 +1197,7 @@ def glm4_moe_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> flo
     return attention_flops + mlp_flops + vocab_flops
 
 
-def minimax_m2_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def minimax_m2_flops(config: _DenseConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for MiniMax-M2 family - accepts either AutoConfig or normalized config.
 
     Architecture: GQA attention (Q/K/V/O separate projections, head_dim may differ from
@@ -979,25 +1206,25 @@ def minimax_m2_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> f
     """
 
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", attention_heads)
     vocab_size = config.vocab_size
-    head_dim = getattr(config, "head_dim", hs // attention_heads)
+    head_dim = _int_attr(config, "head_dim", hs // attention_heads)
     query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
 
     # MoE config — all layers are MoE, no shared experts by default
     ffn_hs = config.intermediate_size
-    moe_router_topk = config.num_experts_per_tok if hasattr(config, "num_experts_per_tok") else 8
-    shared_intermediate_size = getattr(config, "shared_intermediate_size", 0)
+    moe_router_topk = _int_attr(config, "num_experts_per_tok", 8)
+    shared_intermediate_size = _int_attr(config, "shared_intermediate_size", 0)
 
     # MTP config (optional, gated by use_mtp)
-    use_mtp = getattr(config, "use_mtp", False)
-    num_mtp_modules = getattr(config, "num_mtp_modules", 0) if use_mtp else 0
-    mtp_transformer_layers = getattr(config, "mtp_transformer_layers", 1)
+    use_mtp = _optional_bool_attr(config, "use_mtp") or False
+    num_mtp_modules = _int_attr(config, "num_mtp_modules", 0) if use_mtp else 0
+    mtp_transformer_layers = _int_attr(config, "mtp_transformer_layers", 1)
 
     causal_self_attn = True
     gated_linear_multiplier = 2  # SwiGLU: gate + up projections
@@ -1083,7 +1310,9 @@ def _gdn_attention_per_layer_flops(
     )
 
 
-def qwen3_5_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def qwen3_5_flops(
+    config: _GatedDeltaNetConfig | _CompositeConfig[_GatedDeltaNetConfig], gbs: int = 1, seq_len: int | None = None
+) -> float:
     """Model FLOPs for Qwen3.5 family (MoE and Dense) with hybrid GDN/full attention.
 
     Qwen3.5 uses a hybrid attention pattern: 75% GDN (linear attention) layers
@@ -1091,45 +1320,46 @@ def qwen3_5_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
     Supports both the MoE variant (Qwen3.5-35B-A3B) and Dense variant (Qwen3.5-27B).
     """
     # For VL composite configs, use the text_config sub-config
-    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
+    if _is_gated_delta_net_composite(config):
         config = config.text_config
 
     if seq_len is None:
-        seq_len = config.max_position_embeddings if hasattr(config, "max_position_embeddings") else 2048
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
     attention_heads = config.num_attention_heads
-    query_groups = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else attention_heads
+    query_groups = _int_attr(config, "num_key_value_heads", attention_heads)
     vocab_size = config.vocab_size
-    head_dim = getattr(config, "head_dim", hs // attention_heads)
+    head_dim = _int_attr(config, "head_dim", hs // attention_heads)
 
     # GDN (linear attention) parameters
     linear_key_head_dim = config.linear_key_head_dim
     linear_value_head_dim = config.linear_value_head_dim
     linear_num_key_heads = config.linear_num_key_heads
     linear_num_value_heads = config.linear_num_value_heads
-    linear_conv_kernel_dim = getattr(config, "linear_conv_kernel_dim", 4)
+    linear_conv_kernel_dim = _int_attr(config, "linear_conv_kernel_dim", 4)
 
     # Determine layer counts from layer_types or full_attention_interval
-    if hasattr(config, "layer_types") and config.layer_types:
-        layer_types = config.layer_types
+    layer_types = _optional_str_list_attr(config, "layer_types")
+    if layer_types:
         num_full_attn_layers = sum(1 for lt in layer_types if lt == "full_attention")
         num_gdn_layers = layers - num_full_attn_layers
     else:
-        full_attention_interval = getattr(config, "full_attention_interval", 4)
+        full_attention_interval = _int_attr(config, "full_attention_interval", 4)
         num_full_attn_layers = layers // full_attention_interval
         num_gdn_layers = layers - num_full_attn_layers
 
     # MoE fields
-    is_moe = hasattr(config, "num_experts") and config.num_experts is not None and config.num_experts > 1
-    moe_router_topk = getattr(config, "num_experts_per_tok", 1) if is_moe else 1
-    moe_intermediate_size = getattr(config, "moe_intermediate_size", 0) if is_moe else 0
-    shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", 0) if is_moe else 0
-    ffn_hs = getattr(config, "intermediate_size", 0) if not is_moe else 0
+    num_experts = _optional_int_attr(config, "num_experts")
+    is_moe = num_experts is not None and num_experts > 1
+    moe_router_topk = _int_attr(config, "num_experts_per_tok", 1) if is_moe else 1
+    moe_intermediate_size = _int_attr(config, "moe_intermediate_size", 0) if is_moe else 0
+    shared_expert_intermediate_size = _int_attr(config, "shared_expert_intermediate_size", 0) if is_moe else 0
+    ffn_hs = _int_attr(config, "intermediate_size", 0) if not is_moe else 0
 
     # MTP layers
-    mtp_num_layers = getattr(config, "mtp_num_hidden_layers", 0) or 0
+    mtp_num_layers = _int_attr(config, "mtp_num_hidden_layers", 0)
 
     causal_self_attn = True
     gated_linear_multiplier = 2  # SwiGLU: gate + up projections
@@ -1137,8 +1367,8 @@ def qwen3_5_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
     query_projection_to_hidden_size_ratio = (head_dim * attention_heads) / hs
 
     # Qwen3.5 uses gated attention: Q proj outputs 2x (query + gate), applied as sigmoid(gate)*attn
-    attn_output_gate = getattr(config, "attn_output_gate", True)
-    q_gate_multiplier = 2 if attn_output_gate else 1
+    attn_output_gate = _optional_bool_attr(config, "attn_output_gate")
+    q_gate_multiplier = 1 if attn_output_gate is False else 2
 
     # --- Standard (full) attention flops per layer ---
     full_attn_per_layer = (
@@ -1360,69 +1590,73 @@ def _mla_moe_model_flops(
     return attention_flops + ffn_flops + vocab_flops + mtp_flops
 
 
-def _build_moe_layer_pattern(config: Any, layers: int) -> list[int]:
+def _build_moe_layer_pattern(config: _ModelConfig, layers: int) -> list[int]:
     """Build a list of 0/1 indicating dense(0) vs MoE(1) per layer.
 
     Handles multiple config styles: first_k_dense_replace + moe_layer_freq,
     mlp_layer_types list, etc.
     """
-    mlp_layer_types = getattr(config, "mlp_layer_types", None)
+    mlp_layer_types = _optional_str_list_attr(config, "mlp_layer_types")
     if mlp_layer_types is not None:
         return [0 if lt == "dense" else 1 for lt in mlp_layer_types]
 
-    first_k_dense = getattr(config, "first_k_dense_replace", 0)
-    moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+    first_k_dense = _int_attr(config, "first_k_dense_replace", 0)
+    moe_layer_freq = _moe_layer_freq_attr(config)
     if isinstance(moe_layer_freq, list):
         return moe_layer_freq
+    if moe_layer_freq is None:
+        moe_layer_freq = 1
     return [0] * first_k_dense + [
         1 if ((i - first_k_dense) % moe_layer_freq == 0) else 0 for i in range(first_k_dense, layers)
     ]
 
 
-def mla_moe_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def mla_moe_flops(config: _MLAConfig | _CompositeConfig[_MLAConfig], gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for MLA + MoE models (Kimi K2, GLM-5, Mistral Small 4, etc.).
 
     Handles VL wrappers by extracting text_config if present.
     """
     # Handle VL wrappers with nested text_config
-    cfg = config
-    if hasattr(config, "text_config") and not hasattr(config, "num_hidden_layers"):
-        cfg = config.text_config
+    cfg = config.text_config if _is_mla_composite(config) else config
 
     if seq_len is None:
-        seq_len = getattr(cfg, "max_position_embeddings", 2048)
+        seq_len = _int_attr(cfg, "max_position_embeddings", 2048)
 
     layers = cfg.num_hidden_layers
     hs = cfg.hidden_size
-    n_shared = getattr(cfg, "n_shared_experts", 0)
+    n_shared = _int_attr(cfg, "n_shared_experts", 0)
 
-    # MoE intermediate size: try multiple field names
-    moe_int_size = getattr(cfg, "moe_intermediate_size", None)
+    # MoE and dense FFN widths: field names differ across MLA families
+    # (e.g. ``expert_ffn_hidden_size`` / ``ffn_hidden_size``), so try each.
+    dense_ffn_hs = _optional_int_attr(cfg, "intermediate_size")
+    moe_int_size = _optional_int_attr(cfg, "moe_intermediate_size")
     if moe_int_size is None:
-        moe_int_size = getattr(cfg, "expert_ffn_hidden_size", cfg.intermediate_size)
-
-    # Dense FFN intermediate size
-    dense_ffn_hs = getattr(cfg, "intermediate_size", None)
+        moe_int_size = _optional_int_attr(cfg, "expert_ffn_hidden_size")
+    if moe_int_size is None:
+        moe_int_size = dense_ffn_hs
+    if moe_int_size is None:
+        raise AttributeError(
+            f"{type(cfg).__name__} has no moe_intermediate_size, expert_ffn_hidden_size or intermediate_size"
+        )
     if dense_ffn_hs is None:
-        dense_ffn_hs = getattr(cfg, "ffn_hidden_size", moe_int_size)
+        dense_ffn_hs = _int_attr(cfg, "ffn_hidden_size", moe_int_size)
 
     # Router top-k: try multiple field names
-    moe_topk = getattr(cfg, "num_experts_per_tok", None)
+    moe_topk = _optional_int_attr(cfg, "num_experts_per_tok")
     if moe_topk is None:
-        moe_topk = getattr(cfg, "moe_topk", 1)
+        moe_topk = _int_attr(cfg, "moe_topk", 1)
 
     moe_layer_pattern = _build_moe_layer_pattern(cfg, layers)
 
     # MTP: try multiple field names used by different models
-    mtp = getattr(cfg, "num_nextn_predict_layers", None)
+    mtp = _optional_int_attr(cfg, "num_nextn_predict_layers")
     if mtp is None:
-        mtp = getattr(cfg, "mtp_num_layers", 0)
-    mtp = mtp or 0
+        mtp = _int_attr(cfg, "mtp_num_layers", 0)
 
     # DSA (Dynamic Sparse Attention) indexer fields
-    idx_topk = getattr(cfg, "index_topk", None)
-    idx_n_heads = getattr(cfg, "index_n_heads", 0)
-    idx_head_dim = getattr(cfg, "index_head_dim", 0)
+    idx_topk = _optional_int_attr(cfg, "index_topk")
+    idx_n_heads = _int_attr(cfg, "index_n_heads", 0)
+    idx_head_dim = _int_attr(cfg, "index_head_dim", 0)
 
     return _mla_moe_model_flops(
         gbs=gbs,
@@ -1431,7 +1665,7 @@ def mla_moe_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> floa
         layers=layers,
         attention_heads=cfg.num_attention_heads,
         vocab_size=cfg.vocab_size,
-        q_lora_rank=getattr(cfg, "q_lora_rank", None),
+        q_lora_rank=_optional_int_attr(cfg, "q_lora_rank"),
         kv_lora_rank=cfg.kv_lora_rank,
         qk_rope_head_dim=cfg.qk_rope_head_dim,
         qk_nope_head_dim=cfg.qk_nope_head_dim,
@@ -1873,14 +2107,14 @@ def qwen3_8_flash_next_flops(config: Any, gbs: int = 1, seq_len: int | None = No
     return float(trainable_flops + gdn_flops + attention_flops + indexer_flops)
 
 
-def step3_5_flash_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -> float:
+def step3_5_flash_flops(config: _DenseConfig, gbs: int = 1, seq_len: int | None = None) -> float:
     """Model FLOPs for Step3.5-Flash (GQA + sliding-window / full attention + MoE).
 
     Architecture: hybrid full/SWA attention with different head counts per type,
     MoE with shared expert on most layers, first few layers dense, SwiGLU.
     """
     if seq_len is None:
-        seq_len = getattr(config, "max_position_embeddings", 2048)
+        seq_len = _int_attr(config, "max_position_embeddings", 2048)
 
     layers = config.num_hidden_layers
     hs = config.hidden_size
@@ -1888,37 +2122,41 @@ def step3_5_flash_flops(config: Any, gbs: int = 1, seq_len: int | None = None) -
 
     # Attention heads: full vs sliding may differ
     full_attn_heads = config.num_attention_heads
-    attn_other = getattr(config, "attention_other_setting", None)
-    if attn_other is not None and isinstance(attn_other, dict):
-        sliding_attn_heads = attn_other.get("num_attention_heads", full_attn_heads)
-    else:
-        sliding_attn_heads = full_attn_heads
-    num_query_groups = getattr(config, "num_attention_groups", full_attn_heads)
-    head_dim = getattr(config, "head_dim", hs // full_attn_heads)
-    sliding_window = getattr(config, "sliding_window", 512)
+    sliding_attn_heads = full_attn_heads
+    attn_other = _attr(config, "attention_other_setting")
+    if isinstance(attn_other, dict):
+        other_heads = attn_other.get("num_attention_heads", full_attn_heads)
+        if not isinstance(other_heads, int):
+            raise TypeError(
+                f"attention_other_setting['num_attention_heads'] must be an int, got {type(other_heads).__name__}"
+            )
+        sliding_attn_heads = other_heads
+    num_query_groups = _int_attr(config, "num_attention_groups", full_attn_heads)
+    head_dim = _int_attr(config, "head_dim", hs // full_attn_heads)
+    sliding_window = _int_attr(config, "sliding_window", 512)
 
     # MoE config
-    moe_top_k = getattr(config, "moe_top_k", 8)
-    moe_ffn_hs = getattr(config, "moe_intermediate_size", 1280)
-    share_expert_dim = getattr(config, "share_expert_dim", moe_ffn_hs)
+    moe_top_k = _int_attr(config, "moe_top_k", 8)
+    moe_ffn_hs = _int_attr(config, "moe_intermediate_size", 1280)
+    share_expert_dim = _int_attr(config, "share_expert_dim", moe_ffn_hs)
     dense_ffn_hs = config.intermediate_size
 
     # Which layers are MoE? Parse moe_layers_enum (comma-separated string or list)
-    moe_layers_raw = getattr(config, "moe_layers_enum", None)
-    if moe_layers_raw is not None:
-        if isinstance(moe_layers_raw, str):
-            moe_layers_set = set(int(x.strip()) for x in moe_layers_raw.split(",") if x.strip())
-        else:
-            moe_layers_set = set(int(x) for x in moe_layers_raw)
+    moe_layers_raw = _attr(config, "moe_layers_enum")
+    if isinstance(moe_layers_raw, str):
+        moe_layers_set = set(int(x.strip()) for x in moe_layers_raw.split(",") if x.strip())
+    elif moe_layers_raw is not None:
+        moe_layers = _optional_int_list_attr(config, "moe_layers_enum")
+        moe_layers_set = set(moe_layers or [])
     else:
         # Default: first 3 dense, rest MoE
         moe_layers_set = set(range(3, layers))
 
     # Layer types (first `layers` entries; remaining are MTP layers)
-    layer_types = getattr(config, "layer_types", None)
+    layer_types = _optional_str_list_attr(config, "layer_types")
 
     # MTP
-    mtp_num_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
+    mtp_num_layers = _int_attr(config, "num_nextn_predict_layers", 0)
 
     # --- Per-layer FLOPs ---
     total_attn = 0

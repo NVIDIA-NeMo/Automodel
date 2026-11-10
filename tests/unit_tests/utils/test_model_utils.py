@@ -1092,3 +1092,52 @@ def test_freeze_video_embedder_false_keeps_video_embedder_trainable(video_embedd
     )
 
     assert _all_requires_grad(video_embedder_model.patch_generator.video_embedder)
+
+
+class TestLmHeadLookup:
+    def test_get_lm_head_module_ignores_non_module_output_embeddings(self):
+        """A ``get_output_embeddings`` result that is not a module falls back to the ``lm_head`` search."""
+        from types import SimpleNamespace
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lm_head = nn.Linear(4, 8, bias=False)
+
+            def get_output_embeddings(self) -> SimpleNamespace:
+                return SimpleNamespace(weight=torch.zeros(8, 4))
+
+        model = Model()
+        assert model_utils.get_lm_head_module(model) is model.lm_head
+
+    def test_get_lm_head_weight_rejects_module_valued_weight(self):
+        class Head(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = nn.Linear(2, 2)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lm_head = Head()
+
+        with pytest.raises(TypeError, match="LM-head weight must be a tensor"):
+            model_utils.get_lm_head_weight(Model())
+
+
+class TestSkipRandomInit:
+    def test_leaves_releases_without_the_flag_unchanged(self, monkeypatch):
+        import transformers.initialization as init_module
+
+        monkeypatch.delattr(init_module, "_init_weights", raising=False)
+        with model_utils.skip_random_init():
+            assert not hasattr(init_module, "_init_weights")
+        assert not hasattr(init_module, "_init_weights")
+
+    def test_clears_and_restores_the_flag_when_present(self, monkeypatch):
+        import transformers.initialization as init_module
+
+        monkeypatch.setattr(init_module, "_init_weights", True, raising=False)
+        with model_utils.skip_random_init():
+            assert init_module._init_weights is False
+        assert init_module._init_weights is True
