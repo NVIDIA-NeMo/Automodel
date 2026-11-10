@@ -46,6 +46,7 @@ dataset:
       path: hf://yahma/alpaca-cleaned/train
     packing:
       seq_len: 2048
+      # Drop oversized conversations instead of truncating them.
       pack_algorithm: best_fit
     checkpoint:
       run_id: zephon-llama3_2-sft
