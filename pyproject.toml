@@ -72,6 +72,7 @@ classifiers = [
     'Operating System :: OS Independent',
 ]
 dependencies = [
+    "zephon>=0.2.1",
     "datasets>=4.0.0",
     "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]>=1.13.0",

@@ -20,7 +20,7 @@ and image embeddings for image-to-video conditioning.
 """
 
 import logging
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Protocol, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,22 @@ from nemo_automodel.shared.import_utils import safe_import_from
 from .base import FlowMatchingContext, ModelAdapter
 
 logger = logging.getLogger(__name__)
+
+
+class _HunyuanAttention(Protocol):
+    heads: int
+    to_q: nn.Module
+    to_k: nn.Module
+    to_v: nn.Module
+    norm_q: nn.Module
+    norm_k: nn.Module
+    add_q_proj: nn.Module
+    add_k_proj: nn.Module
+    add_v_proj: nn.Module
+    norm_added_q: nn.Module | None
+    norm_added_k: nn.Module | None
+    to_out: Sequence[nn.Module] | None
+    to_add_out: nn.Module | None
 
 
 def _is_flash_varlen_attention_backend(backend: Any) -> bool:
@@ -63,7 +79,7 @@ def enable_hunyuan_flash_varlen_mask_optimization() -> bool:
 
     def _flash_varlen_mask_optimized_call(
         self: Any,
-        attn: nn.Module,
+        attn: "_HunyuanAttention",
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -135,12 +151,14 @@ def enable_hunyuan_flash_varlen_mask_optimization() -> bool:
                 hidden_states[:, -encoder_hidden_states.shape[1] :],
             )
 
-            if getattr(attn, "to_out", None) is not None:
-                hidden_states = attn.to_out[0](hidden_states)
-                hidden_states = attn.to_out[1](hidden_states)
+            to_out = getattr(attn, "to_out", None)
+            if to_out is not None:
+                hidden_states = to_out[0](hidden_states)
+                hidden_states = to_out[1](hidden_states)
 
-            if getattr(attn, "to_add_out", None) is not None:
-                encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+            to_add_out = getattr(attn, "to_add_out", None)
+            if to_add_out is not None:
+                encoder_hidden_states = to_add_out(encoder_hidden_states)
 
         return hidden_states, encoder_hidden_states
 
@@ -175,7 +193,7 @@ class HunyuanAdapter(ModelAdapter):
         self,
         default_image_embed_shape: Tuple[int, int] = (729, 1152),
         use_condition_latents: bool = True,
-    ):
+    ) -> None:
         """
         Initialize the HunyuanAdapter.
 
@@ -254,13 +272,14 @@ class HunyuanAdapter(ModelAdapter):
             valid_len = max(int(text_mask.sum(dim=-1).max().item()), 1)
             text_embeddings = text_embeddings[:, :valid_len, :]
             text_mask = text_mask[:, :valid_len]
+        valid_len_2: int | None = None
         if text_mask_2 is not None:
             text_mask_2 = text_mask_2.to(device, dtype=dtype, non_blocking=True)
             valid_len_2 = max(int(text_mask_2.sum(dim=-1).max().item()), 1)
             text_mask_2 = text_mask_2[:, :valid_len_2]
         if text_embeddings_2 is not None:
             text_embeddings_2 = text_embeddings_2.to(device, dtype=dtype, non_blocking=True)
-            if text_mask_2 is not None:
+            if valid_len_2 is not None:
                 text_embeddings_2 = text_embeddings_2[:, :valid_len_2, :]
 
         # Handle image embeds for i2v

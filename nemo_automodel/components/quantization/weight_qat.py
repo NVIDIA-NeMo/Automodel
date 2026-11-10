@@ -319,7 +319,8 @@ class WeightFakeQuantizer(nn.Module):
             payload = codes[..., 0::2] | (codes[..., 1::2] << 4)
         return QuantizedWeight(payload=payload, scales=scales, config=self.config, shape=shape)
 
-    def forward(self, weight: torch.Tensor) -> torch.Tensor:
+    # Remove this exception when PyTorch types Module.forward as an overridable method, not a writable Callable.
+    def forward(self, weight: torch.Tensor) -> torch.Tensor:  # ty: ignore[invalid-mutable-override]
         """Return exact QDQ values with an identity derivative, without cancellation.
 
         Args:
@@ -354,16 +355,18 @@ class _WeightSTE(torch.autograd.Function):
         return quantizer.quantize(weight).dequantize(dtype=weight.dtype)
 
     @staticmethod
-    def backward(ctx: FunctionCtx, grad_output: torch.Tensor | None) -> tuple[torch.Tensor | None, None]:
+    def backward(ctx: FunctionCtx, *grad_outputs: torch.Tensor | None) -> tuple[torch.Tensor | None, None]:
         """Pass the upstream gradient through unchanged.
 
         Args:
             ctx: Unused autograd context.
-            grad_output: Optional gradient tensor of shape [..., out, in], with
-                the forward weight's dtype/device; arbitrary strides are accepted.
+            *grad_outputs: One optional gradient tensor of shape [..., out, in],
+                with the forward weight's dtype/device; arbitrary strides are accepted.
 
         Returns:
             The same [..., out, in] gradient tensor (an unmodified alias), or
             None, and None for the non-tensor quantizer argument.
         """
-        return grad_output, None
+        if len(grad_outputs) != 1:
+            raise ValueError("Weight fake quantization backward requires exactly one output gradient")
+        return grad_outputs[0], None
