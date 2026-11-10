@@ -50,6 +50,7 @@ dataset:
         column_mapping:
           images: image_id
     packing:
+      # Drop oversized conversations instead of truncating text or image tokens.
       seq_len: 8192
     checkpoint:
       run_id: zephon-ministral3
