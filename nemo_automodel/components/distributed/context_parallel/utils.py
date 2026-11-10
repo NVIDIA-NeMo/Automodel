@@ -18,7 +18,7 @@ import contextlib
 from collections.abc import Generator, Mapping
 from contextlib import AbstractContextManager
 from functools import partial
-from typing import TYPE_CHECKING, Any, List, Literal, Set, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -140,9 +140,9 @@ def get_train_context(
 # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
 def create_context_parallel_ctx(
     cp_mesh: DeviceMesh,
-    cp_buffers: List[torch.Tensor],
-    cp_seq_dims: List[int],
-    cp_no_restore_buffers: Set[torch.Tensor],
+    cp_buffers: list[torch.Tensor],
+    cp_seq_dims: list[int],
+    cp_no_restore_buffers: set[torch.Tensor],
     cp_rotate_method: str | None = None,
 ) -> AbstractContextManager[None]:
     """
