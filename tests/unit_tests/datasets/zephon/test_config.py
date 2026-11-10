@@ -185,8 +185,8 @@ def test_pretraining_examples_select_matching_source_and_preparation(family: str
     config = recipe.dataloader
     assert isinstance(config, ZephonDataloaderConfig)
     dataset = config.dataset_config
-    assert dataset.zephon.packing.seq_len == 2048
-    assert config.batch_size == 1
+    assert dataset.zephon.packing.seq_len == 1024
+    assert config.batch_size == 8
     if prepacked:
         assert isinstance(dataset, ZephonPretokenizedTextDatasetConfig)
         assert dataset.zephon.packing.pack_algorithm is None
