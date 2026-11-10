@@ -129,6 +129,8 @@ class ZephonDataLoader(Iterator[TrainingBatch]):
         self._packing_contract = packing_contract
         self._component_tokens: Counter[int] = Counter()
         self._iterator: Iterator[SampleBatch] | None = None
+        self._started = False
+        self._restored_checkpoint = b""
         self._closed = False
         self._exhausted = False
 
@@ -142,7 +144,9 @@ class ZephonDataLoader(Iterator[TrainingBatch]):
             raise StopIteration
         try:
             if self._iterator is None:
+                self._started = True
                 self._iterator = iter(self._pipeline)
+                self._restored_checkpoint = b""
             sample_batch = next(self._iterator)
             # Convert with Zephon, apply xdoc policy, then select batched or THD output.
             # TODO(zephon): consider pipeline operations on to_training() results.
@@ -183,22 +187,42 @@ class ZephonDataLoader(Iterator[TrainingBatch]):
         finally:
             self._iterator = None
 
-    def state_dict_template(self) -> dict[str, bytes]:
-        """Describe DCP keys without starting a fresh pipeline or calibrating it."""
-        return {"zephon": b""}
-
     def state_dict(self) -> dict[str, bytes]:
-        """Collect the complete aggregated state on every rank as one DCP value."""
+        """Return opaque checkpoint bytes, or empty bytes for an unstarted stream.
+
+        DCP calls this method before loading. An unstarted loader returns its
+        initial or restored state without initializing or calibrating a pipeline.
+        Once iteration starts, every rank collects the complete aggregated state,
+        including after exhaustion or close.
+
+        Returns:
+            Mapping containing ``zephon`` bytes for the current stream position.
+        """
+        if not self._started:
+            # A restored loader may be saved again before it reads another batch.
+            return {"zephon": self._restored_checkpoint}
         return {"zephon": self._pipeline.checkpoint(as_bytes=True)}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Let Zephon validate and restore its checkpoint bytes before iteration."""
+        """Restore opaque bytes before iteration; empty state requires a fresh loader.
+
+        Args:
+            state: Mapping containing ``zephon`` checkpoint bytes. Empty bytes
+                represent a stream that has never started or been restored.
+                Nonempty bytes are validated and restored by Zephon.
+        """
         if self._iterator is not None:
             raise RuntimeError("Restore Zephon before beginning iteration")
         checkpoint = state.get("zephon")
-        if not isinstance(checkpoint, bytes) or not checkpoint:
-            raise ValueError("Zephon checkpoint requires nonempty 'zephon' bytes")
-        self._pipeline.restore(checkpoint)
+        if not isinstance(checkpoint, bytes):
+            raise ValueError("Zephon checkpoint requires 'zephon' bytes")
+        if checkpoint:
+            self._pipeline.restore(checkpoint)
+        elif self._started or self._restored_checkpoint:
+            # A no-op would retain consumed progress or a pending restore.
+            raise ValueError("Restore initial Zephon state into a fresh loader")
+        self._restored_checkpoint = checkpoint
+        self._started = False
         self._component_tokens.clear()
         self._closed = False
         self._exhausted = False
