@@ -3,12 +3,21 @@
 import torch
 from torch.distributed.tensor import Shard
 
+from nemo_automodel.components.models.glm5_next.model import Glm5NextForConditionalGeneration
 from nemo_automodel.components.models.glm5_next.state_dict_adapter import (
     _apply_local_block_scales,
     _local_shard_offsets,
     dequantize_block_fp8,
 )
-from tests.unit_tests.models.glm5_next.conftest import tiny_glm5_next_model
+from tests.unit_tests.models.glm5_next.conftest import tiny_backend, tiny_glm5_next_config, tiny_glm5_next_model
+
+
+def _model_without_mtp() -> Glm5NextForConditionalGeneration:
+    config = tiny_glm5_next_config()
+    config.text_config.num_nextn_predict_layers = 0
+    model = Glm5NextForConditionalGeneration(config, backend=tiny_backend())
+    model.initialize_weights(torch.device("cpu"), dtype=torch.float32)
+    return model
 
 
 def test_native_hf_round_trip_preserves_every_tensor():
@@ -55,8 +64,8 @@ def test_quantized_load_plan_matches_sparse_but_not_linear_output_projection():
     assert sparse_o in planned and sparse_o + "_scale_inv" in planned
 
 
-def test_mtp_layer_is_dropped_on_load():
-    model = tiny_glm5_next_model()
+def test_mtp_layer_is_dropped_on_load_when_mtp_is_disabled():
+    model = _model_without_mtp()
     layer_limit = model.config.text_config.num_hidden_layers
     state = {
         "lm_head.weight": torch.randn(64, 16),
@@ -66,6 +75,58 @@ def test_mtp_layer_is_dropped_on_load():
     converted = model.state_dict_adapter.from_hf(state)
 
     assert converted.keys() == {"lm_head.weight"}
+
+
+def test_mtp_layer_loads_into_the_mtp_head():
+    model = tiny_glm5_next_model()
+    mtp_layer = model.config.text_config.num_hidden_layers
+    state = {
+        f"model.language_model.layers.{mtp_layer}.eh_proj.weight": torch.randn(16, 32),
+        f"model.language_model.layers.{mtp_layer}.shared_head.norm.weight": torch.randn(16),
+        f"model.language_model.layers.{mtp_layer}.self_attn.o_proj.weight": torch.randn(16, 8),
+        f"model.language_model.layers.{mtp_layer + 1}.enorm.weight": torch.randn(16),
+    }
+
+    converted = model.state_dict_adapter.from_hf(dict(state))
+
+    assert converted.keys() == {
+        "mtp.layers.0.eh_proj.weight",
+        "mtp.layers.0.final_layernorm.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+    }
+    torch.testing.assert_close(
+        converted["mtp.layers.0.final_layernorm.weight"],
+        state[f"model.language_model.layers.{mtp_layer}.shared_head.norm.weight"],
+    )
+
+
+def test_mtp_export_uses_checkpoint_layer_names():
+    model = tiny_glm5_next_model()
+    mtp_layer = model.config.text_config.num_hidden_layers
+    native = model.state_dict()
+
+    exported = model.state_dict_adapter.to_hf(native)
+
+    assert not any(key.startswith("mtp.") for key in exported)
+    for suffix in ("eh_proj.weight", "enorm.weight", "hnorm.weight", "shared_head.norm.weight"):
+        assert f"model.language_model.layers.{mtp_layer}.{suffix}" in exported
+    for expert in range(model.config.text_config.n_routed_experts):
+        assert f"model.language_model.layers.{mtp_layer}.mlp.experts.{expert}.down_proj.weight" in exported
+    torch.testing.assert_close(
+        exported[f"model.language_model.layers.{mtp_layer}.mlp.experts.1.down_proj.weight"],
+        native["mtp.layers.0.mlp.experts.down_projs"][1].T,
+    )
+
+
+def test_quantized_load_plan_covers_the_mtp_layer():
+    model = tiny_glm5_next_model()
+    mtp_layer = model.config.text_config.num_hidden_layers
+    planned = model.state_dict_adapter.to_hf(model.state_dict(), quantization=True, for_checkpoint_load=True)
+
+    prefix = f"model.language_model.layers.{mtp_layer}."
+    for quantized in ("self_attn.q_a_proj.weight", "self_attn.o_proj.weight", "mlp.experts.0.down_proj.weight"):
+        assert prefix + quantized + "_scale_inv" in planned
+    assert prefix + "eh_proj.weight_scale_inv" not in planned
 
 
 def test_block_fp8_dequantization_uses_each_128_square_scale():
