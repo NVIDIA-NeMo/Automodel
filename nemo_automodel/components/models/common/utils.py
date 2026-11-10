@@ -484,6 +484,58 @@ class MoKBackendConfig:
         )
 
 
+@dataclass(kw_only=True, frozen=True)
+class NcclEpConfig:
+    """Configuration for the optional NCCL-EP token dispatcher (``dispatcher="nccl_ep"``).
+
+    Every EP rank and every NCCL-EP layer in a process must use the same settings.
+    NCCL-EP sizes its dispatch and combine kernels itself; its ``NCCL_EP_COMM_SMS``
+    environment variable tunes that budget.
+
+    Attributes:
+        max_tokens_per_rank: Upper bound on tokens entering one MoE layer per
+            microbatch on one rank, including masked tokens. Required when selecting
+            NCCL-EP. The transport rounds it up to a multiple of 64; inputs may be
+            shorter.
+        recv_capacity_factor: Size every receive buffer for the rounded
+            ``max_tokens_per_rank`` times top-k times this factor routed rows, plus the
+            alignment padding of each local expert, instead of the rows each dispatch
+            needs. Dispatch then skips its per-layer host synchronization, and rows past
+            the routed count are left unused. A rank that receives more rows than the
+            capacity aborts with a device-side trap rather than dropping tokens, so choose
+            a factor that covers the expected routing skew. Requires the ``torch_mm`` or
+            ``te`` experts backend, without expert bias.
+            ``None`` (default) sizes receive buffers per dispatch.
+        zero_copy: Let dispatch write tokens straight into the experts' input and combine
+            read the experts' output from symmetric-memory windows, skipping NCCL-EP's
+            staging copies. The experts write their down projection and their input
+            gradient into two symmetric buffers of the receive capacity that all layers
+            share. Requires ``recv_capacity_factor`` and the ``te`` experts backend, without
+            expert bias, router weighting after the down projection, or a model hook between
+            the experts and combine.
+    """
+
+    max_tokens_per_rank: int | None = None
+    recv_capacity_factor: float | None = None
+    zero_copy: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate settings that do not depend on a CUDA device or EP group."""
+        if self.max_tokens_per_rank is not None and self.max_tokens_per_rank <= 0:
+            raise ValueError("nccl_ep.max_tokens_per_rank must be positive")
+        if self.recv_capacity_factor is not None and not (
+            math.isfinite(self.recv_capacity_factor) and self.recv_capacity_factor >= 1.0
+        ):
+            raise ValueError(
+                "nccl_ep.recv_capacity_factor must be a finite number >= 1.0 (a smaller receive buffer "
+                f"overflows under balanced routing), got {self.recv_capacity_factor!r}"
+            )
+        if self.zero_copy and self.recv_capacity_factor is None:
+            raise ValueError(
+                "nccl_ep.zero_copy requires nccl_ep.recv_capacity_factor: symmetric-memory windows have a fixed size"
+            )
+
+
 AttentionBackend = Literal["torch", "te", "sdpa", "flex", "eager", "tilelang", "cudnn", "fa4", "magi"]
 
 
@@ -526,16 +578,22 @@ class BackendConfig:
             dispatch but routes the expert grouped GEMMs through torchao's MXFP8
             scaled grouped GEMM (training-only; GB200/sm_100+ with torchao installed,
             else falls back to torch._grouped_mm at runtime).
-        te_grouped_tensor: Prefer TE 2.19 native grouped-tensor GEMMs for ``experts="te"``.
-            Requires ``dispatcher="deepep"``, ``"hybridep"``, or ``"uccl_ep"``.
-            Device and precision support follows TE's ``GroupedLinear`` contract.
-            Parameters and checkpoints retain their existing layouts.
+        te_grouped_tensor: Use TE 2.19 native grouped-tensor GEMMs for ``experts="te"``.
+            Requires ``dispatcher="deepep"``, ``"hybridep"``, ``"uccl_ep"``, or
+            ``"nccl_ep"``. ``None`` (default) resolves to True for ``experts="te"`` with
+            ``dispatcher="nccl_ep"`` and to False otherwise. NCCL-EP always uses these GEMMs,
+            which read its per-expert row counts on the device, and rejects False. Device and
+            precision support follows TE's ``GroupedLinear`` contract. Parameters and
+            checkpoints retain their existing layouts.
         dispatcher: MoE token dispatcher. "torch" uses DTensor all-gather/reduce-scatter,
             "deepep" uses DeepEP, "hybridep" uses HybridEP, "uccl_ep" uses UCCL-EP,
+            "nccl_ep" uses Transformer Engine NCCL-EP,
             and "mok" uses Mixture-of-Kittens' fused communication and SwiGLU megakernel.
+        nccl_ep: NCCL-EP settings; ``max_tokens_per_rank`` is required when selecting
+            "nccl_ep". NCCL-EP sizes its own kernels and ignores ``dispatcher_num_sms``.
         mok: Mixture-of-Kittens tuning settings used when ``dispatcher="mok"``.
         dispatcher_share_token_dispatcher: Whether flex token dispatchers share a communication
-            manager instance across MoE layers.
+            manager instance across MoE layers. NCCL-EP always keeps routing state layer-local.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch and combine should return
             asynchronously and allocate their outputs on the communication stream.
         dispatcher_hybridep_permute_fusion: Fuse HybridEP token permutation into dispatch and
@@ -639,14 +697,15 @@ class BackendConfig:
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
     )
-    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "mok"] = (
+    dispatcher: Literal["torch", "deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"] = (
         "deepep"
         if HAVE_DEEP_EP and torch.cuda.is_available()
         else "uccl_ep"
         if HAVE_UCCL_EP and torch.cuda.is_available()
         else "torch"
     )
-    te_grouped_tensor: bool = False
+    nccl_ep: NcclEpConfig = field(default_factory=NcclEpConfig)
+    te_grouped_tensor: bool | None = None
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
@@ -760,6 +819,38 @@ class BackendConfig:
         elif not isinstance(self.cuda_graph, CudaGraphConfig):
             raise TypeError("cuda_graph must be a CudaGraphConfig or mapping")
 
+        if isinstance(self.nccl_ep, dict):
+            self.nccl_ep = NcclEpConfig(**self.nccl_ep)
+        elif not isinstance(self.nccl_ep, NcclEpConfig):
+            raise TypeError("nccl_ep must be an NcclEpConfig or mapping")
+        if self.te_grouped_tensor is None:
+            self.te_grouped_tensor = self.dispatcher == "nccl_ep" and self.experts == "te"
+        if self.dispatcher == "nccl_ep":
+            if self.nccl_ep.max_tokens_per_rank is None:
+                raise ValueError("dispatcher='nccl_ep' requires nccl_ep.max_tokens_per_rank")
+            if self.experts == "te" and not self.te_grouped_tensor:
+                raise ValueError(
+                    "dispatcher='nccl_ep' with experts='te' always uses TE grouped-tensor GEMMs, which read the "
+                    "per-expert row counts on the device; remove te_grouped_tensor=False"
+                )
+            if self.nccl_ep.recv_capacity_factor is not None and self.experts not in (
+                "te",
+                "torch_mm",
+                "gmm",
+                "torch_mm_mxfp8",
+            ):
+                raise ValueError(
+                    "nccl_ep.recv_capacity_factor requires experts='te' or 'torch_mm': the grouped GEMMs must "
+                    f"bound the routed rows with device-side offsets; got experts={self.experts!r}"
+                )
+            if self.nccl_ep.zero_copy and self.experts != "te":
+                raise ValueError(
+                    "nccl_ep.zero_copy requires experts='te': only its grouped GEMMs write into the shared "
+                    f"symmetric buffers; got experts={self.experts!r}"
+                )
+            if self.dispatcher_async_dispatch:
+                raise ValueError("dispatcher_async_dispatch is not supported by NCCL-EP")
+
         if isinstance(self.mok, dict):
             self.mok = MoKBackendConfig(**self.mok)
         elif not isinstance(self.mok, MoKBackendConfig):
@@ -791,15 +882,15 @@ class BackendConfig:
         if self.te_grouped_tensor:
             if self.experts != "te":
                 raise ValueError("te_grouped_tensor=True requires experts='te'.")
-            if self.dispatcher not in ("deepep", "hybridep", "uccl_ep"):
+            if self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "nccl_ep"):
                 raise ValueError(
-                    "te_grouped_tensor=True requires dispatcher='deepep', 'hybridep', or 'uccl_ep'; "
+                    "te_grouped_tensor=True requires dispatcher='deepep', 'hybridep', 'uccl_ep', or 'nccl_ep'; "
                     f"got dispatcher='{self.dispatcher}'."
                 )
 
         # TE grouped experts require a flex dispatcher. Keep the existing standard-
         # dispatcher fallback for the deprecated gmm alias as well.
-        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "mok"):
+        if self.experts in ("te", "gmm") and self.dispatcher not in ("deepep", "hybridep", "uccl_ep", "nccl_ep", "mok"):
             if (
                 torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
             ) or not torch.distributed.is_initialized():
@@ -1154,10 +1245,39 @@ def _make_lazy_te_patcher():
                 is_first_microbatch = get_is_first_microbatch()
             return _original_linear_forward(self, x, is_first_microbatch=is_first_microbatch, **kwargs)
 
-        def _patched_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=None):
+        def _patched_grouped_linear_forward(
+            self: "TEGroupedLinear",
+            inp: torch.Tensor,
+            m_splits: torch.Tensor | list[int],
+            is_first_microbatch: bool | None = None,
+            out: torch.Tensor | None = None,
+            dgrad_out: torch.Tensor | None = None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | list[torch.Tensor]]:
+            """Preserve TE's buffer API while supplying the training microbatch flag.
+
+            Args:
+                inp: Tensor of shape [rows, in_features], packed by expert.
+                m_splits: Integer tensor of shape [experts] or equivalent host list,
+                    counting each expert's leading rows, including alignment padding.
+                is_first_microbatch: Explicit cache flag, or None to use the training flag.
+                out: Optional contiguous non-grad tensor of shape [rows, out_features]
+                    in the activation dtype. TE writes only the routed rows in place.
+                dgrad_out: Optional contiguous non-grad tensor of shape [rows, in_features]
+                    in the activation dtype, written in place by backward.
+
+            Returns:
+                Output tensor of shape [rows, out_features], aliasing out when supplied.
+                With TE's return_bias option, also returns bias of shape [experts,
+                out_features] or a list of per-expert tensors of shape [out_features].
+            """
             if is_first_microbatch is None:
                 is_first_microbatch = get_is_first_microbatch()
-            return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
+            # Older TE versions lack buffer arguments; preserve their no-buffer call.
+            if out is None and dgrad_out is None:
+                return _original_grouped_linear_forward(self, inp, m_splits, is_first_microbatch=is_first_microbatch)
+            return _original_grouped_linear_forward(
+                self, inp, m_splits, is_first_microbatch=is_first_microbatch, out=out, dgrad_out=dgrad_out
+            )
 
         TERMSNorm.forward = _patched_rmsnorm_forward
         TELinear.forward = _patched_linear_forward
