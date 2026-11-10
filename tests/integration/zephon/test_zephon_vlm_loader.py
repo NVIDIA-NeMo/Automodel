@@ -98,7 +98,7 @@ def _build(config, embedded_inputs, *, pp_n_microbatches=None):
 
 
 def test_example_yaml_route_reads_actual_local_image_source(config, embedded_inputs):
-    path = Path(__file__).resolve().parents[3] / "examples/vlm_finetune/zephon/train.yaml"
+    path = Path(__file__).resolve().parents[3] / "examples/vlm_finetune/qwen3/zephon.yaml"
     values = yaml.safe_load(path.read_text())
     values["model"]["pretrained_model_name_or_path"] = embedded_inputs[0]
     values["processor"] = {}

@@ -26,7 +26,6 @@ import yaml
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoConfig, Mistral3ForConditionalGeneration
 
-from examples.vlm_finetune.zephon.prepare_data import export_jsonl
 from nemo_automodel._transformers.registry import resolve_image_position_state
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
@@ -66,6 +65,7 @@ from tests.utils.zephon_distributed import (
 )
 from tests.utils.zephon_distributed import run_ranks
 from tests.utils.zephon_positions import assert_joined_position_ranges
+from tools.zephon.prepare_images import export_jsonl
 
 
 @pytest.fixture
@@ -146,7 +146,7 @@ def _forward(model, batch):
 def test_training_recipe_uses_local_processor_and_preserves_expanded_images(source):
     prepare(source)
     values = yaml.safe_load(
-        (Path(__file__).resolve().parents[3] / "examples/vlm_finetune/zephon/train.yaml").read_text()
+        (Path(__file__).resolve().parents[3] / "examples/vlm_finetune/mistral/zephon.yaml").read_text()
     )
     values["model"]["pretrained_model_name_or_path"] = str(source / "model")
     values["processor"] = {

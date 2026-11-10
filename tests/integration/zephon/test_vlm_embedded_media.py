@@ -23,7 +23,6 @@ import pytest
 import torch
 from zephon import Dataset, Pipeline, StaticMixtureWorkSource
 
-from examples.vlm_finetune.zephon.prepare_data import export_jsonl
 from nemo_automodel.components.datasets.zephon.config import ZephonCacheOptions, ZephonParquetRGCacheOptions
 from nemo_automodel.components.datasets.zephon.vlm import VlmEncoderConfig, merge_image_documents
 from nemo_automodel.components.models.qwen2_5_vl.preprocessing import Qwen2_5_VLPositionState
@@ -32,6 +31,7 @@ from tests.utils.vlm_fixtures import embedded_inputs as embedded_inputs
 from tests.utils.vlm_fixtures import inputs as inputs
 from tests.utils.vlm_fixtures import processor as processor
 from tests.utils.vlm_fixtures import tiny_vlm_config
+from tools.zephon.prepare_images import export_jsonl
 
 
 def _pipeline(root, processor_path, *, cache=None, runner="inline"):
