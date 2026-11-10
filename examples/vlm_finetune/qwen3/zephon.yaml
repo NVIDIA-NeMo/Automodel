@@ -13,23 +13,31 @@
 # limitations under the License.
 
 # Image SFT on embedded MedPix-VQA records; see /datasets/zephon in the docs.
-# Run: uv run automodel examples/vlm_finetune/qwen3/zephon.yaml --nproc-per-node 1
+# Run: uv run automodel examples/vlm_finetune/qwen3/zephon.yaml --nproc-per-node 8
+# Training reference: examples/vlm_finetune/qwen3/qwen3_vl_4b_neat_packing.yaml
+# The checkpoint variant remains the one selected for this Zephon example.
 recipe: FinetuneRecipeForVLM
-seed: 42
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
 step_scheduler:
-  global_batch_size: 4
+  global_batch_size: 8
   local_batch_size: 1
+  ckpt_every_steps: 50
+  val_every_steps: 50
   max_steps: 100
-  ckpt_every_steps: 20
+  num_epochs: 3
   preemption_signal: null
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-VL-2B-Instruct
-  dtype: float32
-  attn_implementation: sdpa
+  attn_implementation: flash_attention_2
 processor:
-  min_pixels: 3136
-  max_pixels: 200704
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-VL-2B-Instruct
+  min_pixels: 200704
+  max_pixels: 1003520
 dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonVlmDatasetConfig
   zephon:
@@ -37,31 +45,41 @@ dataset:
     - name: medpix
       path: hf://mmoukouba/MedPix-VQA/train
       input:
-        column_mapping: {images: image_id}
+        column_mapping:
+          images: image_id
     packing:
-      seq_len: 1024
+      seq_len: 8192
     checkpoint:
       run_id: zephon-qwen3-vl
 distributed:
   strategy: fsdp2
-  reshard_after_forward: true
-  activation_checkpointing: true
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: false
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-  reduction: sum
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 0.00001
+  lr: 1e-5
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/zephon-qwen3-vl
+  model_save_format: safetensors
+  save_consolidated: true
 dist_env:
   backend: nccl
   timeout_minutes: 10
-
 ci:
   cluster_tag: h100
   recipe_owner: MaxiBoether
-  time: "00:30:00"
+  time: 00:30:00
   nodes: 1
-  nproc_per_node: 1
+  nproc_per_node: 8
