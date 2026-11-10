@@ -29,7 +29,7 @@ step_scheduler:
   ckpt_every_steps: 200
   val_every_steps: 100
   num_epochs: 1
-  max_steps: 624
+  max_steps: 624  # Adjust for your dataset and training budget.
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-0.6B-Base
