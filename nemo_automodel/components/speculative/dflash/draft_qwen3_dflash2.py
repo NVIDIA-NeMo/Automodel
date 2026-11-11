@@ -64,6 +64,7 @@ from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     GREEDY_TEMPERATURE_EPS,
     Qwen3DFlashDecoderLayer,
     Qwen3DFlashDraftModel,
+    _rewind_cache,
     assert_target_supports_rollback,
     extract_context_feature,
     resolve_output_head,
@@ -626,7 +627,7 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
                 use_cache=True,
                 conv_block_size=block_size,
             )[:, -block_size + 1 :, :]
-            past_key_values_draft.crop(start)
+            _rewind_cache(past_key_values_draft, start)
             # Block position 0 holds the last verified token; it is the predecessor
             # the selector starts its walk from, not something the draft predicts.
             draft_tokens, candidate_ids, draft_probs = self.candidate_selector.walk(
@@ -653,7 +654,7 @@ class Qwen3DFlash2DraftModel(Qwen3DFlashDraftModel):
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
             output_ids[:, start + acceptance_length + 1] = bonus
             start += acceptance_length + 1
-            past_key_values_target.crop(start)
+            _rewind_cache(past_key_values_target, start)
             target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[
                 :, : acceptance_length + 1, :
             ]

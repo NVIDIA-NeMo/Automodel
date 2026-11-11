@@ -35,6 +35,26 @@ import torch
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
+
+
+def _rewind_cache(cache: DynamicCache, position: int) -> None:
+    """Rewind a cache to an absolute sequence position.
+
+    Transformers 5.22 ``crop()`` accepts only a negative token count, and for
+    linear-attention (hybrid) layers it trims to the layer's working state
+    rather than an absolute length. Crop plain attention layers by the token
+    count and re-trim hybrid layers so a later forward can proceed.
+    """
+    tokens_to_remove = position - cache.get_seq_length()
+    if tokens_to_remove > 0:
+        return
+    for layer in cache.layers:
+        if getattr(layer, "is_initialized", True):
+            layer.crop(tokens_to_remove)
+        else:
+            layer.crop(0)
+
+
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
@@ -699,7 +719,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                 )[:, -block_size + 1 :, :],
                 output_head,
             )
-            past_key_values_draft.crop(start)
+            _rewind_cache(past_key_values_draft, start)
             block_output_ids[:, 1:] = sample(draft_logits)
 
             output = target(
@@ -714,7 +734,7 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
             start += acceptance_length + 1
-            past_key_values_target.crop(start)
+            _rewind_cache(past_key_values_target, start)
             target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[
                 :, : acceptance_length + 1, :
             ]
