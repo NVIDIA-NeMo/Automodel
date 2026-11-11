@@ -19,8 +19,10 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoderConfig,
     Qwen3OmniMoeTextConfig,
     Qwen3OmniMoeThinkerConfig,
+    Qwen3OmniMoeVisionEncoderConfig,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder as HFQwen3OmniMoeAudioEncoder,
@@ -297,11 +299,17 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.model = Qwen3OmniMoeThinkerTextModel(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
-        # transformers 5.22 routes get_image_features / get_video_features through
-        # ``self.model`` (the text model), which does not carry the vision tower. Build
-        # the vision encoder here and override the two accessors below to call it
-        # directly, matching the pre-5.22 behavior the merger logic depends on.
-        self._base_config = base_config
+        # transformers 5.22 moved the vision/audio towers into the inner thinker model and
+        # routes get_image/get_video/get_audio_features through ``self.model``, which here is
+        # the NeMo text model without towers. Build both towers on the thinker, eagerly and
+        # under their pre-5.22 names, so they stay registered submodules: weight-initialized,
+        # device/dtype-moved, deep-copied, and checkpointed with the rest of the model. Unit
+        # tests that stub the HF ``__init__`` pass bare-namespace sub-configs, which
+        # ``_from_config`` cannot consume; construction is skipped for those.
+        if isinstance(getattr(base_config, "vision_config", None), Qwen3OmniMoeVisionEncoderConfig):
+            self.visual = HFQwen3OmniMoeVisionEncoder._from_config(base_config.vision_config)
+        if isinstance(getattr(base_config, "audio_config", None), Qwen3OmniMoeAudioEncoderConfig):
+            self.audio_tower = HFQwen3OmniMoeAudioEncoder._from_config(base_config.audio_config)
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
@@ -336,26 +344,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
-
-    @property
-    def visual(self):
-        """Lazily build the vision tower.
-
-        Transformers 5.22 routes get_image/get_video_features through the text model,
-        which has no vision tower, so the thinker builds its own. Construction is lazy
-        so tests that stub the HF ``__init__`` and pass a bare-namespace config never
-        materialize a real tower; ``_from_config`` requires the full HF sub-config.
-        """
-        if self.__dict__.get("visual_") is None:
-            self.__dict__["visual_"] = HFQwen3OmniMoeVisionEncoder._from_config(self._base_config.vision_config)
-        return self.__dict__["visual_"]
-
-    @property
-    def audio_tower(self):
-        """Lazily build the audio tower; see :attr:`visual`."""
-        if self.__dict__.get("audio_tower_") is None:
-            self.__dict__["audio_tower_"] = HFQwen3OmniMoeAudioEncoder._from_config(self._base_config.audio_config)
-        return self.__dict__["audio_tower_"]
 
     def get_audio_features(self, input_features, feature_attention_mask=None, audio_feature_lengths=None, **kwargs):
         """Return audio features, calling the audio tower directly.
