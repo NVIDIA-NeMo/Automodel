@@ -35,6 +35,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from nemo_automodel.components.training.batch import move_batch_to_device
+from nemo_automodel.components.training.validation import synchronized_validation_batches
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_MLFLOW, mlflow = safe_import(
@@ -1793,8 +1794,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_num_label_tokens = 0
             self._mtp_accept_metrics: list = []
 
-            for batch in val_dataloader:
+            for validation_batch in synchronized_validation_batches(val_dataloader):
+                batch = validation_batch.batch
                 loss_buffer = []
+                metric_start = len(self._mtp_accept_metrics)
                 num_label_tokens = _count_label_tokens(
                     batch["labels"], _get_loss_ignore_index(getattr(self, "loss_fn", None))
                 )
@@ -1807,8 +1810,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     is_train=False,
                 )
 
-                total_loss += torch.sum(torch.stack(loss_buffer)).item()
-                total_num_label_tokens += num_label_tokens
+                weight = int(validation_batch.contributes)
+                if validation_batch.contributes:
+                    total_loss += torch.sum(torch.stack(loss_buffer)).float()
+                    total_num_label_tokens += num_label_tokens
+                # Keep MTP reduction shapes identical while excluding placeholders.
+                for metric in self._mtp_accept_metrics[metric_start:]:
+                    metric.prefix_hits.mul_(weight)
+                    metric.valid.mul_(weight)
 
             for target, prev in mtp_eval_flags:
                 target.compute_mtp_in_eval = prev
@@ -1817,7 +1826,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         total_num_label_tokens = self._dp_allreduce(
             torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
         ).item()
-        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+        # A globally empty/all-masked dataset has no defined mean; report NaN, not a perfect zero loss.
+        val_loss = total_loss / total_num_label_tokens
 
         # For PP, send val_loss and num_label_tokens from last stage to main rank
         if self.pp_enabled:

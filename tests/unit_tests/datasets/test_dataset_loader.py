@@ -791,3 +791,47 @@ def test_recipe_rejects_a_loader_target_that_is_not_a_config_subclass():
     )
     with pytest.raises(ValueError, match="DataloaderConfig subclass"):
         RecipeConfig(raw).dataloader
+
+
+def test_pipeline_evaluation_padding_preserves_packed_metadata() -> None:
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    sample = {
+        "input_ids": [1, 2, 3, 4],
+        "labels": [2, 3, 4, -100],
+        "position_ids": [0, 1, 0, 1],
+        "seq_lens": [2, 2],
+        "seq_lens_padded": [2, 2],
+    }
+    loader = ParallelAwareDataloader(
+        [sample],
+        dp_rank=0,
+        dp_world_size=1,
+        batch_size=4,
+        pp_enabled=True,
+        is_training=False,
+        collate_fn=packed_sequence_thd_collater,
+        ignore_index=-7,
+    )
+    batch = next(iter(loader))
+    assert batch["input_ids"].shape == (4, 4)
+    assert batch["labels"][0].tolist() == sample["labels"]
+    assert batch["labels"][1:].eq(-7).all()
+    assert batch["seq_lens"].tolist() == [[2, 2]] * 4
+    assert batch["seq_lens_padded"].tolist() == [[2, 2]] * 4
+
+
+@pytest.mark.parametrize("samples", [0, 3, 19])
+def test_evaluation_sampler_covers_tail_exactly_once(samples: int) -> None:
+    seen = []
+    for rank in range(8):
+        loader = ParallelAwareDataloader(
+            list(range(samples)),
+            dp_rank=rank,
+            dp_world_size=8,
+            batch_size=2,
+            is_training=False,
+            drop_last=True,
+        )
+        seen.extend(value for batch in loader for value in batch.tolist())
+    assert sorted(seen) == list(range(samples))
