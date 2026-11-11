@@ -150,7 +150,8 @@ def _check_selected_stage_and_export(root, run, method, selected, native, reposi
     from nemo_automodel.components.checkpoint.utils import read_checkpoint_pointer
 
     best = read_checkpoint_pointer(run, "LOWEST_VAL")
-    assert best is not None or (method == "full" and selected["step"] == 0)
+    assert best is not None and Path(best).name == f"step_{selected['step']:08d}"
+    assert method == "lora" or selected["step"] > 0, "full fine-tuning selects among trained stages"
     stage = read_checkpoint_pointer(run, "LATEST")
     assert stage is not None and Path(stage).name == "step_00000003"
     if method == "lora":

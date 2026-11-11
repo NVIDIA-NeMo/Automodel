@@ -15,8 +15,8 @@
 # Code provenance: the prompt contract below re-implements, behavior for behavior, the Nemotron Deciffusion
 # serving prompt builder and reference fine-tuning row loader (option ordering, single-token option codes,
 # special-token neutralization, option shuffle). The original is NVIDIA-authored, Apache-2.0 licensed.
-# Not ported: long-state compaction (rows whose prompt exceeds ``max_tokens`` are rejected, never truncated) and the
-# OPTION_ORDER / PROMPT_OPTIONS serving environment switches.
+# Not ported: long-state compaction (rows whose prompt exceeds ``max_tokens`` are rejected, never truncated) and
+# serving-time overrides of the option order and option fields.
 
 """The Deciffusion serving prompt: one question per prompt, one trailing mask slot.
 

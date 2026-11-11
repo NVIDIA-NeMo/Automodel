@@ -25,7 +25,7 @@ training reads keep the serving option order; the rest are shuffled and re-coded
 * ``mode: eval`` scores the configured checkpoint (or ``init_from`` stage) on validation and test.
 
 Validation selects the published stage (``LOWEST_VAL``): highest accuracy, then lowest cross-entropy; for LoRA the
-starting checkpoint (step 0) is eligible. Report the test split separately; the validation split is not an untouched
+starting checkpoint (step 0) is a saved, selectable stage; full fine-tuning selects among trained stages. Report the test split separately; the validation split is not an untouched
 test. Export a selected stage as a complete servable checkpoint with ``examples/decision/export_deciffusion.py``.
 
 Run with::
@@ -325,9 +325,7 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
         """Evaluate (``mode: eval``) or train, then report validation and test metrics of the selected weights."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if self.mode == "train":
-            selected = self._train()
-            if selected is not None:
-                self._load_stage(selected)
+            self._load_stage(self._train())
         for split in ("validation", "test"):
             if split in self.examples:
                 summary = self.evaluate(split, predictions=True)
@@ -346,8 +344,8 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
                 handle.write(json.dumps(record) + "\n")
             logger.info("%s %s", name.split(".")[0], json.dumps(record))
 
-    def _train(self) -> Path | None:
-        """Train; returns the validation-selected stage, or ``None`` when the start was not saved and stays best."""
+    def _train(self) -> Path:
+        """Train; returns the validation-selected stage (the last stage when there is no validation split)."""
         world = self._get_dp_group_size()
         rank = self._get_dp_rank()
         batch = int(self.cfg.get("train.global_batch_size", 16))
@@ -402,8 +400,10 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             return record
 
         start = validate(0)
-        best = (start, 0)
-        if is_lora:  # the start is eligible: LoRA B is zero, so the adapter equals the base
+        # LoRA: the start is a saved, selectable stage (B is zero, so the adapter equals the base). Full fine-tuning
+        # does not save the base weights, so selection is among trained stages, matching LOWEST_VAL.
+        best: tuple[dict[str, Any] | None, int] = (start, 0) if is_lora else (None, 0)
+        if is_lora:
             self._save_stage(self.output_dir / "step_00000000", start)
         rows = self.rows["train"]
         order = list(self.usable)
@@ -466,8 +466,6 @@ class TrainDeciffusionDecisionRecipe(BaseRecipe):
             (self.output_dir / "selected.json").write_text(json.dumps(selected, indent=2))
         if best[0] is None:
             return self.output_dir / f"step_{total:08d}"
-        if best[1] == 0 and not is_lora:
-            return None  # nothing beat the starting checkpoint; the base itself is selected
         return self.output_dir / f"step_{best[1]:08d}"
 
 

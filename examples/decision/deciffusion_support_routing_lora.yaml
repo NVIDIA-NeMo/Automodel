@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# LoRA post-training of a Nemotron Deciffusion decision checkpoint on the synthetic support-routing example
-# (fictional help-desk tickets: choice + yes/no decisions, about a quarter with soft labels).
+# LoRA post-training of a Nemotron Deciffusion decision checkpoint on a synthetic support-routing dataset
+# (fictional help-desk tickets with choice and yes/no decisions, some with soft labels) in one-decision JSONL:
+# {"state", "question", "type", "options", "label", optional "soft_labels" and "group"}. Bring your own file.
 #
 #   uv run python examples/decision/prepare_deciffusion_data.py simple --input support_routing.jsonl \
 #       --split three-way --output data/support_routing
@@ -94,7 +95,7 @@ data:
 train:
   global_batch_size: 16  # rows per optimizer step over all ranks (one row per forward)
   epochs: 1.0
-  max_steps: 50          # the reference example: 50 steps of 16 rows
+  max_steps: 50          # 50 steps of 16 rows
   warmup_fraction: 0.05  # linear warmup, then cosine decay to min_lr_ratio * lr
   min_lr_ratio: 0.1
   canonical_fraction: 0.5  # share of training reads in serving option order; the rest are shuffled and re-coded
