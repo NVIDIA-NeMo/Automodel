@@ -436,3 +436,23 @@ def test_packed_document_ids_cannot_reappear_after_another_document() -> None:
 
     with pytest.raises(ValueError, match="contiguous"):
         KimiPackedContext(doc_ids=torch.tensor([[1, 1, 2, 2, 1, 1, 0]]))
+
+
+def test_k3_vlm_staged_media_matches_direct_after_text_only_microbatch():
+    model = _tiny_vlm()
+    text_ids = torch.tensor([[1, 2, 3]])
+    image_ids = torch.tensor([[1, 63, 2]])
+    pixels = torch.randn(8, 3, 2, 2)
+    grid = torch.tensor([[1, 4, 2]])
+    with torch.no_grad():
+        direct_text = model(text_ids)
+        direct_image = model(image_ids, pixel_values=pixels, grid_thws=grid)
+        model._vlm_pixel_values_chunks = [pixels[:0], pixels]
+        model._vlm_image_grid_hws_chunks = [grid[:0], grid[:, 1:]]
+        model._vlm_chunk_idx = 0
+        staged_text = model(text_ids)
+        assert model._vlm_chunk_idx == 1
+        staged_image = model(image_ids)
+    assert model._vlm_chunk_idx == 2
+    torch.testing.assert_close(staged_text.logits, direct_text.logits)
+    torch.testing.assert_close(staged_image.logits, direct_image.logits)

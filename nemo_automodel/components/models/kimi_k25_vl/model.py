@@ -36,6 +36,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 
@@ -1023,38 +1024,66 @@ class KimiK25VLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDP
         **kwargs,
     ):
         # Resolve from the text/decoder sub-config (the language model produces text logits).
+        """Run one Kimi K2.5 VL microbatch, consuming staged PP media when present.
+
+        Args:
+            input_ids: Token IDs of shape [batch, sequence] on the first stage, or
+                float hidden states of shape [batch, sequence, hidden] from the
+                previous pipeline stage. Media placeholders are either
+                pre-expanded (one per merged image feature) or one per image.
+            attention_mask: Optional tensor of shape [batch, sequence]; nonzero
+                marks a real token. It also masks the internal shifted loss.
+            position_ids: Optional tensor of shape [batch, sequence]; recomputed
+                from the attention mask when image features are merged.
+            past_key_values: Unused; kept for HF API compatibility.
+            inputs_embeds: Optional tensor of shape [batch, sequence, hidden].
+            labels: Optional tensor of shape [batch, sequence] aligned with
+                input_ids; the loss shifts them by one. Image and padding targets
+                must already be masked with -100.
+            use_cache: Unused; kept for HF API compatibility.
+            output_attentions: Unused; kept for HF API compatibility.
+            output_hidden_states: Return the final hidden states.
+            return_dict: Return a LlavaCausalLMOutputWithPast instead of logits.
+            pixel_values: Optional tensor of shape [patches, channels,
+                patch_height, patch_width], where each image's
+                time * height * width patches are concatenated along axis 0 in
+                image order. When None, the next staged PP media chunk is used.
+            grid_thws: Optional tensor of shape [images, 3] storing each image's
+                (time, height, width) patch grid. Staged [images, 2]
+                (height, width) grids are widened with time 1.
+            padding_mask: Optional tensor of shape [batch, sequence] where True
+                marks padding.
+            target_seq_length: Optional fixed sequence length after image-token
+                expansion, which keeps PP activation shapes static.
+            logits_to_keep: Number of trailing positions to project, or indices
+                of shape [kept_sequence].
+            **kwargs: Attention metadata forwarded to the language model.
+
+        Returns:
+            Logits of shape [batch, sequence, vocab], or hidden states of shape
+            [batch, sequence, hidden] on a stage without the LM head, where
+            sequence is the post-expansion length, restricted by logits_to_keep.
+            With return_dict or output_hidden_states, a LlavaCausalLMOutputWithPast
+            carrying the optional scalar loss and, when requested, final hidden
+            states [batch, post_expansion_sequence, hidden].
+        """
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
             else getattr(self.config.text_config, "output_hidden_states", False)
         )
 
-        # Retrieve pre-chunked VLM inputs from model attributes (set by finetune.py for PP)
-        if (
-            pixel_values is None
-            and hasattr(self, "_vlm_pixel_values_chunks")
-            and self._vlm_pixel_values_chunks is not None
-        ):
-            has_media_tokens = (
-                input_ids is not None
-                and self.media_placeholder_token_id is not None
-                and (input_ids == self.media_placeholder_token_id).any()
-            )
-            if has_media_tokens:
-                chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-                if chunk_idx < len(self._vlm_pixel_values_chunks):
-                    pixel_values = self._vlm_pixel_values_chunks[chunk_idx]
-                    # Recipe stores as image_grid_hws [N, 2], convert to grid_thws [N, 3] (prepend T=1)
-                    image_grid_hws = self._vlm_image_grid_hws_chunks[chunk_idx]
+        if pixel_values is None:
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values = media.pixel_values
+                image_grid_hws = media.image_grid
+                if image_grid_hws is not None:
                     if image_grid_hws.shape[-1] == 2:
-                        # Convert [N, 2] (H, W) -> [N, 3] (T, H, W) with T=1
-                        ones = torch.ones(
-                            image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
-                        )
-                        grid_thws = torch.cat([ones, image_grid_hws], dim=-1)
+                        ones = torch.ones_like(image_grid_hws[:, :1])
+                        grid_thws = torch.cat((ones, image_grid_hws), dim=-1)
                     else:
-                        grid_thws = image_grid_hws  # Already [N, 3]
-                    self._vlm_chunk_idx = chunk_idx + 1
+                        grid_thws = image_grid_hws
 
         hidden_states = self.model(
             input_ids=input_ids,

@@ -57,6 +57,7 @@ from nemo_automodel.components.distributed.cp_vision_frame_shard import (
     cp_vision_frame_sharding_active,
     maybe_distribute_visual,
 )
+from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import (
@@ -624,6 +625,8 @@ class Qwen3_5DenseBlock(Block):
         elif self.layer_type == "linear_attention":
             self.linear_attn.dt_bias.data.fill_(1.0)
             self.linear_attn.A_log.data.uniform_(0, 16).log_()
+            # Match HF's PreTrainedModel._init_weights for this nn.Conv1d (normal, initializer_range), not torch's default
+            nn.init.normal_(self.linear_attn.conv1d.weight, mean=0.0, std=0.02)
             for linear in (
                 self.linear_attn.in_proj_qkv,
                 self.linear_attn.in_proj_z,
@@ -1187,7 +1190,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
         self.lm_head = new_embeddings
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
@@ -1454,7 +1457,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=True)
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie ``lm_head`` to the active VLM text embedding when requested."""
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
@@ -1487,7 +1490,10 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         input_ids: torch.Tensor | None,
         kwargs: dict[str, Any],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """Resolve media for the current sequence and pipeline chunk.
+        """Resolve explicit media or consume the next staged pipeline chunk.
+
+        Staged media advances once per microbatch, including text-only inputs.
+        Only explicitly passed media is filtered using token-presence metadata.
 
         Args:
             input_ids: Token IDs of shape [batch, sequence], or ``None``.
@@ -1503,14 +1509,23 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
+        token_presence = kwargs.pop("_vlm_token_presence", None)
+
+        if pixel_values is None and pixel_values_videos is None:
+            media = next_vlm_media_chunk(self)
+            if media is not None:
+                pixel_values, image_grid_thw = media.pixel_values, media.image_grid
+                pixel_values_videos, video_grid_thw = media.pixel_values_videos, media.video_grid
+                if image_grid_thw is not None and image_grid_thw.shape[-1] == 2:
+                    image_grid_thw = torch.nn.functional.pad(image_grid_thw, (1, 0), value=1)
+            return pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
 
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
-        has_image_tokens = has_video_tokens = has_vision_start_tokens = False
-        token_presence = kwargs.pop("_vlm_token_presence", None)
+        has_image_tokens = has_video_tokens = False
         if input_ids is not None and token_presence is None:
-            # The staged-media decision needs host booleans. Transfer the three
+            # Explicit-media filtering needs host booleans. Transfer the three
             # results together so it has one CUDA synchronization per forward.
             token_presence = torch.stack(
                 [
@@ -1519,52 +1534,13 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                 ]
             ).tolist()
         if input_ids is not None:
-            has_image_tokens, has_video_tokens, has_vision_start_tokens = token_presence
-        has_media_tokens = input_ids is not None and (has_image_tokens or has_video_tokens or has_vision_start_tokens)
-        if input_ids is not None:
+            has_image_tokens, has_video_tokens, _ = token_presence
             if pixel_values is not None and image_token_id is not None and not has_image_tokens:
                 pixel_values = None
                 image_grid_thw = None
             if pixel_values_videos is not None and video_token_id is not None and not has_video_tokens:
                 pixel_values_videos = None
                 video_grid_thw = None
-        if not has_media_tokens:
-            return pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
-
-        chunk_idx = getattr(self, "_vlm_chunk_idx", 0)
-        consumed_vlm_chunk = False
-
-        if pixel_values is None:
-            image_chunks = getattr(self, "_vlm_pixel_values_chunks", None)
-            if image_chunks is not None and chunk_idx < len(image_chunks):
-                pixel_values = image_chunks[chunk_idx]
-                image_grid_chunks = getattr(self, "_vlm_image_grid_hws_chunks", None)
-                if image_grid_chunks is not None and chunk_idx < len(image_grid_chunks):
-                    image_grid_hws = image_grid_chunks[chunk_idx]
-                    if image_grid_hws is not None and image_grid_hws.numel() > 0:
-                        if image_grid_hws.shape[-1] == 2:
-                            ones = torch.ones(
-                                image_grid_hws.shape[0], 1, dtype=image_grid_hws.dtype, device=image_grid_hws.device
-                            )
-                            image_grid_thw = torch.cat([ones, image_grid_hws], dim=-1)
-                        else:
-                            image_grid_thw = image_grid_hws
-                consumed_vlm_chunk = True
-
-        if pixel_values_videos is None:
-            video_chunks = getattr(self, "_vlm_pixel_values_videos_chunks", None)
-            if video_chunks is not None and chunk_idx < len(video_chunks):
-                video_chunk = video_chunks[chunk_idx]
-                if video_chunk.numel() > 0:
-                    pixel_values_videos = video_chunk
-                    video_grid_chunks = getattr(self, "_vlm_video_grid_thw_chunks", None)
-                    if video_grid_chunks is not None and chunk_idx < len(video_grid_chunks):
-                        video_grid_thw = video_grid_chunks[chunk_idx]
-                consumed_vlm_chunk = True
-
-        if consumed_vlm_chunk:
-            self._vlm_chunk_idx = chunk_idx + 1
-
         return pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
 
     def _encode_vision_for_cp(
@@ -1855,9 +1831,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
+        position_ids: torch.Tensor | None = None,
         past_key_values: Any | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,

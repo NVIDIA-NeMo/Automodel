@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Literal
+from typing import Callable, Literal, Protocol, TypedDict, Unpack
 
 import torch
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,33 @@ from torchao.quantization.qat.linear import (
     disable_8da4w_fake_quant,
     enable_4w_fake_quant,
     enable_8da4w_fake_quant,
+)
+
+QATQuantizerType = Literal["int8_dynact_int4weight", "int4_weight_only"]
+
+
+class _QATQuantizerKwargs(TypedDict, total=False):
+    groupsize: int
+    padding_allowed: bool
+    inner_k_tiles: int | None
+    precision: torch.dtype
+    scales_precision: torch.dtype
+
+
+class _QATConfigRequired(TypedDict):
+    quantizer_type: QATQuantizerType
+
+
+class _QATConfigDict(_QATConfigRequired, _QATQuantizerKwargs, total=False):
+    pass
+
+
+class _QATQuantizer(Protocol):
+    def prepare(self, model: nn.Module) -> nn.Module: ...
+
+
+_QAT_QUANTIZER_KWARG_KEYS = frozenset(
+    {"groupsize", "padding_allowed", "inner_k_tiles", "precision", "scales_precision"}
 )
 
 
@@ -64,24 +92,24 @@ class QATConfig:
             inner_k_tiles).
     """
 
-    quantizer_type: Literal["int8_dynact_int4weight", "int4_weight_only"] = "int8_dynact_int4weight"
+    quantizer_type: QATQuantizerType = "int8_dynact_int4weight"
 
     def __init__(
         self,
-        quantizer_type: Literal["int8_dynact_int4weight", "int4_weight_only"] = "int8_dynact_int4weight",
-        **quantizer_kwargs,
-    ):
+        quantizer_type: QATQuantizerType = "int8_dynact_int4weight",
+        **quantizer_kwargs: Unpack[_QATQuantizerKwargs],
+    ) -> None:
         self.quantizer_type = quantizer_type
-        self.quantizer_kwargs = quantizer_kwargs
+        self.quantizer_kwargs: _QATQuantizerKwargs = quantizer_kwargs
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> _QATConfigDict:
         """Convert config to dictionary."""
         return {
             "quantizer_type": self.quantizer_type,
             **self.quantizer_kwargs,
         }
 
-    def create_quantizer(self):
+    def create_quantizer(self) -> Int8DynActInt4WeightQATQuantizer | Int4WeightOnlyQATQuantizer:
         """Create and return the appropriate QAT quantizer based on config.
 
         Returns:
@@ -89,34 +117,48 @@ class QATConfig:
             or Int4WeightOnlyQATQuantizer).
 
         Raises:
-            ValueError: If quantizer_type is not recognized.
+            ValueError: If quantizer_type or quantizer_kwargs are not recognized.
         """
+        unknown = set(self.quantizer_kwargs) - _QAT_QUANTIZER_KWARG_KEYS
+        if unknown:
+            raise ValueError(f"Unknown QAT quantizer kwargs: {sorted(unknown)}")
+
         # Default precision to bfloat16 so fake-quant params match the model dtype,
         # preventing FSDP mixed-dtype errors. User kwargs can override.
-        kwargs = {
-            "precision": torch.bfloat16,
-            "scales_precision": torch.bfloat16,
-            **self.quantizer_kwargs,
-        }
         if self.quantizer_type == "int8_dynact_int4weight":
-            return Int8DynActInt4WeightQATQuantizer(**kwargs)
-        elif self.quantizer_type == "int4_weight_only":
-            return Int4WeightOnlyQATQuantizer(**kwargs)
-        else:
-            raise ValueError(f"Unknown quantizer_type: {self.quantizer_type}")
+            if "inner_k_tiles" in self.quantizer_kwargs:
+                raise ValueError("inner_k_tiles is not supported by int8_dynact_int4weight")
+            return Int8DynActInt4WeightQATQuantizer(
+                groupsize=self.quantizer_kwargs.get("groupsize", 256),
+                padding_allowed=self.quantizer_kwargs.get("padding_allowed", False),
+                precision=self.quantizer_kwargs.get("precision", torch.bfloat16),
+                scales_precision=self.quantizer_kwargs.get("scales_precision", torch.bfloat16),
+            )
+
+        if self.quantizer_type == "int4_weight_only":
+            if "padding_allowed" in self.quantizer_kwargs:
+                raise ValueError("padding_allowed is not supported by int4_weight_only")
+            return Int4WeightOnlyQATQuantizer(
+                groupsize=self.quantizer_kwargs.get("groupsize", 256),
+                inner_k_tiles=self.quantizer_kwargs.get("inner_k_tiles", 8),
+                precision=self.quantizer_kwargs.get("precision", torch.bfloat16),
+                scales_precision=self.quantizer_kwargs.get("scales_precision", torch.bfloat16),
+            )
+
+        raise ValueError(f"Unknown quantizer_type: {self.quantizer_type}")
 
 
-_QUANTIZER_TO_MODE = {
+_QUANTIZER_TO_MODE: dict[type, str] = {
     Int8DynActInt4WeightQATQuantizer: "8da4w-qat",
     Int4WeightOnlyQATQuantizer: "4w-qat",
 }
 
-_DISABLE_FN_BY_MODE = {
+_DISABLE_FN_BY_MODE: dict[str, Callable[[nn.Module], None]] = {
     "8da4w-qat": disable_8da4w_fake_quant,
     "4w-qat": disable_4w_fake_quant,
 }
 
-_ENABLE_FN_BY_MODE = {
+_ENABLE_FN_BY_MODE: dict[str, Callable[[nn.Module], None]] = {
     "8da4w-qat": enable_8da4w_fake_quant,
     "4w-qat": enable_4w_fake_quant,
 }
@@ -131,24 +173,25 @@ def get_quantizer_mode(quantizer: object) -> str | None:
     return _QUANTIZER_TO_MODE.get(type(quantizer), None)
 
 
-def get_disable_fake_quant_fn(mode: str) -> Callable | None:
+def get_disable_fake_quant_fn(mode: str) -> Callable[[nn.Module], None] | None:
     """Return the disable fake-quant function for a given quantizer mode."""
 
     return _DISABLE_FN_BY_MODE.get(mode, None)
 
 
-def get_enable_fake_quant_fn(mode: str) -> Callable | None:
+def get_enable_fake_quant_fn(mode: str) -> Callable[[nn.Module], None] | None:
     """Return the enable fake-quant function for a given quantizer mode."""
 
     return _ENABLE_FN_BY_MODE.get(mode, None)
 
 
-def prepare_qat_model(model, quantizer) -> tuple[object, str | None]:
+def prepare_qat_model(model: nn.Module, quantizer: _QATQuantizer) -> tuple[nn.Module, str | None]:
     """Apply a torchao QAT quantizer to the given model.
 
     Returns the (possibly wrapped) model and a mode string if recognized.
     """
 
+    # Runtime guard for callers that pass untyped third-party quantizers.
     if not hasattr(quantizer, "prepare"):
         raise ValueError("Provided quantizer does not implement a prepare(model) method")
 

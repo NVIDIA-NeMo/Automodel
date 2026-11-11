@@ -75,6 +75,7 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
         is_val_step = False
         is_ckpt_step = False
         sigterm_flag = False
+        stream_exhausted = False
 
         def set_epoch(self, epoch):
             self.epoch = epoch
@@ -90,6 +91,7 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
     )
     recipe = _bare_recipe()
     recipe.model_parts = [nn.Linear(2, 2)]
+    recipe.dataloader = SimpleNamespace(close=lambda: events.append("loader-close"))
     recipe.step_scheduler = _TwoStepScheduler()
     recipe.max_grad_norm = 1.0
     recipe.partial_cuda_graph_manager = manager
@@ -116,6 +118,7 @@ def test_training_loop_captures_after_first_complete_step_and_closes():
         ("train-step", ("step-0",)),
         "capture",
         ("train-step", ("step-1",)),
+        "loader-close",
         "progress-close",
         "metrics-close",
         "checkpointer-finalize",

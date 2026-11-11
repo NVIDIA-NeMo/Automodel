@@ -15,8 +15,10 @@
 """Packed forwards must equal independent documents, including gradients and CP."""
 
 import copy
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -250,7 +252,7 @@ def test_packed_cp2_forward_backward_with_activation_checkpointing(
         mp.spawn(_cp_worker, args=(str(tmp_path / "packed-gloo"),), nprocs=2, join=True)
 
 
-@pytest.mark.parametrize("lengths,spans", [([3], [2]), ([33], [33]), ([-2], [-2]), ([0], [4])])
+@pytest.mark.parametrize("lengths,spans", [([3], [2]), ([33], [33]), ([-2], [-2]), ([0], [33]), ([-1000], [4])])
 def test_invalid_packed_metadata_fails_before_attention(lengths, spans):
     with pytest.raises(ValueError):
         packed_layout(torch.tensor([lengths]), seq_lens_padded=torch.tensor([spans]), input_shape=(1, 32), alignment=8)
@@ -305,3 +307,15 @@ def test_context_parallel_sharder_prepares_packed_cp1_without_a_mesh(padding_tok
     torch.testing.assert_close(
         sharder.gather_token_tensor(prepared["labels"], seq_dim=1, trim=True, fill=-100), labels, atol=0, rtol=0
     )
+
+
+@pytest.mark.parametrize("attn", ["tilelang", "cudnn"])
+def test_native_vlm_accepts_model_owned_packed_cp_backends(attn: str) -> None:
+    """The VLM setup guard must accept each model-owned sparse CP backend."""
+    from nemo_automodel._transformers.capabilities import ModelSupports
+    from nemo_automodel.recipes.vlm.finetune import _validate_cp_packing_support
+
+    with torch.device("meta"):
+        model = DeepseekV41ForCausalLM(_tiny_config(), backend=replace(_backend(), attn=attn))
+    supports = ModelSupports(model, SimpleNamespace(cp_size=2))
+    _validate_cp_packing_support(supports, packing_enabled=True, cp_size=2)
