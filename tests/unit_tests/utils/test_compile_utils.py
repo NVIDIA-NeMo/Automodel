@@ -241,10 +241,28 @@ class TestPatchPrepareFA2FromPositionIds:
 
     def test_patch_general_exception(self):
         """Test handling of general exception during patching."""
-        # Create a mock that raises an exception when accessed
-        with patch("transformers.modeling_flash_attention_utils", new=None):
+
+        class _ReadOnlyModule:
+            prepare_fa2_from_position_ids = None
+
+            def __setattr__(self, name: str, value: object) -> None:
+                raise RuntimeError("read-only module")
+
+        with patch("transformers.modeling_flash_attention_utils", new=_ReadOnlyModule()):
             result = patch_prepare_fa2_from_position_ids()
             assert result is False
+
+    def test_patch_skips_release_without_the_function(self):
+        """Releases such as transformers 5.18 no longer define the function, so nothing is added."""
+        import types
+
+        fa_utils = types.ModuleType("transformers.modeling_flash_attention_utils")
+        with patch.dict("sys.modules", {"transformers.modeling_flash_attention_utils": fa_utils}):
+            with patch("transformers.modeling_flash_attention_utils", fa_utils, create=True):
+                result = patch_prepare_fa2_from_position_ids()
+
+        assert result is True
+        assert not hasattr(fa_utils, "prepare_fa2_from_position_ids")
 
 
 class TestApplyFlashAttentionCompileFix:
@@ -294,7 +312,7 @@ class TestCompileModel:
     def test_compile_enabled_simple_model(self, mock_torch_compile, mock_fa_fix, mock_configure):
         """Test compilation with a simple model."""
         config = CompileConfig(enabled=True, mode="default", dynamo_cache_size_limit=512)
-        mock_compiled_model = MagicMock()
+        mock_compiled_model = MagicMock(spec=nn.Module)
         mock_torch_compile.return_value = mock_compiled_model
 
         result = compile_model(self.model, config)
@@ -310,7 +328,7 @@ class TestCompileModel:
     def test_compile_enabled_with_backend(self, mock_torch_compile, mock_fa_fix, mock_configure):
         """Test compilation with specific backend."""
         config = CompileConfig(enabled=True, mode="max-autotune", backend="inductor")
-        mock_compiled_model = MagicMock()
+        mock_compiled_model = MagicMock(spec=nn.Module)
         mock_torch_compile.return_value = mock_compiled_model
 
         result = compile_model(self.model, config)
@@ -344,7 +362,7 @@ class TestCompileModel:
         config = CompileConfig(
             enabled=True, mode="default", fullgraph=True, dynamic=True, options={"some_option": "value"}
         )
-        mock_compiled_model = MagicMock()
+        mock_compiled_model = MagicMock(spec=nn.Module)
         mock_torch_compile.return_value = mock_compiled_model
 
         result = compile_model(self.model, config)
@@ -393,3 +411,35 @@ class TestCompileModuleInplace:
                 CompileConfig(enabled=True, mode="max-autotune", fullgraph=True, dynamic=True, backend="inductor"),
             )
         mock_compile.assert_called_once_with(mode="max-autotune", fullgraph=True, dynamic=True, backend="inductor")
+
+
+class _YamlOptions:
+    """Stands in for a YAML-backed ``ConfigNode``: options are only reachable through ``to_dict``."""
+
+    def __init__(self, values: dict) -> None:
+        self._values = values
+
+    def to_dict(self) -> dict:
+        return dict(self._values)
+
+
+class TestYamlBackedCompileOptions:
+    @patch("nemo_automodel.components.utils.compile_utils.configure_torch_dynamo")
+    @patch("nemo_automodel.components.utils.compile_utils.apply_flash_attention_compile_fix")
+    @patch("torch.compile")
+    def test_config_node_options_are_forwarded(self, mock_torch_compile, mock_fa_fix, mock_configure):
+        model = nn.Linear(2, 2)
+        mock_torch_compile.return_value = MagicMock(spec=nn.Module)
+        config = CompileConfig(enabled=True, options=_YamlOptions({"max_autotune": True, "mode_tag": "x"}))
+
+        compile_model(model, config)
+
+        mock_torch_compile.assert_called_once_with(
+            model, fullgraph=False, dynamic=False, options={"max_autotune": True, "mode_tag": "x"}
+        )
+
+    def test_config_node_option_with_unsupported_value_raises(self):
+        config = CompileConfig(enabled=True, options=_YamlOptions({"trace": {"enabled": True}}))
+
+        with pytest.raises(TypeError, match=r"CompileConfig.options\['trace'\] must be a str, int or bool"):
+            compile_model(nn.Linear(2, 2), config)

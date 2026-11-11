@@ -31,7 +31,7 @@ import torch
 
 try:
     # DTensor is not a torch.Tensor subclass; treat it as tensor-like for extraction.
-    from torch.distributed.tensor import DTensor  # type: ignore
+    from torch.distributed.tensor import DTensor
 
     _TENSOR_LIKE = (torch.Tensor, DTensor)
 except Exception:  # pragma: no cover

@@ -160,5 +160,5 @@ ci:
     # Step 6 reached a 0.013566 loss gap vs 0.010862 allowed, with exact restored
     # model/buffer/optimizer state on all 32 ranks. Use relaxed for this numerical drift.
     resume_tolerance_profile: relaxed
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
