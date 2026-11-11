@@ -3,10 +3,14 @@
 The standalone synthetic recipes are retained while they migrate to the
 [`ci.perf_testing` system in PR #4637](https://github.com/NVIDIA-NeMo/Automodel/pull/4637).
 Make runtime tuning changes in the canonical training recipe. Performance settings
-allow scheduling, walltime, and an optional boolean `fake_balanced_gate`; they do
+allow scheduling, walltime, and optional booleans `fake_balanced_gate` and `validation`; they do
 not permit another copy of the model, data, batches, parallelism or optimizer.
 Balanced-gate results must be labeled: they remove routing imbalance and are not
 measurements of learned routing.
+
+Performance CI skips validation by default. Set `ci.perf_testing.validation: true`
+to retain the canonical recipe's periodic and checkpoint-triggered validation
+cadence. Checkpoint saving remains disabled for performance runs.
 
 ## Fixed-length real-text pretraining
 

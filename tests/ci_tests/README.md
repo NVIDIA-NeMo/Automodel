@@ -85,6 +85,7 @@ ci:
     schedule: weekly              # Required. nightly, weekly, or disabled (keeps the settings, pauses the runs)
     time: "00:40:00"              # Optional. Wall time of the performance run (HH:MM:SS, same format as ci.time)
     fake_balanced_gate: false     # Optional boolean. Omit to use the recipe's own MoE routing setting
+    validation: false            # Optional boolean. Default false; true uses the recipe's validation cadence
 ```
 
 Performance runs use the training recipe as their single source of truth: the same recipe class, dataset,
@@ -94,8 +95,12 @@ not supported in `ci.perf_testing`.
 
 The only optional model change is `fake_balanced_gate`, which maps to `model.backend.fake_balanced_gate`.
 Omitting it preserves the recipe's setting. Results with a fake gate must be identified as balanced-routing
-measurements, not presented as the throughput of real routing. The runner can bound the measurement duration
-and disable validation/checkpoint work; these controls do not change the workload's batching or parallelism.
+measurements, not presented as the throughput of real routing. Performance runs skip validation by default:
+omitting `validation` or setting it to `false` disables both periodic and checkpoint-triggered validation.
+Set `validation: true` to use the recipe's `step_scheduler.val_every_steps` and
+`step_scheduler.validate_on_checkpoint` settings. This option applies only to performance CI;
+ordinary training and other CI phases keep their validation behavior. The runner still disables checkpoint
+saving and bounds measurement duration; these controls do not change batching or parallelism.
 Synthetic `llm_benchmark` results are a separate workload and are not performance targets for real-data recipes.
 
 ## Checkpoint Robustness
