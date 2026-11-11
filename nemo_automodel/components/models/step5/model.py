@@ -190,8 +190,12 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         config: Step5Config | Step5VLConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        moe_overrides: dict | None = None,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
+        if moe_config is not None and moe_overrides is not None:
+            raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
         super().__init__(config)
         text = config.text_config if isinstance(config, Step5VLConfig) else config
         self.backend = (
@@ -231,6 +235,9 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
             dtype=dtype,
             gate_dtype=torch.float32,
         )
+        if moe_overrides:
+            # e.g. {"enable_routing_replay": True} from RL frameworks (router replay / R3).
+            moe_config = replace(moe_config, **moe_overrides)
         if not moe_config.swiglu_clamp_after_activation:
             raise ValueError("Step5 requires post-SiLU clamping in its MoEConfig")
         self.model = Step5TextModel(text, self.backend, moe_config, dtype=dtype)
@@ -249,9 +256,11 @@ class Step5ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
         config: Step5Config | Step5VLConfig,
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
+        *,
+        moe_overrides: dict | None = None,
     ) -> "Step5ForCausalLM":
         """Construct a model through the AutoModel registry."""
-        return cls(config, moe_config=moe_config, backend=backend)
+        return cls(config, moe_config=moe_config, backend=backend, moe_overrides=moe_overrides)
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -465,9 +474,14 @@ class Step5ForConditionalGeneration(Step5ForCausalLM):
         supports_pp: bool = False
 
     def __init__(
-        self, config: Step5VLConfig, moe_config: MoEConfig | None = None, backend: BackendConfig | None = None
+        self,
+        config: Step5VLConfig,
+        moe_config: MoEConfig | None = None,
+        backend: BackendConfig | None = None,
+        *,
+        moe_overrides: dict | None = None,
     ) -> None:
-        super().__init__(config, moe_config, backend)
+        super().__init__(config, moe_config, backend, moe_overrides=moe_overrides)
         self.vision_model = Step5VisionEncoder(config.vision_config)
         self.vit_large_projector = nn.Linear(
             config.vision_config.width * 4, config.hidden_size, bias=config.projector_bias
