@@ -34,7 +34,7 @@ supervision stops at a block's first unsupervised token::
     backbone   = a * sum(w * CE(y)) + (1-a) * sum(w * L1(p_draft, p_target))
     refinement = (a * mean_w(CE_topk) + (1-a) * mean_w(L1_topk)) * num_supervised
     alignment  = mean_layers(sum(w * (1 - cos(code_l, E[y]))))
-    loss       = (backbone + refinement + beta_t * stopgrad(CE_bb) * alignment) / batch
+    loss       = (backbone + refinement + beta_t * stopgrad(CE_bb) * alignment) / sequences
 
 * ``L1`` is the full-vocabulary L1 distance between the draft's and the frozen
   target's next-token distributions (the target logits at ``anchor + k - 1``).
@@ -48,6 +48,8 @@ supervision stops at a block's first unsupervised token::
   codebook code of the token that position predicts, scaled by the detached
   backbone CE ``CE_bb = sum(w * CE) / sum(w)`` and a weight ``beta_t`` that warms
   up linearly (:class:`DSpineSchedule`).
+* ``sequences`` counts documents: the micro-batch's rows, or under sequence
+  packing the packed documents, so the loss scale does not depend on packing.
 * A training curriculum replaces, per block and with a probability that decays
   to zero over training, the predecessor codes of the first few layers with the
   true previous tokens' codes.
@@ -150,7 +152,8 @@ class DSpineStepMetrics:
 
     Attributes:
         loss: Scalar tensor containing the differentiable training loss (the
-            objective's numerator divided by the micro-batch's sequence count).
+            objective's numerator divided by the micro-batch's sequence count,
+            which counts packed documents under sequence packing).
         loss_weight: Scalar tensor containing that sequence count.
         accuracy: Scalar tensor containing refined-path greedy token accuracy.
         valid_tokens: Scalar tensor containing the supervised-token count.
@@ -251,6 +254,10 @@ class DSpineTrainerModule(DFlashTrainerModule):
             raise ValueError(
                 "DSpine scores candidates with raw head rows; a target lm_head with a bias is unsupported."
             )
+        if target_lm_head.weight.requires_grad:
+            raise ValueError(
+                "DSpine gathers the target lm_head once, so the head must be frozen (requires_grad=False)."
+            )
         super().__init__(
             draft_model=draft_model,
             target_lm_head=target_lm_head,
@@ -265,6 +272,13 @@ class DSpineTrainerModule(DFlashTrainerModule):
         self.distribution_ce_weight = float(distribution_ce_weight)
         self.candidate_mass_threshold = float(candidate_mass_threshold)
         self.objective_chunk_blocks = int(objective_chunk_blocks)
+        # The objective scores full-vocabulary logits and candidate rows with the raw
+        # head weight. Under tensor parallelism that weight is sharded, and the head is
+        # frozen, so gather it once here instead of on every micro-batch. Gathering at
+        # construction also keeps the collective out of the forward, where a rank
+        # whose micro-batch has no valid anchor raises before reaching it. Like
+        # ``self.lm_head``, it is held unregistered so DDP and state dicts ignore it.
+        object.__setattr__(self, "head_weight", _to_full_tensor(target_lm_head.weight).detach())
 
     def _objective_chunk(
         self,
@@ -455,7 +469,6 @@ class DSpineTrainerModule(DFlashTrainerModule):
             supervised.reshape(num_blocks, depth),
         )
         flat_target_logits = _to_full_tensor(target_logits).reshape(bsz * seq_len, -1)
-        head_weight = _to_full_tensor(self.lm_head.weight)
 
         sums = None
         base_ids, refined_ids = [], []
@@ -464,9 +477,11 @@ class DSpineTrainerModule(DFlashTrainerModule):
             if torch.is_grad_enabled():
                 # Recompute the chunk's full-vocabulary logits in backward instead of
                 # keeping them for every block at once.
-                result = checkpoint(self._objective_chunk, *chunk, flat_target_logits, head_weight, use_reentrant=False)
+                result = checkpoint(
+                    self._objective_chunk, *chunk, flat_target_logits, self.head_weight, use_reentrant=False
+                )
             else:
-                result = self._objective_chunk(*chunk, flat_target_logits, head_weight)
+                result = self._objective_chunk(*chunk, flat_target_logits, self.head_weight)
             sums = result[:8] if sums is None else tuple(a + b for a, b in zip(sums, result[:8]))
             base_ids.append(result[8])
             refined_ids.append(result[9])
@@ -484,7 +499,12 @@ class DSpineTrainerModule(DFlashTrainerModule):
         refinement = (alpha * refine_ce + (1.0 - alpha) * refine_l1) * valid_tokens
         alignment_scale = alignment_beta * (ce_sum.detach() / weight_sum.clamp_min(1e-30))
         numerator = alpha * ce_sum + (1.0 - alpha) * l1_sum + refinement + alignment_scale * alignment_sum
-        sequences = torch.tensor(float(bsz), device=device)
+        # Normalize per document, as SpecForge does per sample: under packing a row
+        # holds several documents, and ``seq_lens`` is zero-padded per row.
+        if seq_lens is None:
+            sequences = torch.tensor(float(bsz), device=device)
+        else:
+            sequences = (seq_lens > 0).sum().to(device=device, dtype=torch.float32).clamp_min(1.0)
         loss = numerator / sequences
 
         with torch.no_grad():

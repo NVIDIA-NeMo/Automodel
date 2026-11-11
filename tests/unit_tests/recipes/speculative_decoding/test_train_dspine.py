@@ -78,6 +78,7 @@ def _recipe_with_draft(head=None):
     if head is not None:
         with torch.no_grad():
             lm_head.weight.copy_(head)
+    lm_head.requires_grad_(False)  # the recipe freezes the target before building the trainer
     recipe.target_model = SimpleNamespace(
         get_output_embeddings=lambda: lm_head,
         get_input_embeddings=lambda: torch.nn.Embedding(VOCAB, HIDDEN),

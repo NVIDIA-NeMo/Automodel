@@ -92,7 +92,7 @@ parts:
   and an `alignment_weight` that warms up over `alignment_warmup_steps` (the LR
   warmup when unset).
 
-The sum is divided by the number of sequences. A curriculum teacher-forces the
+The sum is divided by the number of sequences (documents, under sequence packing). A curriculum teacher-forces the
 predecessor codes of the first `teacher_forcing_layers` layers on a random subset
 of blocks, with a probability that is held and then decays to zero over
 training. The recipe reports the refined path as `accuracy` and `accept_len`

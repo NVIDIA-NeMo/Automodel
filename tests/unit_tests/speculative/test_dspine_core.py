@@ -305,14 +305,49 @@ def test_padding_blocks_and_packing_keep_the_loss_finite(attention_backend):
     metrics.loss.backward()
     assert all(torch.isfinite(g).all() for g in bridge_grads(trainer).values())
 
-    seq_lens = torch.tensor([[12, 8], [20, 0]])
+    packed = run(trainer, make_batch(), **_packed_metadata(torch.tensor([[12, 8], [20, 0]])))
+    assert torch.isfinite(packed.loss)
+
+
+def _packed_metadata(seq_lens):
     position_ids = torch.cat([torch.arange(12), torch.arange(8)]).unsqueeze(0)
     position_ids = torch.cat([position_ids, torch.arange(SEQ_LEN).unsqueeze(0)])
     doc_remaining = torch.stack(
         [torch.cat([torch.arange(11, -1, -1), torch.arange(7, -1, -1)]), torch.arange(SEQ_LEN - 1, -1, -1)]
     )
-    packed = run(trainer, make_batch(), position_ids=position_ids, seq_lens=seq_lens, doc_remaining=doc_remaining)
-    assert torch.isfinite(packed.loss)
+    return dict(position_ids=position_ids, seq_lens=seq_lens, doc_remaining=doc_remaining)
+
+
+def test_packed_loss_is_normalized_per_document():
+    # Row 0 packs two documents and row 1 holds one: three sequences, not two rows.
+    trainer = build_trainer(num_anchors=12)
+    packed = run(trainer, make_batch(), **_packed_metadata(torch.tensor([[12, 8], [20, 0]])))
+    assert packed.loss_weight.item() == 3
+    # Extra zero padding in seq_lens is not a document.
+    padded = run(trainer, make_batch(), **_packed_metadata(torch.tensor([[12, 8, 0], [20, 0, 0]])))
+    assert padded.loss_weight.item() == 3
+    torch.testing.assert_close(padded.loss, packed.loss)
+
+
+def test_target_head_is_gathered_once_at_construction(monkeypatch):
+    import nemo_automodel.components.speculative.dflash.dspine_core as dspine_core
+
+    gathered = []
+    real = dspine_core._to_full_tensor
+
+    def counting_to_full_tensor(tensor):
+        gathered.append(tensor)
+        return real(tensor)
+
+    monkeypatch.setattr(dspine_core, "_to_full_tensor", counting_to_full_tensor)
+    trainer = build_trainer()
+    head = trainer.lm_head.weight
+    for seed in range(3):
+        run(trainer, make_batch(seed=seed), alignment_beta=0.5)
+    assert sum(t is head for t in gathered) == 1
+    # Held unregistered, like the target head itself, so DDP and state dicts ignore it.
+    assert not any(t is trainer.head_weight for t in trainer.state_dict().values())
+    assert all(p is not trainer.head_weight for p in trainer.parameters())
 
 
 def test_a_batch_without_anchors_raises_no_valid_anchors():
@@ -365,6 +400,12 @@ def test_rejects_a_draft_whose_transfer_space_was_never_initialized():
             MASK_ID,
             block_size=BLOCK_SIZE,
         )
+
+
+def test_rejects_a_trainable_head():
+    head = torch.nn.Linear(HIDDEN, VOCAB, bias=False)
+    with pytest.raises(ValueError, match="frozen"):
+        DSpineTrainerModule(build_draft(), head, torch.nn.Embedding(VOCAB, HIDDEN), MASK_ID, block_size=BLOCK_SIZE)
 
 
 def test_rejects_a_head_with_bias():
