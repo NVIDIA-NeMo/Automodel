@@ -53,7 +53,7 @@ def glm_config():
         rms_norm_eps=1e-6,
         rope_theta=10000.0,
         use_qk_norm=True,
-        partial_rotary_factor=0.5,
+        rope_parameters={"rope_type": "default", "partial_rotary_factor": 0.5, "rope_theta": 10000.0},
         attention_bias=False,
         n_group=1,
         topk_group=1,
@@ -128,7 +128,7 @@ class TestBlock:
         batch, seq_len = 2, 4
         x = torch.randn(batch, seq_len, glm_config.hidden_size, device=device)
         freqs_cis = torch.randn(
-            batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor), device=device
+            batch, seq_len, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"]), device=device
         )
 
         with (
@@ -146,7 +146,7 @@ class TestBlock:
         block = block.to(device)
 
         x = torch.randn(1, 3, glm_config.hidden_size, device=device)
-        freqs_cis = torch.randn(1, 3, int(glm_config.head_dim * glm_config.partial_rotary_factor), device=device)
+        freqs_cis = torch.randn(1, 3, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"]), device=device)
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
 
         with (
@@ -167,7 +167,7 @@ class TestBlock:
         block = block.to(device)
 
         x = torch.randn(1, 3, glm_config.hidden_size, device=device)
-        freqs_cis = torch.randn(1, 3, int(glm_config.head_dim * glm_config.partial_rotary_factor), device=device)
+        freqs_cis = torch.randn(1, 3, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"]), device=device)
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
         padding_mask = torch.tensor([[0, 0, 1]], dtype=torch.bool, device=device)
 
@@ -292,7 +292,7 @@ class TestGlm4MoeModel:
             ):
                 with patch("nemo_automodel.components.models.glm4_moe.model.position_ids_to_freqs_cis") as mock_freqs:
                     mock_freqs.return_value = torch.randn(
-                        batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor)
+                        batch, seq_len, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"])
                     )
                     model(input_ids)
 
@@ -332,7 +332,7 @@ class TestGlm4MoeModel:
         ):
             with patch("nemo_automodel.components.models.glm4_moe.model.position_ids_to_freqs_cis") as mock_freqs:
                 mock_freqs.return_value = torch.randn(
-                    batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor)
+                    batch, seq_len, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"])
                 )
                 with patch.object(Block, "forward", return_value=torch.zeros(batch, seq_len, glm_config.hidden_size)):
                     model(input_ids)
@@ -498,7 +498,7 @@ class TestGlm4MoeModelClassmethods:
             routed_scaling_factor=1.0,
             norm_topk_prob=False,
             use_qk_norm=True,
-            partial_rotary_factor=0.5,
+            rope_parameters={"rope_type": "default", "partial_rotary_factor": 0.5, "rope_theta": 10000.0},
             attention_bias=False,
         )
 

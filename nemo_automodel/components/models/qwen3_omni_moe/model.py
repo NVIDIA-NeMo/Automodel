@@ -23,11 +23,18 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoder as HFQwen3OmniMoeAudioEncoder,
+)
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinkerForConditionalGeneration,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextRotaryEmbedding as HFQwen3OmniMoeThinkerTextRotaryEmbedding,
 )
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeVisionEncoder as HFQwen3OmniMoeVisionEncoder,
+)
+from transformers.utils import torch_compilable_check
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -290,6 +297,20 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.model = Qwen3OmniMoeThinkerTextModel(
             text_config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides
         )
+        # transformers 5.22 routes get_image_features / get_video_features through
+        # ``self.model`` (the text model), which does not carry the vision tower. Build
+        # the vision encoder here and override the two accessors below to call it
+        # directly, matching the pre-5.22 behavior the merger logic depends on.
+        self.visual = (
+            HFQwen3OmniMoeVisionEncoder._from_config(base_config.vision_config)
+            if hasattr(base_config, "vision_config")
+            else None
+        )
+        self.audio_tower = (
+            HFQwen3OmniMoeAudioEncoder._from_config(base_config.audio_config)
+            if hasattr(base_config, "audio_config")
+            else None
+        )
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
@@ -324,6 +345,98 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def get_audio_features(
+        self, input_features, feature_attention_mask=None, audio_feature_lengths=None, **kwargs
+    ):
+        """Return audio features, calling the audio tower directly.
+
+        transformers 5.22's inherited implementation delegates to ``self.model`` (the
+        text model), which has no audio tower; call ``self.audio_tower`` here instead.
+        """
+        if feature_attention_mask is not None:
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+        else:
+            audio_feature_lengths = None
+        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+        return self.audio_tower(input_features, feature_lens=feature_lens, return_dict=True, **kwargs)
+
+    def get_placeholder_mask(self, input_ids, inputs_embeds, image_features=None, video_features=None):
+        """Obtains multimodal placeholder mask from ``input_ids`` or ``inputs_embeds``.
+
+        Copied from transformers 5.22; the inherited accessor now lives on the text
+        model (``self.model``), which does not carry the token ids, so it is defined
+        here on the thinker.
+        """
+        if input_ids is None:
+            special_image_mask = inputs_embeds == self.get_input_embeddings()(
+                torch.full((), self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+            )
+            special_image_mask = special_image_mask.all(-1)
+            special_video_mask = inputs_embeds == self.get_input_embeddings()(
+                torch.full((), self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
+            )
+            special_video_mask = special_video_mask.all(-1)
+            special_audio_mask = (
+                inputs_embeds
+                == self.get_input_embeddings()(
+                    torch.full((), self.config.audio_token_id, dtype=torch.long, device=inputs_embeds.device)
+                )
+            ).all(-1)
+        else:
+            special_image_mask = input_ids == self.config.image_token_id
+            special_video_mask = input_ids == self.config.video_token_id
+            special_audio_mask = input_ids == self.config.audio_token_id
+
+        n_image_tokens = special_image_mask.sum()
+        special_image_mask = special_image_mask.unsqueeze(-1).to(inputs_embeds.device)
+        if image_features is not None:
+            torch_compilable_check(
+                n_image_tokens * inputs_embeds.shape[-1] == image_features.numel(),
+                f"Image features and image tokens do not match, tokens: {n_image_tokens}, features: {image_features.shape[0]}",
+            )
+
+        n_video_tokens = special_video_mask.sum()
+        special_video_mask = special_video_mask.unsqueeze(-1).to(inputs_embeds.device)
+        if video_features is not None:
+            torch_compilable_check(
+                n_video_tokens * inputs_embeds.shape[-1] == video_features.numel(),
+                f"Video features and video tokens do not match, tokens: {n_video_tokens}, features: {video_features.shape[0]}",
+            )
+
+        special_audio_mask = special_audio_mask.unsqueeze(-1).to(inputs_embeds.device)
+        return special_image_mask, special_video_mask, special_audio_mask
+
+    def get_image_features(self, pixel_values, image_grid_thw, **kwargs):
+        """Return vision features for images, calling the vision tower directly.
+
+        transformers 5.22's inherited implementation delegates to ``self.model`` (the
+        text model), which has no vision tower; call ``self.visual`` here instead.
+        """
+        pixel_values = pixel_values.type(self.visual.dtype)
+        vision_outputs = self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
+        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        vision_outputs.pooler_output = torch.split(vision_outputs.pooler_output, split_sizes)
+        vision_outputs.deepstack_features = [
+            torch.split(feat, split_sizes) for feat in vision_outputs.deepstack_features
+        ]
+        return vision_outputs
+
+    def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
+        """Return vision features for videos, calling the vision tower directly.
+
+        See :meth:`get_image_features` for why this bypasses the 5.22 ``self.model``
+        delegation.
+        """
+        pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+        vision_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw, **kwargs)
+        split_sizes = (video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        vision_outputs.pooler_output = torch.split(vision_outputs.pooler_output, split_sizes)
+        vision_outputs.deepstack_features = [
+            torch.split(feat, split_sizes) for feat in vision_outputs.deepstack_features
+        ]
+        return vision_outputs
 
     def forward(
         self,

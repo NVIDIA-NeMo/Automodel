@@ -39,7 +39,7 @@ def config():
         rms_norm_eps=1e-6,
         attention_dropout=0.0,
         use_qk_norm=True,
-        partial_rotary_factor=0.5,
+        rope_parameters={"rope_type": "default", "partial_rotary_factor": 0.5, "rope_theta": 10000.0},
         attention_bias=False,
         rope_theta=10000.0,
         n_routed_experts=4,
@@ -69,7 +69,7 @@ def config_without_qk_norm():
         rms_norm_eps=1e-6,
         attention_dropout=0.0,
         use_qk_norm=False,
-        partial_rotary_factor=0.5,
+        rope_parameters={"rope_type": "default", "partial_rotary_factor": 0.5, "rope_theta": 10000.0},
         attention_bias=False,
         rope_theta=10000.0,
         n_routed_experts=4,
@@ -200,7 +200,7 @@ class TestGlm4MoeAttention:
         assert attention.use_qk_norm is False
 
     def test_partial_rotary_factor_is_stored(self, config, sdpa_backend):
-        config.partial_rotary_factor = 0.75
+        config.rope_parameters["partial_rotary_factor"] = 0.75
         attention = Glm4MoeAttention(config, sdpa_backend)
 
         assert attention.partial_rotary_factor == 0.75
@@ -209,7 +209,7 @@ class TestGlm4MoeAttention:
         attention = Glm4MoeAttention(config, sdpa_backend)
         batch_size, seq_len = 2, 5
         hidden = torch.randn(batch_size, seq_len, config.hidden_size).to(torch.bfloat16)
-        freqs_cis = torch.randn(batch_size, seq_len, int(config.head_dim * config.partial_rotary_factor))
+        freqs_cis = torch.randn(batch_size, seq_len, int(config.head_dim * config.rope_parameters["partial_rotary_factor"]))
 
         fake_attn = torch.zeros(batch_size, config.num_attention_heads, seq_len, config.head_dim)
         attention.attn_func = MagicMock(return_value=fake_attn.to(torch.bfloat16))
@@ -224,7 +224,7 @@ class TestGlm4MoeAttention:
         attention = Glm4MoeAttention(config, sdpa_backend)
         num_tokens = 10
         hidden = torch.randn(num_tokens, config.hidden_size).to(torch.bfloat16)
-        freqs_cis = torch.randn(num_tokens, int(config.head_dim * config.partial_rotary_factor))
+        freqs_cis = torch.randn(num_tokens, int(config.head_dim * config.rope_parameters["partial_rotary_factor"]))
 
         fake_attn = torch.zeros(num_tokens, config.num_attention_heads, config.head_dim)
         attention.attn_func = MagicMock(return_value=fake_attn.to(torch.bfloat16))
@@ -241,7 +241,7 @@ class TestGlm4MoeAttention:
         attention = Glm4MoeAttention(config, sdpa_backend)
         batch_size, seq_len = 1, 3
         hidden = torch.randn(batch_size, seq_len, config.hidden_size).to(torch.bfloat16)
-        freqs_cis = torch.randn(batch_size, seq_len, int(config.head_dim * config.partial_rotary_factor))
+        freqs_cis = torch.randn(batch_size, seq_len, int(config.head_dim * config.rope_parameters["partial_rotary_factor"]))
 
         fake_attn = torch.zeros(batch_size, config.num_attention_heads, seq_len, config.head_dim).to(torch.bfloat16)
         attention.attn_func = MagicMock(return_value=fake_attn)
@@ -259,7 +259,7 @@ class TestGlm4MoeAttention:
         attention = Glm4MoeAttention(config_without_qk_norm, sdpa_backend)
         batch_size, seq_len = 1, 3
         hidden = torch.randn(batch_size, seq_len, config_without_qk_norm.hidden_size).to(torch.bfloat16)
-        freqs_cis = torch.randn(batch_size, seq_len, int(config_without_qk_norm.head_dim * config_without_qk_norm.partial_rotary_factor))
+        freqs_cis = torch.randn(batch_size, seq_len, int(config_without_qk_norm.head_dim * config_without_qk_norm.rope_parameters["partial_rotary_factor"]))
 
         fake_attn = torch.zeros(batch_size, config_without_qk_norm.num_attention_heads, seq_len, config_without_qk_norm.head_dim).to(torch.bfloat16)
         attention.attn_func = MagicMock(return_value=fake_attn)
@@ -272,11 +272,11 @@ class TestGlm4MoeAttention:
 
     def test_forward_applies_partial_rotary_embedding(self, config, sdpa_backend):
         """Test that rotary embedding is applied with partial_rotary_factor"""
-        config.partial_rotary_factor = 0.5
+        config.rope_parameters["partial_rotary_factor"] = 0.5
         attention = Glm4MoeAttention(config, sdpa_backend)
         batch_size, seq_len = 1, 2
         hidden = torch.randn(batch_size, seq_len, config.hidden_size).to(torch.bfloat16)
-        rotary_dim = int(config.head_dim * config.partial_rotary_factor)
+        rotary_dim = int(config.head_dim * config.rope_parameters["partial_rotary_factor"])
         freqs_cis = torch.randn(batch_size, seq_len, rotary_dim)
 
         attention.attn_func = MagicMock(
@@ -294,7 +294,7 @@ class TestGlm4MoeAttention:
         attention = Glm4MoeAttention(config, sdpa_backend)
         batch, seq_len = 1, 3
         hidden = torch.randn(batch, seq_len, config.hidden_size).to(torch.bfloat16)
-        freqs_cis = torch.randn(batch, seq_len, int(config.head_dim * config.partial_rotary_factor))
+        freqs_cis = torch.randn(batch, seq_len, int(config.head_dim * config.rope_parameters["partial_rotary_factor"]))
         attention_mask = torch.ones(batch, seq_len, dtype=torch.bool)
 
         fake_attn = torch.zeros(batch, config.num_attention_heads, seq_len, config.head_dim).to(torch.bfloat16)
@@ -349,7 +349,7 @@ class TestGlm4MoeAttention:
             attention = Glm4MoeAttention(config, te_backend)
 
         hidden = torch.randn(batch, seq_len, config.hidden_size).to(torch.bfloat16)
-        freqs_cis = torch.randn(batch, seq_len, int(config.head_dim * config.partial_rotary_factor))
+        freqs_cis = torch.randn(batch, seq_len, int(config.head_dim * config.rope_parameters["partial_rotary_factor"]))
         attention_mask = torch.tensor([[1, 0, 1]], dtype=torch.bool)
 
         with patch("nemo_automodel.components.models.glm4_moe.layers.apply_rotary_emb_qk", side_effect=lambda q, k, *_, **__: (q, k)):
