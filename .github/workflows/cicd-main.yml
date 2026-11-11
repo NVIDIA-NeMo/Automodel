@@ -191,9 +191,11 @@ jobs:
           uv sync --link-mode copy --locked --group linting
 
       - name: Test annotation policy
-        run: python -m unittest discover -s tests/unit_tests/tools -p test_annotation_policy.py
+        run: |
+          source ./venv/bin/activate
+          uv run --active python -m unittest discover -s tests/unit_tests/tools -p test_annotation_policy.py
 
-      - name: Run annotation policy and ty
+      - name: Run annotation policy, signature completeness, and ty
         run: |
           source ./venv/bin/activate
           uv run --active ty --version
