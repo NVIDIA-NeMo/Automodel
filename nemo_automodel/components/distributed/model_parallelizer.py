@@ -71,7 +71,7 @@ def _apply_model_parallelizer(
         reject_unsupported_mtp_cp(model)
 
     if mesh_context.ep_size > 1:
-        return _parallelize_moe(model, mesh_context, parallelizer=parallelizer)
+        return parallelizer._apply_moe(model, mesh_context)
     if isinstance(mesh_context.strategy_config, FSDP2Config):
         return _parallelize_fsdp2(model, mesh_context, parallelizer=parallelizer)
     if isinstance(mesh_context.strategy_config, DDPConfig):

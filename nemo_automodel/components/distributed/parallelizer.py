@@ -195,6 +195,16 @@ class ModelParallelizer:
 
         return _apply_model_parallelizer(self, model, mesh_context)
 
+    def _apply_moe(self, model: nn.Module, mesh_context: "MeshContext") -> nn.Module:
+        """Apply the expert-parallel flow selected by ``mesh_context.ep_size > 1``.
+
+        The shared flow walks one decoder ``layers`` stack. A model whose MoE blocks live
+        in several towers overrides this hook and shards them itself.
+        """
+        from nemo_automodel.components.distributed import model_parallelizer
+
+        return model_parallelizer._parallelize_moe(model, mesh_context, parallelizer=self)
+
     def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
         """Apply the FSDP2 primitive used by this model sidecar."""
         return fully_shard(module, **kwargs)

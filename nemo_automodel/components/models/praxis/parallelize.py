@@ -208,31 +208,23 @@ def replicate_router_biases(policy: PraxisPolicy, mesh: DeviceMesh) -> None:
 class PraxisModelParallelizer(ModelParallelizer):
     """Model-owned parallelization of :class:`PraxisPolicy`, the ``parallelizer`` of the model class.
 
-    The shared MoE walk expects one ``layers`` stack; this sidecar walks the Praxis towers with
-    :func:`shard_policy` and the strategy settings of the :class:`MeshContext`.
+    The shared flows walk one ``layers`` stack; these hooks walk the Praxis towers with
+    :func:`shard_policy` instead, with (``_apply_moe``) and without (``_apply``) expert parallelism.
     """
 
-    def parallelize(self, model: nn.Module, mesh_context: MeshContext, /) -> nn.Module:
+    def _apply_moe(self, model: nn.Module, mesh_context: MeshContext) -> nn.Module:
         """Shard ``model`` for the FSDP2 strategy, and the expert parallelism, of ``mesh_context``."""
-        from nemo_automodel.components.models.praxis.model import PraxisPolicy
-
-        if not isinstance(model, PraxisPolicy):
-            raise TypeError(f"PraxisModelParallelizer parallelizes a PraxisPolicy, got {type(model).__name__}")
+        policy = _policy(model)
         strategy = mesh_context.strategy_config
         if not isinstance(strategy, FSDP2Config):
             raise TypeError(f"PraxisPolicy trains with distributed.strategy fsdp2, got {type(strategy).__name__}")
         if mesh_context.device_mesh is None:
             raise ValueError("PraxisPolicy parallelization needs a device mesh")
         moe = mesh_context.moe_parallel_config or MoEParallelizerConfig()
-        mp_policy = (
-            moe.mp_policy
-            or strategy.mp_policy
-            or MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=False)
-        )
         shard_policy(
-            model,
+            policy,
             get_fsdp_dp_mesh(mesh_context.device_mesh),
-            mp_policy,
+            _mp_policy(moe.mp_policy or strategy.mp_policy),
             moe_mesh=mesh_context.moe_mesh,
             activation_checkpointing=bool(mesh_context.activation_checkpointing),
             ignore_router_for_ac=moe.ignore_router_for_ac,
@@ -240,3 +232,40 @@ class PraxisModelParallelizer(ModelParallelizer):
             offload_policy=strategy.offload_policy,
         )
         return model
+
+    def _apply(
+        self,
+        model: nn.Module,
+        device_mesh: DeviceMesh,
+        mp_policy: MixedPrecisionPolicy | None = None,
+        offload_policy: OffloadPolicy | None = None,
+        sequence_parallel: bool = False,
+        activation_checkpointing: bool = False,
+        reshard_after_forward: bool | None = None,
+        **kwargs,
+    ) -> nn.Module:
+        """Shard ``model`` for FSDP2 without expert parallelism; the experts stay inside their blocks."""
+        del sequence_parallel, kwargs
+        shard_policy(
+            _policy(model),
+            get_fsdp_dp_mesh(device_mesh),
+            _mp_policy(mp_policy),
+            activation_checkpointing=bool(activation_checkpointing),
+            reshard_after_forward=True if reshard_after_forward is None else reshard_after_forward,
+            offload_policy=offload_policy,
+        )
+        return model
+
+
+def _policy(model: nn.Module) -> PraxisPolicy:
+    from nemo_automodel.components.models.praxis.model import PraxisPolicy
+
+    if not isinstance(model, PraxisPolicy):
+        raise TypeError(f"PraxisModelParallelizer parallelizes a PraxisPolicy, got {type(model).__name__}")
+    return model
+
+
+def _mp_policy(mp_policy: MixedPrecisionPolicy | None) -> MixedPrecisionPolicy:
+    return mp_policy or MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=False
+    )
