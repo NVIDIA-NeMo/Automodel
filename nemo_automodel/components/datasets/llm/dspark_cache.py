@@ -83,7 +83,10 @@ def tokenizer_chat_template_sha256(tokenizer) -> str:
     template = getattr(tokenizer, "chat_template", None) or ""
     if not isinstance(template, str):
         # Tokenizers with several named templates (e.g. default / tool_use) expose a dict.
-        template = json.dumps(template, sort_keys=True)
+        # Without a "default" entry, format_chat_template reads the generation-mask setting from the first
+        # entry, so the order can change the cached loss mask and is kept in the hash. With a "default"
+        # entry the order has no effect, so the keys are sorted.
+        template = json.dumps(template, sort_keys="default" in template)
     return hashlib.sha256(template.encode("utf-8")).hexdigest()
 
 

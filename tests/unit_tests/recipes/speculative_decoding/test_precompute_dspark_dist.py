@@ -286,6 +286,57 @@ def test_tokenizer_chat_template_sha256_accepts_named_templates():
     assert digest != tokenizer_chat_template_sha256(SimpleNamespace(chat_template={"default": "{{ messages }}"}))
 
 
+class _NamedTemplateTokenizer:
+    """Renders ``user -> [1, 2]`` and ``assistant -> [3, 7, 8]``; only ``7`` is inside the generation block."""
+
+    eos_token_id = 0
+    pad_token_id = 0
+    bos_token_id = None
+    padding_side = "right"
+
+    def __init__(self, chat_template):
+        self.chat_template = chat_template
+
+    def apply_chat_template(self, messages, return_assistant_tokens_mask=False, add_generation_prompt=False, **kwargs):
+        ids, mask = [], []
+        for message in messages:
+            if message["role"] == "assistant":
+                ids += [3, 7, 8]
+                mask += [0, 1, 0]
+            else:
+                ids += [1, 2]
+                mask += [0, 0]
+        if add_generation_prompt:
+            ids.append(3)
+            mask.append(0)
+        out = {"input_ids": ids, "attention_mask": [1] * len(ids)}
+        if return_assistant_tokens_mask:
+            out["assistant_masks"] = mask
+        return out
+
+
+def test_tokenizer_chat_template_sha256_keeps_order_without_default():
+    """Without a ``default`` template, the order of named templates changes the loss mask and the hash."""
+    from nemo_automodel.components.datasets.llm.dspark_cache import tokenizer_chat_template_sha256
+    from nemo_automodel.components.datasets.llm.formatting_utils import format_chat_template
+
+    generation = "{% generation %}{{ messages }}{% endgeneration %}tail"
+    plain = "{{ messages }}"
+    conversation = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    tool_first = _NamedTemplateTokenizer({"tool_use": generation, "other": plain})
+    other_first = _NamedTemplateTokenizer({"other": plain, "tool_use": generation})
+
+    def labels(tokenizer):
+        return format_chat_template(tokenizer, conversation, eos_token_id=0, pad_token_id=0)["labels"]
+
+    assert labels(tool_first) == [-100, -100, 7, -100]
+    assert labels(other_first) == [-100, 3, 7, 8]
+    assert tokenizer_chat_template_sha256(tool_first) != tokenizer_chat_template_sha256(other_first)
+    assert tokenizer_chat_template_sha256(tool_first) == tokenizer_chat_template_sha256(
+        SimpleNamespace(chat_template=dict(tool_first.chat_template))
+    )
+
+
 # ---------------------------------------------------------------------------
 # build_dspark_target dispatch
 # ---------------------------------------------------------------------------
