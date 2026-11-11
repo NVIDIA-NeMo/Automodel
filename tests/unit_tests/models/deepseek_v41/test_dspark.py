@@ -23,7 +23,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v41.config import DeepseekV41DSparkConfig, DeepseekV41TextConfig
 from nemo_automodel.components.models.deepseek_v41.dspark import DeepseekV41DSparkBackbone, DeepseekV41DSparkModel
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
-from nemo_automodel.recipes.llm._dspark_warm_start import load_dspark_draft_weights
+from nemo_automodel.recipes.speculative_decoding._dspark_warm_start import load_dspark_draft_weights
 
 # Keep a hard watchdog for draft-model tests; slower cases declare exact runtime budgets below.
 pytestmark = pytest.mark.timeout(70)

@@ -718,7 +718,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
 
     def forward(
         self,
-        input_ids: torch.LongTensor | None = None,
+        input_ids: torch.Tensor | None = None,
         *mtp_embed_inputs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         causal_mask_mapping: dict[str, torch.Tensor] | None = None,
@@ -727,7 +727,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         past_key_values: Any | None = None,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
-        position_ids: torch.LongTensor | None = None,
+        position_ids: torch.Tensor | None = None,
         mtp_per_depth_input_ids: tuple[torch.LongTensor, ...] | None = None,
         mtp_per_depth_position_ids: tuple[torch.LongTensor, ...] | None = None,
         padding_mask: torch.Tensor | None = None,

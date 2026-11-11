@@ -38,7 +38,7 @@ def _patch_external_libs(monkeypatch):
     def _fake_load_dataset(path_or_dataset, split=None, trust_remote_code=True):
         # We only check that the slice expression is propagated
         assert split in (None, "train", "train[:1]")
-        return _build_tiny_dataset()
+        return _build_tiny_dataset().select(range(1)) if split == "train[:1]" else _build_tiny_dataset()
 
     monkeypatch.setattr(hellaswag_mod, "load_dataset", _fake_load_dataset)
 
@@ -85,10 +85,10 @@ def test_sample_limiting():
     ds = HellaSwag(
         path_or_dataset="ignored",
         tokenizer=dummy_tokenizer,
-        num_samples_limit=1,  # forces split 'train[:1]'
+        limit_dataset_samples=1,  # forces split 'train[:1]'
     )
-    # Our stub still returns the same two rows
-    assert len(ds) == 2
+    # The canonical limit reaches the dataset loader.
+    assert len(ds) == 1
 
 
 def test_pad_to_max_length_control():
@@ -152,3 +152,38 @@ def test_init_does_not_accept_trust_remote_code_kwarg():
             tokenizer=object(),
             trust_remote_code=True,  # removed kwarg
         )
+
+
+@pytest.mark.parametrize("use_config", [False, True])
+def test_deprecated_limit_is_compatible(use_config: bool) -> None:
+    from nemo_automodel.components.datasets.llm.hellaswag import HellaSwag, HellaSwagConfig
+
+    with pytest.warns(FutureWarning, match="num_samples_limit is deprecated"):
+        ds = (
+            HellaSwagConfig(path_or_dataset="ignored", num_samples_limit=1).build(tokenizer=object())
+            if use_config
+            else HellaSwag("ignored", object(), "train", 1)
+        )
+    assert len(ds) == 1
+
+
+def test_canonical_config_build_preserves_configuration() -> None:
+    from nemo_automodel.components.datasets.llm.hellaswag import HellaSwagConfig
+
+    config = HellaSwagConfig(path_or_dataset="ignored", limit_dataset_samples=1)
+    assert len(config.build(tokenizer=object())) == 1
+    assert len(config.build(tokenizer=object())) == 1
+    assert config.limit_dataset_samples == 1
+    assert config.num_samples_limit is None
+
+
+@pytest.mark.parametrize("canonical", [1, 2])
+def test_both_limit_spellings(canonical: int) -> None:
+    from nemo_automodel.components.datasets.llm.hellaswag import HellaSwag
+
+    with pytest.warns(FutureWarning):
+        if canonical == 1:
+            assert len(HellaSwag("ignored", object(), num_samples_limit=1, limit_dataset_samples=1)) == 1
+        else:
+            with pytest.raises(ValueError, match="must agree"):
+                HellaSwag("ignored", object(), num_samples_limit=1, limit_dataset_samples=2)

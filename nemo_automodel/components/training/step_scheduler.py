@@ -20,7 +20,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from itertools import islice
 from math import ceil
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -153,7 +153,7 @@ class StepScheduler(Stateful):
 
         # Throws with IterableDataset.
         try:
-            self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
+            self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps) if dataloader is not None else None
         except (NotImplementedError, TypeError, RuntimeError):
             self.epoch_len = None
 
@@ -207,7 +207,7 @@ class StepScheduler(Stateful):
         self.sigterm_flag = False
         self._sig_polled_step: int | None = None
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[list[Any]]:
         """
         Iterates over dataloader while keeping track of counters.
 
@@ -217,7 +217,7 @@ class StepScheduler(Stateful):
         Yields:
             dict: batch
         """
-        if self.step >= self.max_steps:
+        if self.step >= self.max_steps or self.dataloader is None:
             return
         if self._synchronized_stream:
             yield from self._iter_stream()
@@ -247,7 +247,7 @@ class StepScheduler(Stateful):
         The only buffered data is the current optimizer step, as in the native iterator.
         There is no next-step lookahead that could advance checkpointed data progress.
         """
-        if self.stream_exhausted:
+        if self.stream_exhausted or self.dataloader is None:
             return
         iterator = None
         while self.step < self.max_steps and not self.sigterm_flag:
@@ -291,7 +291,7 @@ class StepScheduler(Stateful):
             self.step += 1
             self._step_in_progress = False
 
-    def set_epoch(self, epoch: int):
+    def set_epoch(self, epoch: int) -> None:
         """
         Set the epoch for the sampler and the collate function.
 
@@ -301,20 +301,25 @@ class StepScheduler(Stateful):
         a fixed augmentation mix.
         """
         self.epoch = epoch
-        if hasattr(getattr(self.dataloader, "sampler", None), "set_epoch"):
-            self.dataloader.sampler.set_epoch(epoch)
-        if hasattr(getattr(self.dataloader, "collate_fn", None), "set_epoch"):
-            self.dataloader.collate_fn.set_epoch(epoch)
+        if self.dataloader is not None:
+            sampler = getattr(self.dataloader, "sampler", None)
+            sampler_set_epoch = getattr(sampler, "set_epoch", None)
+            if callable(sampler_set_epoch):
+                sampler_set_epoch(epoch)
+            collate_fn = getattr(self.dataloader, "collate_fn", None)
+            collate_set_epoch = getattr(collate_fn, "set_epoch", None)
+            if callable(collate_set_epoch):
+                collate_set_epoch(epoch)
 
     @property
-    def is_remote_logging_step(self):
+    def is_remote_logging_step(self) -> bool:
         """
         Returns whether this step should log to remote services (WandB, MLflow, etc.).
         """
         return self.step % self.log_remote_every_steps == 0
 
     @property
-    def is_val_step(self):
+    def is_val_step(self) -> bool:
         """
         Returns whether this step needs to call the validation.
         """
@@ -327,7 +332,7 @@ class StepScheduler(Stateful):
         return (is_val or is_checkpoint_validation) and not self.sigterm_flag
 
     @property
-    def is_ckpt_step(self):
+    def is_ckpt_step(self) -> bool:
         """
         Returns whether this step needs to call the checkpoint saving.
 
@@ -339,14 +344,14 @@ class StepScheduler(Stateful):
         return is_ckpt_step or is_epoch_boundary or self.is_last_step or self.sigterm_received
 
     @property
-    def is_gc_step(self):
+    def is_gc_step(self) -> bool:
         """
         Returns whether this step needs to run manual garbage collection.
         """
         return self.gc_every_steps is not None and self.step % self.gc_every_steps == 0
 
     @property
-    def is_last_step(self):
+    def is_last_step(self) -> bool:
         """
         Returns whether the current step is the final training step.
 
@@ -370,7 +375,7 @@ class StepScheduler(Stateful):
         return False
 
     @property
-    def is_last_batch(self):
+    def is_last_batch(self) -> bool:
         """
         Returns whether this is the last batch for this epoch.
         """
@@ -379,7 +384,7 @@ class StepScheduler(Stateful):
         return (self.step % self.epoch_len) == self.epoch_len - 1
 
     @property
-    def sigterm_received(self):
+    def sigterm_received(self) -> bool:
         """
         Returns whether SIGTERM was received.
         """
@@ -394,7 +399,7 @@ class StepScheduler(Stateful):
         return self.sigterm_flag
 
     @property
-    def epochs(self):
+    def epochs(self) -> Iterator[int]:
         """
         Epoch iterator.
 
@@ -407,7 +412,7 @@ class StepScheduler(Stateful):
                 return
             yield e
 
-    def state_dict(self):
+    def state_dict(self) -> dict[str, Any]:
         """
         Get the current state of the scheduler.
 
@@ -426,15 +431,15 @@ class StepScheduler(Stateful):
             }
         return {"step": min(self.max_steps, self.step + 1), "epoch": self.epoch}
 
-    def load_state_dict(self, s):
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """
         Load the scheduler state from a dictionary.
 
         Args:
-            s (dict): Dictionary containing 'step' and 'epoch'.
+            state_dict (dict): Dictionary containing 'step' and 'epoch'.
         """
-        self.step, self.epoch = s["step"], s["epoch"]
-        self.stream_exhausted = bool(s.get("stream_exhausted", False))
+        self.step, self.epoch = state_dict["step"], state_dict["epoch"]
+        self.stream_exhausted = bool(state_dict.get("stream_exhausted", False))
         self._step_in_progress = False
 
 

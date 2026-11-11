@@ -225,7 +225,7 @@ class TestAnnotationPolicy(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must exist", result.stderr)
 
-    def test_both_gates_run_and_either_failure_fails_combined_command(self) -> None:
+    def test_all_gates_run_and_any_failure_fails_combined_command(self) -> None:
         (self.root / "ty.toml").write_text('[[overrides]]\ninclude = ["src/**"]\n')
         # A tiny module stands in for the external executable, recording arguments
         # and returning a controlled exit code. The real policy still runs.
@@ -236,9 +236,58 @@ class TestAnnotationPolicy(unittest.TestCase):
                     'Path("ty-args.json").write_text(json.dumps(sys.argv[1:]))\n'
                     f"raise SystemExit({ty_code})\n"
                 )
-                result = self.run_policy(f"def f(x: {annotation}): pass", "check_types.py")
+                result = self.run_policy(f"def f(x: {annotation}) -> None: pass", "check_types.py")
                 self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertEqual(json.loads((self.root / "ty-args.json").read_text()), ["check", "--verbose", "src"])
+
+    def test_combined_command_rejects_missing_signatures(self) -> None:
+        (self.root / "ty.toml").write_text('[[overrides]]\ninclude = ["src/**"]\n')
+        (self.root / "ty.py").write_text('from pathlib import Path\nPath("ty-ran").touch()\n')
+        # Completeness must not inherit Ruff settings that suppress missing
+        # annotations, even on fully untyped functions and dummy arguments.
+        (self.root / "ruff.toml").write_text(
+            '[lint]\nignore = ["ANN"]\n[lint.flake8-annotations]\n'
+            "ignore-fully-untyped = true\nsuppress-dummy-args = true\nmypy-init-return = true\n"
+        )
+        cases = (
+            ("def f(value) -> None: pass", "ANN001"),
+            ("def f(_unused) -> None: pass", "ANN001"),
+            ("def f(*args) -> None: pass", "ANN002"),
+            ("def f(**kwargs) -> None: pass", "ANN003"),
+            ("def f(): pass", "ANN201"),
+            ("def _get_cloud(name: str): return name", "ANN202"),
+            ("class C:\n    def __init__(self, value: int): pass", "ANN204"),
+            ("class C:\n    @staticmethod\n    def f(): pass", "ANN205"),
+            ("class C:\n    @classmethod\n    def f(cls): pass", "ANN206"),
+            ("async def f(value) -> None: pass", "ANN001"),
+            ("def f() -> None:\n    def nested(): pass", "ANN202"),
+            ("def f(): pass  # noqa: ANN201", "ANN201"),
+        )
+        for source, rule in cases:
+            with self.subTest(rule=rule, source=source):
+                (self.root / "ty-ran").unlink(missing_ok=True)
+                result = self.run_policy(source, "check_types.py")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(rule, result.stdout)
+                self.assertTrue((self.root / "ty-ran").exists(), "ty must still run after the signature gate fails")
+
+    def test_signature_gate_follows_opt_in_scope_and_exclusions(self) -> None:
+        (self.root / "ty.py").write_text("")
+        (self.root / "ty.toml").write_text(
+            '[src]\nexclude = ["src/excluded.py"]\n[[overrides]]\ninclude = ["src/**"]\n'
+        )
+        (self.root / "src/excluded.py").write_text("def untyped(value): return value\n")
+        valid = "class C:\n    def __init__(self, value: int) -> None: pass\n    def f(self) -> None: pass\n"
+        self.assertEqual(self.run_policy(valid, "check_types.py").returncode, 0)
+        # Narrow the opt-in scope to one file: an untyped sibling is not opted in.
+        (self.root / "ty.toml").write_text('[[overrides]]\ninclude = ["src/example.py"]\n')
+        self.assertEqual(self.run_policy(valid, "check_types.py").returncode, 0)
+        # Opting the sibling in must immediately expose its existing omissions.
+        (self.root / "ty.toml").write_text('[[overrides]]\ninclude = ["src/**"]\n')
+        result = self.run_policy(valid, "check_types.py")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ANN001", result.stdout)
+        self.assertIn("ANN201", result.stdout)
 
 
 if __name__ == "__main__":

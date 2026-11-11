@@ -35,7 +35,7 @@ from nemo_automodel.components.models.minimax_m3_vl import dspark as minimax_m3_
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.dspark import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.registry import ModelOwnedDSparkProvider
-from nemo_automodel.recipes.llm._dspark_warm_start import load_dspark_draft_weights
+from nemo_automodel.recipes.speculative_decoding._dspark_warm_start import load_dspark_draft_weights
 
 VOCAB = 256
 HIDDEN = 64

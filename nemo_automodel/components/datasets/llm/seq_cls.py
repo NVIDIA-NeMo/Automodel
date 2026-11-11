@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, ClassVar
 
 from datasets import load_dataset
 
+from nemo_automodel.components.datasets.llm.sample_limit import resolve_sample_limit
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
@@ -32,18 +34,24 @@ class GLUE_MRPCConfig:
     split: str = "train"
     """Dataset split to use (e.g. ``train``, ``validation``)."""
     num_samples_limit: int | None = None
-    """If set, limit the dataset to this many samples via slicing."""
+    """Deprecated alias for ``limit_dataset_samples``."""
     trust_remote_code: bool = True
     """Forwarded to ``datasets.load_dataset``."""
     max_length: int | None = 256
     """Maximum tokenization length (``None`` derives one from the tokenizer)."""
 
+    limit_dataset_samples: int | None = None
+    """If set, limit the dataset to this many samples via slicing."""
+
     def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "GLUE_MRPC":
         """Build a :class:`GLUE_MRPC` dataset from this :class:`GLUE_MRPCConfig` and a runtime tokenizer."""
+        if tokenizer is None:
+            raise ValueError("GLUE_MRPC requires a tokenizer")
         return GLUE_MRPC(
             tokenizer=tokenizer,
             split=self.split,
             num_samples_limit=self.num_samples_limit,
+            limit_dataset_samples=self.limit_dataset_samples,
             trust_remote_code=self.trust_remote_code,
             max_length=self.max_length,
         )
@@ -57,15 +65,17 @@ class GLUE_MRPC:
 
     def __init__(
         self,
-        tokenizer,
+        tokenizer: PreTrainedTokenizerBase,
         *,
         split: str = "train",
         num_samples_limit: int | None = None,
         trust_remote_code: bool = True,
         max_length: int | None = 256,
+        limit_dataset_samples: int | None = None,
     ) -> None:
-        if isinstance(num_samples_limit, int):
-            split = f"{split}[:{num_samples_limit}]"
+        limit_dataset_samples = resolve_sample_limit(limit_dataset_samples, num_samples_limit)
+        if isinstance(limit_dataset_samples, int):
+            split = f"{split}[:{limit_dataset_samples}]"
         raw = load_dataset("glue", "mrpc", split=split, trust_remote_code=trust_remote_code)
 
         # Resolve max_length
