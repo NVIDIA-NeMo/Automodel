@@ -122,6 +122,7 @@ MODEL_TYPE_OVERVIEW_PATHS = (
     ("Diffusion", "diffusion/index.mdx"),
     ("Embedding", "embedding/index.mdx"),
     ("Reranking", "reranker/index.mdx"),
+    ("WAM", "wam/index.mdx"),
 )
 
 
@@ -135,6 +136,7 @@ MODEL_TYPE_ROUTE_CATEGORIES = {
     "Diffusion": "diffusion",
     "Embedding": "embedding-models",
     "Reranking": "reranking-models",
+    "WAM": "wam",
 }
 
 

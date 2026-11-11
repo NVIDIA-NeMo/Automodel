@@ -759,6 +759,18 @@ navigation:
                 path: ../../model-coverage/omni/qwen/qwen2-5-omni-7b.mdx
               - page: "Qwen3-Omni-30B-A3B-Instruct"
                 path: ../../model-coverage/omni/qwen/qwen3-omni.mdx
+      - section: "World Action Models"
+        slug: wam
+        contents:
+          - page: "Overview"
+            path: ../../model-coverage/wam/index.mdx
+            slug: overview
+          - section: "Runway"
+            slug: runwayml
+            path: ../../model-coverage/wam/runwayml/index.mdx
+            contents:
+              - page: "Praxis-1"
+                path: ../../model-coverage/wam/runwayml/praxis-1.mdx
       - section: "Diffusion Language Models"
         slug: dllm
         contents:
