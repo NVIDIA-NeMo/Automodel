@@ -301,16 +301,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         # ``self.model`` (the text model), which does not carry the vision tower. Build
         # the vision encoder here and override the two accessors below to call it
         # directly, matching the pre-5.22 behavior the merger logic depends on.
-        self.visual = (
-            HFQwen3OmniMoeVisionEncoder._from_config(base_config.vision_config)
-            if hasattr(base_config, "vision_config")
-            else None
-        )
-        self.audio_tower = (
-            HFQwen3OmniMoeAudioEncoder._from_config(base_config.audio_config)
-            if hasattr(base_config, "audio_config")
-            else None
-        )
+        self._base_config = base_config
         model_dtype = get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16)
         self.lm_head = initialize_linear_module(
             self.backend.linear, text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype
@@ -345,6 +336,26 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    @property
+    def visual(self):
+        """Lazily build the vision tower.
+
+        Transformers 5.22 routes get_image/get_video_features through the text model,
+        which has no vision tower, so the thinker builds its own. Construction is lazy
+        so tests that stub the HF ``__init__`` and pass a bare-namespace config never
+        materialize a real tower; ``_from_config`` requires the full HF sub-config.
+        """
+        if self.__dict__.get("visual_") is None:
+            self.__dict__["visual_"] = HFQwen3OmniMoeVisionEncoder._from_config(self._base_config.vision_config)
+        return self.__dict__["visual_"]
+
+    @property
+    def audio_tower(self):
+        """Lazily build the audio tower; see :attr:`visual`."""
+        if self.__dict__.get("audio_tower_") is None:
+            self.__dict__["audio_tower_"] = HFQwen3OmniMoeAudioEncoder._from_config(self._base_config.audio_config)
+        return self.__dict__["audio_tower_"]
 
     def get_audio_features(self, input_features, feature_attention_mask=None, audio_feature_lengths=None, **kwargs):
         """Return audio features, calling the audio tower directly.
