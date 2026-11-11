@@ -21,8 +21,8 @@ from pathlib import Path
 import pytest
 import yaml
 from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import RepositoryNotFoundError
-from transformers import AutoConfig
+from huggingface_hub.errors import RepositoryNotFoundError, StrictDataclassClassValidationError
+from transformers import AutoConfig, PretrainedConfig
 from transformers.utils.hub import resolve_revision
 
 from nemo_automodel import NeMoAutoConfig
@@ -292,8 +292,9 @@ def test_subfolder_and_token_are_preserved(hf_config_hub):
 
 @pytest.mark.parametrize("hub_fixture", ["hf_config_hub", "config_hub_without_revision_api"])
 @pytest.mark.parametrize("code_revision, expected", [(None, "b"), (A, "a")])
+@pytest.mark.parametrize("extra_layer_types", [False, True])
 def test_remote_code_follows_resolved_commit_or_explicit_override(
-    request, hub_fixture, monkeypatch, code_revision, expected
+    request, hub_fixture, monkeypatch, code_revision, expected, extra_layer_types
 ):
     root, cache, _, _ = request.getfixturevalue(hub_fixture)
     monkeypatch.setattr("transformers.dynamic_module_utils.HF_MODULES_CACHE", str(root / "modules"))
@@ -304,6 +305,10 @@ def test_remote_code_follows_resolved_commit_or_explicit_override(
             "class SharedCacheConfig(PretrainedConfig):\n"
             "    model_type = 'cache_test_custom'\n"
             f"    implementation_revision = {revision[0]!r}\n"
+            "    def __init__(self, num_hidden_layers=2, layer_types=None, **kwargs):\n"
+            "        self.num_hidden_layers = num_hidden_layers\n"
+            "        self.layer_types = layer_types\n"
+            "        super().__init__(**kwargs)\n"
         )
         (snapshot / "config.json").write_text(
             json.dumps(
@@ -311,9 +316,160 @@ def test_remote_code_follows_resolved_commit_or_explicit_override(
                     "model_type": "cache_test_custom",
                     "auto_map": {"AutoConfig": "configuration_cache.SharedCacheConfig"},
                     "hidden_size": 64,
+                    "num_hidden_layers": 2,
+                    "layer_types": ["full_attention"] * (3 if extra_layer_types else 2),
                 }
             )
         )
     config = NeMoAutoConfig.from_pretrained(REPO, cache_dir=root, trust_remote_code=True, code_revision=code_revision)
     assert config.hidden_size == 64
     assert config.implementation_revision == expected
+    assert list(config.layer_types) == ["full_attention"] * 2
+
+
+@pytest.fixture(params=["remote", "qwen3"])
+def layer_types_checkpoint(tmp_path, monkeypatch, request):
+    monkeypatch.setattr("transformers.dynamic_module_utils.HF_MODULES_CACHE", str(tmp_path / "modules"))
+    path = tmp_path / "model"
+    path.mkdir()
+    data = {
+        "model_type": "qwen3",
+        "num_hidden_layers": 2,
+        "layer_types": ["full_attention", "sliding_attention", "full_attention"],
+        "num_nextn_predict_layers": 1,
+        "hidden_size": 64,
+    }
+    if request.param == "remote":
+        (path / "configuration_mtp.py").write_text(
+            "from transformers import PretrainedConfig\n"
+            "class MtpConfig(PretrainedConfig):\n"
+            "    model_type = 'mtp_test'\n"
+            "    def __init__(self, num_hidden_layers=2, layer_types=None, **kwargs):\n"
+            "        self.num_hidden_layers = num_hidden_layers\n"
+            "        self.layer_types = layer_types\n"
+            "        super().__init__(**kwargs)\n"
+        )
+        data.update(model_type="mtp_test", auto_map={"AutoConfig": "configuration_mtp.MtpConfig"})
+    (path / "config.json").write_text(json.dumps(data))
+    return path
+
+
+def test_layer_types_fallback_preserves_overrides_and_unused_kwargs(layer_types_checkpoint):
+    with pytest.raises(StrictDataclassClassValidationError, match="layer_types"):
+        AutoConfig.from_pretrained(layer_types_checkpoint, trust_remote_code=True)
+
+    config, unused = NeMoAutoConfig.from_pretrained(
+        layer_types_checkpoint,
+        trust_remote_code=True,
+        hidden_size=128,
+        sentinel=7,
+        attn_implementation="sdpa",
+        return_unused_kwargs=True,
+    )
+    assert config.num_hidden_layers == 2
+    assert list(config.layer_types) == ["full_attention", "sliding_attention"]
+    assert config.num_nextn_predict_layers == 1
+    assert config.hidden_size == 128
+    assert config._attn_implementation == "sdpa"
+    assert unused["sentinel"] == 7
+    assert "hidden_size" not in unused
+    assert config.name_or_path == str(layer_types_checkpoint)
+    assert len(json.loads((layer_types_checkpoint / "config.json").read_text())["layer_types"]) == 3
+    # The fallback must not relax Transformers' validator globally.
+    with pytest.raises(StrictDataclassClassValidationError, match="layer_types"):
+        AutoConfig.from_pretrained(layer_types_checkpoint, trust_remote_code=True)
+
+
+def test_yaml_config_target_truncates_layer_types(layer_types_checkpoint):
+    config = ConfigNode(
+        {
+            "_target_": "nemo_automodel.NeMoAutoConfig.from_pretrained",
+            "pretrained_model_name_or_path": str(layer_types_checkpoint),
+            "trust_remote_code": True,
+            "hidden_size": 128,
+        }
+    ).instantiate()
+    assert config.hidden_size == 128
+    assert list(config.layer_types) == ["full_attention", "sliding_attention"]
+
+
+def test_model_id_path_still_truncates_layer_types(layer_types_checkpoint):
+    from nemo_automodel._transformers.model_init import get_hf_config
+
+    config = get_hf_config(str(layer_types_checkpoint), "sdpa", trust_remote_code=True)
+    assert list(config.layer_types) == ["full_attention", "sliding_attention"]
+    assert config._attn_implementation == "sdpa"
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_short_or_matching_layer_types_are_not_padded(layer_types_checkpoint, count):
+    path = layer_types_checkpoint / "config.json"
+    data = json.loads(path.read_text())
+    data["layer_types"] = data["layer_types"][:count]
+    path.write_text(json.dumps(data))
+    if count == 1:
+        with pytest.raises(StrictDataclassClassValidationError, match="layer_types"):
+            NeMoAutoConfig.from_pretrained(layer_types_checkpoint, trust_remote_code=True)
+    else:
+        config = NeMoAutoConfig.from_pretrained(layer_types_checkpoint, trust_remote_code=True)
+        assert list(config.layer_types) == data["layer_types"]
+
+
+def test_remote_config_requires_explicit_trust(layer_types_checkpoint):
+    if "auto_map" in json.loads((layer_types_checkpoint / "config.json").read_text()):
+        with pytest.raises(ValueError, match="trust_remote_code"):
+            NeMoAutoConfig.from_pretrained(layer_types_checkpoint, trust_remote_code=False)
+    else:
+        config = NeMoAutoConfig.from_pretrained(layer_types_checkpoint, trust_remote_code=False)
+        assert list(config.layer_types) == ["full_attention", "sliding_attention"]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_unrelated_config_errors_propagate(tmp_path, monkeypatch, strict):
+    error = ValueError("unrelated config failure")
+    if strict:
+        error = StrictDataclassClassValidationError(validator="other_validator", cause=error)
+
+    def fail(cls, *args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", classmethod(fail))
+    with pytest.raises(type(error), match="unrelated config failure") as caught:
+        NeMoAutoConfig.from_pretrained(tmp_path)
+    assert caught.value is error
+
+
+def test_plain_value_error_also_retries(layer_types_checkpoint, monkeypatch):
+    def fail(cls, *args, **kwargs):
+        raise ValueError("`num_hidden_layers` (2) must be equal to the number of layer types (3)")
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", classmethod(fail))
+    config = NeMoAutoConfig.from_pretrained(layer_types_checkpoint, trust_remote_code=True)
+    assert list(config.layer_types) == ["full_attention", "sliding_attention"]
+
+
+def test_registered_local_config_keeps_precedence(tmp_path, monkeypatch):
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    class LocalConfig(PretrainedConfig):
+        model_type = "local_layer_types_test"
+
+        def __init__(self, num_hidden_layers=2, layer_types=None, **kwargs):
+            self.num_hidden_layers = num_hidden_layers
+            self.layer_types = layer_types
+            super().__init__(**kwargs)
+
+    monkeypatch.setitem(CONFIG_MAPPING._extra_content, LocalConfig.model_type, LocalConfig)
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": LocalConfig.model_type,
+                "num_hidden_layers": 2,
+                "layer_types": ["full_attention"] * 3,
+                "auto_map": {"AutoConfig": "nonexistent.UntrustedConfig"},
+            }
+        )
+    )
+    config = NeMoAutoConfig.from_pretrained(tmp_path, trust_remote_code=True)
+    assert isinstance(config, LocalConfig)
+    assert list(config.layer_types) == ["full_attention"] * 2
