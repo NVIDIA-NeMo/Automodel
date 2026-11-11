@@ -209,7 +209,8 @@ class PraxisModelParallelizer(ModelParallelizer):
     """Model-owned parallelization of :class:`PraxisPolicy`, the ``parallelizer`` of the model class.
 
     The shared flows walk one ``layers`` stack; these hooks walk the Praxis towers with
-    :func:`shard_policy` instead, with (``_apply_moe``) and without (``_apply``) expert parallelism.
+    :func:`shard_policy` instead, with (``_apply_moe``) and without (``_apply``) expert parallelism,
+    and on one rank (``_apply_unsharded``).
     """
 
     def _apply_moe(self, model: nn.Module, mesh_context: MeshContext) -> nn.Module:
@@ -232,6 +233,22 @@ class PraxisModelParallelizer(ModelParallelizer):
             offload_policy=strategy.offload_policy,
         )
         return model
+
+    def _apply_unsharded(self, model: nn.Module, mesh_context: MeshContext) -> nn.Module:
+        """One data-parallel rank: the per-block FSDP2 wrapping and activation checkpointing over the one-rank mesh."""
+        strategy = mesh_context.strategy_config
+        if not isinstance(strategy, FSDP2Config):
+            raise TypeError(f"PraxisPolicy trains with distributed.strategy fsdp2, got {type(strategy).__name__}")
+        if mesh_context.device_mesh is None:
+            raise ValueError("PraxisPolicy parallelization needs a device mesh")
+        return self._apply(
+            model,
+            mesh_context.device_mesh,
+            mp_policy=strategy.mp_policy,
+            offload_policy=strategy.offload_policy,
+            activation_checkpointing=bool(mesh_context.activation_checkpointing),
+            reshard_after_forward=strategy.reshard_after_forward,
+        )
 
     def _apply(
         self,

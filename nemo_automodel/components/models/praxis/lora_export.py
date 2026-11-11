@@ -31,13 +31,15 @@ import hashlib
 import json
 import re
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
 from safetensors.torch import load_file, save_file
-from torch import Tensor
+from torch import Tensor, nn
 
-from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components.checkpoint.addons import load_automodel_peft_config_dict
 from nemo_automodel.components.models.praxis.hub import resolve_repo
 from nemo_automodel.components.models.praxis.model import PraxisPolicy, praxis_backend
@@ -57,7 +59,20 @@ _EXPERT_LORA = {"lora_gate_and_up": "gate_and_up_projs", "lora_down": "down_proj
 _EXPERT_LORA_A = re.compile(r"^(?P<base>.+)\.(?P<kind>lora_gate_and_up|lora_down)_A$")
 
 
-def merge_lora(state: dict[str, Tensor], scale: float) -> dict[str, Tensor]:
+def adapter_scales(model: nn.Module) -> dict[str, float]:
+    """The scale ``alpha / rank`` of every adapter module of ``model``, by module name.
+
+    Expert adapters may run at a smaller rank than the linear adapters (``moe_rank_scaling``), so the
+    scale is read from each module rather than derived from the PEFT config.
+    """
+    return {
+        name: module.scale
+        for name, module in model.named_modules()
+        if isinstance(module, (LinearLoRA, GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA))
+    }
+
+
+def merge_lora(state: dict[str, Tensor], scales: Mapping[str, float]) -> dict[str, Tensor]:
     """Fold the adapters into the weights they adapt and drop the adapter tensors.
 
     Linear adapters are ``<m>.lora_A.weight`` of shape [rank, in] and ``<m>.lora_B.weight`` of shape
@@ -67,7 +82,7 @@ def merge_lora(state: dict[str, Tensor], scale: float) -> dict[str, Tensor]:
 
     Args:
         state: Module state dict with the adapters.
-        scale: The adapter scale ``alpha / rank``.
+        scales: The scale ``alpha / rank`` of each adapted module, by module name (:func:`adapter_scales`).
 
     Returns:
         A new state dict with ``weight + scale * B @ A`` (``scale * A @ B`` per expert) in the weight's dtype.
@@ -95,13 +110,13 @@ def merge_lora(state: dict[str, Tensor], scale: float) -> dict[str, Tensor]:
         a = state[f"{base}.lora_A.weight"].float()
         b = state[f"{base}.lora_B.weight"].float()
         w = out[f"{base}.weight"]
-        out[f"{base}.weight"] = (w.float() + scale * (b @ a)).to(w.dtype)
+        out[f"{base}.weight"] = (w.float() + scales[base] * (b @ a)).to(w.dtype)
     for base, kind in sorted(experts):
         a = state[f"{base}.{kind}_A"].float()
         b = state[f"{base}.{kind}_B"].float()
         name = f"{base}.{_EXPERT_LORA[kind]}"
         w = out[name]
-        out[name] = (w.float() + scale * torch.bmm(a, b)).to(w.dtype)
+        out[name] = (w.float() + scales[base] * torch.bmm(a, b)).to(w.dtype)
     return out
 
 
@@ -202,7 +217,7 @@ def export_merged(checkpoint: str | Path, adapters: str | Path, out: str | Path)
     apply_lora_to_linear_modules(policy, peft)
     state = policy.state_dict()
     state.update(load_adapters(policy, adapters))
-    save_checkpoint(out, merge_lora(state, peft.alpha / peft.dim), policy.state_dict_adapter, root / "config.json")
+    save_checkpoint(out, merge_lora(state, adapter_scales(policy)), policy.state_dict_adapter, root / "config.json")
 
 
 def main() -> int:

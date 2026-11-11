@@ -205,6 +205,17 @@ class ModelParallelizer:
 
         return model_parallelizer._parallelize_moe(model, mesh_context, parallelizer=self)
 
+    def _apply_unsharded(self, model: nn.Module, mesh_context: "MeshContext") -> nn.Module:
+        """Prepare ``model`` for FSDP2 when the mesh has no sharding dimension (one data-parallel rank).
+
+        The shared flow skips ``fully_shard``, installs activation checkpointing on one decoder
+        ``layers`` stack and wraps the forward in autocast. A model whose blocks live in several
+        towers overrides this hook.
+        """
+        from nemo_automodel.components.distributed import model_parallelizer
+
+        return model_parallelizer._parallelize_unsharded_fsdp2(model, mesh_context, parallelizer=self)
+
     def _fully_shard_module(self, module: nn.Module, **kwargs) -> nn.Module:
         """Apply the FSDP2 primitive used by this model sidecar."""
         return fully_shard(module, **kwargs)

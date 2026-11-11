@@ -169,17 +169,21 @@ def hand_to_flange_pose8(hand_rows: np.ndarray) -> np.ndarray:
     return out.astype(np.float32)
 
 
-def osc_goal(grip_pos: np.ndarray, grip_rot: np.ndarray, action: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """The goal pose that robosuite's OSC_POSE controller sets for one delta ``action``.
+def osc_goal(
+    grip_pos: np.ndarray, grip_rot: np.ndarray, action: np.ndarray, goal_rot: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """The goal pose that robosuite's OSC_POSE controller holds after one delta ``action``.
 
     Mirrors ``OperationalSpaceController.set_goal``: the delta is clipped to [-1, 1] and scaled to
-    ``OSC_POS_MAX`` / ``OSC_ROT_MAX``; the goal orientation is ``R(delta_rot) @ R_current`` (world
-    frame) and the goal position is ``p_current + delta_pos``.
+    ``OSC_POS_MAX`` / ``OSC_ROT_MAX``; the goal position is ``p_current + delta_pos``. A nonzero rotation
+    delta sets the goal orientation to ``R(delta_rot) @ R_current`` (world frame); an all-zero rotation
+    delta leaves the controller's retained goal orientation ``goal_rot`` in place.
     """
     delta = np.clip(np.asarray(action[:6], dtype=np.float64), -1.0, 1.0)
     goal_pos = np.asarray(grip_pos, dtype=np.float64) + delta[:3] * OSC_POS_MAX
-    goal_rot = axis_angle_to_matrix(delta[3:6] * OSC_ROT_MAX) @ np.asarray(grip_rot, dtype=np.float64)
-    return goal_pos, goal_rot
+    if not np.any(delta[3:6]):  # the controller compares each scaled component with exact zero
+        return goal_pos, np.array(goal_rot, dtype=np.float64)
+    return goal_pos, axis_angle_to_matrix(delta[3:6] * OSC_ROT_MAX) @ np.asarray(grip_rot, dtype=np.float64)
 
 
 def osc_action_for_goal(

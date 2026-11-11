@@ -83,3 +83,21 @@ raise SystemExit(sim.main())
         "Simulator closed",
     ):
         assert message in result.stderr.decode()
+
+
+def test_osc_goal_keeps_the_retained_orientation_for_zero_rotation():
+    """robosuite's OSC_POSE controller only replaces its goal orientation when the rotation delta is nonzero."""
+    import numpy as np
+
+    bridge = load_bridge()
+    retained = bridge.rot_z(0.2)
+    observed = bridge.rot_z(0.05)
+    grip_pos = np.array([0.1, 0.2, 0.3])
+    hold = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    goal_pos, goal_rot = bridge.osc_goal(grip_pos, observed, hold, retained)
+    np.testing.assert_allclose(goal_pos, grip_pos)
+    np.testing.assert_allclose(goal_rot, retained)
+    turn = np.array([0.2, 0.0, 0.0, 0.0, 0.0, 0.4, 1.0])
+    goal_pos, goal_rot = bridge.osc_goal(grip_pos, observed, turn, retained)
+    np.testing.assert_allclose(goal_pos, grip_pos + [0.2 * bridge.OSC_POS_MAX, 0.0, 0.0])
+    np.testing.assert_allclose(goal_rot, bridge.rot_z(0.05 + 0.4 * bridge.OSC_ROT_MAX), atol=1e-12)

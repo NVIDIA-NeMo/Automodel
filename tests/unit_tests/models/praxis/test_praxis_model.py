@@ -262,3 +262,16 @@ def test_forward_shapes_cpu() -> None:
     assert out.action_velocity.shape == (1, kk * lat, 40)
     assert len(out.features.taps) == 2
     assert torch.isfinite(out.velocity).all() and torch.isfinite(out.action_velocity).all()
+
+
+def test_place_rotary_tables_moves_the_constructor_frequencies() -> None:
+    """The frequency tables built on the CPU are moved as they are, not recomputed on the target device."""
+    model = PraxisPolicy(PraxisConfig.from_json(TINY_CONFIG), cpu_backend())
+    ropes = (model.action_expert.rope, model.backbone.encoder.core.rope, model.backbone.decoder.core.rope)
+    before = [rope.theta.clone() for rope in ropes]
+    for rope in ropes:
+        rope.make_theta = None  # the move must not call the builder again
+    model.place_rotary_tables(torch.device("cpu"))
+    for rope, table in zip(ropes, before):
+        assert rope.theta.device.type == "cpu"
+        assert torch.equal(rope.theta, table)

@@ -93,13 +93,14 @@ def convert_demo(session: LiberoSession, demo: h5py.Group, min_steps: int) -> tu
     rec_ee = np.asarray(demo["obs"]["ee_pos"], dtype=np.float64)
     session.reset()
     obs = session.set_state(states[0])
+    goal_rot = session.controller_goal_rot()  # carried across steps: zero-rotation actions keep it
     ext, wrist, obs8, cmd8, fk, dev, phase = [], [], [], [], [], [], []
     success_step = None
     t_env = 0
 
     def record(step_obs, action, tag, rec_pos=None):
-        nonlocal success_step
-        goal_pos, goal_rot = osc_goal(step_obs.grip_world[:3, 3], step_obs.grip_world[:3, :3], action)
+        nonlocal success_step, goal_rot
+        goal_pos, goal_rot = osc_goal(step_obs.grip_world[:3, 3], step_obs.grip_world[:3, :3], action, goal_rot)
         goal_world = np.eye(4)
         goal_world[:3, :3], goal_world[:3, 3] = goal_rot, goal_pos
         hand_goal = session.hand_goal_from_grip_goal(goal_world)

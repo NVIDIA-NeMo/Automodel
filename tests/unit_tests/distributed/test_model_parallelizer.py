@@ -154,6 +154,29 @@ def test_sidecar_apply_moe_hook_replaces_unified_moe_executor(monkeypatch):
     call.assert_not_called()
 
 
+def test_sidecar_apply_unsharded_hook_replaces_single_rank_flow(monkeypatch):
+    class _TowerSidecar(ModelParallelizer):
+        def __init__(self) -> None:
+            self.context = None
+
+        def _apply_unsharded(self, model, mesh_context):
+            self.context = mesh_context
+            return model
+
+    parallelizer = _TowerSidecar()
+    model = nn.Linear(2, 2)
+    context = SimpleNamespace(cp_size=1, ep_size=1, device_mesh=object(), strategy_config=FSDP2Config())
+    unsharded = Mock()
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.model_parallelizer._parallelize_unsharded_fsdp2", unsharded
+    )
+    monkeypatch.setattr("nemo_automodel.components.distributed.fsdp2.fsdp2_sharding_enabled", lambda mesh: False)
+
+    assert parallelizer.parallelize(model, context) is model
+    assert parallelizer.context is context
+    unsharded.assert_not_called()
+
+
 def test_moe_executor_uses_generic_sharding_by_default(monkeypatch):
     parallelizer = ModelParallelizer()
     model = nn.Linear(2, 2)

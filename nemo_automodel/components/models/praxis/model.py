@@ -257,9 +257,13 @@ class PraxisPolicy(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         return CheckpointConfigExporter(self.pretrained_path / "config.json")
 
     def place_rotary_tables(self, device: torch.device) -> None:
-        """Materialize the rotary frequency tables on ``device`` (they are plain attributes, not buffers)."""
+        """Move the rotary frequency tables to ``device``.
+
+        The tables are plain attributes, not buffers, so module casts and sharding leave them alone;
+        they are built once on the CPU and only moved, never recomputed on the accelerator.
+        """
         for rope in (self.action_expert.rope, self.backbone.encoder.core.rope, self.backbone.decoder.core.rope):
-            rope.theta = rope.make_theta(device)
+            rope.theta = rope.theta.to(device)
 
     @property
     def device(self) -> torch.device:

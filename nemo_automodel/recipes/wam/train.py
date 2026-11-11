@@ -37,9 +37,10 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from torch import Tensor, nn
+from torch import Tensor
 
-from nemo_automodel.components._peft.lora import LinearLoRA, apply_lora_to_linear_modules
+from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel.components.checkpoint.checkpointing import _init_peft_adapters
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.model_parallelizer import parallelize_model
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -61,15 +62,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def lora_trains_backbone(policy: nn.Module) -> bool:
-    """Whether any LoRA adapter sits in the video backbone, so that its autograd graph must be kept.
+def lora_trains_backbone(policy: PraxisPolicy) -> bool:
+    """Whether any trainable parameter sits in the video backbone, so that its autograd graph must be kept.
+
+    Linear and grouped-expert adapters are the only trainable parameters after
+    :func:`apply_lora_to_linear_modules`; the base weights are frozen.
 
     Args:
         policy: The model after :func:`apply_lora_to_linear_modules`.
     """
-    return any(
-        name.startswith("backbone.") for name, module in policy.named_modules() if isinstance(module, LinearLoRA)
-    )
+    return any(parameter.requires_grad for parameter in policy.backbone.parameters())
 
 
 def draw_seed(seed: int, step: int, micro: int, rank: int, world: int) -> int:
@@ -157,10 +159,9 @@ class TrainWAMFinetuneRecipe(BaseRecipe):
         self.checkpointer.load_base_model(
             policy, device, root_dir=str(policy.pretrained_path.parent), model_name=str(policy.pretrained_path)
         )
-        with torch.no_grad():
-            for module in policy.modules():
-                if isinstance(module, LinearLoRA):
-                    module.init_lora_weights("xavier")
+        if self.peft_config is not None:
+            # Linear and grouped-expert adapters alike, on the materialized storage.
+            _init_peft_adapters(policy, self.peft_config.lora_A_init)
         policy.place_rotary_tables(device)
         if self.peft_config is None:
             policy.requires_grad_(True)

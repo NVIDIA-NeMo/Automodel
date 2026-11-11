@@ -121,6 +121,10 @@ class LiberoSession:
         self._last_obs, _reward, done, _info = self.env.step(np.asarray(action, dtype=np.float64))
         return self.observe(bool(done))
 
+    def controller_goal_rot(self) -> np.ndarray:
+        """The OSC controller's retained goal orientation (world frame, 3x3)."""
+        return np.array(self.env.env.robots[0].controller.goal_ori, dtype=np.float64)
+
     def _pose(self, kind: str, name: str) -> np.ndarray:
         sim = self.sim
         if kind == "body":

@@ -101,7 +101,7 @@ def _parallelize_fsdp2(
     if config.patch_is_packed_sequence:
         _patch_is_packed_sequence_for_training()
     if not fsdp2_sharding_enabled(mesh_context.device_mesh):
-        return _parallelize_unsharded_fsdp2(model, mesh_context, parallelizer=parallelizer)
+        return parallelizer._apply_unsharded(model, mesh_context)
 
     return parallelizer._apply(
         model=model,
