@@ -200,13 +200,15 @@ def resolve_yaml_env_vars(obj: Any) -> Any:
             if var_name in os.environ:
                 return os.environ[var_name]
             if default is not None:
-                return default
+                # A default is part of the config text, so it may itself reference an env var.
+                return _resolve_in_str(default)
             raise KeyError(f"Environment variable '{var_name}' is not set (required by '{token}').")
 
-        # Handle braced patterns first: ${...}
-        braced_pattern = re.compile(r"\$\{([^}]+)\}")
-
-        def _braced_repl(match: re.Match[str]) -> str:
+        # One pass over `${...}` and `$VAR` / `$var.dot.var` (dot-separated segments; do not allow trailing dot),
+        # so the text substituted for one reference is not rescanned for another.
+        def _repl(match: re.Match[str]) -> str:
+            if match.group(1) is None:
+                return _get_env(match.group(2), None, match.group(0))
             expr = match.group(1).strip()
             # Back-compat: ${oc.env:VAR}
             if expr.startswith("oc.env:"):
@@ -221,17 +223,7 @@ def resolve_yaml_env_vars(obj: Any) -> Any:
 
             return _get_env(var_name, default, match.group(0))
 
-        value = braced_pattern.sub(_braced_repl, value)
-
-        # Then handle $VAR patterns (allow dots in name).
-        # `$VAR` and `$var.dot.var` (dot-separated segments; do not allow trailing dot).
-        dollar_pattern = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)")
-
-        def _dollar_repl(match: re.Match[str]) -> str:
-            var_name = match.group(1)
-            return _get_env(var_name, None, match.group(0))
-
-        return dollar_pattern.sub(_dollar_repl, value)
+        return re.sub(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)", _repl, value)
 
     if isinstance(obj, dict):
         return {k: resolve_yaml_env_vars(v) for k, v in obj.items()}
