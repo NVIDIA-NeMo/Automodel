@@ -86,8 +86,8 @@ loss_fn:
   impl: torch_compile
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
 
 packed_sequence:
@@ -100,10 +100,10 @@ dataloader:
   shuffle: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -138,8 +138,8 @@ ci:
     # Restored state passes the exact pre-update gate; later routed-MoE loss drift
     # measured 0.548%, within the shared relaxed resume envelope.
     resume_tolerance_profile: relaxed
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
   perf_testing:
     fake_balanced_gate: true
     schedule: nightly

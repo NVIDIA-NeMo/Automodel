@@ -70,7 +70,7 @@ model:
     num_nextn_predict_layers: 0
     # Tuning shared with the pretraining counterpart. group_compressor_fsdp_units
     # is omitted: it requires unpadded inputs with implicit positions, and these
-    # HellaSwag batches are padded.
+    # SQuAD batches are padded.
     group_fp32_fsdp_units: true
     reuse_sparse_selection_on_recompute: true
     fuse_qnorm_rope: true
@@ -112,8 +112,8 @@ loss_fn:
   chunk_len: 512
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
@@ -130,8 +130,8 @@ dataloader:
   shuffle: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained

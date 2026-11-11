@@ -88,11 +88,11 @@ loss_fn:
   impl: torch_compile
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: Rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
-  num_samples_limit: 25600
-  pad_to_max_length: false
+  limit_dataset_samples: 25600
+  padding: false
   tokenizer:
     _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-K3
@@ -107,11 +107,11 @@ dataloader:
   shuffle: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: Rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 256
-  pad_to_max_length: false
+  limit_dataset_samples: 256
+  padding: false
   tokenizer:
     _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-K3

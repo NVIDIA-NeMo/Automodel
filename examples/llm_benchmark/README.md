@@ -111,12 +111,15 @@ GPU validation; publish the exact source revision and terminal job results.
 
 ## Real-data finetuning
 
-The existing 32 corresponding finetuning recipes retain their real supervised
-corpora, pretrained initialization and learning hyperparameters, including the
+The 32 corresponding finetuning recipes use real supervised data and retain
+pretrained initialization and learning hyperparameters, including the
 optimizer algorithm and weight decay. They now match the benchmark's loss
 implementation/precision, LoRA rank and options, optimizer execution settings,
 garbage-collection interval, parallelism and batch sizes. The former Qwen32B mock
-example now uses real SQuAD. These shorter or packed supervised inputs still define a
+example and the migrated HellaSwag recipes now use real SQuAD. Historical
+`hellaswag` filenames remain stable for CI references. Sample limits use
+`limit_dataset_samples`; the deprecated `num_samples_limit` spelling is retired
+from these configs. These shorter or packed supervised inputs still define a
 different workload from full-length pretraining, so report both token throughput
 and actual sequence lengths instead of assuming their TPS must match. The migrated
 loss upcast, optimizer-state and gradient-reduction precision come from throughput
@@ -135,7 +138,7 @@ to `torch.float32`. All three use FP32 router projections.
 Other recorded differences:
 
 - DeepSeek V4 finetuning omits `group_compressor_fsdp_units`, which requires unpadded
-  inputs with implicit positions; its HellaSwag batches are padded. It keeps the other
+  inputs with implicit positions; its supervised batches can be padded. It keeps the other
   `model.config` tuning of the pretraining config.
 - `qwen/qwen3_moe_30b_hellaswag.yaml` is the PyTorch-backend counterpart of
   `qwen/qwen3_moe_30b_torch.yaml`. Use `qwen/qwen3_moe_30b_te_deepep.yaml` for the TE
@@ -191,7 +194,7 @@ report wall time and tokens per step alongside TPS when diagnosing a remaining g
 
 The compatible migrated finetuning configs pack real supervised examples to the
 sequence length of their corresponding pretraining config (or the retained
-synthetic reference for LoRA). HellaSwag padding is disabled before packing.
+synthetic reference for LoRA). SQuAD padding is disabled before packing.
 TE attention uses THD packing; supported SDPA/HF paths use NEAT packing. Packing
 preserves document boundaries and prompt/answer labels. Full local microbatches
 are retained with `dataloader.drop_last: true`; global and local batch sizes and
@@ -205,32 +208,20 @@ The following recipes remain unpacked pending support or data-size validation:
   packed document mask.
 - DeepSeek V4 with cudnn/torch attention: the selected packing paths require
   capability and document-mask validation before enabling them.
-- GLM5: all 39,905 HellaSwag examples yield only 784 packs at 4,096 tokens,
-  below the 1,024 packs required by one canonical distributed microbatch.
-- Kimi K3: the capped 25,600-example HellaSwag dataset yields only 1,649
-  packs at 1,024 tokens or 824 at 2,048 tokens, below the 4,096 packs required
-  by one canonical distributed microbatch. Increasing epoch count cannot fix
-  this empty loader.
+- GLM5 and Kimi K3: packing remains disabled pending validation of SQuAD at their
+  large distributed batch sizes. The previous HellaSwag sample counts no longer
+  describe these recipes.
 
 These exceptions must be labeled in performance reports. Do not interpret them
 as measured packed-finetuning results.
 
-Packing at canonical global batch sizes leaves few optimizer steps per HellaSwag
-epoch. At a global batch of 512, one epoch of roughly 800 packs of 4,096 tokens is
-one full and one partial optimizer step, compared with about 78 steps for the same
-examples unpacked. Treat these recipes as throughput workloads at the canonical
-batch geometry; for convergence work, choose epochs and batch sizes for the dataset.
+SQuAD changes the number of packs and optimizer steps per epoch. Previous
+HellaSwag pack counts, partial-step percentages and throughput measurements are
+historical evidence, not measurements of the current configs. Revalidate the
+configured global batch on the actual tokenizer and dataset before comparing TPS.
 
-Three packed recipes cannot fill one global batch per epoch, so every optimizer step
-is a partial epoch tail:
-
-| Finetuning config | Packs per epoch | Microbatches per rank (filled / needed) | Global batch filled |
-|---|---:|---:|---:|
-| [glm/glm_4.7_te_deepep.yaml](../llm_finetune/glm/glm_4.7_te_deepep.yaml) | 783 | 3 / 8 | 37.5% |
-| [stepfun/step_3.5_flash_hellaswag_pp.yaml](../llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml) | 795 | 6 / 16 | 37.5% |
-| [gpt_oss/gpt_oss_120b_te_mxfp8_gb200.yaml](../llm_finetune/gpt_oss/gpt_oss_120b_te_mxfp8_gb200.yaml) | 773 | 3 / 5 | 60% |
-
-Report their results with tokens per step; they never reach the canonical global
-batch. Console training metrics now also include
-`num_tokens_per_step` and the trainer's `mfu` value so reports can distinguish
-padding/partial-batch effects and retain MFU without checkpoint artifacts.
+Small validation sets may leave some data-parallel ranks empty. The validation
+prerequisite keeps forward collectives aligned and counts each real example once;
+placeholder forwards contribute neither loss nor token counts. A globally empty
+validation set has no defined loss and reports NaN. Keep tokens per step in
+performance reports so partial accumulation windows remain visible.

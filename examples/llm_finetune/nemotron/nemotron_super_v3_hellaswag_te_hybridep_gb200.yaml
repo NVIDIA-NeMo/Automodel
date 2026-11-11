@@ -63,11 +63,11 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
 
-  pad_to_max_length: false
+  padding: false
 packed_sequence:
   packed_sequence_size: 8192
 
@@ -79,12 +79,12 @@ dataloader:
 
   drop_last: true
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
-  pad_to_max_length: false
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
@@ -130,8 +130,8 @@ ci:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  # pragma: allowlist secret -- Public Hugging Face model ID.
     hf_device_map_auto: true
     step_scheduler.global_batch_size: 64
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
   perf_testing:
     fake_balanced_gate: true
     schedule: nightly

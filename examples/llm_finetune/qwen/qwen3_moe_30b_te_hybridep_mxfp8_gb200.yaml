@@ -14,7 +14,7 @@
 #
 # Qwen3-30B-A3B real-data GB200 training with HybridEP and TE MXFP8 experts.
 # Runtime tuning is migrated from llm_benchmark/qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml.
-# Existing HellaSwag data, packing, pretrained loading, and training hyperparameters are retained.
+# Existing SQuAD data, packing, pretrained loading, and training hyperparameters are retained.
 # Unfused RoPE is retained because fused RoPE has documented NaN gradients on THD inputs.
 # MXFP8 requires Blackwell hardware; run on two GB200 nodes with four GPUs per node.
 #   automodel examples/llm_finetune/qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml --nnodes 2 --nproc-per-node 4
@@ -84,10 +84,10 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
-  pad_to_max_length: false
+  padding: false
 
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
@@ -101,10 +101,10 @@ dataloader:
 
   drop_last: true
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  pad_to_max_length: false
+  padding: false
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

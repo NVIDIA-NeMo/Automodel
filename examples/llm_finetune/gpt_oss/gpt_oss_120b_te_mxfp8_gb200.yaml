@@ -74,13 +74,13 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
 
-  pad_to_max_length: false
+  padding: false
 packed_sequence:
-  # HellaSwag yields 773 packs of 4,096 tokens: 3 of the 5 microbatches per rank that
+  # SQuAD yields 773 packs of 4,096 tokens: 3 of the 5 microbatches per rank that
   # global_batch_size 1280 needs. Each epoch is one partial optimizer step (60% of
   # the global batch); see examples/llm_benchmark/README.md.
   packed_sequence_size: 4096
@@ -93,12 +93,12 @@ dataloader:
 
   drop_last: true
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
-  pad_to_max_length: false
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
