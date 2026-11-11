@@ -85,7 +85,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -106,4 +106,4 @@ ci:
   checkpoint_robustness:
     tokenizer_name: baidu/ERNIE-4.5-21B-A3B-PT
     hf_device_map_auto: true
-    dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
