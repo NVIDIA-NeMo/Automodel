@@ -1,6 +1,6 @@
 ---
 title: "Breaking Changes"
-description: ""
+description: "Review breaking changes by release, including required opt-ins, changed defaults, and CLI and configuration updates."
 position: 6
 ---
 ## 0.8.0
@@ -11,7 +11,7 @@ A `_target_` or `*_fn` value in the `file.py:symbol` form runs the named file. N
 only when it is inside the installed `nemo_automodel` package or when you opt in. Previously, any existing file
 loaded, including a file shipped next to a downloaded configuration.
 
-If your configuration names your own file, for example a custom dataset builder, launch with the opt-in:
+If your configuration names your own file, for example, a custom dataset builder, launch with the opt-in:
 
 ```bash
 NEMO_ENABLE_USER_MODULES=1 automodel my_config.yaml
@@ -46,7 +46,7 @@ policies and the `wrap_outer_model` constraint.
 
 ### FSDP2 Default `reduce_dtype` Is Now `float32`
 
-The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward/backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in FP32 to reduce communication-rounding error at larger data-parallel world sizes.
+The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward and backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in FP32 to reduce communication-rounding error at larger data-parallel world sizes.
 
 To restore the previous behavior, override the policy explicitly:
 
@@ -68,26 +68,26 @@ See the [mixed-precision training guide](/development/mixed-precision-training) 
 
 **Before:**
 
-```
+```bash
 automodel <command> <domain> -c <config.yaml>
 ```
 
 **After:**
 
-```
+```bash
 automodel <config.yaml> [--nproc-per-node N] [--overrides ...]
 ```
 
 A short alias `am` is also available:
 
-```
+```bash
 am <config.yaml> [--nproc-per-node N] [--overrides ...]
 ```
 
 The positional `<command>` and `<domain>` arguments have been removed. The recipe
 class is now specified inside the YAML config through the `recipe._target_` key.
 
-### YAML Config: New Required `recipe` Section
+### YAML Configs Require a `recipe` Section
 
 All YAML configs now require a top-level `recipe:` key:
 
@@ -114,14 +114,14 @@ Configs without this key will produce an error with guidance on which target to 
 Multi-node launch settings (Kubernetes, NeMo Run) are now configured
 entirely within the YAML config file rather than through CLI arguments.
 
-| Launcher | YAML section |
+| Launcher | YAML Section |
 |---|---|
 | Kubernetes (through SkyPilot) | `skypilot:` with `cloud: kubernetes` |
 | NeMo Run | `nemo_run:` |
 
 If neither section is present, the job runs locally (interactive mode).
 
-### Slurm: Script-Based Submission
+### Script-Based Slurm Submission
 
 The `slurm:` YAML section and all related fields have been removed. Slurm
 jobs are now submitted with `sbatch` directly, using a self-contained `sbatch`
@@ -135,7 +135,7 @@ sbatch my_cluster.sub
 
 The script runs `torchrun -m nemo_automodel.cli.app` on each node, which
 detects the distributed environment and executes the recipe in-process.
-All cluster-specific configuration lives in the sbatch script where you can
+All cluster-specific configuration lives in the `sbatch` script where you can
 edit it directly.
 
 ### CLI Install Extra
