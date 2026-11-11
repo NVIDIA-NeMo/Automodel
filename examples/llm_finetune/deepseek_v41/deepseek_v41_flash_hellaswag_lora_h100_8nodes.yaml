@@ -124,7 +124,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
-  num_samples_limit: 16384
+  limit_dataset_samples: 16384
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
@@ -147,7 +147,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained

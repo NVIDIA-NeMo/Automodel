@@ -90,7 +90,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -128,8 +128,8 @@ ci:
     # Vanilla Transformers intentionally omits the training-only MTP modules.
     # Exact-match every adapter tensor it can instantiate and allow only MTP keys.
     hf_adapter_ignored_key_prefix: "base_model.model.mtp."
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
 
 # wandb:
 #   project: <your_wandb_project>

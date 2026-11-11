@@ -105,7 +105,7 @@ validation_dataset:
     trust_remote_code: true
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
