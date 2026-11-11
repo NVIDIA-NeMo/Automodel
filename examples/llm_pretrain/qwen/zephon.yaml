@@ -50,7 +50,7 @@ dataset:
       path: hf://BEE-spoke-data/the-stack-smol-xl-readable/original/train
       weight: 0.2
     - name: arxiv
-      path: hf://secemp9/arxiv-complete/paper_text/train
+      path: hf://aklein4/proof-pile-2-fixed/arxiv/train
       weight: 0.1
     packing:
       seq_len: 1024

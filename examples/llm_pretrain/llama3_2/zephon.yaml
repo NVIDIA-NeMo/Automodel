@@ -37,10 +37,6 @@ dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
   tokenize_special_tokens: eos
   zephon:
-    source:
-      token_estimation:
-        # Bound calibration I/O while retaining the default document sample count.
-        calibration_shards_max: 6
     # Weights target token proportions; estimation is automatic with multiple text sources.
     sources:
     - name: web
@@ -50,7 +46,7 @@ dataset:
       path: hf://BEE-spoke-data/the-stack-smol-xl-readable/original/train
       weight: 0.2
     - name: arxiv
-      path: hf://secemp9/arxiv-complete/paper_text/train
+      path: hf://aklein4/proof-pile-2-fixed/arxiv/train
       weight: 0.1
     packing:
       seq_len: 1024

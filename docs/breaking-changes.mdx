@@ -1,8 +1,32 @@
 ---
 title: "Breaking Changes"
-description: ""
+description: "Breaking changes in NeMo AutoModel, including speculative-decoding recipe paths, FSDP2 defaults, and the 0.4.0 CLI, YAML, and install changes."
 position: 6
 ---
+## 0.8.0
+
+### Speculative-Decoding Recipes Moved to `recipes/speculative_decoding/`
+
+The draft-model training recipes (EAGLE-1, EAGLE-2, EAGLE-3, DFlash, DFlash 2, Domino, JetSpec, DSpark, and ViSpec) and the DSpark
+precompute and target-server entry points now live in `nemo_automodel/recipes/speculative_decoding/` instead of
+`nemo_automodel/recipes/llm/`. Recipes are grouped by type rather than by model family. Update module paths in launch
+commands and imports, for example:
+
+**Before:**
+
+```bash
+torchrun --nproc-per-node 8 -m nemo_automodel.recipes.llm.train_eagle3 -c examples/speculative/eagle3/qwen3_eagle3_perfectblend.yaml
+```
+
+**After:**
+
+```bash
+torchrun --nproc-per-node 8 -m nemo_automodel.recipes.speculative_decoding.train_eagle3 -c examples/speculative/eagle3/qwen3_eagle3_perfectblend.yaml
+```
+
+YAML configs launched through the `automodel` CLI are unaffected unless they name a recipe class by its fully qualified
+module path.
+
 ## 0.5.0
 
 ### Frozen Multimodal FSDP2 Modules Default to Root Sharding
@@ -27,7 +51,7 @@ policies and the `wrap_outer_model` constraint.
 
 ### FSDP2 Default `reduce_dtype` Is Now `float32`
 
-The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward/backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in FP32 to reduce communication-rounding error at larger data-parallel world sizes.
+The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward and backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in FP32 to reduce communication-rounding error at larger data-parallel world sizes.
 
 To restore the previous behavior, override the policy explicitly:
 
@@ -68,7 +92,7 @@ am <config.yaml> [--nproc-per-node N] [--overrides ...]
 The positional `<command>` and `<domain>` arguments have been removed. The recipe
 class is now specified inside the YAML config through the `recipe._target_` key.
 
-### YAML Config: New Required `recipe` Section
+### New Required Recipe Section in the YAML Config
 
 All YAML configs now require a top-level `recipe:` key:
 
@@ -102,7 +126,7 @@ entirely within the YAML config file rather than through CLI arguments.
 
 If neither section is present, the job runs locally (interactive mode).
 
-### Slurm: Script-Based Submission
+### Slurm Script-Based Submission
 
 The `slurm:` YAML section and all related fields have been removed. Slurm
 jobs are now submitted with `sbatch` directly, using a self-contained `sbatch`

@@ -96,7 +96,7 @@ symlinked into `.claude/skills/`.
 ## Where things live
 
 `automodel <config.yaml>` runs `cli/app.py`, which dispatches to the recipe named
-by the config's `recipe` key. Recipes under `recipes/{llm,vlm,diffusion,retrieval}/`
+by the config's `recipe` key. Recipes under `recipes/{llm,vlm,diffusion,retrieval,speculative_decoding}/`
 assemble model, optimizer, data, and trainer from YAML (`_target_` keys name the
 class or function to instantiate). `components/` holds the building blocks
 (models, datasets, distributed, checkpoint, quantization, `_peft`, launcher).
