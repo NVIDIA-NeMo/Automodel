@@ -128,7 +128,10 @@ class TestBlock:
         batch, seq_len = 2, 4
         x = torch.randn(batch, seq_len, glm_config.hidden_size, device=device)
         freqs_cis = torch.randn(
-            batch, seq_len, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"]), device=device
+            batch,
+            seq_len,
+            int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"]),
+            device=device,
         )
 
         with (
@@ -146,7 +149,9 @@ class TestBlock:
         block = block.to(device)
 
         x = torch.randn(1, 3, glm_config.hidden_size, device=device)
-        freqs_cis = torch.randn(1, 3, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"]), device=device)
+        freqs_cis = torch.randn(
+            1, 3, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"]), device=device
+        )
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
 
         with (
@@ -167,7 +172,9 @@ class TestBlock:
         block = block.to(device)
 
         x = torch.randn(1, 3, glm_config.hidden_size, device=device)
-        freqs_cis = torch.randn(1, 3, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"]), device=device)
+        freqs_cis = torch.randn(
+            1, 3, int(glm_config.head_dim * glm_config.rope_parameters["partial_rotary_factor"]), device=device
+        )
         attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.bool, device=device)
         padding_mask = torch.tensor([[0, 0, 1]], dtype=torch.bool, device=device)
 

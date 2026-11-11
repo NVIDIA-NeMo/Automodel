@@ -346,9 +346,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def get_audio_features(
-        self, input_features, feature_attention_mask=None, audio_feature_lengths=None, **kwargs
-    ):
+    def get_audio_features(self, input_features, feature_attention_mask=None, audio_feature_lengths=None, **kwargs):
         """Return audio features, calling the audio tower directly.
 
         transformers 5.22's inherited implementation delegates to ``self.model`` (the
