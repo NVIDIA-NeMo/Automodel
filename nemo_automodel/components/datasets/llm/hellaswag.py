@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, ClassVar
 
 from datasets import load_dataset
 
+from nemo_automodel.components.datasets.llm.sample_limit import resolve_sample_limit
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
@@ -36,17 +38,23 @@ class HellaSwagConfig:
     split: str = "train"
     """Dataset split to use (e.g. ``train``, ``validation``)."""
     num_samples_limit: int | None = None
-    """If set, limit the dataset to this many samples via slicing."""
+    """Deprecated alias for ``limit_dataset_samples``."""
     pad_to_max_length: bool = True
     """Whether to pad sequences to the dataset max length."""
 
+    limit_dataset_samples: int | None = None
+    """If set, limit the dataset to this many samples via slicing."""
+
     def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "HellaSwag":
         """Build a :class:`HellaSwag` dataset from this :class:`HellaSwagConfig` and a runtime tokenizer."""
+        if tokenizer is None:
+            raise ValueError("HellaSwag requires a tokenizer")
         return HellaSwag(
             path_or_dataset=self.path_or_dataset,
             tokenizer=tokenizer,
             split=self.split,
             num_samples_limit=self.num_samples_limit,
+            limit_dataset_samples=self.limit_dataset_samples,
             pad_to_max_length=self.pad_to_max_length,
         )
 
@@ -64,28 +72,32 @@ class HellaSwag:
 
     def __init__(
         self,
-        path_or_dataset,
-        tokenizer,
-        split="train",
-        num_samples_limit=None,
-        pad_to_max_length=True,
-    ):
+        path_or_dataset: str,
+        tokenizer: PreTrainedTokenizerBase,
+        split: str = "train",
+        num_samples_limit: int | None = None,
+        pad_to_max_length: bool = True,
+        *,
+        limit_dataset_samples: int | None = None,
+    ) -> None:
         """Initialize the HellaSwag dataset wrapper.
 
         Args:
             path_or_dataset (str or Dataset): Path to the dataset or a HuggingFace Dataset object.
             tokenizer (PreTrainedTokenizer): The tokenizer used to process text.
             split (str, optional): Dataset split to use (e.g., 'train', 'validation'). Defaults to 'train'.
-            num_samples_limit (int, optional): Maximum number of samples to load. Defaults to None.
+            num_samples_limit: Deprecated alias for ``limit_dataset_samples``.
+            limit_dataset_samples: Maximum number of samples to load. Defaults to None.
             pad_to_max_length (bool, optional): Whether to pad sequences to max length in the dataset.
                 If False, sequences will have variable lengths and padding will be handled by the collate function.
                 Defaults to True.
 
         Notes:
-            If num_samples_limit is an integer, it limits the dataset size using slicing.
+            If limit_dataset_samples is an integer, it limits the dataset size using slicing.
         """
-        if isinstance(num_samples_limit, int):
-            split = f"{split}[:{num_samples_limit}]"
+        limit_dataset_samples = resolve_sample_limit(limit_dataset_samples, num_samples_limit)
+        if isinstance(limit_dataset_samples, int):
+            split = f"{split}[:{limit_dataset_samples}]"
         raw_datasets = load_dataset(path_or_dataset, split=split)
         processor = SFTSingleTurnPreprocessor(tokenizer)
         processor.pad_to_max_length = pad_to_max_length
