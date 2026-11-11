@@ -25,14 +25,16 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from praxis.robot_io import contiguous_chunk_geometry, pose8_to_10d
-from praxis.train.data import TrainingWindow
 from torch.utils.data import IterableDataset, get_worker_info
 
 from nemo_automodel.components.models.praxis.config import JsonValue
+
+if TYPE_CHECKING:
+    from praxis.train.data import TrainingWindow
 
 
 def _mapping(config: Mapping[str, JsonValue], name: str) -> Mapping[str, JsonValue]:
@@ -69,12 +71,17 @@ class EpisodeWindowDataset(IterableDataset):
         self.files = sorted(Path(root).glob("*.npz"))[rank::world_size]
         if not self.files:
             raise ValueError(f"no episodes for rank {rank} under {root}")
+        from praxis.robot_io import contiguous_chunk_geometry
+
         self.geometry = contiguous_chunk_geometry(int(chunking["action_chunk"]), int(chunking["n_chunks"]))
         self.window_frames = sum(self.geometry[-1])
         self.seed, self.rank = seed, rank
         self.canvas_hw = (int(video["height"]), int(video["width"]))
 
     def window(self, file: Path, start: int) -> TrainingWindow:
+        from praxis.robot_io import pose8_to_10d
+        from praxis.train.data import TrainingWindow
+
         """The window of ``file`` starting at frame ``start``."""
         ep = np.load(file)
         canvas, obs8, cmd8 = ep["canvas"], ep["obs8"], ep["cmd8"]
