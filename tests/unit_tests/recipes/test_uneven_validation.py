@@ -34,6 +34,14 @@ from nemo_automodel.components.training.validation import synchronized_validatio
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 
+@pytest.fixture(autouse=True)
+def _cpu_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep spawned Gloo workers on CPU, including when pytest runs on GPU hosts."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    monkeypatch.setenv("MKL_NUM_THREADS", "1")
+
+
 class CollectiveModel(nn.Module):
     """A tiny DDP model whose buffer broadcast requires every rank to forward."""
 
