@@ -162,8 +162,7 @@ def test_launcher_command_executes_recipe(
     if launcher == "external":
         monkeypatch.setenv("LOCAL_RANK", "0")
         monkeypatch.setenv("TORCHELASTIC_RUN_ID", "external-torchrun")
-    expected_result = None if recipe_kind == "benchmark" and launcher == "external" else 0
-    assert app.main() == expected_result
+    assert app.main() == 0
     assert events.exists(), "The selected worker exited without constructing the recipe"
     assert events.read_text().splitlines() == ["init", "setup", event]
     assert json.loads(observed.read_text()) == {
