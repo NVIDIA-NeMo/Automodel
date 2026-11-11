@@ -1595,11 +1595,16 @@ def neat_packed_vlm_collater(
     1. Pads all text tensors to a common length.
     2. Converts the indexed ``attention_mask`` to the representation requested
        by ``packing``: a dense block-causal mask, compact document IDs, or
-       document IDs plus native metadata. ``flash_varlen`` emits HF varlen
-       kwargs without an attention mask.
+       document IDs plus native metadata. ``flash_varlen`` keeps CPU document
+       IDs; configured model-entry hooks build the text decoder's Flash offsets.
     3. Concatenates media tensors across the batch dimension.
 
     **No autoregressive shift** — it was already applied during packing.
+
+    Flash callers must use a model configured by ``configure_packing`` and keep
+    ``_packed_seq_ids`` on CPU until entry. Direct callers without those hooks
+    can convert the IDs with the model contract's ``prepare_attention_inputs``
+    and transfer the resulting public Flash kwargs explicitly.
 
     Args:
         batch: Packed sample mappings. ``input_ids``, ``labels``, indexed
@@ -1618,7 +1623,7 @@ def neat_packed_vlm_collater(
         attn_implementation: Deprecated attention-backend name retained in its
             original positional slot for Python-call compatibility.
         packing: Structural model contract selecting the packed mask representation.
-            Native mask/Flash collation requires a model-derived contract supplying
+            Native mask collation requires a model-derived contract supplying
             the attention conversion; recipes provide it automatically.
         materialize_4d_mask: Whether SDPA/eager packing should expand the
             indexed ``[B, S]`` document map into a dense
@@ -1630,10 +1635,9 @@ def neat_packed_vlm_collater(
         Mapping with text IDs, labels, and token types of shape [batch, sequence];
         positions of shape [batch, sequence] or [3, batch, sequence]; and an
         attention mask of shape [batch, sequence] or [batch, 1, sequence, sequence].
-        For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
-        and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
-        padding runs. ``max_length_q`` and ``max_length_k`` are Python ints.
-        Optional ``_packed_seq_ids`` has shape [batch, sequence]. Media values,
+        For ``flash_varlen``, neither a mask nor flattened offsets are emitted.
+        ``_packed_seq_ids`` [batch, sequence] is always retained; model entry
+        constructs text offsets after any microbatch split. Media values,
         grids, image positions, and timestamps concatenate their leading axis
         while preserving their trailing axes; variable-resolution media remain
         a flattened list of per-image tensors. Pixel values are cast to bfloat16.
@@ -1718,7 +1722,8 @@ def neat_packed_vlm_collater(
     if packed_mask_type == "block_causal" and not materialize_4d_mask:
         # Native CP consumes compact IDs and constructs its local attention policy.
         result["attention_mask"] = attention_mask
-    else:
+    # Flat Flash offsets cannot be split along the batch axis; model entry builds them.
+    elif packed_mask_type != "flash_varlen":
         prepare_attention = packing.prepare_attention_inputs
         if prepare_attention is None:
             raise ValueError("Native packed collation requires a model-derived packing contract")
@@ -1730,9 +1735,7 @@ def neat_packed_vlm_collater(
     # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
     # ``attention_mask`` is already converted to 4D, so keep a copy.
-    has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
-    if has_multiple_docs or not materialize_4d_mask or packing.return_packed_sequence_metadata:
-        result["_packed_seq_ids"] = attention_mask
+    result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
     for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):

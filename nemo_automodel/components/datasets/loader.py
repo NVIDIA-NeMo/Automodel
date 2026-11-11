@@ -345,7 +345,7 @@ class NeatPackingConfig(PackingConfig):
         attn_implementation: str | None = None,
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
     ) -> tuple[object, CollateFn]:
-        """Pack with NEAT and configure the collator for the selected attention implementation."""
+        """Pack with NEAT and select the model input format."""
         del supports_seq_lens, cp_size
         packing_contract = resolve_packing_contract(packing_contract, attn_implementation)
         from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
@@ -815,8 +815,8 @@ class DataloaderConfig:
             attn_implementation: Deprecated attention-backend name retained for
                 Python-call compatibility during the packing-contract migration.
             packing_contract: Structural model contract used by NEAT packing.
-                Native mask/Flash collation requires a model-derived contract supplying
-                the attention conversion; recipes provide it automatically.
+                Native mask collation requires a model-derived attention conversion;
+                recipes provide it automatically. Flash offsets are built at model entry.
             collate_wrapper: Optional recipe-owned wrapper around the resolved collator.
             ignore_index: Stream-backend label exclusion value. Native collators retain
                 their own configured supervision policy and do not consume this value.

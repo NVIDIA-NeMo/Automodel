@@ -529,7 +529,11 @@ def neat_packed_collater(
     ``document_ids`` keeps the indexed 2D mask ``[B, S]`` and
     ``block_causal`` converts the mask to ``[B, 1, S, S]``. Models may
     independently request flat-token metadata through the same contract.
-    ``flash_varlen`` emits HF varlen kwargs without an attention mask.
+    ``flash_varlen`` keeps CPU ``_packed_seq_ids`` for the hooks installed by
+    ``configure_packing`` to convert to HF varlen kwargs at model entry. This
+    applies with or without pipeline parallelism. Direct callers using a model
+    without those hooks must explicitly convert the IDs with the model contract's
+    ``prepare_attention_inputs`` and transfer the resulting public Flash kwargs.
 
     Args:
         batch: Sample mappings from ``neat_pack_dataset``. Each holds
@@ -538,17 +542,16 @@ def neat_packed_collater(
         attn_implementation: Deprecated attention-backend name retained for
             Python-call compatibility during the packing-contract migration.
         packing: Structural model contract selecting the packed mask representation.
-            Native mask/Flash collation requires a model-derived contract supplying
+            Native mask collation requires a model-derived contract supplying
             the attention conversion; recipes provide it automatically.
 
     Returns:
         Mapping with ``input_ids``, ``labels``, and ``position_ids`` of shape
         [batch, sequence]. ``attention_mask`` has shape [batch, sequence] for
         document IDs or [batch, 1, sequence, sequence] for block-causal masking.
-        For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
-        and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
-        padding runs. ``max_length_q`` and ``max_length_k`` are Python ints.
-        Optional ``_packed_seq_ids`` retains the [batch, sequence] document map.
+        For ``flash_varlen``, neither a mask nor flattened offsets are emitted.
+        ``_packed_seq_ids`` [batch, sequence] is always retained, so document
+        boundaries split with tokens before model-entry offset construction.
         A contract requiring native packed-sequence metadata additionally adds
         int64 ``packed_token_indices`` of shape [batch, sequence], containing
         row-local token positions and -1 padding; int32 ``cu_seqlens`` of shape
@@ -571,14 +574,16 @@ def neat_packed_collater(
     if packed_mask_type not in ("document_ids", "flash_varlen", "block_causal"):
         raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
     result = {"input_ids": input_ids, "labels": labels, "position_ids": position_ids}
-    prepare_attention = packing.prepare_attention_inputs
-    if prepare_attention is None:
-        raise ValueError("Native packed collation requires a model-derived packing contract")
-    result.update(prepare_attention(attention_mask))
+    # Flat Flash offsets cannot be split along the batch axis; model entry builds them.
+    if packed_mask_type != "flash_varlen":
+        prepare_attention = packing.prepare_attention_inputs
+        if prepare_attention is None:
+            raise ValueError("Native packed collation requires a model-derived packing contract")
+        result.update(prepare_attention(attention_mask))
     if packing.return_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
-    if attention_mask.max() > 1 or packing.return_packed_sequence_metadata:
-        result["_packed_seq_ids"] = attention_mask
+    # Original boundaries are data, including when a pack contains one document.
+    result["_packed_seq_ids"] = attention_mask
     return result
 
 

@@ -28,7 +28,7 @@ import importlib.util
 import pytest
 import torch
 
-from nemo_automodel.components.models.common.packing import get_packing_capabilities
+from nemo_automodel.components.models.common.packing import configure_packing, get_packing_capabilities
 
 transformers = pytest.importorskip("transformers")
 
@@ -180,6 +180,7 @@ def test_flash_varlen_has_no_cross_document_leakage_on_gpu(pad):
     torch.manual_seed(0)
     model = LlamaForCausalLM(config).to("cuda", torch.bfloat16).eval()
     model.config._attn_implementation = "flash_attention_2"
+    configure_packing("flash_attention_2", model=model)
 
     doc_a = [5, 9, 13, 21]
     doc_b = [7, 3, 11]
@@ -198,10 +199,8 @@ def test_flash_varlen_has_no_cross_document_leakage_on_gpu(pad):
         packed_logits = model(
             input_ids=to_cuda(flash_batch["input_ids"]),
             position_ids=to_cuda(flash_batch["position_ids"]),
-            cu_seq_lens_q=to_cuda(flash_batch["cu_seq_lens_q"]),
-            cu_seq_lens_k=to_cuda(flash_batch["cu_seq_lens_k"]),
-            max_length_q=flash_batch["max_length_q"],
-            max_length_k=flash_batch["max_length_k"],
+            # The entry hook scans host IDs before transferring the offsets.
+            _packed_seq_ids=flash_batch["_packed_seq_ids"],
         ).logits[0]
 
         # Reference: each document decoded alone as a plain causal flash forward.
@@ -231,6 +230,7 @@ def test_flash_varlen_batch_gt_1_uneven_padding_no_leakage_on_gpu():
     torch.manual_seed(0)
     model = LlamaForCausalLM(config).to("cuda", torch.bfloat16).eval()
     model.config._attn_implementation = "flash_attention_2"
+    configure_packing("flash_attention_2", model=model)
 
     doc_a = [5, 9, 13]  # row 0, doc 1
     doc_b = [7, 3]  # row 0, doc 2 -> row 0 keeps 1 padding token
@@ -256,10 +256,8 @@ def test_flash_varlen_batch_gt_1_uneven_padding_no_leakage_on_gpu():
         packed_logits = model(
             input_ids=to_cuda(flash_batch["input_ids"]),
             position_ids=to_cuda(flash_batch["position_ids"]),
-            cu_seq_lens_q=to_cuda(flash_batch["cu_seq_lens_q"]),
-            cu_seq_lens_k=to_cuda(flash_batch["cu_seq_lens_k"]),
-            max_length_q=flash_batch["max_length_q"],
-            max_length_k=flash_batch["max_length_k"],
+            # The entry hook scans host IDs before transferring the offsets.
+            _packed_seq_ids=flash_batch["_packed_seq_ids"],
         ).logits
         ref_a = model(input_ids=torch.tensor([doc_a], device="cuda")).logits[0]
         ref_b = model(input_ids=torch.tensor([doc_b], device="cuda")).logits[0]

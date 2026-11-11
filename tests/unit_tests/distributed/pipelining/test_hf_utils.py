@@ -21,6 +21,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import (
+    _build_or_reuse_pp_causal_mask,
     create_pipeline_forward_causal_lm,
     create_pipeline_forward_inner,
     init_hf_model_buffers,
@@ -28,6 +29,27 @@ from nemo_automodel.components.distributed.pipelining.hf_utils import (
     patch_hf_model_for_pp,
     validate_hf_model_for_pipeline_support,
 )
+
+
+def test_pipeline_mask_cache_does_not_reuse_position_dependent_boundaries():
+    from transformers import LlamaConfig
+
+    model = nn.Module()
+    model.config = LlamaConfig(attn_implementation="sdpa")
+    inputs = torch.randn(1, 4, 8)
+    cache_position = torch.arange(4)
+    packed = _build_or_reuse_pp_causal_mask(model, inputs, None, cache_position, torch.tensor([[0, 1, 0, 1]]))[
+        "full_attention"
+    ]
+    assert packed is not None
+    assert not packed[0, 0, 3, 0]
+    causal = _build_or_reuse_pp_causal_mask(model, inputs, None, cache_position, torch.arange(4).unsqueeze(0))[
+        "full_attention"
+    ]
+    assert causal is None
+    first = _build_or_reuse_pp_causal_mask(model, inputs, None, cache_position, None)
+    second = _build_or_reuse_pp_causal_mask(model, inputs, None, cache_position, None)
+    assert first is second
 
 
 class TestCreatePipelineForwardInner:

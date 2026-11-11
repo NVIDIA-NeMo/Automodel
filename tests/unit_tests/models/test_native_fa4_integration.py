@@ -286,7 +286,8 @@ def test_default_te_qwen3_neat_packing_uses_its_hf_flash_dispatch():
     assert contract.packed_mask_type == "flash_varlen"
     batch = neat_packed_collater([_packed_sample()], packing=contract)
     assert "attention_mask" not in batch
-    assert batch["cu_seq_lens_q"].tolist() == [0, 2, 4]
+    assert "cu_seq_lens_q" not in batch
+    assert contract.prepare_attention_inputs(batch["_packed_seq_ids"])["cu_seq_lens_q"].tolist() == [0, 2, 4]
     assert batch["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
 
 
@@ -314,8 +315,10 @@ def test_hf_and_native_packing_contracts_keep_distinct_offset_layouts(vlm):
 
     assert "attention_mask" not in hf_batch
     assert "packed_token_indices" not in hf_batch
-    assert hf_batch["cu_seq_lens_q"].tolist() == [0, 2, 3, 4, 6, 8]
-    assert hf_batch["max_length_q"] == hf_batch["max_length_k"] == 2
+    assert "cu_seq_lens_q" not in hf_batch
+    flash = hf_contract.prepare_attention_inputs(hf_batch["_packed_seq_ids"])
+    assert flash["cu_seq_lens_q"].tolist() == [0, 2, 3, 4, 6, 8]
+    assert flash["max_length_q"] == flash["max_length_k"] == 2
     assert native_batch["attention_mask"].tolist() == [[1, 1, 2, 0], [1, 1, 0, 0]]
     assert native_batch["packed_token_indices"].tolist() == [[0, 1, 2, -1], [0, 1, -1, -1]]
     assert native_batch["cu_seqlens"].tolist() == [[0, 2, 3], [0, 2, -1]]

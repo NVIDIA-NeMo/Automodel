@@ -3221,6 +3221,56 @@ def _minimal_vlm_cfg(
     return ConfigNode(cfg)
 
 
+def test_vlm_setup_configures_flash_when_only_validation_is_packed(monkeypatch):
+    """Validation collation must have a configured consumer even with unpacked training."""
+    from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+
+    class Capture(DummyModel):
+        def forward(self, input_ids: torch.Tensor, **kwargs):
+            """Return decoder kwargs for token IDs [batch, sequence]."""
+            return kwargs
+
+    model = Capture()
+    model.config._attn_implementation = "flash_attention_2"
+    build_requests = []
+
+    def build_model_for_test(*args, **kwargs):
+        build_requests.append(kwargs["has_packed_sequence"])
+        return model
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", build_model_for_test)
+
+    def build_validation(**kwargs):
+        batch = neat_packed_vlm_collater(
+            [
+                {
+                    "input_ids": [1, 2, 3, 4],
+                    "labels": [2, -100, 4, -100],
+                    "position_ids": [0, 1, 0, 1],
+                    "attention_mask": [1, 1, 2, 2],
+                }
+            ],
+            packing=kwargs["packing_contract"],
+        )
+        batch.pop("labels")
+        output = model(**batch)
+        assert output["cu_seq_lens_q"].tolist() == [0, 2, 4]
+        assert output["max_length_q"] == 2
+        return SimpleNamespace(dataloader="validation", processor="processor")
+
+    validation = SimpleNamespace(is_packed=True, output_format="batched", build=build_validation)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_validation_dataloader",
+        property(lambda self: validation),
+    )
+    trainer = FinetuneRecipeForVLM(_minimal_vlm_cfg(cp_size=1, rope_fusion=False))
+    trainer.setup()
+    assert build_requests == [True]
+    assert trainer.val_dataloader == "validation"
+
+
 def test_vlm_setup_applies_prewarm_config(monkeypatch):
     """VLM setup should apply the typed prewarm config to its parallelized model parts."""
     cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False, prewarm={"comm_groups": True})
