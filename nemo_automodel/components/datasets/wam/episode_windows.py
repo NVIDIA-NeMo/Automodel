@@ -31,10 +31,10 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from nemo_automodel.components.models.praxis.config import JsonValue
-
 if TYPE_CHECKING:
     from praxis.train.data import TrainingWindow
+
+    from nemo_automodel.components.models.praxis.config import JsonValue
 
 
 def _mapping(config: Mapping[str, JsonValue], name: str) -> Mapping[str, JsonValue]:
@@ -83,7 +83,7 @@ class EpisodeWindowDataset(IterableDataset):
         from praxis.train.data import TrainingWindow
 
         """The window of ``file`` starting at frame ``start``."""
-        ep = np.load(file)
+        ep = np.load(file, allow_pickle=False)
         canvas, obs8, cmd8 = ep["canvas"], ep["obs8"], ep["cmd8"]
         if tuple(canvas.shape[1:3]) != self.canvas_hw:
             raise ValueError(
@@ -111,7 +111,7 @@ class EpisodeWindowDataset(IterableDataset):
         rng = np.random.default_rng((self.seed, self.rank, worker))
         while True:
             file = self.files[int(rng.integers(len(self.files)))]
-            n = int(np.load(file)["obs8"].shape[0])
+            n = int(np.load(file, allow_pickle=False)["obs8"].shape[0])
             if n < self.window_frames:
                 continue
             yield self.window(file, int(rng.integers(0, n - self.window_frames + 1)))

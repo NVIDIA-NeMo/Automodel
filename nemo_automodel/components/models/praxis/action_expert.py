@@ -241,7 +241,7 @@ class ActionExpert(nn.Module):
         self._masks = MaskCache()
 
     def _masks_for(
-        self, q_tags: TokenTags, kv_tags: TokenTags, window: int, key: tuple[object, ...]
+        self, q_tags: TokenTags, kv_tags: TokenTags, window: int, key: tuple[int, int, int, int, str]
     ) -> tuple[Tensor, Tensor]:
         device = q_tags.kind.device
 

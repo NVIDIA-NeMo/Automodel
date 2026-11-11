@@ -62,6 +62,10 @@ class Slot:
     tokens_per_frame: int
 
 
+# A cache key: the slot layout, sizes, device string and flags that determine one mask.
+MaskKey = tuple[int | str | bool | tuple[Slot, ...], ...]
+
+
 def window_tags(slots: tuple[Slot, ...], chunk_size: int, device: torch.device) -> TokenTags:
     """Tags of a window sequence laid out as ``slots`` in order.
 
@@ -176,9 +180,9 @@ class MaskCache:
 
     def __init__(self, max_entries: int = 64) -> None:
         self.max_entries = max_entries
-        self._entries: OrderedDict[tuple[object, ...], BlockMask | Tensor] = OrderedDict()
+        self._entries: OrderedDict[MaskKey, BlockMask | Tensor] = OrderedDict()
 
-    def get(self, key: tuple[object, ...], build: Callable[[], BlockMask | Tensor]) -> BlockMask | Tensor:
+    def get(self, key: MaskKey, build: Callable[[], BlockMask | Tensor]) -> BlockMask | Tensor:
         mask = self._entries.pop(key, None)
         if mask is None:
             mask = build()
