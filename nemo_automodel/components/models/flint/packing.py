@@ -29,6 +29,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_aux_only,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
+from nemo_automodel.components.distributed.thd_utils import batch_tensor
 from nemo_automodel.shared.import_utils import safe_import
 
 if TYPE_CHECKING:
@@ -125,7 +126,7 @@ def _prepare_inputs_for_cp(
         )
         if num_chunks > 1:
             cp_size = cp_mesh.size() if cp_mesh is not None else 1
-            local_tokens = sharded["input_ids"].shape[-1]
+            local_tokens = batch_tensor(sharded, "input_ids").shape[-1]
             if cp_size > 1:
                 available, tex = safe_import("transformer_engine_torch")
                 if not available:
@@ -138,11 +139,13 @@ def _prepare_inputs_for_cp(
                             cp_size,
                             sharded["cp_rank"],
                         )
-                        for cu in sharded["cu_seqlens"]
+                        for cu in batch_tensor(sharded, "cu_seqlens")
                     ]
                 )
             else:
                 indices = torch.arange(local_tokens, device=source_ids.device).expand(num_chunks, -1)
+        if indices is None:
+            raise ValueError("Flint THD sharding produced no local token index map")
         if source_loss_mask is not None:
             if num_chunks > 1:
                 sharded["loss_mask"] = source_loss_mask.reshape(num_chunks, -1).gather(1, indices.long())

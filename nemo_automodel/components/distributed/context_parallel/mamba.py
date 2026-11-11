@@ -28,6 +28,8 @@ and slices them in the forward path so that gradients flow back to the full
 (unsliced) parameters.
 """
 
+from typing import Protocol
+
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -35,6 +37,12 @@ import torch.nn as nn
 # ---------------------------------------------------------------------------
 # Autograd-aware all-to-all primitive
 # ---------------------------------------------------------------------------
+
+
+class _AllToAllCtx(Protocol):
+    """Autograd context of :class:`_AllToAll`: forward stores the group for backward."""
+
+    group: torch.distributed.ProcessGroup
 
 
 class _AllToAll(torch.autograd.Function):
@@ -45,14 +53,36 @@ class _AllToAll(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, input_: torch.Tensor, group: torch.distributed.ProcessGroup) -> torch.Tensor:
+    def forward(ctx: _AllToAllCtx, input_: torch.Tensor, group: torch.distributed.ProcessGroup) -> torch.Tensor:
+        """Exchange equal-sized chunks of ``input_`` across ``group``.
+
+        Args:
+            ctx: Autograd context; receives ``group`` for the backward pass.
+            input_: Tensor of shape [cp_size * rows, ...] whose first axis holds
+                ``cp_size`` equal chunks, chunk ``r`` destined for rank ``r``.
+            group: Process group of size ``cp_size``.
+
+        Returns:
+            Tensor of the input's shape whose chunk ``r`` came from rank ``r``.
+        """
         ctx.group = group
         output = torch.empty_like(input_)
         torch.distributed.all_to_all_single(output, input_, group=group)
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx: _AllToAllCtx, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Route gradients back with the inverse (identical) all-to-all.
+
+        Args:
+            ctx: Autograd context holding the forward's ``group``.
+            grad_outputs: Exactly one gradient with the forward output's shape
+                [cp_size * rows, ...].
+
+        Returns:
+            The input gradient of the same shape, and None for ``group``.
+        """
+        (grad_output,) = grad_outputs
         group = ctx.group
         grad_output = grad_output.contiguous()
         grad_input = torch.empty_like(grad_output)
@@ -349,7 +379,7 @@ def _redo_attention_load_balancing(
         chunks = torch.arange(num_chunks, device=input_.device)
         order = torch.where(chunks % 2 == 0, chunks // 2, num_chunks - 1 - chunks // 2)
     else:
-        order = [None] * num_chunks
+        order = [0] * num_chunks
         order[::2] = range(cp_size)
         order[1::2] = reversed(range(cp_size, num_chunks))
     return _reorder_chunks(input_, order, cu_seqlens)
@@ -358,6 +388,30 @@ def _redo_attention_load_balancing(
 # ---------------------------------------------------------------------------
 # MambaContextParallel – orchestrates CP for a single Mamba mixer layer
 # ---------------------------------------------------------------------------
+
+
+class MambaCPMixer(Protocol):
+    """Mamba2 mixer parameters that :class:`MambaContextParallel` slices per CP rank."""
+
+    @property
+    def conv1d(self) -> nn.Conv1d:
+        """Depthwise causal conv with weight [conv_dim, 1, kernel_size] and optional bias [conv_dim]."""
+        ...
+
+    @property
+    def dt_bias(self) -> torch.Tensor:
+        """Per-head time-step bias of shape [num_heads]."""
+        ...
+
+    @property
+    def A_log(self) -> torch.Tensor:
+        """Per-head log state decay of shape [num_heads]."""
+        ...
+
+    @property
+    def D(self) -> torch.Tensor:
+        """Per-head skip coefficient of shape [num_heads]."""
+        ...
 
 
 class MambaContextParallel:
@@ -388,7 +442,7 @@ class MambaContextParallel:
         head_dim: int,
         n_groups: int,
         d_state: int,
-        mixer: nn.Module,
+        mixer: MambaCPMixer,
     ) -> None:
         self.cp_group = cp_group
         self.num_heads = num_heads
@@ -516,10 +570,11 @@ class MambaContextParallel:
         """
         return self._slice_conv_param(self._mixer.conv1d.weight).squeeze(1)
 
-    def get_conv1d_bias(self) -> torch.Tensor:
+    def get_conv1d_bias(self) -> torch.Tensor | None:
         """Slice ``conv1d.bias`` for the current CP rank.
 
-        Bias shape: ``[conv_dim]``.  Returns ``[conv_dim_local]``.
+        Bias shape: ``[conv_dim]``.  Returns ``[conv_dim_local]``, or None when
+        the conv has no bias.
         """
         if self._mixer.conv1d.bias is None:
             return None

@@ -63,6 +63,7 @@ from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
 
 if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.config import ActivationCheckpointingScope
     from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
 logger = logging.getLogger(__name__)
@@ -605,7 +606,7 @@ def apply_ac(
     hidden_size: int | None = None,
     num_experts: int | None = None,
     selective: bool = False,
-    activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
+    activation_checkpointing_scope: "ActivationCheckpointingScope" = "all",
     moe_only: bool = False,
 ):
     """Apply activation checkpointing to the model.
@@ -1264,7 +1265,7 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
-    activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
+    activation_checkpointing_scope: "ActivationCheckpointingScope" = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,

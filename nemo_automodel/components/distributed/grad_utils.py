@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -21,11 +20,11 @@ from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtens
 
 
 def clip_grad_by_total_norm_(
-    parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
-    max_grad_norm: Union[int, float],
+    parameters: list[torch.Tensor | DTensor] | torch.Tensor | DTensor,
+    max_grad_norm: int | float,
     total_norm: float,
     dtype: torch.dtype = torch.float32,
-):
+) -> None:
     """Clips gradient of an iterable of parameters by total norm.
 
     Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/a695b2bd2a0ca9ca63385a48c41a1c5a033cdd1e/megatron/core/optimizer/clip_grads.py#L138
@@ -54,10 +53,10 @@ def clip_grad_by_total_norm_(
 
 
 def get_grad_norm(
-    parameters: Union[list[Union[torch.Tensor, DTensor]], Union[torch.Tensor, DTensor]],
+    parameters: list[torch.Tensor | DTensor] | torch.Tensor | DTensor,
     dp_cp_group: torch.distributed.ProcessGroup,
     tp_group: torch.distributed.ProcessGroup,
-    norm_type: Union[int, float] = 2,
+    norm_type: int | float = 2,
     dtype: torch.dtype = torch.float32,
 ) -> float:
     """Calculate the norm of gradients.
@@ -107,6 +106,6 @@ def get_grad_norm(
         torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group)
 
         torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=tp_group)
-        total_norm = total_norm.item() ** (1.0 / norm_type)  # type: ignore
+        total_norm = total_norm.item() ** (1.0 / norm_type)
 
     return total_norm

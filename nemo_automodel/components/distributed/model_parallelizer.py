@@ -35,10 +35,18 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
 )
 
 if TYPE_CHECKING:
+    from typing import TypeGuard
+
     from nemo_automodel.components.distributed.mesh import MeshContext
+    from nemo_automodel.components.distributed.parallelizer_utils import MTPCapableModel
 
 
 _DEFAULT_PARALLELIZER = ModelParallelizer()
+
+
+def _has_model_capabilities(model: nn.Module) -> TypeGuard[MTPCapableModel]:
+    """Return whether AutoModel attached its ``supports`` capability descriptor to ``model``."""
+    return hasattr(model, "supports")
 
 
 def get_model_parallelizer(model: nn.Module) -> ModelParallelizer:
@@ -66,7 +74,7 @@ def _apply_model_parallelizer(
 ) -> nn.Module:
     """Execute shared strategy dispatch for one model-owned parallelizer."""
     # Diffusers components also use this dispatcher without AutoModel capabilities.
-    if mesh_context.cp_size > 1 and hasattr(model, "supports"):
+    if mesh_context.cp_size > 1 and _has_model_capabilities(model):
         reject_unsupported_mtp_cp_pp(model, pp_size=mesh_context.pp_size)
         reject_unsupported_mtp_cp(model)
 

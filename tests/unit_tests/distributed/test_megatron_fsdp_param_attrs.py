@@ -212,3 +212,13 @@ def test_fully_shard_optimizer_raises_when_megatron_fsdp_unavailable(monkeypatch
 
     with pytest.raises(ImportError, match="MegatronFSDP is not installed"):
         mfsdp.fully_shard_optimizer(wrapped, object())
+
+
+def test_fully_shard_optimizer_raises_import_error_when_megatron_fsdp_is_missing(monkeypatch):
+    """Without the Megatron-FSDP wheel its module globals are None: fail with the install hint, not a TypeError."""
+    monkeypatch.setattr(mfsdp, "MegatronFSDP", None, raising=True)
+    monkeypatch.setattr(mfsdp, "HAS_MEGATRON_FSDP", False, raising=True)
+    monkeypatch.setattr(mfsdp, "megatron_fsdp_fully_shard_optimizer", None, raising=True)
+
+    with pytest.raises(ImportError, match="MegatronFSDP is not installed"):
+        mfsdp.fully_shard_optimizer(nn.Linear(2, 2), object())

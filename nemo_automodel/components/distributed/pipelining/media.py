@@ -18,6 +18,8 @@ from dataclasses import dataclass
 
 import torch
 
+from nemo_automodel.components.distributed._patching import set_undeclared_attr
+
 
 @dataclass(frozen=True)
 class VlmMediaChunk:
@@ -58,14 +60,17 @@ class VlmMediaChunk:
     patch_newline_mask: torch.Tensor | None = None
 
 
-def next_vlm_media_chunk(module: torch.nn.Module) -> VlmMediaChunk | None:
+def next_vlm_media_chunk(module: object) -> VlmMediaChunk | None:
     """Advance staged media once, including for a text-only microbatch.
 
     Args:
-        module: Pipeline stage carrying image/video chunk lists. Pixel tensors
-            retain their image/patch-major layouts; metadata is [media, coordinates].
-            Optional patch pixels retain [patches, channels, height, width], patch
-            counts [images], and newline masks [patches] for patch-based consumers.
+        module: Pipeline stage carrying image/video chunk lists. The lists and the
+            ``_vlm_chunk_idx`` cursor are attributes the training loop attaches to
+            the stage, which no stage type declares, so only they are accessed.
+            Pixel tensors retain their image/patch-major layouts; metadata is
+            [media, coordinates]. Optional patch pixels retain [patches, channels,
+            height, width], patch counts [images], and newline masks [patches] for
+            patch-based consumers.
 
     Returns:
         The next chunk with original nonempty tensor views, or None when no media
@@ -108,5 +113,5 @@ def next_vlm_media_chunk(module: torch.nn.Module) -> VlmMediaChunk | None:
         take(getattr(module, "_vlm_num_patches_chunks", None), "patch counts"),
         take(getattr(module, "_vlm_patch_newline_mask_chunks", None), "patch newline metadata"),
     )
-    module._vlm_chunk_idx = index + 1
+    set_undeclared_attr(module, "_vlm_chunk_idx", index + 1)
     return result

@@ -20,7 +20,7 @@ including LLaMA, Qwen, Gemma3, and Ministral3 models.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Dict, Union, cast
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -34,30 +34,68 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.distributed.parallel_styles import ReplicatedWithGradAllReduce
 
-# These are needed only for annotations and for PARALLELIZE_FUNCTIONS keys. Importing
-# any one of them at module scope drags in the whole transformers model zoo --
-# transformers.models.gemma3 alone pulls sklearn -> pandas/scipy plus torchvision and
-# opentelemetry, which measured longer than `import torch` itself. The registry below
-# therefore spells the qualnames out as literals, the same trick already used for
-# qwen3_5 and falcon_h1.
+# Model classes are never imported at module scope: importing any one of them drags in
+# the whole transformers model zoo -- transformers.models.gemma3 alone pulls sklearn ->
+# pandas/scipy plus torchvision and opentelemetry, which measured longer than
+# `import torch` itself. The registry below therefore spells the qualnames out as
+# literals, and plan functions type the dispatched model structurally.
 if TYPE_CHECKING:
-    from transformers.models.gemma3.modeling_gemma3 import (
-        Gemma3ForCausalLM,
-        Gemma3ForConditionalGeneration,
-    )
-    from transformers.models.llama.modeling_llama import LlamaForCausalLM
-    from transformers.models.phi.modeling_phi import PhiForCausalLM
-    from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForSequenceClassification
+    from collections.abc import Callable, Sequence
+    from typing import TypeGuard
 
-    # Same reason as above: these model modules import transformers' generation
-    # stack, which reaches sklearn. Only the qualnames are needed at runtime.
-    from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
-    from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
+    from torch import nn
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor.placement_types import Placement
+    from transformers import PretrainedConfig
 
 
-def is_nemotron_flash_config(config) -> bool:
+class _NemotronNASAttentionConfig(Protocol):
+    """Attention fields of one remote-code Nemotron-NAS block config."""
+
+    replace_with_linear: bool
+    n_heads_in_group: int | None
+    no_op: bool
+
+
+class _NemotronNASBlockConfig(Protocol):
+    """One entry of a Nemotron-NAS ``block_configs`` list."""
+
+    attention: _NemotronNASAttentionConfig
+
+
+class _NemotronNASConfig(Protocol):
+    """Remote-code DeciLM Nemotron-NAS config fields read by TP validation."""
+
+    num_attention_heads: int
+    num_hidden_layers: int
+    block_configs: Sequence[_NemotronNASBlockConfig]
+
+
+class _NemotronNASModel(Protocol):
+    """Model carrying a Nemotron-NAS config."""
+
+    @property
+    def config(self) -> _NemotronNASConfig:
+        """Return the model config."""
+        ...
+
+
+class _PhiConfig(Protocol):
+    """Phi config field that enables the optional Q/K layer norms."""
+
+    qk_layernorm: bool
+
+
+class _PhiModel(Protocol):
+    """Phi causal LM carrying its config."""
+
+    @property
+    def config(self) -> _PhiConfig:
+        """Return the model config."""
+        ...
+
+
+def is_nemotron_flash_config(config: PretrainedConfig | None) -> bool:
     """Return whether a Transformers config identifies Nemotron-Flash."""
     if config is None:
         return False
@@ -68,7 +106,7 @@ def is_nemotron_flash_config(config) -> bool:
     return "nemotron-flash" in (getattr(config, "name_or_path", "") or "").lower()
 
 
-def validate_nemotron_nas_tp_mesh(model, tp_size: int) -> None:
+def validate_nemotron_nas_tp_mesh(model: _NemotronNASModel, tp_size: int) -> None:
     """Validate the heterogeneous attention layout of a Nemotron-NAS model."""
     config = model.config
     if config.num_attention_heads % tp_size:
@@ -88,15 +126,20 @@ def validate_nemotron_nas_tp_mesh(model, tp_size: int) -> None:
             raise ValueError(f"layer {index}: attention must define grouped heads, a linear replacement, or no_op")
 
 
-def validate_optimized_tp_mesh(model, tp_size: int) -> bool:
-    """Run a model-plan-specific TP validator, returning whether one matched."""
+def _is_nemotron_nas_model(model: nn.Module) -> TypeGuard[_NemotronNASModel]:
+    """Return whether ``model`` is a remote-code DeciLM Nemotron-NAS checkpoint."""
     config = getattr(model, "config", None)
     architectures = getattr(config, "architectures", None) or ()
-    if (
+    return bool(
         architectures
         and architectures[0] == "DeciLMForCausalLM"
         and getattr(config, "model_type", None) == "nemotron-nas"
-    ):
+    )
+
+
+def validate_optimized_tp_mesh(model: nn.Module, tp_size: int) -> bool:
+    """Run a model-plan-specific TP validator, returning whether one matched."""
+    if _is_nemotron_nas_model(model):
         validate_nemotron_nas_tp_mesh(model, tp_size)
         return True
     return False
@@ -106,8 +149,30 @@ class SequenceParallelAllGatherActivation(SequenceParallel):
     """SequenceParallel that all-gathers activations for sequence parallelism."""
 
     @staticmethod
-    def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
-        """Prepare outputs by redistributing sharded DTensors to replicated placement."""
+    def _prepare_output_fn(
+        use_local_output: bool, mod: nn.Module, outputs: torch.Tensor, device_mesh: DeviceMesh
+    ) -> torch.Tensor:
+        """Prepare outputs by redistributing sharded DTensors to replicated placement.
+
+        ``SequenceParallel`` installs this as the forward hook of the module it
+        parallelizes (a norm layer), with ``use_local_output`` bound from the style.
+
+        Args:
+            use_local_output: Return the local tensor instead of the DTensor.
+            mod: The module that produced ``outputs``.
+            outputs: The module output, a DTensor on the 1-D TP mesh with global shape
+                [batch, sequence, hidden]. Under sequence parallelism it is sharded on the
+                sequence axis (``Shard(1)`` for the default ``sequence_dim``), so each TP
+                rank holds [batch, local_sequence, hidden]. A plain tensor raises
+                ``ValueError``.
+            device_mesh: The 1-D TP device mesh.
+
+        Returns:
+            When any placement of ``outputs`` is ``Shard``, the output all-gathered to
+            ``Replicate()``, so every TP rank holds the full [batch, sequence, hidden];
+            other placements are left unchanged. The local tensor when
+            ``use_local_output`` is True, else the DTensor.
+        """
         # If output is a DTensor with Shard placement, redistribute to Replicate
         if isinstance(outputs, DTensor):
             if any(isinstance(p, Shard) for p in outputs.placements):
@@ -140,7 +205,34 @@ class VocabParallelEmbedding(RowwiseParallel):
     """
 
     @staticmethod
-    def _prepare_input_fn(input_layouts, desired_input_layouts, mod, inputs, device_mesh):
+    def _prepare_input_fn(
+        input_layouts: tuple[Placement, ...],
+        desired_input_layouts: tuple[Placement, ...],
+        mod: nn.Embedding | nn.Linear,
+        inputs: tuple[torch.Tensor, ...],
+        device_mesh: DeviceMesh,
+    ) -> torch.Tensor:
+        """Save the original token ids on ``mod``, then prepare the input as ``RowwiseParallel`` does.
+
+        Args:
+            input_layouts: Placements of the incoming token ids on ``device_mesh``;
+                ``(Replicate(),)`` in every plan that uses this style.
+            desired_input_layouts: Placements the vocabulary-sharded lookup requires;
+                ``(Replicate(),)`` for ``nn.Embedding``.
+            mod: The embedding module. A clone of the local token ids, of shape [batch,
+                sequence], is stored on it as ``_vocab_parallel_saved_ids`` for
+                :meth:`_prepare_output_fn`.
+            inputs: The module's positional inputs; ``inputs[0]`` is the integer token-id
+                Tensor of shape [batch, sequence]. A plain tensor is this rank's local value
+                under ``input_layouts`` (with ``Replicate()``, the full ids on every TP
+                rank); for a DTensor, its local tensor is saved. Only ``inputs[0]`` is read
+                and returned.
+            device_mesh: The 1-D TP device mesh.
+
+        Returns:
+            The token ids as a DTensor of shape [batch, sequence] with
+            ``desired_input_layouts`` placements.
+        """
         # Save the original input_ids (before DTensor index-adjustment)
         # so we can recompute the mask in the output hook if needed.
         input_tensor = inputs[0]
@@ -152,7 +244,34 @@ class VocabParallelEmbedding(RowwiseParallel):
         return RowwiseParallel._prepare_input_fn(input_layouts, desired_input_layouts, mod, inputs, device_mesh)
 
     @staticmethod
-    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
+    def _prepare_output_fn(
+        output_layouts: tuple[Placement, ...],
+        use_local_output: bool,
+        mod: nn.Embedding | nn.Linear,
+        outputs: torch.Tensor,
+        device_mesh: DeviceMesh,
+    ) -> torch.Tensor:
+        """Populate a missing ``MaskPartial`` mask, then prepare the output as ``RowwiseParallel`` does.
+
+        Args:
+            output_layouts: Target placements of the embedding output: ``(Replicate(),)``
+                (an all-reduce) or ``(Shard(1),)`` (a reduce-scatter over the sequence
+                axis, for sequence parallelism) in every plan that uses this style.
+            use_local_output: Return the local tensor instead of the DTensor.
+            mod: The embedding module; the token ids that :meth:`_prepare_input_fn` saved
+                on it are consumed and deleted here.
+            outputs: The embedding output, a DTensor of shape [batch, sequence, hidden]
+                with the pending vocabulary-parallel sum placement (``MaskPartial``): each
+                TP rank's local [batch, sequence, hidden] holds the rows of the token ids in
+                its vocabulary shard, and the placement's [batch, sequence] mask (True for
+                ids outside the shard) zeroes the other rows when the sum is reduced.
+            device_mesh: The 1-D TP device mesh.
+
+        Returns:
+            The output redistributed to ``output_layouts``, with global shape [batch,
+            sequence, hidden]; under ``Shard(1)`` each rank holds [batch, local_sequence,
+            hidden]. The local tensor when ``use_local_output`` is True, else the DTensor.
+        """
         saved_ids = getattr(mod, "_vocab_parallel_saved_ids", None)
         if saved_ids is not None:
             delattr(mod, "_vocab_parallel_saved_ids")
@@ -187,7 +306,32 @@ class RotaryEmbedParallel(SequenceParallel):
     """Custom SequenceParallel class for Qwen2 / Gemma3 rotary embeddings because the input is a tuple."""
 
     @staticmethod
-    def _prepare_input_fn(sequence_sharding, mod, inputs, device_mesh):
+    def _prepare_input_fn(
+        sequence_sharding: tuple[Placement, ...],
+        mod: nn.Module,
+        inputs: tuple[torch.Tensor, ...],
+        device_mesh: DeviceMesh,
+    ) -> tuple[torch.Tensor, ...]:
+        """Annotate the rotary module's hidden-state and position inputs as DTensors.
+
+        Args:
+            sequence_sharding: Placements of the sequence-parallel activations,
+                ``(Shard(sequence_dim),)`` (``Shard(1)`` by default).
+            mod: The rotary embedding module.
+            inputs: The module's positional inputs ``(hidden_states, position_ids,
+                *rest)``. ``hidden_states`` has global shape [batch, sequence, hidden]; a
+                DTensor passes through, while a plain tensor is taken as this rank's
+                sequence shard [batch, local_sequence, hidden] and wrapped with
+                ``sequence_sharding`` (checked across ranks: every TP rank must hold the
+                same local shape). ``position_ids`` is a Tensor of shape [batch, sequence]
+                covering the full sequence; a plain tensor is wrapped as ``Replicate()``.
+                Further entries (for example a layer-type string) pass through unchanged.
+            device_mesh: The 1-D TP device mesh.
+
+        Returns:
+            ``inputs`` in its original container type, with its first two entries as
+            DTensors.
+        """
         new_inputs = list(inputs)
 
         if not isinstance(inputs[0], DTensor):
@@ -217,12 +361,32 @@ class RotaryEmbedParallel(SequenceParallel):
         return type(inputs)(new_inputs)
 
     @staticmethod
-    def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
-        return type(outputs)([o.to_local() if use_local_output else o for o in outputs])
+    def _prepare_output_fn(
+        use_local_output: bool, mod: nn.Module, outputs: tuple[DTensor, ...], device_mesh: DeviceMesh
+    ) -> tuple[torch.Tensor, ...]:
+        """Convert the rotary outputs to local tensors when ``use_local_output`` is True.
+
+        Args:
+            use_local_output: Convert each output with ``to_local()``.
+            mod: The rotary embedding module (unused).
+            outputs: The rotary module's ``(cos, sin)`` tuple of DTensors, each of shape
+                [batch, sequence, rotary_dim], where ``rotary_dim`` is the rotary width
+                (the head dimension for Qwen2 and Gemma3). They are computed from the
+                ``Replicate()`` ``position_ids``, so they are replicated and each rank's
+                local tensor covers the full sequence.
+            device_mesh: The TP device mesh (unused).
+
+        Returns:
+            ``(cos, sin)`` as local tensors of shape [batch, sequence, rotary_dim] when
+            ``use_local_output`` is True, else the DTensors unchanged; placements are not
+            redistributed.
+        """
+        # ``outputs`` is the rotary module's ``(cos, sin)`` tuple of DTensors.
+        return tuple(o.to_local() if use_local_output else o for o in outputs)
 
 
 def _parallelize_gemma3(
-    model: Union[Gemma3ForCausalLM, Gemma3ForConditionalGeneration],
+    model: nn.Module,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Gemma3ForCausalLM model across data and tensor parallel dimensions."""
@@ -247,7 +411,7 @@ def _parallelize_gemma3(
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
 
-    base_model_sp_plan = {
+    base_model_sp_plan: dict[str, ParallelStyle] = {
         f"{model_prefix}.embed_tokens": VocabParallelEmbedding(
             input_layouts=Replicate(),
             output_layouts=Shard(1),
@@ -267,9 +431,9 @@ def _parallelize_gemma3(
 
     if sequence_parallel:
         # Enable sequence parallelism only if TP size > 1
-        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+        base_model_tp_plan.update(base_model_sp_plan)
 
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+    return base_model_tp_plan
 
 
 def get_llama_nemotron_super_tp_plan(
@@ -283,7 +447,7 @@ def get_llama_nemotron_super_tp_plan(
     Use this plan explicitly by passing it as tp_shard_plan (dict) or by name
     ``llama_nemotron_super_tp_plan`` when calling fsdp2_strategy_parallelize / _get_parallel_plan.
     """
-    return _parallelize_llama(None, sequence_parallel)  # type: ignore[arg-type]
+    return _parallelize_llama(None, sequence_parallel)
 
 
 def get_decilm_nemotron_tp_plan(
@@ -308,7 +472,7 @@ def get_decilm_nemotron_tp_plan(
         "lm_head": ColwiseParallel(output_layouts=Replicate()),
     }
 
-    base_model_sp_plan = {
+    base_model_sp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": VocabParallelEmbedding(
             input_layouts=Replicate(),
             output_layouts=Shard(1),
@@ -323,13 +487,13 @@ def get_decilm_nemotron_tp_plan(
     }
 
     if sequence_parallel:
-        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+        base_model_tp_plan.update(base_model_sp_plan)
 
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+    return base_model_tp_plan
 
 
 def _parallelize_decilm_nemotron(
-    model,
+    model: nn.Module,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     if getattr(getattr(model, "config", None), "model_type", None) != "nemotron-nas":
@@ -338,7 +502,7 @@ def _parallelize_decilm_nemotron(
 
 
 def _parallelize_baichuan(
-    model: BaichuanForCausalLM | None,
+    model: nn.Module | None,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a BaichuanForCausalLM model (MLP-only).
@@ -348,18 +512,15 @@ def _parallelize_baichuan(
     would split it incorrectly) and NormHead (lm_head) is not nn.Linear
     (ColwiseParallel is unsupported).
     """
-    return cast(
-        dict[str, ParallelStyle],
-        {
-            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
-            "model.layers.*.mlp.up_proj": ColwiseParallel(),
-            "model.layers.*.mlp.down_proj": RowwiseParallel(),
-        },
-    )
+    return {
+        "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "model.layers.*.mlp.up_proj": ColwiseParallel(),
+        "model.layers.*.mlp.down_proj": RowwiseParallel(),
+    }
 
 
 def _parallelize_llama(
-    model: LlamaForCausalLM | None,
+    model: nn.Module | None,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a LlamaForCausalLM model across data and tensor parallel dimensions."""
@@ -377,7 +538,7 @@ def _parallelize_llama(
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
 
-    base_model_sp_plan = {
+    base_model_sp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": VocabParallelEmbedding(
             input_layouts=Replicate(),
             output_layouts=Shard(1),
@@ -393,13 +554,13 @@ def _parallelize_llama(
 
     if sequence_parallel:
         # Enable sequence parallelism only if TP size > 1
-        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+        base_model_tp_plan.update(base_model_sp_plan)
 
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+    return base_model_tp_plan
 
 
 def _parallelize_ministral3(
-    model: "Ministral3ForCausalLM",
+    model: nn.Module,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Ministral3ForCausalLM model across data and tensor parallel dimensions."""
@@ -415,7 +576,7 @@ def _parallelize_ministral3(
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
 
-    base_model_sp_plan = {
+    base_model_sp_plan: dict[str, ParallelStyle] = {
         "model.embed_tokens": VocabParallelEmbedding(
             input_layouts=Replicate(),
             output_layouts=Shard(1),
@@ -431,13 +592,13 @@ def _parallelize_ministral3(
 
     if sequence_parallel:
         # Enable sequence parallelism only if TP size > 1
-        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+        base_model_tp_plan.update(base_model_sp_plan)
 
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+    return base_model_tp_plan
 
 
 def _parallelize_nemotron_labs_diffusion(
-    model,  # NemotronLabsDiffusionModel — loaded via trust_remote_code, not importable.
+    model: nn.Module,  # NemotronLabsDiffusionModel — loaded via trust_remote_code, not importable.
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """TP plan for ``NemotronLabsDiffusionModel`` (Nemotron-Labs-Diffusion).
@@ -458,7 +619,7 @@ def _parallelize_nemotron_labs_diffusion(
         "diffusion_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
 
-    base_model_sp_plan = {
+    base_model_sp_plan: dict[str, ParallelStyle] = {
         "encoder.embed_tokens": VocabParallelEmbedding(
             input_layouts=Replicate(),
             output_layouts=Shard(1),
@@ -477,13 +638,13 @@ def _parallelize_nemotron_labs_diffusion(
     }
 
     if sequence_parallel:
-        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+        base_model_tp_plan.update(base_model_sp_plan)
 
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+    return base_model_tp_plan
 
 
 def _parallelize_mistral3_vlm(
-    model,
+    model: nn.Module,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """TP plan for Mistral3ForConditionalGeneration (and subclasses like
@@ -503,11 +664,11 @@ def _parallelize_mistral3_vlm(
         f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+    return base_model_tp_plan
 
 
 def _parallelize_muse_glimmer(
-    model,
+    model: nn.Module,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """TP plan for the native MuseGlimmer dense VLM.
@@ -538,17 +699,17 @@ def _parallelize_muse_glimmer(
         "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
     }
 
-    return cast(dict[str, ParallelStyle], plan)
+    return plan
 
 
 def _parallelize_qwen(
-    model: Union[Qwen2ForCausalLM, Qwen3ForCausalLM],
+    model: nn.Module,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a Qwen2/Qwen3 causal LM across data and tensor parallel dimensions."""
 
     if sequence_parallel:
-        base_model_tp_plan = {
+        base_model_tp_plan: dict[str, ParallelStyle] = {
             "lm_head": ColwiseParallel(
                 input_layouts=Shard(1),
                 output_layouts=Shard(-1),
@@ -599,11 +760,11 @@ def _parallelize_qwen(
             "model.layers.*.mlp.down_proj": RowwiseParallel(),
         }
 
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+    return base_model_tp_plan
 
 
 def _parallelize_qwen_classification(
-    model: Union[Qwen3ForSequenceClassification],
+    model: nn.Module,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     plan = _parallelize_qwen(model, sequence_parallel)
@@ -617,7 +778,7 @@ def _parallelize_qwen_classification(
 
 
 def _parallelize_phi(
-    model: PhiForCausalLM,
+    model: _PhiModel,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     """Parallelizes a PhiForCausalLM (Phi-2) model across tensor parallel dimensions.
@@ -659,12 +820,12 @@ def _parallelize_phi(
         }
         base_model_tp_plan.update(base_model_sp_plan)
 
-    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+    return base_model_tp_plan
 
 
 # Phi3: fused attention cannot be sharded; shard MLP as in HF guidance
 def _parallelize_phi3(
-    model: Phi3ForCausalLM,
+    model: nn.Module,
     sequence_parallel: bool = False,
 ) -> dict[str, ParallelStyle]:
     base_model_tp_plan: dict[str, ParallelStyle] = {
@@ -697,10 +858,7 @@ def _parallelize_phi3(
         ),
     }
 
-    return cast(
-        dict[str, ParallelStyle],
-        base_model_tp_plan,
-    )
+    return base_model_tp_plan
 
 
 # Named TP plan for use with tp_shard_plan="llama_nemotron_super_tp_plan" in parallelizer
@@ -730,9 +888,9 @@ def _get_class_qualname(cls: type) -> str:
 
 
 def _parallelize_qwen3_5_vlm(
-    model,
+    model: nn.Module,
     sequence_parallel: bool = False,
-) -> Dict[str, ParallelStyle]:
+) -> dict[str, ParallelStyle]:
     """Parallelize Qwen3.5 VLM by reusing transformers' base_model_tp_plan.
 
     Qwen3.5 has mixed attention: full self_attn (every 4th layer) + linear_attn
@@ -745,9 +903,9 @@ def _parallelize_qwen3_5_vlm(
 
 
 def _parallelize_falcon_h1(
-    model,
+    model: nn.Module,
     sequence_parallel: bool = False,
-) -> Dict[str, ParallelStyle]:
+) -> dict[str, ParallelStyle]:
     """Parallelize Falcon-H1 (hybrid Transformer + Mamba2 SSM).
 
     Every Falcon-H1 decoder layer runs an attention branch (``self_attn``) and a
@@ -769,24 +927,24 @@ def _parallelize_falcon_h1(
     parallel Mamba2 branch emits non-sequence-parallel activations that cannot be
     combined with sequence-parallel attention outputs.
     """
-    return cast(
-        Dict[str, ParallelStyle],
-        {
-            "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
-            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
-            "model.layers.*.feed_forward.gate_proj": ColwiseParallel(),
-            "model.layers.*.feed_forward.up_proj": ColwiseParallel(),
-            "model.layers.*.feed_forward.down_proj": RowwiseParallel(),
-            "lm_head": ColwiseParallel(output_layouts=Replicate()),
-        },
-    )
+    return {
+        "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "model.layers.*.feed_forward.gate_proj": ColwiseParallel(),
+        "model.layers.*.feed_forward.up_proj": ColwiseParallel(),
+        "model.layers.*.feed_forward.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Replicate()),
+    }
 
 
-# Keyed by qualified class name — see _get_class_qualname for why.
-PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
+# Keyed by qualified class name — see _get_class_qualname for why. Each factory is called as
+# ``factory(model, sequence_parallel)`` with the model whose class matched its key, and types that
+# model by what it reads (``_parallelize_phi`` needs ``config.qk_layernorm``, which ``nn.Module``
+# does not declare). No single parameter type admits every factory, so the parameters stay open.
+PARALLELIZE_FUNCTIONS: dict[str, Callable[..., dict[str, ParallelStyle]]] = {
     "nemo_automodel.components.models.baichuan.model.BaichuanForCausalLM": _parallelize_baichuan,
     "transformers.models.qwen2.modeling_qwen2.Qwen2ForCausalLM": _parallelize_qwen,
     "transformers.models.qwen3.modeling_qwen3.Qwen3ForCausalLM": _parallelize_qwen,

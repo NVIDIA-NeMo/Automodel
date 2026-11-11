@@ -14,8 +14,18 @@
 
 import logging
 from collections import defaultdict
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from copy import copy
-from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Sequence, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Literal,
+    Protocol,
+    Required,
+    TypedDict,
+    TypeGuard,
+    Union,
+    overload,
+)
 
 import torch
 import torch.nn as nn
@@ -26,6 +36,7 @@ from torch.distributed.fsdp import (
     OffloadPolicy,
     fully_shard,
 )
+from typing_extensions import TypeVar
 
 from nemo_automodel.components.distributed.fsdp_patches import (
     patch_fsdp_restore_unused_param_grads as _patch_fsdp_restore_unused_param_grads,
@@ -41,7 +52,12 @@ from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
-UniformSubtreeItem = Union[Tuple[nn.Module, torch.dtype], Tuple[str, nn.Module, torch.dtype]]
+# Key used to group tensors into dtype-uniform FSDP units: ``torch.dtype`` by default,
+# or whatever a caller's ``dtype_of`` returns (e.g. a (storage, compute) dtype pair).
+_GroupKeyT = TypeVar("_GroupKeyT", bound=Hashable, default=torch.dtype)
+_ShardTargetT_contra = TypeVar("_ShardTargetT_contra", contravariant=True)
+
+UniformSubtreeItem = Union[tuple[nn.Module, Hashable], tuple[str, nn.Module, Hashable]]
 
 __all__ = [
     "fully_shard_by_dtype",
@@ -53,13 +69,163 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-def reject_unsupported_mtp_cp(model: nn.Module) -> None:
+class _MTPCapabilities(Protocol):
+    """MTP capability flags of AutoModel's ``model.supports`` descriptor."""
+
+    @property
+    def mtp_enabled(self) -> bool:
+        """Whether MTP is active for this model instance."""
+        ...
+
+    @property
+    def supports_mtp_cp(self) -> bool:
+        """Whether the model owns an MTP training path under context parallelism."""
+        ...
+
+    @property
+    def supports_mtp_cp_pp(self) -> bool:
+        """Whether the model owns an MTP training path with both CP and PP."""
+        ...
+
+
+class MTPCapableModel(Protocol):
+    """Model carrying AutoModel's ``supports`` capability descriptor."""
+
+    @property
+    def supports(self) -> _MTPCapabilities:
+        """Return the capability descriptor."""
+        ...
+
+
+class FullyShardFn(Protocol[_ShardTargetT_contra]):
+    """FSDP2 sharding primitive: ``fully_shard`` or a model parallelizer's ``_fully_shard_module``.
+
+    The type parameter is what one call shards: one module, or a list of modules that
+    become a single FSDP unit. Callers ignore the return value.
+    """
+
+    def __call__(
+        self,
+        module: _ShardTargetT_contra,
+        /,
+        *,
+        mesh: DeviceMesh,
+        mp_policy: MixedPrecisionPolicy | None,
+        offload_policy: OffloadPolicy | None,
+        reshard_after_forward: bool | int | None = ...,
+        ignored_params: set[nn.Parameter] | None = ...,
+    ) -> object:
+        """Shard ``module`` in place."""
+        ...
+
+
+class FullyShardKwargs(TypedDict, total=False):
+    """Keyword arguments of one ``FullyShardFn`` call."""
+
+    mesh: Required[DeviceMesh]
+    mp_policy: Required[MixedPrecisionPolicy | None]
+    offload_policy: Required[OffloadPolicy | None]
+    reshard_after_forward: bool | int | None
+    ignored_params: set[nn.Parameter] | None
+
+
+class _TorchFullyShardKwargs(TypedDict, total=False):
+    """``fully_shard`` options as it declares them; an omitted key keeps ``fully_shard``'s default."""
+
+    mesh: DeviceMesh
+    mp_policy: MixedPrecisionPolicy
+    offload_policy: OffloadPolicy
+    reshard_after_forward: bool | int
+    ignored_params: set[nn.Parameter]
+
+
+def torch_fully_shard_kwargs(
+    *,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy | None,
+    offload_policy: OffloadPolicy | None,
+    reshard_after_forward: bool | int | None,
+    ignored_params: set[nn.Parameter] | None,
+) -> _TorchFullyShardKwargs:
+    """Translate optional FSDP options to ``fully_shard`` keyword arguments.
+
+    ``fully_shard`` declares its policies as non-optional. An unset (``None``) option
+    is therefore omitted so ``fully_shard`` applies its own default: no offloading,
+    no mixed-precision casts, and automatic ``reshard_after_forward``.
+
+    Args:
+        mesh: FSDP data-parallel mesh.
+        mp_policy: Mixed-precision policy, or ``None`` for ``fully_shard``'s default.
+        offload_policy: Offload policy, or ``None`` for ``fully_shard``'s default.
+        reshard_after_forward: Reshard override, or ``None`` to let FSDP2 decide.
+        ignored_params: Parameters of arbitrary shapes already owned by another unit, or ``None``.
+
+    Returns:
+        The keyword arguments for ``fully_shard``, holding only the options that are set.
+    """
+    kwargs: _TorchFullyShardKwargs = {"mesh": mesh}
+    if mp_policy is not None:
+        kwargs["mp_policy"] = mp_policy
+    if offload_policy is not None:
+        kwargs["offload_policy"] = offload_policy
+    if reshard_after_forward is not None:
+        kwargs["reshard_after_forward"] = reshard_after_forward
+    if ignored_params is not None:
+        kwargs["ignored_params"] = ignored_params
+    return kwargs
+
+
+def _default_fully_shard(
+    module: nn.Module | list[nn.Module],
+    *,
+    mesh: DeviceMesh,
+    mp_policy: MixedPrecisionPolicy | None = None,
+    offload_policy: OffloadPolicy | None = None,
+    reshard_after_forward: bool | int | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
+) -> None:
+    """Shard with ``fully_shard`` when no model parallelizer owns the FSDP primitive.
+
+    Args:
+        module: Module, or list of modules that become one FSDP unit, sharded in place.
+        mesh: FSDP data-parallel mesh.
+        mp_policy: Mixed-precision policy; ``None`` keeps ``fully_shard``'s default.
+        offload_policy: Offload policy; ``None`` keeps ``fully_shard``'s default (no offloading).
+        reshard_after_forward: Reshard override; ``None`` lets FSDP2 decide.
+        ignored_params: Parameters of arbitrary shapes already owned by another unit.
+    """
+    fully_shard(
+        module,
+        **torch_fully_shard_kwargs(
+            mesh=mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=ignored_params,
+        ),
+    )
+
+
+class _UnusedParamReduceScatter(Protocol):
+    """FSDP unit with PyTorch's public unused-parameter reduce-scatter switch (absent in older releases)."""
+
+    def set_reduce_scatter_unused_params(self, enabled: bool, /, *, recurse: bool = ...) -> None:
+        """Reduce-scatter zero gradients for parameters this rank did not use."""
+        ...
+
+
+def _has_unused_param_reduce_scatter(fsdp_modules: list[FSDPModule]) -> TypeGuard[list[_UnusedParamReduceScatter]]:
+    """Return whether the installed PyTorch exposes the unused-parameter reduce-scatter API on FSDP units."""
+    return hasattr(fsdp_modules[0], "set_reduce_scatter_unused_params")
+
+
+def reject_unsupported_mtp_cp(model: MTPCapableModel) -> None:
     """Reject enabled MTP when the model has not declared CP support."""
     if model.supports.mtp_enabled and not model.supports.supports_mtp_cp:
         raise RuntimeError(f"{type(model).__name__} does not support MTP with context parallelism")
 
 
-def reject_unsupported_mtp_cp_pp(model: nn.Module, *, pp_size: int | None = None) -> None:
+def reject_unsupported_mtp_cp_pp(model: MTPCapableModel, *, pp_size: int | None = None) -> None:
     """Reject unsupported MTP+CP+PP before parallelizing the model.
 
     Call only when context parallelism is active.
@@ -97,7 +263,7 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     Returns:
         Number of FSDP units configured.
     """
-    fsdp_modules = [candidate for candidate in module.modules() if isinstance(candidate, FSDPModule)]
+    fsdp_modules: list[FSDPModule] = [candidate for candidate in module.modules() if isinstance(candidate, FSDPModule)]
     if not fsdp_modules:
         return 0
 
@@ -105,7 +271,7 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     # dtype and must be aligned with the peers' reduce-dtype accumulations before
     # the group reaches ``foreach_reduce``.
     _patch_fsdp_uniform_reduce_dtype()
-    if hasattr(fsdp_modules[0], "set_reduce_scatter_unused_params"):
+    if _has_unused_param_reduce_scatter(fsdp_modules):
         for fsdp_module in fsdp_modules:
             fsdp_module.set_reduce_scatter_unused_params(True, recurse=False)
     else:
@@ -115,12 +281,34 @@ def configure_fsdp_unused_param_reduction(module: nn.Module) -> int:
     return len(fsdp_modules)
 
 
+@overload
 def iter_maximal_uniform_dtype_subtrees(
     module: nn.Module,
     *,
     include_buffers: bool = True,
     tensor_pred: Callable[[torch.Tensor], bool] | None = None,
-    dtype_of: Callable[[torch.Tensor], torch.dtype] | None = None,
+    dtype_of: Callable[[torch.Tensor], _GroupKeyT] | None = None,
+    return_paths: Literal[False] = False,
+) -> Iterator[tuple[nn.Module, _GroupKeyT]]: ...
+
+
+@overload
+def iter_maximal_uniform_dtype_subtrees(
+    module: nn.Module,
+    *,
+    include_buffers: bool = True,
+    tensor_pred: Callable[[torch.Tensor], bool] | None = None,
+    dtype_of: Callable[[torch.Tensor], _GroupKeyT] | None = None,
+    return_paths: Literal[True],
+) -> Iterator[tuple[str, nn.Module, _GroupKeyT]]: ...
+
+
+def iter_maximal_uniform_dtype_subtrees(
+    module: nn.Module,
+    *,
+    include_buffers: bool = True,
+    tensor_pred: Callable[[torch.Tensor], bool] | None = None,
+    dtype_of: Callable[[torch.Tensor], Hashable] | None = None,
     return_paths: bool = False,
 ) -> Iterator[UniformSubtreeItem]:
     """
@@ -131,7 +319,8 @@ def iter_maximal_uniform_dtype_subtrees(
                    Example: tensor_pred=torch.is_floating_point  (to consider only FP tensors)
     - dtype_of: maps a tensor to the dtype used for unification (default: its storage
                 dtype ``t.dtype``). Pass a custom function to group by *compute* dtype
-                rather than storage dtype.
+                rather than storage dtype; any hashable key (e.g. a dtype pair) works,
+                and it is yielded in place of the dtype.
     - return_paths: if True, yields (qualified_name, module, dtype); else (module, dtype).
 
     Notes:
@@ -143,8 +332,8 @@ def iter_maximal_uniform_dtype_subtrees(
     if dtype_of is None:
         dtype_of = lambda t: t.dtype
 
-    def _local_dtype_set(m: nn.Module) -> Set[torch.dtype]:
-        ds: Set[torch.dtype] = set()
+    def _local_dtype_set(m: nn.Module) -> set[Hashable]:
+        ds: set[Hashable] = set()
         for p in m.parameters(recurse=False):
             if tensor_pred(p):
                 ds.add(dtype_of(p))
@@ -154,10 +343,10 @@ def iter_maximal_uniform_dtype_subtrees(
                     ds.add(dtype_of(b))
         return ds
 
-    def _visit(m: nn.Module, path: Tuple[str, ...]) -> Tuple[Set[torch.dtype], List[UniformSubtreeItem]]:
+    def _visit(m: nn.Module, path: tuple[str, ...]) -> tuple[set[Hashable], list[UniformSubtreeItem]]:
         local = _local_dtype_set(m)
-        subtree_dtypes: Set[torch.dtype] = set(local)
-        collected: List[UniformSubtreeItem] = []
+        subtree_dtypes: set[Hashable] = set(local)
+        collected: list[UniformSubtreeItem] = []
 
         # Recurse into children
         for name, child in m.named_children():
@@ -184,15 +373,31 @@ def iter_maximal_uniform_dtype_subtrees(
         yield it
 
 
+@overload
 def _group_params_by_dtype(
     layer: nn.Module,
-    dtype_of: Callable[[torch.Tensor], torch.dtype] | None = None,
+    dtype_of: None = None,
     ignored_params: set[nn.Parameter] | None = None,
-) -> Dict[torch.dtype, List[nn.Parameter]]:
+) -> dict[torch.dtype, list[nn.Parameter]]: ...
+
+
+@overload
+def _group_params_by_dtype(
+    layer: nn.Module,
+    dtype_of: Callable[[torch.Tensor], _GroupKeyT],
+    ignored_params: set[nn.Parameter] | None = None,
+) -> dict[_GroupKeyT, list[nn.Parameter]]: ...
+
+
+def _group_params_by_dtype(
+    layer: nn.Module,
+    dtype_of: Callable[[torch.Tensor], Hashable] | None = None,
+    ignored_params: set[nn.Parameter] | None = None,
+) -> dict[Hashable, list[nn.Parameter]]:
     if dtype_of is None:
         dtype_of = lambda t: t.dtype
     ignored_param_ids = {id(param) for param in ignored_params or ()}
-    ans: Dict[torch.dtype, List[nn.Parameter]] = {}
+    ans: dict[Hashable, list[nn.Parameter]] = {}
     for name, param in layer.named_parameters():
         if id(param) in ignored_param_ids:
             continue
@@ -217,7 +422,7 @@ def _fully_shard(
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
     *,
-    shard_module: Callable[..., None],
+    shard_module: FullyShardFn[nn.Module],
 ) -> None:
     if isinstance(module, nn.ModuleList):
         for layer in module:
@@ -250,9 +455,9 @@ def _call_fully_shard(
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
     *,
-    shard_module: Callable[..., None],
+    shard_module: FullyShardFn[nn.Module],
 ) -> None:
-    kwargs = {
+    kwargs: FullyShardKwargs = {
         "mesh": mesh,
         "mp_policy": mp_policy,
         "offload_policy": offload_policy,
@@ -313,7 +518,7 @@ def get_internal_fsdp_mp_policy(
 def _make_compute_dtype_fn(
     module: nn.Module,
     mp_policy: MixedPrecisionPolicy | None,
-    fp32_compute_module_names: Tuple[str, ...],
+    fp32_compute_module_names: tuple[str, ...],
     ignored_params: set[nn.Parameter] | None = None,
 ) -> Callable[[torch.Tensor], torch.dtype]:
     """Build the per-parameter *compute* dtype resolver used to group FSDP units.
@@ -343,7 +548,7 @@ def _make_compute_dtype_fn(
 
     ignored_param_ids = {id(param) for param in ignored_params or ()}
 
-    pinned_ids: Set[int] = set()
+    pinned_ids: set[int] = set()
     if fp32_compute_module_names:
         for name, tensor in (*module.named_parameters(), *module.named_buffers()):
             name = canonical_parameter_fqn(name)
@@ -374,7 +579,7 @@ def fully_shard_across_blocks(
     mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy | None,
     offload_policy: OffloadPolicy | None,
-    shard_module: Callable[..., None] = fully_shard,
+    shard_module: FullyShardFn[list[nn.Module]] = _default_fully_shard,
 ) -> set[nn.Parameter]:
     """Put every block's instance of the named fp32 parameter holders into one FSDP unit.
 
@@ -399,7 +604,7 @@ def fully_shard_across_blocks(
         mp_policy: The blocks' mixed-precision policy; the unit computes and reduces in fp32 and returns its
             natural fp32 outputs (the policy's ``output_dtype`` is cleared, as for every internal unit).
         offload_policy: Parameter/gradient offload policy.
-        shard_module: FSDP primitive (``fully_shard`` or a model parallelizer's override).
+        shard_module: FSDP primitive (a model parallelizer's override); defaults to ``fully_shard``.
 
     Returns:
         The parameters now owned by the cross-block units. Callers pass them as ``ignored_params``
@@ -457,7 +662,7 @@ def fully_shard_by_dtype(
     mesh: DeviceMesh,
     mp_policy: MixedPrecisionPolicy | None,
     offload_policy: OffloadPolicy | None,
-    fp32_compute_module_names: Tuple[str, ...] = (),
+    fp32_compute_module_names: tuple[str, ...] = (),
     reshard_after_forward: bool | int | None = None,
     ignored_params: set[nn.Parameter] | None = None,
     model_parallelizer: "ModelParallelizer | None" = None,
@@ -499,7 +704,9 @@ def fully_shard_by_dtype(
         model_parallelizer: Optional model sidecar that owns the
             FSDP primitive.
     """
-    shard_module = fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
+    shard_module: FullyShardFn[nn.Module] = (
+        _default_fully_shard if model_parallelizer is None else model_parallelizer._fully_shard_module
+    )
     ignored_params = set(ignored_params or ())
     ignored_param_ids = {id(param) for param in ignored_params}
     compute_dtype_of = _make_compute_dtype_fn(
@@ -599,7 +806,7 @@ def fully_shard_by_dtype(
             )
 
         for path, key, _ in selected_subtrees:
-            subtree_kwargs = {
+            subtree_kwargs: FullyShardKwargs = {
                 "mesh": mesh,
                 "mp_policy": get_internal_fsdp_mp_policy(_mp_policy_with_param_dtype(mp_policy, key[1])),
                 "offload_policy": offload_policy,

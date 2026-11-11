@@ -12,18 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 import types
-from collections.abc import MutableMapping
-from typing import TYPE_CHECKING, Callable, Union
+from collections.abc import Iterable, MutableMapping
+from typing import TYPE_CHECKING, Protocol, TypeAlias, TypedDict, TypeVar
 
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.distributed._patching import get_undeclared_attr, set_undeclared_attr
 from nemo_automodel.components.distributed.pipelining.media import next_vlm_media_chunk
 
 if TYPE_CHECKING:
-    pass
+    from torch.nn.attention.flex_attention import BlockMask
+    from transformers.cache_utils import Cache
+    from transformers.configuration_utils import PreTrainedConfig
+    from transformers.modeling_outputs import BaseModelOutputWithPast
+
+    # Attention-type name ("full_attention", "sliding_attention") -> complete mask, as built by
+    # transformers.masking_utils; None lets attention run without an explicit mask.
+    _CausalMaskMapping: TypeAlias = dict[str, torch.Tensor | BlockMask | None]
+    # (sequence length, dtype, device) of the stage input; the inputs that determine an unpadded mask.
+    _CausalMaskCacheKey: TypeAlias = tuple[int, torch.dtype, torch.device]
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +63,312 @@ MULTIMODAL_SUFFIXES = (
 )
 
 
-def get_text_module(model: nn.Module) -> nn.Module:
+class _CausalMaskKwargs(TypedDict):
+    """Arguments shared by Hugging Face's full and sliding-window causal-mask builders."""
+
+    config: PreTrainedConfig
+    inputs_embeds: torch.Tensor
+    attention_mask: torch.Tensor | None
+    past_key_values: Cache | None
+    position_ids: torch.Tensor | None
+
+
+class _CausalMaskOwner(Protocol):
+    """Decoder module whose config selects the mask implementation.
+
+    It also owns the stage mask cache, an attribute this module attaches (``_pp_causal_mask_cache``).
+    """
+
+    config: PreTrainedConfig
+
+
+class _SubmoduleAttributes(Protocol):
+    """Module whose undeclared attributes resolve to its registered children, parameters or buffers.
+
+    This is ``nn.Module``'s attribute fallback. The pipeline forwards read decoder parts (embeddings,
+    layers, norm, rotary embedding) through it and narrow each result.
+    """
+
+    def __getattr__(self, name: str, /) -> torch.Tensor | nn.Module:
+        """Return the registered submodule, parameter or buffer called ``name``."""
+        ...
+
+
+class _DecoderStage(_SubmoduleAttributes, Protocol):
+    """Module the inner pipeline forward is bound to: a decoder backbone, or a module nesting one.
+
+    Its config selects the causal-mask implementation; decoder parts owned by other pipeline
+    stages are pruned to None.
+    """
+
+    config: PreTrainedConfig
+
+
+_ModuleT = TypeVar("_ModuleT", bound=_SubmoduleAttributes)
+
+
+class _CausalLMStage(Protocol):
+    """Causal-LM wrapper; submodules owned by other pipeline stages are pruned to None."""
+
+    config: PreTrainedConfig
+    model: nn.Module | None
+    lm_head: nn.Module | None
+
+
+class _Gemma4TextStage(Protocol):
+    """Gemma4 text decoder; submodules owned by other pipeline stages are pruned to None."""
+
+    config: PreTrainedConfig
+    embed_tokens: nn.Module | None
+    rotary_emb: nn.Module | None
+    layers: nn.ModuleList | nn.ModuleDict | None
+    norm: nn.Module | None
+
+
+class _PooledImageFeatures(Protocol):
+    """Vision-tower output whose pooled features are one tensor per image."""
+
+    pooler_output: tuple[torch.Tensor, ...]
+
+
+class _Gemma4VLMConfig(Protocol):
+    """Composite Gemma4 VLM config."""
+
+    text_config: PreTrainedConfig
+    image_token_id: int
+
+
+class _Gemma4VLMBackbone(Protocol):
+    """Gemma4 VLM inner model holding the vision tower and the text decoder."""
+
+    language_model: nn.Module
+
+    def get_image_features(
+        self, pixel_values: torch.Tensor, /, *, image_position_ids: torch.Tensor | None, return_dict: bool
+    ) -> _PooledImageFeatures:
+        """Encode images [images, ...] into one pooled feature tensor per image.
+
+        Args:
+            pixel_values: Tensor of shape [images, max_patches, patch_pixels] in the Gemma4
+                image processor's patchified layout, where ``patch_pixels`` is
+                ``patch_size * patch_size * channels`` and every image is padded to
+                ``max_patches`` patches.
+            image_position_ids: Integer Tensor of shape [images, max_patches, 2] holding each
+                patch's (x, y) position, with (-1, -1) marking padding patches.
+            return_dict: Always True; the result is an output object.
+
+        Returns:
+            Output whose ``pooler_output`` holds one Tensor of shape [image_tokens, hidden]
+            per image, where ``image_tokens`` is that image's soft-token count and
+            ``hidden`` is the text decoder's hidden size (the features are already
+            projected into the language-model embedding space).
+        """
+        ...
+
+
+class _Gemma4VLMStage(Protocol):
+    """Gemma4ForConditionalGeneration-style stage; lm_head is None before the last stage."""
+
+    config: _Gemma4VLMConfig
+    model: _Gemma4VLMBackbone
+    lm_head: nn.Module | None
+
+
+class _Mistral3VLMBackbone(Protocol):
+    """Mistral3 VLM inner model holding the vision tower, projector and the text decoder."""
+
+    language_model: nn.Module
+
+    def get_image_features(
+        self,
+        *,
+        pixel_values: torch.Tensor,
+        vision_feature_layer: int | list[int] | None,
+        image_sizes: torch.Tensor | None,
+        return_dict: bool,
+    ) -> _PooledImageFeatures:
+        """Encode images [images, channels, height, width] into one pooled feature tensor per image.
+
+        Args:
+            pixel_values: Tensor of shape [images, channels, height, width], zero-padded to
+                a common height and width.
+            vision_feature_layer: Index of the vision-tower layer whose hidden states are
+                projected, or a list of indices whose hidden states are concatenated first.
+            image_sizes: Integer Tensor of shape [images, 2] holding each image's unpadded
+                (height, width) in pixels.
+            return_dict: Always True; the result is an output object.
+
+        Returns:
+            Output whose ``pooler_output`` holds one Tensor of shape [image_tokens, hidden]
+            per image, where ``image_tokens`` is ``(height // d) * (width // d)`` for the
+            downsampling factor ``d = patch_size * spatial_merge_size`` and ``hidden`` is
+            the text decoder's hidden size.
+        """
+        ...
+
+    def get_placeholder_mask(
+        self, input_ids: torch.Tensor | None, /, *, inputs_embeds: torch.Tensor, image_features: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the bool mask of image-token embedding slots, broadcastable to [batch, sequence, hidden].
+
+        Args:
+            input_ids: Integer token ids of shape [batch, sequence], or None to locate the
+                image placeholders by comparing ``inputs_embeds`` with the image-token
+                embedding.
+            inputs_embeds: Tensor of shape [batch, sequence, hidden].
+            image_features: Tensor of shape [image_tokens, hidden] with every image's tokens
+                concatenated along axis 0; only its element count is checked against the
+                number of placeholder slots.
+
+        Returns:
+            Bool Tensor that is True at image-placeholder positions, of shape [batch,
+            sequence, 1] or, in some Transformers releases, already expanded to [batch,
+            sequence, hidden]; either form broadcasts against ``inputs_embeds`` in
+            ``masked_scatter``.
+        """
+        ...
+
+
+class _Mistral3VLMStage(Protocol):
+    """Mistral3ForConditionalGeneration-style stage; lm_head is None before the last stage."""
+
+    config: PreTrainedConfig
+    model: _Mistral3VLMBackbone
+    lm_head: nn.Module | None
+
+
+class _InnerPipelineForward(Protocol):
+    """Pipeline forward bound to a decoder backbone (or a module nesting one)."""
+
+    def __call__(
+        self,
+        module: _DecoderStage,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+        causal_mask_mapping: _CausalMaskMapping | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | BaseModelOutputWithPast:
+        """Call the ``pipeline_forward`` returned by :func:`create_pipeline_forward_inner`.
+
+        ``module`` is the bound ``self``. Every tensor argument and the return value follow
+        the layouts in that function's Args and Returns sections, which this Protocol
+        mirrors exactly.
+        """
+        ...
+
+
+class _CausalLMPipelineForward(Protocol):
+    """Pipeline forward bound to a causal-LM wrapper."""
+
+    def __call__(
+        self,
+        module: _CausalLMStage,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Call the ``pipeline_forward_causal_lm`` returned by :func:`create_pipeline_forward_causal_lm`.
+
+        ``module`` is the bound ``self``. Every tensor argument and the return value follow
+        the layouts in that function's Args and Returns sections, which this Protocol
+        mirrors exactly.
+        """
+        ...
+
+
+class _Gemma4TextPipelineForward(Protocol):
+    """Pipeline forward bound to a Gemma4 text decoder."""
+
+    def __call__(
+        self,
+        module: _Gemma4TextStage,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Call the ``pipeline_forward_gemma4_text`` returned by :func:`create_pipeline_forward_gemma4_text`.
+
+        ``module`` is the bound ``self``. Every tensor argument and the return value follow
+        the layouts in that function's Args and Returns sections, which this Protocol
+        mirrors exactly.
+        """
+        ...
+
+
+class _Gemma4VLMPipelineForward(Protocol):
+    """Pipeline forward bound to a Gemma4 VLM."""
+
+    def __call__(
+        self,
+        module: _Gemma4VLMStage,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Call the ``pipeline_forward_gemma4_vlm`` returned by :func:`create_pipeline_forward_gemma4_vlm`.
+
+        ``module`` is the bound ``self``. Every tensor argument and the return value follow
+        the layouts in that function's Args and Returns sections, which this Protocol
+        mirrors exactly.
+        """
+        ...
+
+
+class _Mistral3VLMPipelineForward(Protocol):
+    """Pipeline forward bound to a Mistral3 VLM."""
+
+    def __call__(
+        self,
+        module: _Mistral3VLMStage,
+        /,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_sizes: torch.Tensor | None = None,
+        vision_feature_layer: int | list[int] | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Call the ``pipeline_forward_mistral3_vlm`` returned by :func:`create_pipeline_forward_mistral3_vlm`.
+
+        ``module`` is the bound ``self``. Every tensor argument and the return value follow
+        the layouts in that function's Args and Returns sections, which this Protocol
+        mirrors exactly.
+        """
+        ...
+
+
+def get_text_module(model: _ModuleT) -> _ModuleT | nn.Module:
     """Return the nested text/LLM module if present, else the model itself."""
     if model is None:
         return model
@@ -65,7 +382,57 @@ def get_text_module(model: nn.Module) -> nn.Module:
     return model
 
 
-def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_position, position_ids):
+def _child_module(value: torch.Tensor | nn.Module) -> nn.Module:
+    """Narrow an ``nn.Module.__getattr__`` result that names a child module.
+
+    ``nn.Module.__getattr__`` also resolves registered parameters and buffers; the
+    pipeline helpers read only children here (inner models, embeddings, rotary
+    embeddings and norms).
+
+    Args:
+        value: The resolved attribute: a child module, or a registered parameter or
+            buffer (a Tensor of any shape), which is rejected.
+
+    Returns:
+        ``value`` itself, narrowed to ``nn.Module``.
+
+    Raises:
+        TypeError: If the attribute is a parameter or buffer.
+    """
+    if isinstance(value, torch.Tensor):
+        raise TypeError(f"Expected a submodule, got a {type(value).__name__}")
+    return value
+
+
+def _decoder_layers(layers: torch.Tensor | nn.Module) -> Iterable[nn.Module]:
+    """Iterate decoder layers held in an ``nn.ModuleList`` or, after stage pruning, an ``nn.ModuleDict``.
+
+    Args:
+        layers: A decoder's resolved ``layers`` attribute: an ``nn.ModuleList``,
+            ``nn.Sequential`` or ``nn.ModuleDict`` of decoder layers. A registered
+            parameter or buffer (a Tensor of any shape) or any other module is rejected.
+
+    Returns:
+        The container itself when it is list-like, or its values in insertion order for
+        an ``nn.ModuleDict``.
+
+    Raises:
+        TypeError: If ``layers`` is not a module container.
+    """
+    if isinstance(layers, nn.ModuleDict):
+        return layers.values()
+    if isinstance(layers, (nn.ModuleList, nn.Sequential)):
+        return layers
+    raise TypeError(f"Expected decoder layers in an nn.ModuleList or nn.ModuleDict, got {type(layers).__name__}")
+
+
+def _build_or_reuse_pp_causal_mask(
+    module: _CausalMaskOwner,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | _CausalMaskMapping | None,
+    cache_position: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> _CausalMaskMapping:
     """Build a stage's ``causal_mask_mapping``, caching it per stage when safe.
 
     Under pipeline parallelism the mask precomputed in the data pipeline only reaches
@@ -77,6 +444,18 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
     so it is built once per stage and reused. With an explicit ``attention_mask`` (which
     may encode per-batch padding) it is rebuilt each call. Behavior is identical to the
     previous recompute; only the redundant recomputation is removed.
+
+    Args:
+        module: Decoder module whose config selects the mask implementation.
+        inputs_embeds: Hidden states [batch, sequence, hidden]; only shape, dtype and
+            device are read.
+        attention_mask: Padding mask [batch, sequence], a complete mask, or an already
+            built attention-type -> mask mapping.
+        cache_position: Sequence offsets [sequence].
+        position_ids: Positions [batch, sequence].
+
+    Returns:
+        Mapping from attention type to its mask.
     """
     # An ``attention_mask`` that is already a mask-mapping dict is used as-is.
     if isinstance(attention_mask, dict):
@@ -86,49 +465,94 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
 
     cacheable = attention_mask is None
     cache_key = (inputs_embeds.shape[1], inputs_embeds.dtype, inputs_embeds.device)
-    cache = getattr(module, "_pp_causal_mask_cache", None)
-    if cache is not None and not isinstance(cache, MutableMapping):
-        cache = None
+    stored_cache = get_undeclared_attr(module, "_pp_causal_mask_cache")
+    cache = stored_cache if isinstance(stored_cache, MutableMapping) else None
     if cacheable and cache is not None and cache_key in cache:
         return cache[cache_key]
 
     # Note: inputs_embeds is only used for shape and dtype, not values.
-    mask_kwargs = {
+    mask_kwargs: _CausalMaskKwargs = {
         "config": module.config,
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
         "past_key_values": None,  # Training-only: no KV cache
         "position_ids": position_ids,
     }
-    causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+    causal_mask_mapping: _CausalMaskMapping = {"full_attention": create_causal_mask(**mask_kwargs)}
     if getattr(module, "has_sliding_layers", False) is True:
         causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
     if cacheable:
         if cache is None:
             cache = {}
-            module._pp_causal_mask_cache = cache
+            set_undeclared_attr(module, "_pp_causal_mask_cache", cache)
         cache[cache_key] = causal_mask_mapping
     return causal_mask_mapping
 
 
-def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callable:
+def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> _InnerPipelineForward:
     """Create a pipeline-compatible forward method for HuggingFace inner models."""
-    from transformers.cache_utils import Cache
     from transformers.modeling_outputs import BaseModelOutputWithPast
 
     def pipeline_forward(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: _DecoderStage,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
+        position_ids: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
-        causal_mask_mapping: dict | None = None,
-        **kwargs,
-    ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        cache_position: torch.Tensor | None = None,
+        causal_mask_mapping: _CausalMaskMapping | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | BaseModelOutputWithPast:
+        """Run this stage's decoder layers.
+
+        ``input_ids`` holds token ids [batch, sequence] on the first stage, or the
+        previous stage's floating-point hidden states [batch, sequence, hidden] on a
+        stage without ``embed_tokens``; ``inputs_embeds`` is [batch, sequence, hidden].
+        ``position_ids`` is [batch, sequence] and ``cache_position`` is [sequence].
+        Returns hidden states [batch, sequence, hidden] for ``"PipelineStage"``.
+
+        Args:
+            input_ids: On a stage that owns ``embed_tokens``, integer token ids of shape
+                [batch, sequence], where ``batch`` is the pipeline microbatch size. On a
+                stage without ``embed_tokens``, the previous stage's float16, bfloat16 or
+                float32 hidden states of shape [batch, sequence, hidden], which the
+                pipeline schedule passes positionally in this slot. Unused when
+                ``inputs_embeds`` is given.
+            attention_mask: Optional mask passed to the Hugging Face causal-mask builders
+                when ``causal_mask_mapping`` is None: a padding mask of shape [batch,
+                sequence] or a complete mask of shape [batch, 1, sequence, sequence],
+                which the builders return unchanged.
+            position_ids: Token positions of shape [batch, sequence]; defaults to
+                ``cache_position`` as [1, sequence].
+            past_key_values: Optional KV cache; a ``DynamicCache`` is created when
+                ``use_cache`` is set and none is given.
+            inputs_embeds: Optional hidden states of shape [batch, sequence, hidden] that
+                replace the embedding lookup.
+            use_cache: Create (if needed) and return a KV cache.
+            cache_position: Absolute positions of shape [sequence]; defaults to the
+                ``sequence`` positions that follow the cached tokens.
+            causal_mask_mapping: Mapping from attention type (``"full_attention"``,
+                ``"sliding_attention"``) to the complete mask that
+                ``transformers.masking_utils`` builds for the model's attention
+                implementation (for example a [batch, 1, sequence, sequence] tensor, a
+                ``BlockMask``, or None). The data pipeline supplies it to the first stage;
+                when it is None it is built here, and cached per stage while
+                ``attention_mask`` is None.
+            **kwargs: Only the Hugging Face FlashAttention varlen arguments are used, and
+                every decoder layer receives them: ``cu_seq_lens_q``/``cu_seq_lens_k``,
+                int32 cumulative offsets of shape [segments + 1] over the flattened
+                ``batch * sequence`` tokens, and the ``max_length_q``/``max_length_k``
+                ints. Other keys are ignored.
+
+        Returns:
+            For ``model_class_name == "PipelineStage"``, hidden states of shape [batch,
+            sequence, hidden] (after the final norm when this stage owns it); otherwise a
+            ``BaseModelOutputWithPast`` whose ``last_hidden_state`` has that shape and
+            that also carries ``past_key_values`` when ``use_cache`` is set.
+        """
         # For VLM models the text components (embed_tokens, layers, norm) live on a
         # nested text module (e.g. model.language_model) rather than directly on self.
         # get_text_module returns self when no nesting exists (e.g. LlamaModel).
@@ -139,7 +563,7 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
             if hasattr(text_module, "embed_tokens") and text_module.embed_tokens is not None:
                 if input_ids is None:
                     raise ValueError("You must provide either input_ids or inputs_embeds")
-                inputs_embeds = text_module.embed_tokens(input_ids)
+                inputs_embeds = _child_module(text_module.embed_tokens)(input_ids)
             else:
                 if (
                     input_ids is not None
@@ -181,13 +605,13 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
         position_embeddings = None
         rotary_emb = get_text_module(self).rotary_emb
         if rotary_emb is not None:
-            position_embeddings = rotary_emb(hidden_states, position_ids)
+            position_embeddings = _child_module(rotary_emb)(hidden_states, position_ids)
 
         if hasattr(text_module, "layers") and text_module.layers is not None:
             # Preserve the public FlashAttention metadata for this microbatch.
             flash_kwargs = {key: kwargs[key] for key in _FLASH_VARLEN_KWARGS if key in kwargs}
             # Works for dict-like or list-like containers
-            layer_iter = text_module.layers.values() if hasattr(text_module.layers, "values") else text_module.layers
+            layer_iter = _decoder_layers(text_module.layers)
             for decoder_layer in layer_iter:
                 layer_attention_mask = causal_mask_mapping.get("full_attention")
                 if hasattr(decoder_layer, "attention_type"):
@@ -208,39 +632,43 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
                 hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 
         if hasattr(text_module, "norm") and text_module.norm is not None:
-            hidden_states = text_module.norm(hidden_states)
+            hidden_states = _child_module(text_module.norm)(hidden_states)
 
         if model_class_name == "PipelineStage":
             return hidden_states
         else:
-            return BaseModelOutputWithPast(
-                last_hidden_state=hidden_states,
-                past_key_values=past_key_values if use_cache else None,
-            )
+            # Hugging Face annotates last_hidden_state as torch.FloatTensor, the legacy float32 CPU tensor
+            # class, which hidden states in the model dtype are not. ModelOutput's mapping interface stores
+            # each field as the dataclass constructor does: attribute and entry, in field order, with None
+            # fields left out (use_cache implies past_key_values is set above).
+            output = BaseModelOutputWithPast()
+            output["last_hidden_state"] = hidden_states
+            if use_cache:
+                output["past_key_values"] = past_key_values
+            return output
 
     return pipeline_forward
 
 
-def create_pipeline_forward_causal_lm() -> Callable:
+def create_pipeline_forward_causal_lm() -> _CausalLMPipelineForward:
     """Create a pipeline-compatible forward method for causal LM wrappers."""
-    from transformers.cache_utils import Cache
     from transformers.modeling_outputs import BaseModelOutputWithPast
 
     def pipeline_forward_causal_lm(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: _CausalLMStage,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
+        position_ids: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        labels: torch.LongTensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs,
-    ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        cache_position: torch.Tensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: object,
+    ) -> torch.Tensor:
         """Pipeline-stage forward for a causal-LM wrapper.
 
         B=microbatch, S=seq, H=hidden, V=vocab. Non-first stages take input
@@ -251,6 +679,36 @@ def create_pipeline_forward_causal_lm() -> Callable:
         is set (lm_head deferred to FusedLinearCrossEntropy); else logits
         ``[B, S', V]`` when this stage owns ``lm_head`` (``S'`` = ``S`` sliced by
         ``logits_to_keep``); else hidden states ``[B, S, H]`` for the next stage.
+
+        Args:
+            input_ids: Integer token ids of shape [B, S] on the first stage; on later
+                stages, the previous stage's hidden states of shape [B, S, H], which the
+                pipeline schedule passes positionally in this slot. Forwarded to the inner
+                model when this stage has one; otherwise used as the hidden states when
+                ``inputs_embeds`` is None and the dtype is float16, bfloat16 or float32.
+            attention_mask: Forwarded unchanged to the inner model: a padding mask of shape
+                [B, S] or a complete mask of shape [B, 1, S, S].
+            position_ids: Token positions of shape [B, S], forwarded to the inner model.
+            past_key_values: Forwarded to the inner model.
+            inputs_embeds: Optional hidden states of shape [B, S, H]; forwarded to the
+                inner model, or used as the hidden states on a stage without one.
+            labels: Ignored; the pipeline schedule applies the loss to this stage's output.
+            use_cache: Forwarded to the inner model.
+            output_attentions: Forwarded to the inner model; defaults to the config value.
+            output_hidden_states: Forwarded to the inner model; defaults to the config
+                value.
+            cache_position: Absolute positions of shape [S], forwarded to the inner model.
+            logits_to_keep: Number of trailing positions that ``lm_head`` projects (0 keeps
+                all ``S``), or a 1-D integer Tensor of shape [S'] indexing the sequence
+                axis.
+            **kwargs: Forwarded to the inner model.
+
+        Returns:
+            Hidden states of shape [B, S, H] when ``_pp_return_hidden_states`` is set;
+            else logits of shape [B, S', V] when this stage owns ``lm_head``; else hidden
+            states of shape [B, S, H] for the next stage. With an inner model, the hidden
+            states are its output (its ``last_hidden_state`` for a
+            ``BaseModelOutputWithPast``).
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -297,7 +755,7 @@ def create_pipeline_forward_causal_lm() -> Callable:
     return pipeline_forward_causal_lm
 
 
-def create_pipeline_forward_gemma4_text() -> Callable:
+def create_pipeline_forward_gemma4_text() -> _Gemma4TextPipelineForward:
     """Pipeline-compatible forward for the Gemma4 text decoder backbone.
 
     Works for both HF Gemma4TextModel (dense path) and Gemma4MoETextModelBackend (MoE path).
@@ -308,14 +766,14 @@ def create_pipeline_forward_gemma4_text() -> Callable:
     """
 
     def pipeline_forward_gemma4_text(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: _Gemma4TextStage,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
-        position_ids: torch.LongTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
-        **kwargs,
+        **kwargs: object,
     ) -> torch.Tensor:
         """Run retained decoder layers with native or model-prepared masks.
 
@@ -361,7 +819,7 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-            mask_kwargs = {
+            mask_kwargs: _CausalMaskKwargs = {
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
@@ -374,7 +832,7 @@ def create_pipeline_forward_gemma4_text() -> Callable:
             }
 
         # Per-layer-type rotary embeddings: Gemma4RotaryEmbedding takes (x, pos_ids, layer_type)
-        position_embeddings_map: dict = {}
+        position_embeddings_map: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         if hasattr(self, "rotary_emb") and self.rotary_emb is not None:
             for lt in set(getattr(self.config, "layer_types", ["full_attention"])):
                 try:
@@ -392,16 +850,19 @@ def create_pipeline_forward_gemma4_text() -> Callable:
         # mirroring HF's Gemma4TextModel.forward. gemma-4-31B, 26B-A4B have num_kv_shared_layers=0
         # (no readers, store is a harmless no-op write); for a kv-sharing model split
         # across PP stages only within-stage sharing would work here.
-        shared_kv_states: dict = {}
+        shared_kv_states: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         if hasattr(self, "layers") and self.layers is not None:
-            layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
+            layer_iter = _decoder_layers(self.layers)
             for decoder_layer in layer_iter:
                 # Prefer config.layer_types[layer_idx] over decoder_layer attribute — the
                 # attribute lookup defaults to "full_attention" and mis-assigns position
-                # embeddings (wrong head_dim) to sliding-window layers.
-                if config_layer_types is not None and hasattr(decoder_layer, "layer_idx"):
-                    idx = decoder_layer.layer_idx
-                    layer_type = config_layer_types[idx] if idx < len(config_layer_types) else "full_attention"
+                # embeddings (wrong head_dim) to sliding-window layers. Hugging Face decoder
+                # layers store their int index as a plain attribute nn.Module does not declare.
+                layer_idx = get_undeclared_attr(decoder_layer, "layer_idx")
+                if config_layer_types is not None and isinstance(layer_idx, int):
+                    layer_type = (
+                        config_layer_types[layer_idx] if layer_idx < len(config_layer_types) else "full_attention"
+                    )
                 else:
                     layer_type = getattr(decoder_layer, "attention_type", "full_attention")
                 layer_attention_mask = causal_mask_mapping.get(layer_type, causal_mask_mapping.get("full_attention"))
@@ -427,7 +888,7 @@ def create_pipeline_forward_gemma4_text() -> Callable:
     return pipeline_forward_gemma4_text
 
 
-def create_pipeline_forward_gemma4_vlm() -> Callable:
+def create_pipeline_forward_gemma4_vlm() -> _Gemma4VLMPipelineForward:
     """Pipeline-compatible forward for Gemma4ForConditionalGeneration (VLM top-level).
 
     Stage 0: embeds text tokens, merges image features from vision tower (if pixel_values
@@ -437,17 +898,61 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
     """
 
     def pipeline_forward_gemma4_vlm(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: _Gemma4VLMStage,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | dict[str, torch.Tensor] | None = None,
-        position_ids: torch.LongTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        pixel_values: torch.FloatTensor | None = None,
-        image_position_ids: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.LongTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
-        **kwargs,
-    ):
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Return logits [batch, sequence, vocab] on the last stage, else hidden states.
+
+        ``input_ids`` holds token ids [batch, sequence] on the first stage and hidden
+        states [batch, sequence, hidden] on later stages. ``pixel_values`` and
+        ``image_position_ids`` use the Gemma4 processor layouts.
+
+        Args:
+            input_ids: On the first stage (the one that owns ``embed_tokens``), integer
+                token ids of shape [batch, sequence], where ``batch`` is the pipeline
+                microbatch size; on later stages, the previous stage's float16, bfloat16
+                or float32 hidden states of shape [batch, sequence, hidden], which the
+                pipeline schedule passes positionally in this slot.
+            attention_mask: A padding mask or compact per-token attention ids of shape
+                [batch, sequence], a complete mask of shape [batch, 1, sequence,
+                sequence], or a full/sliding mapping of complete masks. With packed
+                sequences (``_packed_seq_ids`` in ``kwargs``) the model's
+                ``prepare_document_attention_mask`` rewrites it first; it is then
+                forwarded to the language model.
+            position_ids: Token positions of shape [batch, sequence], forwarded to the
+                language model.
+            inputs_embeds: Optional hidden states of shape [batch, sequence, hidden] that
+                replace the embedding lookup on the first stage, or the hidden states in
+                ``input_ids`` on later stages.
+            pixel_values: Tensor of shape [images, max_patches, patch_pixels] in the Gemma4
+                patchified layout described in :meth:`_Gemma4VLMBackbone.get_image_features`.
+                Read on the first stage only; when it is None there, the next staged media
+                chunk supplies it together with ``image_position_ids``.
+            image_position_ids: Integer Tensor of shape [images, max_patches, 2] holding
+                each patch's (x, y) position, with (-1, -1) marking padding patches.
+            mm_token_type_ids: Modality ids of shape [batch, sequence], where 1 marks image
+                tokens. On the first stage it selects the image-feature slots (falling back
+                to ``input_ids == image_token_id``), and it feeds the packed document mask.
+            cache_position: Positions of shape [sequence]; defaults to ``arange(sequence)``.
+            **kwargs: Forwarded to the language model. ``_packed_seq_ids`` holds packed
+                document ids of shape [batch, sequence] and requires an ``attention_mask``
+                outside context parallelism. The FlashAttention ``cu_seq_lens_q``/
+                ``cu_seq_lens_k`` are int32 cumulative offsets of shape [segments + 1];
+                their presence makes the model validate its packed-attention backend.
+
+        Returns:
+            On the stage that owns ``lm_head``, logits of shape [batch, sequence, vocab],
+            soft-capped when the text config sets ``final_logit_softcapping``; on other
+            stages, hidden states of shape [batch, sequence, hidden].
+        """
         if (
             kwargs.get("_packed_seq_ids") is not None
             and attention_mask is None
@@ -537,7 +1042,7 @@ def create_pipeline_forward_gemma4_vlm() -> Callable:
     return pipeline_forward_gemma4_vlm
 
 
-def create_pipeline_forward_mistral3_vlm() -> Callable:
+def create_pipeline_forward_mistral3_vlm() -> _Mistral3VLMPipelineForward:
     """Pipeline-compatible forward for Mistral3ForConditionalGeneration (VLM top-level).
 
     Stage 0: embeds text tokens, runs vision_tower + multi_modal_projector for
@@ -553,17 +1058,52 @@ def create_pipeline_forward_mistral3_vlm() -> Callable:
     """
 
     def pipeline_forward_mistral3_vlm(
-        self,
-        input_ids: torch.LongTensor | None = None,
+        self: _Mistral3VLMStage,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        pixel_values: torch.FloatTensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
         image_sizes: torch.Tensor | None = None,
-        vision_feature_layer=None,
-        cache_position: torch.LongTensor | None = None,
-        **kwargs,
-    ):
+        vision_feature_layer: int | list[int] | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Return logits [batch, sequence, vocab] on the last stage, else hidden states.
+
+        ``input_ids`` holds token ids [batch, sequence] on the first stage and hidden
+        states [batch, sequence, hidden] on later stages. ``pixel_values`` is
+        [images, channels, height, width] and ``image_sizes`` is [images, 2].
+
+        Args:
+            input_ids: On the first stage (the one that owns ``embed_tokens``), integer
+                token ids of shape [batch, sequence], where ``batch`` is the pipeline
+                microbatch size; on later stages, the previous stage's float16, bfloat16
+                or float32 hidden states of shape [batch, sequence, hidden], which the
+                pipeline schedule passes positionally in this slot.
+            attention_mask: Forwarded unchanged to the language model: a padding mask of
+                shape [batch, sequence] or a complete mask of shape [batch, 1, sequence,
+                sequence].
+            position_ids: Token positions of shape [batch, sequence], forwarded to the
+                language model.
+            inputs_embeds: Optional hidden states of shape [batch, sequence, hidden] that
+                replace the embedding lookup on the first stage, or the hidden states in
+                ``input_ids`` on later stages.
+            pixel_values: Tensor of shape [images, channels, height, width], zero-padded to
+                a common height and width. Read on the first stage only; when it is None
+                there, the next staged media chunk supplies it together with
+                ``image_sizes``.
+            image_sizes: Integer Tensor of shape [images, 2] holding each image's unpadded
+                (height, width) in pixels.
+            vision_feature_layer: Vision-tower layer index, or indices, whose hidden states
+                are projected; defaults to the config value.
+            cache_position: Positions of shape [sequence]; defaults to ``arange(sequence)``.
+            **kwargs: Forwarded to the language model.
+
+        Returns:
+            On the stage that owns ``lm_head``, logits of shape [batch, sequence, vocab];
+            on other stages, hidden states of shape [batch, sequence, hidden].
+        """
         inner = self.model
         lang_model = inner.language_model
         embed_tokens = getattr(lang_model, "embed_tokens", None)
@@ -670,7 +1210,7 @@ def model_keeps_self_forward(model: torch.nn.Module) -> bool:
     return bool(getattr(type(model), "_pp_keep_self_forward", False))
 
 
-def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
+def patch_hf_model_for_pp(model: nn.Module, patch_inner_model: bool = True, patch_causal_lm_model: bool = True) -> None:
     """Patch a HF model/module to produce pipeline-compatible forward.
 
     The caller is responsible for skipping this function when the model
@@ -709,19 +1249,36 @@ def patch_hf_model_for_pp(model, patch_inner_model: bool = True, patch_causal_lm
             inner_model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), inner_model)
         if patch_causal_lm_model:
             model.forward = types.MethodType(create_pipeline_forward_causal_lm(), model)
-            model._pp_return_hidden_states_supported = True
+            # Recipes read this flag to keep the last stage's lm_head deferred to fused cross-entropy.
+            set_undeclared_attr(model, "_pp_return_hidden_states_supported", True)
     else:
         if patch_inner_model:
             model.forward = types.MethodType(create_pipeline_forward_inner("PipelineStage"), model)
 
 
 def init_hf_model_buffers(model: torch.nn.Module, device: torch.device) -> None:
-    """Initialize HuggingFace model buffers needed before pipeline execution."""
-    if hasattr(getattr(model, "model", model), "rotary_emb"):
-        rotary_owner = getattr(model, "model", model)
-        if hasattr(rotary_owner.rotary_emb, "rope_init_fn"):
-            inv_freq, _ = rotary_owner.rotary_emb.rope_init_fn(rotary_owner.rotary_emb.config, device)
-            rotary_owner.rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+    """Initialize HuggingFace model buffers needed before pipeline execution.
+
+    Recomputes the rotary embedding's ``inv_freq`` on ``device`` when the embedding module exposes
+    Hugging Face's ``rope_init_fn(config, device) -> (inv_freq, attention_scaling)`` attribute.
+
+    Raises:
+        TypeError: If ``rope_init_fn`` does not return a tuple.
+    """
+    rotary_owner = getattr(model, "model", model)
+    if not hasattr(rotary_owner, "rotary_emb"):
+        return
+    rotary_emb = rotary_owner.rotary_emb
+    if not isinstance(rotary_emb, nn.Module):
+        return
+    rope_init_fn = get_undeclared_attr(rotary_emb, "rope_init_fn")
+    if not callable(rope_init_fn):
+        return
+    rope_parameters = rope_init_fn(rotary_emb.config, device)
+    if not isinstance(rope_parameters, tuple):
+        raise TypeError(f"rope_init_fn must return (inv_freq, attention_scaling), got {type(rope_parameters).__name__}")
+    inv_freq, _ = rope_parameters
+    rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
 
 # VLM model_types whose vision routing is handled inside ``patch_hf_model_for_pp``

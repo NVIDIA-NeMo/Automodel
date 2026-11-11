@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING, Any, Dict, Literal, Union
+from typing import TYPE_CHECKING, Any, Literal, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
@@ -197,11 +197,11 @@ class MoEParallelizerConfig:
     # torch.utils.checkpoint raise a CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
     reshard_after_forward: bool = False
-    lm_head_precision: Union[str, torch.dtype] | None = None
+    lm_head_precision: str | torch.dtype | None = None
     wrap_outer_model: bool = True
     mp_policy: MixedPrecisionPolicy | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
@@ -365,7 +365,7 @@ class FSDP2Config:
         if not isinstance(self.multimodal, MultimodalDistributedConfig):
             raise TypeError("FSDP2Config.multimodal must be a MultimodalDistributedConfig instance.")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """Convert config to dictionary (shallow, preserves policy objects)."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
@@ -429,7 +429,7 @@ class MegatronFSDPConfig:
     fsdp_double_buffer: bool = False
     activation_checkpointing: bool = False
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """Convert config to dictionary (shallow, preserves objects)."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
@@ -477,13 +477,13 @@ class DDPConfig:
             self.activation_checkpointing_scope
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """Convert config to dictionary."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 _StrategyConfigClass = type[FSDP2Config] | type[MegatronFSDPConfig] | type[DDPConfig]
-_STRATEGY_MAP: Dict[str, _StrategyConfigClass] = {
+_STRATEGY_MAP: dict[str, _StrategyConfigClass] = {
     "fsdp2": FSDP2Config,
     "megatron_fsdp": MegatronFSDPConfig,
     "megatron-fsdp": MegatronFSDPConfig,

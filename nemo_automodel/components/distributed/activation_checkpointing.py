@@ -25,26 +25,34 @@ other way around -- so the dependency stays one-directional and the central
 parallelizer file stays small.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import ModuleType
-from typing import List
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
+from torch._ops import OperatorBase, OpOverloadPacket
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
     CheckpointWrapper,
     checkpoint_wrapper,
 )
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+from torch.utils.checkpoint import CheckpointPolicy, SelectiveCheckpointContext, create_selective_checkpoint_contexts
 
+from nemo_automodel.components.distributed._patching import get_undeclared_attr, set_undeclared_attr
 from nemo_automodel.shared.import_utils import get_torch_version, safe_import
+
+if TYPE_CHECKING:
+    from torch.utils._python_dispatch import TorchDispatchMode
 
 __all__ = [
     "SELECTIVE_AC_WRAPPER_FLAG",
@@ -79,19 +87,22 @@ def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
     return getattr(module, "_checkpoint_wrapped_module", module)
 
 
-def _resolve_torch_op(dotted_path: str):
+def _resolve_torch_op(dotted_path: str) -> OperatorBase | None:
     """Resolve a dotted ``torch.ops`` path, defaulting to the ``default`` overload."""
     if dotted_path.count(".") == 1:
         dotted_path = f"{dotted_path}.default"
     return _resolve_op_attr(torch.ops, dotted_path)
 
 
-def _resolve_op_attr(root: ModuleType, dotted_path: str):
-    """Resolve a dotted attribute path from ``root``, or ``None`` if any part is absent.
+def _resolve_op_attr(root: ModuleType, dotted_path: str) -> OperatorBase | None:
+    """Resolve a dotted attribute path from ``root`` to an operator, or ``None`` if any part is absent.
 
     Used for ops that live outside ``torch.ops`` (higher-order ops, optional
     custom backends such as DeepEP/HybridEP). Missing namespaces/ops raise
     ``AttributeError`` on access, so they are swallowed and reported as ``None``.
+    A path that resolves to something other than an operator overload or a
+    higher-order operator (for example an overload packet) is also reported as
+    ``None``: selective AC dispatches and matches only those.
     """
     obj = root
     try:
@@ -99,10 +110,10 @@ def _resolve_op_attr(root: ModuleType, dotted_path: str):
             obj = getattr(obj, part)
     except AttributeError:
         return None
-    return obj
+    return obj if isinstance(obj, OperatorBase) else None
 
 
-def _existing_ops(*ops):
+def _existing_ops(*ops: OperatorBase | None) -> frozenset[OperatorBase]:
     return frozenset(op for op in ops if op is not None)
 
 
@@ -121,24 +132,27 @@ _SELECTIVE_AC_MATMUL_OPS = _existing_ops(
 )
 
 
-def _default_compute_intensive_ops() -> tuple:
+def _default_compute_intensive_ops() -> tuple[OperatorBase, ...]:
     """Compute-intensive aten ops from PyTorch's partitioner, or ``()`` if unavailable.
 
     Mirrors TorchTitan: seeding from PyTorch's own ``compute_intensive_ops`` list
     keeps the save-set in sync with upstream rather than relying on a frozen,
     hand-maintained list. ``torch._functorch.partitioners`` is a private API, so
     any failure falls back to the curated supplement in
-    :func:`_build_selective_ac_save_ops`.
+    :func:`_build_selective_ac_save_ops`. The list is typed as plain callables
+    upstream; its entries are op overload packets, and anything else is skipped.
     """
     try:
         from torch._functorch.partitioners import get_default_op_list
 
-        return tuple(op.default for op in get_default_op_list().compute_intensive_ops)
+        return tuple(
+            op.default for op in get_default_op_list().compute_intensive_ops if isinstance(op, OpOverloadPacket)
+        )
     except (ImportError, AttributeError):
         return ()
 
 
-def _ffpa_forward_ops() -> tuple:
+def _ffpa_forward_ops() -> tuple[OperatorBase | None, ...]:
     """FFPA forward ops (dense + varlen); import the CuTeDSL kernel so they register first, else ``()``.
 
     Their ops register only on that import, which otherwise lands after this
@@ -154,14 +168,14 @@ def _ffpa_forward_ops() -> tuple:
     )
 
 
-def _build_selective_ac_save_ops() -> frozenset:
+def _build_selective_ac_save_ops() -> frozenset[OperatorBase]:
     """Build the set of ops whose activations are always saved under selective AC.
 
     The set is seeded from PyTorch's compute-intensive op list and supplemented
     with attention variants, low-precision/reduction ops, the compiled HOP, and
     communication collectives whose outputs are expensive to recompute.
     """
-    save_ops = set(_default_compute_intensive_ops())
+    save_ops: set[OperatorBase] = set(_default_compute_intensive_ops())
 
     # Compute ops the partitioner list may not classify as compute-intensive.
     compute_ops = _existing_ops(
@@ -243,13 +257,21 @@ def is_selective_activation_checkpointing(activation_checkpointing: bool | str |
     )
 
 
-def _is_cuda_to_cpu_copy(func, args, kwargs) -> bool:
+def _is_cuda_to_cpu_copy(func: OperatorBase, args: Sequence[object], kwargs: Mapping[str, object]) -> bool:
+    """Return whether a dispatched op is an ``aten._to_copy`` from a CUDA tensor to the CPU.
+
+    Args:
+        func: The dispatched operator.
+        args: The op's positional arguments; for ``aten._to_copy`` the first is the
+            source tensor (any shape).
+        kwargs: The op's keyword arguments; ``device`` is the copy's target device.
+    """
     if func != _SELECTIVE_AC_TO_COPY_OP or not args:
         return False
     tensor = args[0]
     src_device = getattr(tensor, "device", None)
     target_device = kwargs.get("device")
-    if target_device is None:
+    if not isinstance(target_device, (torch.device, str, int)):
         return False
     try:
         target_device = torch.device(target_device)
@@ -266,7 +288,9 @@ _SELECTIVE_AC_TRACE = os.environ.get("NEMO_SELECTIVE_AC_TRACE", "0").lower() not
 _SELECTIVE_AC_TRACE_SEEN: set[str] = set()
 
 
-def _maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, is_recompute: bool) -> None:
+def _maybe_trace_selective_ac_decision(
+    func: OperatorBase, decision: CheckpointPolicy, is_alternating: bool, *, is_recompute: bool
+) -> None:
     """Log a selective-AC decision once per op (no-op unless tracing is enabled).
 
     Args:
@@ -291,7 +315,7 @@ def _maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, 
     logger.info("[selective-ac] %s -> %s", key, verdict)
 
 
-def ignore_sac_ops(ops: list[torch._ops.OpOverload | torch._ops.HigherOrderOperator | None]) -> None:
+def ignore_sac_ops(ops: Iterable[OperatorBase | None]) -> None:
     """Add available operators to PyTorch's selective-AC ignore set.
 
     Args:
@@ -396,12 +420,17 @@ def ensure_moe_recompute_cache_ops_sac_ignored() -> None:
     ignore_sac_ops([getattr(getattr(torch.ops.aten, "new_empty", None), "default", None)])
 
 
-def make_selective_checkpoint_context_fn():
-    """Build a TorchTitan-style selective activation checkpointing context."""
+def make_selective_checkpoint_context_fn() -> Callable[[], tuple[TorchDispatchMode, TorchDispatchMode]]:
+    """Build a TorchTitan-style selective activation checkpointing context.
+
+    Returns:
+        A ``context_fn`` for non-reentrant checkpointing that returns the
+        ``(forward, recompute)`` selective-checkpoint dispatch modes.
+    """
     ensure_profiler_ops_sac_ignored()
     ensure_fsdp_ops_sac_ignored()
 
-    def selective_checkpointing_context_fn():
+    def selective_checkpointing_context_fn() -> tuple[TorchDispatchMode, TorchDispatchMode]:
         # Count matmuls separately for the forward and recompute passes. torch
         # calls ``context_fn`` once per checkpointed region, so a single shared
         # counter would continue from the forward count into recompute and flip
@@ -410,7 +439,9 @@ def make_selective_checkpoint_context_fn():
         # same matmul gets the same decision in both passes.
         mm_counts = {False: 0, True: 0}
 
-        def selective_checkpointing_policy(ctx, func, *args, **kwargs):
+        def selective_checkpointing_policy(
+            ctx: SelectiveCheckpointContext, func: OperatorBase, *args: object, **kwargs: object
+        ) -> CheckpointPolicy:
             is_alternating = func in _SELECTIVE_AC_MATMUL_OPS
             if is_alternating:
                 mm_counts[ctx.is_recompute] += 1
@@ -449,16 +480,64 @@ def _disable_dynamo_lru_cache() -> None:
     underlying API is private, so failures are swallowed.
     """
     try:
-        torch._C._dynamo.eval_frame._set_lru_cache(False)
+        # Present in torch 2.10 at runtime but missing from its type stubs.
+        set_lru_cache = get_undeclared_attr(torch._C._dynamo.eval_frame, "_set_lru_cache")
+        if not callable(set_lru_cache):
+            raise AttributeError("torch._C._dynamo.eval_frame has no callable _set_lru_cache")
+        set_lru_cache(False)
     except (AttributeError, RuntimeError):
         logger.debug("Could not disable dynamo LRU cache for selective AC + compile.", exc_info=True)
 
 
+class _ScaledDotProductAttention(Protocol):
+    """Call signature of ``torch.nn.functional.scaled_dot_product_attention``.
+
+    ``query`` is ``[..., L, E]``, ``key`` is ``[..., S, E]``, ``value`` is ``[..., S, Ev]`` and
+    ``attn_mask`` broadcasts to ``[..., L, S]``; the result is ``[..., L, Ev]``.
+    """
+
+    def __call__(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+    ) -> torch.Tensor:
+        """Compute scaled dot-product attention with the PyTorch SDPA semantics.
+
+        Args:
+            query: Tensor of shape [..., L, E], where ``L`` is the query sequence length
+                and ``E`` the query/key head dimension, with arbitrary leading dimensions
+                (typically [batch, heads]).
+            key: Tensor of shape [..., S, E] with ``query``'s leading dimensions, where
+                ``S`` is the key/value sequence length; with ``enable_gqa`` its head axis
+                (-3) may be smaller than ``query``'s.
+            value: Tensor of shape [..., S, Ev] with ``key``'s leading dimensions, where
+                ``Ev`` is the value head dimension.
+            attn_mask: Optional boolean mask (``True`` = attend) or additive float mask
+                that broadcasts to [..., L, S].
+            dropout_p: Dropout probability applied to the attention weights.
+            is_causal: Apply a causal (lower-triangular) mask; mutually exclusive with
+                ``attn_mask``.
+            scale: Softmax scale; ``None`` uses ``E ** -0.5``.
+            enable_gqa: Allow ``key``/``value`` to carry fewer heads (axis -3) than
+                ``query`` for grouped-query attention.
+
+        Returns:
+            Tensor of shape [..., L, Ev] with ``query``'s leading dimensions.
+        """
+        ...
+
+
 @contextmanager
-def _restore_sdpa_state(sdpa: Callable, backends: list[SDPBackend]):
+def _restore_sdpa_state(sdpa: _ScaledDotProductAttention, backends: list[SDPBackend]) -> Generator[None, None, None]:
     """Temporarily restore the SDPA callable and backend set captured during forward."""
     backward_sdpa = F.scaled_dot_product_attention
-    F.scaled_dot_product_attention = sdpa
+    set_undeclared_attr(F, "scaled_dot_product_attention", sdpa)
     try:
         with sdpa_kernel(backends):
             yield
@@ -466,7 +545,7 @@ def _restore_sdpa_state(sdpa: Callable, backends: list[SDPBackend]):
         F.scaled_dot_product_attention = backward_sdpa
 
 
-def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager[None], AbstractContextManager[None]]:
     """Snapshot the ambient SDPA state and restore it on checkpoint recompute.
 
     A ``context_fn`` for non-reentrant ``checkpoint_wrapper``: torch's
@@ -504,7 +583,7 @@ def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, Abstract
     return nullcontext(), _restore_sdpa_state(captured_sdpa, captured_backends)
 
 
-def _get_transformer_engine_attention_backend_cache() -> dict | None:
+def _get_transformer_engine_attention_backend_cache() -> dict[str, object] | None:
     """Return Transformer Engine's attention-backend cache when available."""
     available, dot_product_attention = safe_import(
         "transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention"
@@ -517,10 +596,10 @@ def _get_transformer_engine_attention_backend_cache() -> dict | None:
 
 @contextmanager
 def _restore_transformer_engine_attention_backend_cache(
-    cache: dict,
-    captured_cache: dict,
-    recompute_context: AbstractContextManager,
-):
+    cache: dict[str, object],
+    captured_cache: dict[str, object],
+    recompute_context: AbstractContextManager[object],
+) -> Generator[None, None, None]:
     """Restore the forward-entry TE attention cache only for recomputation."""
     backward_cache = dict(cache)
     cache.clear()
@@ -534,8 +613,8 @@ def _restore_transformer_engine_attention_backend_cache(
 
 
 def transformer_engine_attention_backend_snapshot_context_fn(
-    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
-) -> tuple[AbstractContextManager, AbstractContextManager]:
+    context_fn: Callable[[], tuple[AbstractContextManager[object], AbstractContextManager[object]]] | None = None,
+) -> tuple[AbstractContextManager[object], AbstractContextManager[object]]:
     """Snapshot Transformer Engine's attention-backend cache for checkpoint replay.
 
     Transformer Engine caches the parameters and result of attention-backend
@@ -579,12 +658,11 @@ def _wrap_first_existing_attr(
     attr_names: tuple[str, ...],
     *,
     skip: bool = False,
-    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
+    context_fn: Callable[[], tuple[AbstractContextManager[object], AbstractContextManager[object]]] | None = None,
 ) -> int:
     """Checkpoint-wrap the first matching registered child attr on ``module``."""
     if skip:
         return 0
-    checkpoint_kwargs = {} if context_fn is None else {"context_fn": context_fn}
     for attr in attr_names:
         child = getattr(module, attr, None)
         if isinstance(child, nn.Module):
@@ -593,16 +671,19 @@ def _wrap_first_existing_attr(
                 continue
             if hasattr(child, "_checkpoint_wrapped_module"):
                 return 0
-            setattr(module, child_name, checkpoint_wrapper(child, **checkpoint_kwargs))
+            wrapped_child = (
+                checkpoint_wrapper(child) if context_fn is None else checkpoint_wrapper(child, context_fn=context_fn)
+            )
+            setattr(module, child_name, wrapped_child)
             return 1
     return 0
 
 
 def apply_submodule_checkpointing(
-    layers: List[nn.Module],
+    layers: list[nn.Module],
     has_kv_sharing: bool,
     *,
-    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = (
+    context_fn: Callable[[], tuple[AbstractContextManager[object], AbstractContextManager[object]]] | None = (
         sdpa_backend_snapshot_context_fn
     ),
 ) -> None:
@@ -657,14 +738,17 @@ def apply_submodule_checkpointing(
         # Qwen2MoTDecoderLayer for the generation expert. mlp_moe_gen is a full
         # Qwen2MLP duplicate (same size as mlp), so omitting it from AC roughly
         # doubles per-layer activation memory in Stage-2 BAGEL training.
-        if hasattr(layer, "mlp_moe_gen"):
-            layer.mlp_moe_gen = checkpoint_wrapper(layer.mlp_moe_gen)  # type: ignore
+        # ``nn.Module.__getattr__`` types registered children as ``Tensor | Module``.
+        if hasattr(layer, "mlp_moe_gen") and isinstance(layer.mlp_moe_gen, nn.Module):
+            layer.mlp_moe_gen = checkpoint_wrapper(layer.mlp_moe_gen)
             wrapped_counts["mot"] += 1
-        if hasattr(layer, "input_layernorm_moe_gen"):
-            layer.input_layernorm_moe_gen = checkpoint_wrapper(layer.input_layernorm_moe_gen)  # type: ignore
+        if hasattr(layer, "input_layernorm_moe_gen") and isinstance(layer.input_layernorm_moe_gen, nn.Module):
+            layer.input_layernorm_moe_gen = checkpoint_wrapper(layer.input_layernorm_moe_gen)
             wrapped_counts["mot"] += 1
-        if hasattr(layer, "post_attention_layernorm_moe_gen"):
-            layer.post_attention_layernorm_moe_gen = checkpoint_wrapper(layer.post_attention_layernorm_moe_gen)  # type: ignore
+        if hasattr(layer, "post_attention_layernorm_moe_gen") and isinstance(
+            layer.post_attention_layernorm_moe_gen, nn.Module
+        ):
+            layer.post_attention_layernorm_moe_gen = checkpoint_wrapper(layer.post_attention_layernorm_moe_gen)
             wrapped_counts["mot"] += 1
     logger.info("Applied submodule activation checkpointing to %d layers: %s", len(layers), wrapped_counts)
 
@@ -685,7 +769,7 @@ def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Mo
     return False
 
 
-def apply_full_layer_checkpointing_to_layers(model: nn.Module, layers: List[nn.Module]) -> None:
+def apply_full_layer_checkpointing_to_layers(model: nn.Module, layers: list[nn.Module]) -> None:
     """Wrap transformer layers with non-reentrant activation checkpointing."""
     context_fn = functools.partial(
         transformer_engine_attention_backend_snapshot_context_fn,
@@ -741,7 +825,7 @@ def detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
 
 def apply_selective_checkpointing_to_layers(
     model: nn.Module,
-    layers: List[nn.Module],
+    layers: list[nn.Module],
     has_kv_sharing: bool,
     *,
     enable_compile: bool = False,

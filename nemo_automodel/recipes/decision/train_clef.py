@@ -111,7 +111,7 @@ class TrainClefDecisionRecipe(BaseRecipe):
         self.tag = "eval" if self.mode == "eval" else self.loss_config.mode
         self.seed = int(self.cfg.get("seed", 1234))
         self.output_dir = Path(self.cfg.get("output_dir", f"runs/clef_{self.tag}"))
-        self.device = self.dist_env.device
+        self.device = self.dist_env.device or torch.device("cpu")
         torch.manual_seed(self.seed)
 
         (

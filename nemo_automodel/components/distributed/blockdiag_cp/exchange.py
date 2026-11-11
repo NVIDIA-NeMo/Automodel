@@ -16,9 +16,72 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict
+
 import torch
 
 from nemo_automodel.components.distributed.blockdiag_cp.kernels import _cp_blockdiag_varlen, _varlen_seg_for_rank
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
+    from nemo_automodel.components.distributed.blockdiag_cp.kernels import _VarlenMeta
+
+
+class _BlockdiagKvPlan(TypedDict):
+    """Replicated needed-only K/V exchange plan; every list holds one entry per CP rank.
+
+    Attributes:
+        use_halo: Whether every rank's straddle fits in its left neighbor's chunk.
+        recv: Straddle tokens each rank receives from rank ``r - 1`` (``recv[0] == 0``).
+        send: Tokens each rank sends to rank ``r + 1`` (``send[-1] == 0``).
+        nreal: Real (non-padding) local query rows per rank.
+        s_first: First needed global K/V position per rank.
+        real_end: End (exclusive) of each rank's needed global K/V range.
+        rank: This rank's index within the CP group, added by the runtime.
+        world: CP world size, added by the runtime.
+    """
+
+    use_halo: bool
+    recv: list[int]
+    send: list[int]
+    nreal: list[int]
+    s_first: list[int]
+    real_end: list[int]
+    rank: NotRequired[int]
+    world: NotRequired[int]
+
+
+class _AllGatherSeqContext(Protocol):
+    """Autograd context fields saved by :class:`_AllGatherSeqDiff`."""
+
+    group: ProcessGroup
+    seq_dim: int
+    world: int
+
+
+class _LeftHaloContext(Protocol):
+    """Autograd context fields saved by :class:`_LeftHaloExchange`."""
+
+    group: ProcessGroup
+    halo_size: int
+    prev_peer: int
+    next_peer: int
+    shape: tuple[int, ...]
+
+
+class _NeededKVContext(Protocol):
+    """Autograd context fields and saved tensors of :class:`_NeededKVExchange`."""
+
+    group: ProcessGroup
+    in_splits: list[int]
+    out_splits: list[int]
+    local_len: int
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None: ...
+
+    @property
+    def saved_tensors(self) -> tuple[torch.Tensor, ...]: ...
 
 
 class _AllGatherSeqDiff(torch.autograd.Function):
@@ -34,8 +97,24 @@ class _AllGatherSeqDiff(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, group, seq_dim: int) -> torch.Tensor:
-        """All-gather ``x`` (this rank's shard) into the full sequence along ``seq_dim``."""
+    def forward(ctx: _AllGatherSeqContext, x: torch.Tensor, group: ProcessGroup, seq_dim: int) -> torch.Tensor:
+        """All-gather ``x`` (this rank's shard) into the full sequence along ``seq_dim``.
+
+        Args:
+            ctx: Autograd context; stores ``group``, ``seq_dim`` and the group size.
+            x: This rank's sequence shard, Tensor of shape [batch, heads, local_sequence,
+                head_dim] with ``seq_dim == 2`` at the block-diagonal SDPA call site, where
+                ``heads`` stacks the key heads followed by the value heads. Tensors of any
+                rank are accepted; ``x`` must have the same shape on every rank of
+                ``group``. ``x`` is not modified.
+            group: Process group (the CP group) to gather over.
+            seq_dim: Axis of ``x`` that holds the sequence shard.
+
+        Returns:
+            Tensor shaped like ``x`` except that the ``seq_dim`` extent is
+            ``world * local_sequence`` (for example [batch, heads, world * local_sequence,
+            head_dim]), with the shards concatenated in group-rank order.
+        """
         ctx.group = group
         ctx.seq_dim = seq_dim
         world = torch.distributed.get_world_size(group)
@@ -46,15 +125,27 @@ class _AllGatherSeqDiff(torch.autograd.Function):
         return torch.cat(gathered, dim=seq_dim)
 
     @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        """Reduce-scatter(SUM) the full-sequence gradient back to this rank's shard."""
+    def backward(ctx: _AllGatherSeqContext, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Reduce-scatter(SUM) the full-sequence gradient back to this rank's shard.
+
+        Args:
+            ctx: Autograd context holding the group, ``seq_dim`` and world size.
+            grad_outputs: Exactly one gradient of shape ``[B, H, L*world, D]``.
+
+        Returns:
+            The gradient of this rank's shard ``[B, H, L, D]``, then ``None`` for
+            ``group`` and ``seq_dim``.
+        """
+        (grad_out,) = grad_outputs
         chunks = [c.contiguous() for c in grad_out.chunk(ctx.world, dim=ctx.seq_dim)]
         local = torch.empty_like(chunks[0])
         torch.distributed.reduce_scatter(local, chunks, op=torch.distributed.ReduceOp.SUM, group=ctx.group)
         return local, None, None
 
 
-def _compute_blockdiag_kv_plan(doc_ids_full: torch.Tensor, world: int, local_len: int, dev) -> dict:
+def _compute_blockdiag_kv_plan(
+    doc_ids_full: torch.Tensor, world: int, local_len: int, dev: torch.device
+) -> _BlockdiagKvPlan:
     """Global left-halo exchange plan, computed from replicated ``doc_ids``.
 
     For each rank r the block-diagonal path needs the contiguous K/V range
@@ -119,8 +210,37 @@ class _LeftHaloExchange(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x_local, group, halo_size, prev_peer, next_peer):
-        """Exchange the chunk suffix; ``x_local`` is ``[B, C, L, D]``, returns ``[B, C, halo_size, D]``."""
+    def forward(
+        ctx: _LeftHaloContext,
+        x_local: torch.Tensor,
+        group: ProcessGroup,
+        halo_size: int,
+        prev_peer: int,
+        next_peer: int,
+    ) -> torch.Tensor:
+        """Exchange the chunk suffix; ``x_local`` is ``[B, C, L, D]``, returns ``[B, C, halo_size, D]``.
+
+        Args:
+            ctx: Autograd context; stores the group, ``halo_size``, both peers and
+                ``x_local``'s shape.
+            x_local: This rank's local sequence chunk, Tensor of shape [batch, channels,
+                local_sequence, head_dim] (``[B, C, L, D]``). At the call site ``channels``
+                stacks the key heads followed by the value heads. ``batch``, ``channels``
+                and ``head_dim`` must match on every rank, because the peer's suffix is
+                received into a buffer shaped from this rank's input. ``x_local`` is not
+                modified.
+            group: The CP process group.
+            halo_size: Number of trailing sequence positions sent to ``next_peer`` and
+                received from ``prev_peer``; uniform across ranks and at most
+                ``local_sequence``.
+            prev_peer: Global rank that sends this rank its chunk suffix.
+            next_peer: Global rank that receives this rank's chunk suffix.
+
+        Returns:
+            Tensor of shape [batch, channels, halo_size, head_dim] holding ``prev_peer``'s
+            last ``halo_size`` sequence positions in sequence order. Rank 0 receives the
+            last rank's suffix (the ring wraps around), which callers ignore.
+        """
         ctx.group = group
         ctx.halo_size = halo_size
         ctx.prev_peer = prev_peer
@@ -138,8 +258,18 @@ class _LeftHaloExchange(torch.autograd.Function):
         return recv_buf  # [B, C, halo_size, D] from prev rank's chunk suffix
 
     @staticmethod
-    def backward(ctx, grad_recv):
-        """Reverse exchange: route ``grad_recv`` ``[B, C, halo_size, D]`` back to the sending suffix."""
+    def backward(ctx: _LeftHaloContext, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
+        """Reverse exchange: route ``grad_recv`` ``[B, C, halo_size, D]`` back to the sending suffix.
+
+        Args:
+            ctx: Autograd context holding the peers, halo size and input shape.
+            grad_outputs: Exactly one gradient ``grad_recv`` of shape ``[B, C, halo_size, D]``.
+
+        Returns:
+            The gradient of ``x_local`` ``[B, C, L, D]`` (non-zero only on the sent
+            suffix), then ``None`` for the four non-tensor inputs.
+        """
+        (grad_recv,) = grad_outputs
         B, C, L, D = ctx.shape
         hs = ctx.halo_size
         grad_send = torch.empty(B, C, hs, D, dtype=grad_recv.dtype, device=grad_recv.device)
@@ -154,7 +284,19 @@ class _LeftHaloExchange(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
-def _blockdiag_halo_attention(query, key, value, doc_ids, group, plan, gm, row_offset, scale, backend, dropout_p):
+def _blockdiag_halo_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    doc_ids: torch.Tensor,
+    group: ProcessGroup,
+    plan: _BlockdiagKvPlan,
+    gm: _VarlenMeta,
+    row_offset: int,
+    scale: float | None,
+    backend: str,
+    dropout_p: float,
+) -> torch.Tensor | None:
     """Needed-only block-diagonal CP attention via the left-halo exchange.
 
     Each rank attends its local queries against ``[boundary-doc halo from rank-1] +
@@ -210,7 +352,7 @@ def _blockdiag_halo_attention(query, key, value, doc_ids, group, plan, gm, row_o
 
     # cu_seqlens are relative to s_first already; only the SLICE base changes: key_needed
     # IS the [s_first, real_end) slice, so index it at [0, recv+n_real).
-    local_meta = dict(gm)
+    local_meta = gm.copy()
     local_meta["s_first"] = 0
     local_meta["real_end"] = recv_count + n_real
     gm.setdefault(
@@ -239,7 +381,9 @@ def _blockdiag_halo_attention(query, key, value, doc_ids, group, plan, gm, row_o
     )
 
 
-def _needed_kv_a2a_plan(plan: dict, rank: int, world: int, local_len: int, dev):
+def _needed_kv_a2a_plan(
+    plan: _BlockdiagKvPlan, rank: int, world: int, local_len: int, dev: torch.device
+) -> tuple[list[int], list[int], torch.Tensor]:
     """Per-(src,dst) split sizes + local gather index for the general needed-only
     all-to-all-v exchange (the >2-rank / single-doc case the halo can't cover).
 
@@ -293,8 +437,40 @@ class _NeededKVExchange(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x_local, group, in_splits, out_splits, send_index):
-        """All-to-all-v ``x_local`` ``[B, C, L, D]`` into the needed range ``[B, C, R_recv, D]``."""
+    def forward(
+        ctx: _NeededKVContext,
+        x_local: torch.Tensor,
+        group: ProcessGroup,
+        in_splits: list[int],
+        out_splits: list[int],
+        send_index: torch.Tensor,
+    ) -> torch.Tensor:
+        """All-to-all-v ``x_local`` ``[B, C, L, D]`` into the needed range ``[B, C, R_recv, D]``.
+
+        ``send_index`` is the 1D int64 local token index (with duplication) of
+        the send buffer, of shape ``[sum(in_splits)]``.
+
+        Args:
+            ctx: Autograd context; stores the group, both split lists, the local length
+                and ``send_index``.
+            x_local: This rank's local sequence chunk, Tensor of shape [batch, channels,
+                local_sequence, head_dim] (``[B, C, L, D]``). At the call site ``channels``
+                stacks the key heads followed by the value heads. ``batch``, ``channels``
+                and ``head_dim`` must match on every rank. ``x_local`` is not modified.
+            group: The CP process group.
+            in_splits: Number of sequence positions sent to each CP rank, in rank order.
+            out_splits: Number of sequence positions received from each CP rank, in rank
+                order.
+            send_index: Int64 Tensor of shape [sum(in_splits)] indexing ``x_local``'s
+                sequence axis (axis 2). Indices are grouped by destination rank in rank
+                order, and a position repeats once for every destination that needs it.
+                Saved for backward.
+
+        Returns:
+            Tensor of shape [batch, channels, R_recv, head_dim], where
+            ``R_recv = sum(out_splits)``: the received positions concatenated in
+            source-rank order, which is this rank's contiguous needed global K/V range.
+        """
         ctx.group = group
         ctx.in_splits = in_splits
         ctx.out_splits = out_splits
@@ -315,8 +491,18 @@ class _NeededKVExchange(torch.autograd.Function):
         return recv_buf.permute(1, 2, 0, 3).contiguous()  # [B, C, Rrecv, D]
 
     @staticmethod
-    def backward(ctx, grad_out):
-        """Reverse all-to-all-v of ``grad_out`` ``[B, C, R_recv, D]``; multi-cast grads accumulate."""
+    def backward(ctx: _NeededKVContext, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
+        """Reverse all-to-all-v of ``grad_out`` ``[B, C, R_recv, D]``; multi-cast grads accumulate.
+
+        Args:
+            ctx: Autograd context holding the splits, local length and ``send_index``.
+            grad_outputs: Exactly one gradient ``grad_out`` of shape ``[B, C, R_recv, D]``.
+
+        Returns:
+            The gradient of ``x_local`` ``[B, C, L, D]``, then ``None`` for the four
+            remaining inputs.
+        """
+        (grad_out,) = grad_outputs
         (send_index,) = ctx.saved_tensors
         B, C, R, D = grad_out.shape
         gp = grad_out.permute(2, 0, 1, 3).contiguous()  # [Rrecv, B, C, D]
@@ -334,7 +520,19 @@ class _NeededKVExchange(torch.autograd.Function):
         return grad_x.permute(1, 2, 0, 3).contiguous(), None, None, None, None
 
 
-def _blockdiag_a2a_attention(query, key, value, doc_ids, group, plan, gm, row_offset, scale, backend, dropout_p):
+def _blockdiag_a2a_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    doc_ids: torch.Tensor,
+    group: ProcessGroup,
+    plan: _BlockdiagKvPlan,
+    gm: _VarlenMeta,
+    row_offset: int,
+    scale: float | None,
+    backend: str,
+    dropout_p: float,
+) -> torch.Tensor | None:
     """Needed-only block-diagonal CP attention via the general all-to-all-v exchange.
 
     Handles documents spanning >2 ranks (single long doc / unpacked long context)
@@ -375,7 +573,7 @@ def _blockdiag_a2a_attention(query, key, value, doc_ids, group, plan, gm, row_of
         out = torch.zeros_like(query)
         return out + 0.0 * (key_needed.sum() + value_needed.sum()).to(out.dtype)
     needed_len = plan["real_end"][rank] - plan["s_first"][rank]
-    local_meta = dict(gm)
+    local_meta = gm.copy()
     local_meta["s_first"] = 0
     local_meta["real_end"] = needed_len
     gm.setdefault(

@@ -12,29 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import contextlib
+from collections.abc import Generator, Mapping
+from contextlib import AbstractContextManager
 from functools import partial
-from typing import Any, List, Set
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
+    ShardContextFactory,
+    ShardedBatch,
     ShardLayout,
+    TokenBatch,
     identity_local_indices,
     round_robin_local_indices,
     shard_batch_identity,
     shard_batch_load_balanced,
 )
 from nemo_automodel.components.distributed.thd_utils import (
+    THDBatch,
+    batch_tensor,
     split_batch_into_thd_chunks,
     thd_padding_mask_from_token_ids,
 )
 
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel.magi import MagiState
+
+# Type of the source-batch entries that THD conversion passes through unchanged.
+_V = TypeVar("_V")
+
 
 @contextlib.contextmanager
-def cp_dispatcher_suspended(cp_mesh):
+def cp_dispatcher_suspended(cp_mesh: DeviceMesh | None) -> Generator[None, None, None]:
     """Temporarily suspend torch's ``context_parallel`` ring-SDPA monkeypatch.
 
     A model that embeds and sequence-shards its own primary stream in ``forward``
@@ -81,20 +96,30 @@ def cp_dispatcher_suspended(cp_mesh):
 
 
 # based on https://github.com/pytorch/torchtitan/blob/0b44d4c437c424b6bf719661c0eb4283dc4068bc/torchtitan/distributed/utils.py#L180  # pylint: disable=C0301
-def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool, cp_context=None):
+def get_train_context(
+    enable_loss_parallel: bool,
+    enable_compiled_autograd: bool,
+    cp_context: AbstractContextManager[None] | None = None,
+) -> ShardContextFactory:
     """
     Create a train context.
 
     Args:
         enable_loss_parallel (bool): Whether to enable loss parallelism.
         enable_compiled_autograd (bool): Whether to enable compiled autograd.
+        cp_context: Optional context-parallel context entered after the SDPA backend selection.
+
+    Returns:
+        A zero-argument factory of the combined train context.
     """
 
     @contextlib.contextmanager
-    def context():
+    def context() -> Generator[None, None, None]:
         with contextlib.ExitStack() as stack:
             if enable_loss_parallel:
-                stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
+                from torch.distributed.tensor.parallel import loss_parallel
+
+                stack.enter_context(loss_parallel())
 
             if enable_compiled_autograd:
                 stack.enter_context(torch._dynamo.utils.maybe_enable_compiled_autograd(True))
@@ -115,21 +140,25 @@ def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool
 # based on https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/utils.py#L113
 def create_context_parallel_ctx(
     cp_mesh: DeviceMesh,
-    cp_buffers: List[torch.Tensor],
-    cp_seq_dims: List[int],
-    cp_no_restore_buffers: Set[torch.Tensor],
+    cp_buffers: list[torch.Tensor],
+    cp_seq_dims: list[int],
+    cp_no_restore_buffers: set[torch.Tensor],
     cp_rotate_method: str | None = None,
-):
+) -> AbstractContextManager[None]:
     """
     Create a context parallel context.
 
     Args:
         cp_mesh (DeviceMesh): The device mesh for context parallel.
-        cp_buffers (List[torch.Tensor]): The buffers for context parallel.
+        cp_buffers (List[torch.Tensor]): The buffers for context parallel, each
+            of shape [..., sequence, ...] with the sequence axis given by ``cp_seq_dims``.
         cp_seq_dims (List[int]): The sequence dimensions for context parallel.
         cp_no_restore_buffers (Set[torch.Tensor]): The no restore buffers for context parallel.
         cp_rotate_method (str): The rotation method for context parallel,
             such as "allgather" or "addtoall".
+
+    Returns:
+        The torch ``context_parallel`` context that shards the buffers in place on entry.
     """
     from torch.distributed.tensor.experimental import context_parallel
     from torch.distributed.tensor.experimental._attention import set_rotate_method
@@ -167,7 +196,7 @@ def _shard_grad_buffer_for_cp(buffer: torch.Tensor, seq_dim: int, cp_mesh: Devic
     return torch.cat((head_chunk, tail_chunk), dim=seq_dim)
 
 
-def attach_context_parallel_hooks(model: torch.nn.Module):
+def attach_context_parallel_hooks(model: torch.nn.Module) -> None:
     """Attach forward pre-hooks to self_attn modules to fix attention masks for context parallelism.
 
     Context parallelism shards Q/K/V on the sequence dimension as DTensors,
@@ -179,7 +208,9 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
     Based on ``accelerate.big_modeling._attach_context_parallel_hooks``.
     """
 
-    def _self_attn_pre_forward_hook(_module, module_args, module_kwargs):
+    def _self_attn_pre_forward_hook(
+        _module: torch.nn.Module, module_args: tuple[object, ...], module_kwargs: dict[str, object]
+    ) -> tuple[tuple[object, ...], dict[str, object]]:
         if "attention_mask" in module_kwargs:
             module_kwargs["attention_mask"] = None
             module_kwargs["is_causal"] = True
@@ -216,11 +247,11 @@ def attach_te_context_parallel(
         raise ImportError("Transformer Engine attention is required for dense TE parallelism.")
 
     cp_size = cp_mesh.size() if cp_mesh is not None else 1
-    cp_group = cp_mesh.get_group() if cp_size > 1 else None
+    cp_group = cp_mesh.get_group() if cp_mesh is not None and cp_size > 1 else None
     cp_ranks = torch.distributed.get_process_group_ranks(cp_group) if cp_group is not None else None
     cp_stream = torch.cuda.Stream() if cp_group is not None else None
     tp_size = tp_mesh.size() if tp_mesh is not None else 1
-    tp_group = tp_mesh.get_group() if tp_size > 1 else None
+    tp_group = tp_mesh.get_group() if tp_mesh is not None and tp_size > 1 else None
     configured = 0
     for name, module in model.named_modules():
         if not name.endswith("self_attn"):
@@ -250,7 +281,7 @@ def attach_te_context_parallel(
     return configured
 
 
-def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
+def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh: DeviceMesh | None) -> None:
     """Inject CP-aware SDPA into self_attn modules for compile + CP>1 correctness.
 
     Problem: when per-layer torch.compile is active, Dynamo traces through the decoder
@@ -268,6 +299,11 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
       - Everything after (O proj + residual + MLP) is compiled and fused.
 
     Seq dim at the SDPA call is 2: tensors are [B, nH, S/cp_size, D] after HF reshape.
+
+    Args:
+        model: Model whose ``self_attn`` sub-modules receive the hooks.
+        cp_mesh: One-dimensional context-parallel mesh the local Q/K/V shards are wrapped
+            on; None defers to DTensor's current mesh context.
     """
     import torch.nn.functional as F_module
     from torch.distributed.tensor import DTensor, Shard
@@ -276,8 +312,33 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
 
     @torch._dynamo.disable
     def _cp_sdpa(
-        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False, **kwargs
-    ):
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+        scale: float | None = None,
+        enable_gqa: bool = False,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """CP-aware drop-in for ``F.scaled_dot_product_attention``.
+
+        Args:
+            query: Local query shard of shape [batch, heads, sequence / cp_size, head_dim],
+                or a DTensor sharded on axis 2 over ``cp_mesh``.
+            key: Local key shard with the same layout as ``query``.
+            value: Local value shard with the same layout as ``query``.
+            attn_mask: Optional attention mask forwarded to SDPA.
+            dropout_p: Attention dropout probability.
+            is_causal: Whether SDPA applies a causal mask.
+            scale: Optional softmax scale.
+            enable_gqa: Whether SDPA broadcasts grouped key/value heads.
+            **kwargs: Further SDPA keyword arguments, forwarded unchanged.
+
+        Returns:
+            Local attention output of shape [batch, heads, sequence / cp_size, head_dim].
+        """
         # Re-wrap local Q/K/V as DTensors so DTensor SDPA dispatch fires the CP allgather.
         # Seq dim is 2: [B, nH, S/cp_size, D].
         if not isinstance(query, DTensor):
@@ -298,11 +359,13 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
         # Unwrap back to local tensor for the compiled O-proj + MLP region.
         return out.to_local() if isinstance(out, DTensor) else out
 
-    def _pre_hook(module, args, kwargs):
+    def _pre_hook(
+        module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> tuple[tuple[object, ...], dict[str, object]]:
         F_module.scaled_dot_product_attention = _cp_sdpa
         return args, kwargs
 
-    def _post_hook(module, inputs, output):
+    def _post_hook(module: torch.nn.Module, inputs: tuple[object, ...], output: object) -> None:
         F_module.scaled_dot_product_attention = _original_sdpa
 
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
@@ -319,20 +382,20 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_hook(_post_hook, always_call=True)
 
 
-def _get_submesh(device_mesh, dim: str):
+def _get_submesh(device_mesh: DeviceMesh | None, dim: str) -> DeviceMesh | None:
     """The named submesh, or None when the mesh or dimension is absent."""
     if device_mesh is None or dim not in getattr(device_mesh, "mesh_dim_names", ()):
         return None
     return device_mesh[dim]
 
 
-def _mesh_dim_size(device_mesh, dim: str) -> int:
+def _mesh_dim_size(device_mesh: DeviceMesh | None, dim: str) -> int:
     """Size of a named submesh, 0 when the mesh or dimension is absent."""
     submesh = _get_submesh(device_mesh, dim)
     return submesh.size() if submesh is not None else 0
 
 
-def _attention_backend(model) -> str | None:
+def _attention_backend(model: torch.nn.Module | None) -> str | None:
     """Read the configured attention backend from a live model."""
     backend = getattr(getattr(model, "backend", None), "attn", None)
     if backend is not None:
@@ -347,12 +410,12 @@ def _attention_backend(model) -> str | None:
     return None
 
 
-def _uses_te_attention(model) -> bool:
+def _uses_te_attention(model: torch.nn.Module | None) -> bool:
     """Whether a live model uses native or injected TE attention."""
     return _attention_backend(model) == "te" or bool(getattr(model, "_te_attention_injected", False))
 
 
-def _is_multimodal_model(model) -> bool:
+def _is_multimodal_model(model: torch.nn.Module) -> bool:
     """Whether a live model owns a vision or audio tower."""
     config = getattr(model, "config", None)
     return any(getattr(config, name, None) is not None for name in ("vision_config", "audio_config")) or any(
@@ -361,7 +424,7 @@ def _is_multimodal_model(model) -> bool:
     )
 
 
-def _magi_state_from_model(model, device_mesh):
+def _magi_state_from_model(model: torch.nn.Module | None, device_mesh: DeviceMesh | None) -> MagiState | None:
     """Recreate the per-forward Magi handle from the model and device mesh."""
     if model is None or _attention_backend(model) != "magi":
         return None
@@ -464,14 +527,14 @@ def _prepare_cp_sharder(
 
 
 def _resolve_cp_sharder(
-    cp_mesh,
+    cp_mesh: DeviceMesh | None,
     model_sharder: ContextParallelSharder | None,
     *,
-    magi,
+    magi: MagiState | None,
     is_thd: bool,
     num_chunks: int,
     seq_lens_padding_value: int,
-    model,
+    model: torch.nn.Module | None,
     extra_seq_buffers: dict[str, int] | None = None,
 ) -> ContextParallelSharder:
     """Resolve the ContextParallelSharder for this forward: model-owned > magi > TE > generic > none.
@@ -502,7 +565,27 @@ def _resolve_cp_sharder(
         # context_parallel.magi. The dispatch-solver partition is data-dependent, so
         # shard_batch installs the index map it just computed (magi's
         # get_position_ids) on the sharder for the token verbs.
-        def _shard_batch_magi(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        def _shard_batch_magi(
+            cp_mesh: DeviceMesh | None,
+            tp_mesh: DeviceMesh | None,
+            batch: TokenBatch,
+            *,
+            loss_mask: torch.Tensor | None = None,
+            padding_token_id: int = 0,
+        ) -> tuple[ShardContextFactory, ShardedBatch, ShardLayout | None]:
+            """Dispatch the batch with MagiAttention and report the partition it applied.
+
+            Args:
+                cp_mesh: Context-parallel submesh, unused by magi's own transport.
+                tp_mesh: Tensor-parallel submesh, unused.
+                batch: Full-sequence token tensors; ``input_ids`` has shape [batch, sequence].
+                loss_mask: Unused per-token mask of shape [batch, sequence].
+                padding_token_id: Pad sentinel for ``input_ids``.
+
+            Returns:
+                ``(contextlib.nullcontext, dispatched_batch, layout)``; the layout carries the
+                [local_tokens] global index map when magi dispatched the sequence.
+            """
             input_ids = batch.get("input_ids")
             row_shape = tuple(input_ids.shape[:2]) if input_ids is not None and input_ids.dim() >= 2 else None
             prepped, local_indices = magi.make_cp_batch(
@@ -543,9 +626,33 @@ def _resolve_cp_sharder(
         # verbs (chunked streams carry none). The BSHD->THD flatten is a pure
         # reshape, so the pre-flatten row shape is the caller's coordinate
         # system and the stream length is rows x cols.
-        def _shard_batch_te(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        def _shard_batch_te(
+            cp_mesh: DeviceMesh | None,
+            tp_mesh: DeviceMesh | None,
+            batch: Mapping[str, _V],
+            *,
+            loss_mask: torch.Tensor | None = None,
+            padding_token_id: int = 0,
+        ) -> tuple[ShardContextFactory, THDBatch[_V], ShardLayout | None]:
+            """Convert the batch to THD, shard it with TE, and report the partition.
+
+            Args:
+                cp_mesh: Context-parallel submesh, or None for an unsharded conversion.
+                tp_mesh: Tensor-parallel submesh, unused.
+                batch: Packed token tensors with ``input_ids`` of shape [batch, sequence]
+                    and the ``seq_lens``/``seq_lens_padded`` pack metadata; other
+                    entries pass through.
+                loss_mask: Unused per-token mask of shape [batch, sequence].
+                padding_token_id: Pad sentinel for ``input_ids``.
+
+            Returns:
+                ``(contextlib.nullcontext, thd_batch, layout)``; the layout carries this rank's
+                [local_tokens] global index map unless the stream is chunked.
+            """
             input_ids = batch.get("input_ids")
-            row_shape = tuple(input_ids.shape[:2]) if input_ids is not None and input_ids.dim() >= 2 else None
+            row_shape = (
+                tuple(input_ids.shape[:2]) if isinstance(input_ids, torch.Tensor) and input_ids.dim() >= 2 else None
+            )
             prepped, local_indices = make_cp_batch_for_te(
                 cp_mesh,
                 batch,
@@ -612,18 +719,18 @@ def unshard_context_parallel_tensor(
 
 
 def _make_cp_batch_and_ctx(
-    device_mesh,
-    batch,
-    loss_mask=None,
+    device_mesh: DeviceMesh | None,
+    batch: TokenBatch,
+    loss_mask: torch.Tensor | None = None,
     use_te: bool = False,
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
-    magi=None,
-    model=None,
+    magi: MagiState | None = None,
+    model: torch.nn.Module | None = None,
     cp_sharder: ContextParallelSharder | None = None,
     extra_seq_buffers: dict[str, int] | None = None,
-):
+) -> tuple[ShardContextFactory, ShardedBatch, ContextParallelSharder]:
     """
     Resolve a ContextParallelSharder and shard the batch; a no-op when no CP prep applies.
 
@@ -640,6 +747,8 @@ def _make_cp_batch_and_ctx(
     Args:
         device_mesh (DeviceMesh): The device mesh; its ``cp``/``tp`` submeshes are read.
         batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
+            token tensors such as ``input_ids`` of shape [batch, sequence].
+        loss_mask: Optional per-token mask of shape [batch, sequence], sharded with the batch.
 
     Returns:
         tuple (contextmanager, dict[str, torch.Tensor], ContextParallelSharder): The forward
@@ -677,15 +786,40 @@ def _make_cp_batch_and_ctx(
     return ctx, batch, sharder
 
 
+@overload
 def make_cp_batch_for_te(
-    cp_mesh,
-    batch,
-    qkv_format="thd",
+    cp_mesh: DeviceMesh | None,
+    batch: Mapping[str, _V],
+    qkv_format: str = ...,
+    padding_token_id: int = ...,
+    num_chunks: int = ...,
+    seq_lens_padding_value: int = ...,
+    return_local_indices: Literal[False] = ...,
+) -> THDBatch[_V]: ...
+
+
+@overload
+def make_cp_batch_for_te(
+    cp_mesh: DeviceMesh | None,
+    batch: Mapping[str, _V],
+    qkv_format: str = ...,
+    padding_token_id: int = ...,
+    num_chunks: int = ...,
+    seq_lens_padding_value: int = ...,
+    *,
+    return_local_indices: Literal[True],
+) -> tuple[THDBatch[_V], torch.Tensor | None]: ...
+
+
+def make_cp_batch_for_te(
+    cp_mesh: DeviceMesh | None,
+    batch: Mapping[str, _V],
+    qkv_format: str = "thd",
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
     return_local_indices: bool = False,
-):
+) -> THDBatch[_V] | tuple[THDBatch[_V], torch.Tensor | None]:
     """
     Build a CP batch for Transformer Engine using THD format.
 
@@ -702,12 +836,13 @@ def make_cp_batch_for_te(
     Args:
         cp_mesh (DeviceMesh or None): The device mesh for context parallel. If None or
             size <= 1, returns the batch in THD format without sharding.
-        batch (Dict[str, torch.Tensor]): The input batch in BSHD format containing:
+        batch (Mapping[str, _V]): The input batch in BSHD format containing:
             - input_ids: Input token IDs [batch_size, seq_len] or [batch_size, seq_len, hidden_dim]
             - labels: Label token IDs [batch_size, seq_len]
             - position_ids (optional): Position IDs [batch_size, seq_len]
             - seq_lens: Actual sequence lengths [batch_size, num_packs]
             - seq_lens_padded: Padded sequence lengths [batch_size, num_packs]
+            Other entries (e.g. VLM media) pass through, except in chunked CP mode.
         qkv_format (str): Format for QKV tensors. Currently only "thd" is supported.
         padding_token_id (int): Token ID used for padding in input_ids (default: 0)
         num_chunks (int): Number of chunks to split the batch into. If > 1, the batch
@@ -722,7 +857,9 @@ def make_cp_batch_for_te(
 
     Returns:
         dict: Processed batch in THD format (or ``(dict, LongTensor | None)``
-        when ``return_local_indices``) with the following keys:
+        when ``return_local_indices``). Without a CP mesh it is the THD conversion's
+        batch; sharded batches add the ``qkv_format``, ``pad_between_seqs``,
+        ``cp_size`` and ``cp_rank`` entries. Keys:
             - input_ids: Sharded input token IDs [total_tokens] or [num_chunks, chunk_tokens]
             - labels: Sharded labels [total_tokens] or [num_chunks, chunk_tokens]
             - position_ids: Generated and sharded position IDs [total_tokens] or [num_chunks, chunk_tokens]
@@ -762,7 +899,7 @@ def make_cp_batch_for_te(
     if qkv_format != "thd":
         raise ValueError(f"Currently only 'thd' format is supported, got: {qkv_format}")
 
-    batch = split_batch_into_thd_chunks(
+    thd_batch = split_batch_into_thd_chunks(
         batch,
         num_chunks=num_chunks,
         seq_lens_padding_value=seq_lens_padding_value,
@@ -771,39 +908,39 @@ def make_cp_batch_for_te(
 
     if cp_mesh is None or cp_mesh.size() <= 1:
         if not return_local_indices:
-            return batch
+            return thd_batch
         # Unsharded THD stream: identity index map. Chunked streams are
         # per-chunk token spaces with no single step-wide map -> None.
-        input_ids = batch["input_ids"]
+        input_ids = batch_tensor(thd_batch, "input_ids")
         local_indices = (
             torch.arange(input_ids.shape[-1], device=input_ids.device, dtype=torch.long) if num_chunks <= 1 else None
         )
-        return batch, local_indices
+        return thd_batch, local_indices
 
     if num_chunks <= 1:
         sharded, local_indices = _shard_thd_chunk_for_te(
-            batch, cp_mesh, qkv_format, seq_lens_padding_value, padding_token_id
+            thd_batch, cp_mesh, qkv_format, seq_lens_padding_value, padding_token_id
         )
         return (sharded, local_indices) if return_local_indices else sharded
 
     # Extract each chunk from the batched result and shard it
     chunks = []
     for i in range(num_chunks):
-        chunk_batch = {k: v[i] if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        chunk_batch = {k: v[i] if isinstance(v, torch.Tensor) else v for k, v in thd_batch.items()}
         chunks.append(
             _shard_thd_chunk_for_te(chunk_batch, cp_mesh, qkv_format, seq_lens_padding_value, padding_token_id)[0]
         )
 
-    return_dict = {
-        "input_ids": torch.stack([chunk["input_ids"] for chunk in chunks]),
-        "labels": torch.stack([chunk["labels"] for chunk in chunks]),
-        "position_ids": torch.stack([chunk["position_ids"] for chunk in chunks]),
-        "cu_seqlens": torch.stack([chunk["cu_seqlens"] for chunk in chunks]),
-        "cu_seqlens_padded": torch.stack([chunk["cu_seqlens_padded"] for chunk in chunks]),
+    return_dict: THDBatch[_V] = {
+        "input_ids": torch.stack([batch_tensor(chunk, "input_ids") for chunk in chunks]),
+        "labels": torch.stack([batch_tensor(chunk, "labels") for chunk in chunks]),
+        "position_ids": torch.stack([batch_tensor(chunk, "position_ids") for chunk in chunks]),
+        "cu_seqlens": torch.stack([batch_tensor(chunk, "cu_seqlens") for chunk in chunks]),
+        "cu_seqlens_padded": torch.stack([batch_tensor(chunk, "cu_seqlens_padded") for chunk in chunks]),
         "pad_between_seqs": False,
-        "max_seqlen": torch.stack([chunk["max_seqlen"] for chunk in chunks]),
+        "max_seqlen": torch.stack([batch_tensor(chunk, "max_seqlen") for chunk in chunks]),
         "qkv_format": qkv_format,
-        "padding_mask": torch.stack([chunk["padding_mask"] for chunk in chunks]),
+        "padding_mask": torch.stack([batch_tensor(chunk, "padding_mask") for chunk in chunks]),
         "cp_size": cp_mesh.size() if cp_mesh is not None else 1,
         "cp_rank": torch.distributed.get_rank(group=cp_mesh.get_group()) if cp_mesh is not None else 0,
     }
@@ -814,24 +951,45 @@ def make_cp_batch_for_te(
 
 
 def _shard_thd_chunk_for_te(
-    batch,
-    cp_mesh,
-    qkv_format,
-    seq_lens_padding_value,
-    padding_token_id,
-):
+    batch: THDBatch[_V],
+    cp_mesh: DeviceMesh,
+    qkv_format: str,
+    seq_lens_padding_value: int,
+    padding_token_id: int,
+) -> tuple[THDBatch[_V], torch.Tensor]:
+    """Shard one THD stream across the CP group with TE's partitioning.
+
+    Args:
+        batch: One THD stream: ``input_ids``/``labels``/``position_ids`` of shape
+            [tokens], optional ``padding_mask`` [tokens], and ``cu_seqlens`` /
+            optional ``cu_seqlens_padded`` of shape [sequences + 1] (padded with
+            ``seq_lens_padding_value``), plus pass-through entries. Token entries
+            are partitioned in place.
+        cp_mesh: Context-parallel mesh of size ``C``.
+        qkv_format: Format tag stored in the result (``"thd"``).
+        seq_lens_padding_value: Sentinel padding the boundary tensors.
+        padding_token_id: Pad id used to derive ``padding_mask`` when absent.
+
+    Returns:
+        The local THD batch (token tensors of shape [tokens / C] plus the
+        ``qkv_format``, ``pad_between_seqs``, ``cp_size`` and ``cp_rank`` entries)
+        and this rank's global token indices of shape [tokens / C].
+
+    Raises:
+        ValueError: If the stream has no ``cu_seqlens`` boundaries (BSHD input).
+    """
     import transformer_engine_torch as tex
 
     cu_seqlens = batch.get("cu_seqlens", None)
     cu_seqlens_padded = batch.get("cu_seqlens_padded", batch["cu_seqlens"])
-    filtered_cu_seqlens_padded = cu_seqlens_padded[cu_seqlens_padded != seq_lens_padding_value]
 
     # Check for required fields - BSHD format is not supported
-    if cu_seqlens is None or cu_seqlens_padded is None:
+    if not isinstance(cu_seqlens, torch.Tensor) or not isinstance(cu_seqlens_padded, torch.Tensor):
         raise ValueError(
             "BSHD format is not supported. Both 'cu_seqlens' and 'cu_seqlens_padded' must be present in the batch. "
             "Please use packed sequence format with cu_seqlens and cu_seqlens_padded."
         )
+    filtered_cu_seqlens_padded = cu_seqlens_padded[cu_seqlens_padded != seq_lens_padding_value]
 
     cp_size = cp_mesh.size()
 
@@ -841,25 +999,26 @@ def _shard_thd_chunk_for_te(
     # rank's local-token global index map, returned so the caller can install
     # it on the THD sharder (ContextParallelSharder token verbs).
     local_indices = tex.thd_get_partitioned_indices(
-        filtered_cu_seqlens_padded, batch["input_ids"].size(0), cp_size, cp_rank
+        filtered_cu_seqlens_padded, batch_tensor(batch, "input_ids").size(0), cp_size, cp_rank
     )
     mask_keys = ["input_ids", "labels", "position_ids", "padding_mask"]
     for key in mask_keys:
         if key in batch:
-            batch[key] = batch[key].index_select(0, local_indices)
+            batch[key] = batch_tensor(batch, key).index_select(0, local_indices)
 
     # Keep model-owned payloads (for example VLM media) by default. Only remove
     # source metadata that is invalid after the THD CP conversion; the update
     # below replaces every transformed field with its authoritative local value.
-    output_batch = batch.copy()
+    output_batch: THDBatch[_V] = dict(batch)
     output_batch.pop("attention_mask", None)
 
     max_seqlen = (filtered_cu_seqlens_padded[1:] - filtered_cu_seqlens_padded[:-1]).max().item()
+    input_ids = batch_tensor(batch, "input_ids").to(torch.int64).contiguous()
     output_batch.update(
         {
-            "input_ids": batch["input_ids"].to(torch.int64).contiguous(),
-            "labels": batch["labels"].to(torch.int64).contiguous(),
-            "position_ids": batch["position_ids"].to(torch.int64).contiguous(),
+            "input_ids": input_ids,
+            "labels": batch_tensor(batch, "labels").to(torch.int64).contiguous(),
+            "position_ids": batch_tensor(batch, "position_ids").to(torch.int64).contiguous(),
             # CP attention already includes each document's trailing pad slots.
             # Retain the same physical boundaries without enabling padding dispatch.
             "cu_seqlens": cu_seqlens_padded.to(torch.int32).contiguous(),
@@ -876,11 +1035,9 @@ def _shard_thd_chunk_for_te(
     # fall back to the token-value comparison when the caller supplied no mask;
     # it rejects a pad id that is also content instead of silently masking it.
     if "padding_mask" in batch:
-        output_batch["padding_mask"] = batch["padding_mask"].bool().contiguous()
+        output_batch["padding_mask"] = batch_tensor(batch, "padding_mask").bool().contiguous()
     else:
-        output_batch["padding_mask"] = thd_padding_mask_from_token_ids(
-            output_batch["input_ids"], padding_token_id
-        ).contiguous()
+        output_batch["padding_mask"] = thd_padding_mask_from_token_ids(input_ids, padding_token_id).contiguous()
 
     return output_batch, local_indices
 

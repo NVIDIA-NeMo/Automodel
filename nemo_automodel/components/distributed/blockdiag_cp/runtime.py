@@ -18,18 +18,22 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from nemo_automodel.components.distributed.blockdiag_cp import exchange, kernels
 from nemo_automodel.components.distributed.blockdiag_cp import state as state_module
 
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
 logger = logging.getLogger(__name__)
 _KV_EXCHANGE_PATH_LOGGED = False
 _KV_XNODE_LOGGED = False
 
 
-def _cp_group_spans_nodes(group) -> bool:
+def _cp_group_spans_nodes(group: ProcessGroup) -> bool:
     """True if the CP group spans more than one node.
 
     The needed-only exchanges (halo neighbor-p2p, a2a all-to-all-v) are verified when
@@ -64,7 +68,7 @@ def _cp_group_spans_nodes(group) -> bool:
     return spans
 
 
-def _resolve_cp_varlen_config(state: dict) -> tuple[str, str]:
+def _resolve_cp_varlen_config(state: state_module._BlockdiagStepState) -> tuple[str, str]:
     """Return ``(attn_backend, kv_exchange)`` for this step.
 
     Prefers the per-step snapshot threaded into ``state`` by the batch/ctx builder (so
@@ -80,8 +84,8 @@ def _resolve_cp_varlen_config(state: dict) -> tuple[str, str]:
 
 
 def _needed_only_preflight(
-    state: dict,
-    group,
+    state: state_module._BlockdiagStepState,
+    group: ProcessGroup,
     backend: str,
     query_dtype: torch.dtype,
     device: torch.device,
@@ -116,12 +120,31 @@ def _needed_only_preflight(
     return all_available, reason
 
 
-def _needed_only_kernel_succeeded_on_all_ranks(out, group, device, *, diagnostic=None) -> bool:
+def _needed_only_kernel_succeeded_on_all_ranks(
+    out: torch.Tensor | None,
+    group: ProcessGroup,
+    device: torch.device,
+    *,
+    diagnostic: kernels._HaloDiagnostic | kernels._A2aDiagnostic | None = None,
+) -> bool:
     """Make a rank-local varlen result safe to act on collectively.
 
     In particular, an all-padding rank returns a zero tensor without invoking
     FlashAttention/TE. It must nevertheless learn when a peer's real-token
     kernel returned ``None`` before either rank advances to another collective.
+
+    Args:
+        out: This rank's needed-only attention output, a Tensor of shape [batch,
+            query_heads, local_sequence, head_dim], or ``None`` when the varlen kernel
+            was unavailable. Only whether it is ``None`` is read; its values and layout
+            are not inspected.
+        group: The CP process group that must agree on the outcome.
+        device: Device of the one-element status tensor that is all-reduced.
+        diagnostic: Kernel metadata logged when creating the status tensor raises.
+
+    Returns:
+        True only when every rank of ``group`` produced an output (a MIN all-reduce of
+        the local flag when the group has more than one rank).
     """
     succeeded = out is not None
     if torch.distributed.is_initialized() and torch.distributed.get_world_size(group) > 1:
@@ -149,16 +172,16 @@ def _needed_only_kernel_succeeded_on_all_ranks(out, group, device, *, diagnostic
 
 
 def _select_kv_exchange_path(
-    state,
-    group,
-    doc_ids,
-    local_len,
-    device,
-    offset,
+    state: state_module._BlockdiagStepState,
+    group: ProcessGroup,
+    doc_ids: torch.Tensor,
+    local_len: int,
+    device: torch.device,
+    offset: int,
     *,
     query_dtype: torch.dtype | None = None,
     dropout_p: float = 0.0,
-):
+) -> tuple[Literal["halo", "a2a", "allgather"], exchange._BlockdiagKvPlan | None, str]:
     """Decide this step's KV-exchange path and WHY.
 
     Every downgrade to all-gather names its cause (mode, kernel, missing varlen meta,
@@ -223,7 +246,7 @@ def cp_blockdiag_sdpa(
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-    **kwargs,
+    **kwargs: object,
 ) -> torch.Tensor:
     """Block-diagonal context-parallel SDPA.
 
@@ -303,7 +326,7 @@ def cp_blockdiag_sdpa(
             cp_sz,
             query.shape[seq_dim],
         )
-    if path in ("halo", "a2a"):
+    if plan is not None:  # needed-only path: the selector returns a plan exactly for "halo"/"a2a"
         if path == "halo":
             out = exchange._blockdiag_halo_attention(
                 query,

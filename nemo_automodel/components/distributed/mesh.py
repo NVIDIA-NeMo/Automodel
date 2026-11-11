@@ -28,10 +28,10 @@ YAML / dict parsing belongs in the recipe layer — see
 ``nemo_automodel.recipes._dist_utils``.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Optional, TypedDict, overload
 
 from nemo_automodel.components.distributed.config import ActivationCheckpointingMode, DistributedStrategyConfig
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
@@ -64,7 +64,23 @@ class MeshAxisName(str, Enum):
 
 
 #: All values accepted as ``DeviceMesh`` axis names.
-_VALID_AXIS_NAMES: frozenset = frozenset(MeshAxisName)
+_VALID_AXIS_NAMES: frozenset[MeshAxisName] = frozenset(MeshAxisName)
+
+
+class _ParallelizeAxisKwargs(TypedDict):
+    """Axis-name keyword arguments of a ``parallelize_fn`` (EP/FSDP, no pipeline axis)."""
+
+    dp_axis_names: tuple[str, ...]
+    cp_axis_name: str | None
+    tp_axis_name: str | None
+    ep_axis_name: str | None
+    ep_shard_axis_names: tuple[str, ...] | None
+
+
+class _PipelineAxisKwargs(_ParallelizeAxisKwargs):
+    """Axis-name keyword arguments of ``AutoPipeline``: the ``parallelize_fn`` axes plus the pipeline axis."""
+
+    pp_axis_name: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -186,10 +202,10 @@ class MeshContext:
         return _get_axis_size(self.device_mesh, MeshAxisName.DP_SHARD, default=1)
 
     # Axis-name helpers (used by AutoPipeline and parallelize_model)
-    def _dp_axis_names(self) -> Tuple[str, ...]:
+    def _dp_axis_names(self) -> tuple[str, ...]:
         """DP axis names for FSDP mesh slicing."""
         if self.device_mesh is not None:
-            names = self.device_mesh.mesh_dim_names
+            names = _axis_names(self.device_mesh)
             if (
                 MeshAxisName.DP_REPLICATE in names
                 and _get_axis_size(self.device_mesh, MeshAxisName.DP_SHARD_CP, default=None) is not None
@@ -198,14 +214,15 @@ class MeshContext:
         return (MeshAxisName.DP_SHARD_CP,)
 
     # @akoumpa: we will deprecate `pipeline_axis_kwargs` in 26.04.
-    def pipeline_axis_kwargs(self) -> dict[str, str | tuple[str, ...] | None]:
+    def pipeline_axis_kwargs(self) -> _PipelineAxisKwargs:
         """Axis-name kwargs for ``AutoPipeline``."""
         return {
             "pp_axis_name": MeshAxisName.PP,
-        } | self.parallelize_axis_kwargs()
+            **self.parallelize_axis_kwargs(),
+        }
 
     # @akoumpa: we will deprecate `parallelize_axis_kwargs` in 26.04.
-    def parallelize_axis_kwargs(self) -> dict[str, str | tuple[str, ...] | None]:
+    def parallelize_axis_kwargs(self) -> _ParallelizeAxisKwargs:
         """Axis-name kwargs for ``parallelize_fn`` (EP/FSDP, no ``pp_axis_name``)."""
         return {
             "dp_axis_names": self._dp_axis_names(),
@@ -323,12 +340,32 @@ class MeshContext:
 
 
 # misc utils
-def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) -> int | None:
+def _axis_names(mesh: "DeviceMesh") -> tuple[str, ...]:
+    """Return *mesh*'s axis names.
+
+    Raises:
+        TypeError: If *mesh* was created without ``mesh_dim_names``; name-based lookups need named axes.
+    """
+    names = mesh.mesh_dim_names
+    if names is None:
+        raise TypeError("Expected a DeviceMesh with mesh_dim_names; axis lookups by name need named axes")
+    return names
+
+
+@overload
+def _get_axis_size(mesh: "DeviceMesh | None", axis: MeshAxisName, default: int = 1) -> int: ...
+
+
+@overload
+def _get_axis_size(mesh: "DeviceMesh | None", axis: MeshAxisName, default: None) -> int | None: ...
+
+
+def _get_axis_size(mesh: "DeviceMesh | None", axis: MeshAxisName, default: int | None = 1) -> int | None:
     """Return the size of *axis* if present in *mesh*, else *default*."""
     if mesh is None:
         return default
     # Check mesh axes and _flatten() results on root mesh.
-    if axis in mesh.mesh_dim_names:
+    if axis in _axis_names(mesh):
         return mesh[axis].size()
     if hasattr(mesh, "_get_root_mesh"):
         root = mesh._get_root_mesh()
@@ -341,7 +378,7 @@ def _get_axis_size(mesh: Optional["DeviceMesh"], axis: MeshAxisName, default=1) 
 
 def _optional_axis(mesh: Optional["DeviceMesh"], axis: MeshAxisName) -> str | None:
     """Return *axis* if present in *mesh*, else ``None``."""
-    if mesh is not None and axis in mesh.mesh_dim_names:
+    if mesh is not None and axis in _axis_names(mesh):
         return axis
     return None
 

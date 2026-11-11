@@ -14,15 +14,17 @@
 
 
 import logging
-from contextlib import ContextDecorator, nullcontext
+from contextlib import AbstractContextManager, ContextDecorator, nullcontext
 from datetime import datetime, timedelta
-from typing import Any
+from types import TracebackType
+from typing import Literal
 
 import torch
 import torch.distributed
 import torch.distributed as dist
+from torch.distributed.fsdp import FSDPModule
 
-from nemo_automodel.components.distributed.config import DDPConfig
+from nemo_automodel.components.distributed.config import DDPConfig, DistributedStrategyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +118,7 @@ class FirstRankPerNode(ContextDecorator):
     def __init__(self, group: dist.ProcessGroup | None = None) -> None:
         self.group = group
 
-    def __enter__(self, timeout=timedelta(hours=10)):
+    def __enter__(self, timeout: timedelta = timedelta(hours=10)) -> bool:
         """
         Create / bootstrap a (distributed) proc. group that rank0 enters first.
 
@@ -145,7 +147,12 @@ class FirstRankPerNode(ContextDecorator):
 
         return self._first
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> Literal[False]:
         """
         Tear down the context.
 
@@ -178,7 +185,7 @@ class FirstRankPerNode(ContextDecorator):
                         "Exception inside FirstRankPerNode: %s: %s",
                         exc_type.__name__,
                         exc_val,
-                        exc_info=(exc_type, exc_val, exc_tb),
+                        exc_info=exc_val,
                     )
                     raise SystemExit(1) from exc_val
         finally:
@@ -233,7 +240,9 @@ def reduce_loss(
     return loss, denominator
 
 
-def get_sync_ctx(model, is_optim_step, defer_fsdp_grad_sync: bool):
+def get_sync_ctx(
+    model: torch.nn.Module, is_optim_step: bool, defer_fsdp_grad_sync: bool
+) -> AbstractContextManager[None]:
     """
     Get the synchronization context for the model.
 
@@ -251,7 +260,7 @@ def get_sync_ctx(model, is_optim_step, defer_fsdp_grad_sync: bool):
     # this gradient update (i.e., when `is_grad` is False). This avoids an
     # all-reduce for every micro-batch and greatly improves throughput.
     sync_ctx = nullcontext()
-    if isinstance(model, dist.fsdp._fully_shard._fully_shard.FSDPModule):
+    if isinstance(model, FSDPModule):
         if defer_fsdp_grad_sync:
             model.set_requires_gradient_sync(is_optim_step)
         else:
@@ -261,7 +270,9 @@ def get_sync_ctx(model, is_optim_step, defer_fsdp_grad_sync: bool):
     return sync_ctx
 
 
-def dp_eval_sample_shard(distributed_config: Any, dp_rank: int, dp_size: int) -> tuple | None:
+def dp_eval_sample_shard(
+    distributed_config: DistributedStrategyConfig | None, dp_rank: int, dp_size: int
+) -> tuple[int, int] | None:
     """Return ``(dp_rank, dp_size)`` to shard eval samples across DP ranks, else ``None``.
 
     Only DDP replicates the full model on every rank, so only there can each rank

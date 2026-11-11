@@ -415,7 +415,7 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
         if not uses_hard_negatives:
             batch = {key: value for key, value in batch.items() if not key.startswith("n_")}
 
-        batch = _move_to_device(batch, self.dist_env.device)
+        batch = _move_to_device(batch, self.dist_env.device or torch.device("cpu"))
         q_batch, d_batch, n_batch, n_mask = _unpack_qpn(batch)
 
         student_model = self.model_parts[0]

@@ -45,24 +45,44 @@ in :func:`_packed_varlen_sdpa` passes any non-matching call straight through.
 
 from __future__ import annotations
 
+from typing import TypedDict
+
 import torch
 
+from nemo_automodel.components.distributed._patching import set_undeclared_attr
 from nemo_automodel.components.distributed.blockdiag_cp import kernels, runtime, state
 
-_PACKED_STATE = state._ThreadSharedVar()
+
+class _PackedVarlenState(TypedDict):
+    """Per-forward cp_size==1 packed varlen state armed by :func:`enable_cp1_packed_varlen`.
+
+    Attributes:
+        doc_ids: Per-position document ids of shape ``[batch, sequence]``
+            (0 == padding) over the full packed sequence.
+        backend: Varlen kernel backend, ``"flash"`` or ``"te"``.
+        varlen_meta: Precomputed segmentation for a single packed row, or
+            ``None`` when the kernel must segment each row inline.
+    """
+
+    doc_ids: torch.Tensor
+    backend: str
+    varlen_meta: kernels._VarlenMeta | None
+
+
+_PACKED_STATE: state._ThreadSharedVar[_PackedVarlenState] = state._ThreadSharedVar()
 
 
 def _packed_varlen_sdpa(
-    query,
-    key,
-    value,
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False,
-    scale=None,
-    enable_gqa=False,
-    **kwargs,
-):
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+    **kwargs: object,
+) -> torch.Tensor:
     """SDPA replacement for cp1 packed runs: block-diagonal varlen from doc_ids.
 
     Only intervenes for a full packed-sequence call whose batch and sequence
@@ -174,11 +194,13 @@ def attach_cp1_packed_varlen_hooks(model: torch.nn.Module) -> None:
     import torch.nn.functional as F_module
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-    def _pre_hook(module, args, kwargs):
-        F_module.scaled_dot_product_attention = _packed_varlen_sdpa
+    def _pre_hook(
+        module: torch.nn.Module, args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> tuple[tuple[object, ...], dict[str, object]]:
+        set_undeclared_attr(F_module, "scaled_dot_product_attention", _packed_varlen_sdpa)
         return args, kwargs
 
-    def _post_hook(module, inputs, output):
+    def _post_hook(module: torch.nn.Module, inputs: tuple[object, ...], output: object) -> None:
         F_module.scaled_dot_product_attention = runtime._ORIGINAL_SDPA
 
     for name, module in model.named_modules():

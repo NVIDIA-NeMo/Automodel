@@ -1180,7 +1180,7 @@ def test_fully_shard_by_dtype_fp32_parent_preserves_caller_output_dtype(
     """FP32 compute must preserve the parent output contract regardless of grouping."""
     calls: list[tuple[nn.Module, MixedPrecisionPolicy | None]] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+    def fake_fully_shard(mod, *, mesh, mp_policy=None, offload_policy, reshard_after_forward=None):
         calls.append((mod, mp_policy))
 
     monkeypatch.setattr("nemo_automodel.components.distributed.parallelizer_utils.fully_shard", fake_fully_shard)

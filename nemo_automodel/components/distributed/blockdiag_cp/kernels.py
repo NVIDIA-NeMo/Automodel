@@ -17,10 +17,14 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING, Literal, Required, TypedDict
 
 import torch
 
 from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
+
+if TYPE_CHECKING:
+    from transformer_engine.pytorch import DotProductAttention
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +39,132 @@ _CP_FLASH_ENGAGED = False
 _CP_VARLEN_SHAPE_LOGGED = False
 _CP_FLASH_LONG_SEGMENT_WARNED = False
 _CP_TE_DROPOUT_WARNED = False
-_TE_DPA_CACHE = {}
+_TE_DPA_CACHE: dict[tuple[int, int, int, float, str, str], DotProductAttention] = {}
+
+
+class _VarlenValidationSnapshot(TypedDict):
+    """Host-only copy of validated varlen metadata, kept for post-failure diagnostics.
+
+    Attributes:
+        n_real: Real local query rows.
+        query_len: Local query length the metadata was validated against.
+        key_len: Key length the metadata was validated against.
+        s_first: Start of the attended K/V slice.
+        real_end: End (exclusive) of the attended K/V slice.
+        max_q: Maximum per-document query segment length.
+        max_k: Maximum per-document key segment length.
+        first_q: Query length of the first segment (0 when not precomputed).
+        first_k: Key length of the first segment (0 when not precomputed).
+        max_tail: Maximum query segment length after the first (0 when absent).
+        cu_q: Per-document cumulative query offsets, ``[num_segments + 1]`` ints.
+        cu_k: Per-document cumulative key offsets, ``[num_segments + 1]`` ints.
+    """
+
+    n_real: int
+    query_len: int
+    key_len: int
+    s_first: int
+    real_end: int
+    max_q: int
+    max_k: int
+    first_q: int
+    first_k: int
+    max_tail: int
+    cu_q: list[int]
+    cu_k: list[int]
+
+
+class _HaloDiagnostic(TypedDict):
+    """Kernel context recorded by the needed-only left-halo exchange.
+
+    Attributes:
+        path: Exchange path, always ``"halo"``.
+        rank: This rank's index within the CP group.
+        world: CP world size.
+        row_offset: Global position of this rank's first local query row.
+        recv_count: Straddle tokens this rank received from its left neighbor.
+        max_halo: Uniform halo size exchanged across the ring.
+        key_needed_len: Length of the delivered K/V range.
+        kernel_meta: Host snapshot of the validated varlen metadata, if any.
+    """
+
+    path: Literal["halo"]
+    rank: int
+    world: int
+    row_offset: int
+    recv_count: int
+    max_halo: int
+    key_needed_len: int
+    kernel_meta: _VarlenValidationSnapshot | None
+
+
+class _A2aDiagnostic(TypedDict):
+    """Kernel context recorded by the needed-only all-to-all-v exchange.
+
+    Attributes:
+        path: Exchange path, always ``"a2a"``.
+        rank: This rank's index within the CP group.
+        world: CP world size.
+        row_offset: Global position of this rank's first local query row.
+        needed_len: Length of this rank's needed K/V range.
+        in_splits: Per-destination send token counts.
+        out_splits: Per-source receive token counts.
+        key_needed_len: Length of the delivered K/V range.
+        kernel_meta: Host snapshot of the validated varlen metadata, if any.
+    """
+
+    path: Literal["a2a"]
+    rank: int
+    world: int
+    row_offset: int
+    needed_len: int
+    in_splits: list[int]
+    out_splits: list[int]
+    key_needed_len: int
+    kernel_meta: _VarlenValidationSnapshot | None
+
+
+class _VarlenMeta(TypedDict, total=False):
+    """Block-diagonal varlen segmentation of one rank's local query chunk.
+
+    ``n_real == 0`` marks an all-padding chunk, which carries no other
+    segmentation field. Otherwise every segmentation field is present: the
+    chunk's real query rows (a prefix of the chunk) attend the K/V slice
+    ``[s_first, real_end)`` as per-document varlen segments. The underscored
+    fields are filled lazily by validation and needed-only exchanges.
+
+    Attributes:
+        n_real: Number of real (non-padding) local query rows.
+        s_first: Start of the attended K/V slice (the left-straddling
+            document's first position).
+        real_end: End (exclusive) of the attended K/V slice.
+        cu_q: Per-document cumulative query offsets, 1D int32 tensor of shape
+            ``[num_segments + 1]``.
+        cu_k: Per-document cumulative key offsets, 1D int32 tensor of shape
+            ``[num_segments + 1]``.
+        max_q: Maximum per-document query segment length.
+        max_k: Maximum per-document key segment length.
+        first_q: Query length of the first (possibly straddling) segment.
+        first_k: Key length of the first (possibly straddling) segment.
+        max_tail: Maximum query segment length after the first (0 if none).
+        _validation_cache: Validation result per validated metadata signature.
+        _validation_snapshot: Host snapshot of the last validated metadata.
+        _needed_only_diagnostic: Kernel context of the needed-only exchange.
+    """
+
+    n_real: Required[int]
+    s_first: int
+    real_end: int
+    cu_q: torch.Tensor
+    cu_k: torch.Tensor
+    max_q: int
+    max_k: int
+    first_q: int
+    first_k: int
+    max_tail: int
+    _validation_cache: dict[tuple[int, int, int, int, int, int, int, str], str | None]
+    _validation_snapshot: _VarlenValidationSnapshot
+    _needed_only_diagnostic: _HaloDiagnostic | _A2aDiagnostic
 
 
 def _varlen_backend_unavailable_reason(
@@ -76,7 +205,7 @@ def _varlen_backend_unavailable_reason(
 
 
 def _varlen_metadata_unavailable_reason(
-    meta: dict | None,
+    meta: _VarlenMeta | None,
     *,
     query_len: int,
     key_len: int,
@@ -216,7 +345,14 @@ def _varlen_metadata_unavailable_reason(
     return reason
 
 
-def _te_varlen_dpa(num_q_heads, num_kv_heads, head_dim, scale, device, dtype):
+def _te_varlen_dpa(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    scale: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> DotProductAttention:
     """Cached TE DotProductAttention module for thd/varlen block-diagonal CP attention."""
     key = (num_q_heads, num_kv_heads, head_dim, round(float(scale), 10), str(device), str(dtype))
     m = _TE_DPA_CACHE.get(key)
@@ -249,10 +385,10 @@ def _flash_varlen_with_long_prefix_guard(
     max_q: int,
     max_k: int,
     local_query_len: int,
-    scale,
+    scale: float | None,
     dropout_p: float,
-    meta: dict,
-):
+    meta: _VarlenMeta,
+) -> torch.Tensor:
     """Run FlashAttention without an asymmetric-prefix varlen launch.
 
     In CP, only the first local document can have ``K > Q``: it may include a
@@ -403,7 +539,7 @@ def _cp_blockdiag_mask(
     return allow.unsqueeze(1)  # [B, 1, L, S]
 
 
-def _varlen_seg_for_rank(dids: torch.Tensor, row_offset: int, local_len: int, dev) -> dict | None:
+def _varlen_seg_for_rank(dids: torch.Tensor, row_offset: int, local_len: int, dev: torch.device) -> _VarlenMeta | None:
     """Per-rank block-diagonal varlen segmentation for ONE packed sequence.
 
     Factoring the segmentation out of the per-layer hot path lets
@@ -476,7 +612,9 @@ def _varlen_seg_for_rank(dids: torch.Tensor, row_offset: int, local_len: int, de
     }
 
 
-def precompute_blockdiag_varlen_meta(doc_ids: torch.Tensor, row_offset: int, local_len: int, device) -> dict:
+def precompute_blockdiag_varlen_meta(
+    doc_ids: torch.Tensor, row_offset: int, local_len: int, device: torch.device
+) -> _VarlenMeta:
     """Precompute this rank's varlen segmentation once per step.
 
     The block-diagonal varlen cu_seqlens depend only on ``(doc_ids, row_offset,
@@ -506,17 +644,17 @@ def precompute_blockdiag_varlen_meta(doc_ids: torch.Tensor, row_offset: int, loc
 
 
 def _cp_blockdiag_varlen(
-    query,
-    key_full,
-    value_full,
-    doc_ids,
-    row_offset,
-    scale=None,
-    backend="flash",
+    query: torch.Tensor,
+    key_full: torch.Tensor,
+    value_full: torch.Tensor,
+    doc_ids: torch.Tensor,
+    row_offset: int,
+    scale: float | None = None,
+    backend: str = "flash",
     *,
-    dropout_p=0.0,
-    meta=None,
-):
+    dropout_p: float = 0.0,
+    meta: _VarlenMeta | None = None,
+) -> torch.Tensor | None:
     """Block-diagonal CP attention via varlen (flash or TE) -- no dense ``[B,1,L,S]`` mask.
 
     Equivalent to ``_cp_blockdiag_mask`` + SDPA for real (non-padding) query rows.
@@ -587,6 +725,7 @@ def _cp_blockdiag_varlen(
             # contract) so the hot path does zero .item() host syncs; otherwise
             # rebuild inline for an unsupported multi-row/direct caller or when
             # metadata was not armed -- identical math.
+            seg: _VarlenMeta | None
             if meta is not None and B == 1:
                 seg = meta
             else:

@@ -36,6 +36,8 @@ allowed-unresolved-imports = [
     "flash_attn",
     "liger_kernel.**",
     "lmdb",
+    "magi_attention",
+    "magi_attention.**",
     "mamba_ssm.**",
     "megatron.**",
     "mlflow",
@@ -44,6 +46,9 @@ allowed-unresolved-imports = [
     "pynvml",
     "sky",
     "torch.distributed._mesh_layout",
+    # PyTorch 2.12+ pipelining internals, imported behind a version check.
+    "torch.distributed.pipelining._utils.InferenceMode",
+    "torch.distributed.pipelining.stage.extract_tensor_metas",
     "transformer_engine",
     "transformer_engine.**",
     "transformer_engine_torch",
@@ -73,7 +78,7 @@ include = [
     "nemo_automodel/components/utils/**",
     "nemo_automodel/components/quantization/**",
     "nemo_automodel/components/training/**",
-    "nemo_automodel/components/distributed/config.py",
+    "nemo_automodel/components/distributed/**",
 ]
 
 [overrides.rules]
