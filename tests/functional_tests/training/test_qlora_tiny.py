@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import sys
 
+import datasets
 import pytest
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.quantization.qlora import verify_qlora_quantization
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
-
-import datasets
 
 datasets.disable_caching()
 
@@ -58,10 +57,14 @@ def test_qlora_tiny_smoke():
     # Single-stage model in this config
     model = trainer.model_parts[0]
 
-    is_quantized = bool(getattr(model, "is_loaded_in_4bit", False)) or bool(
-        getattr(getattr(model, "config", None), "quantization_config", None)
+    # Evaluate the quant_state probe first so this test exercises it even when
+    # the HF config already advertises 4-bit loading.
+    is_quantized = verify_qlora_quantization(model)
+    is_quantized = (
+        is_quantized
+        or bool(getattr(model, "is_loaded_in_4bit", False))
+        or bool(getattr(getattr(model, "config", None), "quantization_config", None))
     )
-    is_quantized = is_quantized or verify_qlora_quantization(model)
     assert is_quantized, "Expected 4-bit quantization to be active for QLoRA"
 
     trainable = [n for n, p in model.named_parameters() if p.requires_grad]

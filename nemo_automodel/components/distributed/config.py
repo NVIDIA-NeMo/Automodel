@@ -37,8 +37,9 @@ Usage:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
@@ -55,7 +56,7 @@ if TYPE_CHECKING:
 
 # Type aliases for API signatures.
 ActivationCheckpointingMode = Union[bool, Literal["full", "selective", "moe"]]
-ActivationCheckpointingScope = Union[str, List[str], Tuple[str, ...]]
+ActivationCheckpointingScope = Union[str, Sequence[str]]
 DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
 # Backwards-compatible alias for external / type-checking references.
 DistributedConfig = DistributedStrategyConfig
@@ -63,7 +64,7 @@ DistributedConfig = DistributedStrategyConfig
 _VALID_ACTIVATION_CHECKPOINTING_SCOPES = {"all", "language", "vision", "audio", "multimodal"}
 
 
-def normalize_activation_checkpointing_scope(value: Any) -> Tuple[str, ...]:
+def normalize_activation_checkpointing_scope(value: str | Sequence[str] | None) -> tuple[str, ...]:
     """Validate and normalize activation-checkpointing scope values."""
     if value is None:
         return ("all",)
@@ -471,7 +472,7 @@ class DDPConfig:
     gradient_as_bucket_view: bool = False
     autocast_dtype: torch.dtype | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
             self.activation_checkpointing_scope
         )

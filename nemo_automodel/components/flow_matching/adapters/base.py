@@ -21,10 +21,12 @@ dataclass used to pass data between the pipeline and adapters.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Generic, TypeVar
 
 import torch
 import torch.nn as nn
+
+_InputT = TypeVar("_InputT")
 
 
 @dataclass
@@ -76,12 +78,13 @@ class FlowMatchingContext:
         return self.latents
 
 
-class ModelAdapter(ABC):
+class ModelAdapter(ABC, Generic[_InputT]):
     """
     Abstract base class for model-specific forward pass logic.
 
     Implement this class to add support for new model architectures
-    without modifying the FlowMatchingPipeline.
+    without modifying the FlowMatchingPipeline. The input type links the payload
+    produced by prepare_inputs to forward and auxiliary_losses.
 
     The adapter pattern decouples the flow matching logic from model-specific
     details like input preparation and forward pass conventions.
@@ -102,7 +105,7 @@ class ModelAdapter(ABC):
     """
 
     @abstractmethod
-    def prepare_inputs(self, context: FlowMatchingContext) -> Dict[str, Any]:
+    def prepare_inputs(self, context: FlowMatchingContext) -> _InputT:
         """
         Prepare model-specific inputs from the context.
 
@@ -115,7 +118,7 @@ class ModelAdapter(ABC):
         pass
 
     @abstractmethod
-    def forward(self, model: nn.Module, inputs: Dict[str, Any]) -> torch.Tensor:
+    def forward(self, model: nn.Module, inputs: _InputT) -> torch.Tensor:
         """
         Execute the model forward pass.
 
@@ -156,7 +159,7 @@ class ModelAdapter(ABC):
         """
         return nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
 
-    def auxiliary_losses(self, inputs: Dict[str, Any]) -> Dict[str, torch.Tensor] | None:
+    def auxiliary_losses(self, inputs: _InputT) -> Dict[str, torch.Tensor] | None:
         """
         Return additional named scalar losses computed from adapter-stashed state.
 

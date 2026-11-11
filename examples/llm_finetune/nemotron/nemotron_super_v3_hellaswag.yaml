@@ -76,7 +76,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -115,5 +115,5 @@ ci:
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
     hf_device_map_auto: true
     step_scheduler.global_batch_size: 64
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
