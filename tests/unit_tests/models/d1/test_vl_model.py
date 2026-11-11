@@ -104,7 +104,7 @@ def test_ordinary_scaled_rotary_preserves_hf_factors_after_dtype_moves(rope_type
     }
     model = Lfm2VlForConditionalGeneration(config).eval()
     rotary = model.model.language_model.rotary_emb
-    reference = Lfm2RotaryEmbedding(config.text_config, device=device)
+    reference = Lfm2RotaryEmbedding(config.text_config).to(device)
     positions = torch.tensor([[0, 17, 4095]], device=device)
     expected = reference(torch.empty(1, 3, config.text_config.hidden_size, device=device), positions)
     for dtype in (torch.float32, torch.bfloat16, torch.float32):
