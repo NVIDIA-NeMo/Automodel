@@ -14,15 +14,15 @@
 
 """Prepare one-question training rows for ``train_deciffusion`` from public fictional data.
 
-  # simple one-decision-per-line JSONL (e.g. the synthetic support-routing example)
+  # simple one-decision-per-line JSONL (e.g. a synthetic support-routing dataset)
   uv run python examples/decision/prepare_deciffusion_data.py simple --input support_routing.jsonl \
       --output data/support_routing --split three-way
   # SystemOne records (e.g. the fictional SOC-triage tutorial data with train/validation/test files)
   uv run python examples/decision/prepare_deciffusion_data.py systemone --input-dir data/soc_triage \
       --output data/soc_triage_rows
 
-``--split reference`` reproduces the reference two-way split (``train``/``heldout``, held-out fraction 0.2, seed
-``0``); its held-out file selects checkpoints, so it is validation, not an untouched test. ``--split three-way`` writes
+``--split two-way`` writes a ``train``/``heldout`` split (held-out fraction 0.2, seed ``0``); its held-out file
+selects checkpoints, so it is validation, not an untouched test. ``--split three-way`` writes
 group-disjoint ``train``/``validation``/``test`` files for a separate final test.
 """
 
@@ -62,7 +62,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="source", required=True)
     simple = sub.add_parser("simple")
     simple.add_argument("--input", required=True)
-    simple.add_argument("--split", choices=["reference", "three-way"], default="three-way")
+    simple.add_argument("--split", choices=["two-way", "three-way"], default="three-way")
     simple.add_argument("--seed", default="0")
     simple.add_argument("--heldout-fraction", type=float, default=0.2)
     simple.add_argument("--test-fraction", type=float, default=0.2, help="three-way: share of groups for test")
@@ -86,7 +86,7 @@ def main() -> None:
             except (ValueError, KeyError, TypeError) as error:
                 errors += 1
                 print(f"{args.input}:{number}: skipped: {error}", file=sys.stderr)
-        if args.split == "reference":
+        if args.split == "two-way":
             splits = {
                 "train": [r for r in rows if not in_heldout(r, args.heldout_fraction, args.seed)],
                 "heldout": [r for r in rows if in_heldout(r, args.heldout_fraction, args.seed)],

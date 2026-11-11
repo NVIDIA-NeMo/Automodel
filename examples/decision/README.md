@@ -8,7 +8,7 @@
 | `d1_posttrain.py` | `D1PostTraining` | Experimental frozen-backbone D1-3B answer-token rows or Omni marker-head adaptation, with a publisher-baseline gate |
 | `export_clef_release.py` | — | Merge a Clef stage (LoRA + head) into a directory with the `Cloudflare/clef` release layout |
 | `deciffusion_soc_triage_lora.yaml` | `TrainDeciffusionDecisionRecipe` | Nemotron Deciffusion: LoRA (or full) post-training on fictional SOC triage, one question per serving prompt |
-| `deciffusion_support_routing_lora.yaml` | `TrainDeciffusionDecisionRecipe` | The same recipe on the synthetic support-routing example |
+| `deciffusion_support_routing_lora.yaml` | `TrainDeciffusionDecisionRecipe` | The same recipe on a synthetic support-routing dataset in one-decision JSONL (bring your own) |
 | `prepare_deciffusion_data.py` | — | Convert SystemOne records or one-decision JSONL to one-question rows with group-disjoint splits |
 | `export_deciffusion.py` | — | Export a Deciffusion stage (merged LoRA or full weights) as a complete servable checkpoint |
 
@@ -108,11 +108,12 @@ uv run python examples/decision/export_deciffusion.py --base /path/to/deciffusio
 
 For one-decision-per-line JSONL (`state`, `question`, `type`, `options`, `label`, optional `soft_labels` and
 `group`), use `prepare_deciffusion_data.py simple`. `--split three-way` writes group-disjoint
-`train`/`validation`/`test` files. `--split reference` writes the two-way `train`/`heldout` split (fraction 0.2,
-seed `0`); because its held-out file selects checkpoints, treat it as validation, not as a final test.
+`train`/`validation`/`test` files. `--split two-way` writes a `train`/`heldout` split (fraction 0.2, seed `0`);
+because its held-out file selects checkpoints, treat it as validation, not as a final test.
 
 Validation selects the published stage (`LOWEST_VAL`): highest accuracy, then lowest cross-entropy. For LoRA the
-starting checkpoint (step 0) is eligible. Each run writes `training.jsonl`, `validation.jsonl`, `selected.json`, and
+starting checkpoint (step 0) is a saved, selectable stage; full fine-tuning selects among its trained stages (score
+the base with `--mode eval` for the before number). Each run writes `training.jsonl`, `validation.jsonl`, `selected.json`, and
 `metrics_{validation,test}.json` (with per-row probabilities). Stages record a fingerprint of the base checkpoint,
 and `init_from` and the export refuse a stage trained from a different base. The export removes
 `deciffusion_shared_context` from the exported configuration because these runs train single-question reads, not

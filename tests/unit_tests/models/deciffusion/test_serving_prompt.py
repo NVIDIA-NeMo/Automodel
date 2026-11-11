@@ -153,7 +153,7 @@ def test_too_many_options_for_the_code_vocabulary_is_rejected():
     assert question_options(CHOICE)[0] == ["billing", "technical", "sales"]
 
 
-# Golden values computed with the reference serving prompt builder (COMPACT_OVER=0) on the public
+# Golden values computed with the reference serving prompt builder (compaction disabled) on the public
 # nvidia/Nemotron-Labs-Diffusion-8B-Base tokenizer, whose tokenizer and chat-template files match the Deciffusion
 # text checkpoints byte for byte.
 TOKENIZER_REPO = "nvidia/Nemotron-Labs-Diffusion-8B-Base"

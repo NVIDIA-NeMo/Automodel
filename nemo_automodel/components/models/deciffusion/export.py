@@ -15,7 +15,7 @@
 # Code provenance: the merge follows the reference fine-tuning merge script (W += (alpha / r) * B @ A in fp32,
 # complete standalone checkpoint, shared-context flag removed). See serving_prompt.py for the provenance note.
 
-"""Export a trained LoRA adapter as a complete, servable Deciffusion checkpoint."""
+"""Export a trained Deciffusion stage (merged LoRA adapter or full weights) as a complete, servable checkpoint."""
 
 from __future__ import annotations
 
@@ -28,6 +28,9 @@ from pathlib import Path
 import safetensors.torch as _st
 
 from nemo_automodel.components.models.deciffusion.scorer import SHARED_CONTEXT_FLAG
+
+# Base-checkpoint files replaced by the export (weights, their index, caches and receipts of an earlier export).
+_NOT_COPIED = ("*.safetensors", "*.safetensors.index.json", ".cache", "merge-receipt.json", "export-receipt.json")
 
 
 def checkpoint_fingerprint(checkpoint_dir: str | Path, *, window: int = 1 << 20) -> str:
@@ -120,7 +123,7 @@ def merge_lora_checkpoint(base_dir: str | Path, adapter_dir: str | Path, output_
     shutil.copytree(
         base_dir,
         output_dir,
-        ignore=shutil.ignore_patterns("*.safetensors", "*.safetensors.index.json", ".cache", "merge-receipt.json"),
+        ignore=shutil.ignore_patterns(*_NOT_COPIED),
     )
     _st.save_file(
         {k: v.contiguous() for k, v in weights.items()},
@@ -173,7 +176,7 @@ def export_full_checkpoint(base_dir: str | Path, weights_dir: str | Path, output
     shutil.copytree(
         base_dir,
         output_dir,
-        ignore=shutil.ignore_patterns("*.safetensors", "*.safetensors.index.json", ".cache", "merge-receipt.json"),
+        ignore=shutil.ignore_patterns(*_NOT_COPIED),
     )
     _st.save_file(
         {k: v.to(base[k].dtype).contiguous() for k, v in trained.items()},
