@@ -276,6 +276,16 @@ def test_tokenizer_chat_template_sha256():
     assert with_template == tokenizer_chat_template_sha256(SimpleNamespace(chat_template="{{ messages }}"))
 
 
+def test_tokenizer_chat_template_sha256_accepts_named_templates():
+    from nemo_automodel.components.datasets.llm.dspark_cache import tokenizer_chat_template_sha256
+
+    templates = {"default": "{{ messages }}", "tool_use": "{{ tools }}"}
+    digest = tokenizer_chat_template_sha256(SimpleNamespace(chat_template=templates))
+    reordered = {"tool_use": "{{ tools }}", "default": "{{ messages }}"}
+    assert digest == tokenizer_chat_template_sha256(SimpleNamespace(chat_template=reordered))
+    assert digest != tokenizer_chat_template_sha256(SimpleNamespace(chat_template={"default": "{{ messages }}"}))
+
+
 # ---------------------------------------------------------------------------
 # build_dspark_target dispatch
 # ---------------------------------------------------------------------------

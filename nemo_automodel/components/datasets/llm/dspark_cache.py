@@ -81,6 +81,9 @@ def compute_batch_cache(target_batch, cache_dtype: torch.dtype) -> dict[str, tor
 def tokenizer_chat_template_sha256(tokenizer) -> str:
     """Return a stable identity for the tokenizer's effective (post-override) chat template."""
     template = getattr(tokenizer, "chat_template", None) or ""
+    if not isinstance(template, str):
+        # Tokenizers with several named templates (e.g. default / tool_use) expose a dict.
+        template = json.dumps(template, sort_keys=True)
     return hashlib.sha256(template.encode("utf-8")).hexdigest()
 
 
