@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
-from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules, lora_token_gate
+from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules, lora_token_gate
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.speculative.gated_mtp import GatedMTPConfig
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -238,3 +238,18 @@ def test_validate_rejects_setups_that_break_losslessness(monkeypatch):
             recipe._validate_gated_mtp(is_packed=False)
     finally:
         model.model.layers[0].self_attn.sliding_window = None
+
+    model.config.sliding_window = 4
+    try:
+        with pytest.raises(NotImplementedError, match="sliding-window"):
+            recipe._validate_gated_mtp(is_packed=False)
+    finally:
+        model.config.sliding_window = None
+
+    original_lm_head = model.lm_head
+    model.lm_head = LinearLoRA(original_lm_head, dim=4, alpha=8)
+    try:
+        with pytest.raises(NotImplementedError, match="LoRA-adapted lm_head"):
+            recipe._validate_gated_mtp(is_packed=False)
+    finally:
+        model.lm_head = original_lm_head

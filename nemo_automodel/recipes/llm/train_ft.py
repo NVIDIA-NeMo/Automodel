@@ -62,7 +62,7 @@ from nemo_automodel._transformers.infrastructure import (
     instantiate_infrastructure,
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components._peft.lora import lora_token_gate
+from nemo_automodel.components._peft.lora import LinearLoRA, lora_token_gate
 from nemo_automodel.components.attention.gated_mtp_mask import create_gated_mtp_block_mask, create_gated_mtp_sdpa_mask
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
@@ -1292,10 +1292,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         vocab_size = getattr(config, "vocab_size", None)
         if vocab_size is not None and not all(0 <= i < vocab_size for i in self.gated_mtp.mask_token_ids):
             raise ValueError(f"gated_mtp.mask_token_ids must lie in the model vocabulary of size {vocab_size}.")
-        if any(getattr(m, "sliding_window", None) for m in model.modules()):
+        has_sliding_window = any(getattr(m, "sliding_window", None) for m in model.modules()) or bool(
+            getattr(config, "sliding_window", None)
+        )
+        if has_sliding_window:
             raise NotImplementedError(
                 "gated_mtp does not support models with sliding-window attention layers yet: the gated-MTP mask "
-                "is full causal, so a layer that is supplied an explicit mask stops applying its own window."
+                "is full causal, so a layer that is supplied an explicit mask stops applying its own window. This "
+                "includes a model-config-owned window (e.g. Mistral), not only a per-layer one (e.g. Qwen3)."
+            )
+        lm_head = _get_lm_head_module(model)
+        if isinstance(lm_head, LinearLoRA):
+            raise NotImplementedError(
+                "gated_mtp does not support a LoRA-adapted lm_head: the MTP loss projects each depth's hidden "
+                "states through lm_head separately, which does not match the token gate's expanded shape."
             )
 
     def _gated_mtp_attention_mask(
