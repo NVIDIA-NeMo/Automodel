@@ -770,7 +770,7 @@ navigation:
             slug: runwayml
             path: ../../model-coverage/wam/runwayml/index.mdx
             contents:
-              - page: "Praxis-1"
+              - page: "praxis-1-droid"
                 path: ../../model-coverage/wam/runwayml/praxis-1.mdx
       - section: "Diffusion Language Models"
         slug: dllm
