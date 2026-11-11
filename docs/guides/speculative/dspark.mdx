@@ -50,7 +50,7 @@ parallelism.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 \
-  -m nemo_automodel.recipes.llm.train_dspark \
+  -m nemo_automodel.recipes.speculative_decoding.train_dspark \
   -c examples/speculative/dspark/qwen3_0.6b_dspark.yaml
 ```
 
@@ -131,7 +131,7 @@ rejects mismatches:
 Use the production-scale
 [`deepseek_v41_flash_dspark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/dspark/deepseek_v41_flash_dspark.yaml)
 as the starting point. It uses FSDP2 for the trainable draft and the model's
-distributed EP/FSDP path for the frozen target. Pipeline parallelism, context
+distributed EP and FSDP path for the frozen target. Pipeline parallelism, context
 parallelism, image inputs, and the serving-time dynamic verification scheduler
 are not part of this training path.
 

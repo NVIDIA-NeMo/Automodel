@@ -25,7 +25,7 @@ from nemo_automodel.components.speculative.dspark.config import build_kimi_k3_dr
 from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
 from nemo_automodel.components.speculative.dspark.loss import compute_dspark_loss
 from nemo_automodel.components.speculative.dspark.registry import resolve_dspark_draft_spec
-from nemo_automodel.recipes.llm import _dspark_target_build
+from nemo_automodel.recipes.speculative_decoding import _dspark_target_build
 
 VOCAB = 64
 HIDDEN = 32
