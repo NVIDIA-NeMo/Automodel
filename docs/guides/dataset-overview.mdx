@@ -20,7 +20,12 @@ NeMo AutoModel supports several common patterns for language modeling and instru
 ### HellaSwag (Completion SFT)
 - Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
 - Use case: single-turn completion-style SFT where a prompt (ctx) is followed by a gold continuation (ending)
-- Key args: `path_or_dataset`, `split`, `num_samples_limit`
+- Key args: `path_or_dataset`, `split`, `limit_dataset_samples`
+
+Use `limit_dataset_samples` to cap dataset size. HellaSwag and GLUE MRPC also
+accept the deprecated `num_samples_limit` spelling with a warning until the next
+breaking dataset API release. If both names are provided, their values must agree.
+
 - Example YAML:
 
 ```yaml
