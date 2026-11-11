@@ -84,11 +84,11 @@ _OVERRIDES = [
     "dataset._target_",
     "dataset.path_or_dataset",
     "dataset.path_or_dataset_id",
-    "dataset.num_samples_limit",
+    "dataset.num_samples_limit",  # Deprecated alias remains accepted during migration.
     "validation_dataset.path_or_dataset",
     "validation_dataset.path_or_dataset_id",
     "validation_dataset.split",
-    "validation_dataset.num_samples_limit",
+    "validation_dataset.num_samples_limit",  # Deprecated alias.
     "validation_dataset.limit_dataset_samples",
     "distributed.pipeline._target_",
     "distributed.pipeline.pp_schedule",

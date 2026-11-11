@@ -24,9 +24,10 @@ every forward, while gradients flow through the main attention Q/K/V path.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -38,11 +39,15 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
+from nemo_automodel.components.models.qwen3_8_flash_next.cudnn_qsa import cudnn_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.fa4_qsa import fa4_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import FlexQSAMask, flex_sparse_gqa_attention
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
 from nemo_automodel.shared.recompute_replay import RecomputeReplay
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 
 # The gathered implementation is a numerical oracle and CPU fallback, not the
 # production CUDA path. Keep its workspace bounded without exposing a model or
@@ -435,21 +440,93 @@ def gathered_qsa_gqa_attention(
     return torch.cat(outputs, dim=1)
 
 
+def _bf16_flex_sparse_gqa_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    selected_token_ids: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    flex_mask: FlexQSAMask | None = None,
+) -> torch.Tensor:
+    """Run :func:`flex_sparse_gqa_attention` after checking its CUDA BF16 input contract."""
+    if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
+        raise RuntimeError("Qwen3.8-Flash-Next flex QSA requires CUDA BF16 query, key, and value tensors")
+    return flex_sparse_gqa_attention(
+        query,
+        key,
+        value,
+        selected_token_ids,
+        softmax_scale=softmax_scale,
+        mask=flex_mask,
+    )
+
+
+def _fa4_qsa_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    selected_token_ids: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    flex_mask: FlexQSAMask | None = None,
+) -> torch.Tensor:
+    """Run :func:`fa4_sparse_gqa_attention`; FA4 consumes the routes directly and never takes a Flex mask."""
+    if flex_mask is not None:
+        raise ValueError("FA4 QSA does not consume a FlexAttention mask; build one only for backend.attn='flex'")
+    return fa4_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
+
+
+def _cudnn_qsa_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    selected_token_ids: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    flex_mask: FlexQSAMask | None = None,
+) -> torch.Tensor:
+    """Run :func:`cudnn_sparse_gqa_attention`; cuDNN consumes the routes directly and never takes a Flex mask."""
+    if flex_mask is not None:
+        raise ValueError("cuDNN QSA does not consume a FlexAttention mask; build one only for backend.attn='flex'")
+    return cudnn_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
+
+
+def select_qsa_cuda_kernel(backend: str) -> Callable[..., torch.Tensor] | None:
+    """Return the CUDA QSA kernel selected by ``backend.attn``, resolved once at layer setup.
+
+    Args:
+        backend: ``backend.attn`` value; "flex", "fa4" and "cudnn" have CUDA kernels. FA4 requires SM90 BF16
+            D256; cuDNN requires SM100/SM103 BF16 D256 and equal Q/KV extents.
+
+    Returns:
+        The kernel, called as ``kernel(query, key, value, selected_token_ids, softmax_scale=..., flex_mask=...)``, or
+        None when the backend has no CUDA QSA kernel. CPU execution needs no kernel, so None is only an error on CUDA.
+    """
+    if backend == "fa4":
+        return _fa4_qsa_attention
+    if backend == "cudnn":
+        return _cudnn_qsa_attention
+    if backend == "flex":
+        return _bf16_flex_sparse_gqa_attention
+    return None
+
+
 def qsa_gqa_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     selected_token_ids: torch.Tensor,
     *,
-    backend: str,
+    cuda_kernel: Callable[..., torch.Tensor] | None,
     softmax_scale: float | None = None,
     flex_mask: FlexQSAMask | None = None,
 ) -> torch.Tensor:
-    """Dispatch QSA to the selected CUDA kernel or the PyTorch CPU oracle.
+    """Run QSA with the preselected CUDA kernel, or the PyTorch CPU oracle.
 
     CPU execution always uses the oracle so model construction, checkpoint
     inspection, and distributed CPU parity tests need no compiled kernels.
-    CUDA execution is strict: unsupported backends or dtypes are reported
+    CUDA execution is strict: a backend without a CUDA kernel is reported
     rather than silently falling back to the gathered implementation.
 
     Args:
@@ -457,8 +534,10 @@ def qsa_gqa_attention(
         key: Tensor [batch, global_keys, kv_heads, head_dim].
         value: Tensor with key's layout. Q/K/V share one dtype and device.
         selected_token_ids: Signed IDs [batch, local_queries, routes] in global
-            K/V coordinates; invalid CUDA IDs are padding and duplicates collapse.
-        backend: CUDA backend, "flex" or "cute". FA4 requires SM90 BF16 D256.
+            K/V coordinates; invalid CUDA IDs are padding. Flex/FA4 collapse duplicates;
+            cuDNN requires the ratio-four indexer's distinct complete blocks and causal tails.
+        cuda_kernel: Kernel from :func:`select_qsa_cuda_kernel`, or None when
+            ``backend.attn`` has no CUDA QSA kernel.
         softmax_scale: Optional positive QK score multiplier.
         flex_mask: Optional FlexAttention mask already built from ``selected_token_ids``
             (see :func:`build_flex_qsa_mask`); used by the flex backend only.
@@ -475,23 +554,12 @@ def qsa_gqa_attention(
             selected_token_ids,
             softmax_scale=softmax_scale,
         )
-    if backend == "cute":
-        return fa4_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale=softmax_scale)
-    if backend != "flex":
+    if cuda_kernel is None:
         raise RuntimeError(
-            f"Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex' or 'cute', got {backend!r}; "
+            "Qwen3.8-Flash-Next CUDA QSA requires backend.attn='flex', 'fa4', or 'cudnn'; "
             "call gathered_qsa_gqa_attention directly for a numerical oracle"
         )
-    if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
-        raise RuntimeError("Qwen3.8-Flash-Next flex QSA requires CUDA BF16 query, key, and value tensors")
-    return flex_sparse_gqa_attention(
-        query,
-        key,
-        value,
-        selected_token_ids,
-        softmax_scale=softmax_scale,
-        mask=flex_mask,
-    )
+    return cuda_kernel(query, key, value, selected_token_ids, softmax_scale=softmax_scale, flex_mask=flex_mask)
 
 
 @dataclass(frozen=True)
@@ -546,7 +614,7 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
     ``[B, floor(S / c), 1, D_index]`` before K RMSNorm and group-start RoPE.
     """
 
-    def __init__(self, config: object, backend: BackendConfig) -> None:
+    def __init__(self, config: Qwen3_8_FlashNextTextConfig, backend: BackendConfig) -> None:
         super().__init__()
         self.hidden_size = int(getattr(config, "hidden_size"))
         self.num_query_heads = int(getattr(config, "indexer_n_heads"))
@@ -887,6 +955,7 @@ __all__ = [
     "apply_qsa_rope",
     "gathered_qsa_gqa_attention",
     "qsa_gqa_attention",
+    "select_qsa_cuda_kernel",
     "right_padded_sequence_lengths",
     "select_qsa_token_ids",
 ]
