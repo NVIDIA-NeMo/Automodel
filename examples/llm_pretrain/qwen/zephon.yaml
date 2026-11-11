@@ -37,10 +37,6 @@ dataset:
   _target_: nemo_automodel.components.datasets.zephon.ZephonTextDatasetConfig
   tokenize_special_tokens: eos
   zephon:
-    source:
-      token_estimation:
-        # Bound calibration I/O while retaining the default document sample count.
-        calibration_shards_max: 6
     # Weights target token proportions; estimation is automatic with multiple text sources.
     sources:
     - name: web
