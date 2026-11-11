@@ -36,7 +36,7 @@ from nemo_automodel.components.speculative.dspark.config import build_deepseek_v
 from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_kimi_k3 import KimiK3DSparkModel
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
-from nemo_automodel.recipes.llm.train_dspark import _validate_draft_packing
+from nemo_automodel.recipes.speculative_decoding.train_dspark import _validate_draft_packing
 from tests.unit_tests.models.deepseek_v4.test_dsv4_model_smoke import _tiny_config as _v4_tiny_config
 from tests.unit_tests.models.deepseek_v41.test_model import _build_model as _build_v41_model
 from tests.unit_tests.models.deepseek_v41.test_model import _tiny_config as _v41_tiny_config
