@@ -42,6 +42,9 @@ EXCLUDED_RECIPE_PREFIXES = (
 )
 
 EXCLUDED_RECIPE_FILES = {
+    # Praxis-1 configs: their recipe (TrainWAMFinetuneRecipe) lands with the Praxis-1 code PR.
+    Path("examples/wam/praxis/praxis_1_libero.yaml"),
+    Path("examples/wam/praxis/praxis_1_libero_lora.yaml"),
     Path("examples/retrieval/data_utils/mining_config.yaml"),
     Path("examples/retrieval/data_utils/mining_multimodal_config.yaml"),
     # Command-only configs: launched via
