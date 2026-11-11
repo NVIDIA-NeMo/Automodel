@@ -56,6 +56,23 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str
 
 
+def _decoder_compute_dtype(layer: nn.Module) -> torch.dtype:
+    """Dtype the decoder's projections compute in.
+
+    Read before the layer's FSDP pre-forward, the stored weight dtype is the
+    storage dtype: FP32 when a framework keeps FP32 parameters and lets FSDP2
+    mixed precision cast them (for example RL trainers without optimizer master
+    weights). Use the layer's FSDP ``param_dtype`` then; otherwise the weight dtype.
+    """
+    from torch.distributed.fsdp import FSDPModule
+
+    if isinstance(layer, FSDPModule):
+        policy = getattr(layer._get_fsdp_state(), "_mp_policy", None)
+        if policy is not None and policy.param_dtype is not None:
+            return policy.param_dtype
+    return layer.self_attn.qkv_proj.weight.dtype
+
+
 class Step5TextModel(nn.Module):
     """Embedding, decoder stack and final normalization."""
 
@@ -99,7 +116,7 @@ class Step5TextModel(nn.Module):
         """
         first_layer = next(iter(self.layers.values()))
         cp_group = first_layer.self_attn.cp_group
-        compute_dtype = first_layer.self_attn.qkv_proj.weight.dtype
+        compute_dtype = _decoder_compute_dtype(first_layer)
         fields = (positions, padding_mask.to(positions.dtype))
         if packed_documents is not None:
             if packed_documents.shape != positions.shape:
