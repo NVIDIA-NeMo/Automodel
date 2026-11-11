@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
 if TYPE_CHECKING:
+    from wandb.sdk.wandb_run import Run
+
     from nemo_automodel.components.loggers.trackio_utils import TrackioLogger
 
 logger = logging.getLogger(__name__)
@@ -58,7 +60,9 @@ def _patch_mirror_values(swanlab: Any) -> None:
     _, run_cls = safe_import_from("wandb.sdk.wandb_run", "Run")
     log_mirrored = run_cls.log
 
-    def log_builtin_scalars(run, data=None, *args, **kwargs):
+    def log_builtin_scalars(
+        run: Run, data: Mapping[str, object] | None = None, *args: object, **kwargs: object
+    ) -> None:
         if isinstance(data, Mapping):
             data = {k: _builtin_scalar(v) for k, v in data.items()}
         return log_mirrored(run, data, *args, **kwargs)
@@ -66,7 +70,7 @@ def _patch_mirror_values(swanlab: Any) -> None:
     run_cls.log = log_builtin_scalars
     log_scalars = swanlab.log
 
-    def log_strings_as_text(data, step=None):
+    def log_strings_as_text(data: Mapping[str, object], step: int | None = None) -> None:
         return log_scalars({k: swanlab.Text(v) if isinstance(v, str) else v for k, v in data.items()}, step=step)
 
     swanlab.log = log_strings_as_text
