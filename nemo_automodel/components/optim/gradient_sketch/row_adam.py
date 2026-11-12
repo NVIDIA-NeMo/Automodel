@@ -50,9 +50,13 @@ def row_adam_direction(
         raise ValueError("Invalid RowAdam step, decay, or epsilon")
     if second_moment.shape != (sketch.shape[0], 1):
         raise ValueError("RowAdam requires one second moment per output row")
-    if not torch.isfinite(sketch).all():
+    # Row mean of squares via a [rows, 1] norm: no full-size temporary, even when inplace.
+    row_mean_sq = torch.linalg.vector_norm(sketch, dim=1, keepdim=True, dtype=torch.float32).square_()
+    row_mean_sq.div_(sketch.shape[1])
+    # A NaN or inf anywhere in a row propagates into its norm, so this check is equivalent.
+    if not torch.isfinite(row_mean_sq).all():
         raise FloatingPointError("Nonfinite gradient sketch")
-    second_moment.mul_(beta2).add_(sketch.square().mean(dim=1, keepdim=True), alpha=1 - beta2)
+    second_moment.mul_(beta2).add_(row_mean_sq, alpha=1 - beta2)
     denominator = (second_moment / (1 - beta2**step)).sqrt_().add_(epsilon)
     if inplace:
         return sketch.div_(denominator)

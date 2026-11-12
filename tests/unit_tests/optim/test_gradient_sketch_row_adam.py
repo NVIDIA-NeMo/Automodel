@@ -20,9 +20,11 @@ def test_running_rms_reference():
 def test_inplace_matches_out_of_place_and_reuses_storage():
     sketch = torch.tensor([[1.0, 3.0], [2.0, 4.0], [0.5, -1.0]])
     expected = row_adam_direction(sketch.clone(), torch.zeros(3, 1), step=3, beta2=0.9, epsilon=1e-8)
-    actual = row_adam_direction(sketch, torch.zeros(3, 1), step=3, beta2=0.9, epsilon=1e-8, inplace=True)
+    moment = torch.zeros(3, 1)
+    actual = row_adam_direction(sketch, moment, step=3, beta2=0.9, epsilon=1e-8, inplace=True)
     assert actual is sketch
     torch.testing.assert_close(actual, expected)
+    assert torch.all(moment > 0)
 
 
 def test_rejects_invalid_arguments():
@@ -32,3 +34,10 @@ def test_rejects_invalid_arguments():
         row_adam_direction(torch.ones(2, 2), torch.zeros(2, 2), step=1, beta2=0.9, epsilon=1e-8)
     with pytest.raises(FloatingPointError):
         row_adam_direction(torch.tensor([[float("nan"), 1.0]]), torch.zeros(1, 1), step=1, beta2=0.9, epsilon=1e-8)
+
+
+def test_nonfinite_sketch_leaves_moment_unchanged():
+    moment = torch.full((1, 1), 0.5)
+    with pytest.raises(FloatingPointError):
+        row_adam_direction(torch.tensor([[float("inf"), 1.0]]), moment, step=1, beta2=0.9, epsilon=1e-8)
+    torch.testing.assert_close(moment, torch.full((1, 1), 0.5))
