@@ -18,9 +18,12 @@ from typing import Any
 
 import torch
 
-from nemo_automodel.shared.import_utils import safe_import_te
+from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
 
 HAS_TE, transformer_engine = safe_import_te()
+HAS_FUSED_ADAM, FusedAdam = (
+    safe_import_from("transformer_engine.pytorch.optimizers", "FusedAdam") if HAS_TE else (False, None)
+)
 
 # The Conflict:
 # PyTorch DCP passes an _EXTRA_STATE sentinel for missing keys, but Transformer Engine (TE)
@@ -136,6 +139,37 @@ def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
                 state["exp_avg_sq"] = _zeros_like_optimizer_param(param)
             if group.get("amsgrad", False) and "max_exp_avg_sq" not in state:
                 state["max_exp_avg_sq"] = _zeros_like_optimizer_param(param)
+
+
+def _materialize_native_fused_adam_state(optimizer: torch.optim.Optimizer) -> None:
+    """Create the state a never-stepped TE FusedAdam would otherwise allocate in its first ``step()``.
+
+    TE FusedAdam keeps the step counter in each parameter group and allocates the moments and master weights
+    lazily inside ``step()``. A fresh optimizer therefore returns an empty ``state_dict()``, and DCP only loads
+    keys present in that skeleton, so a resume on the native optimizer checkpoint path would restore nothing.
+    This mirrors the initialization in ``FusedAdam.step``: a zero step counter for every group (an int32 tensor
+    of shape [1] when capturable) and TE's own ``initialize_state`` for every parameter without state, which
+    allocates zero moments plus the fp32 master copy, or the zero int16 remainder of a bf16 parameter. The first
+    real update after materialization is unchanged.
+
+    Args:
+        optimizer: Optimizer to populate; every other optimizer type is left untouched. Each parameter keeps its
+            shape, dtype, device and DTensor placements, and TE allocates matching per-parameter buffers.
+    """
+    if not HAS_FUSED_ADAM or not isinstance(optimizer, FusedAdam):
+        return
+    for group in optimizer.param_groups:
+        if "step" not in group:
+            if optimizer.capturable:
+                # FusedAdam.step() keeps the counter on the group's first parameter and, for a group without
+                # parameters, on the optimizer's own overflow buffer.
+                step_device = group["params"][0].device if group["params"] else optimizer._dummy_overflow_buf.device
+                group["step"] = torch.zeros(1, dtype=torch.int32, device=step_device)
+            else:
+                group["step"] = 0
+        for param in group["params"]:
+            if not optimizer.state[param]:
+                optimizer.initialize_state(param, optimizer.store_param_remainders and param.dtype == torch.bfloat16)
 
 
 def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
@@ -646,8 +680,14 @@ class OptimizerState:
         # can remain trainable yet unused for a step, so normalize missing state before both native and flattened DCP
         # serialization. This makes the save and subsequent load skeletons agree without changing a future first
         # update: the materialized step and moment tensors are all zero.
+        # TE FusedAdam allocates all of its state, including the per-group step counter, in its first step(), so a
+        # fresh optimizer would hand DCP an empty native load skeleton and a resume would silently keep fresh
+        # optimizer state. The flattened path needs no help: torch's get_optimizer_state_dict() initializes a fresh
+        # optimizer itself.
         for optimizer in self.optimizer:
             _materialize_missing_adam_state(optimizer)
+            if self._use_native_optimizer_state:
+                _materialize_native_fused_adam_state(optimizer)
         if self._use_native_optimizer_state:
             if self.optimizer_part_ids is None:
                 if len(self.optimizer) != 1:
