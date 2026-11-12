@@ -1,7 +1,7 @@
 ---
 title: "Reduce Optimizer Memory with Gradient Sketching"
 description: "Train dense LLMs with the gradient_sketch optimizer, which replaces dense gradients and Adam moments of selected linear weights with rank-r sketches."
-position: 3
+position: 7
 ---
 The `gradient_sketch` optimizer replaces the dense gradient of selected linear weights with a rank-`r` sketch accumulated during backward. It keeps one second moment per output row (RowAdam) instead of two dense Adam moments, and merges the low-rank update into the full weight each step. The method is LoGRA (Zhang et al., arXiv:2610.06647). All parameters that are not sketch targets are handled by a nested native optimizer such as AdamW.
 
@@ -17,12 +17,12 @@ optimizer:
   rank: 256
   seed: 42
   native:
-    _target_: adamw
+    _target_: nemo_automodel.components.optim.optimizer.AdamWConfig
     lr: 1.0e-5
     weight_decay: 0.0
 ```
 
-The registry key `gradient_sketch` selects the same config. `native` is a nested optimizer config written in the same `_target_` style as any other optimizer.
+The nested `native` target must be a dotted class path. Registry short names such as `adamw` are not resolved inside nested mappings. Omitting the nested `_target_` selects AdamW. The registry key `gradient_sketch` is accepted only by the top-level `build_optimizer_config` and `build_optimizer` entry points, not inside recipe YAML.
 
 ## Fields
 
@@ -54,7 +54,7 @@ Projections are not saved; they are regenerated from the seed on load. A checkpo
 
 ## Limits
 
-- FSDP2 row sharding only. No tensor, context, or pipeline parallelism.
+- FSDP2 row sharding only. Tensor and pipeline parallelism are rejected. Context parallelism is not supported or tested.
 - The process group used for gradient clipping must be the FSDP shard group. HSDP replicate groups are unsupported.
 - With more than one rank, every target must be an FSDP DTensor. Plain-tensor DDP is rejected.
 - No PEFT.
