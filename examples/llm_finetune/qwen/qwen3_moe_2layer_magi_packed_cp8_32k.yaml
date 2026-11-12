@@ -102,7 +102,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: train
-  num_samples_limit: 8192
+  limit_dataset_samples: 8192
   pad_to_max_length: false
   tokenizer:
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B

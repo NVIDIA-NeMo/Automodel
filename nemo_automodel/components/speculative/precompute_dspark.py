@@ -166,8 +166,8 @@ def _run(args: argparse.Namespace) -> int:
         raise ValueError(
             "precompute_dspark supports HF-loadable single-process targets only. "
             f"model_type={model_type!r}: DeepSeek V4/V4.1, GLM-5.2, and Kimi K3 targets use the distributed "
-            "offline precompute (python -m nemo_automodel.recipes.llm.precompute_dspark_dist); MiniMax M3 is "
-            "multimodal and the DSpark cache schema is text-only, so it needs the online training path."
+            "offline precompute (python -m nemo_automodel.recipes.speculative_decoding.precompute_dspark_dist); "
+            "MiniMax M3 is multimodal and the DSpark cache schema is text-only, so it needs the online training path."
         )
 
     target_config = AutoConfig.from_pretrained(args.target_model, trust_remote_code=args.trust_remote_code)

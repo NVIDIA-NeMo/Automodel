@@ -425,6 +425,8 @@ def _model_type_for_recipe(recipe: Path, hf_model_id: str) -> str | None:
         return None
     if top_level.startswith("vlm_"):
         return "VLM"
+    if top_level == "wam":
+        return "WAM"
     if top_level.startswith("llm_") or top_level in {"convergence", "long_context_validation"}:
         if hf_model_id.startswith("google-t5/"):
             return "Encoder-Decoder"

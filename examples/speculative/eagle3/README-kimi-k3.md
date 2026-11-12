@@ -1,16 +1,16 @@
-# Training a Kimi K3 EAGLE-3 drafter
+# Train a Kimi K3 EAGLE-3 Drafter
 
 This recipe trains an EAGLE-3 drafter against the frozen Kimi K3 text model.
 `kimi_k3_eagle3.yaml` is the reference configuration.
 
-## The draft
+## The Draft
 
 Kimi K3 interleaves Kimi Delta Attention (KDA) layers with full-attention MLA
 layers. The draft mirrors one MLA layer: Q-LoRA, the compressed KV latent, the
-sigmoid output gate, K3's fp32-variance RMSNorm and the SiTU MLP. KDA, the routed
-experts and the attention-residual mixer stay in the target only.
+sigmoid output gate, K3's fp32-variance RMSNorm, and the SiTU MLP. KDA, the routed
+experts, and the attention-residual mixer stay in the target only.
 
-K3's MLA is NoPE (`mla_use_nope=True`): the `qk_rope_head_dim` slice is carried
+K3's MLA uses no positional embeddings (NoPE, `mla_use_nope=True`): the `qk_rope_head_dim` slice is carried
 along unrotated and no rotary embedding is applied, so unlike the DeepSeek MLA
 draft this one registers no rotary cache and applies no per-TTT-step rotary phase
 offset. Positional information reaches the draft through the target hidden states
@@ -21,7 +21,7 @@ it is conditioned on, exactly as it reaches the target's own MLA layers.
 The target has 896 routed experts, so shard it with expert parallelism and pick
 an `ep_size` that divides 896. `pp_size` must stay 1: online hidden-state capture
 hooks one complete, non-pipelined target forward. Context parallelism, tensor
-parallelism and sequence packing are rejected up front for this target: K3 owns
+parallelism, and sequence packing are rejected up front for this target: K3 owns
 its own CP and packed-attention paths, which the EAGLE-3 target wrapper does not
 drive.
 
@@ -42,5 +42,5 @@ Run the same command on every node, varying only `--node-rank`. Node 0 provides
 the rendezvous address.
 
 ```bash
-torchrun --nnodes=8 --node-rank=<RANK> --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.llm.train_eagle3 -c examples/speculative/eagle3/kimi_k3_eagle3.yaml
+torchrun --nnodes=8 --node-rank=<RANK> --nproc_per_node=8 --master-addr=<NODE0_IP> --master-port=29500 -m nemo_automodel.recipes.speculative_decoding.train_eagle3 -c examples/speculative/eagle3/kimi_k3_eagle3.yaml
 ```

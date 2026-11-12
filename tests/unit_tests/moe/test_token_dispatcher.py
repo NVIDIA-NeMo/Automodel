@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import logging
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts
 
 import nemo_automodel.components.moe.megatron.fused_a2a as fused_a2a
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
@@ -1159,3 +1161,44 @@ class TestHybridEPMaxTokensPerRank:
                 _HybridEPManager(
                     group=None, num_local_experts=2, num_experts=8, router_topk=2, moe_hybridep_max_tokens_per_rank=0
                 )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_hybridep_first_capacity_dispatch_backward(
+    hybrid_ep_manager: _HybridEPManager, monkeypatch: pytest.MonkeyPatch, checkpointed: bool
+) -> None:
+    """First capacity dispatch must support selective recompute as well as eager backward."""
+    manager = hybrid_ep_manager
+    manager.hybridep_capacity_factor = 1.0
+    values = torch.linspace(-1.0, 1.0, 32, dtype=torch.float64).reshape(8, 4).requires_grad_()
+    probabilities = torch.full((8, 8), 0.125)
+    handle = tuple([None] * 10 + [8, torch.tensor(0)])
+    transport = Mock(return_value=(values, probabilities, None, torch.tensor([4, 4]), handle))
+    monkeypatch.setattr("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", transport)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    def dispatch_and_activate(hidden_states: torch.Tensor) -> torch.Tensor:
+        """Dispatch identity transport rows and apply an activation that needs recompute.
+
+        Args:
+            hidden_states: Tensor of shape [tokens, hidden].
+
+        Returns:
+            Activated dispatched rows of shape [tokens, hidden].
+        """
+        manager.routing_map = torch.ones(8, 8, dtype=torch.bool)
+        manager.token_probs = probabilities
+        return manager.dispatch(hidden_states).sin()
+
+    if checkpointed:
+        context_fn = partial(create_selective_checkpoint_contexts, [torch.ops.aten.eq.Scalar])
+        result = checkpoint(dispatch_and_activate, values, use_reentrant=False, context_fn=context_fn)
+    else:
+        result = dispatch_and_activate(values)
+    result.sum().backward()
+
+    torch.testing.assert_close(result, values.detach().sin(), rtol=0, atol=0)
+    torch.testing.assert_close(values.grad, values.detach().cos(), rtol=0, atol=0)
+    assert manager._hybridep_capacity == 8
+    assert transport.call_count == (2 if checkpointed else 1)

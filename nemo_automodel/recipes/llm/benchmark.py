@@ -287,6 +287,8 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         ``mtp_config.use_repeated_layer``, and the per-sublayer ``block_type`` from
         ``mtp.layers``. Returns 0.0 when the model has no enabled MTP head.
         """
+        from transformers import PretrainedConfig
+
         from nemo_automodel.components.utils.flops_utils import _nemotronh_mtp_flops
 
         for mp in self.model_parts:
@@ -296,9 +298,17 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             if mtp_cfg is None or not getattr(mtp_cfg, "enabled", False) or layers is None:
                 continue
             block_types = [getattr(s, "block_type", "moe") for s in layers]
+            config = mp.config
+            if not isinstance(config, PretrainedConfig):
+                if self.dist_env.is_main:
+                    logger.warning(
+                        "Skipping MTP head FLOPs for %s because it is not a transformers config",
+                        type(config).__name__,
+                    )
+                continue
             try:
                 flops = _nemotronh_mtp_flops(
-                    mp.config,
+                    config,
                     global_batch_size,
                     seq_len,
                     mtp_cfg.num_layers,
@@ -310,7 +320,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.warning(
                         "Skipping MTP head FLOPs for %s because the Nemotron-H FLOPs formula "
                         "does not support this config: %s",
-                        type(mp.config).__name__,
+                        type(config).__name__,
                         exc,
                     )
                 continue

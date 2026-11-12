@@ -110,7 +110,7 @@ def create_idlm_block_mask(
     B = valid_mask.size(0)
     key_valid = torch.cat([valid_mask.bool(), valid_mask.bool()], dim=1)  # [B, 2L]
 
-    def idlm_mask_mod(b, h, q_idx, kv_idx):
+    def idlm_mask_mod(b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
         x0_q = q_idx >= seq_len
         x0_kv = kv_idx >= seq_len
         block_q = torch.where(x0_q, (q_idx - seq_len) // block_size, q_idx // block_size)

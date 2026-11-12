@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.quantization.fp8 import (
     FP8Config,
     _module_filter_fn,
@@ -364,6 +365,16 @@ class TestFP8ConfigBuilders:
         assert config.enabled is False
         assert config.recipe_name is None
         assert config.filter_fqns == []
+
+    def test_build_fp8_config_from_config_node(self):
+        """Test build_fp8_config accepts the recipe's ConfigNode input."""
+        config_node = ConfigNode({"enabled": True, "recipe_name": "rowwise", "filter_fqns": ["lm_head"]})
+
+        config = build_fp8_config(config_node)
+
+        assert config.enabled is True
+        assert config.recipe_name == "rowwise"
+        assert config.filter_fqns == ["lm_head"]
 
 
 class TestIntegration:

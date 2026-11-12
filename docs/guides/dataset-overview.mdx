@@ -18,7 +18,12 @@ NeMo AutoModel supports several common patterns for language modeling and instru
 ### HellaSwag (Completion SFT)
 - Wrapper: `nemo_automodel.components.datasets.llm.hellaswag.HellaSwag`
 - Use case: single-turn completion-style SFT where a prompt (ctx) is followed by a gold continuation (ending)
-- Key args: `path_or_dataset`, `split`, `num_samples_limit`
+- Key args: `path_or_dataset`, `split`, `limit_dataset_samples`
+
+Use `limit_dataset_samples` to cap dataset size. HellaSwag and GLUE MRPC also
+accept the deprecated `num_samples_limit` spelling with a warning until the next
+breaking dataset API release. If both names are provided, their values must agree.
+
 - Example YAML:
 
 ```yaml
@@ -76,8 +81,8 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/colum
   - `path_or_dataset_id`: path to local file(s) or Hugging Face dataset ID
   - `tokenizer`: tokenizer instance (required; must have chat template support)
   - `split`: dataset split (for example, "train", "validation")
-  - `name`: dataset configuration/subset name
-  - `seq_length`: maximum sequence length for padding/truncation
+  - `name`: dataset configuration or subset name
+  - `seq_length`: maximum sequence length for padding or truncation
   - `padding`: padding strategy ("do_not_pad", "max_length", and so on)
   - `truncation`: truncation strategy ("do_not_truncate", "longest_first", and so on)
   - `chat_template`: optional override for tokenizer's chat template
@@ -86,22 +91,22 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/colum
   - `mask_generation_prompt`: optionally exclude the template-supplied prefix of each assistant turn (the role header and any empty reasoning block such as `<think></think>`) from loss
   - `skip_invalid_samples`: if `true`, skip malformed JSONL lines when reading local files (warnings log skip counts); default `false` fails fast on a bad line
 <Note>
-- Requires a tokenizer with chat template support
-- Supports both single-turn and multi-turn tool calling
-- Assistant messages can also include `reasoning_content` for structured reasoning traces
-- Tool definitions are provided in a `tools` field at the conversation level
-- Tool calls appear in assistant messages through the `tool_calls` field
-- Tool responses use the `tool` role and must include `tool_call_id`
-- If your dataset contains `reasoning_content`, your chat template must render it explicitly or it will be dropped
-- For multi-turn tool-calling datasets, prefer chat templates that use `{% generation %}` blocks so assistant-turn loss masking is exact
-- Set `mask_reasoning_content: true` if you want to train on the final assistant answer while excluding rendered reasoning traces from loss
-- Set `mask_generation_prompt: true` when fine-tuning a hybrid-reasoning model (Nemotron, Qwen3, GLM, ...) on non-thinking data.
+- Requires a tokenizer with chat template support.
+- Supports both single-turn and multi-turn tool calling.
+- Assistant messages can also include `reasoning_content` for structured reasoning traces.
+- Tool definitions are provided in a `tools` field at the conversation level.
+- Tool calls appear in assistant messages through the `tool_calls` field.
+- Tool responses use the `tool` role and must include `tool_call_id`.
+- If your dataset contains `reasoning_content`, your chat template must render it explicitly or it will be dropped.
+- For multi-turn tool-calling datasets, prefer chat templates that use `{% generation %}` blocks so assistant-turn loss masking is exact.
+- Set `mask_reasoning_content: true` if you want to train on the final assistant answer while excluding rendered reasoning traces from loss.
+- Set `mask_generation_prompt: true` when fine-tuning a hybrid-reasoning model (Nemotron, Qwen3, GLM, and so on) on non-thinking data.
   - Those chat templates insert an empty reasoning block (for example, `<think></think>`) into every assistant turn that has no `reasoning_content`.
   - At inference, the generation prompt supplies that block, so training on it only teaches the model to close the block immediately.
   - The option masks the role header and that block for every assistant turn. It is detected by rendering the template's generation prompt, so no tag strings are hardcoded.
   - Like `answer_only_loss_mask` without `{% generation %}` blocks, the option locates turns by rendering conversation prefixes. Multi-turn conversations need a template that renders earlier turns the same way as the conversation grows, or a `{% generation %}` template.
   - Stock Qwen3 rewrites earlier assistant turns (it drops their reasoning block after a later user turn follows). On that template, multi-turn answer-only masking raises, and the option applies to single-turn conversations only.
-- Set `skip_invalid_samples: true` for noisy local JSONL so lines that are not valid JSON are skipped instead of failing the load
+- Set `skip_invalid_samples: true` for noisy local JSONL so lines that are not valid JSON are skipped instead of failing the load.
 
 </Note>
 - Example YAML:
@@ -298,7 +303,7 @@ Streaming datasets enable processing very large datasets without loading them en
 
 ### What Are Streaming Datasets?
 
-Streaming datasets load and process data incrementally, one batch at a time, rather than loading the entire dataset into memory upfront. This approach:
+Streaming datasets load and process data incrementally, one batch at a time, rather than loading the entire dataset into memory upfront. This approach has the following benefits:
 
 - **Reduces memory footprint**: Only the current batch resides in memory
 - **Enables training on massive datasets**: Process terabyte-scale datasets on machines with limited RAM
@@ -389,14 +394,14 @@ dataset.set_epoch(epoch_num)
 
 ### Performance Considerations
 
-**Memory vs. Speed Trade-offs**:
+**Memory and Speed Trade-offs**:
 - Streaming reduces memory usage but might be slower than in-memory datasets
 - Network latency can impact streaming performance for remote datasets
 - Use local caching when repeatedly accessing the same remote dataset
 
 **Buffer Size for Shuffling**:
 - Larger buffers provide better randomization but use more memory
-- A buffer size of 10,000-100,000 samples is typically a good balance
+- A buffer size of 10,000–100,000 samples is typically a good balance
 - For perfect shuffling, you need a buffer size equal to the dataset size (defeating the purpose of streaming)
 
 **Prefetching**:
@@ -404,9 +409,9 @@ dataset.set_epoch(epoch_num)
 - This helps hide network latency and keeps GPUs busy
 - Adjust prefetch settings based on your network speed and batch size
 
-### Example: Streaming a Large Dataset
+### Large Dataset Streaming Example
 
-Here's a complete example of using streaming for a large instruction-tuning dataset:
+Here is a complete example of using streaming for a large instruction-tuning dataset:
 
 ```yaml
 dataset:
@@ -426,14 +431,14 @@ dataloader:
   num_workers: 4
 ```
 
-This configuration:
+This configuration does the following:
 - Streams the dataset without loading it fully into memory
 - Automatically repeats when the stream is exhausted
 - Uses multiple workers for efficient data loading
 - Applies answer-only loss masking during tokenization
 
 ## Packed Sequence Support
-To reduce padding and improve throughput with variable-length sequences:
+To reduce padding and improve throughput with variable-length sequences, add the following to your config:
 ```yaml
 packed_sequence:
   packed_sequence_size: 8192   # > 0 enables packing; 0 disables it
@@ -452,7 +457,7 @@ dataloader:
 
 ---
 
-## VLM Datasets (Vision/Audio + Language)
+## VLM Datasets (Vision or Audio with Language)
 VLM datasets are represented as conversations (message lists) that combine text with images or audio and are processed with the model's `AutoProcessor.apply_chat_template` and a suitable collate function.
 
 Built-in dataset makers return a Python list or a Hugging Face `Dataset`; each yielded sample includes a `conversation` field:
@@ -516,7 +521,7 @@ See [Gemma-3n](/recipes-e2e-examples/gemma-3-3n) and [VLM dataset](/datasets/mul
 
 Diffusion models do not train directly on raw images or videos. Instead, the data is first encoded into a compact numerical representation called a latent. This is what the model actually learns from. Text captions are similarly converted into text embeddings that the model uses as conditioning.
 
-This encoding is done once during preprocessing, and the results are saved as cache files (.meta). Training then reads these cache files directly, which is significantly faster than re-encoding on every step.
+This encoding is done once during preprocessing, and the results are saved as cache files (`.meta`). Training then reads these cache files directly, which is significantly faster than re-encoding on every step.
 
 The built-in preprocessing tool ([`tools/diffusion/preprocessing_multiprocess.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/diffusion/preprocessing_multiprocess.py)) handles this conversion. It uses a VAE (Variational Autoencoder) to encode visual data and a text encoder for captions, grouping outputs into resolution-bucketed directories compatible with the multiresolution dataloader.
 
@@ -576,7 +581,9 @@ dataset:
   some_arg: 123
   split: train
 ```
-Where `build_my_dataset` returns either a `datasets.Dataset` or a list/iterator of conversation dicts (for VLM).
+Here, `build_my_dataset` returns either a `datasets.Dataset` or a list or iterator of conversation dicts (for VLM).
+
+Loading the file runs its code, so NeMo AutoModel loads a file from outside the installed package only after you opt in. Launch with `NEMO_ENABLE_USER_MODULES=1 automodel my_config.yaml`. For details, refer to [Target Resolution and Code Execution](/get-started/configuration#target-resolution-and-code-execution).
 
 ### Use ColumnMappedTextInstructionDataset for Most Instruction Datasets (LLM)
 - Ideal when your data has columns like `instruction`, `input`, or `output` but with arbitrary names

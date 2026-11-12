@@ -22,6 +22,8 @@ in backward instead of saving the dequantized tensor, so frozen expert weights s
 packed at steady state during LoRA training.
 """
 
+from typing import Protocol
+
 import torch
 from torch.autograd.function import FunctionCtx
 
@@ -121,6 +123,13 @@ def quantize_mxfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return packed.contiguous(), scales.contiguous()
 
 
+class _MXFP4Context(Protocol):
+    """Autograd context retaining the 3 packed-weight tensors for backward."""
+
+    @property
+    def saved_tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+
 class MXFP4GroupedMM(torch.autograd.Function):
     """Grouped GEMM over mxfp4-packed frozen weights with dequantization on the fly.
 
@@ -159,16 +168,17 @@ class MXFP4GroupedMM(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx: FunctionCtx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+    def backward(ctx: _MXFP4Context, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
         """Backpropagate through activations while keeping the packed base frozen.
 
         Args:
-            grad_out: Tensor of shape [tokens, out_dim], in the forward output dtype.
+            grad_outputs: Exactly one gradient tensor of shape [tokens, out_dim], in the forward output dtype.
 
         Returns:
             Activation gradient of shape [tokens, in_dim], followed by None for
             the packed weights, scales, and offsets.
         """
+        (grad_out,) = grad_outputs
         packed, scales, offs = ctx.saved_tensors
         w_t = dequantize_mxfp4(packed, scales, grad_out.dtype)  # [E, N, K] == W^T
         grad_x = torch._grouped_mm(grad_out.contiguous(), w_t, offs=offs)

@@ -136,5 +136,5 @@ ci:
     parity_threshold_overrides:
       automodel_reload:
         cosine_similarity: 0.985
-    dataset.num_samples_limit: 512
-    validation_dataset.num_samples_limit: 512
+    dataset.limit_dataset_samples: 512
+    validation_dataset.limit_dataset_samples: 512
