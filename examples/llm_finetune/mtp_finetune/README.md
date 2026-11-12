@@ -50,7 +50,7 @@ MTP head adapts to the fine-tuning domain. A value near `1.0` means the MTP
 head is barely contributing beyond the main head's own next token; a value
 approaching `1 + num_mtp_layers` means every MTP depth is being accepted.
 
-## Gated-LoRA MTP for models without an MTP head
+## Gated-LoRA MTP for Models without an MTP Head
 
 `qwen3_0p6b_gated_lora_mtp.yaml` adds MTP to a model that has no MTP layers,
 following [Your LLM Knows the Future](https://arxiv.org/abs/2507.11851). A
