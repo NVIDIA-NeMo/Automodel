@@ -34,14 +34,17 @@ Performance CI skips validation by default. Set `ci.perf_testing.validation: tru
 to retain the canonical recipe's periodic and checkpoint-triggered validation
 cadence. Checkpoint saving remains disabled for performance runs.
 
-## Fixed-length real-text pretraining
+## Fixed-length synthetic pretraining
 
-The 56 full-training benchmarks below have `llm_pretrain` counterparts. They use
-FineWeb-Edu's `sample-10BT` text stream at a pinned dataset revision and the model's
-own tokenizer. EOS separates documents, and contiguous token chunks match the
-legacy sequence length exactly. These are ordinary causal sequences: attention
-can cross document boundaries, and there is no THD packing or padding. Labels
-are shifted by one token, including across chunk boundaries.
+The 56 full-training benchmarks below have `llm_pretrain` counterparts using the
+existing `MockIterableDatasetConfig`. Random token IDs span the model vocabulary,
+excluding padding IDs. Fixed sequence lengths match the legacy benchmarks. Labels
+shift within each sequence, with the final label ignored. There is no THD packing;
+the model builds canonical positions. The default collator joins the generator's
+single-row tensors using `step_scheduler.local_batch_size`.
+
+These synthetic workloads measure runtime performance; they do not establish
+learning quality or convergence on real text.
 
 The canonical configs contain the benchmark's model initialization, precision,
 kernels, loss, optimizer, parallelism and global/local batches. Their normal route
@@ -64,12 +67,10 @@ torchrun --standalone --nproc-per-node=8 -m nemo_automodel.recipes.llm.train_ft 
   --config examples/llm_pretrain/qwen/qwen3_moe_30b_te_deepep.yaml
 ```
 
-Use the same config for performance testing. Streaming downloads require dataset
-access from the training workers; gated model tokenizers require the usual Hugging
-Face credentials. `max_steps` bounds the repeating text stream. Stateful loader
-resume is deterministic but replays earlier samples; for long production runs,
-preprocessed Megatron or NanoGPT data avoids repeated tokenization and network I/O.
-The existing local-shard examples remain available for that use.
+Use the same config for performance testing. Mock data requires no dataset download
+or tokenization. Model initialization may still require Hugging Face access.
+`max_steps` bounds the run. Use the existing local-shard Megatron or NanoGPT
+examples with prepared real data for production pretraining.
 
 GB200 configs use four GPUs per node and need an ARM64 image on a GB200 cluster;
 H100 configs use eight. Deprecated variants remain disabled. Existing known-issue
@@ -235,9 +236,9 @@ The following recipes remain unpacked pending support or data-size validation:
   packed document mask.
 - DeepSeek V4 with cudnn/torch attention: the selected packing paths require
   capability and document-mask validation before enabling them.
-- GLM5 and Kimi K3: packing remains disabled pending validation of SQuAD at their
-  large distributed batch sizes. The previous HellaSwag sample counts no longer
-  describe these recipes.
+- GLM5: packing remains disabled pending validation of SQuAD at its large
+  distributed batch size. Kimi K3 uses 1,024-token packing. The previous
+  HellaSwag sample counts no longer describe these recipes.
 
 These exceptions must be labeled in performance reports. Do not interpret them
 as measured packed-finetuning results.
@@ -247,8 +248,7 @@ HellaSwag pack counts, partial-step percentages and throughput measurements are
 historical evidence, not measurements of the current configs. Revalidate the
 configured global batch on the actual tokenizer and dataset before comparing TPS.
 
-Small validation sets may leave some data-parallel ranks empty. The validation
-prerequisite keeps forward collectives aligned and counts each real example once;
-placeholder forwards contribute neither loss nor token counts. A globally empty
-validation set has no defined loss and reports NaN. Keep tokens per step in
-performance reports so partial accumulation windows remain visible.
+Performance runs skip validation by default. Ordinary training retains the existing
+validation sampler and loop; this migration does not add support for uneven-rank
+validation. Keep tokens per step in performance reports so partial accumulation
+windows remain visible.

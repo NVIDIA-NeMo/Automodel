@@ -27,15 +27,14 @@ import inspect
 import logging
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Iterator, Sized
+from collections.abc import Callable, Iterable, Sized
 from contextlib import AbstractContextManager, nullcontext
-from copy import copy, deepcopy
+from copy import copy
 from dataclasses import dataclass, field, fields, is_dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypedDict, TypeVar, cast, runtime_checkable
 
-from torch import Tensor
-from torch.utils.data import Dataset, IterableDataset, default_collate
+from torch.utils.data import Dataset, IterableDataset
 from torch.utils.data.sampler import Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -580,55 +579,6 @@ def make_dataset_config(target: object, kwargs: dict[str, object] | None = None)
     return _LegacyDatasetConfig(obj, kwargs, accepts_tokenizer=accepts_tokenizer)
 
 
-class _EvaluationSampler(Sampler[int]):
-    """Partition evaluation examples exactly once, including shards smaller than world size."""
-
-    def __init__(self, dataset: Sized, *, rank: int, world_size: int) -> None:
-        self.indices = range(rank, len(dataset), world_size)
-
-    def __iter__(self) -> Iterator[int]:
-        return iter(self.indices)
-
-    def __len__(self) -> int:
-        return len(self.indices)
-
-
-_SampleT = TypeVar("_SampleT")
-_BatchT = TypeVar("_BatchT")
-
-
-class _PipelineEvaluationCollator(Generic[_SampleT, _BatchT]):
-    """Keep the PP batch axis fixed while excluding padded rows from supervised metrics.
-
-    Duplicate raw examples before collation so packing metadata and masks describe
-    the padded inputs. Collated labels must have shape [batch, sequence]; added rows
-    use ``ignore_index`` and therefore contribute neither CE nor MTP supervision.
-    """
-
-    def __init__(
-        self, collate_fn: Callable[[list[_SampleT]], _BatchT] | None, batch_size: int | None, ignore_index: int
-    ) -> None:
-        if batch_size is None or batch_size <= 0:
-            raise ValueError("Pipeline evaluation requires a positive fixed batch_size")
-        self.collate_fn = collate_fn or default_collate
-        self.batch_size = batch_size
-        self.ignore_index = ignore_index
-
-    def __call__(self, examples: list[_SampleT]) -> _BatchT:
-        valid_rows = len(examples)
-        if valid_rows == self.batch_size:
-            return self.collate_fn(examples)
-        if not 0 < valid_rows < self.batch_size:
-            raise ValueError("Pipeline evaluation requires a nonempty batch no larger than batch_size")
-        padded = examples + [deepcopy(examples[0]) for _ in range(self.batch_size - valid_rows)]
-        batch = self.collate_fn(padded)
-        # CollateFn is an external boundary: validate the supervised batch contract.
-        if not isinstance(batch, dict) or not isinstance(batch.get("labels"), Tensor):
-            raise TypeError("Pipeline evaluation requires a collator returning a labels tensor")
-        batch["labels"][valid_rows:] = self.ignore_index
-        return batch
-
-
 def _make_sampler(
     dataset: Any,
     *,
@@ -638,11 +588,8 @@ def _make_sampler(
     shuffle: bool,
     group_by_length: bool,
     batch_size: int,
-    is_training: bool = True,
 ) -> Sampler:
     """Build the default map-style sampler (distributed, or length-grouped)."""
-    if not is_training:
-        return _EvaluationSampler(dataset, rank=dp_rank, world_size=dp_world_size)
     if group_by_length:
         from nemo_automodel.components.datasets.llm.length_grouped_sampler import LengthGroupedSampler
 
@@ -694,8 +641,6 @@ class ParallelAwareDataloader(StatefulDataLoader):
         persistent_workers: bool = False,
         prefetch_factor: int | None = None,
         drop_last: bool = False,
-        is_training: bool = True,
-        ignore_index: int = -100,
     ) -> None:
         """Shard / sample ``dataset`` for the given ranks, then construct the ``StatefulDataLoader``."""
         loader_kwargs: _DataloaderKwargs = {
@@ -725,13 +670,10 @@ class ParallelAwareDataloader(StatefulDataLoader):
                 shuffle=True if shuffle is None else shuffle,
                 group_by_length=group_by_length,
                 batch_size=batch_size,
-                is_training=is_training,
             )
             loader_kwargs["batch_size"] = batch_size
-            loader_kwargs["drop_last"] = (pp_enabled or drop_last) and is_training
+            loader_kwargs["drop_last"] = pp_enabled or drop_last
 
-        if pp_enabled and not is_training:
-            collate_fn = _PipelineEvaluationCollator(collate_fn, batch_size, ignore_index)
         _set_spawn_start_method()
         super().__init__(dataset, collate_fn=collate_fn, **loader_kwargs)
         self.dp_rank = dp_rank
@@ -859,7 +801,7 @@ class DataloaderConfig:
         Args:
             dp_rank: Rank within the data-parallel group.
             dp_world_size: Size of the data-parallel group.
-            pp_enabled: Whether pipeline parallelism requires fixed batch shapes.
+            pp_enabled: Whether pipeline parallelism requires dropping incomplete batches.
             tokenizer: Runtime tokenizer or multimodal processor for tokenizer-aware datasets and collators.
             dataset_build_context: Optional caller-owned rank-ordering context used only while materializing the
                 dataset. Collective dataset builders should pass ``None``.
@@ -876,8 +818,8 @@ class DataloaderConfig:
                 Native mask/Flash collation requires a model-derived contract supplying
                 the attention conversion; recipes provide it automatically.
             collate_wrapper: Optional recipe-owned wrapper around the resolved collator.
-            ignore_index: Label exclusion value for streams and padded pipeline evaluation rows.
-                Native collators otherwise retain their configured supervision policy.
+            ignore_index: Stream-backend label exclusion value. Native collators retain
+                their own configured supervision policy and do not consume this value.
 
         Returns:
             Stateful, data-parallel-aware dataloader.
@@ -984,8 +926,6 @@ class DataloaderConfig:
                 persistent_workers=self.persistent_workers,
                 prefetch_factor=self.prefetch_factor,
                 drop_last=self.drop_last,
-                is_training=is_training,
-                ignore_index=ignore_index,
             )
 
 

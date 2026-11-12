@@ -35,7 +35,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from nemo_automodel.components.training.batch import move_batch_to_device
-from nemo_automodel.components.training.validation import synchronized_validation_batches
 from nemo_automodel.shared.import_utils import safe_import
 
 _HAS_MLFLOW, mlflow = safe_import(
@@ -462,7 +461,6 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
         return None
 
     from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
-    from nemo_automodel.components.models.common.packed_seq import FLASH_VARLEN_KWARGS
 
     def wrapper(base_collate_fn):
         def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
@@ -478,14 +476,7 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
                 size and ``S`` is padded sequence length, plus ``causal_mask_mapping`` entries covering the
                 same ``S`` token axis. Other tensor fields preserve the base collator's documented layout.
             """
-            collated = base_fn(batch)
-            if "_packed_seq_ids" in collated:
-                # Flat Flash offsets describe the whole local batch and cannot
-                # be split along batch dimension. Model-entry hooks rebuild
-                # them from batch-major document IDs after PP microbatching.
-                for key in FLASH_VARLEN_KWARGS:
-                    collated.pop(key, None)
-            return add_causal_masks_to_batch(collated, model_config=config)
+            return add_causal_masks_to_batch(base_fn(batch), model_config=config)
 
         return chained_collate_fn
 
@@ -1806,10 +1797,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_num_label_tokens = 0
             self._mtp_accept_metrics: list = []
 
-            for validation_batch in synchronized_validation_batches(val_dataloader):
-                batch = validation_batch.batch
+            for batch in val_dataloader:
                 loss_buffer = []
-                metric_start = len(self._mtp_accept_metrics)
                 num_label_tokens = _count_label_tokens(
                     batch["labels"], _get_loss_ignore_index(getattr(self, "loss_fn", None))
                 )
@@ -1822,14 +1811,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     is_train=False,
                 )
 
-                weight = int(validation_batch.contributes)
-                if validation_batch.contributes:
-                    total_loss += torch.sum(torch.stack(loss_buffer)).float()
-                    total_num_label_tokens += num_label_tokens
-                # Keep MTP reduction shapes identical while excluding placeholders.
-                for metric in self._mtp_accept_metrics[metric_start:]:
-                    metric.prefix_hits.mul_(weight)
-                    metric.valid.mul_(weight)
+                total_loss += torch.sum(torch.stack(loss_buffer)).item()
+                total_num_label_tokens += num_label_tokens
 
             for target, prev in mtp_eval_flags:
                 target.compute_mtp_in_eval = prev
@@ -1838,8 +1821,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         total_num_label_tokens = self._dp_allreduce(
             torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
         ).item()
-        # A globally empty/all-masked dataset has no defined mean; report NaN, not a perfect zero loss.
-        val_loss = total_loss / total_num_label_tokens
+        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
 
         # For PP, send val_loss and num_label_tokens from last stage to main rank
         if self.pp_enabled:
