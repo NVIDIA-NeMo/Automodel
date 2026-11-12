@@ -257,8 +257,9 @@ _TE_RECIPE_NAMES = ("current", "block", "mxfp8", "nvfp4")
 
 @dataclass(kw_only=True)
 class TENvfp4Config:
-    """Options of the Transformer Engine NVFP4BlockScaling recipe (``te_fp8.recipe: nvfp4``).
+    """Options of the Transformer Engine NVFP4BlockScaling recipe.
 
+    Set as the backend block ``te_nvfp4``, or as ``te_fp8.nvfp4`` next to ``te_fp8.recipe: nvfp4``.
     The defaults are the recipe defaults for training. ``row_scaled_activation`` and ``four_over_six``
     change how forward activations are quantized; Transformer Engine supports them
     only without the random Hadamard transform.
@@ -290,18 +291,18 @@ class TENvfp4Config:
         """Reject option values and combinations that Transformer Engine does not implement."""
         if self.four_over_six not in ("none", "weights", "activations", "all"):
             raise ValueError(
-                "te_fp8.nvfp4.four_over_six must be one of 'none', 'weights', 'activations' or 'all', "
+                "NVFP4 option four_over_six must be one of 'none', 'weights', 'activations' or 'all', "
                 f"got {self.four_over_six!r}"
             )
         if self.backward not in ("quantized", "high_precision", "dequantized"):
             raise ValueError(
-                f"te_fp8.nvfp4.backward must be one of quantized, high_precision or dequantized, got {self.backward!r}"
+                f"NVFP4 option backward must be one of quantized, high_precision or dequantized, got {self.backward!r}"
             )
         if self.random_hadamard_transform and (
             self.row_scaled_activation or self.four_over_six in ("activations", "all")
         ):
             raise ValueError(
-                "te_fp8.nvfp4: row_scaled_activation and four_over_six on activations require "
+                "NVFP4 options row_scaled_activation and four_over_six on activations require "
                 "random_hadamard_transform=False"
             )
 
@@ -796,6 +797,10 @@ class BackendConfig:
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None
+    # NVFP4 training with Transformer Engine under its own name: the "nvfp4" recipe with these options
+    # ({} keeps the recipe defaults). Equivalent to te_fp8 = {recipe: nvfp4, nvfp4: {...}} and exclusive
+    # with te_fp8. Construction moves it into te_fp8, which the model code reads, and leaves None here.
+    te_nvfp4: TENvfp4Config | None = None
     gate_precision: str | torch.dtype | None = None
     # When True, torch.compile(fullgraph=True) the attention module's forward to fuse its many
     # small ops (projections, RoPE, reshapes, SDPA). Applies to both the DeepSeek-V3 MLA and
@@ -867,6 +872,19 @@ class BackendConfig:
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
+        # te_nvfp4 selects the NVFP4 recipe; move it into te_fp8 so one field describes the TE recipe.
+        te_block = "te_fp8"
+        if isinstance(self.te_nvfp4, dict):
+            self.te_nvfp4 = TENvfp4Config(**self.te_nvfp4)
+        if self.te_nvfp4 is not None:
+            if self.te_fp8 is not None:
+                raise ValueError(
+                    "te_nvfp4 and te_fp8 are mutually exclusive; set the NVFP4 options in te_nvfp4 or in "
+                    "te_fp8.nvfp4, not in both"
+                )
+            self.te_fp8 = TEFp8Config(recipe="nvfp4", nvfp4=self.te_nvfp4)
+            self.te_nvfp4 = None
+            te_block = "te_nvfp4"
 
         if isinstance(self.cuda_graph, dict):
             self.cuda_graph = CudaGraphConfig(**self.cuda_graph)
@@ -948,7 +966,7 @@ class BackendConfig:
         # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
         if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(
-                "te_fp8 requires at least one TE backend "
+                f"{te_block} requires at least one TE backend "
                 f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
             )
         # The sync-free knobs only mean something to the HybridEP dispatcher; elsewhere the capacity factor
@@ -1929,6 +1947,7 @@ __all__ = [
     "BackendConfig",
     "Float32RMSNorm",
     "TEFp8Config",
+    "TENvfp4Config",
     "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",
     "compute_lm_head_logits",

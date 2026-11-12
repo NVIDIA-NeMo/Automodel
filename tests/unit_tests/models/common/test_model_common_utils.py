@@ -16,6 +16,7 @@ import copy
 import types
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -26,6 +27,7 @@ from torch import nn
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
+    TENvfp4Config,
     compute_lm_head_logits,
     generation_config_from_model_config,
     get_is_first_microbatch,
@@ -283,7 +285,7 @@ class TestTEFp8Config:
         ],
     )
     def test_nvfp4_options_reject_unsupported_combinations(self, options):
-        with pytest.raises(ValueError, match="te_fp8.nvfp4"):
+        with pytest.raises(ValueError, match="NVFP4 option"):
             TEFp8Config(recipe="nvfp4", nvfp4=options)
 
     def test_nvfp4_options_need_the_nvfp4_recipe(self):
@@ -383,6 +385,41 @@ class TestBackendConfigTeFp8:
         """te_fp8 requires linear='te' or experts='te'."""
         with pytest.raises(ValueError, match="te_fp8 requires at least one TE backend"):
             BackendConfig(te_fp8=TEFp8Config(), linear="torch", experts="torch")
+
+
+class TestBackendConfigTeNvfp4:
+    def test_block_selects_the_nvfp4_recipe_with_its_options(self):
+        options = {"stochastic_rounding": False, "resident_weights": True}
+        cfg = BackendConfig(te_nvfp4=options, experts="te", dispatcher="deepep")
+        nested = BackendConfig(te_fp8={"recipe": "nvfp4", "nvfp4": options}, experts="te", dispatcher="deepep")
+        assert cfg.te_fp8 == nested.te_fp8
+        assert cfg.te_fp8.recipe == "nvfp4"
+        assert cfg.te_fp8.nvfp4 == TENvfp4Config(stochastic_rounding=False, resident_weights=True)
+        assert cfg.te_fp8.resident_nvfp4_weights()
+        assert cfg.te_nvfp4 is None
+
+    def test_empty_block_keeps_the_recipe_defaults(self):
+        cfg = BackendConfig(te_nvfp4={}, experts="te", dispatcher="deepep")
+        assert cfg.te_fp8 == TEFp8Config(recipe="nvfp4", nvfp4=TENvfp4Config())
+        assert cfg.te_fp8.nvfp4.recipe_kwargs() == {}
+
+    def test_block_survives_a_copy_of_the_backend(self):
+        cfg = BackendConfig(te_nvfp4={"resident_weights": True}, experts="te", dispatcher="deepep")
+        copied = replace(cfg, gate_precision=torch.float32)
+        assert copied.te_fp8 == cfg.te_fp8
+        assert copied.te_fp8.resident_nvfp4_weights()
+
+    def test_block_and_te_fp8_together_are_rejected(self):
+        with pytest.raises(ValueError, match="te_nvfp4 and te_fp8 are mutually exclusive"):
+            BackendConfig(te_nvfp4={}, te_fp8={"recipe": "nvfp4"}, experts="te", dispatcher="deepep")
+
+    def test_block_requires_a_te_backend(self):
+        with pytest.raises(ValueError, match="te_nvfp4 requires at least one TE backend"):
+            BackendConfig(te_nvfp4={}, linear="torch", experts="torch")
+
+    def test_block_rejects_unsupported_options(self):
+        with pytest.raises(ValueError, match="NVFP4 option"):
+            BackendConfig(te_nvfp4={"backward": "float"}, experts="te", dispatcher="deepep")
 
 
 class TestGetRopeConfig:
