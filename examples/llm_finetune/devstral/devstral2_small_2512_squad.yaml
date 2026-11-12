@@ -113,5 +113,5 @@ ci:
   recipe_owner: akoumpa
   node_multiplier: true
   time: "00:15:00"
-  perf_testing:
+  perf_testing:  #PR4637: not set
     schedule: nightly

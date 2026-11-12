@@ -4,13 +4,14 @@
 #   automodel examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
+#PR4637: removed benchmark: {nsys_end: -1, nsys_ranks: [], nsys_start: -1, num_nodes: 1, peak_tflops: 989, warmup_steps: 5}
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 42
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 2
+  local_batch_size: 2  #PR4637: 8
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 10
@@ -25,6 +26,7 @@ rng:
   ranked: true
 
 model:
+  #PR4637: removed model.force_hf: true
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen2.5-32B-Instruct
   torch_dtype: bf16
@@ -43,36 +45,41 @@ checkpoint:
   save_consolidated: false
 
 distributed:
+  #PR4637: removed distributed.pipeline: {dtype: bf16, layers_per_stage: 2, pp_microbatch_size: 1, pp_schedule: interleaved1f1b, round_virtual_stages_to_pp_multiple: up, scale_grads_in_schedule: false}
   strategy: fsdp2
-  dp_size:
-  tp_size: 2
+  dp_size:  #PR4637: none
+  tp_size: 2  #PR4637: 1
   cp_size: 1
-  pp_size: 1
+  pp_size: 1  #PR4637: 4
   sequence_parallel: false
   activation_checkpointing: true
-  enable_async_tensor_parallel: false
-  enable_fsdp2_prefetch: true
-  enable_compile: true
-  patch_is_packed_sequence: true
+  enable_async_tensor_parallel: false  #PR4637: not set
+  enable_fsdp2_prefetch: true  #PR4637: not set
+  enable_compile: true  #PR4637: not set
+  patch_is_packed_sequence: true  #PR4637: not set
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
-  split: train
+  #PR4637: removed dataset.vocab_size: 100
+  #PR4637: removed dataset.seq_len: 4096
+  #PR4637: removed dataset.num_samples: 1000000
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+  dataset_name: rajpurkar/squad  #PR4637: not set
+  split: train  #PR4637: not set
 
-  padding: false
-packed_sequence:
+  padding: false  #PR4637: not set
+packed_sequence:  #PR4637: not set
   packed_sequence_size: 4096
 
   packing_strategy: neat
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
-  shuffle: false
+  #PR4637: removed dataloader.batch_size: null
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader  #PR4637: torch.utils.data.DataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: not set
+  shuffle: false  #PR4637: not set
 
-  drop_last: true
+  drop_last: true  #PR4637: not set
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
@@ -87,7 +94,7 @@ lr_scheduler:
 ci:
   cluster_tag: h100
   recipe_owner: ZhiyuLi-Nvidia
-  time: "00:40:00"
-  perf_testing:
+  time: "00:40:00"  #PR4637: "00:30:00"
+  perf_testing:  #PR4637: not set
     schedule: nightly
-  nodes: 1
+  nodes: 1  #PR4637: not set

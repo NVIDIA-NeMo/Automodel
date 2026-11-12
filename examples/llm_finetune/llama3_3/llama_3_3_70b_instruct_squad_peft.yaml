@@ -21,11 +21,11 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 32
-  local_batch_size: 2
+  local_batch_size: 2  #PR4637: 4
   ckpt_every_steps: 50
   val_every_steps: 1000
   max_steps: 100
-  gc_every_steps: 10
+  gc_every_steps: 10  #PR4637: not set
 
 dist_env:
   backend: nccl
@@ -52,7 +52,7 @@ checkpoint:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: '*_proj'
-  dim: 16
+  dim: 16  #PR4637: 8
   alpha: 32
   use_triton: true
 
@@ -61,10 +61,10 @@ distributed:
   dp_size: none
   tp_size: 4
   cp_size: 1
-  pp_size: 2
+  pp_size: 2  #PR4637: 1
   sequence_parallel: false
-  activation_checkpointing: true
-  pipeline:
+  activation_checkpointing: true  #PR4637: not set
+  pipeline:  #PR4637: not set
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 1
     layers_per_stage: 4
@@ -80,27 +80,27 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
 
-  padding: false
+  padding: false  #PR4637: not set
 packed_sequence:
-  packed_sequence_size: 4096
+  packed_sequence_size: 4096  #PR4637: 0
 
 # StatefulDataLoader with default collate
-  packing_strategy: neat
+  packing_strategy: neat  #PR4637: not set
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
 
-  drop_last: true
+  drop_last: true  #PR4637: not set
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
 
-  padding: false
+  padding: false  #PR4637: not set
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
   _target_: torch.optim.Adam
@@ -116,7 +116,7 @@ lr_scheduler:
 ci:
   cluster_tag: h100
   recipe_owner: akoumpa
-  time: "01:00:00"
-  perf_testing:
+  time: "01:00:00"  #PR4637: "00:30:00"
+  perf_testing:  #PR4637: not set
     schedule: nightly
-  nodes: 1
+  nodes: 1  #PR4637: not set

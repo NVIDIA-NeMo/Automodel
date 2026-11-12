@@ -23,11 +23,11 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   num_epochs: 1
-  global_batch_size: 512
-  local_batch_size: 2
+  global_batch_size: 512  #PR4637: 256
+  local_batch_size: 2  #PR4637: 8
   ckpt_every_steps: 100
   val_every_steps: 100  # will run every x number of gradient steps
-  gc_every_steps: 10
+  gc_every_steps: 10  #PR4637: not set
 
 dist_env:
   backend: nccl
@@ -44,7 +44,7 @@ model:
   mtp_loss_scaling_factor: 0.1
 
 # torch.compile configuration
-  backend:
+  backend:  #PR4637: not set
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
@@ -69,55 +69,57 @@ checkpoint:
   save_consolidated: final
 
 peft:
+  #PR4637: removed peft.use_triton: True
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   # Mamba kernels use out_proj.weight directly and cannot apply its LoRA adapter.
   exclude_modules: ['*.out_proj']
-  dim: 32
+  dim: 32  #PR4637: 8
   alpha: 32
-  dropout: 0.0
-  moe_rank_scaling: true
+  dropout: 0.0  #PR4637: not set
+  moe_rank_scaling: true  #PR4637: not set
 
 distributed:
+  #PR4637: removed distributed.dp_size: none
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
-  ep_size: 64
-  sequence_parallel: false
-  activation_checkpointing: true
-  moe:
+  pp_size: 1  #PR4637: not set
+  ep_size: 64  #PR4637: 8
+  sequence_parallel: false  #PR4637: not set
+  activation_checkpointing: true  #PR4637: not set
+  moe:  #PR4637: not set
     reshard_after_forward: true
     ignore_router_for_ac: false
 loss_fn:
-  fp32_upcast: false
+  fp32_upcast: false  #PR4637: not set
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
-  padding: false
+  padding: false  #PR4637: not set
 packed_sequence:
-  packed_sequence_size: 4096
+  packed_sequence_size: 4096  #PR4637: 0
 
-  packing_strategy: thd
+  packing_strategy: thd  #PR4637: not set
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
 
-  drop_last: true
+  drop_last: true  #PR4637: not set
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
   limit_dataset_samples: 64
 
-  padding: false
+  padding: false  #PR4637: not set
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
   _target_: torch.optim.Adam
@@ -138,7 +140,7 @@ ci:
   vllm_deploy_time: "00:30:00"
   vllm_enable_expert_parallel: false  # vLLM 0.19 does not support expert parallelism with runtime LoRA
   recipe_owner: adil-a
-  time: "00:40:00"
+  time: "00:40:00"  #PR4637: "00:30:00"
   checkpoint_robustness:
     experts_implementation: grouped_mm
     trust_remote_code: true
@@ -159,7 +161,7 @@ ci:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-  perf_testing:
+  perf_testing:  #PR4637: not set
     fake_balanced_gate: true
     schedule: nightly
-  nodes: 8
+  nodes: 8  #PR4637: not set

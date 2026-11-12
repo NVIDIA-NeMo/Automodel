@@ -21,8 +21,8 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 32
-  local_batch_size: 2
+  global_batch_size: 32  #PR4637: 128
+  local_batch_size: 2  #PR4637: 4
   ckpt_every_steps: 50
   val_every_steps: 50  # will run every x number of gradient steps
   max_steps: 100
@@ -41,7 +41,7 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen2.5-7B
   torch_dtype: bf16
 
-  force_hf: true
+  force_hf: true  #PR4637: not set
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
@@ -51,10 +51,10 @@ checkpoint:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: '*_proj'
-  dim: 16
+  dim: 16  #PR4637: 8
   alpha: 32
-  dropout: 0.0
-  use_memory_efficient_lora: false
+  dropout: 0.0  #PR4637: not set
+  use_memory_efficient_lora: false  #PR4637: not set
   use_triton: true
 
 distributed:
@@ -71,31 +71,31 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
 
-  padding: false
+  padding: false  #PR4637: not set
 packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
-  packed_sequence_size: 4096
+  packed_sequence_size: 4096  #PR4637: 0
 
-  packing_strategy: neat
+  packing_strategy: neat  #PR4637: not set
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   shuffle: false
 
 
-  drop_last: true
+  drop_last: true  #PR4637: not set
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
 
-  padding: false
+  padding: false  #PR4637: not set
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
 
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: torch.optim.AdamW  #PR4637: torch.optim.Adam
   betas: [0.9, 0.999]
   eps: 1e-8
   lr: 1.0e-5
@@ -106,7 +106,7 @@ ci:
   cluster_tag: h100
   vllm_deploy: true
   recipe_owner: HuiyingLi
-  time: "00:40:00"
+  time: "00:40:00"  #PR4637: "00:30:00"
   known_issue_id: AM-154
   allow_failure: true
   checkpoint_robustness:
@@ -122,6 +122,6 @@ ci:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-  perf_testing:
+  perf_testing:  #PR4637: not set
     schedule: nightly
-  nodes: 1
+  nodes: 1  #PR4637: not set

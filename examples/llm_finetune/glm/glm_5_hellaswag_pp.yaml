@@ -21,7 +21,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 1024
+  global_batch_size: 1024  #PR4637: 512
   local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -56,9 +56,9 @@ model:
   pretrained_model_name_or_path: zai-org/GLM-5
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: te  #PR4637: sdpa
     linear: te
-    rms_norm: te
+    rms_norm: te  #PR4637: torch_fp32
     rope_fusion: false
     experts: torch_mm
     dispatcher: hybridep
@@ -70,13 +70,13 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 loss_fn:
-  fp32_upcast: false
+  fp32_upcast: false  #PR4637: not set
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 # Data configuration from llama finetuning
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
 packed_sequence:
@@ -90,8 +90,8 @@ dataloader:
   shuffle: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
 validation_dataloader:
@@ -113,11 +113,11 @@ optimizer:
 
 ci:
   cluster_tag: h100
-  recipe_owner: akoumpa
-  nodes: 128
+  recipe_owner: akoumpa  #PR4637: hemildesai
+  nodes: 128  #PR4637: 32
   time: "00:45:00"
-  env_vars:
+  env_vars:  #PR4637: not set
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
-  perf_testing:
+  perf_testing:  #PR4637: not set
     fake_balanced_gate: true
     schedule: weekly

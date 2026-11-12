@@ -20,8 +20,8 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 4096
-  local_batch_size: 128
+  global_batch_size: 4096  #PR4637: 256
+  local_batch_size: 128  #PR4637: 8
   ckpt_every_steps: 100
   val_every_steps: 100
   max_steps: 100
@@ -51,15 +51,15 @@ model:
     attn: eager
     linear: torch
     rms_norm: torch_fp32
-    experts: te
-    dispatcher: hybridep
-    dispatcher_num_sms: 32
+    experts: te  #PR4637: torch_mm
+    dispatcher: hybridep  #PR4637: torch
+    dispatcher_num_sms: 32  #PR4637: not set
     rope_fusion: false
     fake_balanced_gate: false  # benchmark only — see header
-    fake_gate_noise: 0.0
-    compile_situ: true
-    compile_norm: true
-    benchmark_static_routing: false  # requires fake_balanced_gate, noise 0.0
+    fake_gate_noise: 0.0  #PR4637: not set
+    compile_situ: true  #PR4637: not set
+    compile_norm: true  #PR4637: not set
+    benchmark_static_routing: false  # requires fake_balanced_gate, noise 0.0  #PR4637: not set
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
@@ -78,10 +78,10 @@ distributed:
   ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
-  enable_fsdp2_prefetch: true
+  enable_fsdp2_prefetch: true  #PR4637: not set
   pipeline:
     pp_schedule: 1f1b
-    pp_microbatch_size: 2
+    pp_microbatch_size: 2  #PR4637: 1
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
@@ -90,21 +90,21 @@ distributed:
     wrap_outer_model: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy  #PR4637: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: Rowan/hellaswag
   split: train
   limit_dataset_samples: 25600
-  padding: false
+  padding: false  #PR4637: pad_to_max_length: false
   tokenizer:
     _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-K3
     trust_remote_code: false
 
 packed_sequence:
-  packed_sequence_size: 1024
+  packed_sequence_size: 1024  #PR4637: 0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -112,11 +112,11 @@ dataloader:
   shuffle: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: Rowan/hellaswag
   split: validation
   limit_dataset_samples: 256
-  padding: false
+  padding: false  #PR4637: pad_to_max_length: false
   tokenizer:
     _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-K3
@@ -145,19 +145,19 @@ clip_grad_norm:
 
 prewarm:
   comm_groups: true
-  fla_gdn_autotune: true
-  cublas_backward: true
+  fla_gdn_autotune: true  #PR4637: not set
+  cublas_backward: true  #PR4637: not set
 
 ci:
   recipe_owner: huiyingl
   nodes: 64
   cluster_tag: gb200
-  time: "02:00:00"
-  nproc_per_node: 4
-  perf_testing:
+  time: "02:00:00"  #PR4637: "01:30:00"
+  nproc_per_node: 4  #PR4637: not set
+  perf_testing:  #PR4637: not set
     fake_balanced_gate: true
     schedule: weekly
-  env_vars:
+  env_vars:  #PR4637: not set
     # Keep each EP32 group within one NVLink block: 8 nodes x 4 GPUs.
     SBATCH_SEGMENT_SIZE: "8"
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

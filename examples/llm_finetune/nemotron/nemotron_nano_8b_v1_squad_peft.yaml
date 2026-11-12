@@ -119,5 +119,5 @@ ci:
     check_fused_qkv_keys: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-  perf_testing:
+  perf_testing:  #PR4637: not set
     schedule: nightly

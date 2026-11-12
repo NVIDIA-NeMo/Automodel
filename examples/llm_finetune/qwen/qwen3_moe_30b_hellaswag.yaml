@@ -12,13 +12,13 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 4
+  global_batch_size: 256  #PR4637: 1024
+  local_batch_size: 4  #PR4637: 64
   ckpt_every_steps: 100
   val_every_steps: 50
   num_epochs: 2
   max_steps: 1000
-  gc_every_steps: 10
+  gc_every_steps: 10  #PR4637: not set
 
 dist_env:
   backend: nccl
@@ -35,12 +35,13 @@ model:
   trust_remote_code: true
   torch_dtype: bfloat16
   backend:
+    #PR4637: removed model.backend.enable_fsdp_optimizations: true
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
+    attn: sdpa  #PR4637: te
     linear: torch
-    rms_norm: torch
-    experts: torch
-    dispatcher: torch
+    rms_norm: torch  #PR4637: torch_fp32
+    experts: torch  #PR4637: torch_mm
+    dispatcher: torch  #PR4637: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 checkpoint:
@@ -57,10 +58,10 @@ distributed:
   ep_size: 8
   sequence_parallel: false
   activation_checkpointing: true
-  moe:
+  moe:  #PR4637: not set
     reshard_after_forward: false
     ignore_router_for_ac: false
-  pipeline:
+  pipeline:  #PR4637: not set
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 2
     round_virtual_stages_to_pp_multiple: down
@@ -69,32 +70,32 @@ distributed:
     patch_causal_lm_model: false
     layers_per_stage: 2
 loss_fn:
-  fp32_upcast: false
+  fp32_upcast: false  #PR4637: not set
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
-  padding: false
+  padding: false  #PR4637: not set
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
   num_workers: 4
 
-  drop_last: true
+  drop_last: true  #PR4637: not set
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
   limit_dataset_samples: 128
 
-  padding: false
+  padding: false  #PR4637: not set
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   num_workers: 4
 
 optimizer:
@@ -104,13 +105,13 @@ optimizer:
   betas: [0.9, 0.95]
   eps: 1e-8
 
-packed_sequence:
+packed_sequence:  #PR4637: not set
   packed_sequence_size: 4096
   packing_strategy: neat
 ci:
   cluster_tag: h100
-  recipe_owner: akoumpa
-  time: "01:00:00"
+  recipe_owner: akoumpa  #PR4637: hemildesai
+  time: "01:00:00"  #PR4637: "00:25:00"
   known_issue_id: AM-648
   allow_failure: true
   checkpoint_robustness:
@@ -119,7 +120,7 @@ ci:
     hf_device_map_auto: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-  perf_testing:
+  perf_testing:  #PR4637: not set
     fake_balanced_gate: true
     schedule: nightly
-  nodes: 1
+  nodes: 1  #PR4637: not set

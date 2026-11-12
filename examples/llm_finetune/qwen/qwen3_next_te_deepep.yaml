@@ -20,11 +20,11 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 512
-  local_batch_size: 1
+  local_batch_size: 1  #PR4637: 8
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
-  gc_every_steps: 10
+  gc_every_steps: 10  #PR4637: not set
   # max_steps: 5
 
 dist_env:
@@ -41,16 +41,16 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-Next-80B-A3B-Instruct
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
-    linear: te
-    rms_norm: te
-    rope_fusion: true
-    experts: torch_mm
+    attn: te  #PR4637: not set
+    linear: te  #PR4637: not set
+    rms_norm: te  #PR4637: not set
+    rope_fusion: true  #PR4637: not set
+    experts: torch_mm  #PR4637: not set
     dispatcher: hybridep
-    dispatcher_hybridep_compact_routing: false
-    fake_balanced_gate: false
-    enable_hf_state_dict_adapter: true
-    enable_fsdp_optimizations: true
+    dispatcher_hybridep_compact_routing: false  #PR4637: not set
+    fake_balanced_gate: false  #PR4637: not set
+    enable_hf_state_dict_adapter: true  #PR4637: not set
+    enable_fsdp_optimizations: true  #PR4637: not set
 checkpoint:
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
@@ -62,27 +62,27 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 64
+  ep_size: 64  #PR4637: 32
   sequence_parallel: false
   activation_checkpointing: true
   pipeline:
     pp_schedule: interleaved1f1b
-    pp_microbatch_size: 2
-    round_virtual_stages_to_pp_multiple: down
+    pp_microbatch_size: 2  #PR4637: 8
+    round_virtual_stages_to_pp_multiple: down  #PR4637: up
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    layers_per_stage: 2
-  moe:
+    layers_per_stage: 2  #PR4637: not set
+  moe:  #PR4637: not set
     reshard_after_forward: false
     ignore_router_for_ac: false
 loss_fn:
-  fp32_upcast: false
+  fp32_upcast: false  #PR4637: not set
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
 packed_sequence:
@@ -95,8 +95,8 @@ dataloader:
   shuffle: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
   limit_dataset_samples: 64
 
@@ -122,9 +122,9 @@ optimizer:
 
 ci:
   cluster_tag: h100
-  recipe_owner: akoumpa
-  nodes: 8
+  recipe_owner: akoumpa  #PR4637: hemildesai
+  nodes: 8  #PR4637: 4
   time: "00:30:00"
-  perf_testing:
+  perf_testing:  #PR4637: not set
     fake_balanced_gate: true
     schedule: nightly

@@ -19,12 +19,12 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 256
-  local_batch_size: 2
+  global_batch_size: 256  #PR4637: 512
+  local_batch_size: 2  #PR4637: 32
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
-  gc_every_steps: 10
+  gc_every_steps: 10  #PR4637: not set
 
 dist_env:
   backend: nccl
@@ -50,7 +50,7 @@ model:
   #   enable_hf_state_dict_adapter: true
   #   enable_fsdp_optimizations: true
 
-  backend:
+  backend:  #PR4637: not set
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: flex
     linear: te
@@ -75,19 +75,19 @@ distributed:
   sequence_parallel: false
   pipeline:
     pp_schedule: interleaved1f1b
-    pp_microbatch_size: 2
-    round_virtual_stages_to_pp_multiple: down
+    pp_microbatch_size: 2  #PR4637: 8
+    round_virtual_stages_to_pp_multiple: down  #PR4637: up
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    layers_per_stage: 2
+    layers_per_stage: 2  #PR4637: not set
 loss_fn:
-  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
-  impl: torch_compile
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy  #PR4637: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  impl: torch_compile  #PR4637: not set
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
 packed_sequence:
@@ -100,8 +100,8 @@ dataloader:
   shuffle: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
-  dataset_name: rajpurkar/squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
   limit_dataset_samples: 64
 
@@ -127,7 +127,7 @@ optimizer:
 
 ci:
   cluster_tag: h100
-  recipe_owner: akoumpa
+  recipe_owner: akoumpa  #PR4637: hemildesai
   time: "00:30:00"
   node_multiplier: true
   vllm_deploy: true
@@ -140,7 +140,7 @@ ci:
     resume_tolerance_profile: relaxed
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-  perf_testing:
+  perf_testing:  #PR4637: not set
     fake_balanced_gate: true
     schedule: nightly
-  nodes: 1
+  nodes: 1  #PR4637: not set
