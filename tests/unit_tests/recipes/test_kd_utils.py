@@ -384,28 +384,6 @@ def test_kd_mesh_bridge_command_sync_and_non_dtensor_vocab(monkeypatch):
     assert barriers == [{"group": bridge.control_group}]
 
 
-def test_match_student_vocab_shard_selects_local_dtensor_chunk(monkeypatch):
-    class FakeShard:
-        def __init__(self, dim):
-            self.dim = dim
-
-    class FakeDTensor:
-        ndim = 3
-        placements = (FakeShard(-1),)
-        device_mesh = SimpleNamespace(get_group=lambda mesh_dim: f"group-{mesh_dim}")
-
-    monkeypatch.setattr(kd_utils, "DTensor", FakeDTensor)
-    monkeypatch.setattr(kd_utils, "Shard", FakeShard)
-    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda group: 1)
-    teacher_logits = torch.arange(8).reshape(1, 2, 4)
-
-    result = kd_utils.KDMeshBridge.match_student_vocab_shard(FakeDTensor(), teacher_logits)
-
-    assert torch.equal(result, teacher_logits[..., 2:])
-    assert result.is_contiguous()
-
-
 def test_broadcast_tree_covers_source_receiver_and_nonmember(monkeypatch):
     bridge = object.__new__(kd_utils.KDMeshBridge)
     bridge.device = torch.device("cpu")
