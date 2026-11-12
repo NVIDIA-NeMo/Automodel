@@ -242,6 +242,40 @@ def test_load_sketch_state_dict_rejects_missing_and_mismatched():
         opt.load_sketch_state_dict({**saved, "bogus": torch.zeros(1)})
 
 
+class _FusedExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up = nn.Parameter(torch.randn(2, 3, 4))
+
+    def forward(self, x):
+        return torch.einsum("th,eih->tei", x, self.up).sum(dim=1)
+
+
+def test_bf16_fused_expert_master_is_stored_3d_and_updated_as_rows():
+    def build():
+        torch.manual_seed(5)
+        model = _FusedExperts().to(torch.bfloat16)
+        native = torch.optim.AdamW(model.parameters(), lr=0.01)
+        settings = SketchSettings(rank=2, target_modules=(), target_parameters=("up",))
+        return model, GradientSketchOptimizer(model, native, settings)
+
+    model, opt = build()
+    before = model.up.detach().clone()
+    model(torch.randn(5, 4, dtype=torch.bfloat16)).float().square().sum().backward()
+    opt.synchronize_and_clip(None, 1.0)
+    opt.step()
+    master = opt.state[model.up]["master_weight"]
+    assert master.shape == (2, 3, 4) and master.dtype == torch.float32
+    assert not torch.equal(model.up, before)
+    assert torch.equal(master.to(torch.bfloat16), model.up)
+
+    model2, opt2 = build()
+    opt2.load_sketch_state_dict(copy.deepcopy(opt.sketch_state_dict()))
+    torch.testing.assert_close(opt2.state[model2.up]["master_weight"], master)
+    opt2.reset_master_weights()
+    assert torch.equal(opt2.state[model2.up]["master_weight"].to(torch.bfloat16), model2.up)
+
+
 def test_backward_leaves_no_cyclic_garbage():
     net, opt = _build()
     _backward(net)

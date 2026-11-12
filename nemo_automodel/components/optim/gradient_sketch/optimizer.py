@@ -44,6 +44,12 @@ def _local(tensor: Tensor) -> Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _rows(tensor: Tensor) -> Tensor:
+    """View the local part of a stored tensor as 2-D ``[rows, width]``, like ``local_weight_rows``."""
+    local = _local(tensor)
+    return local.reshape(-1, local.shape[-1])
+
+
 class GradientSketchOptimizer(torch.optim.Optimizer):
     """RowAdam or SGD on gradient sketches, with a native optimizer for everything else.
 
@@ -107,11 +113,11 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
     @staticmethod
     def _new_master(weight: Tensor) -> Tensor:
         """Create an fp32 master copy; a ``DTensor`` with the weight's layout under FSDP so DCP shards it."""
-        local, _ = local_weight_rows(weight)
-        master = local.float().clone()
+        # Stored in the weight's own (local) shape, 3-D for fused experts; ``_rows`` flattens it on use.
+        master = _local(weight).float().clone()
         if isinstance(weight, DTensor):
             return DTensor.from_local(
-                master.reshape(weight.to_local().shape),
+                master,
                 weight.device_mesh,
                 weight.placements,
                 run_check=False,
@@ -299,7 +305,7 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
         for layer, offset in zip(self.layers, self.local_rows, strict=True):
             local, _ = local_weight_rows(layer.weight)
             master = self.state[layer.weight].get("master_weight")
-            master = None if master is None else _local(master)
+            master = None if master is None else _rows(master)
             destination = local if master is None else master
             destination.addmm_(
                 layer.sketch[offset : offset + local.shape[0]], layer.projection, beta=decay, alpha=alpha
@@ -317,7 +323,7 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
         for layer in self.layers:
             master = self.state[layer.weight].get("master_weight")
             if master is not None:
-                _local(master).copy_(local_weight_rows(layer.weight)[0])
+                _rows(master).copy_(local_weight_rows(layer.weight)[0])
 
     def refresh_projection(self) -> None:
         """Redraw every projection on its device from ``(seed, update_count, layer name)``."""
@@ -387,7 +393,7 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
                     f"{tuple(target.shape)} (resume requires the same data-parallel size for plain-tensor masters)"
                 )
         for key, target in expected.items():
-            _local(target).copy_(_local(sketch_state[key]).to(torch.float32))
+            _rows(target).copy_(_rows(sketch_state[key]).to(torch.float32))
         if self.row_second_moment is not None:
             self._link_row_moments()
 
