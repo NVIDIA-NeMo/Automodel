@@ -23,16 +23,24 @@ shared buffer, RowAdam keeps one second moment per output row, and the update
 
 from nemo_automodel.components.optim.gradient_sketch.sketch import (
     SketchSettings,
+    SketchState,
     fill_projection_,
+    install_sketches,
     local_weight_rows,
     make_projection,
     projection_seed,
+    select_sketch_targets,
+    sketch_buffer,
 )
 
 __all__ = [
     "SketchSettings",
+    "SketchState",
     "fill_projection_",
+    "install_sketches",
     "local_weight_rows",
     "make_projection",
     "projection_seed",
+    "select_sketch_targets",
+    "sketch_buffer",
 ]
