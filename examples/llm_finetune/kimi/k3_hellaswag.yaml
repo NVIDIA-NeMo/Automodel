@@ -104,7 +104,7 @@ dataset:
     trust_remote_code: false
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 1024
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
