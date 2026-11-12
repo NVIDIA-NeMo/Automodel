@@ -24,9 +24,12 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoi
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer
 from nemo_automodel.components.optim.optimizer import (
+    OPTIMIZER_CONFIG_REGISTRY,
     AdamConfig,
     AdamWConfig,
+    GradientSketchConfig,
     LRSchedulerConfig,
     OptimizerConfig,
     OptimizerFromFactoryConfig,
@@ -801,3 +804,39 @@ class TestDropEmptyLocalShards:
         ]
         with pytest.raises(ValueError, match="param group 1"):
             _drop_empty_local_shards(groups)
+
+
+class TestGradientSketchConfig:
+    def _model(self):
+        return nn.Sequential(nn.Linear(7, 5), nn.Tanh(), nn.Linear(5, 3))
+
+    def test_registered(self):
+        assert OPTIMIZER_CONFIG_REGISTRY["gradient_sketch"] is GradientSketchConfig
+        assert GradientSketchConfig.supports_megatron_fsdp_sharding is False
+
+    def test_build_wraps_native_adamw(self):
+        cfg = GradientSketchConfig(native=AdamWConfig(lr=5e-6, weight_decay=0.01), rank=3, target_modules=["0", "2"])
+        (opt,) = cfg.build(self._model())
+        assert isinstance(opt, GradientSketchOptimizer)
+        assert isinstance(opt.native, torch.optim.AdamW)
+        assert opt.param_groups[0]["lr"] == 5e-6 and opt.settings.rank == 3
+
+    def test_native_accepts_yaml_dict(self):
+        cfg = build_optimizer_config(
+            "gradient_sketch", {"native": {"_target_": "adamw", "lr": 1e-5}, "rank": 2, "target_modules": ["0"]}
+        )
+        (opt,) = cfg.build(self._model())
+        assert opt.param_groups[0]["lr"] == 1e-5
+
+    def test_rejects_pipeline_parts(self):
+        class Parts(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.parts = [nn.Linear(2, 2), nn.Linear(2, 2)]
+
+        with pytest.raises(NotImplementedError, match="pipeline"):
+            GradientSketchConfig(native=AdamWConfig(), target_modules=["0"]).build(Parts())
+
+    def test_invalid_settings_raise_at_construction(self):
+        with pytest.raises(ValueError, match="rank"):
+            GradientSketchConfig(native=AdamWConfig(), rank=0)
