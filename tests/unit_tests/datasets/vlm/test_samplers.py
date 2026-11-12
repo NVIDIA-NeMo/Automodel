@@ -304,7 +304,7 @@ class TestEstimateLengthAccurate:
         assert length == 200
 
     def test_video_min_frames_enforced(self):
-        """Very short video gets clamped to min_frames."""
+        """A short sampled count is raised to min_frames when the clip has that many frames."""
         processor = _make_processor(
             video_patch_size=16,
             video_merge_size=2,
@@ -315,17 +315,39 @@ class TestEstimateLengthAccurate:
             video_min_frames=4,
             video_max_frames=128,
         )
-        # 2 frames at 30fps → sampled = int(2/30*2) = 0 → max(1,0)=1 → clamped to min_frames=4
+        # 10 frames at 30fps → sampled = int(10/30*2) = 0 → max(1,0)=1 → raised to min_frames=4
         # 4 % 2 == 0, nframes = 4, grid_t = 2
         # 320x320 factor=32 → 320x320
         # grid_h=20, grid_w=20, merge=4, per_frame=100
         # total = 2 * 100 = 200
         example = {
             "conversation": _media_msg(n_videos=1),
-            "mm_inputs_meta": {"videos_meta": [[2, 320, 320, 30.0, 0.067]]},
+            "mm_inputs_meta": {"videos_meta": [[10, 320, 320, 30.0, 0.333]]},
         }
         length = self._estimate(example, processor)
         assert length == 200
+
+    def test_video_shorter_than_min_frames_keeps_its_frames(self):
+        """A clip with fewer frames than min_frames is not padded up to min_frames."""
+        processor = _make_processor(
+            video_patch_size=16,
+            video_merge_size=2,
+            video_temporal_patch_size=2,
+            video_min_pixels=100,
+            video_max_pixels=100_000_000,
+            video_fps=2.0,
+            video_min_frames=4,
+            video_max_frames=128,
+        )
+        # 2 frames at 30fps → raised to min_frames=4, then capped by the 2 frames the clip has
+        # (Qwen3-VL sample_frames: min(max(n, min_frames), max_frames, total_frames))
+        # nframes = 2, grid_t = 1, per_frame=100 → total = 100
+        example = {
+            "conversation": _media_msg(n_videos=1),
+            "mm_inputs_meta": {"videos_meta": [[2, 320, 320, 30.0, 0.067]]},
+        }
+        length = self._estimate(example, processor)
+        assert length == 100
 
     def test_video_max_frames_enforced(self):
         """Long video gets clamped to max_frames."""
@@ -530,18 +552,18 @@ class TestEdgeCases:
             video_min_frames=4,
             video_max_frames=128,
         )
-        # total_frames=0, fps=0 → total_frames stays 0
+        # total_frames=0, fps=0 → total_frames stays 0 (unknown, so it does not cap)
         # nframes from duration: max(1, int(5*2)) = 10
-        # min(total_frames=0, max_frames=128, 10) = 0 → max(min_frames=4, 0) = 4
-        # 4 % 2 == 0, grid_t = 2
+        # min(max(10, min_frames=4), max_frames=128) = 10
+        # 10 % 2 == 0, grid_t = 5
         # 320x320, grid_h=20, grid_w=20, per_frame=100
-        # total = 2 * 100 = 200
+        # total = 5 * 100 = 500
         example = {
             "conversation": _media_msg(n_videos=1),
             "mm_inputs_meta": {"videos_meta": [[0, 320, 320, 0.0, 5.0]]},
         }
         length = LengthGroupedSampler([example], seed=0, processor=processor).lengths[0]
-        assert length == 200
+        assert length == 500
 
 
 # ---------------------------------------------------------------------------
