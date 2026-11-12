@@ -256,6 +256,46 @@ def test_consolidate_opens_each_input_shard_independently_of_tensor_count(tmp_pa
 
 
 @pytest.mark.run_only_on("CPU")
+def test_consolidate_imports_without_unix_resource():
+    """This module still imports when its own `import resource` raises."""
+    repo_root = str(Path(__file__).resolve().parents[3])
+    child = f"""
+import builtins
+import sys
+sys.path.insert(0, {repo_root!r})
+_real_import = builtins.__import__
+
+def _import(name, globals=None, locals=None, fromlist=(), level=0):
+    caller = ""
+    if isinstance(globals, dict):
+        caller = globals.get("__file__") or ""
+    if name == "resource" and caller.endswith("consolidate_hf_safetensors.py"):
+        raise ModuleNotFoundError("No module named 'resource'")
+    return _real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = _import
+from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
+    _OPEN_INPUT_FALLBACK,
+    _max_open_input_files,
+    resource,
+)
+assert resource is None
+assert _max_open_input_files() == _OPEN_INPUT_FALLBACK
+print("ok")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", child],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "OMP_NUM_THREADS": "1"},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "ok" in completed.stdout
+    assert "ModuleNotFoundError" not in completed.stderr
+
+
+@pytest.mark.run_only_on("CPU")
 def test_consolidate_completes_under_constrained_open_file_limit(tmp_path):
     """Parallel writers must share a bounded input-handle budget under a soft RLIMIT_NOFILE.
 

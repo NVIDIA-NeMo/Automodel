@@ -22,7 +22,6 @@ import json
 import logging
 import math
 import os
-import resource
 import shutil
 import struct
 import tempfile
@@ -31,6 +30,12 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO
+
+try:
+    import resource
+except ImportError:
+    # Unix-only stdlib; native Windows raises ModuleNotFoundError at import.
+    resource = None
 
 import torch
 from torch import distributed as dist
@@ -71,14 +76,18 @@ _QUANTIZED_DTYPE_WARNING_LIMIT = 5
 _MISSING_FQN_WARNING_LIMIT = 5
 # Leave room under RLIMIT_NOFILE for output writers, the interpreter, and libraries.
 _OPEN_INPUT_FD_HEADROOM = 128
+# Bound used when `resource` is missing, so the cache stays finite without getrlimit.
+_OPEN_INPUT_FALLBACK = 32
 
 
 def _max_open_input_files() -> int:
+    if resource is None:
+        return _OPEN_INPUT_FALLBACK
     try:
         soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     except (ValueError, OSError):
         soft_limit = 1024
-    return max(32, soft_limit - _OPEN_INPUT_FD_HEADROOM)
+    return max(_OPEN_INPUT_FALLBACK, soft_limit - _OPEN_INPUT_FD_HEADROOM)
 
 
 class _BoundedInputFileCache:
