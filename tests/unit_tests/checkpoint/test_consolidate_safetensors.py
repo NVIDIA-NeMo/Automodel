@@ -205,6 +205,55 @@ def test_consolidate_preserves_semantics_for_multi_shard_outputs_without_append(
 
 
 @pytest.mark.run_only_on("CPU")
+def test_consolidate_opens_each_input_shard_independently_of_tensor_count(tmp_path, monkeypatch):
+    """Input shards must not be reopened per tensor; per-shard opens and page faults made network mounts slow."""
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    names = [f"layers.{i}.weight" for i in range(6)]
+    expected_tensors = {
+        name: torch.arange(8 * (i + 1), dtype=torch.float32).reshape(4, -1) for i, name in enumerate(names)
+    }
+    input_paths = []
+    for rank in range(2):
+        input_path = input_dir / f"shard-0000{rank + 1}-model-00001-of-00001.safetensors"
+        save_file(
+            {name: tensor[2 * rank : 2 * rank + 2].contiguous() for name, tensor in expected_tensors.items()},
+            input_path,
+            metadata={CUSTOM_METADATA_KEY: json.dumps({name: {"saved_offsets": [2 * rank, 0]} for name in names})},
+        )
+        input_paths.append(os.fspath(input_path))
+
+    real_open = builtins.open
+    input_opens = {path: 0 for path in input_paths}
+
+    def counting_open(file, mode="r", *args, **kwargs):
+        if isinstance(file, (str, os.PathLike)) and os.fspath(file) in input_opens:
+            input_opens[os.fspath(file)] += 1
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+    num_output_files = 2
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={name: 1 + i % num_output_files for i, name in enumerate(names)},
+    )
+    monkeypatch.setattr(builtins, "open", real_open)
+
+    # One header read per input file plus at most one handle per output file, however many tensors it holds.
+    assert all(count <= 1 + num_output_files for count in input_opens.values()), input_opens
+    output_tensors = {}
+    for file_name in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"):
+        output_tensors.update(load_file(output_dir / file_name))
+    assert set(output_tensors) == set(names)
+    for name, expected_tensor in expected_tensors.items():
+        torch.testing.assert_close(output_tensors[name], expected_tensor)
+
+
+@pytest.mark.run_only_on("CPU")
 def test_consolidate_casts_float_tensors_only_when_cast_dtype_is_set(tmp_path, caplog):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
