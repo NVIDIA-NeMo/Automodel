@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import gc
 import math
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, cast
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -788,6 +788,41 @@ def scale_grads_and_clip_grad_norm(
         use_torch_clip_grad_norm=use_torch_clip_grad_norm,
         grad_norm_backend=grad_norm_backend,
     )
+
+
+def clip_grads_for_optimizers(
+    optimizers: list[torch.optim.Optimizer],
+    max_grad_norm: float | None,
+    model_parts: list[torch.nn.Module],
+    *,
+    dp_group: Any = None,
+    **clip_kwargs: Any,
+) -> torch.Tensor | float:
+    """Clip gradients the way the configured optimizers require.
+
+    Gradient-sketch optimizers own their gradients (sketches plus native grads) and
+    synchronize them as part of clipping; everything else goes through
+    :func:`scale_grads_and_clip_grad_norm` with ``clip_kwargs`` forwarded verbatim.
+
+    Args:
+        optimizers: Optimizers built for ``model_parts`` (one per part).
+        max_grad_norm: Clip threshold, or ``None`` to only measure.
+        model_parts: Model parts whose parameters the optimizers update.
+        dp_group: Data-parallel process group used by sketch synchronization.
+        **clip_kwargs: Keyword arguments for ``scale_grads_and_clip_grad_norm``.
+
+    Returns:
+        The pre-clip global norm.
+    """
+    from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer  # avoid import cycle
+
+    sketched = [isinstance(o, GradientSketchOptimizer) for o in optimizers]
+    if any(sketched) and not all(sketched):
+        raise ValueError("Cannot mix gradient-sketch optimizers with other optimizers across model parts")
+    if all(sketched) and optimizers:
+        norms = [cast(GradientSketchOptimizer, o).synchronize_and_clip(dp_group, max_grad_norm) for o in optimizers]
+        return torch.stack(norms).square().sum().sqrt() if len(norms) > 1 else norms[0]
+    return scale_grads_and_clip_grad_norm(max_grad_norm, model_parts, **clip_kwargs)
 
 
 def move_to_device(model: torch.nn.Module, device: torch.device | str) -> None:

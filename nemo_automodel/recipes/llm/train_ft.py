@@ -71,6 +71,7 @@ from nemo_automodel.components.distributed.context_parallel import ContextParall
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
@@ -103,12 +104,12 @@ from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
+    clip_grads_for_optimizers,
     count_tail_padding,
     get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
-    scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.compile_utils import (
     build_compile_config,
@@ -1573,6 +1574,20 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
+    def _get_dp_process_group(self, include_cp: bool = True):
+        """Process group over which ranks hold the same parameters (dp, plus cp when enabled).
+
+        Unlike ``_get_dp_group`` this returns the group even when its size is 1, so callers never
+        fall back to the default (world) group. Returns ``None`` only without a device mesh.
+        """
+        device_mesh = getattr(self, "device_mesh", None)
+        if not device_mesh:
+            return None
+        dp_mesh = get_flat_mesh(device_mesh, "dp")
+        if include_cp and device_mesh["cp"].size() > 1:
+            dp_mesh = get_flat_mesh(device_mesh, "dp_cp")
+        return dp_mesh.get_group()
+
     def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
@@ -1647,9 +1662,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 prepare_after_first_microbatch()
 
         synchronize_tp_replica_gradients(self.model_parts, self.device_mesh)
-        grad_norm = scale_grads_and_clip_grad_norm(
+        grad_norm = clip_grads_for_optimizers(
+            self.optimizer,
             max_grad_norm,
             self.model_parts,
+            dp_group=self._get_dp_process_group(include_cp=True),
             norm_type=2.0,
             pp_enabled=self.pp_enabled,
             device_mesh=self.device_mesh,

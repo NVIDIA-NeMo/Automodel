@@ -2414,7 +2414,7 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         monkeypatch.setattr(recipe, "_forward_backward_step", mock_forward_backward_step)
         monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
+            "nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm",
             lambda *a, **k: torch.tensor(1.0),
         )
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.prepare_for_grad_accumulation", lambda *a, **k: None)
@@ -2430,7 +2430,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         options = {} if backend is None else {"backend": backend}
         recipe = self._make_recipe(monkeypatch, pp_enabled=False, clip_grad_norm=options)
         clip = MagicMock(return_value=torch.tensor(1.0))
-        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm", clip)
+        monkeypatch.setattr("nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm", clip)
         batches = [{"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[1, 2, 3]])}]
 
         sample = recipe._run_train_optim_step(batches, max_grad_norm=1.0)
@@ -2495,7 +2495,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.synchronize_tp_replica_gradients", synchronize)
         monkeypatch.setattr(
-            "nemo_automodel.recipes.llm.train_ft.scale_grads_and_clip_grad_norm",
+            "nemo_automodel.components.training.utils.scale_grads_and_clip_grad_norm",
             scale_grads_and_clip_grad_norm,
         )
         batches = [{"labels": torch.tensor([[1, 2, 3, -100]])} for _ in range(accumulation_steps)]
