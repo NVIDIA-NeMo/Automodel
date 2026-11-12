@@ -27,7 +27,7 @@ step_scheduler:
   local_batch_size: 2  #PR4637: 1
   ckpt_every_steps: 100
   val_every_steps: 100  # will run every x number of gradient steps
-  gc_every_steps: 10  #PR4637: not set
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -43,7 +43,7 @@ model:
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
   mtp_loss_scaling_factor: 0.1
 
-  backend:  #PR4637: not set
+  backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     linear: te
     rms_norm: te
@@ -63,13 +63,13 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1  #PR4637: not set
+  pp_size: 1
   ep_size: 64  #PR4637: 32
-  activation_checkpointing: true  #PR4637: not set
-  moe:  #PR4637: not set
+  activation_checkpointing: true
+  moe:
     reshard_after_forward: true
 loss_fn:
-  fp32_upcast: false  #PR4637: not set
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -77,24 +77,24 @@ dataset:
   dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
-  padding: false  #PR4637: not set
+  padding: false
 packed_sequence:
   packed_sequence_size: 4096  #PR4637: 0
 
-  packing_strategy: neat  #PR4637: not set
+  packing_strategy: neat
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
 
-  drop_last: true  #PR4637: not set
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
   limit_dataset_samples: 64
 
-  padding: false  #PR4637: not set
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
@@ -134,6 +134,6 @@ ci:
     step_scheduler.global_batch_size: 64
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-  perf_testing:  #PR4637: not set
+  perf_testing:
     fake_balanced_gate: true
     schedule: nightly

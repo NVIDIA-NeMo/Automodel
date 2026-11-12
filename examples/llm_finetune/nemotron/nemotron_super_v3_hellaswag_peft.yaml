@@ -27,7 +27,7 @@ step_scheduler:
   local_batch_size: 2  #PR4637: 8
   ckpt_every_steps: 100
   val_every_steps: 100  # will run every x number of gradient steps
-  gc_every_steps: 10  #PR4637: not set
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -44,7 +44,7 @@ model:
   mtp_loss_scaling_factor: 0.1
 
 # torch.compile configuration
-  backend:  #PR4637: not set
+  backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
     linear: te
@@ -75,23 +75,23 @@ peft:
   exclude_modules: ['*.out_proj']
   dim: 32  #PR4637: 8
   alpha: 32
-  dropout: 0.0  #PR4637: not set
-  moe_rank_scaling: true  #PR4637: not set
+  dropout: 0.0
+  moe_rank_scaling: true
 
 distributed:
   #PR4637: removed distributed.dp_size: none
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1  #PR4637: not set
+  pp_size: 1
   ep_size: 64  #PR4637: 8
-  sequence_parallel: false  #PR4637: not set
-  activation_checkpointing: true  #PR4637: not set
-  moe:  #PR4637: not set
+  sequence_parallel: false
+  activation_checkpointing: true
+  moe:
     reshard_after_forward: true
     ignore_router_for_ac: false
 loss_fn:
-  fp32_upcast: false  #PR4637: not set
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -99,24 +99,24 @@ dataset:
   dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
-  padding: false  #PR4637: not set
+  padding: false
 packed_sequence:
   packed_sequence_size: 4096  #PR4637: 0
 
-  packing_strategy: thd  #PR4637: not set
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
 
-  drop_last: true  #PR4637: not set
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: validation
   limit_dataset_samples: 64
 
-  padding: false  #PR4637: not set
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater  #PR4637: nemo_automodel.components.datasets.utils.default_collater
@@ -161,7 +161,7 @@ ci:
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
-  perf_testing:  #PR4637: not set
+  perf_testing:
     fake_balanced_gate: true
     schedule: nightly
-  nodes: 8  #PR4637: not set
+  nodes: 8

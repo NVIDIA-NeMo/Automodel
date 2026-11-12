@@ -24,7 +24,7 @@ step_scheduler:
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
-  gc_every_steps: 10  #PR4637: not set
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -50,7 +50,7 @@ model:
   #   enable_hf_state_dict_adapter: true
   #   enable_fsdp_optimizations: true
 
-  backend:  #PR4637: not set
+  backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: flex
     linear: te
@@ -80,10 +80,10 @@ distributed:
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    layers_per_stage: 2  #PR4637: not set
+    layers_per_stage: 2
 loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy  #PR4637: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
-  impl: torch_compile  #PR4637: not set
+  impl: torch_compile
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
@@ -140,7 +140,7 @@ ci:
     resume_tolerance_profile: relaxed
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-  perf_testing:  #PR4637: not set
+  perf_testing:
     fake_balanced_gate: true
     schedule: nightly
-  nodes: 1  #PR4637: not set
+  nodes: 1

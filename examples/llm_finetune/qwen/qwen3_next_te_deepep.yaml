@@ -24,7 +24,7 @@ step_scheduler:
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 2
-  gc_every_steps: 10  #PR4637: not set
+  gc_every_steps: 10
   # max_steps: 5
 
 dist_env:
@@ -41,16 +41,16 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-Next-80B-A3B-Instruct
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te  #PR4637: not set
-    linear: te  #PR4637: not set
-    rms_norm: te  #PR4637: not set
-    rope_fusion: true  #PR4637: not set
-    experts: torch_mm  #PR4637: not set
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    experts: torch_mm
     dispatcher: hybridep
-    dispatcher_hybridep_compact_routing: false  #PR4637: not set
-    fake_balanced_gate: false  #PR4637: not set
-    enable_hf_state_dict_adapter: true  #PR4637: not set
-    enable_fsdp_optimizations: true  #PR4637: not set
+    dispatcher_hybridep_compact_routing: false
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
 checkpoint:
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
@@ -72,12 +72,12 @@ distributed:
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    layers_per_stage: 2  #PR4637: not set
-  moe:  #PR4637: not set
+    layers_per_stage: 2
+  moe:
     reshard_after_forward: false
     ignore_router_for_ac: false
 loss_fn:
-  fp32_upcast: false  #PR4637: not set
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -125,6 +125,6 @@ ci:
   recipe_owner: akoumpa  #PR4637: hemildesai
   nodes: 8  #PR4637: 4
   time: "00:30:00"
-  perf_testing:  #PR4637: not set
+  perf_testing:
     fake_balanced_gate: true
     schedule: nightly

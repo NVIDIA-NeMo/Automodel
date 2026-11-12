@@ -70,7 +70,7 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 loss_fn:
-  fp32_upcast: false  #PR4637: not set
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 # Data configuration from llama finetuning
@@ -116,8 +116,8 @@ ci:
   recipe_owner: akoumpa  #PR4637: hemildesai
   nodes: 128  #PR4637: 32
   time: "00:45:00"
-  env_vars:  #PR4637: not set
+  env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
-  perf_testing:  #PR4637: not set
+  perf_testing:
     fake_balanced_gate: true
     schedule: weekly

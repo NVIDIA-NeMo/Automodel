@@ -53,10 +53,10 @@ distributed:
   pp_size: 1  #PR4637: 4
   sequence_parallel: false
   activation_checkpointing: true
-  enable_async_tensor_parallel: false  #PR4637: not set
-  enable_fsdp2_prefetch: true  #PR4637: not set
-  enable_compile: true  #PR4637: not set
-  patch_is_packed_sequence: true  #PR4637: not set
+  enable_async_tensor_parallel: false
+  enable_fsdp2_prefetch: true
+  enable_compile: true
+  patch_is_packed_sequence: true
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
@@ -65,21 +65,21 @@ dataset:
   #PR4637: removed dataset.seq_len: 4096
   #PR4637: removed dataset.num_samples: 1000000
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
-  dataset_name: rajpurkar/squad  #PR4637: not set
-  split: train  #PR4637: not set
+  dataset_name: rajpurkar/squad
+  split: train
 
-  padding: false  #PR4637: not set
-packed_sequence:  #PR4637: not set
+  padding: false
+packed_sequence:
   packed_sequence_size: 4096
 
   packing_strategy: neat
 dataloader:
   #PR4637: removed dataloader.batch_size: null
   _target_: torchdata.stateful_dataloader.StatefulDataLoader  #PR4637: torch.utils.data.DataLoader
-  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater  #PR4637: not set
-  shuffle: false  #PR4637: not set
+  collate_fn: nemo_automodel.components.datasets.utils.neat_packed_collater
+  shuffle: false
 
-  drop_last: true  #PR4637: not set
+  drop_last: true
 optimizer:
   _target_: torch.optim.Adam
   betas: [0.9, 0.999]
@@ -95,6 +95,6 @@ ci:
   cluster_tag: h100
   recipe_owner: ZhiyuLi-Nvidia
   time: "00:40:00"  #PR4637: "00:30:00"
-  perf_testing:  #PR4637: not set
+  perf_testing:
     schedule: nightly
-  nodes: 1  #PR4637: not set
+  nodes: 1

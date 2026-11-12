@@ -27,7 +27,7 @@ step_scheduler:
   ckpt_every_steps: 500
   num_epochs: 2
 
-  gc_every_steps: 10  #PR4637: not set
+  gc_every_steps: 10
 dist_env:
   backend: nccl
   timeout_minutes: 10
@@ -50,7 +50,7 @@ model:
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
-    enable_fsdp_optimizations: true  #PR4637: not set
+    enable_fsdp_optimizations: true
     te_fp8:
       recipe: mxfp8
 
@@ -80,7 +80,7 @@ distributed:
     layers_per_stage: 2
 
 loss_fn:
-  fp32_upcast: false  #PR4637: not set
+  fp32_upcast: false
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
@@ -93,13 +93,13 @@ packed_sequence:
   # Set packed_sequence_size > 0 to run with packed sequences
   packed_sequence_size: 4096  #PR4637: 1024
 
-  packing_strategy: thd  #PR4637: not set
+  packing_strategy: thd
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
-  drop_last: true  #PR4637: not set
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
@@ -130,8 +130,8 @@ ci:
   cluster_tag: gb200
   nodes: 2
   recipe_owner: akoumpa  #PR4637: hemildesai
-  nproc_per_node: 4  #PR4637: not set
-  perf_testing:  #PR4637: not set
+  nproc_per_node: 4
+  perf_testing:
     fake_balanced_gate: true
     schedule: nightly
-  time: "00:40:00"  #PR4637: not set
+  time: "00:40:00"

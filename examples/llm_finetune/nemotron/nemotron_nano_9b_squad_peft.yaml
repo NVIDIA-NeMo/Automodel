@@ -121,5 +121,5 @@ ci:
     hf_device_map_auto: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
-  perf_testing:  #PR4637: not set
+  perf_testing:
     schedule: nightly

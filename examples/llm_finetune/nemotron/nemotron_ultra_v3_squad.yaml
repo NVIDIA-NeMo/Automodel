@@ -38,7 +38,7 @@ step_scheduler:
   local_batch_size: 1  #PR4637: 4
   ckpt_every_steps: 50
   val_every_steps: 50
-  gc_every_steps: 10  #PR4637: not set
+  gc_every_steps: 10
 
 dist_env:
   backend: nccl
@@ -66,7 +66,7 @@ model:
     rms_norm: te
     experts: torch_mm
     dispatcher: hybridep
-    fake_balanced_gate: false  #PR4637: not set
+    fake_balanced_gate: false
     enable_fsdp_optimizations: false
 checkpoint:
   enabled: true
@@ -93,7 +93,7 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
 
-  padding: false  #PR4637: not set
+  padding: false
 packed_sequence:
   packed_sequence_size: 4096
   packing_strategy: thd
@@ -103,13 +103,13 @@ dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
   shuffle: true
 
-  drop_last: true  #PR4637: not set
+  drop_last: true
 validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   dataset_name: rajpurkar/squad
   split: validation
 
-  padding: false  #PR4637: not set
+  padding: false
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
@@ -143,6 +143,6 @@ ci:
 #   project: my-project
 #   entity: my-entity
 #   name: ultra-full-sft
-  perf_testing:  #PR4637: not set
+  perf_testing:
     fake_balanced_gate: true
     schedule: weekly
