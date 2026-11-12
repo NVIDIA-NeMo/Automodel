@@ -116,3 +116,20 @@ def test_laguna_adapter_splits_native_experts_back_to_hf_names():
     torch.testing.assert_close(hf["model.layers.1.mlp.experts.0.gate_proj.weight"], gate_and_up[0, :, :3].T)
     torch.testing.assert_close(hf["model.layers.1.mlp.experts.0.up_proj.weight"], gate_and_up[0, :, 3:].T)
     torch.testing.assert_close(hf["model.layers.1.mlp.experts.1.down_proj.weight"], down[1].T)
+
+
+def test_laguna_peft_target_modules_follow_shared_expert_rename():
+    adapter = _adapter()
+    lora_key = "model.layers.1.mlp.shared_experts.gate_proj.lora_A.weight"
+    (hf_lora_key,) = adapter.to_hf({lora_key: torch.zeros(2, 4)})
+
+    target = adapter.map_peft_target_module_to_hf("model.layers.1.mlp.shared_experts.gate_proj")
+
+    assert target == "model.layers.1.mlp.shared_expert.gate_proj"
+    assert hf_lora_key == f"{target}.lora_A.weight"
+    for unchanged in (
+        "model.layers.0.mlp.gate_proj",
+        "model.layers.1.mlp.experts.0.down_proj",
+        "model.layers.1.self_attn.q_proj",
+    ):
+        assert adapter.map_peft_target_module_to_hf(unchanged) == unchanged

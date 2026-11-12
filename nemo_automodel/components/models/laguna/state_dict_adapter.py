@@ -34,6 +34,9 @@ _NATIVE_TO_HF_RENAMES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\.mlp\.gate\.e_score_correction_bias$"), ".mlp.experts.e_score_correction_bias"),
 )
 
+# Target-module names can end at the segment, which the key-oriented renames never match.
+_SHARED_EXPERTS_TARGET_TO_HF = re.compile(r"\.mlp\.shared_experts(?=\.|$)")
+
 
 def _apply_renames(key: str, renames: tuple[tuple[re.Pattern[str], str], ...]) -> str:
     for pattern, replacement in renames:
@@ -92,6 +95,11 @@ class LagunaStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter):
             for key, value in converted_tensors:
                 hf_state_dict[key] = value
         return hf_state_dict
+
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
+        """Apply the shared-expert rename ``to_hf`` uses so PEFT targets match the saved keys."""
+        del v4_compatible
+        return _SHARED_EXPERTS_TARGET_TO_HF.sub(".mlp.shared_expert", name)
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
         exclude_key_regex = kwargs.get("exclude_key_regex", None)
