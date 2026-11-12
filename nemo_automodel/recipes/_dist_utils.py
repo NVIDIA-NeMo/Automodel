@@ -178,12 +178,6 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
 
                 strategy_kwargs["offload_policy"] = CPUOffloadPolicy(**op_raw)
 
-    # Convert autocast_dtype string to torch.dtype if present.
-    if "autocast_dtype" in strategy_kwargs:
-        val = strategy_kwargs["autocast_dtype"]
-        if isinstance(val, str):
-            strategy_kwargs["autocast_dtype"] = dtype_from_str(val)
-
     ep_size: int = parallelism.get("ep_size") or 1
     if activation_checkpointing == "selective" and strategy_name not in {"fsdp2", "ddp"}:
         raise ValueError("selective activation checkpointing is supported only for FSDP2 and DDP configs.")

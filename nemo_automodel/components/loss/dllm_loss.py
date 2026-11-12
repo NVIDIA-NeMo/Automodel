@@ -43,9 +43,21 @@ def _compute_per_token_nll(
     logits: torch.Tensor,
     target_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute per-token negative log-likelihood, shape ``[B, L]``."""
+    """Compute per-token negative log-likelihood outside model autocast.
+
+    Args:
+        logits: Tensor of shape [batch, sequence, vocab], possibly a DTensor.
+            BF16/FP16 logits are promoted to FP32 for cross entropy.
+        target_ids: Integer tensor of shape [batch, sequence].
+
+    Returns:
+        Negative log-likelihood of shape [batch, sequence], in FP32 for
+        BF16/FP16 inputs and otherwise in the input dtype.
+    """
     if isinstance(logits, DTensor):
         logits = logits.full_tensor()
+    if logits.dtype in (torch.bfloat16, torch.float16):
+        logits = logits.float()
 
     V = logits.size(-1)
     return F.cross_entropy(

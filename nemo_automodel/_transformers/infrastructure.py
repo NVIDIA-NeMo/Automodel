@@ -1004,12 +1004,11 @@ def apply_model_infrastructure(
     if mp_policy is None:
         mp_policy = getattr(model_wrapper, "mp_policy", None)
     compute_dtype = getattr(mp_policy, "param_dtype", None)
-    # One-rank FSDP2 has no mixed-precision wrappers: retain uniform storage for
-    # explicit parameter freezes instead of introducing a plain-tensor dtype seam.
-    if (
-        freeze_config is not None
-        and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters)
-        and not fsdp2_active
+    # Unsharded FSDP2 uses forward autocast. Preserve storage, including FP32
+    # LoRA adapters that the mixed-subtree cast would otherwise downcast.
+    if not fsdp2_active and (
+        isinstance(strategy_config, FSDP2Config)
+        or (freeze_config is not None and (freeze_config.freeze_parameters or freeze_config.unfreeze_parameters))
     ):
         compute_dtype = None
     if compute_dtype is not None:

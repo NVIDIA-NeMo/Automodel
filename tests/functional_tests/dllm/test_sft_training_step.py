@@ -68,7 +68,7 @@ def test_mdlm_sft_step_corrupts_tokens_and_updates_model() -> None:
     recipe.lr_scheduler = None
     recipe.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
     recipe.dist_env = SimpleNamespace(device=device, world_size=1)
-    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True, autocast_dtype=None)
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.device_mesh = None
     recipe.moe_mesh = None
     recipe.pp_enabled = False
@@ -99,3 +99,65 @@ def test_mdlm_sft_step_corrupts_tokens_and_updates_model() -> None:
     assert not torch.equal(model.projection.weight, before)
     assert torch.all(batches[0]["_noisy_input_ids"] == recipe.mask_token_id)
     assert torch.equal(batches[0]["input_ids"], clean_ids)
+
+
+@pytest.mark.parametrize("use_lora", [False, True])
+def test_fp32_storage_survives_unsharded_recipe_infrastructure(tmp_path, use_lora):
+    """Load a tiny checkpoint and retain FP32 trainable weights and AdamW state."""
+    import torch.distributed as dist
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from nemo_automodel.components._peft.lora import PeftConfig
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config
+    from nemo_automodel.components.optim.optimizer import AdamWConfig
+    from nemo_automodel.recipes.llm.train_ft import build_model
+
+    torch.manual_seed(4494)
+    fixture = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+    )
+    checkpoint = tmp_path / "checkpoint"
+    fixture.save_pretrained(checkpoint)
+    del fixture
+    dist.init_process_group("nccl", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
+    try:
+        setup = DistributedSetup.build(strategy=FSDP2Config(), world_size=1)
+        peft = PeftConfig(dim=2, alpha=4, target_modules=["*q_proj", "*v_proj"]) if use_lora else None
+        model = build_model(
+            ConfigNode(
+                {
+                    "_target_": "nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained",
+                    "pretrained_model_name_or_path": str(checkpoint),
+                    "dtype": "float32",
+                    "attn_implementation": "sdpa",
+                }
+            ),
+            peft,
+            seed=4494,
+            distributed_setup=setup,
+        )
+        params = [p for p in model.parameters() if p.requires_grad]
+        assert params and all(p.dtype == torch.float32 for p in params)
+        before = [p.detach().clone() for p in params]
+        optimizer = AdamWConfig(lr=0.01).build(model, is_peft=use_lora)[0]
+        tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
+        logits = model(input_ids=tokens, use_cache=False).logits
+        assert logits.dtype == torch.bfloat16
+        loss = logits.float().square().mean()
+        loss.backward()
+        assert torch.isfinite(loss)
+        assert all(p.grad is not None and p.grad.dtype == torch.float32 for p in params)
+        optimizer.step()
+        assert any(not torch.equal(old, p) for old, p in zip(before, params))
+        for state in optimizer.state.values():
+            assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
+    finally:
+        dist.destroy_process_group()
