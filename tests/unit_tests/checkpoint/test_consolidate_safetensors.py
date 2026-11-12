@@ -16,6 +16,8 @@ import builtins
 import json
 import logging
 import os
+import subprocess
+import sys
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -248,6 +250,70 @@ def test_consolidate_opens_each_input_shard_independently_of_tensor_count(tmp_pa
     output_tensors = {}
     for file_name in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"):
         output_tensors.update(load_file(output_dir / file_name))
+    assert set(output_tensors) == set(names)
+    for name, expected_tensor in expected_tensors.items():
+        torch.testing.assert_close(output_tensors[name], expected_tensor)
+
+
+@pytest.mark.run_only_on("CPU")
+def test_consolidate_completes_under_constrained_open_file_limit(tmp_path):
+    """Parallel writers must share a bounded input-handle budget under a soft RLIMIT_NOFILE.
+
+    Without a shared bound, shards × concurrent outputs can exceed a low soft limit and raise EMFILE.
+    The child runs under ulimit so the pytest process's own descriptors do not consume the budget.
+    """
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    num_ranks = 64
+    num_output_files = 5
+    num_tensors = 10
+    names = [f"layers.{i}.weight" for i in range(num_tensors)]
+    rows, cols = 2, 8
+    generator = torch.Generator().manual_seed(0)
+    expected_tensors = {
+        name: torch.randn(num_ranks * rows, cols, generator=generator, dtype=torch.float32) for name in names
+    }
+    for rank in range(num_ranks):
+        save_file(
+            {name: tensor[rank * rows : (rank + 1) * rows].contiguous() for name, tensor in expected_tensors.items()},
+            input_dir / f"shard-{rank + 1:05d}-model-00001-of-00001.safetensors",
+            metadata={CUSTOM_METADATA_KEY: json.dumps({name: {"saved_offsets": [rank * rows, 0]} for name in names})},
+        )
+
+    mapping = {name: 1 + i % num_output_files for i, name in enumerate(names)}
+    # 64 shards × 5 writers need 320 input FDs without sharing; 256 is enough once handles are shared.
+    repo_root = str(Path(__file__).resolve().parents[3])
+    child = f"""
+import resource, sys
+sys.path.insert(0, {repo_root!r})
+from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import consolidate_safetensors_files
+_soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+consolidate_safetensors_files(
+    input_dir={str(input_dir)!r},
+    output_dir={str(output_dir)!r},
+    fqn_to_index_mapping={mapping!r},
+    num_threads={num_output_files},
+)
+print("ok")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", child],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "OMP_NUM_THREADS": "1"},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "ok" in completed.stdout
+    assert "Too many open files" not in completed.stderr
+
+    output_tensors = {}
+    for index in range(1, num_output_files + 1):
+        output_tensors.update(load_file(output_dir / f"model-{index:05d}-of-{num_output_files:05d}.safetensors"))
     assert set(output_tensors) == set(names)
     for name, expected_tensor in expected_tensors.items():
         torch.testing.assert_close(output_tensors[name], expected_tensor)
