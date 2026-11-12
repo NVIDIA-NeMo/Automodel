@@ -90,7 +90,7 @@ def _packed_state(uniform_rows: bool = True, dim: int = DIM, inter: int = INTER)
 
 def _experts(dim: int = DIM, inter: int = INTER, row_scaled_forward: bool = False) -> GroupedExpertsTENVFP4:
     backend = _backend(row_scaled_forward=row_scaled_forward)
-    experts = GroupedExpertsTENVFP4(_config(dim, inter), backend=backend, dispatcher_backend="deepep")
+    experts = GroupedExpertsTENVFP4(_config(dim, inter), backend=backend)
     experts.to_empty(device="cuda")
     return experts
 
@@ -238,5 +238,5 @@ def test_several_row_scales_in_one_expert_are_rejected() -> None:
 def test_a_backend_without_te_nvfp4_is_rejected() -> None:
     backend = BackendConfig(experts="te", dispatcher="deepep", te_fp8={"recipe": "mxfp8"})
 
-    with pytest.raises(NotImplementedError, match="te_nvfp4 backend block"):
-        GroupedExpertsTENVFP4(_config(), backend=backend, dispatcher_backend="deepep")
+    with pytest.raises(NotImplementedError, match="require backend.te_nvfp4"):
+        GroupedExpertsTENVFP4(_config(), backend=backend)

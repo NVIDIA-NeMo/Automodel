@@ -387,11 +387,11 @@ class TestBackendConfigTeNvfp4:
         assert cfg.te_fp8 is None
         assert cfg.te_quantization is cfg.te_nvfp4
 
-    def test_empty_block_keeps_the_recipe_defaults(self):
+    def test_empty_te_nvfp4_keeps_the_recipe_defaults(self):
         cfg = BackendConfig(te_nvfp4={}, experts="te", dispatcher="deepep")
         assert cfg.te_nvfp4 == TENvfp4Config()
 
-    def test_te_quantization_is_te_fp8_when_that_block_is_set(self):
+    def test_te_quantization_is_te_fp8_when_that_is_set(self):
         cfg = BackendConfig(te_fp8={"recipe": "block"}, experts="te", dispatcher="deepep")
         assert cfg.te_nvfp4 is None
         assert cfg.te_quantization is cfg.te_fp8

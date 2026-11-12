@@ -18,6 +18,7 @@ import math
 import os
 import types
 import warnings
+from abc import ABC, abstractmethod
 from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -252,15 +253,11 @@ def _forward_outside_fp8(module: nn.Module, *args, **kwargs):
 
 
 @dataclass(kw_only=True)
-class _TEQuantizationConfig:
-    """What the Transformer Engine quantization blocks of :class:`BackendConfig` share.
+class TEQuantizationConfig(ABC):
+    """Base class of :class:`TEFp8Config` and :class:`TENvfp4Config`."""
 
-    A block that is present (not None) makes the Transformer Engine modules quantize the operands of their
-    GEMMs with the recipe the block builds. The blocks differ in that recipe and in its options.
-    """
-
-    block: ClassVar[str]
-    """Name of the block in :class:`BackendConfig`."""
+    name: ClassVar[str]
+    """``"te_fp8"`` or ``"te_nvfp4"``; used in log and error messages."""
     exclude_fqns: tuple[str, ...] = ("lm_head",)
     """Module names kept out of the Transformer Engine autocast (their GEMMs run in the model dtype).
 
@@ -278,7 +275,7 @@ class _TEQuantizationConfig:
         self.exclude_fqns = tuple(self.exclude_fqns)
         if any(not isinstance(fqn, str) or not fqn for fqn in self.exclude_fqns):
             raise ValueError(
-                f"{self.block}.exclude_fqns must be non-empty module-name strings, got {self.exclude_fqns!r}"
+                f"{self.name}.exclude_fqns must be non-empty module-name strings, got {self.exclude_fqns!r}"
             )
 
     def module_excluded(self, name: str) -> bool:
@@ -316,18 +313,18 @@ class _TEQuantizationConfig:
         if excluded:
             logger.info(
                 "%s: %d module(s) kept out of the Transformer Engine autocast: %s",
-                self.block,
+                self.name,
                 len(excluded),
                 ", ".join(excluded),
             )
         return excluded
 
+    @abstractmethod
     def build_recipe(self) -> "Recipe | None":
-        """Build the Transformer Engine recipe of this block; ``None`` without Transformer Engine."""
-        raise NotImplementedError
+        """Return the Transformer Engine recipe; ``None`` when Transformer Engine is not installed."""
 
     def maybe_te_autocast(self):
-        """Return the Transformer Engine autocast context manager with the recipe of this block."""
+        """Return te_autocast context manager for the recipe."""
         if not HAVE_TE:
             return nullcontext()
         from transformer_engine.pytorch.quantization import autocast as te_autocast
@@ -336,7 +333,7 @@ class _TEQuantizationConfig:
 
 
 @dataclass(kw_only=True)
-class TEFp8Config(_TEQuantizationConfig):
+class TEFp8Config(TEQuantizationConfig):
     """Configuration for Transformer Engine FP8 quantization.
 
     When present (not None) in BackendConfig, FP8 is enabled.
@@ -349,7 +346,7 @@ class TEFp8Config(_TEQuantizationConfig):
     ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
     """
 
-    block: ClassVar[str] = "te_fp8"
+    name: ClassVar[str] = "te_fp8"
     recipe: Literal["current", "block", "mxfp8"] | Any = "current"
 
     def build_recipe(self):
@@ -384,20 +381,17 @@ class TEFp8Config(_TEQuantizationConfig):
 
 
 @dataclass(kw_only=True)
-class TENvfp4Config(_TEQuantizationConfig):
-    """Configuration for Transformer Engine NVFP4 quantization (the ``NVFP4BlockScaling`` recipe).
+class TENvfp4Config(TEQuantizationConfig):
+    """Configuration for Transformer Engine NVFP4 quantization.
 
-    When present (not None) in BackendConfig, NVFP4 is enabled: 4-bit e2m1 data with one e4m3 scale per
-    16 values and one FP32 scale per tensor. Parameters keep the model dtype and are quantized for each
-    GEMM unless ``resident_weights`` is set. It requires compute capability 10.0+ (Blackwell).
-
-    The defaults are the recipe defaults for training: weights quantized in 16x16 blocks, random Hadamard
-    transforms on the operands of the weight-gradient GEMM and stochastic rounding of gradients.
-    ``row_scaled_activation`` and ``four_over_six`` change how forward activations are quantized;
-    Transformer Engine supports them only without the random Hadamard transform.
+    When present (not None) in BackendConfig, NVFP4 is enabled with TE's ``NVFP4BlockScaling`` recipe
+    (Blackwell GPUs only). Weights stay in the model dtype and are quantized for each GEMM unless
+    ``resident_weights`` is set. The defaults are the recipe's defaults.
     """
 
-    block: ClassVar[str] = "te_nvfp4"
+    name: ClassVar[str] = "te_nvfp4"
+    max_grouped_tensors: ClassVar[int] = 64
+    """``kMaxTensorsPerKernel`` of TE's NVFP4 grouped quantization kernels; caps the experts per rank."""
     random_hadamard_transform: bool = True
     """Rotate the operands of the weight-gradient GEMM with a 16x16 Hadamard matrix before quantizing."""
     stochastic_rounding: bool = True
@@ -409,16 +403,12 @@ class TENvfp4Config(_TEQuantizationConfig):
     four_over_six: Literal["none", "weights", "activations", "all"] = "none"
     """Tensors whose blocks map their maximum to 4 or to 6, whichever quantizes the block with less error."""
     backward: Literal["quantized", "high_precision", "dequantized"] = "quantized"
-    """Operands of the backward GEMMs. ``"quantized"`` quantizes them to NVFP4 (the recipe default; needs a
-    column-wise copy of the forward activations, which ``row_scaled_activation`` and ``four_over_six`` on
-    activations do not provide, so those options then only work with frozen weights). ``"high_precision"``
-    uses the original floating-point operands and ``"dequantized"`` the dequantized forward operands; the
-    forward is unchanged."""
+    """Operands of the backward GEMMs: quantized to NVFP4, the original floating-point operands, or the
+    dequantized forward operands. With ``"quantized"``, ``row_scaled_activation`` and ``four_over_six`` on
+    activations only work with frozen weights."""
     resident_weights: bool = False
-    """Hold the expert weights as NVFP4 tensors instead of floating point. An NVFP4 checkpoint fills them
-    unchanged and they are saved in the same form. Training them needs an optimizer that keeps FP32 master
-    weights and writes the re-quantized weights back after each step (Transformer Engine ``FusedAdam`` with
-    ``master_weights=True``)."""
+    """Hold the expert weights as NVFP4 tensors: an NVFP4 checkpoint fills them unchanged and they are saved
+    in the same form. Training them needs Transformer Engine ``FusedAdam`` with ``master_weights=True``."""
 
     def __post_init__(self) -> None:
         """Normalize ``exclude_fqns`` and reject options that Transformer Engine does not implement."""
@@ -798,8 +788,6 @@ class BackendConfig:
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None
-    # NVFP4 training with Transformer Engine ({} keeps the recipe defaults). Exclusive with te_fp8:
-    # Transformer Engine runs one recipe.
     te_nvfp4: TENvfp4Config | None = None
     gate_precision: str | torch.dtype | None = None
     # When True, torch.compile(fullgraph=True) the attention module's forward to fuse its many
@@ -959,7 +947,7 @@ class BackendConfig:
         te_quantization = self.te_quantization
         if te_quantization is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(
-                f"{te_quantization.block} requires at least one TE backend "
+                f"{te_quantization.name} requires at least one TE backend "
                 f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
             )
         # The sync-free knobs only mean something to the HybridEP dispatcher; elsewhere the capacity factor
@@ -999,8 +987,8 @@ class BackendConfig:
             )
 
     @property
-    def te_quantization(self) -> TEFp8Config | TENvfp4Config | None:
-        """The Transformer Engine quantization block that is set (``te_fp8`` or ``te_nvfp4``), if any."""
+    def te_quantization(self) -> TEQuantizationConfig | None:
+        """The ``te_fp8`` or ``te_nvfp4`` config, whichever is set."""
         return self.te_fp8 if self.te_fp8 is not None else self.te_nvfp4
 
 
@@ -1946,6 +1934,7 @@ __all__ = [
     "Float32RMSNorm",
     "TEFp8Config",
     "TENvfp4Config",
+    "TEQuantizationConfig",
     "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",
     "compute_lm_head_logits",

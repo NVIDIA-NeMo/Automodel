@@ -1876,14 +1876,6 @@ def _torch_mm_experts_fwd(
     return output2
 
 
-_TE_NVFP4_MAX_GROUPED_TENSORS = 64
-"""Most tensors Transformer Engine's NVFP4 grouped quantization kernels accept in one call.
-
-Mirrors ``kMaxTensorsPerKernel``, a compile-time constant of those kernels that Transformer Engine does not
-expose to Python.
-"""
-
-
 class GroupedExpertsTE(nn.Module):
     """
     MoE experts using TE's GroupedLinear module directly.
@@ -1950,8 +1942,7 @@ class GroupedExpertsTE(nn.Module):
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
-        # NVFP4 block of the backend: it limits the experts per rank, and a storage variant of this module
-        # rebuilds the projections under its recipe.
+        # Set when NVFP4 is enabled; caps the experts per rank.
         self.te_nvfp4 = backend.te_nvfp4 if backend is not None else None
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
@@ -2266,9 +2257,9 @@ class GroupedExpertsTE(nn.Module):
             f"n_routed_experts ({self.config.n_routed_experts}) must be divisible by ep_size ({self.ep_size})"
         )
         self.num_local_experts = self.config.n_routed_experts // self.ep_size
-        if self.te_nvfp4 is not None and self.num_local_experts > _TE_NVFP4_MAX_GROUPED_TENSORS:
+        if self.te_nvfp4 is not None and self.num_local_experts > self.te_nvfp4.max_grouped_tensors:
             raise ValueError(
-                f"te_nvfp4 supports at most {_TE_NVFP4_MAX_GROUPED_TENSORS} experts per rank (the limit of "
+                f"te_nvfp4 supports at most {self.te_nvfp4.max_grouped_tensors} experts per rank (the limit of "
                 f"Transformer Engine's NVFP4 grouped quantization), got {self.num_local_experts}; "
                 "use a larger ep_size."
             )

@@ -87,7 +87,7 @@ def _experts(state: dict[str, torch.Tensor], weight_blocks_2d: bool = True) -> G
         norm_topk_prob=False,
         dtype=torch.bfloat16,
     )
-    experts = GroupedExpertsTENVFP4(config, backend=backend, dispatcher_backend="deepep")
+    experts = GroupedExpertsTENVFP4(config, backend=backend)
     experts.to_empty(device="cuda")
     experts.load_state_dict({key: value.cuda() for key, value in state.items()}, strict=False)
     return experts

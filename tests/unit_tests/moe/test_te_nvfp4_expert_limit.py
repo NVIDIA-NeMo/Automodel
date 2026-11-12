@@ -96,7 +96,7 @@ def _moe_config(n_routed_experts: int) -> MoEConfig:
 
 
 @pytest.mark.parametrize(
-    ("te_block", "n_experts", "ep_size", "allowed"),
+    ("quantization", "n_experts", "ep_size", "allowed"),
     [
         ({"te_nvfp4": {}}, 96, 1, False),
         ({"te_nvfp4": {}}, 130, 2, False),
@@ -105,8 +105,8 @@ def _moe_config(n_routed_experts: int) -> MoEConfig:
         ({}, 96, 1, True),
     ],
 )
-def test_only_nvfp4_limits_the_experts_per_rank(fake_te, te_block, n_experts, ep_size, allowed):
-    backend = BackendConfig(experts="te", dispatcher="deepep", **te_block)
+def test_only_nvfp4_limits_the_experts_per_rank(fake_te, quantization, n_experts, ep_size, allowed):
+    backend = BackendConfig(experts="te", dispatcher="deepep", **quantization)
     experts = GroupedExpertsTE(_moe_config(n_experts), backend=backend)
 
     if not allowed:

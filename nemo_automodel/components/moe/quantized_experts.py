@@ -917,7 +917,7 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
     ) -> None:
         """Create the projections and the packed placeholders; the arguments are those of ``GroupedExpertsTE``."""
         if backend is None or backend.te_nvfp4 is None:
-            raise NotImplementedError("NVFP4 expert weights require the te_nvfp4 backend block.")
+            raise NotImplementedError("NVFP4 expert weights require backend.te_nvfp4.")
         if backend.te_grouped_tensor:
             raise NotImplementedError("NVFP4 expert weights require te_grouped_tensor=False.")
         if config.expert_bias:
