@@ -176,7 +176,7 @@ table = pa.Table.from_batches(batches)
 pq.write_table(table, raw)
 
 # Save only tokenizer assets for the standalone preprocessing tool.
-tokenizer = AutoTokenizer.from_pretrained(os.environ["MODEL_SNAPSHOT"], trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(os.environ["MODEL_SNAPSHOT"], trust_remote_code=False)
 tokenizer.save_pretrained(root / "tokenizer")
 with raw.open("rb") as handle:
     checksum = hashlib.file_digest(handle, "sha256").hexdigest()
