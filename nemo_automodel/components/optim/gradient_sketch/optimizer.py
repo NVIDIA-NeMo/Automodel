@@ -21,6 +21,7 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 from torch import Tensor, nn
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.optim.gradient_sketch.row_adam import row_adam_direction
 from nemo_automodel.components.optim.gradient_sketch.sketch import (
@@ -32,9 +33,15 @@ from nemo_automodel.components.optim.gradient_sketch.sketch import (
     projection_seed,
     sketch_buffer,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _SETTINGS_KEY = "sketch_settings"
 _COUNT_KEY = "update_count"
+
+
+def _local(tensor: Tensor) -> Tensor:
+    """Return the local shard of a ``DTensor``, or the tensor itself."""
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 class GradientSketchOptimizer(torch.optim.Optimizer):
@@ -42,10 +49,12 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
 
     ``param_groups[0]`` holds the sketch targets (plus ``update_count`` and the
     settings); the remaining groups are the native optimizer's own group objects, and
-    ``state`` is shared with it, so the standard ``state_dict`` covers both and DCP
-    checkpointing needs no special handling. Construct it before the native
-    optimizer's first step: target parameters are removed before it can allocate
-    full-size moment buffers.
+    ``state`` is shared with it. The standard ``state_dict`` covers native state, group
+    settings and ``update_count``; sketch-target state is exposed through
+    ``sketch_state_dict`` / ``load_sketch_state_dict`` because DCP ignores the state of
+    frozen parameters (Automodel's ``OptimizerState`` saves it under the ``"sketch"`` key).
+    Construct it before the native optimizer's first step: target parameters are removed
+    before it can allocate full-size moment buffers.
     """
 
     def __init__(self, model: nn.Module, native: torch.optim.Optimizer, settings: SketchSettings) -> None:
@@ -92,12 +101,28 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
             self._link_row_moments()
         for layer in self.layers:
             if layer.weight.dtype != torch.float32:
-                local, _ = local_weight_rows(layer.weight)
-                self.state[layer.weight]["master_weight"] = local.float().clone()
+                self.state[layer.weight]["master_weight"] = self._new_master(layer.weight)
 
     # ------------------------------------------------------------------ bookkeeping
+    @staticmethod
+    def _new_master(weight: Tensor) -> Tensor:
+        """Create an fp32 master copy; a ``DTensor`` with the weight's layout under FSDP so DCP shards it."""
+        local, _ = local_weight_rows(weight)
+        master = local.float().clone()
+        if isinstance(weight, DTensor):
+            return DTensor.from_local(
+                master.reshape(weight.to_local().shape),
+                weight.device_mesh,
+                weight.placements,
+                run_check=False,
+                shape=weight.shape,
+                stride=weight.stride(),
+            )
+        return master
+
     @property
     def update_count(self) -> int:
+        """Number of completed optimizer updates, stored in ``param_groups[0]`` for checkpoints."""
         return int(self.param_groups[0][_COUNT_KEY])
 
     @update_count.setter
@@ -153,8 +178,12 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
 
     # ------------------------------------------------------------------ training step
     def zero_grad(self, set_to_none: bool = True) -> None:
+        """Clear gradients of every parameter group and zero the sketch buffer.
+
+        Args:
+            set_to_none: Set gradients to ``None`` instead of zero, as in ``torch.optim.Optimizer``.
+        """
         super().zero_grad(set_to_none=set_to_none)
-        self.native.zero_grad(set_to_none=set_to_none)
         self.sketches.zero_()
         self.ready = False
 
@@ -162,32 +191,49 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
     def synchronize_and_clip(self, process_group: Any, max_norm: float | None) -> Tensor:
         """Average sketches across data-parallel ranks, then clip the implied gradient globally.
 
-        Returns the pre-clip global norm as a 0-d tensor on the sketch device.
+        After the all-reduce every rank holds the full averaged sketch, so the sketch part of the
+        norm is computed locally over all rows; only the (sharded) native gradient norm is reduced.
+        ``process_group`` must be the FSDP shard group; HSDP replicate groups are unsupported.
+
+        Args:
+            process_group: FSDP shard group, or ``None`` for the default group / a single process.
+            max_norm: Clip the global gradient norm to this value, or ``None`` to only measure it.
+
+        Returns:
+            The pre-clip global norm as a 0-d tensor on the sketch device.
+
+        Raises:
+            RuntimeError: If sketches were already synchronized this step, targets are not
+                FSDP-sharded on more than one rank, or projections differ across ranks.
+            FloatingPointError: If the norm is not finite.
         """
         if self.ready:
             raise RuntimeError("Sketches have already been synchronized for this step")
         world = dist.get_world_size(process_group) if dist.is_initialized() else 1
+        if world > 1:
+            self._check_sharded_targets()
         if world > 1 and not self.projections_verified:
             self._verify_shared_projections(process_group)
         if world > 1:
             dist.all_reduce(self.sketches, group=process_group)
             self.sketches.div_(world)
         # ||S Aᵀ||² = <S (A Aᵀ), S>: a rank x rank Gram matrix per layer; the dense gradient is never formed.
-        partial: list[Tensor] = []
-        for layer, offset in zip(self.layers, self.local_rows, strict=True):
-            local, _ = local_weight_rows(layer.weight)
-            rows = layer.sketch[offset : offset + local.shape[0]]
+        sketch_terms: list[Tensor] = []
+        for layer in self.layers:
             gram = layer.projection @ layer.projection.T
-            partial.append(((rows @ gram) * rows).sum())
+            sketch_terms.append(((layer.sketch @ gram) * layer.sketch).sum())
+        sketch_norm2 = torch.stack(sketch_terms).sum()
         native_grads = [
             local_weight_rows(p.grad)[0] for g in self.native.param_groups for p in g["params"] if p.grad is not None
         ]
+        native_norm2 = torch.zeros((), device=self.sketches.device, dtype=torch.float32)
         if native_grads:
-            partial.extend(n.square() for n in torch._foreach_norm(native_grads, 2, dtype=torch.float32))
-        norm2 = torch.stack(partial).sum()
+            native_norm2 = torch.stack(
+                [n.square() for n in torch._foreach_norm(native_grads, 2, dtype=torch.float32)]
+            ).sum()
         if world > 1:
-            dist.all_reduce(norm2, group=process_group)
-        norm = norm2.sqrt()
+            dist.all_reduce(native_norm2, group=process_group)
+        norm = (sketch_norm2 + native_norm2).sqrt()
         if not torch.isfinite(norm):
             raise FloatingPointError("Nonfinite gradient sketch norm")
         if max_norm is not None:
@@ -197,6 +243,12 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
                 torch._foreach_mul_(native_grads, scale)
         self.ready = True
         return norm
+
+    def _check_sharded_targets(self) -> None:
+        if any(not isinstance(layer.weight, DTensor) for layer in self.layers):
+            raise RuntimeError(
+                "gradient sketch requires FSDP-sharded (DTensor) targets when running on more than one rank"
+            )
 
     @torch.no_grad()
     def _verify_shared_projections(self, process_group: Any) -> None:
@@ -213,6 +265,23 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Any = None, *, scale: float = 1.0) -> None:  # type: ignore[override]
+        """Apply the sketch update to targets and the native step to everything else.
+
+        An unready call with every group's ``lr`` equal to 0 is the state-initialization probe
+        used by ``torch.distributed.checkpoint``: only the native optimizer runs, so its state
+        is created; sketches, projections and ``update_count`` are untouched.
+
+        Args:
+            closure: Unsupported; must be ``None``.
+            scale: Multiplies only the sketch-target update, not its weight decay or the native step.
+
+        Raises:
+            RuntimeError: If ``synchronize_and_clip`` has not run this step (and this is not the
+                zero-lr probe), or a closure is given.
+        """
+        if closure is None and not self.ready and all(g["lr"] == 0 for g in self.param_groups):
+            self.native.step()
+            return
         if closure is not None or not self.ready:
             raise RuntimeError("Call synchronize_and_clip before step; closures are unsupported")
         group = self.param_groups[0]
@@ -230,6 +299,7 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
         for layer, offset in zip(self.layers, self.local_rows, strict=True):
             local, _ = local_weight_rows(layer.weight)
             master = self.state[layer.weight].get("master_weight")
+            master = None if master is None else _local(master)
             destination = local if master is None else master
             destination.addmm_(
                 layer.sketch[offset : offset + local.shape[0]], layer.projection, beta=decay, alpha=alpha
@@ -247,7 +317,7 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
         for layer in self.layers:
             master = self.state[layer.weight].get("master_weight")
             if master is not None:
-                master.copy_(local_weight_rows(layer.weight)[0])
+                _local(master).copy_(local_weight_rows(layer.weight)[0])
 
     def refresh_projection(self) -> None:
         """Redraw every projection on its device from ``(seed, update_count, layer name)``."""
@@ -261,28 +331,90 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
             layer.refresh_cast()
 
     # ------------------------------------------------------------------ checkpointing
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Standard torch format, with fp32 kept for sketch-target state.
+    def state_dict(self) -> dict[str, Any]:
+        """Standard torch state dict covering native parameters, group settings and ``update_count``.
 
-        ``torch.optim.Optimizer.load_state_dict`` casts floating state to the parameter
-        dtype, which would round fp32 moments and masters of bf16 targets. Native
-        parameters go through the parent implementation; target state is copied back
-        explicitly in fp32.
+        Sketch-target entries are dropped from ``"state"``; they travel through
+        :meth:`sketch_state_dict` because DCP ignores the state of frozen parameters.
+
+        Returns:
+            ``{"state": ..., "param_groups": ...}``.
+        """
+        state_dict = super().state_dict()
+        target_ids = set(state_dict["param_groups"][0]["params"])
+        state_dict["state"] = {k: v for k, v in state_dict["state"].items() if k not in target_ids}
+        return state_dict
+
+    def sketch_state_dict(self) -> dict[str, Tensor]:
+        """Live tensors holding the state of sketch-target parameters.
+
+        Returns:
+            ``row_second_moment`` (the flat ``[rows, 1]`` fp32 buffer, identical on every rank, only
+            for RowAdam) and ``master_weight.<fqn>`` for each target that keeps an fp32 master
+            (``DTensor`` under FSDP). Tensors are not cloned so DCP can use them as a load skeleton.
+        """
+        sketch_state: dict[str, Tensor] = {}
+        if self.row_second_moment is not None:
+            sketch_state["row_second_moment"] = self.row_second_moment
+        for layer in self.layers:
+            master = self.state[layer.weight].get("master_weight")
+            if master is not None:
+                sketch_state[f"master_weight.{canonical_parameter_fqn(layer.name)}"] = master
+        return sketch_state
+
+    @torch.no_grad()
+    def load_sketch_state_dict(self, sketch_state: dict[str, Tensor]) -> None:
+        """Restore state produced by :meth:`sketch_state_dict`.
+
+        Args:
+            sketch_state: Mapping with the same keys as :meth:`sketch_state_dict`.
+
+        Raises:
+            ValueError: If a key is missing or unexpected, or a shape differs.
+        """
+        expected = self.sketch_state_dict()
+        for key in expected:
+            if key not in sketch_state:
+                raise ValueError(f"gradient sketch checkpoint is missing {key}")
+        for key in sketch_state:
+            if key not in expected:
+                raise ValueError(f"gradient sketch checkpoint has unexpected key {key}")
+        for key, target in expected.items():
+            saved = sketch_state[key]
+            if saved.shape != target.shape:
+                raise ValueError(
+                    f"gradient sketch checkpoint shape mismatch for {key}: {tuple(saved.shape)} vs "
+                    f"{tuple(target.shape)} (resume requires the same data-parallel size for plain-tensor masters)"
+                )
+        for key, target in expected.items():
+            _local(target).copy_(_local(sketch_state[key]).to(torch.float32))
+        if self.row_second_moment is not None:
+            self._link_row_moments()
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Load native state, group settings and ``update_count`` from :meth:`state_dict`.
+
+        Sketch-target state is not read here; use :meth:`load_sketch_state_dict`.
+
+        Args:
+            state_dict: A dict produced by :meth:`state_dict`.
+
+        Raises:
+            ValueError: If the saved sketch settings differ from the configured ones.
         """
         saved_settings = state_dict["param_groups"][0].get(_SETTINGS_KEY)
         if saved_settings != self.settings.to_dict():
             raise ValueError("gradient sketch checkpoint settings differ from the configured settings")
-        target_ids = set(state_dict["param_groups"][0]["params"])
-        native_state = {k: v for k, v in state_dict["state"].items() if k not in target_ids}
-        super().load_state_dict({"state": native_state, "param_groups": state_dict["param_groups"]})
-        # Torch replaced ``self.state`` with a new mapping; re-share it with the native optimizer.
+        masters = {id(layer.weight): self.state[layer.weight].get("master_weight") for layer in self.layers}
+        super().load_state_dict(state_dict)
+        # Torch replaced ``self.state`` with a new mapping: re-share it with the native optimizer and
+        # put back the target state it does not carry.
         self.native.state = self.state
-        for layer, saved_id in zip(self.layers, state_dict["param_groups"][0]["params"], strict=True):
-            saved = state_dict["state"].get(saved_id, {})
-            self.state[layer.weight] = {
-                name: value.to(device=layer.weight.device, dtype=torch.float32, copy=True)
-                for name, value in saved.items()
-            }
-        self._gather_row_moments_from_state()
         self.native.param_groups = self.param_groups[1:]
+        for layer in self.layers:
+            master = masters[id(layer.weight)]
+            if master is not None:
+                self.state[layer.weight]["master_weight"] = master
+        if self.row_second_moment is not None:
+            self._link_row_moments()
         self.refresh_projection()

@@ -112,6 +112,8 @@ def _zeros_like_optimizer_param(param: torch.Tensor) -> torch.Tensor:
 
 def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
     """Create zero-valued Adam state for parameters that do not have state yet."""
+    # Wrapper optimizers (e.g. gradient sketch) delegate ordinary parameters to a native optimizer.
+    optimizer = getattr(optimizer, "native", optimizer)
     if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
         return
 
@@ -629,6 +631,16 @@ class OptimizerState:
             or any(_has_quantized_params(model_part) for model_part in self.model)
         )
 
+    def _sketch_optimizer(self) -> Any | None:
+        """Return the single gradient sketch optimizer among the parts, or ``None``."""
+        # Imported lazily to avoid an import cycle between checkpointing and the optim package.
+        from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer
+
+        sketch_optimizers = [opt for opt in self.optimizer if isinstance(opt, GradientSketchOptimizer)]
+        if len(sketch_optimizers) > 1:
+            raise ValueError("gradient sketch checkpointing supports a single optimizer part")
+        return sketch_optimizers[0] if sketch_optimizers else None
+
     def state_dict(self) -> dict[str, Any]:
         """
         Get the optimizer and scheduler state dictionaries.
@@ -675,6 +687,10 @@ class OptimizerState:
         state_dict = {
             "optim": optimizer_state_dict,
         }
+        if not self._use_native_optimizer_state:
+            sketch_optimizer = self._sketch_optimizer()
+            if sketch_optimizer is not None:
+                state_dict["sketch"] = sketch_optimizer.sketch_state_dict()
         if self.scheduler is not None:
             state_dict["sched"] = self.scheduler[0].state_dict()
 
@@ -719,6 +735,13 @@ class OptimizerState:
                 options=StateDictOptions(flatten_optimizer_state_dict=True),
             )
             list(map(func, self.model, self.optimizer))
+            if "sketch" in state_dict:
+                sketch_optimizer = self._sketch_optimizer()
+                if sketch_optimizer is None:
+                    raise ValueError(
+                        "checkpoint holds gradient sketch state but no gradient sketch optimizer is in use"
+                    )
+                sketch_optimizer.load_sketch_state_dict(state_dict["sketch"])
 
         # load the scheduler state if it exists
         if "sched" in state_dict and self.scheduler is not None:

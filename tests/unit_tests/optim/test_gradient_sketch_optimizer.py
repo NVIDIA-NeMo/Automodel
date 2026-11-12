@@ -96,7 +96,10 @@ def test_state_dict_round_trip_restores_fp32_moments_and_masters(dtype):
 
     net2, opt2 = _build(dtype)
     net2.load_state_dict(net.state_dict())
+    native_ids = {id(p) for g in opt.native.param_groups for p in g["params"]}
+    assert len(saved["state"]) == len(native_ids)  # no sketch-target entries
     opt2.load_state_dict(saved)
+    opt2.load_sketch_state_dict(copy.deepcopy(opt.sketch_state_dict()))
     assert opt2.update_count == 2
     torch.testing.assert_close(opt2.row_second_moment, expected_moments)
     for layer, source in zip(opt2.layers, opt.layers, strict=True):
@@ -110,6 +113,7 @@ def test_state_dict_round_trip_restores_fp32_moments_and_masters(dtype):
             torch.testing.assert_close(
                 opt2.state[layer.weight]["master_weight"], opt.state[source.weight]["master_weight"]
             )
+    assert opt2.param_groups[1] is opt2.native.param_groups[0] and opt2.state is opt2.native.state
     # native Adam state restored too
     bias = net2[0].bias
     assert "exp_avg" in opt2.state[bias]
@@ -153,6 +157,7 @@ def test_to_device_relinks_views():
 
 def test_sketches_reduce_with_one_collective(monkeypatch):
     net, opt = _build(rule="sgd")
+    monkeypatch.setattr(opt, "_check_sharded_targets", lambda: None)  # plain tensors stand in for DTensor shards
     calls = []
     monkeypatch.setattr(gradient_sketch.optimizer.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(gradient_sketch.optimizer.dist, "get_world_size", lambda group: 2)
@@ -163,6 +168,78 @@ def test_sketches_reduce_with_one_collective(monkeypatch):
     opt.synchronize_and_clip(None, 1.0)
     # two fingerprint checks (one-time), one flat buffer, one scalar norm
     assert len(calls) == 4 and calls.count((8, 3)) == 1
+
+
+def test_multi_rank_requires_sharded_targets(monkeypatch):
+    net, opt = _build(rule="sgd")
+    monkeypatch.setattr(gradient_sketch.optimizer.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(gradient_sketch.optimizer.dist, "get_world_size", lambda group: 2)
+    _backward(net)
+    with pytest.raises(RuntimeError, match="FSDP-sharded"):
+        opt.synchronize_and_clip(None, 1.0)
+
+
+@pytest.fixture
+def gloo_group(tmp_path):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", store=dist.FileStore(str(tmp_path / "store"), 1), rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("rule", ["row_adam", "sgd"])
+def test_optimizer_state_wrapper_round_trip(rule, dtype, gloo_group):
+    from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
+
+    net, opt = _build(dtype, rule=rule)
+    for _ in range(2):
+        opt.zero_grad()
+        _backward(net, dtype)
+        opt.synchronize_and_clip(None, 1.0)
+        opt.step()
+    saved = copy.deepcopy(OptimizerState(net, opt).state_dict())
+    assert "optim" in saved and "sketch" in saved
+
+    net2, opt2 = _build(dtype, rule=rule)
+    net2.load_state_dict(net.state_dict())
+    wrapper = OptimizerState(net2, opt2)
+    wrapper.state_dict()  # DCP builds the load skeleton this way before loading
+    wrapper.load_state_dict(saved)
+    assert opt2.update_count == 2
+    if rule == "row_adam":
+        torch.testing.assert_close(opt2.row_second_moment, opt.row_second_moment)
+    for layer, source in zip(opt2.layers, opt.layers, strict=True):
+        for value in opt2.state[layer.weight].values():
+            assert value.dtype == torch.float32
+        if dtype == torch.bfloat16:
+            torch.testing.assert_close(
+                opt2.state[layer.weight]["master_weight"], opt.state[source.weight]["master_weight"]
+            )
+    assert "exp_avg" in opt2.state[net2[0].bias]
+    torch.testing.assert_close(opt2.state[net2[0].bias]["exp_avg"], opt.state[net[0].bias]["exp_avg"])
+    for o, n in ((opt, net), (opt2, net2)):
+        torch.manual_seed(11)
+        o.zero_grad()
+        _backward(n, dtype)
+        o.synchronize_and_clip(None, 1.0)
+        o.step()
+    for p, q in zip(net.parameters(), net2.parameters()):
+        torch.testing.assert_close(p, q)
+
+
+def test_load_sketch_state_dict_rejects_missing_and_mismatched():
+    net, opt = _build(torch.bfloat16)
+    saved = copy.deepcopy(opt.sketch_state_dict())
+    with pytest.raises(ValueError, match="gradient sketch checkpoint is missing"):
+        opt.load_sketch_state_dict({k: v for k, v in saved.items() if k != "row_second_moment"})
+    with pytest.raises(ValueError, match="shape mismatch"):
+        opt.load_sketch_state_dict({**saved, "row_second_moment": torch.zeros(3, 1)})
+    with pytest.raises(ValueError, match="unexpected"):
+        opt.load_sketch_state_dict({**saved, "bogus": torch.zeros(1)})
 
 
 def test_backward_leaves_no_cyclic_garbage():
