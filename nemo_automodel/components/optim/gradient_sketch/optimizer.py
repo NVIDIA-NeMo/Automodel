@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,12 +16,12 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Callable, cast, overload
 
 import torch
 import torch.distributed as dist
 from torch import Tensor, nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from nemo_automodel.components.optim.gradient_sketch.row_adam import row_adam_direction
 from nemo_automodel.components.optim.gradient_sketch.sketch import (
@@ -42,6 +42,13 @@ _COUNT_KEY = "update_count"
 def _local(tensor: Tensor) -> Tensor:
     """Return the local shard of a ``DTensor``, or the tensor itself."""
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _parameter_fqn(layer: SketchState) -> str:
+    """Canonical parameter FQN of a sketch target (``<module>.<param>``, no leading dot at the root)."""
+    # Linear targets are named by their module; fused expert targets already end in ``.<param>``.
+    module_fqn = layer.name if isinstance(layer.module, nn.Linear) else layer.name.removesuffix(f".{layer.weight_name}")
+    return canonical_parameter_fqn(f"{module_fqn}.{layer.weight_name}" if module_fqn else layer.weight_name)
 
 
 def _rows(tensor: Tensor) -> Tensor:
@@ -229,9 +236,9 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
             gram = layer.projection @ layer.projection.T
             sketch_terms.append(((layer.sketch @ gram) * layer.sketch).sum())
         sketch_norm2 = torch.stack(sketch_terms).sum()
-        native_grads = [
-            local_weight_rows(p.grad)[0] for g in self.native.param_groups for p in g["params"] if p.grad is not None
-        ]
+        # Local shards as stored (any layout): the norm needs no row view, and scaling them in place
+        # scales the real gradients.
+        native_grads = [_local(p.grad) for g in self.native.param_groups for p in g["params"] if p.grad is not None]
         native_norm2 = torch.zeros((), device=self.sketches.device, dtype=torch.float32)
         if native_grads:
             native_norm2 = torch.stack(
@@ -251,10 +258,18 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
         return norm
 
     def _check_sharded_targets(self) -> None:
-        if any(not isinstance(layer.weight, DTensor) for layer in self.layers):
-            raise RuntimeError(
-                "gradient sketch requires FSDP-sharded (DTensor) targets when running on more than one rank"
-            )
+        for layer in self.layers:
+            weight = layer.weight
+            if not isinstance(weight, DTensor):
+                raise RuntimeError(
+                    "gradient sketch requires FSDP-sharded (DTensor) targets when running on more than one rank"
+                )
+            placements = weight.placements
+            if any(isinstance(p, Replicate) for p in placements) or sum(isinstance(p, Shard) for p in placements) > 1:
+                raise RuntimeError(
+                    f"gradient sketch requires targets sharded once along rows by FSDP; {layer.name} has "
+                    f"placements {placements}"
+                )
 
     @torch.no_grad()
     def _verify_shared_projections(self, process_group: Any) -> None:
@@ -269,8 +284,15 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
             )
         self.projections_verified = True
 
+    # Mirror ``Optimizer.step``'s overloads so the override stays type-compatible.
+    @overload
+    def step(self, closure: None = None, *, scale: float = 1.0) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float], *, scale: float = 1.0) -> float: ...
+
     @torch.no_grad()
-    def step(self, closure: Any = None, *, scale: float = 1.0) -> None:  # type: ignore[override]
+    def step(self, closure: Callable[[], float] | None = None, *, scale: float = 1.0) -> float | None:
         """Apply the sketch update to targets and the native step to everything else.
 
         An unready call with every group's ``lr`` equal to 0 is the state-initialization probe
@@ -281,13 +303,16 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
             closure: Unsupported; must be ``None``.
             scale: Multiplies only the sketch-target update, not its weight decay or the native step.
 
+        Returns:
+            ``None``; closures are unsupported, so there is no loss to return.
+
         Raises:
             RuntimeError: If ``synchronize_and_clip`` has not run this step (and this is not the
                 zero-lr probe), or a closure is given.
         """
         if closure is None and not self.ready and all(g["lr"] == 0 for g in self.param_groups):
             self.native.step()
-            return
+            return None
         if closure is not None or not self.ready:
             raise RuntimeError("Call synchronize_and_clip before step; closures are unsupported")
         group = self.param_groups[0]
@@ -316,6 +341,7 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
         self.update_count += 1
         self.ready = False
         self.refresh_projection()
+        return None
 
     @torch.no_grad()
     def reset_master_weights(self) -> None:
@@ -356,7 +382,7 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
 
         Returns:
             ``row_second_moment`` (the flat ``[rows, 1]`` fp32 buffer, identical on every rank, only
-            for RowAdam) and ``master_weight.<fqn>`` for each target that keeps an fp32 master
+            for RowAdam) and ``master_weight.<parameter fqn>`` for each target that keeps an fp32 master
             (``DTensor`` under FSDP). Tensors are not cloned so DCP can use them as a load skeleton.
         """
         sketch_state: dict[str, Tensor] = {}
@@ -365,7 +391,7 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
         for layer in self.layers:
             master = self.state[layer.weight].get("master_weight")
             if master is not None:
-                sketch_state[f"master_weight.{canonical_parameter_fqn(layer.name)}"] = master
+                sketch_state[f"master_weight.{_parameter_fqn(layer)}"] = master
         return sketch_state
 
     @torch.no_grad()

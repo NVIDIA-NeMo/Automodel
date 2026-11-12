@@ -48,24 +48,25 @@ Invalid values fail at config time. The run fails if the selection matches no mo
 The standard optimizer state dict holds the native optimizer's state, plus `update_count` and the sketch settings in the first param group. State of the sketch targets is not part of it, because PyTorch DCP skips optimizer state of frozen parameters, and sketch targets have `requires_grad=False`. Automodel's `OptimizerState` saves it under a top-level `sketch` entry instead:
 
 - `row_second_moment`: the flat fp32 row second moments (RowAdam only).
-- `master_weight.<fqn>`: fp32 master weights for bf16 targets, stored as DTensors under FSDP.
+- `master_weight.<parameter fqn>` (for example `master_weight.model.layers.0.self_attn.q_proj.weight`): fp32 master weights for bf16 targets, stored as DTensors under FSDP.
 
 Projections are not saved; they are regenerated from the seed on load. A checkpoint saved with different sketch settings is rejected on load, as is a checkpoint whose `sketch` entry has missing, unexpected, or differently shaped keys. A checkpoint containing sketch state cannot be loaded without a gradient sketch optimizer.
 
 ## Limits
 
 - FSDP2 row sharding only. Tensor and pipeline parallelism are rejected. Context parallelism is not supported or tested.
-- The process group used for gradient clipping must be the FSDP shard group. HSDP replicate groups are unsupported.
+- The process group used for gradient clipping must be the FSDP shard group. HSDP (`dp_replicate_size > 1`) is rejected at setup.
 - With more than one rank, every target must be an FSDP DTensor. Plain-tensor DDP is rejected.
 - No PEFT.
 - Outputs of sketched linear layers must not be modified in place. A violation fails at forward time.
 - All data-parallel ranks must run identical hardware: projections are drawn from a shared seed on each device, and their fingerprints are checked once across ranks.
-- Fused 3-D expert parameters are supported through `target_parameters`.
+- Fused 3-D expert parameters are supported through `target_parameters`, only when experts are not sharded along a non-leading dimension: Automodel's EP parallelizer with `ep_shard > 1` is rejected. Expert parallelism is rejected by the gradient-clipping path, as are parameters with model-owned gradient divisors.
 - A single model part is supported; pipeline-parallel parts are rejected.
+- Only the LLM fine-tuning recipe (`recipes/llm/train_ft.py`) is wired for gradient sketching. Other recipes raise at `step()` because they never call `synchronize_and_clip`.
 
 ## Measured Results
 
-These numbers were measured in NeMo-RL (PR #4992) with that harness, not in Automodel. For a 7B model on 4x B300:
+These numbers were measured in NeMo-RL (NVIDIA-NeMo/RL#4992), not in Automodel. For a 7B model on 4x B300:
 
 | | Peak memory | Time per training iteration |
 | --- | --- | --- |

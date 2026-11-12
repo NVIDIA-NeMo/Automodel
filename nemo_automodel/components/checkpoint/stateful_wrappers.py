@@ -14,7 +14,7 @@
 
 import logging
 from functools import partial
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 
@@ -67,6 +67,21 @@ from nemo_automodel.components.checkpoint.utils import (
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 
 _PREFIX = "model."
+
+
+@runtime_checkable
+class SketchStateOptimizer(Protocol):
+    """Optimizer exposing extra state that DCP's optimizer state dict does not carry (gradient sketch).
+
+    Matched structurally so checkpointing does not import the optim component; plain
+    ``torch.optim.Optimizer`` instances have neither method.
+    """
+
+    def sketch_state_dict(self) -> dict[str, torch.Tensor]: ...
+
+    def load_sketch_state_dict(self, sketch_state: dict[str, torch.Tensor]) -> None: ...
+
+
 _OPTIMIZER_PARTS_KEY = "optimizer_parts"
 _OPTIMIZER_PART_KEY_PREFIX = "stage_"
 
@@ -631,12 +646,9 @@ class OptimizerState:
             or any(_has_quantized_params(model_part) for model_part in self.model)
         )
 
-    def _sketch_optimizer(self) -> Any | None:
+    def _sketch_optimizer(self) -> SketchStateOptimizer | None:
         """Return the single gradient sketch optimizer among the parts, or ``None``."""
-        # Imported lazily to avoid an import cycle between checkpointing and the optim package.
-        from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer
-
-        sketch_optimizers = [opt for opt in self.optimizer if isinstance(opt, GradientSketchOptimizer)]
+        sketch_optimizers = [opt for opt in self.optimizer if isinstance(opt, SketchStateOptimizer)]
         if len(sketch_optimizers) > 1:
             raise ValueError("gradient sketch checkpointing supports a single optimizer part")
         return sketch_optimizers[0] if sketch_optimizers else None

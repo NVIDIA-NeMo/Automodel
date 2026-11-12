@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,7 +70,7 @@ class SketchSettings:
             raise ValueError(f"gradient sketch optimizer must be one of {_RULES}, got {self.optimizer!r}")
         if not 0 <= self.beta2 < 1:
             raise ValueError(f"gradient sketch beta2 must satisfy 0 <= beta2 < 1, got {self.beta2}")
-        if self.epsilon <= 0:
+        if not self.epsilon > 0:
             raise ValueError(f"gradient sketch epsilon must be positive, got {self.epsilon}")
         # YAML delivers lists; store tuples so the settings stay hashable and immutable.
         object.__setattr__(self, "target_modules", tuple(self.target_modules))

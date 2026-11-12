@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 
@@ -30,6 +44,8 @@ def test_inplace_matches_out_of_place_and_reuses_storage():
 def test_rejects_invalid_arguments():
     with pytest.raises(ValueError):
         row_adam_direction(torch.ones(2, 2), torch.zeros(2, 1), step=0, beta2=0.9, epsilon=1e-8)
+    with pytest.raises(ValueError):
+        row_adam_direction(torch.ones(2, 2), torch.zeros(2, 1), step=1, beta2=0.9, epsilon=float("nan"))
     with pytest.raises(ValueError, match="one second moment"):
         row_adam_direction(torch.ones(2, 2), torch.zeros(2, 2), step=1, beta2=0.9, epsilon=1e-8)
     with pytest.raises(FloatingPointError):

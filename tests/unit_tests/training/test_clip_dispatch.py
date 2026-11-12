@@ -18,7 +18,7 @@ from torch import nn
 
 import nemo_automodel.components.training.utils as training_utils
 from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer, SketchSettings
-from nemo_automodel.components.training.utils import clip_grads_for_optimizers
+from nemo_automodel.components.training.utils import SketchClippingOptimizer, clip_grads_for_optimizers
 
 
 def _net():
@@ -63,3 +63,44 @@ def test_mixed_optimizers_rejected():
     sketch = _sketch(net)
     with pytest.raises(ValueError, match="mix"):
         clip_grads_for_optimizers([sketch, torch.optim.SGD(net[1].parameters(), lr=0.1)], 1.0, [net])
+
+
+def test_protocol_matches_only_sketch_optimizers():
+    net = _net()
+    assert isinstance(_sketch(net), SketchClippingOptimizer)
+    for plain in (torch.optim.AdamW(_net().parameters()), torch.optim.SGD(_net().parameters(), lr=0.1)):
+        assert not isinstance(plain, SketchClippingOptimizer)
+
+
+def test_rejects_owner_scaled_gradients():
+    net = _net()
+    opt = _sketch(net)
+    net[1].bias._nemo_model_owned_grad_divisor = 2.0
+    net(torch.randn(3, 4)).square().sum().backward()
+    with pytest.raises(RuntimeError, match="owner-scaled"):
+        clip_grads_for_optimizers([opt], 1.0, [net])
+    assert not opt.ready
+
+
+class _FakeMesh:
+    def __init__(self, sizes):
+        self.sizes = sizes
+        self.mesh_dim_names = tuple(sizes)
+
+    def __getitem__(self, name):
+        size = self.sizes[name]
+        return type("_Dim", (), {"size": lambda self: size})()
+
+
+@pytest.mark.parametrize("ep, rejected", [(2, True), (1, False)])
+def test_rejects_expert_parallelism(ep, rejected):
+    net = _net()
+    opt = _sketch(net)
+    net(torch.randn(3, 4)).square().sum().backward()
+    kwargs = {"moe_mesh": _FakeMesh({"ep_shard": 1, "ep": ep}), "ep_axis_name": "ep"}
+    if rejected:
+        with pytest.raises(RuntimeError, match="expert parallelism"):
+            clip_grads_for_optimizers([opt], 1.0, [net], **kwargs)
+    else:
+        clip_grads_for_optimizers([opt], 1.0, [net], **kwargs)
+        assert opt.ready

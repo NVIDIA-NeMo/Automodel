@@ -840,3 +840,34 @@ class TestGradientSketchConfig:
     def test_invalid_settings_raise_at_construction(self):
         with pytest.raises(ValueError, match="rank"):
             GradientSketchConfig(native=AdamWConfig(), rank=0)
+
+    def test_rejects_param_group_overrides(self):
+        with pytest.raises(ValueError, match="param_group_overrides"):
+            GradientSketchConfig(native=AdamWConfig(), param_group_overrides=[{"pattern": "bias", "lr_mult": 0.5}])
+
+    class _FakeMesh:
+        def __init__(self, sizes):
+            self.sizes = sizes
+            self.mesh_dim_names = tuple(sizes)
+
+        def __getitem__(self, name):
+            size = self.sizes[name]
+            return type("_Dim", (), {"size": lambda self: size})()
+
+    @pytest.mark.parametrize(
+        "sizes, message",
+        [
+            ({"dp_replicate": 2, "dp_shard": 2, "cp": 1, "tp": 1}, "HSDP"),
+            ({"dp_replicate": 1, "dp_shard": 2, "cp": 1, "tp": 2}, "tensor parallelism"),
+        ],
+    )
+    def test_build_rejects_unsupported_mesh(self, sizes, message):
+        cfg = GradientSketchConfig(native=AdamWConfig(), rank=2, target_modules=["0"])
+        with pytest.raises(ValueError, match=f"gradient sketch does not support {message}"):
+            cfg.build(self._model(), device_mesh=self._FakeMesh(sizes))
+
+    def test_build_accepts_fsdp_with_context_parallelism(self):
+        cfg = GradientSketchConfig(native=AdamWConfig(), rank=2, target_modules=["0"])
+        mesh = self._FakeMesh({"pp": 1, "dp_replicate": 1, "dp_shard": 2, "cp": 2, "tp": 1})
+        (opt,) = cfg.build(self._model(), device_mesh=mesh)
+        assert isinstance(opt, GradientSketchOptimizer)

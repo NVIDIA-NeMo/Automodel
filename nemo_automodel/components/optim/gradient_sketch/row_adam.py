@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,7 +46,7 @@ def row_adam_direction(
     Returns:
         The normalized direction, same shape as ``sketch``.
     """
-    if step < 1 or not 0 <= beta2 < 1 or epsilon <= 0:
+    if step < 1 or not 0 <= beta2 < 1 or not epsilon > 0:
         raise ValueError("Invalid RowAdam step, decay, or epsilon")
     if second_moment.shape != (sketch.shape[0], 1):
         raise ValueError("RowAdam requires one second moment per output row")

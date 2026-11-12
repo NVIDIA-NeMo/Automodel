@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import gc
 import math
-from typing import Any, Iterable, Literal, cast
+from typing import Any, Iterable, Literal, Protocol, runtime_checkable
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -30,6 +30,19 @@ from nemo_automodel.components.training.triton.grad_norm import multi_tensor_abs
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 
 _GradNormBackend = Literal["triton", "te"]
+
+
+@runtime_checkable
+class SketchClippingOptimizer(Protocol):
+    """Optimizer that owns gradient synchronization and clipping (e.g. gradient sketch).
+
+    Matched structurally so this component does not import the optim component; plain
+    ``torch.optim.Optimizer`` instances have neither member.
+    """
+
+    ready: bool
+
+    def synchronize_and_clip(self, process_group: Any, max_norm: float | None) -> torch.Tensor: ...
 
 
 def _ep_local_expert_param_ids(
@@ -790,6 +803,27 @@ def scale_grads_and_clip_grad_norm(
     )
 
 
+def _reject_presketch_gradient_scaling(model_parts: list[torch.nn.Module], clip_kwargs: dict[str, Any]) -> None:
+    """Reject layouts whose gradients ``scale_grads_and_clip_grad_norm`` would pre-scale.
+
+    The sketch path bypasses that helper, so expert-parallel ratio scaling and model-owned
+    gradient divisors would be silently skipped.
+    """
+    moe_mesh = clip_kwargs.get("moe_mesh")
+    ep_axis_name = clip_kwargs.get("ep_axis_name")
+    mesh_names = getattr(moe_mesh, "mesh_dim_names", None) or ()
+    expert_parallel = (
+        moe_mesh is not None and bool(ep_axis_name) and ep_axis_name in mesh_names and moe_mesh[ep_axis_name].size() > 1
+    )
+    owner_scaled = any(
+        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
+        for model_part in model_parts
+        for parameter in model_part.parameters()
+    )
+    if expert_parallel or owner_scaled:
+        raise RuntimeError("gradient sketch does not support expert parallelism or owner-scaled gradients")
+
+
 def clip_grads_for_optimizers(
     optimizers: list[torch.optim.Optimizer],
     max_grad_norm: float | None,
@@ -813,14 +847,17 @@ def clip_grads_for_optimizers(
 
     Returns:
         The pre-clip global norm.
-    """
-    from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer  # avoid import cycle
 
-    sketched = [isinstance(o, GradientSketchOptimizer) for o in optimizers]
-    if any(sketched) and not all(sketched):
+    Raises:
+        ValueError: If sketch and non-sketch optimizers are mixed.
+        RuntimeError: If sketch optimizers are used with expert parallelism or owner-scaled gradients.
+    """
+    sketch_optimizers = [o for o in optimizers if isinstance(o, SketchClippingOptimizer)]
+    if sketch_optimizers and len(sketch_optimizers) != len(optimizers):
         raise ValueError("Cannot mix gradient-sketch optimizers with other optimizers across model parts")
-    if all(sketched) and optimizers:
-        norms = [cast(GradientSketchOptimizer, o).synchronize_and_clip(dp_group, max_grad_norm) for o in optimizers]
+    if sketch_optimizers:
+        _reject_presketch_gradient_scaling(model_parts, clip_kwargs)
+        norms = [o.synchronize_and_clip(dp_group, max_grad_norm) for o in sketch_optimizers]
         return torch.stack(norms).square().sum().sqrt() if len(norms) > 1 else norms[0]
     return scale_grads_and_clip_grad_norm(max_grad_norm, model_parts, **clip_kwargs)
 

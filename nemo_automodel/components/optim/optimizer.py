@@ -377,6 +377,8 @@ class GradientSketchConfig(OptimizerConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.param_group_overrides:
+            raise ValueError("gradient_sketch does not support param_group_overrides")
         if isinstance(self.native, dict):
             native = dict(self.native)
             target = native.pop("_target_", "adamw")
@@ -420,6 +422,10 @@ class GradientSketchConfig(OptimizerConfig):
 
         Returns:
             A one-element list holding the sketch optimizer.
+
+        Raises:
+            NotImplementedError: If ``model`` has several pipeline-parallel parts.
+            ValueError: If PEFT is enabled, or ``device_mesh`` uses HSDP or tensor parallelism.
         """
         # Local import keeps optimizer.py importable without the sketch package's dependencies at module load.
         from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer
@@ -428,6 +434,14 @@ class GradientSketchConfig(OptimizerConfig):
             raise NotImplementedError("gradient_sketch does not support pipeline-parallel model parts")
         if is_peft:
             raise ValueError("gradient_sketch cannot be combined with PEFT adapters")
+        if device_mesh is not None:
+            # Context parallelism is supported. Expert parallelism lives on the separate MoE mesh,
+            # which this config never sees; ``clip_grads_for_optimizers`` rejects it at the first step.
+            mesh_names = device_mesh.mesh_dim_names or ()
+            if "dp_replicate" in mesh_names and device_mesh["dp_replicate"].size() > 1:
+                raise ValueError("gradient sketch does not support HSDP")
+            if "tp" in mesh_names and device_mesh["tp"].size() > 1:
+                raise ValueError("gradient sketch does not support tensor parallelism")
         (native,) = cast(OptimizerConfig, self.native).build(model, device_mesh=device_mesh, is_peft=False)
         return [GradientSketchOptimizer(model, native, self.settings())]
 

@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import gc
 
@@ -66,6 +80,51 @@ def test_sgd_matches_explicit_reconstruction_and_clipping():
     before = net[0].weight.detach().clone()
     opt.step()
     torch.testing.assert_close(net[0].weight, before - 0.01 * expected * min(1.0, 0.1 / (norm2.sqrt().item() + 1e-6)))
+
+
+def test_sgd_folds_weight_decay_into_the_update():
+    torch.manual_seed(9)
+    net = _mlp()
+    reference = copy.deepcopy(net)
+    lr, wd = 0.01, 0.1
+    opt = GradientSketchOptimizer(
+        net,
+        torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=wd),
+        SketchSettings(rank=3, target_modules=("0",), optimizer="sgd"),
+    )
+    assert opt.param_groups[0]["weight_decay"] == wd
+    x = torch.randn(4, 7, requires_grad=True)
+    reference(x).square().sum().backward()
+    net(x).square().sum().backward()
+    a = opt.layers[0].projection
+    expected = reference[0].weight.grad @ a.T @ a
+    norm = opt.synchronize_and_clip(None, 0.1)
+    clip = min(1.0, 0.1 / (norm.item() + 1e-6))
+    before = net[0].weight.detach().clone()
+    opt.step()
+    torch.testing.assert_close(net[0].weight, (1 - lr * wd) * before - lr * clip * expected)
+
+
+def test_clip_scales_non_contiguous_3d_native_grad_in_place():
+    torch.manual_seed(4)
+    net = _mlp()
+    extra = nn.Parameter(torch.randn(3, 4, 2))
+    net.register_parameter("extra", extra)
+    opt = GradientSketchOptimizer(
+        net, torch.optim.AdamW(net.parameters(), lr=0.01), SketchSettings(rank=3, target_modules=("0", "2"))
+    )
+    _backward(net)
+    extra.grad = torch.randn(4, 3, 2).transpose(0, 1)
+    assert not extra.grad.is_contiguous()
+    grad_before = extra.grad.clone()
+    norm = opt.synchronize_and_clip(None, 1e-3)
+    assert norm.item() > 1e-3
+    torch.testing.assert_close(extra.grad, grad_before * (1e-3 / (norm + 1e-6)))
+
+
+def test_sketch_state_keys_are_parameter_fqns():
+    _, opt = _build(torch.bfloat16)
+    assert set(opt.sketch_state_dict()) == {"row_second_moment", "master_weight.0.weight", "master_weight.2.weight"}
 
 
 def test_step_requires_synchronize_first_and_zero_grad_resets():
@@ -269,6 +328,8 @@ def test_bf16_fused_expert_master_is_stored_3d_and_updated_as_rows():
     assert not torch.equal(model.up, before)
     assert torch.equal(master.to(torch.bfloat16), model.up)
 
+    assert set(opt.sketch_state_dict()) == {"row_second_moment", "master_weight.up"}
+
     model2, opt2 = build()
     opt2.load_sketch_state_dict(copy.deepcopy(opt.sketch_state_dict()))
     torch.testing.assert_close(opt2.state[model2.up]["master_weight"], master)
@@ -288,3 +349,24 @@ def test_backward_leaves_no_cyclic_garbage():
     finally:
         gc.enable()
     assert unreachable == 0
+
+
+@pytest.mark.parametrize("placements", ["replicate", "two_shards"])
+def test_check_sharded_targets_rejects_replicated_or_multiply_sharded(placements, gloo_group):
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+    net, opt = _build(rule="sgd")
+    mesh = init_device_mesh("cpu", (1, 1), mesh_dim_names=("a", "b"))
+    layout = [Replicate(), Shard(0)] if placements == "replicate" else [Shard(0), Shard(0)]
+    row_mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("c",))
+    for layer in opt.layers:
+        weight = distribute_tensor(layer.weight.detach(), row_mesh, [Shard(0)])
+        layer.module._parameters["weight"] = nn.Parameter(weight, requires_grad=False)
+    opt._check_sharded_targets()  # one row shard per target is accepted
+    first = opt.layers[0]
+    first.module._parameters["weight"] = nn.Parameter(
+        distribute_tensor(first.weight.full_tensor(), mesh, layout), requires_grad=False
+    )
+    with pytest.raises(RuntimeError, match=f"sharded once along rows by FSDP; {first.name} "):
+        opt._check_sharded_targets()
