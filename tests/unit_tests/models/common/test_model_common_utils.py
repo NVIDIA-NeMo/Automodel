@@ -16,7 +16,6 @@ import copy
 import types
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -173,13 +172,16 @@ def _fake_te_autocast():
 
 
 @contextmanager
-def _fake_te_recipes(missing: tuple[str, ...] = ()):
-    """Stand in for ``transformer_engine.common.recipe`` with one empty class per recipe name."""
-    names = ("Float8CurrentScaling", "Float8BlockScaling", "MXFP8BlockScaling", "NVFP4BlockScaling")
-    recipes = {name: type(name, (), {}) for name in names if name not in missing}
+def _fake_te_nvfp4_recipe(available: bool = True):
+    """Stand in for ``transformer_engine.common.recipe``, with or without ``NVFP4BlockScaling``."""
     recipe_module = types.ModuleType("transformer_engine.common.recipe")
-    for name, recipe_class in recipes.items():
-        setattr(recipe_module, name, recipe_class)
+    if available:
+
+        class NVFP4BlockScaling:
+            def __init__(self, **kwargs: bool | str) -> None:
+                self.kwargs = kwargs
+
+        recipe_module.NVFP4BlockScaling = NVFP4BlockScaling
     te_common = types.ModuleType("transformer_engine.common")
     te_common.recipe = recipe_module
     te_root = types.ModuleType("transformer_engine")
@@ -190,7 +192,7 @@ def _fake_te_recipes(missing: tuple[str, ...] = ()):
         "transformer_engine.common.recipe": recipe_module,
     }
     with patch("nemo_automodel.components.models.common.utils.HAVE_TE", True), patch.dict("sys.modules", modules):
-        yield recipes
+        yield
 
 
 class TestTEFp8Config:
@@ -220,83 +222,6 @@ class TestTEFp8Config:
         cfg = TEFp8Config()
         with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
             assert cfg.build_recipe() is None
-
-    @pytest.mark.parametrize(
-        ("name", "te_recipe"),
-        [
-            ("current", "Float8CurrentScaling"),
-            ("block", "Float8BlockScaling"),
-            ("mxfp8", "MXFP8BlockScaling"),
-            ("nvfp4", "NVFP4BlockScaling"),
-        ],
-    )
-    def test_build_recipe_maps_each_name_to_its_te_recipe(self, name, te_recipe):
-        with _fake_te_recipes() as recipes:
-            built = TEFp8Config(recipe=name).build_recipe()
-        assert type(built) is recipes[te_recipe]
-
-    def test_nvfp4_recipe_needs_te_with_nvfp4(self):
-        """A TE build without NVFP4BlockScaling is reported instead of falling back to an FP8 recipe."""
-        with _fake_te_recipes(missing=("NVFP4BlockScaling",)):
-            with pytest.raises(ImportError, match="NVFP4BlockScaling"):
-                TEFp8Config(recipe="nvfp4").build_recipe()
-
-    def test_uses_nvfp4_for_the_shorthand_and_for_recipe_objects(self):
-        assert TEFp8Config(recipe="nvfp4").uses_nvfp4()
-        assert not TEFp8Config(recipe="mxfp8").uses_nvfp4()
-        with _fake_te_recipes() as recipes:
-            assert TEFp8Config(recipe=recipes["NVFP4BlockScaling"]()).uses_nvfp4()
-            assert not TEFp8Config(recipe=recipes["MXFP8BlockScaling"]()).uses_nvfp4()
-
-    def test_nvfp4_options_reach_the_te_recipe(self):
-        options = {
-            "random_hadamard_transform": False,
-            "stochastic_rounding": False,
-            "weight_blocks_2d": False,
-            "row_scaled_activation": True,
-            "four_over_six": "activations",
-            "backward": "high_precision",
-            "resident_weights": True,
-        }
-        with _fake_te_recipes() as recipes:
-            recipes["NVFP4BlockScaling"].__init__ = lambda self, **kwargs: setattr(self, "kwargs", kwargs)
-            default = TEFp8Config(recipe="nvfp4").build_recipe()
-            custom = BackendConfig(
-                te_fp8={"recipe": "nvfp4", "nvfp4": options}, experts="te", dispatcher="deepep"
-            ).te_fp8.build_recipe()
-        assert default.kwargs == {}
-        assert custom.kwargs == {
-            "disable_rht": True,
-            "disable_stochastic_rounding": True,
-            "disable_2d_quantization": True,
-            "row_scaled_activation": True,
-            "nvfp4_4over6": "activations",
-            "backward_override": "high_precision",
-        }
-
-    @pytest.mark.parametrize(
-        "options",
-        [
-            {"row_scaled_activation": True},
-            {"four_over_six": "activations"},
-            {"four_over_six": "all"},
-            {"four_over_six": "sometimes", "random_hadamard_transform": False},
-            {"backward": "float"},
-        ],
-    )
-    def test_nvfp4_options_reject_unsupported_combinations(self, options):
-        with pytest.raises(ValueError, match="NVFP4 option"):
-            TEFp8Config(recipe="nvfp4", nvfp4=options)
-
-    def test_nvfp4_options_need_the_nvfp4_recipe(self):
-        with pytest.raises(ValueError, match="te_fp8.nvfp4 options require"):
-            TEFp8Config(recipe="mxfp8", nvfp4={"stochastic_rounding": False})
-
-    def test_unknown_recipe_name_is_rejected(self):
-        with pytest.raises(ValueError, match="te_fp8.recipe"):
-            TEFp8Config(recipe="fp4")
-        with pytest.raises(ValueError, match="te_fp8.recipe"):
-            BackendConfig(te_fp8={"recipe": "nvfp4_typo"}, experts="te", dispatcher="deepep")
 
     def test_exclude_fqns_default_and_normalization(self):
         assert TEFp8Config().exclude_fqns == ("lm_head",)
@@ -387,38 +312,100 @@ class TestBackendConfigTeFp8:
             BackendConfig(te_fp8=TEFp8Config(), linear="torch", experts="torch")
 
 
+class TestTENvfp4Config:
+    def test_default_options_keep_the_recipe_defaults(self):
+        cfg = TENvfp4Config()
+        assert cfg.recipe_kwargs() == {}
+        assert not cfg.resident_weights
+        with _fake_te_nvfp4_recipe():
+            assert cfg.build_recipe().kwargs == {}
+
+    def test_options_reach_the_te_recipe(self):
+        cfg = TENvfp4Config(
+            random_hadamard_transform=False,
+            stochastic_rounding=False,
+            weight_blocks_2d=False,
+            row_scaled_activation=True,
+            four_over_six="activations",
+            backward="high_precision",
+            resident_weights=True,
+        )
+        with _fake_te_nvfp4_recipe():
+            built = cfg.build_recipe()
+        assert built.kwargs == {
+            "disable_rht": True,
+            "disable_stochastic_rounding": True,
+            "disable_2d_quantization": True,
+            "row_scaled_activation": True,
+            "nvfp4_4over6": "activations",
+            "backward_override": "high_precision",
+        }
+
+    def test_build_recipe_without_te(self):
+        with patch("nemo_automodel.components.models.common.utils.HAVE_TE", False):
+            assert TENvfp4Config().build_recipe() is None
+
+    def test_build_recipe_needs_te_with_nvfp4(self):
+        """A TE build without NVFP4BlockScaling is reported."""
+        with _fake_te_nvfp4_recipe(available=False):
+            with pytest.raises(ImportError, match="NVFP4BlockScaling"):
+                TENvfp4Config().build_recipe()
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"row_scaled_activation": True},
+            {"four_over_six": "activations"},
+            {"four_over_six": "all"},
+            {"four_over_six": "sometimes", "random_hadamard_transform": False},
+            {"backward": "float"},
+        ],
+    )
+    def test_unsupported_options_are_rejected(self, options):
+        with pytest.raises(ValueError, match="te_nvfp4"):
+            TENvfp4Config(**options)
+
+    def test_exclude_fqns_default_and_normalization(self):
+        assert TENvfp4Config().exclude_fqns == ("lm_head",)
+        assert TENvfp4Config(exclude_fqns=["lm_head", "model.score"]).exclude_fqns == ("lm_head", "model.score")
+        assert TENvfp4Config(exclude_fqns="score").module_excluded("model.score")
+        with pytest.raises(ValueError, match="te_nvfp4.exclude_fqns"):
+            TENvfp4Config(exclude_fqns=[""])
+
+
 class TestBackendConfigTeNvfp4:
-    def test_block_selects_the_nvfp4_recipe_with_its_options(self):
-        options = {"stochastic_rounding": False, "resident_weights": True}
-        cfg = BackendConfig(te_nvfp4=options, experts="te", dispatcher="deepep")
-        nested = BackendConfig(te_fp8={"recipe": "nvfp4", "nvfp4": options}, experts="te", dispatcher="deepep")
-        assert cfg.te_fp8 == nested.te_fp8
-        assert cfg.te_fp8.recipe == "nvfp4"
-        assert cfg.te_fp8.nvfp4 == TENvfp4Config(stochastic_rounding=False, resident_weights=True)
-        assert cfg.te_fp8.resident_nvfp4_weights()
+    def test_te_nvfp4_default_is_none(self):
+        cfg = BackendConfig()
         assert cfg.te_nvfp4 is None
+        assert cfg.te_quantization is None
+
+    def test_te_nvfp4_dict_normalized(self):
+        cfg = BackendConfig(
+            te_nvfp4={"stochastic_rounding": False, "resident_weights": True}, experts="te", dispatcher="deepep"
+        )
+        assert cfg.te_nvfp4 == TENvfp4Config(stochastic_rounding=False, resident_weights=True)
+        assert cfg.te_fp8 is None
+        assert cfg.te_quantization is cfg.te_nvfp4
 
     def test_empty_block_keeps_the_recipe_defaults(self):
         cfg = BackendConfig(te_nvfp4={}, experts="te", dispatcher="deepep")
-        assert cfg.te_fp8 == TEFp8Config(recipe="nvfp4", nvfp4=TENvfp4Config())
-        assert cfg.te_fp8.nvfp4.recipe_kwargs() == {}
+        assert cfg.te_nvfp4 == TENvfp4Config()
 
-    def test_block_survives_a_copy_of_the_backend(self):
-        cfg = BackendConfig(te_nvfp4={"resident_weights": True}, experts="te", dispatcher="deepep")
-        copied = replace(cfg, gate_precision=torch.float32)
-        assert copied.te_fp8 == cfg.te_fp8
-        assert copied.te_fp8.resident_nvfp4_weights()
+    def test_te_quantization_is_te_fp8_when_that_block_is_set(self):
+        cfg = BackendConfig(te_fp8={"recipe": "block"}, experts="te", dispatcher="deepep")
+        assert cfg.te_nvfp4 is None
+        assert cfg.te_quantization is cfg.te_fp8
 
-    def test_block_and_te_fp8_together_are_rejected(self):
-        with pytest.raises(ValueError, match="te_nvfp4 and te_fp8 are mutually exclusive"):
-            BackendConfig(te_nvfp4={}, te_fp8={"recipe": "nvfp4"}, experts="te", dispatcher="deepep")
+    def test_te_nvfp4_and_te_fp8_together_are_rejected(self):
+        with pytest.raises(ValueError, match="te_fp8 and te_nvfp4 are mutually exclusive"):
+            BackendConfig(te_nvfp4={}, te_fp8={"recipe": "mxfp8"}, experts="te", dispatcher="deepep")
 
-    def test_block_requires_a_te_backend(self):
+    def test_te_nvfp4_requires_te_backend(self):
         with pytest.raises(ValueError, match="te_nvfp4 requires at least one TE backend"):
             BackendConfig(te_nvfp4={}, linear="torch", experts="torch")
 
-    def test_block_rejects_unsupported_options(self):
-        with pytest.raises(ValueError, match="NVFP4 option"):
+    def test_te_nvfp4_rejects_unsupported_options(self):
+        with pytest.raises(ValueError, match="te_nvfp4.backward"):
             BackendConfig(te_nvfp4={"backward": "float"}, experts="te", dispatcher="deepep")
 
 

@@ -802,9 +802,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         # Only the last PP stage needs targets for the loss function.
         targets = labels.clone() if self.pp.info.has_last_stage else None
 
-        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+        te_ctx = self.te_quantization.maybe_te_autocast() if self.te_quantization is not None else nullcontext()
 
-        with train_ctx(), fp8_ctx:
+        with train_ctx(), te_ctx:
             if separate_teacher_logits is not None:
                 self._current_teacher_logits = list(
                     torch.split(separate_teacher_logits, self.pipeline_config.pp_microbatch_size, dim=0)

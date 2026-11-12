@@ -38,19 +38,19 @@ EXPERTS, DIM, INTER, ROWS = 4, 64, 32, 128
 SHAPES = [(64, 32), (128, 64)]
 
 
-def _backend(recipe: str = "nvfp4", resident: bool = True, row_scaled_forward: bool = False) -> BackendConfig:
-    te_fp8: dict[str, str | dict[str, bool | str]] = {"recipe": recipe}
-    if recipe == "nvfp4":
-        te_fp8["nvfp4"] = {
-            "random_hadamard_transform": False,
-            "stochastic_rounding": False,
-            "weight_blocks_2d": False,
-            "resident_weights": resident,
-        }
-        if row_scaled_forward:
-            # Row-scaled four-over-six activations; the weight gradient then needs a floating-point backward.
-            te_fp8["nvfp4"].update(row_scaled_activation=True, four_over_six="activations", backward="high_precision")
-    return BackendConfig(attn="sdpa", linear="te", rms_norm="torch", experts="te", dispatcher="deepep", te_fp8=te_fp8)
+def _backend(resident: bool = True, row_scaled_forward: bool = False) -> BackendConfig:
+    te_nvfp4: dict[str, bool | str] = {
+        "random_hadamard_transform": False,
+        "stochastic_rounding": False,
+        "weight_blocks_2d": False,
+        "resident_weights": resident,
+    }
+    if row_scaled_forward:
+        # Row-scaled four-over-six activations; the weight gradient then needs a floating-point backward.
+        te_nvfp4.update(row_scaled_activation=True, four_over_six="activations", backward="high_precision")
+    return BackendConfig(
+        attn="sdpa", linear="te", rms_norm="torch", experts="te", dispatcher="deepep", te_nvfp4=te_nvfp4
+    )
 
 
 def _config(dim: int = DIM, inter: int = INTER) -> MoEConfig:
@@ -104,8 +104,8 @@ def _loaded(
 
 
 def _gate_up(experts: GroupedExpertsTENVFP4, x: torch.Tensor) -> torch.Tensor:
-    assert experts.te_fp8 is not None
-    with te.autocast(enabled=True, recipe=experts.te_fp8.build_recipe()):
+    assert experts.te_nvfp4 is not None
+    with te.autocast(enabled=True, recipe=experts.te_nvfp4.build_recipe()):
         return experts.gate_up_linear(x, [ROWS] * EXPERTS)
 
 
@@ -235,6 +235,8 @@ def test_several_row_scales_in_one_expert_are_rejected() -> None:
         experts.load_state_dict(state, strict=False)
 
 
-def test_another_recipe_is_rejected() -> None:
-    with pytest.raises(NotImplementedError, match="te_fp8.recipe='nvfp4'"):
-        GroupedExpertsTENVFP4(_config(), backend=_backend("mxfp8"), dispatcher_backend="deepep")
+def test_a_backend_without_te_nvfp4_is_rejected() -> None:
+    backend = BackendConfig(experts="te", dispatcher="deepep", te_fp8={"recipe": "mxfp8"})
+
+    with pytest.raises(NotImplementedError, match="te_nvfp4 backend block"):
+        GroupedExpertsTENVFP4(_config(), backend=backend, dispatcher_backend="deepep")

@@ -839,8 +839,8 @@ class MoE(nn.Module):
                 )
             else:
                 # All other expert backends use the TE grouped implementation; with
-                # te_fp8.nvfp4.resident_weights its weights are NVFP4 tensors.
-                resident = backend.te_fp8 is not None and backend.te_fp8.resident_nvfp4_weights()
+                # te_nvfp4.resident_weights its weights are NVFP4 tensors.
+                resident = backend.te_nvfp4 is not None and backend.te_nvfp4.resident_weights
                 experts_cls = GroupedExpertsTENVFP4 if resident else GroupedExpertsTE
                 self.experts = experts_cls(
                     config,

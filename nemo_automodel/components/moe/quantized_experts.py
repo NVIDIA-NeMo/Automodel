@@ -44,7 +44,6 @@ from nemo_automodel.components.moe.experts import (
     GroupedExpertsDeepEP,
     GroupedExpertsTE,
     _apply_bias,
-    _ChunkedGroupedLinear,
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.components.quantization.mxfp4 import (
@@ -887,7 +886,7 @@ class GroupedExpertsDeepEPNVFP4(NVFP4ExpertStorageMixin, GroupedExpertsDeepEP):
 class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
     """Transformer Engine experts whose weights are NVFP4 tensors, loaded from an NVFP4 checkpoint as they are.
 
-    Selected by ``te_fp8.nvfp4.resident_weights``. The packed codes, E4M3 block scales and row scales of this
+    Selected by ``te_nvfp4.resident_weights``. The packed codes, E4M3 block scales and row scales of this
     rank's experts are parameters with the names and layout of ``NVFP4ExpertStorageMixin``, so the model's
     state-dict adapter fills them from an NVFP4 checkpoint without quantizing anything and saves them the same
     way. Once loaded, every expert weight is a Transformer Engine ``NVFP4Tensor`` parameter whose row-wise
@@ -917,8 +916,8 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
         dispatcher_async_dispatch: bool = False,
     ) -> None:
         """Create the projections and the packed placeholders; the arguments are those of ``GroupedExpertsTE``."""
-        if backend is None or backend.te_fp8 is None or not backend.te_fp8.uses_nvfp4():
-            raise NotImplementedError("NVFP4 expert weights require te_fp8.recipe='nvfp4'.")
+        if backend is None or backend.te_nvfp4 is None:
+            raise NotImplementedError("NVFP4 expert weights require the te_nvfp4 backend block.")
         if backend.te_grouped_tensor:
             raise NotImplementedError("NVFP4 expert weights require te_grouped_tensor=False.")
         if config.expert_bias:
@@ -947,14 +946,13 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
             return
         import transformer_engine.pytorch as te
 
-        assert self.te_fp8 is not None
+        assert self.te_nvfp4 is not None
         # Inside quantized_model_init the projections expect NVFP4Tensor weights and never quantize them.
-        with te.quantized_model_init(enabled=True, recipe=self.te_fp8.build_recipe()):
+        with te.quantized_model_init(enabled=True, recipe=self.te_nvfp4.build_recipe()):
             super()._init_grouped_layers(num_local_experts)
         for linear in (self.gate_up_linear, self.down_linear):
             for index in range(num_local_experts):
-                owner, local = self._weight_owner(linear, index)
-                del owner._parameters[f"weight{local}"]
+                del linear._parameters[f"weight{index}"]
         cfg = self.config
         gate_up_out = cfg.moe_inter_dim * 2 if self.is_gated else cfg.moe_inter_dim
         dims = {"gate_and_up_projs": (gate_up_out, cfg.expert_dim), "down_projs": (cfg.expert_dim, cfg.moe_inter_dim)}
@@ -976,14 +974,7 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
             _preserve_packed_storage_dtypes(self, (packed_name, scales_name, global_name))
         self._te_weights_built = False
 
-    @staticmethod
-    def _weight_owner(linear: "GroupedLinear | _ChunkedGroupedLinear", index: int) -> tuple["GroupedLinear", int]:
-        """Return the Transformer Engine module holding local expert ``index`` and the expert's index in it."""
-        if isinstance(linear, _ChunkedGroupedLinear):
-            return linear.locate(index)
-        return linear, index
-
-    def _projections(self) -> tuple[tuple[str, "GroupedLinear | _ChunkedGroupedLinear"], ...]:
+    def _projections(self) -> tuple[tuple[str, "GroupedLinear"], ...]:
         """Packed base name and Transformer Engine module of both projections."""
         return (("gate_and_up_projs", self.gate_up_linear), ("down_projs", self.down_linear))
 
@@ -1013,13 +1004,12 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
                         "has one outer scale; projections fused from tensors with different scales need "
                         "backend.experts='torch_mm'."
                     )
-                owner, local = self._weight_owner(linear, index)
-                quantizer = owner._get_weight_quantizers()[local]
+                quantizer = linear._get_weight_quantizers()[index]
                 quantizer.set_usage(rowwise=True, columnwise=True)
                 dequantized = dequantize_nvfp4(packed[index], scales[index], row_scale[index], self.config.dtype)
                 parameter = nn.Parameter(quantizer(dequantized), requires_grad=self._weights_trainable)
-                owner.register_parameter(f"weight{local}", parameter)
-                weight = getattr(owner, f"weight{local}")
+                linear.register_parameter(f"weight{index}", parameter)
+                weight = getattr(linear, f"weight{index}")
                 block_scales = scales[index].view(torch.uint8)
                 stored_scales = weight._rowwise_scale_inv
                 rows, blocks = block_scales.shape
@@ -1061,8 +1051,7 @@ class GroupedExpertsTENVFP4(NVFP4ExpertStorageMixin, GroupedExpertsTE):
             row_scale = getattr(self, global_name).data
             amax = torch.empty_like(self._built_amax[name])
             for index in range(linear.num_gemms):
-                owner, local = self._weight_owner(linear, index)
-                weight = getattr(owner, f"weight{local}")
+                weight = getattr(linear, f"weight{index}")
                 if weight._rowwise_data.data_ptr() != packed[index].data_ptr():
                     packed[index].copy_(weight._rowwise_data)
                 block_scales = scales[index].view(torch.uint8)
@@ -1191,7 +1180,7 @@ def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:
     ``GroupedExperts`` and ``GroupedExpertsDeepEP`` modules are replaced in place.
     Transformer Engine experts are rejected: this conversion implements the ``torch_mm`` experts
     backend (torch, DeepEP or HybridEP dispatch) only. Transformer Engine experts hold NVFP4 weights
-    when the model is built with ``te_fp8.nvfp4.resident_weights``; those are left as they are.
+    when the model is built with ``te_nvfp4.resident_weights``; those are left as they are.
 
     Meta experts receive packed placeholders for direct checkpoint loading, and
     their model state-dict adapter must opt into the NVFP4 expert storage format.
@@ -1213,7 +1202,7 @@ def apply_nvfp4_to_moe_experts(model: nn.Module) -> nn.Module:
     if unsupported:
         raise NotImplementedError(
             "expert_weight_format='nvfp4' does not convert Transformer Engine expert modules; use "
-            "backend.experts='torch_mm', or build the model with te_fp8.nvfp4.resident_weights=True "
+            "backend.experts='torch_mm', or build the model with te_nvfp4.resident_weights=True "
             f"(modules: {unsupported[:3]})."
         )
 

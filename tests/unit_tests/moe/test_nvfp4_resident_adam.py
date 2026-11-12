@@ -68,7 +68,7 @@ def _experts(state: dict[str, torch.Tensor], weight_blocks_2d: bool = True) -> G
         rms_norm="torch",
         experts="te",
         dispatcher="deepep",
-        te_fp8={"recipe": "nvfp4", "nvfp4": {"weight_blocks_2d": weight_blocks_2d, "resident_weights": True}},
+        te_nvfp4={"weight_blocks_2d": weight_blocks_2d, "resident_weights": True},
     )
     config = MoEConfig(
         n_routed_experts=EXPERTS,
