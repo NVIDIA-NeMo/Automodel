@@ -21,7 +21,10 @@ import pytest
 import torch
 from PIL import Image
 
-from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+from nemo_automodel.components.datasets.vlm.collate_fns import (
+    neat_packed_vlm_collater,
+    packed_sequence_thd_vlm_collater,
+)
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     NeatPackConfig,
     _build_packed_vlm_sample,
@@ -32,6 +35,15 @@ from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     neat_pack_dataset_vlm,
 )
 from nemo_automodel.components.models.common.packing import get_packing_capabilities
+
+
+def test_estimate_sample_length_uses_exact_pretokenized_length():
+    sample = {
+        "input_ids": torch.arange(17),
+        "messages": [{"role": "user", "content": "character heuristic must not be used"}],
+    }
+    estimate = _estimate_sample_length(sample)
+    assert (estimate.total_tokens, estimate.media_tokens) == (17, 0)
 
 
 class _FakeDataset:
@@ -197,6 +209,23 @@ class TestBuildPackedVlmSample:
         assert result["seq_lens"] == [3, 2]
         assert result["seq_lens_padded"] == [4, 4]
         assert result["position_ids"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+
+    def test_thd_collater_preserves_document_boundaries(self):
+        packed = _build_packed_vlm_sample(
+            [
+                {"input_ids": torch.tensor([1, 2, 3]), "labels": torch.tensor([11, 12, 13])},
+                {"input_ids": torch.tensor([4, 5]), "labels": torch.tensor([14, 15])},
+            ],
+            pack_size=8,
+            padding_idx=0,
+        )
+
+        batch = packed_sequence_thd_vlm_collater([packed], padding_idx=0, max_length=8)
+
+        assert batch["qkv_format"] == "thd"
+        assert batch["seq_lens"].tolist() == [[3, 2]]
+        assert batch["seq_lens_padded"].tolist() == [[3, 5]]
+        assert batch["position_ids"][0, :5].tolist() == [0, 1, 2, 0, 1]
 
 
 class TestNeatPackDatasetVlm:
