@@ -168,31 +168,24 @@ class TestBenchmarkingRecipeInitialization:
     """Test initialization of BenchmarkingRecipeForNextTokenPrediction."""
 
     @pytest.mark.cpu_only
-    @pytest.mark.parametrize("rank", [0, 1])
-    def test_init_warns_about_migration_on_rank_zero(
+    def test_init_warns_about_migration(
         self,
         mock_config: ConfigNamespace,
-        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        rank: int,
     ) -> None:
-        """Direct construction explains the migration once per distributed job."""
-        monkeypatch.setenv("RANK", str(rank))
+        """Direct construction explains how to launch the canonical benchmark workload."""
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
             recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
 
         notices = [record.getMessage() for record in caplog.records if "is deprecated" in record.getMessage()]
         assert recipe._bench_steps == mock_config.step_scheduler.max_steps
-        if rank != 0:
-            assert notices == []
-            return
         assert len(notices) == 1
         for instruction in (
             "BenchmarkingRecipeForNextTokenPrediction is deprecated",
             "TrainFinetuneRecipeForNextTokenPrediction",
             "examples/llm_pretrain",
             "examples/llm_finetune",
-            "automodel <canonical-config.yaml>",
+            "automodel <canonical-config.yaml> --benchmark",
             "ci.perf_testing",
             "examples/llm_benchmark/README.md",
             "https://github.com/NVIDIA-NeMo/Automodel/pull/4637",

@@ -19,7 +19,7 @@ import pathlib
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit, get_rank_safe
+from nemo_automodel.components.distributed.init_utils import get_local_rank_preinit
 from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
 from nemo_automodel.components.training.timers import Timers
 from nemo_automodel.components.training.utils import (
@@ -119,16 +119,15 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         Args:
             cfg: Configuration dictionary/object for benchmarking.
         """
-        if get_rank_safe() == 0:
-            logger.warning(
-                "BenchmarkingRecipeForNextTokenPrediction is deprecated. Use "
-                "TrainFinetuneRecipeForNextTokenPrediction with the corresponding YAML in "
-                "examples/llm_pretrain or examples/llm_finetune and launch it with "
-                "`automodel <canonical-config.yaml> --nproc-per-node <gpus-per-node>`. "
-                "Keep runtime tuning in that canonical YAML; use ci.perf_testing for Core Models performance runs. "
-                "See examples/llm_benchmark/README.md for recipe mappings and "
-                "https://github.com/NVIDIA-NeMo/Automodel/pull/4637 for the migration."
-            )
+        logger.warning(
+            "BenchmarkingRecipeForNextTokenPrediction is deprecated. Use "
+            "TrainFinetuneRecipeForNextTokenPrediction with the corresponding YAML in "
+            "examples/llm_pretrain or examples/llm_finetune and launch it with "
+            "`automodel <canonical-config.yaml> --benchmark --nproc-per-node <gpus-per-node>`. "
+            "Keep runtime tuning in that canonical YAML; use ci.perf_testing for Core Models performance runs. "
+            "See examples/llm_benchmark/README.md for recipe mappings and "
+            "https://github.com/NVIDIA-NeMo/Automodel/pull/4637 for the migration."
+        )
         # Store benchmarking-specific parameters from benchmark section
         bench_cfg = cfg.benchmark
         self._bench_warmup_steps = bench_cfg.warmup_steps

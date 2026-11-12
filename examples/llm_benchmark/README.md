@@ -8,6 +8,28 @@ not permit another copy of the model, data, batches, parallelism or optimizer.
 Balanced-gate results must be labeled: they remove routing imbalance and are not
 measurements of learned routing.
 
+To benchmark a mapped canonical recipe directly, add `--benchmark`:
+
+```bash
+automodel examples/llm_pretrain/qwen/qwen3_moe_30b_te_deepep.yaml \
+  --benchmark --nproc-per-node 8
+```
+
+The flag applies `ci.perf_testing.fake_balanced_gate` when specified, disables
+checkpoint saving, and defaults to 50 steps with no epoch limit. Validation is
+disabled unless `ci.perf_testing.validation: true` retains the recipe's cadence.
+Explicit CLI settings take precedence; for example, add
+`--step_scheduler.max_steps 100` for a longer run. Model, dataset, batch,
+parallelism and optimizer settings continue to come from the canonical YAML.
+The `schedule` and `time` metadata do not submit or resize a local job.
+
+The same flag works with external `torchrun`, including Slurm jobs:
+
+```bash
+torchrun --standalone --nproc-per-node=8 -m nemo_automodel.cli.app \
+  examples/llm_pretrain/qwen/qwen3_moe_30b_te_deepep.yaml --benchmark
+```
+
 Performance CI skips validation by default. Set `ci.perf_testing.validation: true`
 to retain the canonical recipe's periodic and checkpoint-triggered validation
 cadence. Checkpoint saving remains disabled for performance runs.
