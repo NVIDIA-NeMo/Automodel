@@ -206,7 +206,11 @@ def local_weight_rows(weight: Tensor) -> tuple[Tensor, int]:
 
 
 class _AccumulateSketch(torch.autograd.Function):
-    """Keep projected activations in autograd-managed storage, freed after backward."""
+    """Keep projected activations in autograd-managed storage, freed after backward.
+
+    The output is returned without a copy, so outputs of sketched linear layers must not be modified
+    in place; a violation fails loudly at forward time.
+    """
 
     @staticmethod
     def forward(ctx: Any, output: Tensor, projected: Tensor, sketch: Tensor) -> Tensor:  # type: ignore[override]
@@ -294,8 +298,11 @@ class SketchState:
 
     def forward_hook(self, module: nn.Module, inputs: tuple[Tensor, ...], output: Tensor) -> Tensor | None:
         """Project the layer input and register the sketch accumulation for backward."""
-        if not torch.is_grad_enabled() or not output.requires_grad:
+        if not torch.is_grad_enabled():
             return None
+        if not output.requires_grad:
+            # Frozen input and weight: the output is a leaf, so make it carry the backward hook.
+            output.requires_grad_(True)
         with torch.no_grad():
             activation = inputs[0]
             projected = activation.reshape(-1, activation.shape[-1]) @ self.projection_as(activation.dtype).T
@@ -360,6 +367,8 @@ def install_sketches(model: nn.Module, settings: SketchSettings) -> list[SketchS
     Linear targets accumulate sketches directly in backward. Fused experts keep their
     forward implementation and project the transient backward gradient. Target weights
     get ``requires_grad=False`` so autograd never allocates their dense gradient.
+
+    Outputs of sketched linear layers must not be modified in place; a violation fails loudly at forward time.
     """
     targets = select_sketch_targets(model, settings)
     weights: list[Tensor] = []

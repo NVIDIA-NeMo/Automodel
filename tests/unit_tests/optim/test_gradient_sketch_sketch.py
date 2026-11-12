@@ -135,3 +135,15 @@ def test_fused_expert_parameter_is_sketched_without_dense_grad():
     expected = dense.up.grad.reshape(-1, 4) @ states[0].projection.T
     torch.testing.assert_close(states[0].sketch, expected)
     assert sketched.up.grad is None and states[0].swapped_weight is None
+
+
+def test_sketch_accumulates_when_target_output_has_no_grad():
+    torch.manual_seed(4)
+    dense = nn.Sequential(nn.Linear(7, 5, bias=False), nn.Tanh(), nn.Linear(5, 3))
+    sketched = copy.deepcopy(dense)
+    states = install_sketches(sketched, SketchSettings(rank=3, target_modules=("0",)))
+    x = torch.randn(6, 7)
+    dense(x).square().sum().backward()
+    sketched(x).square().sum().backward()
+    assert states[0].sketch.abs().sum() > 0
+    torch.testing.assert_close(states[0].sketch, dense[0].weight.grad @ states[0].projection.T)
