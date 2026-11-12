@@ -353,6 +353,25 @@ def test_apply_tokenizer_chat_template_full_loss_mask():
     assert all(v == 1 for v in out["attention_mask"])
 
 
+def test_apply_tokenizer_chat_template_generation_kwd_honors_answer_only_loss_mask_false():
+    tok = _StubTokenizerChat()
+    messages = [
+        {"role": "system", "content": "ctx"},
+        {"role": "user", "content": "Q?"},
+        {"role": "assistant", "content": "A."},
+    ]
+    out = format_chat_template(
+        tok,
+        formatted_text=messages,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=False,
+    )
+    # No token is masked: the labels are the input ids shifted by one.
+    assert -100 not in out["labels"]
+    assert out["labels"] == out["input_ids"][1:] + [tok.eos_token_id]
+
+
 def test_apply_chat_template_can_mask_reasoning_content_generation_kwd():
     tok = _StubTokenizerChatWithReasoning()
     messages = [
