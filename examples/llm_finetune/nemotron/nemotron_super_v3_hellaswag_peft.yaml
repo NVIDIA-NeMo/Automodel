@@ -142,6 +142,10 @@ ci:
   recipe_owner: adil-a
   time: "00:40:00"  #PR4637: "00:30:00"
   checkpoint_robustness:
+    # DP64 x local batch 2: retain five complete global batches after packing.
+    step_scheduler.global_batch_size: 128  #PR4637: 32
+    step_scheduler.local_batch_size: 2
+    packed_sequence.max_packs: 640
     experts_implementation: grouped_mm
     trust_remote_code: true
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
@@ -153,7 +157,8 @@ ci:
     # Vanilla Transformers intentionally omits the training-only MTP modules.
     # Exact-match every adapter tensor it can instantiate and allow only MTP keys.
     hf_adapter_ignored_key_prefix: "base_model.model.mtp."
-    dataset.limit_dataset_samples: 500
+    # Bound packed sequences rather than source examples, which shrink during packing.
+    dataset.limit_dataset_samples: null  #PR4637: 500
     validation_dataset.limit_dataset_samples: 500
 
 # wandb:
