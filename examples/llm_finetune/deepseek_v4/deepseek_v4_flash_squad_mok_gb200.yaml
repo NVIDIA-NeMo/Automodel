@@ -125,7 +125,7 @@ prewarm:
 ci:
   cluster_tag: gb200
   # ep_size(32) = 32 GPUs => 8 nodes (4 GB200/node).
-  recipe_owner: hemildesai
+  recipe_owner: akoumpa
   nodes: 8
   # Cold multi-node start + TileLang JIT runs past the 00:10:00 default.
   time: "00:45:00"

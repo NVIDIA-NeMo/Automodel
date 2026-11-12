@@ -116,7 +116,7 @@ optimizer:
 
 ci:
   cluster_tag: gb200
-  recipe_owner: hemildesai
+  recipe_owner: akoumpa
   local_batch_size: 4
   nodes: 8
   time: "00:40:00"

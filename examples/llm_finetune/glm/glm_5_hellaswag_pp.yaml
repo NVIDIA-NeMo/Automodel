@@ -113,7 +113,7 @@ optimizer:
 
 ci:
   cluster_tag: h100
-  recipe_owner: hemildesai
+  recipe_owner: akoumpa
   nodes: 128
   time: "00:45:00"
   env_vars:

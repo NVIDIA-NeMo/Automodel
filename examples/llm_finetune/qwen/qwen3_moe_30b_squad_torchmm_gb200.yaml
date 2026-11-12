@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # GB200 real-data training variant; runtime tuning migrated from
-# examples/llm_benchmark/qwen/qwen3_moe_30b_te_bf16_gb200.yaml
+# examples/llm_benchmark/qwen/qwen3_moe_30b_torchmm_gb200.yaml
 # Run with --nproc-per-node 4 and --nnodes 2. GPU validation is pending.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -35,7 +35,7 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: false # THD fused RoPE has documented NaN gradients; use the existing packed-recipe setting.
-    experts: te  # WAVE 11: TE GroupedLinear bf16 (no fp8); vs torch_mm
+    experts: torch_mm  # WAVE 11: native torch._grouped_mm bf16 backend
     dispatcher: hybridep  # GB200: deepep fails EP-buffer init ('invalid resource handle')
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
@@ -114,10 +114,9 @@ optimizer:
 #   name: <your_wandb_exp_name>
 #   save_dir: <your_wandb_save_dir>
 
-  foreach: false
 ci:
   cluster_tag: gb200
-  recipe_owner: hemildesai
+  recipe_owner: akoumpa
   node_multiplier: true
   # The full 2K source/reload matrix completes inside 20 minutes, but the
   # default native-resume phase needs additional setup and continuation time.

@@ -118,7 +118,7 @@ optimizer:
   foreach: false
 ci:
   cluster_tag: gb200
-  recipe_owner: hemildesai
+  recipe_owner: akoumpa
   node_multiplier: true
   # The full 2K source/reload matrix completes inside 20 minutes, but the
   # default native-resume phase needs additional setup and continuation time.

@@ -109,7 +109,7 @@ packed_sequence:
   packing_strategy: neat
 ci:
   cluster_tag: h100
-  recipe_owner: hemildesai
+  recipe_owner: akoumpa
   time: "01:00:00"
   known_issue_id: AM-648
   allow_failure: true

@@ -120,8 +120,9 @@ pretrained initialization and learning hyperparameters, including the
 optimizer algorithm and weight decay. They now match the benchmark's loss
 implementation/precision, LoRA rank and options, optimizer execution settings,
 garbage-collection interval, parallelism and batch sizes. The former Qwen32B mock
-example and the migrated HellaSwag recipes now use real SQuAD. Historical
-`hellaswag` filenames remain stable for CI references. Sample limits use
+example and the migrated HellaSwag recipes now use real SQuAD. Existing
+`hellaswag` filenames remain stable for CI references; newly added SQuAD recipes
+use `squad` filenames. Sample limits use
 `limit_dataset_samples`; the deprecated `num_samples_limit` spelling is retired
 from these configs. These shorter or packed supervised inputs still define a
 different workload from full-length pretraining, so report both token throughput
@@ -170,18 +171,18 @@ Other recorded differences:
 | [qwen/qwen3_next_te_deepep.yaml](qwen/qwen3_next_te_deepep.yaml) | [qwen/qwen3_next_te_deepep.yaml](../llm_finetune/qwen/qwen3_next_te_deepep.yaml) |
 | [step/step_3.5_flash_te_deepep.yaml](step/step_3.5_flash_te_deepep.yaml) | [stepfun/step_3.5_flash_hellaswag_pp.yaml](../llm_finetune/stepfun/step_3.5_flash_hellaswag_pp.yaml) |
 | [step/step_5_preview_full92_mock_h100.yaml](step/step_5_preview_full92_mock_h100.yaml) | [stepfun/step_5_preview_tulu3_sft.yaml](../llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml) |
-| [deepseek/deepseek_v4_flash_mok_32gpu.yaml](deepseek/deepseek_v4_flash_mok_32gpu.yaml) | [deepseek_v4/deepseek_v4_flash_hellaswag_mok_gb200.yaml](../llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_mok_gb200.yaml) |
-| [glm/glm_4.7_flash_mok_4gpu.yaml](glm/glm_4.7_flash_mok_4gpu.yaml) | [glm/glm_4.7_flash_hellaswag_mok_gb200.yaml](../llm_finetune/glm/glm_4.7_flash_hellaswag_mok_gb200.yaml) |
+| [deepseek/deepseek_v4_flash_mok_32gpu.yaml](deepseek/deepseek_v4_flash_mok_32gpu.yaml) | [deepseek_v4/deepseek_v4_flash_squad_mok_gb200.yaml](../llm_finetune/deepseek_v4/deepseek_v4_flash_squad_mok_gb200.yaml) |
+| [glm/glm_4.7_flash_mok_4gpu.yaml](glm/glm_4.7_flash_mok_4gpu.yaml) | [glm/glm_4.7_flash_squad_mok_gb200.yaml](../llm_finetune/glm/glm_4.7_flash_squad_mok_gb200.yaml) |
 | [gpt_oss/gptoss_120b_te_deepep_gb200.yaml](gpt_oss/gptoss_120b_te_deepep_gb200.yaml) | [gpt_oss/gpt_oss_120b_te_deepep_gb200.yaml](../llm_finetune/gpt_oss/gpt_oss_120b_te_deepep_gb200.yaml) |
 | [gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml](gpt_oss/gptoss_120b_te_mxfp8_gb200.yaml) | [gpt_oss/gpt_oss_120b_te_mxfp8_gb200.yaml](../llm_finetune/gpt_oss/gpt_oss_120b_te_mxfp8_gb200.yaml) |
 | [kimi/kimi_k3_gb200.yaml](kimi/kimi_k3_gb200.yaml) | [kimi/k3_hellaswag.yaml](../llm_finetune/kimi/k3_hellaswag.yaml) |
-| [kimi/kimi_k3_gb200_2k.yaml](kimi/kimi_k3_gb200_2k.yaml) | [kimi/k3_hellaswag_te_torchmm_gb200.yaml](../llm_finetune/kimi/k3_hellaswag_te_torchmm_gb200.yaml) |
-| [nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml](nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml) | [nemotron/nemotron_super_v3_hellaswag_te_hybridep_gb200.yaml](../llm_finetune/nemotron/nemotron_super_v3_hellaswag_te_hybridep_gb200.yaml) |
-| [qwen/qwen3_moe_30b_compile_attn_gb200.yaml](qwen/qwen3_moe_30b_compile_attn_gb200.yaml) | [qwen/qwen3_moe_30b_hellaswag_compile_attn_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_hellaswag_compile_attn_gb200.yaml) |
-| [qwen/qwen3_moe_30b_te_bf16_gb200.yaml](qwen/qwen3_moe_30b_te_bf16_gb200.yaml) | [qwen/qwen3_moe_30b_hellaswag_te_bf16_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_hellaswag_te_bf16_gb200.yaml) |
-| [qwen/qwen3_moe_30b_te_deepep_gb200.yaml](qwen/qwen3_moe_30b_te_deepep_gb200.yaml) | [qwen/qwen3_moe_30b_hellaswag_te_deepep_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_hellaswag_te_deepep_gb200.yaml) |
+| [kimi/kimi_k3_gb200_2k.yaml](kimi/kimi_k3_gb200_2k.yaml) | [kimi/k3_squad_te_torchmm_gb200.yaml](../llm_finetune/kimi/k3_squad_te_torchmm_gb200.yaml) |
+| [nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml](nemotron/nemotron_super_v3_te_hybridep_8k_ep16_gb200.yaml) | [nemotron/nemotron_super_v3_squad_te_hybridep_gb200.yaml](../llm_finetune/nemotron/nemotron_super_v3_squad_te_hybridep_gb200.yaml) |
+| [qwen/qwen3_moe_30b_compile_attn_gb200.yaml](qwen/qwen3_moe_30b_compile_attn_gb200.yaml) | [qwen/qwen3_moe_30b_squad_compile_attn_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_squad_compile_attn_gb200.yaml) |
+| [qwen/qwen3_moe_30b_te_bf16_gb200.yaml](qwen/qwen3_moe_30b_te_bf16_gb200.yaml) | [qwen/qwen3_moe_30b_squad_te_bf16_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_squad_te_bf16_gb200.yaml) |
+| [qwen/qwen3_moe_30b_te_deepep_gb200.yaml](qwen/qwen3_moe_30b_te_deepep_gb200.yaml) | [qwen/qwen3_moe_30b_squad_te_deepep_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_squad_te_deepep_gb200.yaml) |
 | [qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml](qwen/qwen3_moe_30b_te_mxfp8_gb200.yaml) | [qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_te_hybridep_mxfp8_gb200.yaml) |
-| [qwen/qwen3_moe_30b_torchmm_gb200.yaml](qwen/qwen3_moe_30b_torchmm_gb200.yaml) | [qwen/qwen3_moe_30b_hellaswag_torchmm_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_hellaswag_torchmm_gb200.yaml) |
+| [qwen/qwen3_moe_30b_torchmm_gb200.yaml](qwen/qwen3_moe_30b_torchmm_gb200.yaml) | [qwen/qwen3_moe_30b_squad_torchmm_gb200.yaml](../llm_finetune/qwen/qwen3_moe_30b_squad_torchmm_gb200.yaml) |
 
 ## Interpreting throughput
 

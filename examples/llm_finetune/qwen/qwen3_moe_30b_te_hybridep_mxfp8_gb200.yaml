@@ -129,7 +129,7 @@ optimizer:
 ci:
   cluster_tag: gb200
   nodes: 2
-  recipe_owner: hemildesai
+  recipe_owner: akoumpa
   nproc_per_node: 4
   perf_testing:
     fake_balanced_gate: true

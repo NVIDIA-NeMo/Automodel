@@ -163,7 +163,7 @@ prewarm:
 ci:
   cluster_tag: h100
   # pp_size(2) * ep_size(32) = 64 GPUs => 8 nodes (8 H100/node).
-  recipe_owner: hemildesai
+  recipe_owner: akoumpa
   nodes: 8
   # Cold multi-node start + TileLang JIT runs past the 00:10:00 default.
   time: "00:30:00"
