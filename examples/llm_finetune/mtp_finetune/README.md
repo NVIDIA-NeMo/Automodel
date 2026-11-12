@@ -67,7 +67,7 @@ draft the next tokens from them. All other tokens use the frozen base weights,
 so the model's own next-token distribution is unchanged and it verifies the
 drafts losslessly. The mask tokens' hidden states are fed to the same MTP loss
 and `val_mtp_tau_sim` metric as a native MTP head. `mtp.distillation_mode: soft`
-distills every depth towards the frozen base model's distribution, the
+distills every depth toward the frozen base model's distribution, the
 verifier at decode time:
 
 ```bash
