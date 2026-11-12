@@ -76,7 +76,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 128
+  limit_dataset_samples: 128
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -100,5 +100,5 @@ ci:
     tokenizer_name: Qwen/Qwen3-30B-A3B
     trust_remote_code: true
     hf_device_map_auto: true
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500
