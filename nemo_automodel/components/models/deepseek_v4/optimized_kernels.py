@@ -17,11 +17,8 @@
 The torch implementations below are kept as the numerical reference.  Optional
 TileLang-backed paths are sourced from:
 
-* Sinkhorn: imported from DeepSeek TileKernels
-  ``tile_kernels.modeling.mhc.ops.sinkhorn_normalize``.  No TileKernels source
-  is vendored in AutoModel.  Upstream source:
-  https://github.com/deepseek-ai/TileKernels/blob/36d9e45d38e204ebb87e6f6e833821eee0482fe5/tile_kernels/modeling/mhc/ops/sinkhorn.py
-  Upstream license: MIT, copyright 2026 DeepSeek.
+* Sinkhorn: ``nemo_automodel.components.models.common.sinkhorn`` (DeepSeek
+  TileKernels, not vendored).
 * Sparse attention and indexer: vendored/adapted Miles DeepSeek V4 ops in
   ``nemo_automodel.components.models.deepseek_v4.kernels``.  Upstream source:
   https://github.com/yueming-yuan/miles/tree/e561465d0b9bbf06188b7a5e2020dc7fd691f732/miles_plugins/models/deepseek_v4/ops
@@ -40,6 +37,11 @@ from typing import Literal
 
 import torch
 
+from nemo_automodel.components.models.common.sinkhorn import (
+    is_tile_kernels_sinkhorn_available,
+    sinkhorn_normalize_tile_kernels,
+    sinkhorn_normalize_torch,
+)
 from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
 
@@ -47,21 +49,6 @@ Dsv4SparseAttentionBackend = Literal["torch", "sparse_torch", "tilelang", "cudnn
 Dsv4IndexerBackend = Literal["torch", "tilelang", "auto"]
 Dsv4SinkhornBackend = Literal["torch", "tilelang", "auto"]
 
-_HAS_TILE_KERNELS_SINKHORN, _tile_kernels_sinkhorn = safe_import_from(
-    "tile_kernels.modeling.mhc.ops",
-    "sinkhorn_normalize",
-    msg="TileKernels sinkhorn is unavailable. Install tile_kernels and tilelang to use backend.attn='tilelang'.",
-)
-_HAS_TILE_KERNELS_SINKHORN_FWD, _tile_kernels_sinkhorn_fwd = safe_import_from(
-    "tile_kernels.mhc.sinkhorn_kernel",
-    "_mhc_sinkhorn_fwd",
-    msg="TileKernels low-level sinkhorn forward kernel is unavailable.",
-)
-_HAS_TILE_KERNELS_SINKHORN_BWD, _tile_kernels_sinkhorn_bwd = safe_import_from(
-    "tile_kernels.mhc.sinkhorn_kernel",
-    "_mhc_sinkhorn_bwd",
-    msg="TileKernels low-level sinkhorn backward kernel is unavailable.",
-)
 _HAS_MILES_SPARSE_ATTN, _miles_sparse_attn_tilelang = safe_import_from(
     "nemo_automodel.components.models.deepseek_v4.kernels.sparse_attention",
     "sparse_attn_tilelang",
@@ -93,7 +80,7 @@ _HAS_MILES_INDEXER_AUTOGRAD, _miles_v4_lighting_indexer = safe_import_from(
 def is_dsv4_kernel_available(name: Literal["sinkhorn", "sparse_attn", "indexer"]) -> bool:
     """Return whether the optional TileLang kernel package for ``name`` is importable."""
     if name == "sinkhorn":
-        return _HAS_TILE_KERNELS_SINKHORN and _HAS_TILE_KERNELS_SINKHORN_FWD and _HAS_TILE_KERNELS_SINKHORN_BWD
+        return is_tile_kernels_sinkhorn_available()
     if name == "sparse_attn":
         return HAS_TILELANG and _HAS_MILES_SPARSE_ATTN
     if name == "indexer":
@@ -129,61 +116,6 @@ def _should_use_tilelang(
     return backend == "tilelang" or (backend == "auto" and can_run)
 
 
-def sinkhorn_normalize_torch(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
-    """Torch reference for TileKernels MHC Sinkhorn normalization."""
-    x = x.softmax(dim=-1) + eps
-    x = x / (x.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(repeat - 1):
-        x = x / (x.sum(dim=-1, keepdim=True) + eps)
-        x = x / (x.sum(dim=-2, keepdim=True) + eps)
-    return x
-
-
-class _Dsv4TileKernelsSinkhorn(torch.autograd.Function):
-    """TileKernels Sinkhorn wrapper that accepts non-contiguous backward gradients.
-
-    The upstream high-level wrapper launches the backward kernel with
-    ``grad_output`` as-is. DSV4 consumes HC combinations through transposed
-    matmul sites, so autograd can provide a transposed gradient layout. The
-    low-level TileKernels backward kernel requires contiguous row-major inputs.
-    """
-
-    @staticmethod
-    def forward(
-        ctx: torch.autograd.function.FunctionCtx,
-        x: torch.Tensor,
-        repeat: int,
-        eps: float,
-    ) -> torch.Tensor:
-        flat_x = x.contiguous().view(-1, *x.shape[-2:])
-        hidden_size = flat_x.shape[1]
-        flat_output = torch.empty_like(flat_x)
-        fwd_kernel = _tile_kernels_sinkhorn_fwd(hidden_size, 1, repeat, eps)
-        bwd_kernel = _tile_kernels_sinkhorn_bwd(hidden_size, 32, repeat, eps)
-        fwd_kernel(flat_x, flat_output)
-        ctx.save_for_backward(flat_x)
-        ctx.bwd_kernel = bwd_kernel
-        ctx.input_shape = x.shape
-        return flat_output.view_as(x)
-
-    @staticmethod
-    def backward(
-        ctx: torch.autograd.function.FunctionCtx,
-        grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None]:
-        (flat_x,) = ctx.saved_tensors
-        flat_grad_output = grad_output.contiguous().view_as(flat_x)
-        flat_grad_input = torch.empty_like(flat_x)
-        ctx.bwd_kernel(flat_grad_output, flat_x, flat_grad_input)
-        return flat_grad_input.view(ctx.input_shape), None, None
-
-
-def _tile_kernels_sinkhorn_contiguous_grad(x: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
-    if _HAS_TILE_KERNELS_SINKHORN_FWD and _HAS_TILE_KERNELS_SINKHORN_BWD:
-        return _Dsv4TileKernelsSinkhorn.apply(x, repeat, eps)
-    return _tile_kernels_sinkhorn(x.contiguous(), repeat=repeat, eps=eps)
-
-
 def dsv4_sinkhorn_normalize(
     x: torch.Tensor,
     *,
@@ -198,7 +130,7 @@ def dsv4_sinkhorn_normalize(
         kernel_name="sinkhorn",
         tensors=(x,),
     ):
-        return _tile_kernels_sinkhorn_contiguous_grad(x, repeat=repeat, eps=eps)
+        return sinkhorn_normalize_tile_kernels(x, repeat=repeat, eps=eps)
     return sinkhorn_normalize_torch(x, repeat=repeat, eps=eps)
 
 

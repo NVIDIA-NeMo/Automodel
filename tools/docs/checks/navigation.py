@@ -74,6 +74,11 @@ def _collect_fern_routes(
 
 def _model_size_key(hf_model_id: str) -> tuple[str, str]:
     (organization, model_name) = hf_model_id.split("/", 1)
+    # Distinct smaller models whose names would otherwise reduce to a sibling's size stem.
+    model_aliases = {("zai-org", "glm-5.3-flash"): "glm-5.3-flash"}
+    alias = model_aliases.get((organization.casefold(), model_name.casefold()))
+    if alias is not None:
+        return (organization.casefold(), alias)
     size_pattern = re.compile("(?i)(?:^|[-_])(?:A?\\d+(?:\\.\\d+)?[BMT])(?=$|[-_])")
     size_matches = list(size_pattern.finditer(model_name))
     if size_matches:
