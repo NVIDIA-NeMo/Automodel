@@ -62,7 +62,7 @@ gated_mtp:
 ```
 
 Every position in the batch is an anchor: one mask token per depth is appended
-after it, and a LoRA adapter that is only active on the mask tokens learns to
+after it, and a LoRA adapter that is active only on the mask tokens learns to
 draft the next tokens from them. All other tokens use the frozen base weights,
 so the model's own next-token distribution is unchanged and it verifies the
 drafts losslessly. The mask tokens' hidden states are fed to the same MTP loss
