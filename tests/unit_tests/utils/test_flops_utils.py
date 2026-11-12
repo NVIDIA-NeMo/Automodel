@@ -35,6 +35,7 @@ def _moonlight_16b_config() -> SimpleNamespace:
         v_head_dim=128,
         moe_intermediate_size=1408,
         num_experts_per_tok=6,
+        n_shared_experts=2,
         moe_layer_freq=[0] * 1 + [1] * 26,
         mtp_num_layers=0,
     )
@@ -227,7 +228,7 @@ def _nemotronh_super_v3_cfg() -> SimpleNamespace:
             flops_utils.deepseekv3_flops,
             _moonlight_16b_config,
             dict(gbs=1, seq_len=2048),
-            30625801175040,
+            33389612630016,
         ),
         (
             "deepseekv3_dsv3",
@@ -273,6 +274,25 @@ def test_gpt_oss_flops_uses_head_dim_from_hf_config():
     assert not hasattr(config, "kv_channels")
     assert config.head_dim != config.hidden_size // config.num_attention_heads
     assert int(flops_utils.gpt_oss_flops(config, gbs=1, seq_len=8)) == 271872
+
+
+def test_deepseekv3_flops_counts_every_shared_expert():
+    two_shared = _moonlight_16b_config()
+    one_shared = _moonlight_16b_config()
+    one_shared.n_shared_experts = 1
+    omitted = _moonlight_16b_config()
+    del omitted.n_shared_experts
+
+    seq_len = 2048
+    delta = flops_utils.deepseekv3_flops(two_shared, seq_len=seq_len) - flops_utils.deepseekv3_flops(
+        one_shared, seq_len=seq_len
+    )
+    # One extra gated shared expert in each of the 26 MoE layers.
+    assert delta == 6 * (2048 * 1408 * 3) * 26 * seq_len
+    # A config without the field keeps the single shared expert DeepSeek-V3 uses.
+    assert flops_utils.deepseekv3_flops(omitted, seq_len=seq_len) == flops_utils.deepseekv3_flops(
+        one_shared, seq_len=seq_len
+    )
 
 
 @pytest.mark.parametrize(
