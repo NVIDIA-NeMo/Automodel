@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.distributed.nn.functional as dist_nn_f
@@ -32,6 +33,11 @@ from nemo_automodel.components.moe.experts import (
     _permute_tokens_for_grouped_mm,
 )
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher
+
+LoraAInitMethod = Literal["xavier", "kaiming"]
 
 
 def _to_local(proj: torch.Tensor) -> torch.Tensor:
@@ -55,7 +61,7 @@ def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) ->
 
 
 @torch.no_grad
-def _init_stacked_lora_A(lora_A: torch.Tensor, init_method: str) -> None:
+def _init_stacked_lora_A(lora_A: torch.Tensor, init_method: LoraAInitMethod | str) -> None:
     """Initialize a stacked per-expert LoRA A tensor of shape ``[n_experts, in_features, rank]``.
 
     Every expert's ``[in_features, rank]`` slice is one LoRA A matrix and must be drawn
@@ -76,9 +82,11 @@ def _init_stacked_lora_A(lora_A: torch.Tensor, init_method: str) -> None:
     in_features, rank = lora_A.shape[1], lora_A.shape[2]
     if init_method == "xavier":
         lora_A.normal_(0.0, math.sqrt(2.0 / (in_features + rank)))
-    else:
+    elif init_method == "kaiming":
         bound = 1.0 / math.sqrt(in_features)
         lora_A.uniform_(-bound, bound)
+    else:
+        raise ValueError(f"expected init_method to be 'xavier' or 'kaiming', got {init_method!r}")
 
 
 class GroupedExpertsLoRA(GroupedExperts):
@@ -102,13 +110,19 @@ class GroupedExpertsLoRA(GroupedExperts):
     lora_gate_and_up_B: nn.Parameter
     lora_down_A: nn.Parameter
     lora_down_B: nn.Parameter
+    use_torch_mm: bool
+    expert_activation_grouped: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    gate_and_up_projs: nn.Parameter | DTensor
+    down_projs: nn.Parameter | DTensor
+    gate_up_proj_bias: nn.Parameter | DTensor | None
+    down_proj_bias: nn.Parameter | DTensor | None
 
     def __init__(
         self,
         orig_module: GroupedExperts,
         lora_dim: int = 8,
         alpha: int = 32,
-        lora_A_init_method: str = "xavier",
+        lora_A_init_method: LoraAInitMethod | str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
         # Build the wrapper without allocating another full set of expert weights.
@@ -139,7 +153,7 @@ class GroupedExpertsLoRA(GroupedExperts):
         obj: GroupedExpertsLoRA,
         lora_dim: int = 8,
         alpha: int = 32,
-        lora_A_init_method: str = "xavier",
+        lora_A_init_method: LoraAInitMethod | str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
         obj.lora_dim = lora_dim
@@ -182,7 +196,7 @@ class GroupedExpertsLoRA(GroupedExperts):
         GroupedExpertsLoRA.init_lora_weights(obj, lora_A_init_method)
 
     @torch.no_grad
-    def init_lora_weights(self, init_method: str) -> None:
+    def init_lora_weights(self, init_method: LoraAInitMethod | str) -> None:
         """Initialize LoRA weights.
 
         IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`
@@ -565,13 +579,33 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     lora_gate_and_up_B: nn.Parameter
     lora_down_A: nn.Parameter
     lora_down_B: nn.Parameter
+    dispatcher_hybridep_permute_fusion: bool
+    dispatcher_hybridep_compact_routing: bool
+    dispatcher_hybridep_num_sms_preprocessing: int | None
+    dispatcher_hybridep_num_blocks_permute: int | None
+    dispatcher_hybridep_num_blocks_unpermute: int | None
+    dispatcher_hybridep_max_tokens_per_rank: int | None
+    dispatcher_capacity_factor: float | None
+    dispatcher_equal_token_counts: bool
+    dispatch_rows_never_empty: bool
+    dispatcher_recompute_cache: str
+    n_routed_experts: int
+    ep_size: int
+    ep_rank: int
+    token_dispatcher: MoEFlexTokenDispatcher | None
+    use_mxfp8: bool
+    expert_activation: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+    gate_and_up_projs: nn.Parameter | DTensor
+    down_projs: nn.Parameter | DTensor
+    gate_up_proj_bias: nn.Parameter | DTensor | None
+    down_proj_bias: nn.Parameter | DTensor | None
 
     def __init__(
         self,
         orig_module: GroupedExpertsDeepEP,
         lora_dim: int = 8,
         alpha: int = 32,
-        lora_A_init_method: str = "xavier",
+        lora_A_init_method: LoraAInitMethod | str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
         # Preserve the existing base storage, including its dtype and device.
@@ -626,7 +660,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         obj: GroupedExpertsDeepEPLoRA,
         lora_dim: int = 8,
         alpha: int = 32,
-        lora_A_init_method: str = "xavier",
+        lora_A_init_method: LoraAInitMethod | str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
         obj.lora_dim = lora_dim
@@ -666,7 +700,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         GroupedExpertsDeepEPLoRA.init_lora_weights(obj, lora_A_init_method)
 
     @torch.no_grad
-    def init_lora_weights(self, init_method: str) -> None:
+    def init_lora_weights(self, init_method: LoraAInitMethod | str) -> None:
         """Initialize LoRA weights.
 
         IMPORTANT: This method is called by the PEFT framework's `_init_peft_adapters`

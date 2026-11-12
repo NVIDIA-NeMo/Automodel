@@ -31,6 +31,7 @@ from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linea
 from nemo_automodel.components._peft.lora_experts import (
     GroupedExpertsDeepEPLoRA,
     GroupedExpertsLoRA,
+    _init_stacked_lora_A,
     _pad_lora_rank_for_grouped_mm,
 )
 from nemo_automodel.components.models.common import BackendConfig
@@ -1465,3 +1466,23 @@ def test_lora_after_down_zero_tokens_keeps_routing_weights_attached(moe_config, 
     torch.testing.assert_close(out, torch.zeros_like(out))
     assert weights.grad is not None
     torch.testing.assert_close(weights.grad, torch.zeros_like(weights))
+
+
+def test_init_stacked_lora_a_invalid_method_raises():
+    """Invalid init method strings raise ValueError instead of silently falling through."""
+    weight = torch.empty(4, 16, 4)
+    with pytest.raises(ValueError, match="expected init_method to be 'xavier' or 'kaiming'"):
+        _init_stacked_lora_A(weight, "unsupported")
+
+
+def test_lora_experts_attribute_types(moe_config, device):
+    """Declared adapter attributes and types match on GroupedExpertsLoRA."""
+    orig_experts = GroupedExperts(moe_config).to(device)
+    lora_experts = GroupedExpertsLoRA(orig_experts, lora_dim=4, alpha=8, lora_A_init_method="xavier")
+
+    assert isinstance(lora_experts.lora_gate_and_up_A, nn.Parameter)
+    assert isinstance(lora_experts.lora_gate_and_up_B, nn.Parameter)
+    assert isinstance(lora_experts.lora_down_A, nn.Parameter)
+    assert isinstance(lora_experts.lora_down_B, nn.Parameter)
+    assert isinstance(lora_experts.use_torch_mm, bool)
+    assert callable(lora_experts.expert_activation_grouped)
