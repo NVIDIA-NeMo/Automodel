@@ -21,6 +21,7 @@ shared buffer, RowAdam keeps one second moment per output row, and the update
 ``ΔW = -lr · D · A`` is merged into the full weight each step.
 """
 
+from nemo_automodel.components.optim.gradient_sketch.optimizer import GradientSketchOptimizer
 from nemo_automodel.components.optim.gradient_sketch.row_adam import row_adam_direction
 from nemo_automodel.components.optim.gradient_sketch.sketch import (
     SketchSettings,
@@ -35,6 +36,7 @@ from nemo_automodel.components.optim.gradient_sketch.sketch import (
 )
 
 __all__ = [
+    "GradientSketchOptimizer",
     "SketchSettings",
     "SketchState",
     "fill_projection_",
