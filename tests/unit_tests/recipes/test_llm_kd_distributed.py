@@ -24,6 +24,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
 
+from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.recipes.llm import kd as llm_kd
@@ -244,3 +245,128 @@ def test_llm_kd_validation_uses_loss_ignore_index(monkeypatch):
     assert seen_num_label_tokens == [2]
     assert metrics.metrics["num_label_tokens"] == 2
     assert metrics.metrics["val_loss"] == pytest.approx(1.0)
+
+
+class _TokenLogitsModel(nn.Module):
+    """Look up per-token logits, so a sharded ``input_ids`` yields sharded logits.
+
+    Args:
+        table: Tensor of shape [vocab, vocab] holding the logits of each token.
+        trainable: Whether to register ``table`` as a parameter.
+    """
+
+    def __init__(self, table: torch.Tensor, *, trainable: bool) -> None:
+        super().__init__()
+        if trainable:
+            self.table = nn.Parameter(table)
+        else:
+            self.register_buffer("table", table)
+
+    def forward(self, input_ids: torch.Tensor) -> SimpleNamespace:
+        """Return the logits of each input token.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence].
+
+        Returns:
+            Namespace whose ``logits`` is a tensor of shape [batch, sequence, vocab].
+        """
+        return SimpleNamespace(logits=self.table[input_ids])
+
+
+_STUDENT_TABLE = torch.linspace(-1.0, 1.0, 16).reshape(4, 4)
+_TEACHER_TABLE = torch.linspace(1.0, -1.0, 16).reshape(4, 4)
+
+
+def _make_step_recipe():
+    """Build a bare KD recipe carrying only the state the non-PP student step reads."""
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.pp_enabled = False
+    recipe.separate_meshes = False
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.model_parts = [_TokenLogitsModel(_STUDENT_TABLE.clone(), trainable=True)]
+    recipe.teacher_model = _TokenLogitsModel(_TEACHER_TABLE, trainable=False)
+    recipe._offload_teacher_model = False
+    recipe.loss_fn = MaskedCrossEntropy()
+    recipe.kd_loss_fn = KDLoss()
+    recipe.kd_ratio = 0.5
+    recipe._get_dp_group = lambda include_cp=False: None
+    recipe._get_dp_group_size = lambda include_cp=False: 1
+    return recipe
+
+
+def _expected_step_losses(input_ids, labels, num_label_tokens):
+    """Compute one KD step's losses directly from the student and teacher tables.
+
+    Args:
+        input_ids: Tensor of shape [batch, sequence] holding this rank's tokens.
+        labels: Tensor of shape [batch, sequence] aligned with ``input_ids``.
+        num_label_tokens: Valid-label count across the full sequence.
+
+    Returns:
+        Tuple of scalar tensors containing mixed, KL, and CE loss.
+    """
+    student_logits = _STUDENT_TABLE[input_ids]
+    ce = MaskedCrossEntropy()(student_logits, labels, num_label_tokens=num_label_tokens)
+    kd = KDLoss()(student_logits, _TEACHER_TABLE[input_ids], labels, num_batch_labels=num_label_tokens)
+    return 0.5 * ce + 0.5 * kd, kd, ce
+
+
+def test_llm_kd_non_pp_step_without_cp_uses_full_sequence_labels():
+    """At cp=1 the real sharder is the identity and the step sees every label."""
+    batch = {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[2, 3, -100]])}
+
+    losses = _make_step_recipe()._forward_backward_step(0, batch, num_label_tokens=2, num_batches=1)
+
+    for actual, expected in zip(losses, _expected_step_losses(batch["input_ids"], batch["labels"], 2)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_llm_kd_non_pp_step_shards_labels_with_the_batch_under_cp(monkeypatch):
+    """Under CP the step leaves labels in the batch for the sharder and uses its local labels."""
+
+    def load_balanced_sharder(model, mesh, batch, **kwargs):
+        """Mimic rank 0 of the cp=2 load-balanced sharder on a length-3 batch.
+
+        Like ``shard_batch_load_balanced``, it requires ``batch["labels"]``, pads
+        the sequence to ``2 * cp`` tokens (labels with -100) and keeps rank 0's
+        head and tail chunks, positions 0 and 3.
+
+        Args:
+            model: Unused student model.
+            mesh: Unused device mesh.
+            batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
+                shape [batch, sequence].
+            **kwargs: Unused context-parallel options.
+
+        Returns:
+            Object whose shard operation shards the batch in place.
+        """
+        del model, mesh, kwargs
+
+        def shard(actual_batch):
+            """Replace ``input_ids`` and ``labels`` with rank 0's padded local tokens.
+
+            Args:
+                actual_batch: Mapping containing ``input_ids`` and ``labels`` as
+                    tensors of shape [batch, 3].
+
+            Returns:
+                Context factory and the same mapping, now holding tensors of shape [batch, 2].
+            """
+            for key, fill in (("input_ids", 0), ("labels", -100)):
+                actual_batch[key] = nn.functional.pad(actual_batch[key], (0, 1), value=fill)[:, [0, 3]]
+            return nullcontext, actual_batch
+
+        return SimpleNamespace(shard=shard)
+
+    monkeypatch.setattr(llm_kd, "ContextParallelSharder", load_balanced_sharder)
+    batch = {"input_ids": torch.tensor([[1, 2, 3]]), "labels": torch.tensor([[2, 3, 1]])}
+
+    losses = _make_step_recipe()._forward_backward_step(0, batch, num_label_tokens=3, num_batches=1)
+
+    local_input_ids, local_labels = torch.tensor([[1, 0]]), torch.tensor([[2, -100]])
+    for actual, expected in zip(losses, _expected_step_losses(local_input_ids, local_labels, 3)):
+        torch.testing.assert_close(actual, expected)
