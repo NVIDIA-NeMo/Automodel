@@ -109,8 +109,8 @@ so the model's own next-token distribution is unchanged and the drafts verify
 losslessly against it. The mask tokens' hidden states feed the same MTP loss
 and `val_mtp_tau_sim` metric as a native MTP head above.
 
-`mtp.distillation_mode: soft` distills every depth towards the frozen base
-model's own distribution — the actual verifier at decode time, and a stable
+`mtp.distillation_mode: soft` distills every depth toward the frozen base
+model's own distribution, which is the actual verifier at decode time and a stable
 target throughout training since the base model never changes:
 
 ```bash
