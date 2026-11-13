@@ -12,13 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import enum
 import functools
 import inspect
 from collections.abc import Generator
 from contextlib import contextmanager
+from types import FunctionType
+from typing import TYPE_CHECKING
 
 import yaml
+
+if TYPE_CHECKING:
+    import torch
+    from transformers import GenerationConfig
 
 
 @contextmanager
@@ -77,16 +85,30 @@ def safe_yaml_representers() -> Generator[None, None, None]:
         yaml.SafeDumper.yaml_multi_representers = original_multi_representers
 
 
-def _function_representer(dumper, data):
+def _dotted_path(obj: object) -> str:
+    """Return ``<module>.<qualname>`` for a class or function.
+
+    Raises:
+        AttributeError: If ``obj`` has no ``__qualname__`` or is not defined in an imported module.
+            ``_safe_object_representer`` relies on this to fall back to the object's class.
+    """
+    module = inspect.getmodule(obj)
+    if module is None:
+        raise AttributeError(f"{obj!r} is not defined in an imported module")
+    # Reflection is confined here: plain instances legitimately lack __qualname__.
+    return f"{module.__name__}.{getattr(obj, '__qualname__')}"
+
+
+def _function_representer(dumper: yaml.SafeDumper, data: FunctionType | type) -> yaml.Node:
     """Represent functions in YAML."""
     value = {
-        "_target_": f"{inspect.getmodule(data).__name__}.{data.__qualname__}",  # type: ignore
+        "_target_": _dotted_path(data),
         "_call_": False,
     }
     return dumper.represent_data(value)
 
 
-def _torch_dtype_representer(dumper, data):
+def _torch_dtype_representer(dumper: yaml.SafeDumper, data: torch.dtype) -> yaml.Node:
     """Represent torch dtypes in YAML."""
     value = {
         "_target_": str(data),
@@ -95,7 +117,7 @@ def _torch_dtype_representer(dumper, data):
     return dumper.represent_data(value)
 
 
-def _safe_object_representer(dumper, data):
+def _safe_object_representer(dumper: yaml.SafeDumper, data: object) -> yaml.Node:
     """General object representer for YAML.
 
     This function is a fallback for objects that don't have specific representers.
@@ -105,36 +127,34 @@ def _safe_object_representer(dumper, data):
     The _call_ key is used to indicate whether the target should be called to create an instance.
 
     Args:
-        dumper (yaml.Dumper): The YAML dumper to use for serialization.
-        data (Any): The data to serialize.
+        dumper: The YAML dumper to use for serialization.
+        data: The object to serialize.
 
     Returns:
         The YAML representation of the data.
     """
     try:
-        obj = data
-        target = f"{inspect.getmodule(obj).__name__}.{obj.__qualname__}"
+        target = _dotted_path(data)
         call = False
     except AttributeError:
-        obj = data.__class__
-        target = f"{inspect.getmodule(obj).__name__}.{obj.__qualname__}"
+        target = _dotted_path(data.__class__)
         call = True
 
     value = {
-        "_target_": target,  # type: ignore
+        "_target_": target,
         "_call_": call,
     }
     return dumper.represent_data(value)
 
 
-def _partial_representer(dumper, data):
+def _partial_representer(dumper: yaml.SafeDumper, data: functools.partial[object]) -> yaml.Node:
     """Represent functools.partial objects in YAML."""
     # Get the underlying function
     func = data.func
 
     # Create a dictionary representation
     value = {
-        "_target_": f"{inspect.getmodule(func).__name__}.{func.__qualname__}",
+        "_target_": _dotted_path(func),
         "_partial_": True,
         "_args_": list(data.args) if data.args else [],
     }
@@ -146,12 +166,11 @@ def _partial_representer(dumper, data):
     return dumper.represent_data(value)
 
 
-def _enum_representer(dumper, data):
+def _enum_representer(dumper: yaml.SafeDumper, data: enum.Enum) -> yaml.Node:
     """Represent enums in YAML."""
     # Create a dictionary representation
-    enum_class = data.__class__
     value = {
-        "_target_": f"{inspect.getmodule(enum_class).__name__}.{enum_class.__qualname__}",
+        "_target_": _dotted_path(data.__class__),
         "_call_": True,
         "_args_": [data.value],
     }
@@ -159,11 +178,10 @@ def _enum_representer(dumper, data):
     return dumper.represent_data(value)
 
 
-def _generation_config_representer(dumper, data):
+def _generation_config_representer(dumper: yaml.SafeDumper, data: GenerationConfig) -> yaml.Node:
     """Represent transformers GenerationConfig objects in YAML."""
-    cls = data.__class__
     value = {
-        "_target_": f"{inspect.getmodule(cls).__name__}.{cls.__qualname__}.from_dict",
+        "_target_": f"{_dotted_path(data.__class__)}.from_dict",
         "_call_": True,
         "config_dict": data.to_dict(),
     }

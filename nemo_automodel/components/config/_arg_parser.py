@@ -86,10 +86,17 @@ def parse_cli_argv(default_cfg_path: str | None = None, argv: list[str] | None =
 
 def parse_args_and_load_config(default_cfg_path: str | None = None, argv: list[str] | None = None) -> ConfigNode:
     """
-    Loads YAML, applies overrides via ConfigNode.set_by_dotted.
+    Load YAML and apply CLI overrides, including opt-in ``--benchmark`` controls.
+
+    Benchmark defaults come from ``ci.perf_testing`` and the Core Models measurement
+    budget. Explicit dotted CLI overrides take precedence over those defaults.
 
     Args:
-        default_cfg_path (str, optional): Default config (yaml) path.
+        default_cfg_path: Default YAML configuration path.
+        argv: Explicit arguments, or ``sys.argv[1:]`` when omitted.
+
+    Returns:
+        Loaded configuration with benchmark defaults and explicit overrides applied.
         argv (list[str], optional): Argument list to parse. Defaults to ``sys.argv[1:]``.
     """
     cfg_path, overrides = parse_cli_argv(default_cfg_path, argv=argv)
@@ -97,10 +104,19 @@ def parse_args_and_load_config(default_cfg_path: str | None = None, argv: list[s
     # load the base YAML
     cfg = load_yaml_config(cfg_path)
 
-    # apply overrides
+    benchmark = "benchmark=True" in overrides
+    explicit_keys: set[str] = set()
+    # Apply explicit overrides before reading performance metadata, so callers may
+    # opt into validation or change the fake-gate choice on the command line too.
     for kv in overrides:
+        if kv == "benchmark=True":
+            continue
         dotted, val_str = kv.split("=", 1)
         cfg.set_by_dotted(dotted, translate_value(val_str))
+        explicit_keys.add(dotted)
+
+    if benchmark:
+        _apply_benchmark_overrides(cfg, explicit_keys=explicit_keys)
 
     # Resolve the optional `wandb.enable` / `trackio.enable` toggles after overrides, so that
     # `wandb.enable=true` passed on the CLI is honored.
@@ -108,6 +124,41 @@ def parse_args_and_load_config(default_cfg_path: str | None = None, argv: list[s
     _resolve_logger_enable(cfg, "trackio")
 
     return cfg
+
+
+def _apply_benchmark_overrides(cfg: ConfigNode, *, explicit_keys: set[str]) -> None:
+    """Apply performance measurement defaults without replacing canonical workload settings.
+
+    Args:
+        cfg: Loaded configuration, updated in place at the shared YAML boundary.
+        explicit_keys: Dotted CLI settings that must retain their explicit values.
+
+    Raises:
+        ValueError: If ``ci.perf_testing`` is missing, malformed, or contains unsupported settings.
+    """
+    perf = cfg.get("ci.perf_testing")
+    if not isinstance(perf, ConfigNode):
+        raise ValueError("--benchmark requires a ci.perf_testing mapping in the canonical training YAML")
+    unknown = set(perf.to_yaml_dict()) - {"schedule", "time", "fake_balanced_gate", "validation"}
+    if unknown:
+        raise ValueError(f"ci.perf_testing contains unsupported settings: {sorted(unknown)}")
+    for key in ("fake_balanced_gate", "validation"):
+        if key in perf and not isinstance(perf.get(key), bool):
+            raise ValueError(f"ci.perf_testing.{key} must be a boolean")
+
+    defaults: dict[str, bool | int | None] = {
+        "checkpoint.enabled": False,
+        "step_scheduler.max_steps": 50,
+        "step_scheduler.num_epochs": None,
+    }
+    if not perf.get("validation", False):
+        defaults["step_scheduler.val_every_steps"] = None
+        defaults["step_scheduler.validate_on_checkpoint"] = False
+    if "fake_balanced_gate" in perf:
+        defaults["model.backend.fake_balanced_gate"] = perf.fake_balanced_gate
+    for key, value in defaults.items():
+        if not any(key == explicit or key.startswith(explicit + ".") for explicit in explicit_keys):
+            cfg.set_by_dotted(key, value)
 
 
 def _resolve_logger_enable(cfg: ConfigNode, section: str) -> None:

@@ -13,10 +13,71 @@
 # limitations under the License.
 import sys
 import types
+from pathlib import Path
 
 import pytest
+import yaml
 
 from nemo_automodel.components.config import loader
+
+
+def _write_payload(path: Path, marker: Path) -> Path:
+    """Write a Python file whose top-level code creates ``marker`` when the file runs."""
+    path.write_text(
+        f"open({str(marker)!r}, 'w').close()\n\n\ndef entry():\n    return 'loaded'\n\n\n_private = entry\n"
+    )
+    return path
+
+
+@pytest.mark.parametrize("key", ["_target_", "collate_fn"])
+def test_config_file_target_outside_package_requires_opt_in(tmp_path, monkeypatch, key):
+    monkeypatch.setattr(loader, "ENABLE_USER_MODULES", False)
+    marker = tmp_path / "ran"
+    payload = _write_payload(tmp_path / "helper.py", marker)
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({"dataset": {key: f"{payload}:entry"}}))
+
+    with pytest.raises(ImportError, match="NEMO_ENABLE_USER_MODULES"):
+        loader.load_yaml_config(cfg_path)
+    # The loader itself enforces the opt-in, so a dotted target that reaches it is refused too.
+    with pytest.raises(ImportError, match="NEMO_ENABLE_USER_MODULES"):
+        loader.load_module_from_file(payload)
+    assert not marker.exists()
+
+    monkeypatch.setattr(loader, "ENABLE_USER_MODULES", True)
+    cfg = loader.load_yaml_config(cfg_path)
+    assert getattr(cfg.dataset, key)() == "loaded"
+    assert marker.exists()
+
+
+def test_file_target_private_attr_is_rejected_before_the_file_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(loader, "ENABLE_USER_MODULES", True)
+    marker = tmp_path / "ran"
+    payload = _write_payload(tmp_path / "helper.py", marker)
+
+    with pytest.raises(ImportError, match="_private"):
+        loader._resolve_target(f"{payload}:_private")
+    assert not marker.exists()
+
+
+def test_file_target_containment_resolves_symlinks_and_parent_segments(tmp_path, monkeypatch):
+    monkeypatch.setattr(loader, "ENABLE_USER_MODULES", False)
+    package_dir, outside_dir = tmp_path / "package", tmp_path / "outside"
+    package_dir.mkdir()
+    outside_dir.mkdir()
+    monkeypatch.setattr(loader, "SAFE_BASE_DIR", package_dir.resolve())
+    inside_marker, outside_marker = tmp_path / "inside_ran", tmp_path / "outside_ran"
+    inside = _write_payload(package_dir / "inside.py", inside_marker)
+    outside = _write_payload(outside_dir / "outside.py", outside_marker)
+    link = package_dir / "link.py"
+    link.symlink_to(outside)
+
+    assert loader._resolve_target(f"{inside}:entry")() == "loaded"
+    for escaping in (link, package_dir / ".." / "outside" / "outside.py"):
+        with pytest.raises(ImportError, match="NEMO_ENABLE_USER_MODULES"):
+            loader._resolve_target(f"{escaping}:entry")
+    assert inside_marker.exists()
+    assert not outside_marker.exists()
 
 
 def test_is_allowed_module_respects_prefix_allowlist_when_spec_missing(monkeypatch):

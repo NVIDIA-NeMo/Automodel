@@ -47,7 +47,7 @@ freeze_config:
   - glob: "*classifier"
 
 dataset:
-  _target_: nemo_automodel/components/datasets/llm/mock_seq_cls.py:MockSequenceClassificationDataset
+  _target_: nemo_automodel.components.datasets.llm.mock_seq_cls.MockSequenceClassificationDataset
   num_samples: 4
   num_labels: 2
   vocab_size: 256
