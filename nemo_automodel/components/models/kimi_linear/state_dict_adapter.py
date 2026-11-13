@@ -116,27 +116,63 @@ class KimiLinear48BStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdap
     def _expert_path_segment(self) -> str:
         return "mlp.experts"
 
+    # The prefix is open-ended: PEFT saves carry keys under the ``base_model.model.``
+    # outer prefix, and expert LoRA keys (``...gate_proj.lora_A.weight``) need the
+    # same w1/w2/w3 and block_sparse_moe renames as the expert weights.
     def _map_hf_expert_key_to_generic(self, key: str) -> str:
         match = re.match(
-            r"(?P<prefix>(?:model\.)?layers\.\d+)\.block_sparse_moe\.experts\.(?P<expert>\d+)\."
-            r"(?P<proj>w1|w2|w3)\.weight$",
+            r"(?P<prefix>.*?layers\.\d+)\.block_sparse_moe\.experts\.(?P<expert>\d+)\."
+            r"(?P<proj>w1|w2|w3)(?P<lora>\.lora_[AB])?\.weight$",
             key,
         )
         if match is None:
             return key
         projection = _HF_TO_GENERIC_EXPERT_PROJ[match.group("proj")]
-        return f"{match.group('prefix')}.mlp.experts.{match.group('expert')}.{projection}.weight"
+        lora = match.group("lora") or ""
+        return f"{match.group('prefix')}.mlp.experts.{match.group('expert')}.{projection}{lora}.weight"
+
+    def map_peft_target_module_to_hf(self, name: str, *, v4_compatible: bool = False) -> str:
+        """Convert a native PEFT target-module path to the Kimi Linear checkpoint layout.
+
+        adapter_config.json's target_modules must name modules that exist in the HF
+        model, so entries get the same renames as the state-dict keys: routed-expert
+        projections become ``block_sparse_moe.experts.{E}.{w1,w3,w2}``, and the MoE
+        ``gate`` and ``shared_experts`` children move from ``mlp.`` to
+        ``block_sparse_moe.``. Dense-layer ``mlp`` paths pass through unchanged.
+
+        Args:
+            name: A target-module name in native layout.
+            v4_compatible: Legacy export selection; Kimi Linear uses the same module names in both formats.
+
+        Returns:
+            Target-module name in the HF Kimi Linear layout.
+        """
+        # Same segment renames as _native_moe_key_to_hf, but a target-module path can
+        # end at the segment, which the key-oriented trailing-dot replace never matches.
+        for segment in _MOE_CHILD_SEGMENTS:
+            seg = segment.rstrip(".")
+            name = re.sub(rf"\.mlp\.{re.escape(seg)}(?=\.|$)", f".block_sparse_moe.{seg}", name)
+        match = re.match(
+            r"(?P<prefix>.*?layers\.\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+            r"(?P<proj>gate_proj|up_proj|down_proj)$",
+            name,
+        )
+        if match is None:
+            return name
+        projection = _GENERIC_TO_HF_EXPERT_PROJ[match.group("proj")]
+        return f"{match.group('prefix')}.block_sparse_moe.experts.{match.group('expert')}.{projection}"
 
     def _map_generic_expert_key_to_hf(self, key: str) -> str:
         match = re.match(
-            r"(?P<prefix>(?:model\.)?layers\.\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-            r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$",
+            r"(?P<prefix>.*?layers\.\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+            r"(?P<proj>gate_proj|up_proj|down_proj)(?P<lora>\.lora_[AB])?\.weight$",
             key,
         )
         if match is None:
             return key
         projection = _GENERIC_TO_HF_EXPERT_PROJ[match.group("proj")]
-        return f"{match.group('prefix')}.block_sparse_moe.experts.{match.group('expert')}.{projection}.weight"
+        lora = match.group("lora") or ""
+        return f"{match.group('prefix')}.block_sparse_moe.experts.{match.group('expert')}.{projection}{lora}.weight"
 
     def to_hf(
         self,
