@@ -1039,9 +1039,9 @@ def format_chat_template(
             )
         return _unpadded_full_ids_memo["value"]
 
-    if template_has_generation_kwd:
+    if template_has_generation_kwd and answer_only_loss_mask:
         mask = tokenized_chat["assistant_masks"]
-    elif not template_has_generation_kwd and answer_only_loss_mask:
+    elif answer_only_loss_mask:
         mask = _build_multiturn_assistant_mask(
             tokenizer,
             formatted_text,
