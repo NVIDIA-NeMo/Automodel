@@ -35,11 +35,11 @@ from nemo_automodel.components.speculative.eagle.target_v12 import (
     HFEagleTargetModel,
     _shift_left_with_zero,
 )
-from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe, _all_reduce_mean
-from nemo_automodel.recipes.llm.train_eagle1 import main as eagle1_main
-from nemo_automodel.recipes.llm.train_eagle2 import TrainEagle2Recipe
-from nemo_automodel.recipes.llm.train_eagle2 import main as eagle2_main
-from nemo_automodel.recipes.llm.train_eagle3 import main as eagle3_main
+from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
+from nemo_automodel.recipes.speculative_decoding.train_eagle1 import main as eagle1_main
+from nemo_automodel.recipes.speculative_decoding.train_eagle2 import TrainEagle2Recipe
+from nemo_automodel.recipes.speculative_decoding.train_eagle2 import main as eagle2_main
+from nemo_automodel.recipes.speculative_decoding.train_eagle3 import main as eagle3_main
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -277,17 +277,6 @@ def test_trainer_custom_loss_weights():
     )
     metrics = trainer_h(**kwargs)
     torch.testing.assert_close(metrics.loss, 10.0 * metrics.hidden_loss, atol=1e-5, rtol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# train_eagle1: _all_reduce_mean (non-distributed path)
-# ---------------------------------------------------------------------------
-
-
-def test_all_reduce_mean_non_distributed():
-    t = torch.tensor(4.0)
-    result = _all_reduce_mean(t)
-    assert result.item() == 4.0
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from nemo_automodel.components.attention.utils import preprocess_args_and_kwargs_for_attn
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    preprocess_args_and_kwargs_for_attn,
+)
 from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 
@@ -35,7 +38,7 @@ def test_te_physical_boundaries_forward_backward(real_lengths: tuple[int, int], 
     """
     if not torch.cuda.is_available():
         pytest.skip("TE THD forward/backward requires CUDA")
-    te = pytest.importorskip("transformer_engine.pytorch")
+    pytest.importorskip("transformer_engine.pytorch")
     device = torch.device("cuda")
     physical_lengths = (32, 48)
     input_ids = torch.arange(80, device=device).view(1, 80)
@@ -62,7 +65,7 @@ def test_te_physical_boundaries_forward_backward(real_lengths: tuple[int, int], 
     inputs = [torch.randn(80, 4, 64, device=device, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)]
     reference_inputs = [value.detach().double().requires_grad_() for value in inputs]
     q, k, v, kwargs = preprocess_args_and_kwargs_for_attn(*inputs, None, "te", **metadata)
-    attention = te.DotProductAttention(4, 64, attention_dropout=0.0, qkv_format="thd")
+    _, attention = initialize_attn_module_and_func("te", 4, 64, 64, 1 / 8, attention_dropout=0.0, qkv_format="thd")
     output = attention(q, k, v, **kwargs).reshape(80, 4, 64)
     # No production packing/attention helper is used to construct the oracle.
     reference_documents = []

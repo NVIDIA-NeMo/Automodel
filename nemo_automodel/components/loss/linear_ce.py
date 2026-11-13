@@ -172,7 +172,8 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
 
         Args:
             hidden_states: Rank-local hidden states with shape
-                ``[batch, sequence, hidden]``.
+                ``[batch, sequence, hidden]`` or packed THD ``[tokens, hidden]`` /
+                ``[1, tokens, hidden]``. Token order must match flattened labels.
             labels: Rank-local target token IDs with shape ``[batch, sequence]``.
             lm_weight: LM-head weight with global shape ``[vocab, hidden]``.
                 It may be a regular tensor or an FSDP-sharded DTensor.
@@ -224,6 +225,11 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
             # resharding meets hidden states of the same dtype. The projection ``e @ c.T`` inside
             # cut-cross-entropy does not align dtypes itself.
             hidden_states = hidden_states.to(lm_weight.dtype)
+
+        # Native THD models flatten packed rows while labels retain [B, S].
+        # Restore the target layout without changing token order; CCE requires
+        # every leading activation dimension to match targets before flattening.
+        hidden_states = hidden_states.reshape(*labels.shape, hidden_states.shape[-1])
 
         # First compute loss with sum reduction to handle normalization ourselves
         softcap = None if self.logit_softcapping == 0 else self.logit_softcapping

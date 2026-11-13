@@ -42,6 +42,8 @@ def _train_sample(step=7):
             "tps": 10.0,
             "tps_per_gpu": 5.0,
             "num_label_tokens": 42,
+            "num_tokens_per_step": 64,
+            "mfu": 0.35,
         },
     )
 
@@ -70,6 +72,8 @@ def test_log_train_metrics_calls_trackio():
     args, kwargs = run.log.call_args
     assert kwargs.get("step") == 7
     assert args[0]["loss"] == 1.25 and args[0]["epoch"] == 1.0
+    assert args[0]["num_tokens_per_step"] == 64
+    assert args[0]["mfu"] == pytest.approx(0.35)
     # ``step`` / ``timestamp`` are reserved by Trackio and must not be sent as metrics.
     assert "step" not in args[0] and "timestamp" not in args[0]
 
@@ -135,14 +139,28 @@ def test_dllm_log_train_metrics_sends_the_window_mean_to_trackio():
     assert "mode" not in args[0]
 
 
-def test_speculative_trainer_log_helper_calls_trackio():
-    from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
+@pytest.mark.parametrize("recipe_name", ["eagle1", "eagle3", "dflash", "dspark"])
+@pytest.mark.parametrize("wandb_active,trackio_active", [(False, False), (False, True), (True, False), (True, True)])
+def test_speculative_trainer_log_helper_calls_trackio(recipe_name, wandb_active, trackio_active):
+    from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
+    from nemo_automodel.recipes.speculative_decoding.train_dspark import TrainDSparkRecipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
+    from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
 
+    recipe_cls = {
+        "eagle1": TrainEagle1Recipe,
+        "eagle3": TrainEagle3Recipe,
+        "dflash": TrainDFlashRecipe,
+        "dspark": TrainDSparkRecipe,
+    }[recipe_name]
     run = Mock()
-    recipe = TrainEagle1Recipe.__new__(TrainEagle1Recipe)
-    recipe.wandb_run = None
-    recipe.trackio_logger = TrackioLogger(run)
+    wandb_run = Mock()
+    recipe = recipe_cls.__new__(recipe_cls)
+    recipe.wandb_run = wandb_run if wandb_active else None
+    recipe.trackio_logger = TrackioLogger(run) if trackio_active else None
 
     recipe._wandb_log({"train/loss": 0.5}, step=3)
 
-    run.log.assert_called_once_with({"train/loss": 0.5}, step=3)
+    expected = [call({"train/loss": 0.5}, step=3)]
+    assert run.log.call_args_list == (expected if trackio_active else [])
+    assert wandb_run.log.call_args_list == (expected if wandb_active else [])
