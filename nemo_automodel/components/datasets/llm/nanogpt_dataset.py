@@ -454,8 +454,19 @@ class NanogptDataset(IterableDataset):
             Training sample dictionaries from all files
         """
         while True:
+            yielded_in_pass = False
             for file in worker_files:
-                yield from self._process_file_tokens(file, split_single_file, file_start_pos, file_end_pos)
+                for sample in self._process_file_tokens(file, split_single_file, file_start_pos, file_end_pos):
+                    yielded_in_pass = True
+                    yield sample
+
+            if not yielded_in_pass:
+                raise ValueError(
+                    f"NanogptDataset produced no samples after a full pass over {len(worker_files)} file(s): "
+                    f"no sample fits: every shard/slice has <= seq_len={self.seq_len} tokens, or (with "
+                    "align_to_bos) no bos_token leaves room for seq_len + 1 tokens. "
+                    "Use a smaller seq_len, larger shards, fewer dataloader workers, or check bos_token."
+                )
 
             # Start a new epoch, optionally reshuffle
             if self.shuffle_files:
