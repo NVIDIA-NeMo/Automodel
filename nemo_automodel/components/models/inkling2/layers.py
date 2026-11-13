@@ -32,6 +32,7 @@ from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .configuration import Inkling2TextConfig
 
@@ -130,15 +131,17 @@ class Inkling2MoE(MoE):
         self,
         config: Inkling2TextConfig,
         backend: BackendConfig,
-        moe_config: MoEConfig,
+        moe_config: MoEConfig | None = None,
     ) -> None:
         """Build the router and experts.
 
         Args:
-            config: Inkling 2 text configuration (softcaps).
+            config: Inkling 2 text configuration (softcaps, and the expert shapes when
+                ``moe_config`` is omitted).
             backend: Backend configuration. ``gate_precision`` must be unset or FP32,
                 since the reference routes in FP32.
-            moe_config: Routed-expert configuration from :func:`inkling2_moe_config`.
+            moe_config: Routed-expert configuration; defaults to :func:`inkling2_moe_config`
+                with the dtype of ``config.torch_dtype`` (BF16 when unset).
 
         Raises:
             ValueError: If the backend requests a non-FP32 gate precision or an expert
@@ -146,6 +149,8 @@ class Inkling2MoE(MoE):
         """
         if backend.gate_precision not in (None, torch.float32):
             raise ValueError(f"Inkling 2 routes in FP32; got gate_precision={backend.gate_precision}")
+        if moe_config is None:
+            moe_config = inkling2_moe_config(config, get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16))
         super().__init__(moe_config, dataclasses.replace(backend, gate_precision=torch.float32))
 
         activation = partial(

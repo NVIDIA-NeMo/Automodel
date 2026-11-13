@@ -444,8 +444,9 @@ class Inkling2Attention(nn.Module):
 
         query_states = self.q_proj(hidden_states)
         if self.is_sliding:
-            key_states = self.k_sconv(self.k_proj(key_hidden_states), conv_mask)
-            value_states = self.v_sconv(self.v_proj(value_hidden_states), conv_mask)
+            # The reference rounds the convolution output to the projection dtype.
+            key_states = self.k_sconv(self.k_proj(key_hidden_states), conv_mask).to(query_states.dtype)
+            value_states = self.v_sconv(self.v_proj(value_hidden_states), conv_mask).to(query_states.dtype)
         else:
             key_states = self.k_sconv(self.k_proj(key_hidden_states), key_hidden_states, conv_mask)
             value_states = self.v_sconv(self.v_proj(value_hidden_states), value_hidden_states, conv_mask)
@@ -462,11 +463,13 @@ class Inkling2Attention(nn.Module):
             query_states = (query_states.float() * tau).to(query_states.dtype)
             relative_states = (relative_states.float() * tau).to(relative_states.dtype)
         query_states = query_states.transpose(1, 2)
-        key_dtype, value_dtype = key_states.dtype, value_states.dtype
+        # Keys and values return to the projection dtype. FP32 FSDP units around the static
+        # convolutions cast their inputs to FP32, so the convolution output dtype alone is not it.
+        compute_dtype = query_states.dtype
         key_states = _l2_clip(key_states.view(head_shape).float(), self.config.qk_l2_clip_threshold)
-        key_states = key_states.to(key_dtype).transpose(1, 2)
+        key_states = key_states.to(compute_dtype).transpose(1, 2)
         value_states = _unweighted_rms_norm(value_states.view(head_shape).float(), self.config.rms_norm_eps)
-        value_states = value_states.to(value_dtype).transpose(1, 2)
+        value_states = value_states.to(compute_dtype).transpose(1, 2)
 
         positions = torch.arange(sequence, device=hidden_states.device)
         position_bias = self.rel_logits_proj(relative_states, positions, positions)
@@ -621,7 +624,9 @@ class _Inkling2DecoderLayer(nn.Module):
             Tensor of shape ``[batch, sequence, hidden]`` in the dtype of ``block_residual``.
         """
         dtype = block_residual.dtype
-        hidden_states = self.post_attention_convolution(attention_output, conv_mask)
+        # The convolutions round to the model dtype as in the reference, also when an FP32 FSDP
+        # unit around them has cast their inputs to FP32.
+        hidden_states = self.post_attention_convolution(attention_output, conv_mask).to(dtype)
         residual = hidden_states = hidden_states.float()
         if self.is_block_boundary:
             # A block boundary stores the layer input and restarts the running residual.
@@ -630,7 +635,7 @@ class _Inkling2DecoderLayer(nn.Module):
             residual = hidden_states = block_residual.float() + hidden_states
         hidden_states = self.mlp_input(block_states, hidden_states)[0]
         hidden_states = self.mlp(self.post_attention_layernorm(hidden_states).to(dtype), padding_mask)
-        hidden_states = self.post_mlp_convolution(hidden_states, conv_mask)
+        hidden_states = self.post_mlp_convolution(hidden_states, conv_mask).to(dtype)
         return (residual + hidden_states).to(dtype)
 
     @torch.no_grad()
