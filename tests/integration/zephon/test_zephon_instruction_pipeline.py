@@ -19,6 +19,7 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from tokenizers import Tokenizer, models, pre_tokenizers, processors, trainers
@@ -29,6 +30,7 @@ from nemo_automodel.components.datasets.zephon.config import (
     ZephonInstructionDatasetConfig,
     ZephonPretokenizedTextDatasetConfig,
 )
+from nemo_automodel.components.datasets.zephon.llm import resolve_token_ids
 from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
@@ -63,6 +65,40 @@ def _instruction_config(config, payloads, **settings):
             ),
         ),
     )
+
+
+@pytest.mark.parametrize("apply_template", [False, True])
+def test_chat_tokens_masks_and_positions_stay_numpy_through_packing(config, tokenizer, apply_template):
+    tokenizer.chat_template = TAGGED
+    dataset = _instruction_config(
+        config,
+        [{"q": "w0 w1", "a": "w2 w3"}, {"q": "w4", "a": "w5"}],
+        use_hf_chat_template=apply_template,
+    ).dataset_config
+    dataset = replace(dataset, zephon=replace(dataset.zephon, source=replace(dataset.zephon.source, chunk_size=2)))
+    pipeline = dataset.tokenize(
+        tokenizer=tokenizer,
+        options=dataset.zephon,
+        ids=resolve_token_ids(tokenizer, pad_token_id=None),
+        seed=42,
+        dp_rank=0,
+        dp_world_size=1,
+    )
+    suffix = [1] if apply_template else []
+    tokens = [2, 3, 4, 5, *suffix, 6, 7, *suffix]
+    mask = [0, 0, 1, 1, *suffix, 0, 1, *suffix]
+    positions = [*range(4 + len(suffix)), *range(2 + len(suffix))]
+    pipeline.pack_flat(max_length=len(tokens), algorithm="wrap").batch(1).options(runner="threads", mtp_mode=False)
+    with closing(pipeline):
+        with closing(iter(pipeline)) as batches:
+            payload = next(batches).records[0].payload
+            for name in ("input_ids", "loss_mask", "positions"):
+                assert isinstance(payload[name], np.ndarray)
+            assert payload["input_ids"].dtype == np.int64
+            assert payload["loss_mask"].dtype == np.uint8
+            np.testing.assert_array_equal(payload["input_ids"], tokens)
+            np.testing.assert_array_equal(payload["loss_mask"], mask)
+            np.testing.assert_array_equal(payload["positions"], positions)
 
 
 @pytest.mark.parametrize(

@@ -893,6 +893,8 @@ class ZephonTextDatasetConfig(ZephonLanguageDatasetConfig):
         return pipeline.tokenize(
             tokenizer=tokenizer,
             field=self.text_field,
+            # Keep token buffers dense through packing and worker transport.
+            return_tensors="np",
             add_attention_mask=False,
             max_length=options.packing.seq_len + 1 if wrapping and options.packing.seq_len is not None else None,
             split_long_samples=wrapping,
@@ -982,6 +984,7 @@ class ZephonInstructionDatasetConfig(ZephonLanguageDatasetConfig):
         pipeline.map_transform(
             partial(normalize_instruction_chat, config=self), parallelism=options.workers.map_parallelism
         )
+        # tokenize_chat already emits NumPy token IDs and loss masks.
         return pipeline.tokenize_chat(
             tokenizer=tokenizer,
             chat_template=template,

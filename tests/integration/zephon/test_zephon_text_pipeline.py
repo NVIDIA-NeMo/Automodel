@@ -19,6 +19,7 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from transformers import PreTrainedTokenizerFast
@@ -27,6 +28,7 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.loader import DataloaderConfig, DatasetBuildSchedule
 from nemo_automodel.components.datasets.packing import BatchOutputFormat
 from nemo_automodel.components.datasets.zephon.config import ZephonPretokenizedTextDatasetConfig
+from nemo_automodel.components.datasets.zephon.llm import resolve_token_ids
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from tests.utils.zephon_text_fixtures import config as config
 from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
@@ -34,6 +36,38 @@ from tests.utils.zephon_text_fixtures import tokenizer as tokenizer
 
 def _training_schedule(config: DataloaderConfig) -> DatasetBuildSchedule:
     return DatasetBuildSchedule(config.batch_size, config.batch_size, max_steps=1, val_check_interval=None)
+
+
+@pytest.mark.parametrize("policy", ["eos", "tokenizer_default"])
+def test_text_tokens_and_positions_stay_numpy_through_packing(config, tokenizer, policy):
+    source = Path(config.dataset_config.zephon.sources[0].path) / "text.jsonl"
+    source.write_text(json.dumps({"text": "w0 w1"}) + "\n" + json.dumps({"text": "w2"}) + "\n")
+    dataset = replace(
+        config.dataset_config,
+        tokenize_special_tokens=policy,
+        zephon=replace(
+            config.dataset_config.zephon,
+            packing=replace(config.dataset_config.zephon.packing, pack_algorithm=None),
+            source=replace(config.dataset_config.zephon.source, chunk_size=2),
+        ),
+    )
+    pipeline = dataset.tokenize(
+        tokenizer=tokenizer,
+        options=dataset.zephon,
+        ids=resolve_token_ids(tokenizer, pad_token_id=None),
+        seed=42,
+        dp_rank=0,
+        dp_world_size=1,
+    )
+    pipeline.pack_flat(max_length=3, algorithm="wrap").batch(1).options(runner="threads", mtp_mode=False)
+    with closing(pipeline):
+        with closing(iter(pipeline)) as batches:
+            payload = next(batches).records[0].payload
+            assert isinstance(payload["input_ids"], np.ndarray)
+            assert isinstance(payload["positions"], np.ndarray)
+            assert payload["input_ids"].dtype == np.int64
+            np.testing.assert_array_equal(payload["input_ids"], [2, 3, 1 if policy == "eos" else 4])
+            np.testing.assert_array_equal(payload["positions"], [0, 1, 2 if policy == "eos" else 0])
 
 
 def test_real_finite_stream_and_continuing_iter(config, tokenizer):
