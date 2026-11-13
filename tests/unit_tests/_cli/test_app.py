@@ -204,6 +204,36 @@ def test_build_parser_nproc_per_node(tmp_path):
     assert args.nproc_per_node == 4
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "section, launcher",
+    [
+        (None, "nemo_automodel.components.launcher.interactive.InteractiveLauncher"),
+        ("nemo_run", "nemo_automodel.components.launcher.nemo_run.launcher.NemoRunLauncher"),
+        ("skypilot", "nemo_automodel.components.launcher.skypilot.launcher.SkyPilotLauncher"),
+    ],
+)
+def test_main_forwards_benchmark_to_workers(
+    monkeypatch: pytest.MonkeyPatch, recipe_yaml: Path, section: str | None, launcher: str
+) -> None:
+    """Every launcher carries the benchmark flag and explicit overrides to the workers."""
+    data = yaml.safe_load(recipe_yaml.read_text())
+    data["ci"] = {"perf_testing": {"schedule": "nightly", "fake_balanced_gate": True}}
+    # Launchers are selected by a nonempty section.
+    if section:
+        data[section] = {"job_name": "benchmark"}
+    recipe_yaml.write_text(yaml.safe_dump(data))
+    monkeypatch.setattr(sys, "argv", ["automodel", str(recipe_yaml), "--benchmark", "--step_scheduler.max_steps", "7"])
+    with mock.patch(f"{launcher}.launch", return_value=0) as launch:
+        assert module.main() == 0
+    config, _, _, _, extra = launch.call_args.args
+    assert extra == ["--benchmark", "--step_scheduler.max_steps", "7"]
+    if section is None:
+        assert config.step_scheduler.max_steps == 7
+        assert config.model.backend.fake_balanced_gate is True
+        assert config.checkpoint.enabled is False
+
+
 # ---------------------------------------------------------------------------
 # main() dispatch tests
 # ---------------------------------------------------------------------------

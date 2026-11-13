@@ -15,6 +15,11 @@ _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
 
 
+# Styles accepted by ``OptimizerParamScheduler.get_lr``.
+_LR_DECAY_STYLES = ("constant", "linear", "cosine", "inverse-square-root", "WSD")
+_LR_WSD_DECAY_STYLES = ("linear", "cosine", "exponential", "minus_sqrt")
+
+
 def _as_float(value: Any) -> float | None:
     """Return ``value`` as a float, or None when it is not numeric (e.g. relative-step Adafactor's ``lr=None``)."""
     try:
@@ -134,9 +139,18 @@ class OptimizerParamScheduler:
         assert self.lr_decay_steps > 0
         assert self.lr_warmup_steps < self.lr_decay_steps
 
+        # Reject unknown styles now: get_lr() only reads them once warmup ends, so a typo would otherwise
+        # crash the run at step ``lr_warmup_steps + 1``.
+        if lr_decay_style not in _LR_DECAY_STYLES:
+            raise ValueError(f"lr_decay_style must be one of {list(_LR_DECAY_STYLES)}, got {lr_decay_style!r}.")
         self.lr_decay_style = lr_decay_style
         if self.lr_decay_style == "WSD":
             assert self.wsd_decay_steps is not None
+            if lr_wsd_decay_style not in _LR_WSD_DECAY_STYLES:
+                raise ValueError(
+                    f"lr_wsd_decay_style must be one of {list(_LR_WSD_DECAY_STYLES)} when lr_decay_style is 'WSD', "
+                    f"got {lr_wsd_decay_style!r}."
+                )
 
         self.start_wd = start_wd
         self.end_wd = end_wd

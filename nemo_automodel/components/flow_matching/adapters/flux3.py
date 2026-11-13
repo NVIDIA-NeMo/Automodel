@@ -59,7 +59,7 @@ class Flux3Inputs(Flux3ConditioningInputs):
     _w_p: int
 
 
-class Flux3Adapter(ModelAdapter):
+class Flux3Adapter(ModelAdapter[Flux3Inputs]):
     """
     Model adapter for FLUX.3 text-to-image and image-to-image.
 
@@ -226,7 +226,7 @@ class Flux3Adapter(ModelAdapter):
         Args:
             model: The Flux3Transformer2DModel to call.
             inputs: Dict from ``prepare_inputs()``; tensor layouts are documented
-                there.
+                there. The input dictionary, including its required grid metadata, is preserved.
 
         Returns:
             Prediction tensor of shape [batch, 128, H_p, W_p], the same unpacked
@@ -234,9 +234,11 @@ class Flux3Adapter(ModelAdapter):
             is correct. Only the generated stream is returned by the
             transformer; conditioning tokens produce no output.
         """
-        h_p = inputs.pop("_h_p")
-        w_p = inputs.pop("_w_p")
+        h_p = inputs["_h_p"]
+        w_p = inputs["_w_p"]
+        model_inputs = dict(inputs)
+        del model_inputs["_h_p"], model_inputs["_w_p"]
 
-        model_pred = model(**inputs, return_dict=False)
+        model_pred = model(**model_inputs, return_dict=False)
         pred = self.post_process_prediction(model_pred)
         return self._unpack_latents(pred, h_p, w_p)

@@ -273,6 +273,8 @@ def _install_torch_and_layers_stubs(monkeypatch):
     # Router ops used by the targeted activation-checkpointing policy.
     aten = types.SimpleNamespace(
         mm=types.SimpleNamespace(default=object()),
+        addmm=types.SimpleNamespace(default=object()),
+        linear=types.SimpleNamespace(default=object()),
         topk=types.SimpleNamespace(default=object()),
     )
     torch_stub.ops = types.SimpleNamespace(aten=aten)

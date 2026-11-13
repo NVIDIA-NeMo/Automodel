@@ -120,11 +120,16 @@ class Step3p5RotaryEmbedding(nn.Module):
 
         Args:
             x: Input tensor (used for dtype and device).
-            position_ids: Position indices [batch_size, seq_len].
+            position_ids: Position indices [batch_size, seq_len] or [tokens]
+                for packed THD inputs, with positions reset at document boundaries.
 
         Returns:
-            Tuple of (cos, sin) tensors.
+            Tuple of (cos, sin) tensors with the position dimensions followed
+            by the rotary dimension.
         """
+        is_thd = position_ids.ndim == 1
+        if is_thd:
+            position_ids = position_ids.unsqueeze(0)
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float().to(x.device)
 
@@ -135,6 +140,8 @@ class Step3p5RotaryEmbedding(nn.Module):
             cos = emb.cos()
             sin = emb.sin()
 
+        if is_thd:
+            cos, sin = cos.squeeze(0), sin.squeeze(0)
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
