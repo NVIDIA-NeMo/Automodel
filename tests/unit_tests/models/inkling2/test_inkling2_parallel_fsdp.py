@@ -216,3 +216,27 @@ def test_mok_dispatcher_is_rejected(monkeypatch, world_size):
     monkeypatch.setattr(moe_layers, "get_world_size_safe", lambda: world_size)
     with pytest.raises(ValueError, match="mok"):
         Inkling2MoE(_tiny_config().text_config, BackendConfig(attn="sdpa", experts="torch_mm", dispatcher="mok"))
+
+
+def test_checkpoint_free_construction_initializes_every_weight():
+    """``from_config`` random init (meta construction, then the checkpointer's initializer) must not leave
+    the ``to_empty`` memory in place: an all-zero model trains at a constant loss of ln(vocab)."""
+    from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+
+    torch.manual_seed(0)
+    with torch.device("meta"):
+        model = _make_model(experts="torch_mm", dispatcher="torch")
+    Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+    params = dict(model.named_parameters())
+    for name in (
+        "model.language_model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+        "model.language_model.layers.5.mlp.gate.weight",
+        "model.language_model.layers.5.mlp.experts.gate_and_up_projs",
+        "model.language_model.layers.6.mlp.experts.down_projs",
+    ):
+        assert torch.isfinite(params[name]).all(), name
+        assert params[name].float().std() > 0, f"{name} was not initialized"
+    for name, param in params.items():
+        assert torch.isfinite(param).all(), name
