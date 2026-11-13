@@ -296,6 +296,59 @@ def test_eval_step_scores_drafts_against_the_base_model(monkeypatch):
     torch.testing.assert_close(metrics.prefix_hits, torch.tensor([len(hits_1), len(hits_2)]))
 
 
+def test_eval_step_scores_sampler_refined_drafts_against_the_base_model(monkeypatch):
+    """With a sampler attached, the eval acceptance metric must score the SAME sampler-refined
+    drafts the model actually produces -- not the raw, un-refined ``lm_head(h)`` projection the
+    LoRA was never trained against. Reference built from one causal forward per (anchor, depth),
+    with the sampler applied exactly as ``_gated_mtp_sampler_logits`` does."""
+    model = _build_lora_model_with_sampler()
+    model.eval()
+    sampler = model.gated_mtp_sampler
+    recipe = _make_recipe(model, monkeypatch, distillation_mode="hard")
+    input_ids, labels = _batch()
+
+    with torch.no_grad():
+        recipe._forward_backward_step(
+            0,
+            {"input_ids": input_ids, "labels": labels},
+            loss_buffer=[],
+            num_label_tokens=int((labels != -100).sum()),
+            num_batches=1,
+            is_train=False,
+        )
+        with lora_token_gate(model, torch.zeros_like(input_ids, dtype=torch.bool)):
+            verifier = model(input_ids=input_ids).logits.argmax(-1)
+        drafts = {}
+        for b in range(2):
+            for t in range(6):
+                for d in (1, 2):
+                    if t + d - 1 >= input_ids.shape[1]:
+                        # Matches roll_tensor's wrap-around at the sequence tail: these positions
+                        # are never in `supervised` below, so the looked-up "previous token" is
+                        # unused padding regardless of its value.
+                        continue
+                    hidden = _sequential_mtp_hidden(model, input_ids[b : b + 1], t, d)
+                    prev_id = verifier[b, t + d - 1].view(1, 1)
+                    prev_emb = model.get_input_embeddings()(prev_id)[:, 0]
+                    logits = model.lm_head(sampler(hidden, prev_emb))
+                    drafts[b, t, d] = logits.argmax(-1).item()
+
+    (metrics,) = recipe._mtp_accept_metrics
+    supervised = {(b, t, d) for (b, t, d) in drafts if t + d < 6 and labels[b, t + d] != -100}
+    valid = [sum(1 for b, t, d in supervised if d == depth) for depth in (1, 2)]
+    hits_1 = {(b, t) for b, t, d in supervised if d == 1 and drafts[b, t, 1] == verifier[b, t + 1]}
+    hits_2 = {(b, t) for b, t in hits_1 if (b, t, 2) in supervised and drafts[b, t, 2] == verifier[b, t + 2]}
+    torch.testing.assert_close(metrics.valid, torch.tensor(valid))
+    torch.testing.assert_close(metrics.prefix_hits, torch.tensor([len(hits_1), len(hits_2)]))
+    # The sampler's second layer was perturbed away from its zero-init no-op, so the sampler-refined
+    # drafts must actually differ from the raw (un-refined) ones somewhere -- otherwise this test
+    # would pass vacuously even if the fix were reverted.
+    raw_drafts = {
+        (b, t, d): _sequential_mtp_logits(model, input_ids[b : b + 1], t, d).argmax(-1).item() for b, t, d in drafts
+    }
+    assert raw_drafts != drafts
+
+
 def test_validate_rejects_setups_that_break_losslessness(monkeypatch):
     model = _build_lora_model()
     recipe = _make_recipe(model, monkeypatch, distillation_mode="hard")

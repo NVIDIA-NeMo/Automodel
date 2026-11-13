@@ -1352,6 +1352,39 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         return create_gated_mtp_sdpa_mask(num_depths, valid_mask, dtype=mask_dtype)
 
+    def _gated_mtp_sampler_logits(
+        self, model: nn.Module, out, mtp_per_depth_h: list[torch.Tensor]
+    ) -> list[torch.Tensor] | None:
+        """Project each gated-MTP depth's hidden state through the sampler, if attached.
+
+        Shared by the soft-MTP training loss and the eval acceptance metric so both
+        score the same sampler-refined logits the model would actually produce.
+
+        Args:
+            model: The wrapped model; supplies the shared ``lm_head``, input embeddings,
+                and (if present) ``gated_mtp_sampler``.
+            out: The clean-copy forward output; ``out.logits`` seeds the teacher-forced
+                "previous token" (the frozen base model's own greedy prediction).
+            mtp_per_depth_h: Per-depth hidden-state tensors of shape ``[batch, sequence, hidden]``.
+
+        Returns:
+            Per-depth logit tensors if a sampler is attached, else ``None``.
+        """
+        sampler = getattr(model, "gated_mtp_sampler", None)
+        if sampler is None:
+            return None
+        lm_head = _get_lm_head_module(model)
+        if lm_head is None:
+            raise ValueError("lm_head module not found in model")
+        embed = model.get_input_embeddings()
+        base_pred_ids = out.logits.argmax(dim=-1).detach()
+        head_logits = []
+        for depth, h in enumerate(mtp_per_depth_h, start=1):
+            prev_ids = roll_tensor(base_pred_ids, shifts=-(depth - 1), dim=-1)
+            prev_emb = embed(prev_ids)
+            head_logits.append(lm_head(sampler(h, prev_emb)))
+        return head_logits
+
     def _forward_backward_step(
         self,
         idx,
@@ -1587,22 +1620,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         if mtp_per_depth_logits is not None:
                             head_logits = mtp_per_depth_logits
                         else:
-                            lm_head = _get_lm_head_module(model)
-                            if lm_head is None:
-                                raise ValueError("lm_head module not found in model")
-                            sampler = getattr(model, "gated_mtp_sampler", None)
-                            if self.gated_mtp is not None and sampler is not None:
-                                # Teacher-forced sampler (arXiv:2507.11851 Sec. 2.3): "previous
-                                # token" is the frozen base model's own greedy prediction at that
-                                # position (from the clean copy's own logits), not a label -- so
-                                # train-time input matches what's available at inference time.
-                                embed = model.get_input_embeddings()
-                                base_pred_ids = out.logits.argmax(dim=-1).detach()
-                                head_logits = []
-                                for depth, h in enumerate(mtp_per_depth_h, start=1):
-                                    prev_ids = roll_tensor(base_pred_ids, shifts=-(depth - 1), dim=-1)
-                                    prev_emb = embed(prev_ids)
-                                    head_logits.append(lm_head(sampler(h, prev_emb)))
+                            sampler_logits = self._gated_mtp_sampler_logits(model, out, mtp_per_depth_h)
+                            if self.gated_mtp is not None and sampler_logits is not None:
+                                head_logits = sampler_logits
                                 # calculate_mtp_loss (below) recomputes its own hard-CE logits from
                                 # mtp_per_depth_h when given raw hidden states; the straight-through
                                 # cancellation this KL-recovery trick depends on requires that term to
@@ -1610,6 +1630,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                                 mtp_per_depth_logits = head_logits
                                 mtp_per_depth_h = None
                             else:
+                                lm_head = _get_lm_head_module(model)
+                                if lm_head is None:
+                                    raise ValueError("lm_head module not found in model")
                                 head_logits = [lm_head(h) for h in mtp_per_depth_h]
                         logits_for_loss = apply_mtp_kl_recovery(
                             logits_for_loss, head_logits, scaling_factor=soft_scaling_factor
@@ -1670,11 +1693,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         and verifier_logits.dim() >= 2
                         and verifier_logits.shape[-2] == labels.shape[-1]
                     ):
+                        eval_per_depth_h, eval_per_depth_logits = mtp_per_depth_h, mtp_per_depth_logits
+                        if eval_per_depth_logits is None and eval_per_depth_h is not None:
+                            sampler_logits = self._gated_mtp_sampler_logits(model, out, eval_per_depth_h)
+                            if self.gated_mtp is not None and sampler_logits is not None:
+                                eval_per_depth_logits, eval_per_depth_h = sampler_logits, None
                         self._mtp_accept_metrics.append(
                             compute_mtp_prefix_hits(
                                 model,
-                                mtp_per_depth_h=mtp_per_depth_h,
-                                mtp_per_depth_logits=mtp_per_depth_logits,
+                                mtp_per_depth_h=eval_per_depth_h,
+                                mtp_per_depth_logits=eval_per_depth_logits,
                                 verifier_logits=verifier_logits,
                                 labels=labels,
                                 ignore_index=ignore_index,
