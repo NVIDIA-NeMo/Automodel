@@ -1,0 +1,110 @@
+# DSpark draft training for Inkling-2-Small.
+#
+# The checkpoint's config.json mtp_config fixes the draft, and the recipe rejects
+# settings that disagree with it: five dense layers (layer 2 global, the others a
+# 1024-token window before the anchor), eight target features, eight block slots
+# (the anchor plus seven drafted tokens, so block_size here is 7), and a rank-256
+# rnn_hidden Markov head. There is no confidence head and no mask token: non-anchor
+# slots use the learned mask_embed, so mask_token_id below is not read.
+#
+# The checkpoint labels its features by the target layer they enter
+# (5, 11, ..., 41) plus 48 for the post-final-norm output. DSpark's
+# target_layer_ids count the layer that produces a feature, so the same features
+# are [4, 10, 16, 22, 28, 34, 40, 47].
+#
+# The trainable weights start from a fresh initialization; the frozen embedding,
+# its norm and the LM head come from the target. The consolidated checkpoint holds
+# the 84 tensors of the released mtp.safetensors under the same names and shapes,
+# plus a config.json with the mtp_config they were trained for.
+#
+# pp_size stays 1 because DSpark captures hidden states from one complete target
+# forward. ep_size must divide the target's 384 routed experts.
+#
+# Run the same command on every node, changing only --node-rank:
+#   torchrun --nnodes=8 --node-rank=0 --nproc-per-node=8 \
+#     --master-addr=<NODE0_IP> --master-port=29500 \
+#     -m nemo_automodel.recipes.speculative_decoding.train_dspark \
+#     -c examples/speculative/dspark/inkling2_small_dspark.yaml
+
+recipe: TrainDSparkRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+distributed:
+  strategy: fsdp2
+  defer_fsdp_grad_sync: true
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 64
+  activation_checkpointing: true
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+
+recipe_args:
+  target_model_name_or_path: thinkingmachines/Inkling-2-Small
+  train_data_path: /path/to/open-perfectblend-regenerated
+  train_split: "train[4096:]"
+  val_data_path: /path/to/open-perfectblend-regenerated
+  val_split: "train[:4096]"
+  output_dir: ./outputs/dspark_inkling2_small
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 16
+  num_workers: 2
+  num_epochs: 10
+
+  draft_num_hidden_layers: 5
+  block_size: 7
+  num_anchors: 512
+  mask_token_id: 0
+  target_layer_ids: [4, 10, 16, 22, 28, 34, 40, 47]
+  freeze_embeddings: true
+
+  markov_rank: 256
+  markov_head_type: rnn_hidden
+  confidence_head_alpha: 0.0
+
+  ce_loss_alpha: 0.1
+  l1_loss_alpha: 0.9
+  loss_decay_gamma: 4.0
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 1
+  ckpt_every_steps: 25
+  save_checkpoint_every_epoch: true
+  max_grad_norm: 1.0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 1.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+  warmup_ratio: 0.0
+  min_lr_ratio: 1.0
+
+wandb:
+  enable: false
+  project: inkling2-small-dspark
+  name: inkling2-small-dspark
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/dspark_inkling2_small/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final
+
+ci:
+  cluster_tag: h100
