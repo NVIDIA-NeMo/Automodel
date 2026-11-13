@@ -1,0 +1,159 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# LoRA SFT of Inkling-2-Small (594B total, 17B active) on MedPix-VQA.
+#
+# Hardware target: 4 nodes x 8 H100 GPUs, FSDP2 + EP32 (12 of 384 experts per rank), no PP or CP.
+# The released NVFP4 (layers 0-39) and MXFP8 (layers 40-47) experts are dequantized to BF16 on load
+# and stay frozen: ~18.6B frozen parameters per rank, ~37 GB in BF16. 32 GPUs is the smallest
+# power-of-two H100 layout that holds the BF16 base. Rank-8 adapters on the language-model attention
+# projections and on every routed expert add ~2.4B trainable parameters, ~75M per rank.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 50
+  log_remote_every_steps: 1
+  gc_every_steps: 10
+  num_epochs: 2
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: thinkingmachines/Inkling-2-Small
+  torch_dtype: bfloat16
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    gate_precision: float32
+    # LoRA supports torch_mm grouped experts; TE expert modules reject LoRA.
+    experts: torch_mm
+    dispatcher: hybridep
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: nemo_automodel.components.models.inkling2.processing.Inkling2Processor.from_pretrained
+  pretrained_model_name_or_path: thinkingmachines/Inkling-2-Small
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  # Anchored on language_model so the vision tower's self_attn projections are not matched.
+  # Router gates, attention output gates, sinks, relative-position projections, and lm_head stay frozen.
+  target_modules:
+    - "*language_model.layers.*.self_attn.q_proj"
+    - "*language_model.layers.*.self_attn.k_proj"
+    - "*language_model.layers.*.self_attn.v_proj"
+    - "*language_model.layers.*.self_attn.o_proj"
+    - "*language_model.layers.*.mlp.experts"
+  dim: 8
+  alpha: 32
+  dropout: 0.0
+  moe_rank_scaling: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/inkling2-small-medpix-lora-ep32/
+  model_save_format: safetensors
+  save_consolidated: false
+  dequantize_base_checkpoint: true
+  load_metadata_with_gloo: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 32
+
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+# One image token per 40x40 pixel patch with no resizing: a 512x655 MedPix image is 13x17 = 221 tokens.
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 1024
+  drop_last: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: validation[:256]
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 1024
+  drop_last: true
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-4
+  weight_decay: 0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+wandb:
+  enable: false
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: inkling2-small-medpix-lora-ep32
+  dir: wandb
+
+ci:
+  cluster_tag: h100
+  recipe_owner: ischencheng
+  # ep_size(32) => 4 nodes (8 H100/node).
+  nodes: 4
+  time: "01:00:00"
