@@ -83,7 +83,7 @@ def _dequantize_worker(rank: int, rendezvous: str) -> None:
                         actual = adapter._convert_moe_packed_tensors(
                             distributed_blocks, distributed_scales, dtype=dtype, rows_per_chunk=chunk_rows
                         )
-                    assert actual.placements == tuple(Shard(0) if name == "ep" else Shard(2) for name in mesh_dim_names)
+                    assert actual.placements == tuple(Shard(0) if name == "ep" else Shard(1) for name in mesh_dim_names)
                     torch.testing.assert_close(actual.full_tensor(), expected.to(dtype), rtol=0, atol=0)
 
             # Exercise the real metadata producer from model-style expert/FSDP placements.
@@ -112,8 +112,14 @@ def _dequantize_worker(rank: int, rendezvous: str) -> None:
                 )
             # Byte 0x12 decodes to [1, 0.5]; distinct expert scales expose row misalignment.
             known_values = torch.tensor([1.0, 0.5] * 1440, dtype=torch.bfloat16).view(1, 2880, 1).expand(4, 2880, 8)
-            assert actual.placements == tuple(Shard(0) if name == "ep" else Shard(2) for name in mesh_dim_names)
+            assert actual.placements == tuple(Shard(0) if name == "ep" else Shard(1) for name in mesh_dim_names)
             torch.testing.assert_close(actual.full_tensor(), torch.ldexp(known_values, exponents), rtol=0, atol=0)
+            # Loading must fit the existing FSDP local input-feature shard, not
+            # merely reconstruct the correct global values after an all-gather.
+            assert actual.to_local().shape == model_weight.to_local().shape
+            model_weight.to_local().copy_(actual.to_local())
+            expected_weight = torch.ldexp(known_values, exponents).float()
+            torch.testing.assert_close(model_weight.full_tensor(), expected_weight, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
