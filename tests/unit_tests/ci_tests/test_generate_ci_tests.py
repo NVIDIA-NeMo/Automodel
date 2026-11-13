@@ -140,7 +140,8 @@ def test_generate_gpt_oss_120b_release_job_uses_ep64():
     variables = jobs[""]["variables"]
     world_size = variables["TEST_NODE_COUNT"] * 8
     assert variables["TEST_NODE_COUNT"] == 8
-    assert variables["LOCAL_BATCH_SIZE"] == 8
+    assert variables["LOCAL_BATCH_SIZE"] == 1
+    assert variables["LOCAL_BATCH_SIZE"] == recipe["step_scheduler"]["local_batch_size"]
     assert recipe["distributed"]["ep_size"] == world_size
     assert recipe["distributed"]["activation_checkpointing"] is False
 
@@ -470,7 +471,8 @@ def test_generate_qwen3_moe_te_deepep_uses_isolated_source_and_reload_phases():
 
     variables = jobs[""]["variables"]
     assert "CHECKPOINT_ROBUSTNESS_PHASES" not in ci_config.get("env_vars", {})
-    assert variables["TIME"] == "00:30:00"
+    assert variables["TIME"] == "00:40:00"
+    assert variables["TIME"] == ci_config["time"]
     assert variables["CHECKPOINT_ROBUSTNESS_PROCESS_ISOLATION"] == "true"
     assert variables["CHECKPOINT_ROBUSTNESS_PHASES"] == (
         "source_load_reference source_load_parity train_and_save automodel_reload hf_reload resume"

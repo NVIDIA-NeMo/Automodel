@@ -697,6 +697,8 @@ navigation:
             contents:
               - page: "Inkling"
                 path: ../../model-coverage/vlm/thinkingmachines/inkling.mdx
+              - page: "Inkling-2-Small"
+                path: ../../model-coverage/vlm/thinkingmachines/inkling2.mdx
               - page: "Inkling-Small"
                 path: ../../model-coverage/vlm/thinkingmachines/inkling-small.mdx
           - section: "Z.ai"

@@ -391,6 +391,83 @@ class TestNeatPackedCollater:
         assert result["attention_mask"].dtype == torch.bool
         assert "packed_token_indices" not in result
 
+    @pytest.mark.parametrize("fake_balanced_gate", [False, True])
+    def test_sdpa_packed_qwen_routes_tokens_with_uneven_padding(self, fake_balanced_gate, monkeypatch):
+        """The real Qwen block must route B*S tokens, not B*S*S attention entries."""
+        from transformers import Qwen3MoeConfig
+
+        from nemo_automodel.components.models.common import BackendConfig
+        from nemo_automodel.components.models.qwen3_moe import model as qwen_model
+        from nemo_automodel.components.models.qwen3_moe.model import Qwen3MoeForCausalLM
+
+        rotary_embedding = qwen_model.RotaryEmbedding
+
+        def cpu_rotary_embedding(*args, **kwargs):
+            kwargs["device"] = torch.device("cpu")
+            return rotary_embedding(*args, **kwargs)
+
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(qwen_model, "RotaryEmbedding", cpu_rotary_embedding)
+        torch.manual_seed(17)
+        config = Qwen3MoeConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            num_experts=2,
+            num_experts_per_tok=1,
+            max_position_embeddings=16,
+            torch_dtype=torch.float32,
+        )
+        backend = BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rms_norm="torch",
+            rope_fusion=False,
+            experts="torch",
+            dispatcher="torch",
+            fake_balanced_gate=fake_balanced_gate,
+        )
+        model = Qwen3MoeForCausalLM(config, backend=backend)
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+        rows = [
+            {
+                "input_ids": [0, 2, 3, 4, 0, 0],
+                "labels": [0, 2, 3, 4, -100, -100],
+                "attention_mask": [1, 1, 2, 2, 0, 0],
+                "position_ids": [0, 1, 0, 1, 0, 0],
+            },
+            {
+                "input_ids": [5, 6, 7, 8, 9, 0],
+                "labels": [5, 6, 7, 8, 9, -100],
+                "attention_mask": [1, 1, 1, 2, 2, 0],
+                "position_ids": [0, 1, 2, 0, 1, 0],
+            },
+        ]
+        batch = neat_packed_collater(rows, packing=get_packing_capabilities("sdpa"))
+        captured_masks = []
+
+        def record_routing_mask(module, args):
+            captured_masks.append(args[1].detach().clone())
+
+        handle = model.model.layers["0"].mlp.experts.register_forward_pre_hook(record_routing_mask)
+        try:
+            logits = model(**batch).logits
+            logits[batch["labels"] != -100].square().mean().backward()
+        finally:
+            handle.remove()
+        expected = torch.tensor([[True, True, True, True, False, False], [True, True, True, True, True, False]])
+        assert len(captured_masks) == 1
+        torch.testing.assert_close(captured_masks[0], expected.flatten())
+        torch.testing.assert_close(batch["padding_mask"], ~expected)
+        assert batch["attention_mask"].shape == (2, 1, 6, 6)
+        assert torch.isfinite(logits).all()
+        assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+
     def test_sdpa_preserves_indexed_packed_seq_ids(self):
         batch = [
             {

@@ -226,12 +226,20 @@ def add_causal_masks_to_batch(batch_dict, model_config):
             - input_ids: [batch_size, seq_length]
             - position_ids: [batch_size, seq_length] (optional)
             - labels: [batch_size, seq_length]
+            - _packed_seq_ids: [batch_size, seq_length] document IDs (optional).
+              Retained while flat Flash offsets are removed for PP microbatching.
         model_config: HuggingFace model config for creating causal masks
-        precompute_masks: If False, skip mask creation (for compatibility with train_ft.py wrapper)
 
     Returns:
         dict: Same batch with added causal_mask_mapping field
     """
+    if "_packed_seq_ids" in batch_dict:
+        # Flat Flash offsets span the whole local batch and cannot be split
+        # along its batch axis. Model-entry hooks rebuild them from the
+        # preserved document IDs after pipeline microbatching.
+        for key in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
+            batch_dict.pop(key, None)
+
     # Extract info from batch
     batch_size = batch_dict["input_ids"].shape[0]
     seq_len = batch_dict["input_ids"].shape[1]
@@ -543,7 +551,8 @@ def neat_packed_collater(
 
     Returns:
         Mapping with ``input_ids``, ``labels``, and ``position_ids`` of shape
-        [batch, sequence]. ``attention_mask`` has shape [batch, sequence] for
+        [batch, sequence], plus a boolean ``padding_mask`` of the same shape
+        where True marks padding for token routing. ``attention_mask`` has shape [batch, sequence] for
         document IDs or [batch, 1, sequence, sequence] for block-causal masking.
         For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
         and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
@@ -570,14 +579,21 @@ def neat_packed_collater(
 
     if packed_mask_type not in ("document_ids", "flash_varlen", "block_causal"):
         raise ValueError(f"Unsupported packed_mask_type: {packed_mask_type!r}")
-    result = {"input_ids": input_ids, "labels": labels, "position_ids": position_ids}
+    result = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "position_ids": position_ids,
+        # Token routing needs one padding bit per token, independently of the
+        # attention backend's document mask or varlen representation.
+        "padding_mask": attention_mask == 0,
+    }
     prepare_attention = packing.prepare_attention_inputs
     if prepare_attention is None:
         raise ValueError("Native packed collation requires a model-derived packing contract")
     result.update(prepare_attention(attention_mask))
     if packing.return_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
-    if attention_mask.max() > 1 or packing.return_packed_sequence_metadata:
+    if packed_mask_type == "flash_varlen" or attention_mask.max() > 1 or packing.return_packed_sequence_metadata:
         result["_packed_seq_ids"] = attention_mask
     return result
 

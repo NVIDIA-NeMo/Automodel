@@ -205,9 +205,8 @@ def _collect_support_entries(
     for model in documented_models:
         if (model.docs_page, model.model_type) in represented_pages:
             continue
-        date = _load_file_addition_date(repo_root, model.source_path)
-        if date is None:
-            continue
+        # New reference cards need a row during the required pre-commit check.
+        date = _load_file_addition_date(repo_root, model.source_path) or "Unreleased"
         recipe_url = recipe_urls.get(model.docs_page, "")
         entries.append(
             _SupportEntry(
