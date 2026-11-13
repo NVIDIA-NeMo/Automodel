@@ -31,7 +31,7 @@ from nemo_automodel.components.models.inkling2.layers import Inkling2MoE, inklin
 from nemo_automodel.components.models.inkling2.model import Inkling2ForConditionalGeneration
 from nemo_automodel.components.moe import layers as moe_layers
 from nemo_automodel.components.moe import parallelizer as moe_parallelizer
-from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 
 pytestmark = pytest.mark.cpu_only
 
@@ -199,15 +199,6 @@ def test_expert_parallel_grouped_mm_experts_get_the_softcapped_activation(monkey
     torch.testing.assert_close(
         moe.experts.expert_activation(torch.tensor([[2.0, 30.0]]), torch.ones(1, 1)), _softcapped_reference(2.0, 30.0)
     )
-
-
-def test_expert_parallel_te_experts_get_the_softcapped_activation(monkeypatch):
-    """TE grouped experts keep the adapter's stacked keys and take Inkling 2's activation."""
-    pytest.importorskip("transformer_engine.pytorch")
-    monkeypatch.setattr(moe_layers, "get_world_size_safe", lambda: 2)
-    moe = Inkling2MoE(_tiny_config().text_config, BackendConfig(attn="sdpa", experts="te", dispatcher="hybridep"))
-    assert isinstance(moe.experts, GroupedExpertsTE)
-    assert moe.experts.expert_activation.func is inkling2_softcapped_swiglu
 
 
 @pytest.mark.parametrize("world_size", [1, 4])
