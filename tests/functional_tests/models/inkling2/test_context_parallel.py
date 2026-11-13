@@ -207,7 +207,7 @@ def worker(case: str, output: Path) -> None:
             max_loss_error=0.0,
         )
 
-        def step(index: int, compare: bool = True) -> None:
+        def step(index: int, compare: bool = True, *, deterministic_loss: bool = False) -> None:
             length = 11 if index == 0 else 5
             ids = (torch.arange(2 * dp * length, device=device).reshape(2 * dp, length) + index) % 35 + 1
             valid = torch.ones_like(ids, dtype=torch.bool)
@@ -339,7 +339,7 @@ def worker(case: str, output: Path) -> None:
                     evaluated[index] = (local_labels, count)
                 elif not compare and index in evaluated:
                     local_labels, count = evaluated[index]
-                if fused_loss:
+                if fused_loss and not deterministic_loss:
                     weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=mesh["dp_cp"].get_group())
                     loss = loss_fn(result.hidden_states, local_labels, weight) / count
                 else:
@@ -422,37 +422,54 @@ def worker(case: str, output: Path) -> None:
 
         step(0)
         state, optim_state = get_state_dict(model, optimizer)
+        saved_parameters = {name: dense(parameter).clone() for name, parameter in owners.items()}
+        saved_optimizer = {
+            name: {
+                key: dense(value).clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
+                for key, value in optimizer.state[parameter].items()
+            }
+            for name, parameter in owners.items()
+        }
         dcp.save({"model": state, "optimizer": optim_state}, checkpoint_id=output / "checkpoint")
+
+        def restore() -> None:
+            state, optim_state = get_state_dict(model, optimizer)
+            dcp.load({"model": state, "optimizer": optim_state}, checkpoint_id=output / "checkpoint")
+            set_state_dict(model, optimizer, model_state_dict=state, optim_state_dict=optim_state)
+            for name, parameter in owners.items():
+                torch.testing.assert_close(dense(parameter), saved_parameters[name], rtol=0, atol=0, msg=name)
+                actual_state = optimizer.state[parameter]
+                assert actual_state.keys() == saved_optimizer[name].keys(), name
+                for key, target in saved_optimizer[name].items():
+                    actual = actual_state[key]
+                    if isinstance(actual, torch.Tensor):
+                        torch.testing.assert_close(dense(actual), target, rtol=0, atol=0, msg=f"{name}.{key}")
+                    else:
+                        assert actual == target, (name, key)
+
         step(1)
+        if fused_loss:
+            # Both training updates above qualify the fused loss against the
+            # independent reference. CCE's atomic backward is nondeterministic,
+            # so isolate checkpoint replay with the model's FP32 logits/CE path.
+            # Verify the loaded parameter and optimizer state exactly first.
+            restore()
+            step(1, compare=False, deterministic_loss=True)
         replay = {
             name: (dense(p).clone(), dense(p.grad).clone(), dense(optimizer.state[p]["momentum_buffer"]).clone())
             for name, p in owners.items()
         }
-        state, optim_state = get_state_dict(model, optimizer)
-        dcp.load({"model": state, "optimizer": optim_state}, checkpoint_id=output / "checkpoint")
-        set_state_dict(model, optimizer, model_state_dict=state, optim_state_dict=optim_state)
-        step(1, compare=False)
-
-        def replay_tolerance(kind: int, target: torch.Tensor) -> dict[str, float]:
-            # The fused kernel accumulates its backward with atomics: a replayed step reproduces the
-            # BF16 gradients and momenta to a few BF16 ulps of their largest magnitude (3 percent)
-            # and the FP32 masters to the resulting update.
-            if not fused_loss:
-                return dict(rtol=0.0, atol=0.0)
-            if kind == 0:
-                return dict(rtol=0.0, atol=1e-5)
-            return dict(rtol=0.0, atol=float(target.abs().max()) * 2**-5)
-
+        restore()
+        step(1, compare=False, deterministic_loss=fused_loss)
         for name, parameter in owners.items():
             current = (dense(parameter), dense(parameter.grad), dense(optimizer.state[parameter]["momentum_buffer"]))
-            for kind, (actual, target) in enumerate(zip(current, replay[name])):
+            for actual, target in zip(current, replay[name]):
                 torch.testing.assert_close(
-                    actual,
-                    target,
-                    **replay_tolerance(kind, target),
-                    msg=lambda error, name=name: f"replay {name}: {error}",
+                    actual, target, rtol=0, atol=0, msg=lambda error, name=name: f"replay {name}: {error}"
                 )
-        metrics["checkpoint_replay_exact"] = not fused_loss
+        metrics["checkpoint_restore_exact"] = True
+        metrics["checkpoint_replay_exact"] = True
+        metrics["checkpoint_replay_loss"] = "model_logits_cross_entropy"
         (output / f"metrics-{dist.get_rank()}.json").write_text(json.dumps(metrics, indent=2) + "\n")
         dist.barrier()
     finally:
