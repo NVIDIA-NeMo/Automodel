@@ -851,3 +851,45 @@ def test_uncommitted_reference_card_is_included_before_first_commit(tmp_path, mo
     assert len(entries) == 1
     assert entries[0].date == "Unreleased"
     assert entries[0].model_link == "[Model](/model-coverage/vision-language-models/org/Model)"
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("checkpoint", ["org/new-model", "checkpoints/local-model"])
+def test_new_recipe_can_be_validated_before_its_first_commit(tmp_path: Path, staged: bool, checkpoint: str):
+    from tools.docs.build import coverage_tables as coverage
+
+    existing = tmp_path / "examples/llm_finetune/existing.yaml"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("model:\n  pretrained_model_name_or_path: org/existing\n")
+    _commit_recipes(tmp_path)
+    added = existing.with_name("new.yaml")
+    added.write_text(f"model:\n  pretrained_model_name_or_path: {checkpoint}\n")
+    if staged:
+        subprocess.run(["git", "-C", str(tmp_path), "add", str(added)], check=True)
+
+    dates = coverage._load_recipe_addition_dates(tmp_path)
+    assert dates["examples/llm_finetune/existing.yaml"] == "2026-07-30"
+    assert dates["examples/llm_finetune/new.yaml"] == "Unreleased"
+    releases = _load_model_releases(tmp_path, {})
+    if checkpoint.startswith("org/"):
+        added_release = next(release for release in releases if release.hf_model_id == checkpoint)
+        assert added_release.release_date == "Unreleased"
+    else:
+        assert [release.hf_model_id for release in releases] == ["org/existing"]
+
+
+def test_missing_history_for_committed_recipe_still_fails(tmp_path: Path, monkeypatch):
+    from tools.docs.build import coverage_tables as coverage
+
+    recipe = tmp_path / "examples/llm_finetune/model.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("model:\n  pretrained_model_name_or_path: org/model\n")
+    _commit_recipes(tmp_path)
+    run_git = coverage._run_git
+
+    def missing_history(root: Path, args: list[str]) -> str:
+        return "" if args[0] == "log" else run_git(root, args)
+
+    monkeypatch.setattr(coverage, "_run_git", missing_history)
+    with pytest.raises(ValueError, match="Missing recipe additions"):
+        coverage._load_recipe_addition_dates(tmp_path)

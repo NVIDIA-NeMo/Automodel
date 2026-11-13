@@ -105,7 +105,7 @@ checkpoint:
   dequantize_base_checkpoint: true
 wandb:
   enable: false
-  project: inkling2
+  project: GoldenCreek
   name: inkling2_medpix_lora_ep32
   mode: online
   dir: logs/inkling2_medpix_lora_ep32/wandb

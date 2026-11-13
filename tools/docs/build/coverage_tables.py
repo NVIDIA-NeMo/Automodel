@@ -339,6 +339,16 @@ def _load_recipe_addition_dates(repo_root: Path) -> dict[str, str]:
     current_recipes = {path.relative_to(repo_root).as_posix() for path in (repo_root / "examples").rglob("*.yaml")}
     missing_recipes = current_recipes - additions.keys()
     if missing_recipes:
+        # Pre-commit checks also inspect recipes newly added in the working tree.
+        # Only paths absent from HEAD can lack an introduction commit legitimately;
+        # tracked recipes must still have complete history below.
+        committed_recipes = set(
+            _run_git(repo_root, ["ls-tree", "-r", "--name-only", "HEAD", "--", "examples"]).splitlines()
+        )
+        for recipe in missing_recipes - committed_recipes:
+            additions[recipe] = ("Unreleased", None)
+        missing_recipes &= committed_recipes
+    if missing_recipes:
         raise ValueError(
             "Git history is incomplete for model support generation; use fetch-depth: 0. "
             f"Missing recipe additions: {', '.join(sorted(missing_recipes))}"
@@ -496,7 +506,7 @@ def _load_model_docs(docs_root: Path) -> tuple[dict[str, list[_ModelDoc]], set[s
 def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]) -> list[_ModelRelease]:
     # This both validates that the checkout contains complete recipe history and
     # gives a clearer error than a missing pickaxe result in a shallow clone.
-    _load_recipe_addition_dates(repo_root)
+    addition_dates = _load_recipe_addition_dates(repo_root)
     introduction_dates = _load_model_introduction_dates(repo_root)
     releases_by_model_type: dict[tuple[str, str], _ModelRelease] = {}
     for path in sorted((repo_root / "examples").rglob("*.yaml")):
@@ -530,6 +540,8 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
             )
             recipe_string = recipe.as_posix()
             release_date = introduction_dates.get((recipe_string, hf_model_id))
+            if release_date is None and addition_dates[recipe_string] == "Unreleased":
+                release_date = "Unreleased"
             if release_date is None:
                 raise ValueError(f"Could not find when {hf_model_id} was introduced in {recipe_string}")
             release = _ModelRelease(release_date, hf_model_id, docs_page, model_type, recipe_string)
