@@ -984,6 +984,7 @@ class ZephonInstructionDatasetConfig(ZephonLanguageDatasetConfig):
         pipeline.map_transform(
             partial(normalize_instruction_chat, config=self), parallelism=options.workers.map_parallelism
         )
+        # tokenize_chat already emits NumPy token IDs and loss masks.
         return pipeline.tokenize_chat(
             tokenizer=tokenizer,
             chat_template=template,
