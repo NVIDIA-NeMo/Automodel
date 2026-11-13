@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The output head (FP32 logits, softcap, unpadded vocabulary) follows the HuggingFace Inkling 2
+# implementation (Apache-2.0).
+# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/50682
+# Revision: 109a7d19bf667168837f32929e00b791e195d14d
+# Original file: src/transformers/models/inkling2/modeling_inkling2.py
+
 """Native NeMo AutoModel implementation of Inkling 2 (``Inkling2ForConditionalGeneration``).
 
 The output head follows the Transformers ``inkling2`` reference (huggingface/transformers

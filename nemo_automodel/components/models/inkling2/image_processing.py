@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The image preprocessing follows the HuggingFace Inkling 2 image processor (Apache-2.0).
+# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/50682
+# Revision: 109a7d19bf667168837f32929e00b791e195d14d
+# Original file: src/transformers/models/inkling2/image_processing_inkling2.py
+
 """Native image preprocessing for the Inkling 2 vision tower.
 
 Code provenance: the preprocessing follows ``Inkling2ImageProcessor`` in Hugging Face Transformers

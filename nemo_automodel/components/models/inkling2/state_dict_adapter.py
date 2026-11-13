@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The checkpoint key correspondence follows the HuggingFace Inkling 2 checkpoint conversion (Apache-2.0).
+# Copyright (C) 2025 the HuggingFace Inc. team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/50682
+# Revision: 109a7d19bf667168837f32929e00b791e195d14d
+# Original files: src/transformers/conversion_mapping.py, src/transformers/core_model_loading.py
+
 """State-dict adapter between native Inkling 2 modules and the released checkpoint layout.
 
 The released checkpoint (``thinkingmachines/Inkling-2-Small``) uses ``model.llm.*`` and

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Attribute names, defaults and aliases follow the HuggingFace Inkling 2 configuration (Apache-2.0).
+# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/50682
+# Revision: 109a7d19bf667168837f32929e00b791e195d14d
+# Original file: src/transformers/models/inkling2/configuration_inkling2.py
+
 """Inkling 2 configuration classes for Automodel's registry-first config lookup.
 
 Attribute names, defaults and aliases follow the Transformers ``inkling2`` configuration
