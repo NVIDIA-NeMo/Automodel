@@ -38,7 +38,6 @@ def _training_schedule(config: DataloaderConfig) -> DatasetBuildSchedule:
     return DatasetBuildSchedule(config.batch_size, config.batch_size, max_steps=1, val_check_interval=None)
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("policy", ["eos", "tokenizer_default"])
 def test_text_tokens_and_positions_stay_numpy_through_packing(config, tokenizer, policy):
     source = Path(config.dataset_config.zephon.sources[0].path) / "text.jsonl"
