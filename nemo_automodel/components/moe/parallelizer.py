@@ -51,6 +51,7 @@ from nemo_automodel.components.distributed.multimodal_fsdp import (
     shard_multimodal_module,
 )
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
+from nemo_automodel.components.moe.dist_moe_experts import GroupedExpertsDistMoE
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import (
     Gate,
@@ -345,7 +346,7 @@ class ExpertParallel(ParallelStyle):
             )
             module.register_parameter(name, dist_param)
 
-        if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsMoK)):
+        if isinstance(module, (GroupedExpertsDeepEP, GroupedExpertsMoK, GroupedExpertsDistMoE)):
             module.init_token_dispatcher(ep_mesh=device_mesh)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
@@ -410,6 +411,10 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
                 device_mesh=ep_mesh,
                 parallelize_plan=ExpertParallel(),
             )
+
+    dist_moe_modules = [module for module in model.modules() if isinstance(module, GroupedExpertsDistMoE)]
+    if dist_moe_modules:
+        dist_moe_modules[0].initialize_shared_context(dist_moe_modules)
 
 
 # Alias of the shared tower taxonomy. Previously a private copy that had drifted
@@ -766,6 +771,11 @@ def apply_ac(
     router_topk = getattr(getattr(torch.ops.aten, "topk", None), "default", None)
 
     def _custom_policy(ctx, func, *args, **kwargs):
+        if func.namespace == "dist_moe":
+            from torch._higher_order_ops.effects import has_effects
+
+            if has_effects(func):
+                return CheckpointPolicy.MUST_SAVE
         if (router_topk is not None and func == router_topk) or _is_router_projection(func, args):
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
@@ -1284,6 +1294,12 @@ def parallelize_model(
             trainability after TP/EP/AC surgery and immediately before FSDP
             construction.
     """
+
+    if any(isinstance(module, GroupedExpertsDistMoE) for module in model.modules()):
+        if "pp" in world_mesh.mesh_dim_names and world_mesh["pp"].size() > 1:
+            raise ValueError("Dist-MoE pipeline parallelism requires activation-slot scheduling")
+        if activation_checkpointing and not (_is_selective_ac(activation_checkpointing) or ignore_router_for_ac):
+            raise ValueError("Dist-MoE requires selective checkpointing, ignore_router_for_ac, or no checkpointing")
 
     tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
     if tp_enabled:

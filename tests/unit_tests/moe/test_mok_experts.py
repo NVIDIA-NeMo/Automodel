@@ -399,7 +399,9 @@ def test_mok_mxfp8_cache_requires_one_optimizer_per_model_part() -> None:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"n_shared_experts": 0}, "n_shared_experts=0"),
+        # The pinned MoK derives the shared intermediate size from the shared weights and requires it to be positive.
+        ({"n_shared_experts": 0}, r"n_shared_experts=0 \(must be 1\)"),
+        ({"n_shared_experts": 2}, r"n_shared_experts=2 \(must be 1\)"),
         ({"dim": 384}, "dim=384"),
         ({"moe_inter_dim": 384}, "moe_inter_dim=384"),
         ({"expert_bias": True}, "expert_bias=True"),
