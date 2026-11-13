@@ -219,6 +219,30 @@ def test_limit_dataset_samples(tmp_path: Path):
     del first["___PAD_TOKEN_IDS___"]
     assert set(first.keys()) == {"labels", "input_ids", "attention_mask"}
 
+
+def test_limit_dataset_samples_larger_than_dataset_keeps_all_rows(tmp_path: Path):
+    """A limit above the dataset size keeps every row, as the other LLM datasets do."""
+    samples = [
+        {"query": "Why is the sky blue?", "response": "Rayleigh scattering."},
+        {"query": "What is 2+2?", "response": "4."},
+    ]
+    jsonl_path = tmp_path / "toy.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as fp:
+        for row in samples:
+            fp.write(json.dumps(row) + "\n")
+
+    ds = ColumnMappedTextInstructionDataset(
+        path_or_dataset_id=str(jsonl_path),
+        column_mapping={"question": "query", "answer": "response"},
+        tokenizer=_DummyTokenizer(),
+        answer_only_loss_mask=False,
+        limit_dataset_samples=100,
+    )
+
+    assert len(ds) == 2
+    assert len(list(ds)) == 2
+
+
 class _TokenizerNoChat:  # noqa: D401 - minimal stub only
     """Tokenizer *without* chat‐template support."""
 
