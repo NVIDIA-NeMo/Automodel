@@ -148,6 +148,7 @@ def test_invalid_base_fails_instead_of_skipping_metadata(checkout: Path) -> None
         ("functional", "`ci.functional` is missing"),
         ("unread_list", "Recipe lists that no CI scope reads"),
         ("missing_entry", "Missing recipe list references"),
+        ("duplicate_key", "generation skips this recipe"),
         ("generator", "combos failed"),
     ],
 )
@@ -160,6 +161,11 @@ def test_validator_failures_reach_cli(checkout: Path, failure: str, diagnostic: 
     elif failure == "unread_list":
         (config / "nightly_recipes.yml").write_text(
             "examples_dir: diffusion/finetune\nconfigs: [model/existing.yaml]\n"
+        )
+    elif failure == "duplicate_key":
+        # The linter keeps the last duplicate; the generator cannot read the file and would skip it.
+        (checkout / "examples/diffusion/finetune/model/existing.yaml").write_text(
+            "ci:\n  functional: skipped\n  functional: release\n  cluster_tag: h100\n"
         )
     elif failure == "missing_entry":
         convergence = checkout / "tests/ci_tests/configs/convergence"

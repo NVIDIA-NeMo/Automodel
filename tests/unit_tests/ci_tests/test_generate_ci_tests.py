@@ -19,6 +19,7 @@ from ruamel.yaml import YAML
 
 from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from tests.ci_tests.utils.generate_ci_tests import (
+    functional_recipe_scopes,
     functional_scopes,
     functional_test_folder,
     generate_job,
@@ -622,13 +623,27 @@ def test_functional_discovery_skips_invalid_recipes(tmp_path: Path, capsys: pyte
     family = tmp_path / "examples/llm_finetune/family"
     (family / "missing.yaml").write_text("ci:\n  cluster_tag: h100\n")
     (family / "broken.yaml").write_text("ci: [\n")
+    # PyYAML keeps the last duplicate, so the linter accepts this file; the generator cannot read it.
+    (family / "duplicate.yaml").write_text("ci:\n  functional: skipped\n  functional: nightly\n")
 
     pipeline = generate_pipeline(str(tmp_path), "nightly", "llm_finetune")
 
     assert set(pipeline) - {"include"} == {"valid"}
     stderr = capsys.readouterr().err
-    for name in ("typo", "missing", "broken"):
+    for name in ("typo", "missing", "broken", "duplicate"):
         assert f"WARNING: skipping examples/llm_finetune/family/{name}.yaml" in stderr
+    scopes, errors = functional_recipe_scopes(str(tmp_path), "llm_finetune")
+    assert scopes == {Path("examples/llm_finetune/family/valid.yaml"): {"nightly"}}
+    assert {path.stem for path in errors} == {"typo", "missing", "broken", "duplicate"}
+
+
+def test_functional_discovery_reads_yml_recipes(tmp_path: Path) -> None:
+    _write_functional_recipes(tmp_path, {"yaml_recipe": "release"})
+    (tmp_path / "examples/llm_finetune/family/yml_recipe.yml").write_text("ci:\n  functional: release\n")
+
+    pipeline = generate_pipeline(str(tmp_path), "release", "llm_finetune")
+
+    assert set(pipeline) - {"include"} == {"yaml_recipe", "yml_recipe"}
 
 
 @pytest.fixture(scope="module")

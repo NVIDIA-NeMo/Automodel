@@ -37,6 +37,7 @@ from generate_ci_tests import (  # noqa: E402
     AUTO_DISCOVER_SCOPES,
     FUNCTIONAL_SCOPES,
     FUNCTIONAL_TEST_FOLDERS,
+    functional_recipe_scopes,
     generate_pipeline,
 )
 
@@ -91,14 +92,24 @@ def main() -> int:
         job_count = sum(1 for k in pipeline if k not in ("include", "stages"))
         successes.append((folder, scope, job_count))
 
+    # Generation skips a functional-folder recipe it cannot read, such as one with a duplicate
+    # YAML key, so the scheduled pipelines would silently drop it.
+    skipped: list[tuple[Path, str]] = []
+    for examples_subpath in FUNCTIONAL_TEST_FOLDERS.values():
+        _scopes, errors = functional_recipe_scopes(str(automodel_dir), examples_subpath)
+        skipped.extend(errors.items())
+
     for folder, scope, job_count in successes:
         print(f"OK   {folder}/{scope}: {job_count} jobs", file=sys.stderr)
     for folder, scope, tb in failures:
         print(f"\nFAIL {folder}/{scope}:\n{tb}", file=sys.stderr)
+    for recipe, error in skipped:
+        print(f"\nFAIL {recipe}: generation skips this recipe: {error}", file=sys.stderr)
 
-    if failures:
+    if failures or skipped:
         print(
-            f"\n{len(failures)} of {len(matrix)} (test_folder, scope) combos failed.",
+            f"\n{len(failures)} of {len(matrix)} (test_folder, scope) combos failed; "
+            f"generation skips {len(skipped)} recipe(s).",
             file=sys.stderr,
         )
         return 1

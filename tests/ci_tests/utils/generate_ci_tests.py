@@ -137,24 +137,43 @@ def _load_ci_config(path: Path) -> Dict[str, Any]:
     return ci_config if isinstance(ci_config, dict) else {}
 
 
+def functional_recipe_scopes(
+    automodel_dir: str, examples_subpath: str
+) -> tuple[Dict[Path, frozenset[str]], Dict[Path, str]]:
+    """Read ``ci.functional`` from every recipe YAML under examples/<examples_subpath>/.
+
+    Args:
+        automodel_dir: Path to the Automodel directory
+        examples_subpath: A ``FUNCTIONAL_TEST_FOLDERS`` subpath under examples/
+
+    Returns:
+        The functional scopes of each readable recipe, and an error message for each recipe that
+        cannot be parsed or has an invalid ``ci.functional``. Paths are relative to ``automodel_dir``.
+    """
+    automodel_path = Path(automodel_dir)
+    examples_path = automodel_path / "examples" / examples_subpath
+    scopes: Dict[Path, frozenset[str]] = {}
+    errors: Dict[Path, str] = {}
+    for path in sorted([*examples_path.rglob("*.yaml"), *examples_path.rglob("*.yml")]):
+        recipe = path.relative_to(automodel_path)
+        try:
+            scopes[recipe] = functional_scopes(_load_ci_config(path))
+        except (ValueError, YAMLError) as error:
+            errors[recipe] = str(error)
+    return scopes, errors
+
+
 def _discover_functional(automodel_dir: str, examples_subpath: str, scope: str) -> list[Path]:
     """Return the recipes under examples/<examples_subpath>/ whose ``ci.functional`` selects ``scope``.
 
     A recipe that cannot be parsed or has an invalid ``ci.functional`` is reported and skipped,
-    so it cannot remove the rest of the folder from the pipeline.
+    so it cannot remove the rest of the folder from the pipeline. validate_generate_ci.py fails
+    on such recipes before they merge.
     """
-    automodel_path = Path(automodel_dir)
-    selected = []
-    for path in sorted((automodel_path / "examples" / examples_subpath).rglob("*.yaml")):
-        recipe = path.relative_to(automodel_path)
-        try:
-            scopes = functional_scopes(_load_ci_config(path))
-        except (ValueError, YAMLError) as error:
-            print(f"WARNING: skipping {recipe}: {error}", file=sys.stderr)
-            continue
-        if scope in scopes:
-            selected.append(recipe)
-    return selected
+    scopes, errors = functional_recipe_scopes(automodel_dir, examples_subpath)
+    for recipe, error in errors.items():
+        print(f"WARNING: skipping {recipe}: {error}", file=sys.stderr)
+    return [recipe for recipe, recipe_scopes in scopes.items() if scope in recipe_scopes]
 
 
 def _discover_via_glob(automodel_dir: str, examples_subpath: str) -> list[Path]:
