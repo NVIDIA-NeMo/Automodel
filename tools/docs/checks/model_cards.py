@@ -24,7 +24,7 @@ from tools.docs.build.coverage_tables import (
     _iter_pretrained_model_ids,
     _read_documented_recipe,
 )
-from tools.docs.cards import _local_checkpoint_identity, _model_card_aliases, _model_card_paths
+from tools.docs.cards import _model_card_aliases, _model_card_paths
 
 
 def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
@@ -40,19 +40,6 @@ def _validate_model_card_recipe_identity(repo_root: Path, card: Path) -> None:
         recipe_ids.update(_iter_pretrained_model_ids(recipe.get("model", {})))
     metadata = yaml.safe_load(document.split("---", 2)[1])
     title = metadata["title"]
-    if _local_checkpoint_identity(card) is not None:
-        slug = metadata.get("slug")
-        if not isinstance(slug, str) or not slug.strip().strip("/"):
-            raise ValueError(f"{card}: add an explicit frontmatter slug for the supplied checkpoint")
-        recipe_paths = set(re.findall(r"examples/[A-Za-z0-9_./-]+\.yaml", document))
-        # Reference cards may precede training support, just like Hub reference cards.
-        for recipe_path in sorted(recipe_paths):
-            recipe = yaml.safe_load((repo_root / recipe_path).read_text(encoding="utf-8"))
-            model = recipe.get("model", {}) if isinstance(recipe, dict) else {}
-            checkpoint = model.get("pretrained_model_name_or_path") if isinstance(model, dict) else None
-            if not isinstance(checkpoint, str) or not checkpoint.startswith(("/", "./", "checkpoints/")):
-                raise ValueError(f"{card}: supplied-checkpoint recipe {recipe_path} must use a local model path")
-        return
     if recipe_ids:
         names = {model_id.split("/", 1)[1] for model_id in recipe_ids}
         if title not in names:

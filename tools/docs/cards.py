@@ -14,7 +14,6 @@
 
 """Discover model cards by route, preserving their published source paths."""
 
-import re
 from pathlib import Path
 
 import yaml
@@ -82,23 +81,3 @@ def _model_card_aliases(repo_root: Path) -> dict[Path, Path]:
         canonical = selected[0]
         aliases.update((path, canonical) for path in paths if path != canonical)
     return aliases
-
-
-def _local_checkpoint_identity(path: Path) -> tuple[str, str] | None:
-    """Read an explicitly identified supplied checkpoint, without inventing a Hub ID."""
-    document = path.read_text(encoding="utf-8")
-    if not document.startswith("---\n"):
-        return None
-    _, frontmatter, body = document.split("---", 2)
-    metadata = yaml.safe_load(frontmatter) or {}
-    if "local_checkpoint" not in metadata:
-        return None
-    checkpoint = metadata["local_checkpoint"]
-    if not isinstance(checkpoint, dict):
-        raise ValueError(f"{path}: local_checkpoint must declare name and publisher")
-    name, publisher = checkpoint.get("name"), checkpoint.get("publisher")
-    if not all(isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", value) for value in (name, publisher)):
-        raise ValueError(f"{path}: local_checkpoint must declare name and publisher")
-    if f"`{name}`" not in body:
-        raise ValueError(f"{path}: describe the supplied checkpoint `{name}` in the page body")
-    return name, publisher

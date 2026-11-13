@@ -27,7 +27,7 @@ from tools.docs.build.coverage_tables import (
     _load_model_releases,
     _resolve_model_card_routes,
 )
-from tools.docs.cards import _frontmatter_slug, _local_checkpoint_identity, _model_card_aliases, _model_card_paths
+from tools.docs.cards import _frontmatter_slug, _model_card_aliases, _model_card_paths
 from tools.docs.catalog import (
     MAX_TOTAL_ENCODED_BYTES,
     PROVIDER_ORGS,
@@ -224,9 +224,6 @@ def _validate_provider_sections(repo_root: Path) -> None:
                     offenders.append(f"{path}: page title {title!r} does not match {model_id!r}")
                 hf_checkpoints = re.findall("https://huggingface\\.co/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", document)
                 canonical_publishers = {owner for (owner, checkpoint) in hf_checkpoints if checkpoint == model_id}
-                local_checkpoint = _local_checkpoint_identity(model_path)
-                if local_checkpoint is not None:
-                    canonical_publishers = {local_checkpoint[1]}
                 if not canonical_publishers:
                     offenders.append(f"{path}: URL model ID {model_id!r} is not linked by the card")
                 expected_publisher = PROVIDER_ORGS.get(provider_slug)

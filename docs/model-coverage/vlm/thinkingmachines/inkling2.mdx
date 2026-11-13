@@ -1,21 +1,17 @@
 ---
-title: "Inkling2"
-description: "Explore the Inkling2 architecture and supplied checkpoint format, including local attention, routed experts, and vision features, with NeMo AutoModel."
-slug: model-coverage/vision-language-models/thinkingmachines/Inkling2
-local_checkpoint:
-  name: tmlinkling_vv3
-  publisher: thinkingmachines
+title: "Inkling-2-Small"
+description: "Explore the Inkling-2-Small architecture and checkpoint formats, including local attention, routed experts, and vision features, with NeMo AutoModel."
+slug: model-coverage/vision-language-models/thinkingmachines/Inkling-2-Small
 ---
 
-Inkling2 (Inkling v2) is a vision-language Mixture-of-Experts model. This page
-records the architecture of the supplied `tmlinkling_vv3` checkpoint for NeMo
-AutoModel users. The download includes an SGLang/TML inference implementation,
-configuration, tokenizer, and model weights.
+[Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) is a vision-language
+Mixture-of-Experts model from Thinking Machines Lab with 594B total and 17B active parameters. It
+accepts text and image inputs, generates text, and supports a context window of up to 1M tokens.
+This page records the architecture of the released checkpoints for NeMo AutoModel users.
 
 <Note>
 Native NeMo AutoModel training support is pending. Training recipes and launch
-instructions will be added with the implementation. The checkpoint is supplied
-as a local directory; no public Hugging Face model ID is assumed.
+instructions will be added with the implementation.
 </Note>
 
 ## Model Reference
@@ -24,9 +20,11 @@ as a local directory; no public Hugging Face model ID is assumed.
 
 | Property | Value |
 | --- | --- |
-| Checkpoint | Supplied `tmlinkling_vv3` directory |
-| **Architecture** | Vision-language model with a routed Mixture-of-Experts decoder |
+| Checkpoints | [`thinkingmachines/Inkling-2-Small`](https://huggingface.co/thinkingmachines/Inkling-2-Small) (NVFP4), [`thinkingmachines/Inkling-2-Small-MXFP8`](https://huggingface.co/thinkingmachines/Inkling-2-Small-MXFP8) |
+| Architecture | `Inkling2ForConditionalGeneration`, a vision-language model with a routed Mixture-of-Experts decoder |
+| Parameters | 594B total, 17B active |
 | Inputs | Text and images |
+| Context length | Up to 1M tokens |
 | Language backbone | 48 layers, hidden size 4608 |
 | Attention | 48 query heads, 8 KV heads, head dimension 128 |
 | Attention pattern | Five local layers followed by one full layer, repeated eight times |
@@ -37,7 +35,7 @@ as a local directory; no public Hugging Face model ID is assumed.
 | Output logits | Soft cap of 30; padded vocabulary rows excluded |
 | Vision tower | 23 layers, hidden size 1024, 16 attention heads |
 | Vision projection | Native 20-by-20 patches; neighboring 2-by-2 features merged before projection |
-| Released expert weights | Layers 0-39: NVFP4; layers 40-47: MXFP8 |
+| Expert weights | `Inkling-2-Small`: NVFP4 in layers 0-39, MXFP8 in layers 40-47; `Inkling-2-Small-MXFP8`: MXFP8 in all layers |
 
 ### Attention and Residuals
 
@@ -69,7 +67,14 @@ The vision encoder processes native 20-by-20 image patches. The projector
 concatenates each neighboring 2-by-2 group of vision features, then maps that
 vector into the language hidden space.
 
-The supplied checkpoint mixes NVFP4 and MXFP8 expert weights with
-floating-point parameters elsewhere in the model. Its quantization metadata
-is in `hf_quant_config.json`. The download also contains an auxiliary
-multi-token prediction module.
+Thinking Machines publishes two checkpoints. `Inkling-2-Small` is the native
+NVFP4 release: its experts are NVFP4 in layers 0-39 and MXFP8 in layers 40-47.
+`Inkling-2-Small-MXFP8` stores every expert in MXFP8. Both checkpoints keep the
+remaining parameters in floating point, record the layout in
+`hf_quant_config.json`, and include an auxiliary multi-token prediction module
+in `mtp.safetensors`.
+
+## Hugging Face Model Card
+
+- [thinkingmachines/Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)
+- [thinkingmachines/Inkling-2-Small-MXFP8](https://huggingface.co/thinkingmachines/Inkling-2-Small-MXFP8)
