@@ -299,6 +299,49 @@ def _split_and_add_pack(
     return output_dict
 
 
+_PACKED_TOKEN_COLUMNS = ("input_ids", "labels", "position_ids")
+_INTEGER_DTYPES = {"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"}
+
+
+def _integer_list_column(features, name: str) -> bool:
+    feature = features.get(name) if features is not None else None
+    dtype = str(getattr(getattr(feature, "feature", None), "dtype", ""))
+    return dtype in _INTEGER_DTYPES
+
+
+def format_packed_token_columns(dataset):
+    """Return packed rows whose token columns are 1-D torch tensors.
+
+    Default Hugging Face formatting rebuilds ``input_ids``, ``labels`` and
+    ``position_ids`` as Python lists on every ``__getitem__``. Those columns
+    are fixed-length in a packed THD row (shape ``[sequence]``). ``seq_lens``
+    and ``seq_lens_padded`` stay Python lists because the collator pads them
+    as ragged document lengths.
+
+    Args:
+        dataset: A Hugging Face dataset, a dataset dict, or any other object.
+            Non-dataset objects are returned unchanged.
+
+    Returns:
+        The same dataset when it has no integer token columns. Otherwise a
+        dataset whose token columns format as torch tensors and whose other
+        columns keep the default formatter.
+    """
+    if isinstance(dataset, DatasetDict):
+        formatted = {name: format_packed_token_columns(split) for name, split in dataset.items()}
+        if all(formatted[name] is dataset[name] for name in dataset):
+            return dataset
+        return DatasetDict(formatted)
+
+    features = getattr(dataset, "features", None)
+    if features is None or not hasattr(dataset, "with_format"):
+        return dataset
+    columns = [name for name in _PACKED_TOKEN_COLUMNS if _integer_list_column(features, name)]
+    if not columns:
+        return dataset
+    return dataset.with_format("torch", columns=columns, output_all_columns=True)
+
+
 def pack_dataset(
     dataset: torch.utils.data.Dataset | Dataset | DatasetDict | list[dict[str, list[int]]],
     split: str | None,

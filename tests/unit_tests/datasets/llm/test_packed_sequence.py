@@ -13,9 +13,14 @@
 # limitations under the License.
 
 import pytest
-from datasets import Dataset
+import torch
+from datasets import Dataset, DatasetDict
 
-from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset, tokenize_dataset_parallel
+from nemo_automodel.components.datasets.llm.packed_sequence import (
+    format_packed_token_columns,
+    pack_dataset,
+    tokenize_dataset_parallel,
+)
 
 
 class _FakeTokenizingDataset:
@@ -655,3 +660,33 @@ def test_neat_pack_over_pretokenized_matches_lazy():
     for i in range(len(packs_lazy)):
         for key in packs_lazy.column_names:
             assert list(packs_lazy[i][key]) == list(packs_pre[i][key]), (i, key)
+
+
+def test_format_packed_token_columns_keeps_length_lists():
+    """Token columns become 1-D tensors; ragged document lengths stay lists."""
+    source = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3, 4]],
+            "labels": [[-100, 2, 3, 4]],
+            "position_ids": [[0, 1, 2, 3]],
+            "seq_lens": [[4]],
+            "seq_lens_padded": [[4]],
+        }
+    )
+    formatted = format_packed_token_columns(source)
+    row = formatted[0]
+    assert isinstance(row["input_ids"], torch.Tensor)
+    assert tuple(row["input_ids"].shape) == (4,)
+    assert row["input_ids"].tolist() == [1, 2, 3, 4]
+    assert isinstance(row["labels"], torch.Tensor)
+    assert isinstance(row["position_ids"], torch.Tensor)
+    assert row["seq_lens"] == [4]
+    assert row["seq_lens_padded"] == [4]
+
+    untouched = object()
+    assert format_packed_token_columns(untouched) is untouched
+
+    splits = DatasetDict({"train": source})
+    formatted_splits = format_packed_token_columns(splits)
+    assert isinstance(formatted_splits["train"][0]["input_ids"], torch.Tensor)
+    assert formatted_splits["train"][0]["seq_lens"] == [4]

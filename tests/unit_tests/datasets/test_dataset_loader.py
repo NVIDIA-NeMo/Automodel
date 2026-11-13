@@ -471,6 +471,30 @@ def test_native_thd_packing_build_preserves_dataset_and_collator(monkeypatch):
     assert observed[0]["cp_size"] == 2
 
 
+def test_thd_packing_build_reads_token_columns_as_tensors():
+    from datasets import Dataset
+
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    source = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3, 4], [5, 6, 7]],
+            "labels": [[-100, 2, 3, 4], [5, 6, 7]],
+        }
+    )
+    dataset, collator = ThdPackingConfig(packed_sequence_size=8).build(source, cp_size=1)
+    assert collator is packed_sequence_thd_collater
+    row = dataset[0]
+    assert isinstance(row["input_ids"], torch.Tensor)
+    assert isinstance(row["labels"], torch.Tensor)
+    assert isinstance(row["position_ids"], torch.Tensor)
+    assert isinstance(row["seq_lens"], list)
+    listed = {key: value.tolist() if isinstance(value, torch.Tensor) else value for key, value in row.items()}
+    assert torch.equal(collator([row])["input_ids"], collator([listed])["input_ids"])
+    assert torch.equal(collator([row])["labels"], collator([listed])["labels"])
+    assert torch.equal(collator([row])["position_ids"], collator([listed])["position_ids"])
+
+
 def test_native_packing_uses_model_owned_cp_alignment(monkeypatch):
     observed = []
 

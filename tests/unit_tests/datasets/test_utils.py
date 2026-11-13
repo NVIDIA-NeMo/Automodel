@@ -420,6 +420,43 @@ def test_create_causal_mask_mapping_uses_inputs_embeds_keyword() -> None:
 class TestPackedSequenceTHDCollater:
     """Tests for packed_sequence_thd_collater function."""
 
+    def test_tensor_rows_match_python_lists(self):
+        """1-D integer tensors stack to the same int64 batch as Python lists."""
+        import warnings
+
+        lists = [
+            {
+                "input_ids": [1, 2, 3, 4],
+                "labels": [-100, 2, 3, 4],
+                "position_ids": [0, 1, 2, 3],
+                "seq_lens": [4],
+                "seq_lens_padded": [4],
+            },
+            {
+                "input_ids": [5, 6, 7, 8],
+                "labels": [5, 6, -100, 8],
+                "position_ids": [0, 1, 2, 3],
+                "seq_lens": [2, 2],
+                "seq_lens_padded": [2, 2],
+            },
+        ]
+        tensors = [
+            {
+                **row,
+                "input_ids": torch.tensor(row["input_ids"], dtype=torch.int32),
+                "labels": torch.tensor(row["labels"], dtype=torch.int32),
+                "position_ids": torch.tensor(row["position_ids"], dtype=torch.int64),
+            }
+            for row in lists
+        ]
+        expected = sftp.packed_sequence_thd_collater(lists)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            result = sftp.packed_sequence_thd_collater(tensors)
+        for key in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded"):
+            assert result[key].dtype == torch.long
+            assert torch.equal(result[key], expected[key])
+
     def test_empty_batch(self):
         """Test that empty batch returns empty dict."""
         result = sftp.packed_sequence_thd_collater([])
