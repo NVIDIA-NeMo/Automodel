@@ -891,9 +891,6 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         # Casting again here would round strict FP32 DTensor storage.
         if not _has_dtensor_params(self):
             cast_model_to_dtype(self, dtype)
-        for layer in self.model.layers.values():
-            if layer.engram is not None:
-                layer.engram.embed.mark_sharding_contract()
 
 
 DeepseekV41ForCausalLM.parallelizer = PARALLELIZER

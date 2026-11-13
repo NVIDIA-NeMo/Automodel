@@ -556,11 +556,7 @@ def clip_grad_norm(
     )
     if can_use_torch_clip:
         for p in parameters:
-            if (
-                isinstance(p, DTensor)
-                or isinstance(p.grad, DTensor)
-                or getattr(p, "_nemo_model_owned_grad_divisor", None) is not None
-            ):
+            if isinstance(p, DTensor) or isinstance(p.grad, DTensor):
                 can_use_torch_clip = False
                 break
 
@@ -679,16 +675,16 @@ def scale_grads_and_clip_grad_norm(
     use_torch_clip_grad_norm: bool = False,
     grad_norm_backend: _GradNormBackend = "triton",
 ) -> torch.Tensor | float:
-    """Scale gradients for PP/EP and model-owned shards, then clip.
+    """Scale gradients for PP/EP, then clip.
 
     The caller must synchronize TP-replicated gradients once after accumulation
     and before calling this function. This helper does not synchronize replicas.
+    Parameters a model shards itself (for example an Engram table routed over an
+    owner group) arrive here already averaged by the model's own backward.
 
     - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
     - EP scaling: for parameters on the expert axis, divide grads by
       ``(dp_group_size / ep_shard_size) * expert_tp_replication_factor``.
-    - Owner-sharded scaling: divide each marked gradient by the explicit factor
-      declared by its model-owned sharding contract.
     - Finally, perform grad clipping with PP/EP-aware reductions.
 
     Args:
@@ -733,27 +729,18 @@ def scale_grads_and_clip_grad_norm(
             ep_ratio = float(dp_group_size) / float(ep_shard_size)
             ep_ratio *= float(expert_tp_replication_factor)
 
-    has_model_owned_sharded_params = any(
-        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
-        for model_part in model_parts
-        for parameter in model_part.parameters()
-    )
-
     # One structural scan shared by the EP grad scaling below and the EP norm
     # reduction inside clipping.
     ep_param_ids = _ep_local_expert_param_ids(model_parts, ep_axis_name) if moe_mesh is not None else None
 
     # Single pass over parameters to apply both scalings where applicable
-    if pp_divisor is not None or ep_ratio is not None or has_model_owned_sharded_params:
+    if pp_divisor is not None or ep_ratio is not None:
         for mp in model_parts:
             for p in mp.parameters():
                 if p.grad is None:
                     continue
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
-                owner_divisor = getattr(p, "_nemo_model_owned_grad_divisor", None)
-                if owner_divisor is not None:
-                    p.grad.div_(float(owner_divisor))
                 if ep_ratio is not None:
                     # Scale expert gradients by the FSDP/EP ratio and by any
                     # identical TP token replicas that were gathered inside EP.
@@ -770,7 +757,7 @@ def scale_grads_and_clip_grad_norm(
                         and ep_axis_name in p_mesh_names
                     )
                     is_expert_param = ep_param_ids is not None and id(p) in ep_param_ids
-                    if owner_divisor is None and (is_ep_sharded_dtensor or is_expert_param):
+                    if is_ep_sharded_dtensor or is_expert_param:
                         p.grad.div_(ep_ratio)
 
     # Clip with the existing PP/EP-aware helper
