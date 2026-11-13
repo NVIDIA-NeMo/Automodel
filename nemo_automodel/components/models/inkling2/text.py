@@ -224,7 +224,9 @@ class Inkling2ShortConvolution(nn.Module):
         residual = hidden_states.float()
         sequence = residual.shape[1]
         context = _mask_padding_states(residual, conv_mask).transpose(1, 2)
-        convolved = self.conv1d(context)[:, :, :sequence].transpose(1, 2)
+        # FP32 taps on FP32 states: keep an enclosing BF16 autocast from lowering the convolution.
+        with torch.autocast(device_type=context.device.type, enabled=False):
+            convolved = self.conv1d(context)[:, :, :sequence].transpose(1, 2)
         return ((convolved + residual) / math.sqrt(self.conv_kernel_size + 1)).to(input_dtype)
 
     @torch.no_grad()

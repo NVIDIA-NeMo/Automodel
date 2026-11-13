@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Block attention residual: einsum mixing equals the SDPA formulation and stays FP32 under autocast."""
+"""FP32 mixing paths: einsum block residual equals SDPA; residual and short conv ignore BF16 autocast."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.models.inkling2.text import Inkling2BlockAttentionResidual, _unweighted_rms_norm
+from nemo_automodel.components.models.inkling2.text import (
+    Inkling2BlockAttentionResidual,
+    Inkling2ShortConvolution,
+    _unweighted_rms_norm,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -77,3 +81,15 @@ def test_mixing_stays_fp32_under_bf16_autocast():
     for a, b in zip(plain, cast):
         assert b.dtype is torch.float32
         torch.testing.assert_close(b, a, rtol=0, atol=0)
+
+
+def test_short_convolution_stays_fp32_under_bf16_autocast():
+    torch.manual_seed(0)
+    conv = Inkling2ShortConvolution(32, 4)
+    conv.init_weights(0.5)
+    hidden = torch.randn(2, 9, 32, dtype=torch.bfloat16)
+    mask = torch.ones(2, 9)
+    plain = conv(hidden, mask)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        cast = conv(hidden, mask)
+    torch.testing.assert_close(cast, plain, rtol=0, atol=0)
