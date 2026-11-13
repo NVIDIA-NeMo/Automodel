@@ -440,7 +440,7 @@ class ModelState:
         # this filtering removes them.
         # TODO: this is a hack and we should find a better way to do this.
         if self.is_peft:
-            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k or "gated_mtp_sampler" in k}
 
         # Pipeline parallelism partitions layers across PP ranks, so each rank's
         # local adapter (collected above) only covers its own stages. Gather the

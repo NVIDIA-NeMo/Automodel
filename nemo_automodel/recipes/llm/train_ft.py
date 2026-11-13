@@ -94,13 +94,14 @@ from nemo_automodel.components.loss.utils import (
     calculate_loss,
     prepare_lm_weight,
 )
+from nemo_automodel.components.models.common.mtp import roll_tensor
 from nemo_automodel.components.models.common.packing import (
     PackingCapabilities,
     configure_packing_for_models,
     validate_thd_packing_support,
 )
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
-from nemo_automodel.components.speculative.gated_mtp import GatedMTPLayout
+from nemo_automodel.components.speculative.gated_mtp import GatedMTPLayout, GatedMTPSampler
 from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.embedding_row_repair import randomize_embedding_rows
@@ -788,6 +789,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # damaged (embedding_row_repair wouldn't touch them), just duplicated copies of one
             # placeholder vector in the base checkpoint, so every depth needs its own random row.
             randomize_embedding_rows(model, list(self.cfg.gated_mtp.mask_token_ids), seed=self.cfg.get("seed", 42))
+            # The sampler (arXiv:2507.11851 Sec. 2.3) is attached here, before sharding: it's a
+            # new submodule (not a structural replacement like a wrapped embedding would be), so
+            # it needs to exist before optimizer.build() collects trainable parameters below, and
+            # multi-GPU FSDP2 sharding of a late-attached module is unsupported, hence the guard.
+            if self.dist_env.world_size > 1:
+                raise NotImplementedError("gated_mtp's sampler does not support multi-GPU yet (world_size > 1).")
+            model.gated_mtp_sampler = GatedMTPSampler(
+                hidden_size=model.config.hidden_size,
+                num_depths=len(self.cfg.gated_mtp.mask_token_ids),
+            ).to(device=next(model.parameters()).device, dtype=next(model.parameters()).dtype)
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
@@ -1579,7 +1590,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                             lm_head = _get_lm_head_module(model)
                             if lm_head is None:
                                 raise ValueError("lm_head module not found in model")
-                            head_logits = [lm_head(h) for h in mtp_per_depth_h]
+                            sampler = getattr(model, "gated_mtp_sampler", None)
+                            if self.gated_mtp is not None and sampler is not None:
+                                # Teacher-forced sampler (arXiv:2507.11851 Sec. 2.3): "previous
+                                # token" is the frozen base model's own greedy prediction at that
+                                # position (from the clean copy's own logits), not a label -- so
+                                # train-time input matches what's available at inference time.
+                                embed = model.get_input_embeddings()
+                                base_pred_ids = out.logits.argmax(dim=-1).detach()
+                                head_logits = []
+                                for depth, h in enumerate(mtp_per_depth_h, start=1):
+                                    prev_ids = roll_tensor(base_pred_ids, shifts=-(depth - 1), dim=-1)
+                                    prev_emb = embed(prev_ids)
+                                    head_logits.append(lm_head(sampler(h, prev_emb)))
+                                # calculate_mtp_loss (below) recomputes its own hard-CE logits from
+                                # mtp_per_depth_h when given raw hidden states; the straight-through
+                                # cancellation this KL-recovery trick depends on requires that term to
+                                # use these SAME sampler-refined logits, not the un-sampled ones.
+                                mtp_per_depth_logits = head_logits
+                                mtp_per_depth_h = None
+                            else:
+                                head_logits = [lm_head(h) for h in mtp_per_depth_h]
                         logits_for_loss = apply_mtp_kl_recovery(
                             logits_for_loss, head_logits, scaling_factor=soft_scaling_factor
                         )

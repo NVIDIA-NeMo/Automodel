@@ -20,10 +20,12 @@ from nemo_automodel.components.speculative.gated_mtp.core import (
     GatedMTPLayout,
     GatedMTPOutput,
 )
+from nemo_automodel.components.speculative.gated_mtp.sampler import GatedMTPSampler
 
 __all__ = [
     "GatedMTPConfig",
     "GatedMTPInputs",
     "GatedMTPLayout",
     "GatedMTPOutput",
+    "GatedMTPSampler",
 ]
