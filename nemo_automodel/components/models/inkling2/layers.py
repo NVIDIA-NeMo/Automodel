@@ -30,7 +30,7 @@ import torch
 
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -145,7 +145,8 @@ class Inkling2MoE(MoE):
 
         Raises:
             ValueError: If the backend requests a non-FP32 gate precision or an expert
-                implementation without a pluggable activation.
+                implementation whose parameters the state-dict adapter cannot map (TE grouped
+                experts, MoK).
         """
         if backend.gate_precision not in (None, torch.float32):
             raise ValueError(f"Inkling 2 routes in FP32; got gate_precision={backend.gate_precision}")
@@ -158,13 +159,17 @@ class Inkling2MoE(MoE):
             gate_softcap=config.mlp_gate_softcap,
             up_softcap=config.mlp_up_softcap,
         )
-        # The expert implementations name their pluggable activation differently.
+        # Only expert implementations that keep ``gate_and_up_projs`` / ``down_projs`` (the names
+        # the state-dict adapter maps) are accepted; they name their pluggable activation differently.
         if isinstance(self.experts, GroupedExperts):
             self.experts.expert_activation_grouped = activation
-        elif isinstance(self.experts, (GroupedExpertsDeepEP, GroupedExpertsTE)):
+        elif isinstance(self.experts, GroupedExpertsDeepEP):
             self.experts.expert_activation = activation
         else:
-            raise ValueError(f"Inkling 2 does not support the {type(self.experts).__name__} expert backend")
+            raise ValueError(
+                f"Inkling 2 does not support the {type(self.experts).__name__} expert backend; with the "
+                "deepep/hybridep/uccl_ep dispatchers set backend.experts to torch_mm (or gmm / torch_mm_mxfp8)"
+            )
 
 
 __all__ = ["Inkling2MoE", "inkling2_moe_config", "inkling2_softcapped_swiglu"]
