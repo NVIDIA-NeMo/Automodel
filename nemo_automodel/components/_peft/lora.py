@@ -50,7 +50,10 @@ from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 HAS_TE, transformer_engine = safe_import_te()
-HAS_PEFT_TRAINABLE_TOKENS, TrainableTokensWrapper = safe_import_from("peft.utils.other", "TrainableTokensWrapper")
+HAS_PEFT_TRAINABLE_TOKENS, TrainableTokensConfig = safe_import_from(
+    "peft.tuners.trainable_tokens.config", "TrainableTokensConfig"
+)
+_, TrainableTokensLayer = safe_import_from("peft.tuners.trainable_tokens.layer", "TrainableTokensLayer")
 
 if TYPE_CHECKING:
     from transformer_engine.pytorch import Linear as _TELinear
@@ -704,9 +707,8 @@ def patch_moe_module(
 def patch_embedding_module(orig_embedding: nn.Embedding, token_indices: list[int]) -> nn.Module:
     """Wrap an embedding so only specific rows are trainable, the rest frozen.
 
-    Uses PEFT's own ``TrainableTokensWrapper`` (a stock PEFT feature since ``peft>=0.20.0``, not a
-    custom reimplementation) -- the exact module ``peft.get_peft_model`` installs for
-    ``LoraConfig.trainable_token_indices`` -- so the resulting checkpoint stays loadable by a plain
+    Uses PEFT's own ``TrainableTokensLayer`` (a stock PEFT feature since ``peft>=0.20.0``, not a
+    custom reimplementation), so the resulting checkpoint stays loadable by a plain
     ``peft.PeftModel.from_pretrained()`` with no Automodel-specific code: only the rows named by
     ``token_indices`` get a small trainable delta parameter, initialized to the current row values
     (a no-op until trained); every other row stays bit-identical to the frozen base embedding.
@@ -717,9 +719,7 @@ def patch_embedding_module(orig_embedding: nn.Embedding, token_indices: list[int
 
     Returns:
         The wrapped embedding module; the caller installs it in the model (e.g. via
-        ``model.set_input_embeddings``). Its trainable delta lives at
-        ``<module>.token_adapter.trainable_tokens_delta["default"]``; the frozen original embedding
-        at ``<module>.token_adapter.base_layer``.
+        ``model.set_input_embeddings``).
 
     Raises:
         ImportError: If ``peft``'s ``trainable_tokens`` tuner module is not installed.
@@ -729,7 +729,10 @@ def patch_embedding_module(orig_embedding: nn.Embedding, token_indices: list[int
             "trainable_token_indices requires `peft` (its `trainable_tokens` tuner is a stock "
             "feature since peft>=0.20.0, not installed in this environment)."
         )
-    return TrainableTokensWrapper(orig_embedding, "default", token_indices=list(token_indices))
+    config = TrainableTokensConfig(token_indices=list(token_indices))
+    wrapped = TrainableTokensLayer(orig_embedding, adapter_name="default", config=config)
+    wrapped.update_layer("default", config=config)
+    return wrapped
 
 
 # patch a model in-place

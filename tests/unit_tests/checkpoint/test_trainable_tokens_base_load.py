@@ -13,10 +13,10 @@
 # limitations under the License.
 
 """Gated-MTP's trainable mask-token embedding must be patched in *after* the base checkpoint
-load, not during PEFT application like LoRA's in-place Linear patching: TrainableTokensWrapper
-wraps the embedding (moving its weight to a nested `token_adapter.base_layer.weight` FQN), so
-patching it before the base HF checkpoint loads would make the loader miss the checkpoint's
-plain `embed_tokens.weight` key entirely."""
+load, not during PEFT application like LoRA's in-place Linear patching: TrainableTokensLayer
+wraps the embedding (moving its weight to a nested `base_layer.weight` FQN), so patching it
+before the base HF checkpoint loads would make the loader miss the checkpoint's plain
+`embed_tokens.weight` key entirely."""
 
 from pathlib import Path
 
@@ -87,16 +87,14 @@ def test_base_checkpoint_loads_before_embedding_is_wrapped(tmp_path: Path) -> No
     wrapped = patch_embedding_module(model.get_input_embeddings(), list(peft_config.trainable_token_indices))
     model.set_input_embeddings(wrapped)
 
-    torch.testing.assert_close(wrapped.token_adapter.base_layer.weight, pretrained["embed_tokens.weight"])
-    torch.testing.assert_close(
-        wrapped.token_adapter.trainable_tokens_delta["default"], pretrained["embed_tokens.weight"][[2, 5]]
-    )
+    torch.testing.assert_close(wrapped.base_layer.weight, pretrained["embed_tokens.weight"])
+    torch.testing.assert_close(wrapped.trainable_tokens_delta["default"], pretrained["embed_tokens.weight"][[2, 5]])
 
     # The post-load global freeze pass must keep the delta trainable alongside the LoRA weights,
     # not just params whose name contains "lora_".
     _apply_trainability_policy(model, peft_enabled=True, freeze_config=None, strict=False)
-    assert wrapped.token_adapter.trainable_tokens_delta["default"].requires_grad
-    assert wrapped.token_adapter.base_layer.weight.requires_grad is False
+    assert wrapped.trainable_tokens_delta["default"].requires_grad
+    assert wrapped.base_layer.weight.requires_grad is False
     assert model.proj.lora_A.weight.requires_grad
 
 
@@ -114,5 +112,5 @@ def test_wrapping_the_embedding_before_base_load_breaks_the_checkpoint_key(tmp_p
     wrapped = patch_embedding_module(model.get_input_embeddings(), list(peft_config.trainable_token_indices))
     model.set_input_embeddings(wrapped)
 
-    with pytest.raises(CheckpointException, match="embed_tokens.token_adapter.base_layer.weight"):
+    with pytest.raises(CheckpointException, match="embed_tokens.base_layer.weight"):
         _peft_checkpointer(tmp_path).load_base_model(model, torch.device("cpu"), str(tmp_path), str(source))

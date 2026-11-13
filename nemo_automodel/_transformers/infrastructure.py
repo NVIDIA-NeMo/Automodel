@@ -903,9 +903,9 @@ def apply_model_infrastructure(
     )
 
     # Applied after the base checkpoint load (not during _apply_peft_and_lower_precision, unlike
-    # LoRA's in-place Linear monkey-patching): TrainableTokensWrapper wraps the embedding module,
-    # moving its weight to a nested `token_adapter.base_layer.weight` FQN, which would otherwise
-    # miss the base checkpoint's plain `embed_tokens.weight` key.
+    # LoRA's in-place Linear monkey-patching): TrainableTokensLayer wraps the embedding module,
+    # moving its weight to a nested `base_layer.weight` FQN, which would otherwise miss the base
+    # checkpoint's plain `embed_tokens.weight` key.
     trainable_token_indices = getattr(peft_config, "trainable_token_indices", None)
     if trainable_token_indices:
         wrapped_embedding = patch_embedding_module(model.get_input_embeddings(), list(trainable_token_indices))
