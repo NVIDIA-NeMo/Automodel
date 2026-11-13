@@ -51,7 +51,7 @@ def _collect_recipe_model_ids(examples_dir: pathlib.Path) -> set[str]:
                 continue
             if not isinstance(v, str) or "/" not in v:
                 continue
-            if v.startswith("/") or v.startswith("./") or " " in v:
+            if v.startswith(("/", "./", "checkpoints/")) or " " in v:
                 continue
             if any(tok in v.lower() for tok in ("path_to", "your", "<", "placeholder")):
                 continue

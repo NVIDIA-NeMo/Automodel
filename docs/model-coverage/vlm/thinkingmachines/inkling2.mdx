@@ -1,0 +1,75 @@
+---
+title: "Inkling2"
+description: "Explore the Inkling2 architecture and supplied checkpoint format, including local attention, routed experts, and vision features, with NeMo AutoModel."
+slug: model-coverage/vision-language-models/thinkingmachines/Inkling2
+local_checkpoint:
+  name: tmlinkling_vv3
+  publisher: thinkingmachines
+---
+
+Inkling2 (Inkling v2) is a vision-language Mixture-of-Experts model. This page
+records the architecture of the supplied `tmlinkling_vv3` checkpoint for NeMo
+AutoModel users. The download includes an SGLang/TML inference implementation,
+configuration, tokenizer, and model weights.
+
+<Note>
+Native NeMo AutoModel training support is pending. Training recipes and launch
+instructions will be added with the implementation. The checkpoint is supplied
+as a local directory; no public Hugging Face model ID is assumed.
+</Note>
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Checkpoint | Supplied `tmlinkling_vv3` directory |
+| **Architecture** | Vision-language model with a routed Mixture-of-Experts decoder |
+| Inputs | Text and images |
+| Language backbone | 48 layers, hidden size 4608 |
+| Attention | 48 query heads, 8 KV heads, head dimension 128 |
+| Attention pattern | Five local layers followed by one full layer, repeated eight times |
+| Local attention window | 1024 tokens, causal |
+| Experts | 384 routed experts per layer, top-8 sigmoid routing, intermediate size 2304 |
+| Routing scale | 8 |
+| Vocabulary | 201024 embedding rows; 200058 usable token IDs |
+| Output logits | Soft cap of 30; padded vocabulary rows excluded |
+| Vision tower | 23 layers, hidden size 1024, 16 attention heads |
+| Vision projection | Native 20-by-20 patches; neighboring 2-by-2 features merged before projection |
+| Released expert weights | Layers 0-39: NVFP4; layers 40-47: MXFP8 |
+
+### Attention and Residuals
+
+Local layers use causal sliding-window attention. Every sixth layer uses full
+causal attention, allowing information to travel beyond the local window.
+Attention includes learned relative-position terms and attention sinks. The
+text decoder does not use rotary position embeddings.
+
+The decoder also applies causal short convolutions with four taps. Each output
+mixes the current position with up to three previous positions. Attention-based
+residual aggregation uses blocks of six decoder layers, with normalization of
+the residual values.
+
+### Experts and Output Vocabulary
+
+Experts use a SwiGLU variant with separate gate and up soft caps of 4 and 25.
+The checkpoint stores packed gate/up weights in an interleaved layout. Each
+token selects eight of the 384 experts using sigmoid router scores; a routing
+scale of 8 controls the contribution of the selected experts.
+
+The output projection has 201024 rows, of which 200058 correspond to usable
+token IDs. The extra rows pad the matrix dimensions for computation; they do
+not represent sequence padding tokens. A logit soft cap of 30 bounds the
+output scores before the probability distribution is computed.
+
+### Vision Features and Checkpoint Format
+
+The vision encoder processes native 20-by-20 image patches. The projector
+concatenates each neighboring 2-by-2 group of vision features, then maps that
+vector into the language hidden space.
+
+The supplied checkpoint mixes NVFP4 and MXFP8 expert weights with
+floating-point parameters elsewhere in the model. Its quantization metadata
+is in `hf_quant_config.json`. The download also contains an auxiliary
+multi-token prediction module.

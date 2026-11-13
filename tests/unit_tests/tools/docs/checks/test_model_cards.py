@@ -244,3 +244,40 @@ def test_description_validator_accepts_a_valid_model_card(tmp_path: Path):
     card.write_text(f'---\ntitle: "Model-1B"\ndescription: "{description}"\n---\n')
 
     checks._validate_descriptions(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "model_path,release,publisher,body,slug,error",
+    [
+        ("checkpoints/native", "download_v3", "org", "`download_v3`", "Model", None),
+        ("org/Model", "download_v3", "org", "`download_v3`", "Model", "must use a local model path"),
+        ("checkpoints/native", "download_v3", "org", "unspecified", "Model", "describe the supplied checkpoint"),
+        ("checkpoints/native", "download_v3", "", "`download_v3`", "Model", "must declare name and publisher"),
+        ("checkpoints/native", "download_v3", "org", "`download_v3`", "", "explicit frontmatter slug"),
+    ],
+)
+def test_supplied_checkpoint_card_requires_identity_and_local_recipe(
+    tmp_path: Path, model_path: str, release: str, publisher: str, body: str, slug: str, error: str | None
+):
+    import yaml
+
+    recipe = tmp_path / "examples/model.yaml"
+    recipe.parent.mkdir()
+    recipe.write_text(yaml.safe_dump({"model": {"pretrained_model_name_or_path": model_path}}))
+    card = tmp_path / "model.mdx"
+    metadata = {"title": "Model", "slug": slug, "local_checkpoint": {"name": release, "publisher": publisher}}
+    card.write_text("---\n" + yaml.safe_dump(metadata) + "---\n" + body + "\nRecipe: `examples/model.yaml`\n")
+    if error:
+        with pytest.raises(ValueError, match=error):
+            _validate_model_card_recipe_identity(tmp_path, card)
+    else:
+        _validate_model_card_recipe_identity(tmp_path, card)
+
+
+def test_supplied_checkpoint_reference_card_without_recipe(tmp_path: Path):
+    card = tmp_path / "model.mdx"
+    card.write_text(
+        "---\ntitle: Model\nslug: models/Model\nlocal_checkpoint:\n"
+        "  name: download_v3\n  publisher: org\n---\nSupplied `download_v3`.\n"
+    )
+    _validate_model_card_recipe_identity(tmp_path, card)

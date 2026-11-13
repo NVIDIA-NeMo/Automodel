@@ -120,3 +120,16 @@ def test_navigation_accepts_a_card_at_a_previously_shared_source_location(tmp_pa
     assert model.docs_page == "/model-coverage/diffusion/black-forest-labs/FLUX.1-dev"
     assert shared.read_bytes() == document
     assert not card.exists()
+
+
+def test_supplied_checkpoint_publisher_must_match_navigation(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[5]
+    shutil.copytree(repo_root / "docs/model-coverage", tmp_path / "docs/model-coverage")
+    for relative in ("docs/fern/docs.yml", "docs/fern/versions/nightly.yml"):
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(repo_root / relative, destination)
+    card = tmp_path / "docs/model-coverage/vlm/thinkingmachines/inkling2.mdx"
+    card.write_text(card.read_text().replace("publisher: thinkingmachines", "publisher: wrong-owner"))
+    with pytest.raises(ValueError, match="checkpoint publisher.*does not match provider 'thinkingmachines'"):
+        _validate_provider_sections(tmp_path)
