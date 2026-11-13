@@ -1,18 +1,70 @@
 ---
 title: "Inkling-2-Small"
-description: "Explore the Inkling-2-Small architecture and checkpoint formats, including local attention, routed experts, and vision features, with NeMo AutoModel."
+description: "Fine-tune Inkling-2-Small with NeMo AutoModel using 128K packed Tulu 3 text SFT, MedPix LoRA, and MedPix full SFT recipes on GB200 with expert parallelism."
 slug: model-coverage/vision-language-models/thinkingmachines/Inkling-2-Small
 ---
 
 [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) is a vision-language
 Mixture-of-Experts model from Thinking Machines Lab with 594B total and 17B active parameters. It
 accepts text and image inputs, generates text, and supports a context window of up to 1M tokens.
-This page records the architecture of the released checkpoints for NeMo AutoModel users.
+NeMo AutoModel provides a text recipe (`Inkling2ForCausalLM`) and two image-text recipes
+(`Inkling2ForConditionalGeneration`) for the released checkpoint.
 
 <Note>
-Native NeMo AutoModel training support is pending. Training recipes and launch
-instructions will be added with the implementation.
+The recipes require the native Inkling-2-Small implementation, which is not yet part of NeMo
+AutoModel. They run once the implementation is merged.
 </Note>
+
+## Fine-Tune Inkling-2-Small
+
+Follow the [installation instructions](/get-started/installation). The recipes run on multiple
+GB200 nodes with four GPUs each; use the [Slurm launcher guide](/job-launchers/slurm-cluster) for
+multi-node runs. For example, launch the LoRA recipe on 8 nodes:
+
+```bash
+uv run torchrun --nnodes=8 --nproc-per-node=4 \
+  --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+  examples/vlm_finetune/finetune.py \
+  --config examples/vlm_finetune/inkling2/inkling2_medpix_lora_ep32.yaml
+```
+
+Run the text recipe with `examples/llm_finetune/finetune.py`.
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| 128K packed text SFT on Tulu 3 | [inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/inkling2/inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml) |
+| Image-text LoRA on MedPix | [inkling2_medpix_lora_ep32.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_lora_ep32.yaml) |
+| Full image-text SFT on MedPix | [inkling2_medpix_sft_ep64_pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling2/inkling2_medpix_sft_ep64_pp4.yaml) |
+| Prepare your environment | Follow the [installation instructions](/get-started/installation). |
+
+### Configuration
+
+| Setting | Tulu 3 128K SFT | MedPix LoRA | MedPix SFT |
+| --- | --- | --- | --- |
+| Model | `Inkling2ForCausalLM`, text only | `Inkling2ForConditionalGeneration` | `Inkling2ForConditionalGeneration` |
+| GPUs | 64 GB200, 16 nodes | 32 GB200, 8 nodes | 256 GB200, 64 nodes |
+| Parallelism | EP32, PP2, CP32, TP1; FSDP2 | EP32, four replicas, TP1; FSDP2 | EP64, PP4, TP1; FSDP2 |
+| Pipeline schedule | Interleaved 1F1B, 12 layers per stage | None | Interleaved 1F1B, 6 layers per stage |
+| Sequence | Packed THD, 131,072 tokens | Nonpacked, up to 4,097 tokens | Nonpacked, up to 4,097 tokens |
+| Batch | Global 8, local 8 | Global 32, local 1 | Global 256, local 4 |
+| Trained weights | Language model | LoRA rank 8, alpha 32, on attention projections and routed experts | Language model |
+| Weights and optimizer | BF16 weights; FusedAdam with FP32 master weights and BF16 moments | BF16 weights; FusedAdam with FP32 master weights and BF16 moments | FP32 weights; AdamW |
+| Learning rate | 5e-6, constant | 5e-6, constant | 5e-6, 10 warmup steps |
+| Steps | 50 | 100 | 100 |
+
+All three recipes load `thinkingmachines/Inkling-2-Small` and dequantize its NVFP4 and MXFP8 expert
+weights at load time (`checkpoint.dequantize_base_checkpoint: true`). They use flex attention,
+`torch_mm` experts with FP32 router gates, and full activation checkpointing. The output loss,
+`Inkling2FusedLinearCrossEntropy`, applies the logit soft cap of 30 over the 200,058 usable
+vocabulary rows.
+
+The text recipe builds `Inkling2ForCausalLM` from the image-text checkpoint through
+`model.config.architectures`, without the vision tower. It reads pre-packed Tulu 3 rows from
+`dataset.dataset_path`. Both MedPix recipes freeze the vision tower.
+
+W&B is opt-in: set `wandb.enable: true` and configure your entity and project when launching.
 
 ## Model Reference
 
@@ -78,3 +130,8 @@ in `mtp.safetensors`.
 
 - [thinkingmachines/Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)
 - [thinkingmachines/Inkling-2-Small-MXFP8](https://huggingface.co/thinkingmachines/Inkling-2-Small-MXFP8)
+
+## Related Resources
+
+- [Multi-modal dataset guide](/datasets/multi-modal-dataset)
+- [Run on a cluster](/job-launchers/slurm-cluster)
