@@ -864,8 +864,8 @@ def test_trainable_tokens_only_targeted_rows_are_trainable_and_forward_works():
 
     wrapped = patch_embedding_module(base, [2, 5])
 
-    assert wrapped.base_layer.weight.requires_grad is False
-    delta = wrapped.trainable_tokens_delta["default"]
+    assert wrapped.token_adapter.base_layer.weight.requires_grad is False
+    delta = wrapped.token_adapter.trainable_tokens_delta["default"]
     assert delta.requires_grad
     assert delta.shape == (2, 4)
 
@@ -876,4 +876,4 @@ def test_trainable_tokens_only_targeted_rows_are_trainable_and_forward_works():
     loss.backward()
     assert delta.grad is not None
     assert torch.isfinite(delta.grad).all()
-    assert wrapped.base_layer.weight.grad is None
+    assert wrapped.token_adapter.base_layer.weight.grad is None
