@@ -225,6 +225,55 @@ def test_config_lookup_folds_in_the_manifest(tmp_path):
     assert not _should_dequantize_base_checkpoint(_tiny_model(plain), None)
 
 
+def _swapped_manifest() -> dict:
+    """Return :func:`_manifest` with layer 0 in MXFP8 and layer 1 in NVFP4."""
+    manifest = _manifest()
+    groups = manifest["model"]["parameter_groups"]
+    groups[1]["tensors"], groups[2]["tensors"] = groups[2]["tensors"], groups[1]["tensors"]
+    return manifest
+
+
+def _load_config(load: str, path: Path | str, **kwargs) -> Inkling2Config:
+    """Read a config through AutoModel's registered-config lookup or ``Inkling2Config.from_pretrained``."""
+    if load == "get_hf_config":
+        return get_hf_config(str(path), "eager", local_files_only=True, **kwargs)
+    return Inkling2Config.from_pretrained(path, local_files_only=True, **kwargs)
+
+
+@pytest.mark.parametrize("load", ["get_hf_config", "from_pretrained"])
+def test_manifest_is_read_beside_the_selected_config(tmp_path, load):
+    """With ``subfolder``, the manifest comes from the selected directory, not from the checkpoint root."""
+    expected = quantization_config_from_manifest(_manifest())
+    assert quantization_config_from_manifest(_swapped_manifest()) != expected
+
+    _write_checkpoint(tmp_path / "only_selected/selected")
+    assert _load_config(load, tmp_path / "only_selected", subfolder="selected").quantization_config == expected
+
+    _write_checkpoint(tmp_path / "both/selected")
+    (tmp_path / "both/hf_quant_config.json").write_text(json.dumps(_swapped_manifest()))
+    assert _load_config(load, tmp_path / "both", subfolder="selected").quantization_config == expected
+
+    _write_checkpoint(tmp_path / "bf16_selected/selected", with_manifest=False)
+    (tmp_path / "bf16_selected/hf_quant_config.json").write_text(json.dumps(_manifest()))
+    assert not hasattr(_load_config(load, tmp_path / "bf16_selected", subfolder="selected"), "quantization_config")
+
+
+@pytest.mark.parametrize("load", ["get_hf_config", "from_pretrained"])
+def test_manifest_is_read_from_the_requested_revision(tmp_path, load):
+    """A pinned Hub revision supplies both files, even when the branch head ships no manifest."""
+    repo = tmp_path / "hub/models--acme--inkling2-tiny"
+    pinned, head = "a" * 40, "b" * 40
+    _write_checkpoint(repo / "snapshots" / pinned)
+    _write_checkpoint(repo / "snapshots" / head, with_manifest=False)
+    (repo / "refs").mkdir()
+    (repo / "refs/main").write_text(head)
+    cache = {"cache_dir": str(tmp_path / "hub")}
+
+    config = _load_config(load, "acme/inkling2-tiny", revision=pinned, **cache)
+    assert config.quantization_config == quantization_config_from_manifest(_manifest())
+    assert not hasattr(_load_config(load, "acme/inkling2-tiny", **cache), "quantization_config")
+
+
 def test_to_hf_emits_stored_layout_destinations_only_for_quantized_loads(tmp_path):
     _write_checkpoint(tmp_path / "release")
     model = _tiny_model(get_hf_config(str(tmp_path / "release"), "eager"))
