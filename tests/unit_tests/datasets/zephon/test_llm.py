@@ -89,6 +89,24 @@ def test_pretokenized_schema_preserves_unshifted_tokens_and_masks():
             normalize_pretokenized_document(malformed, config=config, valid_token_ids=np.arange(6, dtype=np.int64))
 
 
+def test_pretokenized_arrays_retain_storage_without_writing_inputs() -> None:
+    config = ZephonPretokenizedTextDatasetConfig(zephon=_SETTINGS)
+    payload = {
+        "input_ids": np.arange(6, dtype=np.int64)[::2],
+        "loss_mask": np.array([0, 1, 1], dtype=np.uint8),
+        "positions": np.array([0, 1, 0], dtype=np.int64),
+    }
+    for value in payload.values():
+        value.flags.writeable = False
+    actual = normalize_pretokenized_document(
+        payload, config=config, valid_token_ids=np.arange(6, dtype=np.int64), preserve_positions=True
+    )
+    for name, expected in payload.items():
+        assert np.shares_memory(actual[name], expected)
+        np.testing.assert_array_equal(actual[name], expected)
+        assert not expected.flags.writeable
+
+
 def test_pad_override_and_eos_collision(tokenizer):
     assert resolve_token_ids(tokenizer, pad_token_id=None).pad == tokenizer.eos_token_id
     with pytest.raises(ValueError, match="contradicts"):
