@@ -237,6 +237,36 @@ class TestErnie4_5_MoeStateDictAdapter:
         assert mock_merge.call_args[0][1] is mesh
         assert out is sentinel
 
+    def test_from_hf_keeps_model_prefix_when_lm_head_comes_last(self, moe_hf_config, moe_config, backend_config):
+        """A trailing unprefixed key such as lm_head.weight must not change the expert key prefix."""
+        adapter = Ernie4_5_MoeStateDictAdapter(moe_hf_config, moe_config, backend_config, dtype=torch.float32)
+        hf_state = {"model.embed_tokens.weight": torch.randn(8, 64)}
+        for expert in range(moe_config.n_routed_experts):
+            prefix = f"model.layers.1.mlp.experts.{expert}"
+            hf_state[f"{prefix}.gate_proj.weight"] = torch.randn(32, 64)
+            hf_state[f"{prefix}.up_proj.weight"] = torch.randn(32, 64)
+            hf_state[f"{prefix}.down_proj.weight"] = torch.randn(64, 32)
+        hf_state["model.norm.weight"] = torch.randn(64)
+        hf_state["lm_head.weight"] = torch.randn(8, 64)
+
+        native = adapter.from_hf(dict(hf_state))
+        round_trip = adapter.to_hf(native)
+
+        assert adapter._uses_model_prefix is True
+        assert set(round_trip) == set(hf_state)
+        for key, value in hf_state.items():
+            torch.testing.assert_close(round_trip[key], value)
+
+    def test_from_hf_detects_unprefixed_expert_keys(self, moe_hf_config, moe_config, backend_config):
+        adapter = Ernie4_5_MoeStateDictAdapter(moe_hf_config, moe_config, backend_config)
+        hf_state = {
+            "layers.1.mlp.experts.0.up_proj.weight": torch.randn(32, 64),
+            "lm_head.weight": torch.randn(8, 64),
+        }
+        with patch.object(adapter, "_from_hf_w_merged_experts", side_effect=lambda sd, _: sd):
+            adapter.from_hf(hf_state)
+        assert adapter._uses_model_prefix is False
+
     def test_convert_single_tensor_to_hf_non_expert(self, moe_hf_config, moe_config, backend_config):
         adapter = Ernie4_5_MoeStateDictAdapter(moe_hf_config, moe_config, backend_config)
         tensor = torch.randn(4, 4)
