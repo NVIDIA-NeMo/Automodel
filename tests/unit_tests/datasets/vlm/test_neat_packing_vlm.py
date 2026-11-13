@@ -27,6 +27,7 @@ from nemo_automodel.components.datasets.vlm.neat_packing_vlm import (
     _build_packed_vlm_sample,
     _compute_mrope_position_ids,
     _estimate_sample_length,
+    _estimate_video_tokens,
     _image_token_counter,
     _shift_sample,
     neat_pack_dataset_vlm,
@@ -942,3 +943,41 @@ class TestNeatPackingFill:
 
         assert len(pack["input_ids"]) == 4
         assert "Pack 0: dropped 1 of 2 samples that did not fit pack_size 6" in caplog.text
+
+
+# Qwen3-VL video processor defaults.
+_QWEN3_VL_VIDEO_CFG = {
+    "patch_size": 16,
+    "merge_size": 2,
+    "temporal_patch_size": 2,
+    "factor": 32,
+    "min_pixels": 128 * 32 * 32,
+    "max_pixels": 768 * 32 * 32,
+    "fps": 2,
+    "min_frames": 4,
+    "max_frames": 768,
+}
+
+
+class TestEstimateVideoTokens:
+    # Expected counts are what Qwen3VLVideoProcessor returns for these clips:
+    # sample_frames takes min(max(n, min_frames), max_frames, total_frames), so a clip
+    # with fewer than min_frames frames keeps all of its frames instead of being counted
+    # as min_frames.
+    @pytest.mark.parametrize(
+        "vid_meta, expected",
+        [
+            ([2, 224, 224, 2.0, 1.0], 64),  # grid (1, 16, 16)
+            ([2, 480, 640, 30.0, 2 / 30], 300),  # grid (1, 30, 40)
+            ([3, 224, 224, 30.0, 0.1], 98),  # 3 frames padded to 4: grid (2, 14, 14)
+            ([4, 224, 224, 2.0, 2.0], 98),  # grid (2, 14, 14)
+            ([300, 448, 448, 30.0, 10.0], 360),  # 20 sampled frames: grid (10, 12, 12)
+        ],
+    )
+    def test_matches_qwen3_vl_video_processor(self, vid_meta, expected):
+        assert _estimate_video_tokens(vid_meta, _QWEN3_VL_VIDEO_CFG) == expected
+
+    def test_unknown_frame_count_uses_duration(self):
+        # No frame count or fps: 5 s at 2 fps samples 10 frames rather than min_frames.
+        cfg = dict(_QWEN3_VL_VIDEO_CFG, min_pixels=100, max_pixels=100_000_000)
+        assert _estimate_video_tokens([0, 320, 320, 0.0, 5.0], cfg) == 5 * 100
