@@ -220,10 +220,12 @@ def test_quantized_experts_dispatch_to_the_dequantizers(monkeypatch: pytest.Monk
     calls = []
 
     def dequantize_nvfp4_experts(weight, scale, amax, denominator):
+        """Record the call; weight ``[experts, out, in / 2]`` returns ones of shape ``[experts, out, in]``."""
         calls.append(("nvfp4", weight.shape, scale.shape, amax.shape, denominator.shape))
         return torch.ones(weight.shape[0], weight.shape[1], weight.shape[2] * 2)
 
     def dequantize_mxfp8_experts(weight, scale):
+        """Record the call; weight ``[experts, out, in]`` returns twos of the same shape."""
         calls.append(("mxfp8", weight.shape, scale.shape))
         return torch.full(weight.shape, 2.0)
 

@@ -99,7 +99,17 @@ def _hf_to_native_name(name: str) -> str:
 
 
 def _hf_grad_to_native(name: str, grad: torch.Tensor) -> torch.Tensor:
-    """Bring a Transformers expert gradient into the native grouped-expert layout."""
+    """Bring a Transformers gradient into the native layout.
+
+    Args:
+        name: Transformers parameter name.
+        grad: Gradient in the Transformers layout; ``gate_up_proj`` is ``[experts, 2 * intermediate, hidden]``
+            with ``[gate | up]`` rows and ``down_proj`` is ``[experts, hidden, intermediate]``.
+
+    Returns:
+        The gradient in the native layout: ``[experts, hidden, 2 * intermediate]`` with interleaved gate/up
+        columns, ``[experts, intermediate, hidden]``, or ``grad`` unchanged for other parameters.
+    """
     if name.endswith("mlp.experts.gate_up_proj"):
         # [E, 2I, H] with [gate | up] rows -> interleaved rows -> [E, H, 2I].
         experts, rows, hidden = grad.shape

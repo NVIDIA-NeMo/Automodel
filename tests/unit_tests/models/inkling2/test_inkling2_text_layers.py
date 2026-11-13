@@ -204,6 +204,15 @@ def test_fp32_input_casts_around_fp32_modules_keep_model_dtype_numerics() -> Non
         expected = model(input_ids=input_ids).logits
 
     def cast_inputs(module: torch.nn.Module, args: tuple) -> tuple:
+        """Cast floating positional inputs to FP32.
+
+        Args:
+            module: Hooked module.
+            args: Positional inputs; tensors of any shape, floating ones are cast.
+
+        Returns:
+            The inputs with floating tensors in FP32 and shapes unchanged.
+        """
         return tuple(arg.float() if torch.is_tensor(arg) and arg.is_floating_point() else arg for arg in args)
 
     for name, module in model.named_modules():
