@@ -28,7 +28,6 @@ from nemo_automodel.components._peft.lora import (
     PeftConfig,
     apply_lora_to_linear_modules,
     apply_memory_efficient_lora,
-    patch_embedding_module,
     patch_linear_module,
 )
 from nemo_automodel.components.distributed.parallel_styles import TPLinear
@@ -853,27 +852,3 @@ def test_lora_kernel_launchers_report_missing_triton(monkeypatch: pytest.MonkeyP
     for launch, args in launches:
         with pytest.raises(ImportError, match="triton is not installed"):
             launch(*args)
-
-
-def test_trainable_tokens_only_targeted_rows_are_trainable_and_forward_works():
-    """Ensures only the targeted embedding rows are trainable, the rest stay frozen, and
-    forward/backward succeed without changing the forward output before training."""
-    base = nn.Embedding(10, 4)
-    original = base.weight.data.clone()
-    base.weight.requires_grad_(False)
-
-    wrapped = patch_embedding_module(base, [2, 5])
-
-    assert wrapped.base_layer.weight.requires_grad is False
-    delta = wrapped.trainable_tokens_delta["default"]
-    assert delta.requires_grad
-    assert delta.shape == (2, 4)
-
-    out = wrapped(torch.tensor([0, 2, 5, 9]))
-    torch.testing.assert_close(out, original[[0, 2, 5, 9]])
-
-    loss = out.sum()
-    loss.backward()
-    assert delta.grad is not None
-    assert torch.isfinite(delta.grad).all()
-    assert wrapped.base_layer.weight.grad is None

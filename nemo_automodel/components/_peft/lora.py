@@ -44,16 +44,12 @@ from nemo_automodel.components._peft.lora_kernel import (
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
-from nemo_automodel.shared.import_utils import safe_import, safe_import_from, safe_import_te
+from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 from nemo_automodel.shared.tp_linear import tp_linear_forward
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 HAS_TE, transformer_engine = safe_import_te()
-HAS_PEFT_TRAINABLE_TOKENS, TrainableTokensConfig = safe_import_from(
-    "peft.tuners.trainable_tokens.config", "TrainableTokensConfig"
-)
-_, TrainableTokensLayer = safe_import_from("peft.tuners.trainable_tokens.layer", "TrainableTokensLayer")
 
 if TYPE_CHECKING:
     from transformer_engine.pytorch import Linear as _TELinear
@@ -704,37 +700,6 @@ def patch_moe_module(
     return new_module
 
 
-def patch_embedding_module(orig_embedding: nn.Embedding, token_indices: list[int]) -> nn.Module:
-    """Wrap an embedding so only specific rows are trainable, the rest frozen.
-
-    Uses PEFT's own ``TrainableTokensLayer`` (a stock PEFT feature since ``peft>=0.20.0``, not a
-    custom reimplementation), so the resulting checkpoint stays loadable by a plain
-    ``peft.PeftModel.from_pretrained()`` with no Automodel-specific code: only the rows named by
-    ``token_indices`` get a small trainable delta parameter, initialized to the current row values
-    (a no-op until trained); every other row stays bit-identical to the frozen base embedding.
-
-    Args:
-        orig_embedding: The embedding module to wrap.
-        token_indices: Vocabulary ids whose embedding rows become trainable.
-
-    Returns:
-        The wrapped embedding module; the caller installs it in the model (e.g. via
-        ``model.set_input_embeddings``).
-
-    Raises:
-        ImportError: If ``peft``'s ``trainable_tokens`` tuner module is not installed.
-    """
-    if not HAS_PEFT_TRAINABLE_TOKENS:
-        raise ImportError(
-            "trainable_token_indices requires `peft` (its `trainable_tokens` tuner is a stock "
-            "feature since peft>=0.20.0, not installed in this environment)."
-        )
-    config = TrainableTokensConfig(token_indices=list(token_indices))
-    wrapped = TrainableTokensLayer(orig_embedding, adapter_name="default", config=config)
-    wrapped.update_layer("default", config=config)
-    return wrapped
-
-
 # patch a model in-place
 def apply_lora_to_linear_modules(
     model: nn.Module,
@@ -854,10 +819,6 @@ def apply_lora_to_linear_modules(
         n_fused_mlps = install_fused_lora_mlp(model)
         if n_fused_mlps:
             logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
-
-    if peft_config.trainable_token_indices:
-        wrapped = patch_embedding_module(model.get_input_embeddings(), list(peft_config.trainable_token_indices))
-        model.set_input_embeddings(wrapped)
 
     return num_modules_matched
 

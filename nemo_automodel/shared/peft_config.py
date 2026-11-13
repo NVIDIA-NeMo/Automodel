@@ -49,7 +49,3 @@ class PeftConfig:
     # the whole non-pipeline mesh (ep_size == world_size // pp_size): see
     # validate_packed_expert_topology.
     expert_weight_format: Literal["unquantized", "mxfp4", "nvfp4"] = "unquantized"
-    # Token ids whose input-embedding rows get a small trainable delta (via PEFT's own
-    # `TrainableTokensLayer`) instead of staying frozen with the rest of the embedding table.
-    # Not set from YAML; gated_mtp sets this from its own `mask_token_ids` (see train_ft.py).
-    trainable_token_indices: list[int] | None = None
