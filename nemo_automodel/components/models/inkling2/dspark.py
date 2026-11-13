@@ -809,6 +809,9 @@ class Inkling2DSparkModel(nn.Module):
                 "The Inkling 2 DSpark draft shares the target's embedding and LM head and does not export them, "
                 "so freeze_embeddings must be true."
             )
+        # The recipe passes the target module, or a gathered copy of it, through the generic
+        # DSpark interface, which types only ``weight``; this boundary probe is the one place
+        # the norm is read.
         embed_norm = getattr(embed_tokens, "embed_norm", None)
         if embed_norm is None:
             raise ValueError(
