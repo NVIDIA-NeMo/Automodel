@@ -325,11 +325,16 @@ class Inkling2BlockAttentionResidual(nn.Module):
         Returns:
             ``num_queries`` FP32 tensors of shape ``[batch, sequence, hidden]``.
         """
-        stacked_states = torch.cat([block_states, partial_block_states.unsqueeze(-2)], dim=-2).float()
-        stacked_states = _unweighted_rms_norm(stacked_states, 1e-6)
-        hidden_size = stacked_states.shape[-1]
-        query_states = self.query.float().view(-1, hidden_size).expand(*stacked_states.shape[:-2], -1, -1)
-        mixed = F.scaled_dot_product_attention(query_states, stacked_states, stacked_states, scale=hidden_size**-0.5)
+        # A softmax over at most ``blocks + 1`` states per position. Written as two einsums rather than
+        # SDPA, whose head_dim would be ``hidden`` (math-kernel fallback, ~10x slower and ~10 GiB transient
+        # at 4096 tokens), and outside any enclosing autocast so the mixing stays FP32.
+        with torch.autocast(device_type=partial_block_states.device.type, enabled=False):
+            stacked_states = torch.cat([block_states, partial_block_states.unsqueeze(-2)], dim=-2).float()
+            stacked_states = _unweighted_rms_norm(stacked_states, 1e-6)
+            hidden_size = stacked_states.shape[-1]
+            queries = self.query.float().view(-1, hidden_size)
+            scores = torch.einsum("bskh,qh->bsqk", stacked_states, queries) * hidden_size**-0.5
+            mixed = torch.einsum("bsqk,bskh->bsqh", scores.softmax(dim=-1), stacked_states)
         return mixed.unbind(-2)
 
     @torch.no_grad()
