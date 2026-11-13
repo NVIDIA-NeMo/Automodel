@@ -102,5 +102,5 @@ validation_dataloader:
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
 
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   cluster_tag: h100

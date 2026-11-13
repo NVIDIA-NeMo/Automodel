@@ -109,7 +109,7 @@ wandb:
   dir: logs/wandb
 
 ci:
-  functional: nightly,release
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   recipe_owner: akoumpa
   node_multiplier: true

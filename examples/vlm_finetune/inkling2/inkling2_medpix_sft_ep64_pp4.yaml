@@ -118,7 +118,7 @@ wandb:
   mode: online
   dir: logs/inkling2_medpix_sft_ep64_pp4/wandb
 ci:
-  functional: release
+  nemo_ci_schedule: release
   recipe_owner: snowmanwwg
   nodes: 64
   nproc_per_node: 4

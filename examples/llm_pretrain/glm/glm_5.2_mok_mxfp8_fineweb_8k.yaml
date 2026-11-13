@@ -133,7 +133,7 @@ wandb:
   dir: training_logs/wandb
 
 ci:
-  functional: nightly
+  nemo_ci_schedule: nightly
   recipe_owner: HuiyingLi
   time: "00:30:00"
   nodes: 1

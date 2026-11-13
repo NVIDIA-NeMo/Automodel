@@ -111,7 +111,7 @@ optimizer:
 
 
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   cluster_tag: h100
   time: "00:30:00"
   nodes: 1

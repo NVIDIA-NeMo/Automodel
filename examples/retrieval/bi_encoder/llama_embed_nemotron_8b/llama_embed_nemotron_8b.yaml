@@ -106,5 +106,5 @@ dist_env:
   timeout_minutes: 30
 
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   cluster_tag: h100

@@ -16,7 +16,7 @@
 """Validate the recipe lists in tests/ci_tests/configs/<folder>/<scope>_recipes.yml.
 
 Only RECIPE_LIST_SCOPES in generate_ci_tests.py read a recipe list. The nightly and
-release scopes select recipes by their ``ci.functional`` value, so a list for any
+release scopes select recipes by their ``ci.nemo_ci_schedule`` value, so a list for any
 other scope would be silently ignored. Every entry in a list that is read must
 exist under examples/.
 """
@@ -54,8 +54,8 @@ UNREAD_HEADER = "Recipe lists that no CI scope reads:"
 UNREAD_HOW_TO_FIX = f"""
 ------------------------------------------------------------
 Only these scopes read a recipe list: {", ".join(RECIPE_LIST_SCOPES)}.
-The nightly and release scopes run the recipes whose `ci.functional`
-selects them. Delete each list above and set `ci.functional` in the
+The nightly and release scopes run the recipes whose `ci.nemo_ci_schedule`
+selects them. Delete each list above and set `ci.nemo_ci_schedule` in the
 recipes instead. See tests/ci_tests/README.md for details.
 ------------------------------------------------------------"""
 

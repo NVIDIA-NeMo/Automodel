@@ -155,7 +155,7 @@ wandb:
   name: nemotron_3_5_bolt_cord_v2_lora
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   recipe_owner: huiyingl
   cluster_tag: gb300
   nodes: 1

@@ -116,7 +116,7 @@ checkpoint:
   restore_from: null
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: khazic
   time: "01:00:00"

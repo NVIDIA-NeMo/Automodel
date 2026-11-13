@@ -150,7 +150,7 @@ lr_scheduler:
   lr_decay_style: constant
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   recipe_owner: mreso
   nodes: 16
   time: "01:30:00"

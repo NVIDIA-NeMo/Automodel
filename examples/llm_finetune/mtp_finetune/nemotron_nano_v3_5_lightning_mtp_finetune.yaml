@@ -96,7 +96,7 @@ optimizer:
   weight_decay: 0.1
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   cluster_tag: gb10
   recipe_owner: kashif
   time: "00:20:00"

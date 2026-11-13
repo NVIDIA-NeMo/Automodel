@@ -147,5 +147,5 @@ dataloader:
   group_by_length: true
 
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   cluster_tag: h100

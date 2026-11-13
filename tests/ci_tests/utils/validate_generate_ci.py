@@ -18,7 +18,7 @@
 
 The matrix is auto-discovered from the sources of truth so the check stays current
 without manual maintenance:
-  * FUNCTIONAL_SCOPES x FUNCTIONAL_TEST_FOLDERS in generate_ci_tests.py (nightly, release)
+  * NEMO_CI_SCHEDULE_SCOPES x NEMO_CI_SCHEDULE_FOLDERS in generate_ci_tests.py (nightly, release)
   * AUTO_DISCOVER_SCOPES in generate_ci_tests.py (performance)
   * tests/ci_tests/configs/<folder>/<scope>_recipes.yml files (convergence)
 
@@ -35,10 +35,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_ci_tests import (  # noqa: E402
     AUTO_DISCOVER_SCOPES,
-    FUNCTIONAL_SCOPES,
-    FUNCTIONAL_TEST_FOLDERS,
-    functional_recipe_scopes,
+    NEMO_CI_SCHEDULE_FOLDERS,
+    NEMO_CI_SCHEDULE_SCOPES,
     generate_pipeline,
+    read_nemo_ci_schedules,
 )
 
 
@@ -46,8 +46,8 @@ def collect_matrix(automodel_dir: Path) -> list[tuple[str, str]]:
     """Discover every (test_folder, scope) pair worth validating."""
     matrix: set[tuple[str, str]] = set()
 
-    for scope in FUNCTIONAL_SCOPES:
-        for folder in FUNCTIONAL_TEST_FOLDERS:
+    for scope in NEMO_CI_SCHEDULE_SCOPES:
+        for folder in NEMO_CI_SCHEDULE_FOLDERS:
             matrix.add((folder, scope))
 
     for scope, folders in AUTO_DISCOVER_SCOPES.items():
@@ -63,8 +63,8 @@ def collect_matrix(automodel_dir: Path) -> list[tuple[str, str]]:
         scope = recipe_list.stem[: -len("_recipes")]
         matrix.add((folder, scope))
 
-    # Also exercise every config folder with scope=nightly so folders outside the
-    # functional scopes hit the empty-pipeline path.
+    # Also exercise every config folder with scope=nightly so folders outside
+    # NEMO_CI_SCHEDULE_FOLDERS hit the empty-pipeline path.
     for config_dir in configs_root.iterdir():
         if config_dir.is_dir():
             matrix.add((config_dir.name, "nightly"))
@@ -92,11 +92,11 @@ def main() -> int:
         job_count = sum(1 for k in pipeline if k not in ("include", "stages"))
         successes.append((folder, scope, job_count))
 
-    # Generation skips a functional-folder recipe it cannot read, such as one with a duplicate
-    # YAML key, so the scheduled pipelines would silently drop it.
+    # Generation skips a NEMO_CI_SCHEDULE_FOLDERS recipe it cannot read, such as one with a
+    # duplicate YAML key, so the scheduled pipelines would silently drop it.
     skipped: list[tuple[Path, str]] = []
-    for examples_subpath in FUNCTIONAL_TEST_FOLDERS.values():
-        _scopes, errors = functional_recipe_scopes(str(automodel_dir), examples_subpath)
+    for examples_subpath in NEMO_CI_SCHEDULE_FOLDERS.values():
+        _scopes, errors = read_nemo_ci_schedules(str(automodel_dir), examples_subpath)
         skipped.extend(errors.items())
 
     for folder, scope, job_count in successes:

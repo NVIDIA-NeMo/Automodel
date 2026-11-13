@@ -59,21 +59,21 @@ def slurm_time_multiplier(time: str, multiplier: int):
     return updated_time
 
 
-# Functional scopes select recipes by their required `ci.functional` value, which
+# The nightly and release scopes select recipes by their required `ci.nemo_ci_schedule` value, which
 # tools/lint_example_yamls.py enforces on every example recipe.
-FUNCTIONAL_SCOPES = ("nightly", "release")
+NEMO_CI_SCHEDULE_SCOPES = ("nightly", "release")
 
-# Allowed `ci.functional` values, mapped to the functional scopes that run the recipe.
-FUNCTIONAL_VALUES: dict[str, frozenset[str]] = {
+# Allowed `ci.nemo_ci_schedule` values, mapped to the scopes that run the recipe.
+NEMO_CI_SCHEDULE_VALUES: dict[str, frozenset[str]] = {
     "nightly": frozenset({"nightly"}),
     "release": frozenset({"release"}),
     "nightly,release": frozenset({"nightly", "release"}),
     "skipped": frozenset(),
 }
 
-# Test folders that run in the functional scopes, mapped to their subpath under examples/.
-# A recipe outside these subpaths runs in no functional scope.
-FUNCTIONAL_TEST_FOLDERS = {
+# Test folders whose recipes the nightly and release scopes select, mapped to their subpath
+# under examples/. A recipe outside these subpaths runs in neither scope.
+NEMO_CI_SCHEDULE_FOLDERS = {
     "llm_finetune": "llm_finetune",
     "llm_pretrain": "llm_pretrain",
     "vlm_finetune": "vlm_finetune",
@@ -95,8 +95,8 @@ AUTO_DISCOVER_SCOPES = {
 RECIPE_LIST_SCOPES = ("convergence",)
 
 
-def functional_scopes(ci_config: Mapping[str, Any]) -> frozenset[str]:
-    """Return the functional scopes that a recipe's ``ci.functional`` value selects.
+def nemo_ci_schedule_scopes(ci_config: Mapping[str, Any]) -> frozenset[str]:
+    """Return the NeMo-CI scopes that a recipe's ``ci.nemo_ci_schedule`` value selects.
 
     Args:
         ci_config: The recipe's top-level ``ci`` mapping.
@@ -105,25 +105,25 @@ def functional_scopes(ci_config: Mapping[str, Any]) -> frozenset[str]:
         The scopes that run the recipe; empty for ``skipped``.
 
     Raises:
-        ValueError: If ``ci.functional`` is missing or is not one of ``FUNCTIONAL_VALUES``.
+        ValueError: If ``ci.nemo_ci_schedule`` is missing or is not one of ``NEMO_CI_SCHEDULE_VALUES``.
     """
-    value = ci_config.get("functional")
-    if not isinstance(value, str) or value not in FUNCTIONAL_VALUES:
-        problem = "is missing" if "functional" not in ci_config else f"is {value!r}"
-        raise ValueError(f"`ci.functional` {problem}; set it to one of: {', '.join(FUNCTIONAL_VALUES)}")
-    return FUNCTIONAL_VALUES[value]
+    value = ci_config.get("nemo_ci_schedule")
+    if not isinstance(value, str) or value not in NEMO_CI_SCHEDULE_VALUES:
+        problem = "is missing" if "nemo_ci_schedule" not in ci_config else f"is {value!r}"
+        raise ValueError(f"`ci.nemo_ci_schedule` {problem}; set it to one of: {', '.join(NEMO_CI_SCHEDULE_VALUES)}")
+    return NEMO_CI_SCHEDULE_VALUES[value]
 
 
-def functional_test_folder(recipe: Path) -> str | None:
-    """Return the functional test folder whose examples/ subpath contains ``recipe``, if any.
+def nemo_ci_schedule_folder(recipe: Path) -> str | None:
+    """Return the ``NEMO_CI_SCHEDULE_FOLDERS`` test folder whose examples/ subpath contains ``recipe``.
 
     Args:
         recipe: Recipe path relative to the Automodel directory.
 
     Returns:
-        A key of ``FUNCTIONAL_TEST_FOLDERS``, or None when no functional scope can run the recipe.
+        A key of ``NEMO_CI_SCHEDULE_FOLDERS``, or None when neither scope can run the recipe.
     """
-    for test_folder, examples_subpath in FUNCTIONAL_TEST_FOLDERS.items():
+    for test_folder, examples_subpath in NEMO_CI_SCHEDULE_FOLDERS.items():
         if recipe.is_relative_to(Path("examples") / examples_subpath):
             return test_folder
     return None
@@ -137,18 +137,18 @@ def _load_ci_config(path: Path) -> Dict[str, Any]:
     return ci_config if isinstance(ci_config, dict) else {}
 
 
-def functional_recipe_scopes(
+def read_nemo_ci_schedules(
     automodel_dir: str, examples_subpath: str
 ) -> tuple[Dict[Path, frozenset[str]], Dict[Path, str]]:
-    """Read ``ci.functional`` from every recipe YAML under examples/<examples_subpath>/.
+    """Read ``ci.nemo_ci_schedule`` from every recipe YAML under examples/<examples_subpath>/.
 
     Args:
         automodel_dir: Path to the Automodel directory
-        examples_subpath: A ``FUNCTIONAL_TEST_FOLDERS`` subpath under examples/
+        examples_subpath: A ``NEMO_CI_SCHEDULE_FOLDERS`` subpath under examples/
 
     Returns:
-        The functional scopes of each readable recipe, and an error message for each recipe that
-        cannot be parsed or has an invalid ``ci.functional``. Paths are relative to ``automodel_dir``.
+        The scopes of each readable recipe, and an error message for each recipe that
+        cannot be parsed or has an invalid ``ci.nemo_ci_schedule``. Paths are relative to ``automodel_dir``.
     """
     automodel_path = Path(automodel_dir)
     examples_path = automodel_path / "examples" / examples_subpath
@@ -157,20 +157,20 @@ def functional_recipe_scopes(
     for path in sorted([*examples_path.rglob("*.yaml"), *examples_path.rglob("*.yml")]):
         recipe = path.relative_to(automodel_path)
         try:
-            scopes[recipe] = functional_scopes(_load_ci_config(path))
+            scopes[recipe] = nemo_ci_schedule_scopes(_load_ci_config(path))
         except (ValueError, YAMLError) as error:
             errors[recipe] = str(error)
     return scopes, errors
 
 
-def _discover_functional(automodel_dir: str, examples_subpath: str, scope: str) -> list[Path]:
-    """Return the recipes under examples/<examples_subpath>/ whose ``ci.functional`` selects ``scope``.
+def _discover_nemo_ci_schedule(automodel_dir: str, examples_subpath: str, scope: str) -> list[Path]:
+    """Return the recipes under examples/<examples_subpath>/ whose ``ci.nemo_ci_schedule`` selects ``scope``.
 
-    A recipe that cannot be parsed or has an invalid ``ci.functional`` is reported and skipped,
+    A recipe that cannot be parsed or has an invalid ``ci.nemo_ci_schedule`` is reported and skipped,
     so it cannot remove the rest of the folder from the pipeline. validate_generate_ci.py fails
     on such recipes before they merge.
     """
-    scopes, errors = functional_recipe_scopes(automodel_dir, examples_subpath)
+    scopes, errors = read_nemo_ci_schedules(automodel_dir, examples_subpath)
     for recipe, error in errors.items():
         print(f"WARNING: skipping {recipe}: {error}", file=sys.stderr)
     return [recipe for recipe, recipe_scopes in scopes.items() if scope in recipe_scopes]
@@ -200,8 +200,8 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str) 
     """
     Detect recipe YAML configurations to include in the CI pipeline.
 
-    Functional scopes (FUNCTIONAL_SCOPES) select the recipes of FUNCTIONAL_TEST_FOLDERS by
-    their ``ci.functional`` value. Auto-discovery scopes (AUTO_DISCOVER_SCOPES) collect all
+    Scheduled scopes (NEMO_CI_SCHEDULE_SCOPES) select the recipes of NEMO_CI_SCHEDULE_FOLDERS by
+    their ``ci.nemo_ci_schedule`` value. Auto-discovery scopes (AUTO_DISCOVER_SCOPES) collect all
     YAML files via rglob. Recipe-list scopes (RECIPE_LIST_SCOPES) read a scope-specific
     recipe list. Any other scope and folder combination selects no recipes.
 
@@ -213,8 +213,8 @@ def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str) 
     Returns:
         yml_configs: List of yaml configs with path format examples/{test_folder}/
     """
-    if scope in FUNCTIONAL_SCOPES and test_folder in FUNCTIONAL_TEST_FOLDERS:
-        return _discover_functional(automodel_dir, FUNCTIONAL_TEST_FOLDERS[test_folder], scope)
+    if scope in NEMO_CI_SCHEDULE_SCOPES and test_folder in NEMO_CI_SCHEDULE_FOLDERS:
+        return _discover_nemo_ci_schedule(automodel_dir, NEMO_CI_SCHEDULE_FOLDERS[test_folder], scope)
     auto_folders = AUTO_DISCOVER_SCOPES.get(scope, {})
     if test_folder in auto_folders:
         return _discover_via_glob(automodel_dir, auto_folders[test_folder])

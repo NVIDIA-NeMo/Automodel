@@ -55,5 +55,5 @@ optimizer:
   weight_decay: 0.0
 
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   cluster_tag: h100

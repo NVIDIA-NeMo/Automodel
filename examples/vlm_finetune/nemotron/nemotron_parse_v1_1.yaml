@@ -106,7 +106,7 @@ freeze_config:
 #   name: <your_experiment_name>
 
 ci:
-  functional: nightly,release
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "00:30:00"

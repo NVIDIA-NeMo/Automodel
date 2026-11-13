@@ -123,7 +123,7 @@ peft:
   use_triton: false
   moe_rank_scaling: false
 ci:
-  functional: release
+  nemo_ci_schedule: release
   recipe_owner: snowmanwwg
   nodes: 8
   nproc_per_node: 4

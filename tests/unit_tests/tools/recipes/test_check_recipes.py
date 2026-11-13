@@ -22,10 +22,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tests.ci_tests.utils.generate_ci_tests import AUTO_DISCOVER_SCOPES, FUNCTIONAL_TEST_FOLDERS
+from tests.ci_tests.utils.generate_ci_tests import AUTO_DISCOVER_SCOPES, NEMO_CI_SCHEDULE_FOLDERS
 
 SOURCE_ROOT = Path(__file__).resolve().parents[4]
-ENROLLED_RECIPE = "ci:\n  functional: release\n  cluster_tag: h100\n"
+ENROLLED_RECIPE = "ci:\n  nemo_ci_schedule: release\n  cluster_tag: h100\n"
 VALID_RECIPE = ENROLLED_RECIPE + "  recipe_owner: test\n  time: '00:10:00'\n  nodes: 1\n"
 
 
@@ -65,7 +65,7 @@ def checkout(tmp_path: Path) -> Path:
         dest = root / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(SOURCE_ROOT / name, dest)
-    for folder in (*FUNCTIONAL_TEST_FOLDERS, *AUTO_DISCOVER_SCOPES["performance"]):
+    for folder in (*NEMO_CI_SCHEDULE_FOLDERS, *AUTO_DISCOVER_SCOPES["performance"]):
         path = root / "tests/ci_tests/configs" / folder / "override_recipes.yml"
         path.parent.mkdir(parents=True)
         path.write_text("{}\n")
@@ -116,7 +116,7 @@ def test_added_recipe_metadata_and_paths_with_spaces(checkout: Path, state: str)
 
 def test_added_skipped_recipe_needs_no_ci_metadata(checkout: Path) -> None:
     recipe = checkout / "examples/diffusion/finetune/model/skipped.yaml"
-    recipe.write_text("ci:\n  functional: skipped\n  cluster_tag: h100\n")
+    recipe.write_text("ci:\n  nemo_ci_schedule: skipped\n  cluster_tag: h100\n")
     result = _check(checkout)
     assert result.returncode == 0, result.stderr
     assert "0 newly added CI recipe(s)" in result.stderr
@@ -145,7 +145,7 @@ def test_invalid_base_fails_instead_of_skipping_metadata(checkout: Path) -> None
     ("failure", "diagnostic"),
     [
         ("yaml", "YAML syntax error"),
-        ("functional", "`ci.functional` is missing"),
+        ("nemo_ci_schedule", "`ci.nemo_ci_schedule` is missing"),
         ("unread_list", "Recipe lists that no CI scope reads"),
         ("missing_entry", "Missing recipe list references"),
         ("duplicate_key", "generation skips this recipe"),
@@ -156,7 +156,7 @@ def test_validator_failures_reach_cli(checkout: Path, failure: str, diagnostic: 
     config = checkout / "tests/ci_tests/configs/diffusion_finetune"
     if failure == "yaml":
         (checkout / "examples/diffusion/finetune/model/existing.yaml").write_text("ci: [\n")
-    elif failure == "functional":
+    elif failure == "nemo_ci_schedule":
         (checkout / "examples/diffusion/finetune/model/existing.yaml").write_text("ci:\n  cluster_tag: h100\n")
     elif failure == "unread_list":
         (config / "nightly_recipes.yml").write_text(
@@ -165,7 +165,7 @@ def test_validator_failures_reach_cli(checkout: Path, failure: str, diagnostic: 
     elif failure == "duplicate_key":
         # The linter keeps the last duplicate; the generator cannot read the file and would skip it.
         (checkout / "examples/diffusion/finetune/model/existing.yaml").write_text(
-            "ci:\n  functional: skipped\n  functional: release\n  cluster_tag: h100\n"
+            "ci:\n  nemo_ci_schedule: skipped\n  nemo_ci_schedule: release\n  cluster_tag: h100\n"
         )
     elif failure == "missing_entry":
         convergence = checkout / "tests/ci_tests/configs/convergence"

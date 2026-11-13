@@ -137,7 +137,7 @@ optimizer:
 
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: hemildesai
   local_batch_size: 2

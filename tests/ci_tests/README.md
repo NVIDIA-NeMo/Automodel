@@ -23,13 +23,13 @@ ci_tests/
 `generate_ci_tests.py` selects the recipes for the given scope and test folder, reads each recipe's `ci:` section from the YAML under `examples/`, and outputs a CI pipeline YAML with one job per recipe.
 
 **Scopes:**
-- **nightly** -- Recipes whose `ci.functional` is `nightly` or `nightly,release`
-- **release** -- Recipes whose `ci.functional` is `release` or `nightly,release`
+- **nightly** -- Recipes whose `ci.nemo_ci_schedule` is `nightly` or `nightly,release`
+- **release** -- Recipes whose `ci.nemo_ci_schedule` is `release` or `nightly,release`
 - **convergence** -- Recipes in `convergence_recipes.yml`, time automatically doubled
 - **performance** -- Every recipe YAML under `examples/llm_benchmark/` and `examples/vlm_benchmark/`
 
-Any other scope generates an empty pipeline. The nightly and release scopes (functional CI) cover these
-test folders, listed in `FUNCTIONAL_TEST_FOLDERS`:
+Any other scope generates an empty pipeline. The nightly and release scopes cover these
+test folders, listed in `NEMO_CI_SCHEDULE_FOLDERS`:
 
 | Test folder | Recipes |
 |-------------|---------|
@@ -54,7 +54,7 @@ SFT vs PEFT is determined by whether `peft` appears in the recipe filename.
 
 ## Recipe CI Configuration
 
-Every recipe YAML under `examples/` must declare `ci.functional` and either a nonempty
+Every recipe YAML under `examples/` must declare `ci.nemo_ci_schedule` and either a nonempty
 `ci.cluster_tag` or boolean `ci.deprecated: true` (enforced by `tools/lint_example_yamls.py`).
 Deprecated configurations remain available as examples, but generate no training,
 checkpoint, deployment, or evaluation jobs in any CI scope. This applies even
@@ -63,7 +63,7 @@ An entirely excluded nonempty scope gets a lightweight completion job.
 Utility configs excluded by the linter are exempt. The tag selects GPU hardware,
 such as `h100`, `gb200`, or `gb10`, rather than a specific cluster.
 
-`ci.functional` selects the functional CI scopes that run the recipe. It must be exactly one of:
+`ci.nemo_ci_schedule` selects the NeMo-CI scopes that run the recipe. It must be exactly one of:
 
 | Value | Runs in |
 |-------|---------|
@@ -72,18 +72,18 @@ such as `h100`, `gb200`, or `gb10`, rather than a specific cluster.
 | `release` | release only |
 | `skipped` | neither |
 
-Deprecated recipes and recipes outside the functional test folders must use `skipped`. To keep a recipe
-out of functional CI only, set `skipped` rather than adding an `override_recipes.yml` exemption:
+Deprecated recipes and recipes outside these test folders must use `skipped`. To keep a recipe
+out of the nightly and release runs only, set `skipped` rather than adding an `override_recipes.yml` exemption:
 exemptions also apply to performance runs from `ci.perf_testing`. The `ci.nightly` and `ci.release`
 mappings only override recipe settings when the recipe runs in that scope; they do not select it.
 
-Newly added recipes that CI runs (a `ci.functional` other than `skipped`, a performance benchmark, or a
+Newly added recipes that CI runs (a `ci.nemo_ci_schedule` other than `skipped`, a performance benchmark, or a
 convergence list entry) must also declare `recipe_owner`, `time`, and `nodes` (enforced by
 `validate_new_recipe_ci.py`); pre-existing recipes are grandfathered for these three fields:
 
 ```yaml
 ci:
-  functional: nightly,release     # Required. nightly, release, nightly,release, or skipped
+  nemo_ci_schedule: nightly,release     # Required. nightly, release, nightly,release, or skipped
   cluster_tag: h100               # Required unless ci.deprecated is true. GPU hardware selector
   recipe_owner: username          # Required. Maintainer's handle
   time: "00:25:00"                # Required. SLURM wall time (HH:MM:SS)
@@ -373,11 +373,11 @@ separate fresh baseline.
 
 ## How To
 
-### Run a Recipe in Functional CI
+### Run a Recipe in the Nightly or Release Scope
 
 1. Create recipe YAML under `examples/{test_folder}/{model_family}/`
-2. Add `ci:` section with `functional`, `cluster_tag`, `recipe_owner`, `time`, and `nodes` (use `nodes: 1` for single-node)
-3. Set `functional: nightly,release` to run it in both scopes, or `nightly` or `release` for one
+2. Add `ci:` section with `nemo_ci_schedule`, `cluster_tag`, `recipe_owner`, `time`, and `nodes` (use `nodes: 1` for single-node)
+3. Set `nemo_ci_schedule: nightly,release` to run it in both scopes, or `nightly` or `release` for one
 
 ### Enable Checkpoint Robustness
 
@@ -395,14 +395,14 @@ separate fresh baseline.
 
 1. Create `examples/{new_folder}/` with recipe YAMLs
 2. Create `configs/{new_folder}/override_recipes.yml`, plus `convergence_recipes.yml` for convergence recipes
-3. For functional CI, add the folder and its `examples/` path to `FUNCTIONAL_TEST_FOLDERS` in `utils/generate_ci_tests.py`
+3. For the nightly and release scopes, add the folder and its `examples/` path to `NEMO_CI_SCHEDULE_FOLDERS` in `utils/generate_ci_tests.py`
 4. Create `golden_values/{new_folder}/`
 5. Add a CI job template for the new folder in the CI template file
 6. Verify with `generate_ci_tests.py --test-folder {new_folder} --scope nightly`
 
 ### Exempt a Recipe
 
-To keep a recipe out of functional CI only, set `ci.functional: skipped`. Exemptions also apply to
+To keep a recipe out of the nightly and release runs only, set `ci.nemo_ci_schedule: skipped`. Exemptions also apply to
 performance runs from `ci.perf_testing`. To exempt a recipe, edit `configs/{test_folder}/override_recipes.yml`:
 
 ```yaml

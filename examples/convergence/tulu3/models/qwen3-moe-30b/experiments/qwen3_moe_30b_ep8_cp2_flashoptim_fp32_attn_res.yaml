@@ -109,5 +109,5 @@ optimizer:
   compress_state_dict: false
 
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   cluster_tag: h100

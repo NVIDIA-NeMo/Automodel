@@ -111,7 +111,7 @@ step_scheduler:
 wandb:
   enable: false
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   recipe_owner: HuiyingLi
   nodes: 16
   cluster_tag: h100

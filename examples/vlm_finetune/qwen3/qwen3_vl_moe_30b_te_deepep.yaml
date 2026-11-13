@@ -114,7 +114,7 @@ freeze_config:
 
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   nodes: 1

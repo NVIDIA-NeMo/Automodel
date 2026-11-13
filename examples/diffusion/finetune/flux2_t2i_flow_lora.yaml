@@ -125,5 +125,5 @@ checkpoint:
   restore_from: null
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   cluster_tag: h100

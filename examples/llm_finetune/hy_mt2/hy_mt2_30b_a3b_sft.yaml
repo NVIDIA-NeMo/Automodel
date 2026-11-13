@@ -152,5 +152,5 @@ optimizer:
 #   name: hy_mt2_30b_a3b_sft
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   cluster_tag: h100

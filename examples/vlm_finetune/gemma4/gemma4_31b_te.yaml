@@ -114,7 +114,7 @@ freeze_config:
 #   name: <your-run-name>
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   cluster_tag: h100
   time: "00:15:00"
   recipe_owner: khazic

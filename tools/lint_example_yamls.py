@@ -27,11 +27,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# The CI pipeline generator owns the `ci.functional` values it reads.
+# The CI pipeline generator owns the `ci.nemo_ci_schedule` values it reads.
 from tests.ci_tests.utils.generate_ci_tests import (  # noqa: E402
-    FUNCTIONAL_TEST_FOLDERS,
-    functional_scopes,
-    functional_test_folder,
+    NEMO_CI_SCHEDULE_FOLDERS,
+    nemo_ci_schedule_folder,
+    nemo_ci_schedule_scopes,
 )
 
 
@@ -97,7 +97,7 @@ def lint_yaml_text(text: str, path: Path, automodel_dir: Path) -> list[LintError
     if document is None:
         if _relative_path(path, automodel_dir) in EXCLUDED_RECIPE_FILES:
             return []
-        return [*_lint_ci_cluster_tag(path, {}, []), *_lint_ci_functional(path, {}, None, [], automodel_dir)]
+        return [*_lint_ci_cluster_tag(path, {}, []), *_lint_ci_nemo_ci_schedule(path, {}, None, [], automodel_dir)]
     if not isinstance(document, yaml.MappingNode):
         return [LintError(path, document.start_mark.line + 1, "Top-level YAML document must be a mapping.")]
     if not isinstance(data, dict):
@@ -109,7 +109,7 @@ def lint_yaml_text(text: str, path: Path, automodel_dir: Path) -> list[LintError
     if _relative_path(path, automodel_dir) not in EXCLUDED_RECIPE_FILES:
         errors.extend(_lint_ci_cluster_tag(path, data, key_lines))
         errors.extend(_lint_ci_perf_testing(path, data, document, key_lines))
-        errors.extend(_lint_ci_functional(path, data, document, key_lines, automodel_dir))
+        errors.extend(_lint_ci_nemo_ci_schedule(path, data, document, key_lines, automodel_dir))
     if _should_require_recipe(path, automodel_dir):
         errors.extend(_lint_recipe_target(path, data, key_lines, automodel_dir))
     return errors
@@ -163,17 +163,17 @@ def _lint_ci_cluster_tag(path: Path, data: dict, key_lines: list[tuple[str, int]
     ]
 
 
-def _lint_ci_functional(
+def _lint_ci_nemo_ci_schedule(
     path: Path,
     data: dict,
     document: yaml.MappingNode | None,
     key_lines: list[tuple[str, int]],
     automodel_dir: Path,
 ) -> list[LintError]:
-    """Require ``ci.functional``, the NeMo-CI functional scopes that run the recipe.
+    """Require ``ci.nemo_ci_schedule``, the NeMo-CI scopes that run the recipe.
 
     The value is ``nightly``, ``release``, ``nightly,release``, or ``skipped``. A deprecated
-    recipe, or one outside the functional test folders, runs in no functional scope, so it
+    recipe, or one outside ``NEMO_CI_SCHEDULE_FOLDERS``, runs in neither scope, so it
     must declare ``skipped``.
 
     Args:
@@ -188,22 +188,22 @@ def _lint_ci_functional(
     """
     ci = data.get("ci")
     ci = ci if isinstance(ci, dict) else {}
-    line = _mapping_key_lines(_child_node(document, "ci")).get("functional", dict(key_lines).get("ci", 1))
+    line = _mapping_key_lines(_child_node(document, "ci")).get("nemo_ci_schedule", dict(key_lines).get("ci", 1))
     try:
-        scopes = functional_scopes(ci)
+        scopes = nemo_ci_schedule_scopes(ci)
     except ValueError as exc:
         return [LintError(path, line, f"{exc}.")]
     if not scopes:
         return []
     if ci.get("deprecated") is True:
-        return [LintError(path, line, "A deprecated recipe runs no tests; set `ci.functional: skipped`.")]
-    if functional_test_folder(_relative_path(path, automodel_dir)) is None:
-        folders = ", ".join(f"examples/{subpath}" for subpath in FUNCTIONAL_TEST_FOLDERS.values())
+        return [LintError(path, line, "A deprecated recipe runs no tests; set `ci.nemo_ci_schedule: skipped`.")]
+    if nemo_ci_schedule_folder(_relative_path(path, automodel_dir)) is None:
+        folders = ", ".join(f"examples/{subpath}" for subpath in NEMO_CI_SCHEDULE_FOLDERS.values())
         return [
             LintError(
                 path,
                 line,
-                f"Functional CI runs only recipes under {folders}; set `ci.functional: skipped`.",
+                f"NeMo-CI schedules run only recipes under {folders}; set `ci.nemo_ci_schedule: skipped`.",
             )
         ]
     return []

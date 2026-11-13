@@ -15,7 +15,7 @@
 #!/usr/bin/env python3
 """Validate that a newly added CI recipe declares a complete ``ci:`` section.
 
-A recipe YAML runs in CI when its ``ci.functional`` selects the nightly or
+A recipe YAML runs in CI when its ``ci.nemo_ci_schedule`` selects the nightly or
 release scope, when a scope auto-discovers its folder (``AUTO_DISCOVER_SCOPES``
 in ``generate_ci_tests.py`` runs every YAML under the performance benchmark
 folders), or when a recipe list names it. This check enforces, on newly added
@@ -24,7 +24,7 @@ how many nodes it needs -- so the generated job is accountable and correctly
 sized rather than falling back to opaque defaults.
 
 The set of CI-enabled recipes is derived entirely from configuration already in
-this repo (no nemo-ci dependency): each recipe's ``ci.functional``, the
+this repo (no nemo-ci dependency): each recipe's ``ci.nemo_ci_schedule``, the
 auto-discover subpaths, and every recipe referenced by a
 ``tests/ci_tests/configs/<folder>/*_recipes.yml`` list.
 
@@ -48,7 +48,7 @@ UTILS_DIR = Path(__file__).resolve().parent
 if str(UTILS_DIR) not in sys.path:
     sys.path.insert(0, str(UTILS_DIR))
 
-from generate_ci_tests import AUTO_DISCOVER_SCOPES, functional_scopes, functional_test_folder  # noqa: E402
+from generate_ci_tests import AUTO_DISCOVER_SCOPES, nemo_ci_schedule_folder, nemo_ci_schedule_scopes  # noqa: E402
 
 # ci: keys every newly added CI recipe must declare.
 REQUIRED_CI_FIELDS = ("recipe_owner", "time", "nodes")
@@ -97,12 +97,12 @@ def is_ci_enabled(rel_path: Path, recipe: object, subpaths: set[str], listed: se
     if any(_is_relative_to(rel_path, Path("examples") / subpath) for subpath in subpaths):
         return True
     ci_block = recipe.get("ci") if isinstance(recipe, dict) else None
-    if not isinstance(ci_block, dict) or functional_test_folder(rel_path) is None:
+    if not isinstance(ci_block, dict) or nemo_ci_schedule_folder(rel_path) is None:
         return False
     try:
-        return bool(functional_scopes(ci_block))
+        return bool(nemo_ci_schedule_scopes(ci_block))
     except ValueError:
-        # tools/lint_example_yamls.py reports a missing or invalid `ci.functional`.
+        # tools/lint_example_yamls.py reports a missing or invalid `ci.nemo_ci_schedule`.
         return False
 
 

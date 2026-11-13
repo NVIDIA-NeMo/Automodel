@@ -110,7 +110,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  functional: nightly,release
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   vllm_deploy: true
   vllm_smoke_test: true

@@ -127,7 +127,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
-  functional: release
+  nemo_ci_schedule: release
   cluster_tag: gb200
   nodes: 2
   recipe_owner: akoumpa  #PR4637: hemildesai

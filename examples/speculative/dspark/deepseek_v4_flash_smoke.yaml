@@ -93,5 +93,5 @@ checkpoint:
   enabled: false                 # smoke: don't write checkpoints
 
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   cluster_tag: h100

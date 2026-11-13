@@ -147,5 +147,5 @@ freeze_config:
   freeze_language_model: false
 
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   cluster_tag: h100

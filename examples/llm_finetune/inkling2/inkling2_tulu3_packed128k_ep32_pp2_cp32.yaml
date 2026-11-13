@@ -110,7 +110,7 @@ wandb:
   mode: online
   dir: logs/inkling2_tulu3_packed128k_ep32_pp2_cp32/wandb
 ci:
-  functional: release
+  nemo_ci_schedule: release
   recipe_owner: snowmanwwg
   nodes: 16
   nproc_per_node: 4

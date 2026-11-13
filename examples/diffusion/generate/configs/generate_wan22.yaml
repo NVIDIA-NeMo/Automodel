@@ -48,5 +48,5 @@ vae:
 seed: 42
 
 ci:
-  functional: skipped
+  nemo_ci_schedule: skipped
   cluster_tag: h100

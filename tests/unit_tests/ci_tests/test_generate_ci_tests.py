@@ -19,11 +19,11 @@ from ruamel.yaml import YAML
 
 from nemo_automodel.recipes._dist_utils import parse_distributed_section
 from tests.ci_tests.utils.generate_ci_tests import (
-    functional_recipe_scopes,
-    functional_scopes,
-    functional_test_folder,
     generate_job,
     generate_pipeline,
+    nemo_ci_schedule_folder,
+    nemo_ci_schedule_scopes,
+    read_nemo_ci_schedules,
 )
 
 # Over the default 5s budget on purpose: this module parses every example config under examples/.
@@ -525,7 +525,7 @@ def test_deprecated_nightly_scope_completes_without_gpu_jobs(tmp_path: Path) -> 
     (config_dir / "override_recipes.yml").write_text("exempt_models: []\nexempt_configs: {}\n")
     recipe = tmp_path / "examples/retrieval/cross_encoder/deprecated.yaml"
     recipe.parent.mkdir(parents=True)
-    recipe.write_text("ci: {deprecated: true, functional: nightly}\n")
+    recipe.write_text("ci: {deprecated: true, nemo_ci_schedule: nightly}\n")
     pipeline = generate_pipeline(str(tmp_path), "nightly", "retrieval_cross_encoder")
     jobs = {name: job for name, job in pipeline.items() if name != "include"}
     assert len(jobs) == 1
@@ -545,27 +545,27 @@ def test_deprecated_nightly_scope_completes_without_gpu_jobs(tmp_path: Path) -> 
         ("skipped", set()),
     ],
 )
-def test_functional_scopes_accepts_exact_values(value: str, scopes: set[str]) -> None:
-    assert functional_scopes({"functional": value}) == scopes
+def test_nemo_ci_schedule_scopes_accepts_exact_values(value: str, scopes: set[str]) -> None:
+    assert nemo_ci_schedule_scopes({"nemo_ci_schedule": value}) == scopes
 
 
 @pytest.mark.parametrize(
     "ci_config",
     [
         {},
-        {"functional": None},
-        {"functional": True},
-        {"functional": ["nightly"]},
-        {"functional": ""},
-        {"functional": "test"},
-        {"functional": "release,nightly"},
-        {"functional": "nightly, release"},
-        {"functional": "nightly,skipped"},
+        {"nemo_ci_schedule": None},
+        {"nemo_ci_schedule": True},
+        {"nemo_ci_schedule": ["nightly"]},
+        {"nemo_ci_schedule": ""},
+        {"nemo_ci_schedule": "test"},
+        {"nemo_ci_schedule": "release,nightly"},
+        {"nemo_ci_schedule": "nightly, release"},
+        {"nemo_ci_schedule": "nightly,skipped"},
     ],
 )
-def test_functional_scopes_rejects_other_values(ci_config: dict) -> None:
-    with pytest.raises(ValueError, match="`ci.functional`"):
-        functional_scopes(ci_config)
+def test_nemo_ci_schedule_scopes_rejects_other_values(ci_config: dict) -> None:
+    with pytest.raises(ValueError, match="`ci.nemo_ci_schedule`"):
+        nemo_ci_schedule_scopes(ci_config)
 
 
 @pytest.mark.parametrize(
@@ -579,18 +579,18 @@ def test_functional_scopes_rejects_other_values(ci_config: dict) -> None:
         ("examples/llm_benchmark/recipe.yaml", None),
     ],
 )
-def test_functional_test_folder_maps_recipe_paths(recipe: str, test_folder: str | None) -> None:
-    assert functional_test_folder(Path(recipe)) == test_folder
+def test_nemo_ci_schedule_folder_maps_recipe_paths(recipe: str, test_folder: str | None) -> None:
+    assert nemo_ci_schedule_folder(Path(recipe)) == test_folder
 
 
-def _write_functional_recipes(root: Path, values: dict[str, str]) -> None:
+def _write_scheduled_recipes(root: Path, values: dict[str, str]) -> None:
     config_dir = root / "tests/ci_tests/configs/llm_finetune"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "override_recipes.yml").write_text("exempt_models: []\nexempt_configs: {}\n")
     for name, value in values.items():
         recipe = root / "examples/llm_finetune/family" / f"{name}.yaml"
         recipe.parent.mkdir(parents=True, exist_ok=True)
-        recipe.write_text(f"ci:\n  functional: {value}\n  cluster_tag: h100\n")
+        recipe.write_text(f"ci:\n  nemo_ci_schedule: {value}\n  cluster_tag: h100\n")
 
 
 @pytest.mark.parametrize(
@@ -601,12 +601,12 @@ def _write_functional_recipes(root: Path, values: dict[str, str]) -> None:
         ("test", set()),
     ],
 )
-def test_functional_scopes_select_recipes_by_ci_functional(tmp_path: Path, scope: str, expected: set[str]) -> None:
-    _write_functional_recipes(
+def test_schedule_scopes_select_recipes_by_nemo_ci_schedule(tmp_path: Path, scope: str, expected: set[str]) -> None:
+    _write_scheduled_recipes(
         tmp_path,
         {"both": "nightly,release", "nightly_only": "nightly", "release_only": "release", "skipped": "skipped"},
     )
-    # A recipe list no longer enrolls recipes in a functional scope.
+    # A recipe list no longer enrolls recipes in the nightly or release scope.
     (tmp_path / "tests/ci_tests/configs/llm_finetune" / f"{scope}_recipes.yml").write_text(
         "configs: [family/skipped.yaml]\n"
     )
@@ -618,13 +618,13 @@ def test_functional_scopes_select_recipes_by_ci_functional(tmp_path: Path, scope
         assert pipeline[name]["variables"]["TEST_LEVEL"] == scope
 
 
-def test_functional_discovery_skips_invalid_recipes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    _write_functional_recipes(tmp_path, {"valid": "nightly", "typo": "nighlty"})
+def test_schedule_discovery_skips_invalid_recipes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _write_scheduled_recipes(tmp_path, {"valid": "nightly", "typo": "nighlty"})
     family = tmp_path / "examples/llm_finetune/family"
     (family / "missing.yaml").write_text("ci:\n  cluster_tag: h100\n")
     (family / "broken.yaml").write_text("ci: [\n")
     # PyYAML keeps the last duplicate, so the linter accepts this file; the generator cannot read it.
-    (family / "duplicate.yaml").write_text("ci:\n  functional: skipped\n  functional: nightly\n")
+    (family / "duplicate.yaml").write_text("ci:\n  nemo_ci_schedule: skipped\n  nemo_ci_schedule: nightly\n")
 
     pipeline = generate_pipeline(str(tmp_path), "nightly", "llm_finetune")
 
@@ -632,14 +632,14 @@ def test_functional_discovery_skips_invalid_recipes(tmp_path: Path, capsys: pyte
     stderr = capsys.readouterr().err
     for name in ("typo", "missing", "broken", "duplicate"):
         assert f"WARNING: skipping examples/llm_finetune/family/{name}.yaml" in stderr
-    scopes, errors = functional_recipe_scopes(str(tmp_path), "llm_finetune")
+    scopes, errors = read_nemo_ci_schedules(str(tmp_path), "llm_finetune")
     assert scopes == {Path("examples/llm_finetune/family/valid.yaml"): {"nightly"}}
     assert {path.stem for path in errors} == {"typo", "missing", "broken", "duplicate"}
 
 
-def test_functional_discovery_reads_yml_recipes(tmp_path: Path) -> None:
-    _write_functional_recipes(tmp_path, {"yaml_recipe": "release"})
-    (tmp_path / "examples/llm_finetune/family/yml_recipe.yml").write_text("ci:\n  functional: release\n")
+def test_schedule_discovery_reads_yml_recipes(tmp_path: Path) -> None:
+    _write_scheduled_recipes(tmp_path, {"yaml_recipe": "release"})
+    (tmp_path / "examples/llm_finetune/family/yml_recipe.yml").write_text("ci:\n  nemo_ci_schedule: release\n")
 
     pipeline = generate_pipeline(str(tmp_path), "release", "llm_finetune")
 

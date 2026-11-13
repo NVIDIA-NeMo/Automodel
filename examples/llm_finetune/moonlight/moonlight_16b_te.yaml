@@ -133,7 +133,7 @@ optimizer:
 #   dir: /tmp/wandb
 
 ci:
-  functional: nightly,release
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   recipe_owner: akoumpa  #PR4637: hemildesai
   node_multiplier: true
