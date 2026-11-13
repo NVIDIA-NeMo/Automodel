@@ -93,6 +93,10 @@ from nemo_automodel.components.models.deepseek_v41.layers import (
     compile_norm_core,
 )
 from nemo_automodel.components.models.deepseek_v41.packing import packed_layout
+from nemo_automodel.components.models.deepseek_v41.pipeline import (
+    DeepseekV41BackboneOutput,
+    DeepseekV41PipelineMixin,
+)
 from nemo_automodel.components.models.deepseek_v41.processing import (
     IMAGE_END,
     IMAGE_NEW_LINE,
@@ -447,7 +451,10 @@ class DeepseekV41Model(nn.Module):
         output_residual_streams: bool = False,
         cp_group: dist.ProcessGroup | None = None,
         packed_seq_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
+        pipeline_hidden_states: torch.Tensor | None = None,
+        pipeline_pre_mix: torch.Tensor | None = None,
+        pipeline_attention_state: DeepseekV41AttentionState | None = None,
+    ) -> DeepseekV41BackboneOutput:
         """Compute all positions without inference-only prefill shortcuts.
 
         Args:
@@ -464,15 +471,29 @@ class DeepseekV41Model(nn.Module):
             packed_seq_ids: Optional document IDs [batch, local_sequence], zero for padding.
             cp_group: CP group; token axes above are local sequence shards.
                 Engram hashes use global token history, with only local rows looked up.
+            pipeline_hidden_states: Incoming streams [batch, local_sequence, streams, hidden],
+                required only on a stage without token embeddings.
+            pipeline_pre_mix: Incoming FP32 coefficients [batch, local_sequence, streams],
+                required with pipeline_hidden_states; gradients must not be detached.
+            pipeline_attention_state: Incoming immutable CSA2 state, with layouts
+                in DeepseekV41AttentionState, belonging to this microbatch only.
 
         Returns:
-            Final normalized hidden states [batch, sequence, hidden] and, under
-            ``output_residual_streams``, the per-block residual streams
-            [batch, sequence, streams, hidden] captured before each block; else None.
+            Stage values with layouts documented by DeepseekV41BackboneOutput.
+            A stage without the final norm preserves uncollapsed residual streams.
         """
         # Fuse within this FSDP owner's forward so learned image delimiters
         # are unsharded before they are read.
-        if self.vision is not None and (inputs_embeds is None or pixel_values is not None):
+        on_first_stage = self.embed_tokens is not None
+        if not on_first_stage:
+            if pipeline_hidden_states is None or pipeline_pre_mix is None:
+                raise ValueError("A non-first PP stage requires both hidden streams and FP32 pre_mix")
+            if pixel_values is not None or image_grid_hws is not None or inputs_embeds is not None:
+                raise ValueError("Only the first PP stage can consume image patches or input embeddings")
+            image_mask = None if vision_token_types is None else vision_token_types >= 0
+        elif pipeline_hidden_states is not None or pipeline_pre_mix is not None:
+            raise ValueError("The first PP stage cannot consume upstream hidden streams")
+        if on_first_stage and self.vision is not None and (inputs_embeds is None or pixel_values is not None):
             if vision_token_types is None:
                 if pixel_values is not None or image_grid_hws is not None:
                     raise ValueError("Image inputs require vision_token_types")
@@ -486,7 +507,7 @@ class DeepseekV41Model(nn.Module):
                 packed_seq_ids=packed_seq_ids,
             )
             image_mask = vision_token_types >= 0
-        elif (
+        elif on_first_stage and (
             pixel_values is not None
             or image_grid_hws is not None
             or (vision_token_types is not None and torch.any(vision_token_types >= 0))
@@ -495,10 +516,14 @@ class DeepseekV41Model(nn.Module):
         if position_ids is None:
             start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
             position_ids = (torch.arange(input_ids.shape[1], device=input_ids.device) + start).expand_as(input_ids)
-        embedded = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-        hidden_states = embedded.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
-        pre_mix = torch.zeros(*input_ids.shape, self.config.hc_mult, device=embedded.device, dtype=torch.float32)
-        pre_mix[..., 0] = 1
+        if on_first_stage:
+            embedded = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+            hidden_states = embedded.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+            pre_mix = torch.zeros(*input_ids.shape, self.config.hc_mult, device=embedded.device, dtype=torch.float32)
+            pre_mix[..., 0] = 1
+        else:
+            hidden_states = pipeline_hidden_states
+            pre_mix = pipeline_pre_mix
         token_mask = None if image_mask is None else ~image_mask
         if attention_mask is not None:
             token_mask = attention_mask.bool() if token_mask is None else token_mask & attention_mask.bool()
@@ -515,7 +540,7 @@ class DeepseekV41Model(nn.Module):
         validate_attention_inputs(
             position_ids, attention_mask, packed_seq_ids, sequence=input_ids.shape[1], cp_group=cp_group
         )
-        state = DeepseekV41AttentionState()
+        state = DeepseekV41AttentionState() if pipeline_attention_state is None else pipeline_attention_state
         captured = [] if output_residual_streams else None
         for layer in self.layers.values():
             if captured is not None:
@@ -532,11 +557,12 @@ class DeepseekV41Model(nn.Module):
                 packed_seq_ids=packed_seq_ids,
                 inputs_validated=True,
             )
-        hidden_states = DeepseekV41HyperConnection.collapse(hidden_states, pre_mix)
-        return self.norm(hidden_states), None if captured is None else tuple(captured)
+        if self.norm is not None:
+            hidden_states = self.norm(DeepseekV41HyperConnection.collapse(hidden_states, pre_mix))
+        return DeepseekV41BackboneOutput(hidden_states, pre_mix, None if captured is None else tuple(captured), state)
 
 
-class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
+class DeepseekV41ForCausalLM(DeepseekV41PipelineMixin, HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncMixin):
     """DeepSeek V4.1 causal LM with optional vision and an fp32 ``lm_head``.
 
     ``engram_process_group`` explicitly selects contiguous row owners for the
@@ -575,7 +601,7 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
 
         supports_tp: bool = False
         supports_cp: bool = True
-        supports_pp: bool = False
+        supports_pp: bool = True
         supports_ep: bool = True
         supports_thd: bool = True
         supports_cp_vision_frame_sharding: bool = True
@@ -598,6 +624,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.cp_mesh: DeviceMesh | None = None
+        self._vlm_pixel_values_chunks: list[torch.Tensor] | None = None
+        self._vlm_image_grid_hws_chunks: list[torch.Tensor] | None = None
+        self._vlm_chunk_idx: int | None = None
         text = config.text_config
         ratios = text.compress_ratios[: text.num_hidden_layers]
         self._packed_alignment = math.lcm(*(r for r in ratios if r))
@@ -728,9 +757,9 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     def forward(
         self,
         input_ids: torch.Tensor,
+        *pipeline_inputs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-        *,
         labels: torch.Tensor | None = None,
         pixel_values: torch.Tensor | None = None,
         image_grid_hws: torch.Tensor | None = None,
@@ -743,11 +772,16 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         seq_lens: torch.Tensor | None = None,
         seq_lens_padded: torch.Tensor | None = None,
         qkv_format: str | None = None,
-    ) -> CausalLMOutputWithPast:
-        """Compute full-vocabulary logits or hidden states for the training loss.
+    ) -> CausalLMOutputWithPast | tuple[torch.Tensor, ...] | torch.Tensor:
+        """Compute language outputs, or the documented PP stage tensor contract.
 
         Args:
-            input_ids: Integer tensor of shape [batch, sequence].
+            input_ids: Integer IDs [batch, local_sequence], or incoming hidden streams
+                [batch, local_sequence, streams, hidden] on the non-first PP stage.
+            pipeline_inputs: Only on a non-first stage: FP32 pre_mix
+                [batch, local_sequence, streams] and int64 metadata
+                [batch, local_sequence, 5], followed by live CSA2 state tensors,
+                as documented by get_pipeline_stage_metas and _pack_pipeline_state.
             attention_mask: Optional binary right-padding tensor [batch, sequence].
             position_ids: Optional integer tensor of shape [batch, sequence].
             labels: Optional targets of shape [batch, sequence], with -100 ignored.
@@ -779,6 +813,45 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
         """
         if cp_group is None and self.cp_mesh is not None:
             cp_group = self.cp_mesh.get_group()
+        is_pp_stage = self.lm_head is None or self.model.embed_tokens is None
+        pipeline_hidden = pipeline_mix = pipeline_state = None
+        if self.model.embed_tokens is None:
+            if len(pipeline_inputs) < 2:
+                raise ValueError("A non-first PP stage requires pre_mix and token metadata")
+            pipeline_hidden = input_ids
+            pipeline_mix, metadata, *state_tensors = pipeline_inputs
+            if metadata.dtype != torch.long or metadata.shape != (*input_ids.shape[:2], 5):
+                raise ValueError("PP token metadata must be int64 [batch, local_sequence, 5]")
+            if pipeline_mix.dtype != torch.float32 or pipeline_mix.shape != input_ids.shape[:3]:
+                raise ValueError("PP pre_mix must be FP32 [batch, local_sequence, streams]")
+            input_ids, position_ids, valid, packed_seq_ids, vision_token_types = metadata.unbind(-1)
+            attention_mask = valid.bool()
+            # Preserve the unpacked index-selection path, including right padding.
+            # Document IDs are nonnegative in packed mode; -1 denotes absent metadata.
+            if packed_seq_ids[0, 0].item() == -1:
+                packed_seq_ids = None
+            pipeline_state = self._unpack_pipeline_state(
+                tuple(state_tensors),
+                boundary=int(next(iter(self.model.layers))),
+                hidden_states=pipeline_hidden,
+                packed=packed_seq_ids is not None,
+            )
+            seq_lens = seq_lens_padded = qkv_format = None
+            pixel_values = image_grid_hws = None
+        elif pipeline_inputs:
+            if is_pp_stage or len(pipeline_inputs) > 2:
+                raise ValueError("The first PP stage accepts token IDs, not an upstream payload")
+            # Preserve the ordinary model's positional mask/position API.
+            if attention_mask is not None or (len(pipeline_inputs) == 2 and position_ids is not None):
+                raise TypeError("attention_mask or position_ids was supplied both positionally and by keyword")
+            attention_mask = pipeline_inputs[0]
+            if len(pipeline_inputs) == 2:
+                position_ids = pipeline_inputs[1]
+        if is_pp_stage and (labels is not None or output_residual_streams):
+            raise ValueError("PP uses the recipe loss and does not return residual-stream diagnostics")
+        if is_pp_stage and seq_lens is not None:
+            raise ValueError("Packed PP must prepare aligned tokens and labels with the model-owned CP sharder")
+
         if cp_group is not None and dist.get_world_size(cp_group) > 1:
             if labels is not None:
                 raise ValueError("CP training requires the recipe loss with labels shifted before sequence sharding")
@@ -819,7 +892,21 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
                 "output_hidden_states returns the final hidden states and output_residual_streams the per-layer "
                 "residual streams; request one of them"
             )
-        hidden, captured = self.model(
+        if self.model.embed_tokens is not None and self._vlm_pixel_values_chunks is not None:
+            index = self._vlm_chunk_idx
+            if index is None or index >= len(self._vlm_pixel_values_chunks):
+                raise RuntimeError("PP vision media cursor is outside the current schedule")
+            if self._vlm_image_grid_hws_chunks is None:
+                raise RuntimeError("PP image patches require staged image grids")
+            pixel_values = self._vlm_pixel_values_chunks[index]
+            image_grid_hws = self._vlm_image_grid_hws_chunks[index]
+            if image_grid_hws.numel() == 0:
+                pixel_values = image_grid_hws = None
+            self._vlm_chunk_idx = index + 1
+        if is_pp_stage and position_ids is None:
+            start = 0 if cp_group is None else dist.get_rank(cp_group) * input_ids.shape[1]
+            position_ids = (torch.arange(input_ids.shape[1], device=input_ids.device) + start).expand_as(input_ids)
+        backbone = self.model(
             input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -829,7 +916,24 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             output_residual_streams=output_residual_streams,
             cp_group=cp_group,
             packed_seq_ids=packed_seq_ids,
+            pipeline_hidden_states=pipeline_hidden,
+            pipeline_pre_mix=pipeline_mix,
+            pipeline_attention_state=pipeline_state,
         )
+        hidden, captured = backbone.hidden_states, backbone.residual_streams
+        if self.lm_head is None:
+            valid = torch.ones_like(input_ids) if attention_mask is None else attention_mask.to(torch.long)
+            documents = torch.full_like(input_ids, -1) if packed_seq_ids is None else packed_seq_ids
+            vision_types = torch.full_like(input_ids, -1) if vision_token_types is None else vision_token_types
+            metadata = torch.stack(
+                (input_ids, position_ids.expand_as(input_ids), valid, documents, vision_types), dim=-1
+            ).long()
+            boundary = int(tuple(self.model.layers)[-1]) + 1
+            return (hidden.contiguous(), backbone.pre_mix.contiguous(), metadata) + self._pack_pipeline_state(
+                backbone.attention_state, boundary
+            )
+        if is_pp_stage and self._pp_return_hidden_states:
+            return hidden
         if layout is not None:
             hidden = layout.restore(hidden)
             captured = None if captured is None else tuple(layout.restore(values) for values in captured)
@@ -864,10 +968,12 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
     ) -> None:
         """Initialize every trainable backbone weight after meta materialization."""
         if buffer_device is None:
-            buffer_device = self.model.embed_tokens.weight.device
+            buffer_device = next(self.parameters()).device
         std = self.config.text_config.initializer_range
-        nn.init.normal_(self.model.embed_tokens.weight, std=std)
-        nn.init.normal_(self.lm_head.weight, std=std)
+        if self.model.embed_tokens is not None:
+            nn.init.normal_(self.model.embed_tokens.weight, std=std)
+        if self.lm_head is not None:
+            nn.init.normal_(self.lm_head.weight, std=std)
         if self.model.vision is not None:
             self.model.vision.init_weights(std)
             self.model.aligner.init_weights(std)
@@ -886,7 +992,8 @@ class DeepseekV41ForCausalLM(HFCheckpointingMixin, PreTrainedModel, MoEFSDPSyncM
             layer.attn.reset_parameters(std)
             if layer.engram is not None:
                 layer.engram.init_weights()
-        nn.init.ones_(self.model.norm.weight)
+        if self.model.norm is not None:
+            nn.init.ones_(self.model.norm.weight)
         # As in DeepSeek V4, construction fixes storage dtypes before sharding.
         # Casting again here would round strict FP32 DTensor storage.
         if not _has_dtensor_params(self):

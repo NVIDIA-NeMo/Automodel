@@ -79,7 +79,9 @@ class DeepseekV41AttentionState:
     sequence axes in topk_indices and candidates contain only local queries.
 
     Tensor fields retain autograd history and are never modified by consumers.
-    A model creates an empty state for every forward, including every microbatch.
+    A full model or first pipeline stage creates an empty state per microbatch.
+    Later stages restore live tensors from that microbatch's PP payload; backend
+    sparse plans are rebuilt locally and are not sent between stages.
     """
 
     global_valid: torch.Tensor | None = None

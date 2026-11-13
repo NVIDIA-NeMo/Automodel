@@ -14,13 +14,22 @@
 
 """FSDP policy for V4.1's shared V4 vision tower."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
 from nemo_automodel.components.distributed import ModelParallelizer
+from nemo_automodel.components.distributed.config import FSDP2Config
+from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.models.deepseek_v4.fsdp import fully_shard_deepseek_v4
 from nemo_automodel.components.models.deepseek_v4.vision import DeepseekV4VisionBlock, DeepseekV4VisionTransformer
+
+if TYPE_CHECKING:
+    from .model import DeepseekV41ForCausalLM
 
 
 def fully_shard_deepseek_v41(
@@ -66,6 +75,25 @@ class DeepseekV41ModelParallelizer(ModelParallelizer):
     """Keep DeepSeek-V4.1 vision parameters in dtype-safe FSDP units."""
 
     _customizes_moe_fsdp = True
+
+    def parallelize(self, model: DeepseekV41ForCausalLM, mesh_context: MeshContext, /) -> nn.Module:
+        """Bind PP-local Engram ownership before the shared parallelizer captures parameters."""
+        if mesh_context.pp_size > 1:
+            if not isinstance(mesh_context.strategy_config, FSDP2Config):
+                raise ValueError("DeepSeek V4.1 pipeline training requires FSDP2")
+            model._pipeline_layer_bounds()
+            first = model.model.embed_tokens is not None
+            owner_mesh = mesh_context.device_mesh["dp_shard_cp"]
+            if owner_mesh.size() > 1 and mesh_context.ep_size == 1:
+                raise ValueError("DeepSeek V4.1 PP with sharded Engram currently requires expert parallelism")
+            for layer in model.model.layers.values():
+                if layer.engram is not None:
+                    layer.engram.set_owner_group(owner_mesh.get_group())
+            if not first and model.config.vision_config.num_hidden_layers > 0:
+                # Pipeline trimming handles child modules; these are direct Parameters.
+                for name in ("image_start", "image_end", "image_newline"):
+                    model.model.register_parameter(name, None)
+        return super().parallelize(model, mesh_context)
 
     def _fully_shard_module(self, module, **kwargs):
         return fully_shard_deepseek_v41(module, **kwargs)
