@@ -91,8 +91,9 @@ class Inkling2ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
 
         supports_tp: bool = False
         supports_cp: bool = False
+        # Decoder layers also carry ``block_states``, which single-tensor pipeline stage IO cannot pass.
         supports_pp: bool = False
-        supports_ep: bool = False
+        supports_ep: bool = True
 
     @classmethod
     def from_config(

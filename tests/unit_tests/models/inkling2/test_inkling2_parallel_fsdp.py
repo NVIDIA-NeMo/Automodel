@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 
+from nemo_automodel._transformers.model_capabilities import query_capabilities
 from nemo_automodel.components.distributed import parallelizer_utils
 from nemo_automodel.components.distributed.model_parallelizer import get_model_parallelizer
 from nemo_automodel.components.models.common import BackendConfig
@@ -117,6 +118,12 @@ def _owner_policies(model: nn.Module, calls) -> dict[str, MixedPrecisionPolicy]:
 def test_inkling2_uses_model_owned_parallelizer():
     assert Inkling2ForConditionalGeneration.parallelizer is parallelization_module.PARALLELIZER
     assert get_model_parallelizer(_make_model()) is parallelization_module.PARALLELIZER
+
+
+def test_inkling2_declares_expert_but_not_pipeline_parallelism():
+    capabilities = query_capabilities(Inkling2ForConditionalGeneration)
+    assert capabilities.supports_ep
+    assert not capabilities.supports_pp
 
 
 @pytest.mark.parametrize("model_owned", [False, True])
