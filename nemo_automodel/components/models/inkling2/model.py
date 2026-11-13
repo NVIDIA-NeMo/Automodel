@@ -50,6 +50,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 from .configuration import Inkling2Config
 from .layers import inkling2_moe_config
 from .multimodal import Inkling2Model
+from .parallelization import PARALLELIZER
 from .quantization import checkpoint_expert_formats
 from .state_dict_adapter import Inkling2StateDictAdapter
 
@@ -76,6 +77,9 @@ class Inkling2ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     # The adapter covers every checkpoint tensor; skip initializing a model that is loaded next.
     _skip_init_weights_on_load: bool = True
 
+    # FSDP sidecar: the text model's ``final_input`` query gets its own FP32 unit.
+    parallelizer = PARALLELIZER
+
     # The Transformers reference keeps these modules in FP32 (``_keep_in_fp32_modules_strict``).
     _keep_in_fp32_modules_strict = [
         "e_score_correction_bias",
@@ -95,6 +99,7 @@ class Inkling2ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
 
         supports_tp: bool = False
         supports_cp: bool = False
+        # Decoder layers also carry ``block_states``, which single-tensor pipeline stage IO cannot pass.
         supports_pp: bool = False
         supports_ep: bool = True
 

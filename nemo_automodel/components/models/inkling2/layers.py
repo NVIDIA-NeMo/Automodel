@@ -36,7 +36,7 @@ import torch
 
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -151,8 +151,7 @@ class Inkling2MoE(MoE):
 
         Raises:
             ValueError: If the backend requests a non-FP32 gate precision or an expert
-                implementation whose parameters the state-dict adapter cannot map (TE grouped
-                experts, MoK).
+                implementation without a pluggable activation (MoK's fused SwiGLU kernel).
         """
         if backend.gate_precision not in (None, torch.float32):
             raise ValueError(f"Inkling 2 routes in FP32; got gate_precision={backend.gate_precision}")
@@ -165,16 +164,17 @@ class Inkling2MoE(MoE):
             gate_softcap=config.mlp_gate_softcap,
             up_softcap=config.mlp_up_softcap,
         )
-        # Only expert implementations that keep ``gate_and_up_projs`` / ``down_projs`` (the names
-        # the state-dict adapter maps) are accepted; they name their pluggable activation differently.
+        # Every accepted implementation exposes ``gate_and_up_projs`` / ``down_projs`` in its state
+        # dict (TE stacks its per-expert GroupedLinear weights under those keys), the names the
+        # state-dict adapter maps; they name their pluggable activation differently.
         if isinstance(self.experts, GroupedExperts):
             self.experts.expert_activation_grouped = activation
-        elif isinstance(self.experts, GroupedExpertsDeepEP):
+        elif isinstance(self.experts, (GroupedExpertsDeepEP, GroupedExpertsTE)):
             self.experts.expert_activation = activation
         else:
             raise ValueError(
-                f"Inkling 2 does not support the {type(self.experts).__name__} expert backend; with the "
-                "deepep/hybridep/uccl_ep dispatchers set backend.experts to torch_mm (or gmm / torch_mm_mxfp8)"
+                f"Inkling 2 needs an expert backend with a pluggable activation; {type(self.experts).__name__} "
+                "has none. Use the torch, deepep, hybridep or uccl_ep dispatcher."
             )
 
 
