@@ -77,7 +77,7 @@ def _use_physical_fa4_layout(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
         and sink.shape == (64,)
         and sink.dtype == torch.bfloat16
         and sink.device == q.device
-        and kwargs.get("window_size", (-1, 0)) in ((-1, 0), (129, 0))
+        and kwargs.get("window_size", (-1, 0)) in ((-1, 0), (128, 0))
         and kwargs.get("softcap") in (None, 0.0)
     )
 
@@ -213,10 +213,8 @@ class GptOssAttention(nn.Module):
                 updated_attn_kwargs = {**updated_attn_kwargs, "qkv_format": "thd"}
                 attention_mask = None
             if self.sliding_window is not None:
-                # TE uses a left distance; shared FA4 preprocessing subtracts one
-                # from an inclusive-current width. Preserve the existing TE distance.
-                window = self.sliding_window + (1 if self.backend.attn == "fa4" else 0)
-                updated_attn_kwargs["window_size"] = (window, 0)
+                # FA4 preprocessing converts this inclusive-current width to a left distance.
+                updated_attn_kwargs["window_size"] = (self.sliding_window, 0)
 
         if self.backend.attn == "fa4" and qkv_format == "thd":
             updated_attn_kwargs["fa4_physical_layout"] = _use_physical_fa4_layout(q, k, v, updated_attn_kwargs)

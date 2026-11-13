@@ -1013,9 +1013,9 @@ def test_fa4_prepared_thd_scatter_preserves_physical_layout_and_sink_gradient(em
         _fa4_max_seqlen=0 if empty else 2,
         packed_token_indices=indices,
         learnable_sink=sink,
-        window_size=(129, 0),
+        window_size=(128, 0),
     )
-    assert kwargs["window_size"] == (128, None)
+    assert kwargs["window_size"] == (127, None)
     torch.testing.assert_close(q1, q[indices])
     expected = q1 + k1.repeat_interleave(2, -2) + v1.repeat_interleave(2, -2) + sink[None, :, None]
     external = ModuleType("flash_attn.cute")
@@ -1070,7 +1070,7 @@ def test_fa4_physical_dependency_identity_is_cached_and_unreadable_falls_back(tm
 
 
 @pytest.mark.parametrize("dependency", ["patched", "original", "unknown"])
-@pytest.mark.parametrize("window", [(-1, 0), (129, 0)])
+@pytest.mark.parametrize("window", [(-1, 0), (128, 0)])
 def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency: str, window: tuple[int, int]) -> None:
     from torch.utils.checkpoint import checkpoint
 
@@ -1151,7 +1151,7 @@ def test_fa4_physical_shared_call_checkpoint_and_dependency_fallback(dependency:
             assert all(torch.count_nonzero(g[~valid]) == 0 for g in gradients[:3])
     assert all(("seqused_q" in kw) is (dependency == "patched") for _, kw in seen)
     assert all(kw["max_seqlen_q"] == (129 if dependency != "unknown" else 128) for _, kw in seen)
-    assert all(kw["window_size"] == ((None, None) if window[0] < 0 else (128, None)) for _, kw in seen)
+    assert all(kw["window_size"] == ((None, None) if window[0] < 0 else (127, None)) for _, kw in seen)
     assert all(kw["learnable_sink"] is sink for _, kw in seen)
     assert torch.equal(original["cu_seqlens_padded"], physical)
 
