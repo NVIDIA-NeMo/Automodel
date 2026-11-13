@@ -1256,10 +1256,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Both counts are needed as Python integers. Reduce and read them in one
         # transfer so the second count does not introduce another device sync.
         if token_counts is None:
-            local_counts = self._count_step_tokens(batches)
-            num_label_tokens, num_tokens_in_batch = self._dp_allreduce(
-                torch.tensor([local_counts.supervised, local_counts.total], dtype=torch.long)
-            ).tolist()
+            ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
+            local_counts = torch.tensor(
+                [
+                    sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+                    sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+                ],
+                dtype=torch.long,
+            )
+            num_label_tokens, num_tokens_in_batch = self._dp_allreduce(local_counts).tolist()
         else:
             num_label_tokens, num_tokens_in_batch = token_counts.supervised, token_counts.total
 
