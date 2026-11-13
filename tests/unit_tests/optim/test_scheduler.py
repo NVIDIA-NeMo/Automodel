@@ -607,16 +607,59 @@ def test_get_lr_unsupported_style(dummy_optimizer):
         min_lr=1e-6,
         lr_warmup_steps=100,
         lr_decay_steps=1000,
-        lr_decay_style="unsupported",
+        lr_decay_style="linear",
         start_wd=0.01,
         end_wd=0.1,
         wd_incr_steps=500,
         wd_incr_style="linear",
     )
+    scheduler.lr_decay_style = "unsupported"
     scheduler.num_steps = 200
     param_group = dummy_optimizer.param_groups[0]
     with pytest.raises(Exception, match="unsupported decay style is not supported."):
         scheduler.get_lr(param_group)
+
+
+def _scheduler_kwargs(optimizer, **overrides):
+    kwargs = dict(
+        optimizer=optimizer,
+        init_lr=1e-5,
+        max_lr=1e-3,
+        min_lr=1e-6,
+        lr_warmup_steps=100,
+        lr_decay_steps=1000,
+        lr_decay_style="cosine",
+        start_wd=0.01,
+        end_wd=0.01,
+        wd_incr_steps=500,
+        wd_incr_style="constant",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.parametrize("bad_style", ["cosin", "poly", "wsd", None])
+def test_init_rejects_unsupported_lr_decay_style(dummy_optimizer, bad_style):
+    """
+    An unknown `lr_decay_style` must fail at construction. `get_lr` only reads it after warmup, so
+    without this check the run would crash at step `lr_warmup_steps + 1`.
+    """
+    with pytest.raises(ValueError, match="lr_decay_style must be one of"):
+        OptimizerParamScheduler(**_scheduler_kwargs(dummy_optimizer, lr_decay_style=bad_style))
+
+
+@pytest.mark.parametrize("bad_style", [None, "cos", "exp"])
+def test_init_rejects_wsd_without_supported_wsd_decay_style(dummy_optimizer, bad_style):
+    """
+    With `lr_decay_style="WSD"` the annealing branch needs a supported `lr_wsd_decay_style`. Otherwise
+    `get_lr` hits an `assert coeff is not None` when annealing starts, long after the run began.
+    """
+    with pytest.raises(ValueError, match="lr_wsd_decay_style must be one of"):
+        OptimizerParamScheduler(
+            **_scheduler_kwargs(
+                dummy_optimizer, lr_decay_style="WSD", wsd_decay_steps=300, lr_wsd_decay_style=bad_style
+            )
+        )
 
 
 def test_step_method(dummy_optimizer):

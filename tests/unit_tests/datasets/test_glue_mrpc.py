@@ -100,7 +100,7 @@ def test_glue_mrpc_structure_and_slicing(monkeypatch: pytest.MonkeyPatch):
     tokenizer = FakeTokenizer(include_attention_mask=False, model_max_length=512, pad_token_id=7)
 
     # Act
-    ds = GLUE_MRPC(tokenizer, split="train", num_samples_limit=2, max_length=128)
+    ds = GLUE_MRPC(tokenizer, split="train", limit_dataset_samples=2, max_length=128)
 
     # Assert: length equals sliced size
     assert len(ds) == 2
@@ -120,19 +120,54 @@ def test_glue_mrpc_structure_and_slicing(monkeypatch: pytest.MonkeyPatch):
     "tok_max_length, init_max_length, expected_called_max",
     [
         (16384, None, 1024),  # clamp very large tokenizer.model_max_length to 1024 when None provided
-        (512, None, None),     # propagate None when tokenizer model max is modest
-        (4096, 64, 64),        # explicit max_length overrides tokenizer setting
+        (512, None, None),  # propagate None when tokenizer model max is modest
+        (4096, 64, 64),  # explicit max_length overrides tokenizer setting
     ],
 )
-def test_glue_mrpc_max_length_resolution(monkeypatch: pytest.MonkeyPatch, tok_max_length: int, init_max_length: int | None, expected_called_max: int | None):
+def test_glue_mrpc_max_length_resolution(
+    monkeypatch: pytest.MonkeyPatch, tok_max_length: int, init_max_length: int | None, expected_called_max: int | None
+):
     fake_loader = _fake_load_dataset_factory(total=3)
     monkeypatch.setattr("nemo_automodel.components.datasets.llm.seq_cls.load_dataset", fake_loader)
 
     tokenizer = FakeTokenizer(include_attention_mask=True, model_max_length=tok_max_length, pad_token_id=0)
 
     # Act
-    GLUE_MRPC(tokenizer, split="train", num_samples_limit=2, max_length=init_max_length)
+    GLUE_MRPC(tokenizer, split="train", limit_dataset_samples=2, max_length=init_max_length)
 
     # Assert the tokenizer call received the resolved max_length
     assert "max_length" in tokenizer.last_kwargs
     assert tokenizer.last_kwargs["truncation"] is True
+
+
+@pytest.mark.parametrize("use_config", [False, True])
+def test_deprecated_limit_alias(monkeypatch: pytest.MonkeyPatch, use_config: bool) -> None:
+    from nemo_automodel.components.datasets.llm.seq_cls import GLUE_MRPCConfig
+
+    monkeypatch.setattr("nemo_automodel.components.datasets.llm.seq_cls.load_dataset", _fake_load_dataset_factory(5))
+    tokenizer = FakeTokenizer()
+    with pytest.warns(FutureWarning, match="num_samples_limit is deprecated"):
+        dataset = (
+            GLUE_MRPCConfig(num_samples_limit=2).build(tokenizer=tokenizer)
+            if use_config
+            else GLUE_MRPC(tokenizer, num_samples_limit=2)
+        )
+    assert len(dataset) == 2
+
+
+def test_canonical_limit_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nemo_automodel.components.datasets.llm.seq_cls import GLUE_MRPCConfig
+
+    monkeypatch.setattr("nemo_automodel.components.datasets.llm.seq_cls.load_dataset", _fake_load_dataset_factory(5))
+    config = GLUE_MRPCConfig(limit_dataset_samples=2)
+    assert len(config.build(tokenizer=FakeTokenizer())) == 2
+    assert config.num_samples_limit is None
+
+
+def test_conflicting_limits_rejected_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unexpected_load(*args: object, **kwargs: object) -> None:
+        pytest.fail("Conflicting limits must fail before data loading")
+
+    monkeypatch.setattr("nemo_automodel.components.datasets.llm.seq_cls.load_dataset", unexpected_load)
+    with pytest.warns(FutureWarning), pytest.raises(ValueError, match="must agree"):
+        GLUE_MRPC(FakeTokenizer(), num_samples_limit=1, limit_dataset_samples=2)

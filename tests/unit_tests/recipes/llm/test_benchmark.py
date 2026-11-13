@@ -167,6 +167,31 @@ def mock_recipe(mock_config, monkeypatch):
 class TestBenchmarkingRecipeInitialization:
     """Test initialization of BenchmarkingRecipeForNextTokenPrediction."""
 
+    @pytest.mark.cpu_only
+    def test_init_warns_about_migration(
+        self,
+        mock_config: ConfigNamespace,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Direct construction explains how to launch the canonical benchmark workload."""
+        with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
+            recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+
+        notices = [record.getMessage() for record in caplog.records if "is deprecated" in record.getMessage()]
+        assert recipe._bench_steps == mock_config.step_scheduler.max_steps
+        assert len(notices) == 1
+        for instruction in (
+            "BenchmarkingRecipeForNextTokenPrediction is deprecated",
+            "TrainFinetuneRecipeForNextTokenPrediction",
+            "examples/llm_pretrain",
+            "examples/llm_finetune",
+            "automodel <canonical-config.yaml> --benchmark",
+            "ci.perf_testing",
+            "examples/llm_benchmark/README.md",
+            "https://github.com/NVIDIA-NeMo/Automodel/pull/4637",
+        ):
+            assert instruction in notices[0]
+
     def test_init_extracts_benchmark_params(self, mock_config):
         """Test that __init__ correctly extracts benchmarking parameters from benchmark section."""
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):

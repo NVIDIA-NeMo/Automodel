@@ -27,28 +27,19 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.shared.import_utils import safe_import
+from nemo_automodel.components.attention.fa4 import import_fa4_modules
 
 
 @functools.cache
 def _load_fa4() -> tuple[Callable, type, Callable]:
     """Cache optional FA4 entry points and the mask callback, never tensors."""
-    dependencies = [
-        safe_import(name)
-        for name in (
-            "flash_attn.cute.interface",
-            "flash_attn.cute.block_sparsity",
-            "cutlass",
-            "cutlass.cute",
-            "flash_attn.cute.utils",
-        )
-    ]
-    if not all(available for available, _ in dependencies):
-        raise ImportError(
-            "FA4 QSA requires FlashAttention's flash_attn.cute SM90 kernels, "
-            "nvidia-cutlass-dsl==4.6.2 and compatible TVM FFI."
-        )
-    interface, sparsity, cutlass, cute, utils = [module for _, module in dependencies]
+    interface, sparsity, cutlass, cute, utils = import_fa4_modules(
+        "flash_attn.cute.interface",
+        "flash_attn.cute.block_sparsity",
+        "cutlass",
+        "cutlass.cute",
+        "flash_attn.cute.utils",
+    )
 
     @cute.jit
     def mask_mod(batch, head, query_idx, key_idx, seqlen_info, aux_tensors):
