@@ -59,7 +59,15 @@ from tests.unit_tests.models.inkling2.test_reference import tiny_config
 
 
 def dense(value: torch.Tensor) -> torch.Tensor:
-    """Materialize a parameter/gradient only inside the test process."""
+    """Materialize a parameter, gradient or optimizer tensor for comparison.
+
+    Args:
+        value: Local tensor or DTensor owned by this rank's model.
+
+    Returns:
+        Detached tensor with the global shape; a DTensor is gathered collectively, so
+        every rank must call this for the same tensor.
+    """
     return (value.full_tensor() if isinstance(value, DTensor) else value).detach()
 
 
@@ -67,7 +75,8 @@ def worker(case: str, output: Path) -> None:
     """Compare CP against an independent whole-sequence model and replay an update."""
     cpu = case.startswith("cpu")
     bf16, image, lora = "bf16" in case, "image" in case, "lora" in case
-    cp, ep = (4 if "cp4" in case else 2), (2 if "ep2" in case else 1)
+    cp = 4 if "cp4" in case else 1 if "cp1" in case else 2
+    ep = 2 if "ep2" in case else 1
     ac = "ac" in case
     local = int(os.environ["LOCAL_RANK"])
     if not cpu:
@@ -157,17 +166,19 @@ def worker(case: str, output: Path) -> None:
             )
             model = parallelize_model(model, setup.mesh_context)
             mesh = setup.mesh_context.device_mesh
-        # Reject unsupported layout semantics before any attention collective.
-        ids_probe = torch.ones(1, 12, dtype=torch.long, device=device)
-        for invalid in (
-            {"qkv_format": "thd"},
-            {"cu_seqlens": torch.tensor([0, 6, 12], device=device)},
-            {"attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1]], device=device)},
-            {"position_ids": torch.tensor([[0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 6, 7]], device=device)},
-        ):
-            invalid_batch = {"input_ids": ids_probe, "labels": ids_probe, **invalid}
-            with pytest.raises(ValueError, match="Inkling2"):
-                ContextParallelSharder(model, mesh, invalid_batch).shard(invalid_batch)
+        # Reject unsupported layout semantics before any attention collective. Without
+        # CP the shared sharder is the identity and the decoder validates inside forward.
+        if cp > 1:
+            ids_probe = torch.ones(1, 12, dtype=torch.long, device=device)
+            for invalid in (
+                {"qkv_format": "thd"},
+                {"cu_seqlens": torch.tensor([0, 6, 12], device=device)},
+                {"attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1]], device=device)},
+                {"position_ids": torch.tensor([[0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 6, 7]], device=device)},
+            ):
+                invalid_batch = {"input_ids": ids_probe, "labels": ids_probe, **invalid}
+                with pytest.raises(ValueError, match="Inkling2"):
+                    ContextParallelSharder(model, mesh, invalid_batch).shard(invalid_batch)
         lane = mesh["dp"].get_local_rank()
         dp = world // cp
         owners = {canonical_parameter_fqn(n): p for n, p in model.named_parameters() if p.requires_grad}
@@ -300,7 +311,7 @@ def worker(case: str, output: Path) -> None:
                         selections.insert(1, torch.full_like(selections[0][:, :1], -1))
                     expected_routing[name] = torch.cat(selections, dim=1)
             routing["model"].clear()
-            keep = ~batch["padding_mask"]
+            keep = ~batch["padding_mask"] if cp > 1 else batch["attention_mask"].bool()
             same_routing = torch.ones_like(keep)
             with context():
                 result = model(**batch, output_hidden_states=True)
@@ -544,6 +555,37 @@ def test_context_parallel_cuda(case: str, tmp_path: Path) -> None:
         stderr=subprocess.STDOUT,
         text=True,
         timeout=900,
+    )
+    assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
+def test_trainable_vision_without_context_parallel_cuda(tmp_path: Path) -> None:
+    """DP-only FSDP peers with two and zero images issue the same per-image vision calls."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[4]) + os.pathsep + env.get("PYTHONPATH", "")
+    env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--master_addr=127.0.0.1",
+            f"--master_port={port}",
+            "--nproc_per_node=2",
+            __file__,
+            "--worker",
+            "gpu-image-cp1-ac",
+            str(tmp_path),
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=600,
     )
     assert result.returncode == 0, result.stdout
 

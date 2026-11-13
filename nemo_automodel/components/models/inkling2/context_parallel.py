@@ -37,9 +37,17 @@ CPBatch: TypeAlias = dict[str, torch.Tensor | list[torch.Tensor] | str | None]
 def gather_sequence(value: torch.Tensor, mesh: DeviceMesh | None, *, differentiable: bool) -> torch.Tensor:
     """Gather equal-length [batch, local_sequence, ...] tensors in CP rank order.
 
-    Returns [batch, global_sequence, ...]. Differentiable transport sums every
-    remote consumer's gradient at its source; FSDP owns parameter averaging.
-    Wait before returning so compiled/raw-pointer consumers see completed data.
+    Args:
+        value: This rank's shard [batch, local_sequence, ...]; every rank supplies the same
+            shape and dtype.
+        mesh: One-dimensional CP mesh; None or a single rank returns the input itself.
+        differentiable: Route gradients back to each shard's source rank.
+
+    Returns:
+        [batch, global_sequence, ...] with the shards concatenated in rank order, newly
+        allocated on the input's device. Differentiable transport sums every remote
+        consumer's gradient at its source; FSDP owns parameter averaging. The result is
+        waited on so compiled/raw-pointer consumers see completed data.
     """
     if mesh is None or mesh.size() == 1:
         return value
@@ -57,9 +65,17 @@ def gather_sequence(value: torch.Tensor, mesh: DeviceMesh | None, *, differentia
 def convolution_history(masked: torch.Tensor, mesh: DeviceMesh | None, width: int) -> torch.Tensor:
     """Prepend causal history to masked [batch, local_sequence, channels].
 
-    Returns [batch, local_sequence + width - 1, channels]. Only each rank's
-    final min(width - 1, local_sequence) tokens are exchanged. This also handles
-    a halo wider than a shard and preserves backward participation on rank zero.
+    Args:
+        masked: This rank's shard [batch, local_sequence, channels] with invalid positions
+            already zeroed.
+        mesh: One-dimensional CP mesh; None or a single rank pads with zeros only.
+        width: Convolution taps; width - 1 history positions are prepended.
+
+    Returns:
+        New [batch, local_sequence + width - 1, channels] tensor. Rank zero and positions
+        before the sequence start receive zeros. Only each rank's final
+        min(width - 1, local_sequence) tokens are exchanged, which also handles a halo
+        wider than a shard and preserves backward participation on rank zero.
     """
     halo = width - 1
     if mesh is None or mesh.size() == 1 or halo == 0:
@@ -166,7 +182,25 @@ def prepare_cp_inputs(batch: CPBatch, *, num_chunks: int = 1) -> dict[str, Conte
         loss_mask: torch.Tensor | None = None,
         padding_token_id: int = 0,
     ) -> tuple[Callable, CPBatch, ShardLayout]:
-        """Validate the global real-token span before shared contiguous sharding."""
+        """Validate the global real-token span before shared contiguous sharding.
+
+        Args:
+            cp_mesh: CP mesh; None or a single rank keeps every tensor global.
+            tp_mesh: TP mesh forwarded to the shared sharders.
+            local_batch: Global [batch, sequence] input_ids, labels, position_ids, binary
+                attention_mask and boolean padding_mask; packed seq_lens and seq_lens_padded
+                [batch, documents]; optional inputs_embeds [batch, sequence, hidden]; image
+                patches, grids and the mm_token_type_ids image-body mask. Mutated in place:
+                packed metadata becomes padding_mask and position_ids.
+            loss_mask: Optional [batch, sequence] supervision mask, sharded like labels.
+            padding_token_id: Filler for the sequence padding the shared sharder adds.
+
+        Returns:
+            The shared sharder's context, the sharded batch, and its layout. In the sharded
+            batch labels, loss mask, position_ids and padding_mask are local
+            [batch, local_sequence]; input_ids, the complete attention_mask, images and the
+            image-body mask remain global for image splicing inside forward.
+        """
         ids = cast(torch.Tensor, local_batch["input_ids"])
         if ids.ndim != 2 or min(ids.shape) == 0:
             raise ValueError("Inkling2 CP requires nonempty input_ids [batch, sequence]")

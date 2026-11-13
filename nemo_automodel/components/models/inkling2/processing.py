@@ -165,7 +165,9 @@ class Inkling2Processor(ProcessorMixin):
             HF-compatible token output. Token fields are [batch, sequence]; image patches
             are BF16 [patches, 2, 40, 40, 3], grids int64 [images, 3]. The binary
             mm_token_type_ids marks image bodies only, excluding image headers.
-            Images cut by truncation are rejected instead of silently misaligning features.
+            Images cut by truncation are rejected instead of silently misaligning
+            features, including an image whose last body token is the final token: the
+            training collator drops that position when it shifts inputs against labels.
         """
         del add_generation_prompt
         batched = bool(conversation) and isinstance(conversation[0], list)
@@ -215,7 +217,9 @@ class Inkling2Processor(ProcessorMixin):
             return result
         ids = result["input_ids"]
         image_mask = ids == self.image_body_id
-        if image_mask.sum(-1).tolist() != counts:
+        # The shared collator drops the final position when it shifts inputs against
+        # labels, so every image body has to end before it.
+        if image_mask[..., :-1].sum(-1).tolist() != counts:
             raise ValueError("Inkling2 truncation removed image tokens; filter overlong images or increase max_length")
         result["input_ids"] = ids.masked_fill(image_mask, self.image_token_id)
         result["mm_token_type_ids"] = image_mask.long()

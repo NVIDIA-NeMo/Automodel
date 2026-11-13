@@ -24,6 +24,7 @@ from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPoli
 
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.mesh import MeshContext
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
 
 FP32_MODULES = ("attn_query", "mlp_query", "output_query", "q_l2_clip", "rel_l2_clip", "mlp.gate")
@@ -146,9 +147,12 @@ class Inkling2Parallelizer(ModelParallelizer):
         from .vision import Inkling2VisionEncoder
 
         visual = getattr(model, "visual", None)
-        if isinstance(visual, Inkling2VisionEncoder) and model.cp_mesh is not None:
-            assert device_mesh is not None
-            visual.image_cp_mesh = device_mesh["dp_cp"] if any(p.requires_grad for p in visual.parameters()) else None
+        if isinstance(visual, Inkling2VisionEncoder) and device_mesh is not None:
+            # Trainable vision layers are FSDP units owned by every DP and CP rank, so all
+            # of those ranks must issue the same per-image calls, with or without CP.
+            participants = get_flat_mesh(device_mesh, "dp_cp")
+            trainable = any(p.requires_grad for p in visual.parameters())
+            visual.image_cp_mesh = participants if trainable and participants.size() > 1 else None
 
     def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
         """Residual histories are explicit immutable inputs to each decoder layer."""

@@ -216,3 +216,14 @@ def test_shared_trainer_padding_mask_contract() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     with pytest.raises(ValueError, match="padding_mask must be boolean"):
         first(ids, padding_mask=valid.long())
+
+
+def test_scheduled_composition_cases_construct() -> None:
+    """The four-GPU launcher's cases must build with the two-GPU ``Case`` contract."""
+    from tests.functional_tests.models.inkling2.pipeline_composition import CASES
+
+    assert len(CASES) == 8
+    for name, case in CASES.items():
+        master = name.startswith("master-bf16")
+        assert (case.fused, case.bf16, case.ac) == (master, master, master), name
+        assert case.dp == 2 and case.flex == name.endswith("-flex"), name

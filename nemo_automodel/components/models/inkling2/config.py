@@ -53,12 +53,16 @@ def _checked_quantization_config(
     return declaration
 
 
-def load_quantization_config(name_or_path: str, num_hidden_layers: int) -> Inkling2QuantizationConfig | None:
+def load_quantization_config(
+    name_or_path: str, num_hidden_layers: int, *, revision: str | None = None
+) -> Inkling2QuantizationConfig | None:
     """Read the released ``hf_quant_config.json`` stored next to ``config.json``.
 
     Args:
         name_or_path: Local checkpoint directory or Hub repository id.
         num_hidden_layers: Decoder depth the expert declaration must cover.
+        revision: Hub revision the weights are loaded from; None reads the
+            repository's default branch. Ignored for a local directory.
 
     Returns:
         The expert storage layout, or None for a checkpoint without the sidecar,
@@ -72,7 +76,7 @@ def load_quantization_config(name_or_path: str, num_hidden_layers: int) -> Inkli
         from huggingface_hub.errors import EntryNotFoundError
 
         try:
-            local = hf_hub_download(name_or_path, "hf_quant_config.json")
+            local = hf_hub_download(name_or_path, "hf_quant_config.json", revision=revision)
         except EntryNotFoundError:
             return None
     with open(local, encoding="utf-8") as stream:
@@ -97,12 +101,18 @@ def load_quantization_config(name_or_path: str, num_hidden_layers: int) -> Inkli
     return {"quant_method": "inkling2", "nvfp4_layer_count": boundary}
 
 
-def resolve_quantization_config(config: "Inkling2TextConfig | Inkling2Config") -> None:
-    """Fill ``quantization_config`` from the checkpoint sidecar for a config loaded from a checkpoint."""
+def resolve_quantization_config(config: "Inkling2TextConfig | Inkling2Config", *, revision: str | None = None) -> None:
+    """Fill ``quantization_config`` from the checkpoint sidecar for a config loaded from a checkpoint.
+
+    Args:
+        config: Text or image/text configuration; both levels receive the declaration.
+        revision: Resolved Hub revision of the checkpoint, so the sidecar comes from the
+            same snapshot as the weights.
+    """
     if config.quantization_config is not None or not config.name_or_path:
         return
     text = config.text_config if isinstance(config, Inkling2Config) else config
-    declaration = load_quantization_config(config.name_or_path, text.num_hidden_layers)
+    declaration = load_quantization_config(config.name_or_path, text.num_hidden_layers, revision=revision)
     if declaration is not None:
         config.quantization_config = declaration
         text.quantization_config = declaration
@@ -382,6 +392,18 @@ class Inkling2Config(PretrainedConfig):
         self.text_config.quantization_config = self.quantization_config
         kwargs.setdefault("tie_word_embeddings", False)
         super().__init__(**kwargs)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize both levels; a stripped source declaration is stripped from the text config too.
+
+        The shared floating export removes ``quantization_config`` from this configuration
+        after dequantization. The text configuration carries the same declaration, and a
+        reload would otherwise promote it back to the root and request packed tensors.
+        """
+        output = super().to_dict()
+        if "quantization_config" not in output:
+            output["text_config"].pop("quantization_config", None)
+        return output
 
 
 class Inkling2LegacyConfig(Inkling2Config):

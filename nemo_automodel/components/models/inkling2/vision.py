@@ -41,10 +41,19 @@ class Inkling2VisionEmbeddings(nn.Module):
         self.cls_position_embedding = nn.Parameter(torch.empty(width, dtype=dtype))
 
     def forward(self, pixels: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
-        """Embed one image's row-major pixels [height*width, patch_area*3].
+        """Embed one image's native patches and add interpolated positions.
+
+        Args:
+            pixels: Tensor of shape [height * width, native_patch_size ** 2 * 3]. Rows follow
+                the native patch grid in row-major order; each row flattens patch height,
+                patch width and RGB channels, in that order. Its device and dtype must match
+                the patch projection.
+            height: Native patch rows of the image.
+            width: Native patch columns of the image.
 
         Returns:
-            Compute-dtype [1+height*width, hidden] tokens with the class token first.
+            New [1 + height * width, hidden] tokens in the projection dtype, with the class
+            token first; the input is unchanged.
         """
         grid = self.position_embedding.reshape(self.grid_size, self.grid_size, -1)
         axes = []
@@ -117,7 +126,14 @@ class Inkling2VisionMLP(nn.Module):
         self.c_proj = nn.Linear(int(config.hidden_size * config.mlp_ratio), config.hidden_size, dtype=dtype)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Map [tokens, hidden] features to same-shape features without mutation."""
+        """Apply the GELU feed-forward block.
+
+        Args:
+            hidden: [tokens, hidden] features in the block's dtype.
+
+        Returns:
+            New [tokens, hidden] features; the input is unchanged.
+        """
         return self.c_proj(F.gelu(self.c_fc(hidden)))
 
 
@@ -129,7 +145,15 @@ class Inkling2VisionLayerScale(nn.Module):
         self.gamma = nn.Parameter(torch.ones(width, dtype=dtype))
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Scale [tokens, hidden] features by the learned [hidden] vector."""
+        """Scale a residual branch per channel.
+
+        Args:
+            hidden: [tokens, hidden] branch output.
+
+        Returns:
+            New [tokens, hidden] features, each channel multiplied by the learned [hidden]
+            vector; the input is unchanged.
+        """
         return hidden * self.gamma
 
 
@@ -146,7 +170,15 @@ class Inkling2VisionLayer(nn.Module):
         self.ls_2 = Inkling2VisionLayerScale(config.hidden_size, dtype=dtype)
 
     def forward(self, hidden: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Update [tokens, hidden] features using integer [tokens, 2] positions."""
+        """Apply one pre-LayerNorm attention and feed-forward block.
+
+        Args:
+            hidden: [tokens, hidden] features of one image, class token first.
+            positions: Integer [tokens, 2] (y, x) patch coordinates; the class token uses zero.
+
+        Returns:
+            New [tokens, hidden] features; the inputs are unchanged.
+        """
         hidden = hidden + self.ls_1(self.self_attn(self.ln_1(hidden), positions))
         return hidden + self.ls_2(self.mlp(self.ln_2(hidden)))
 
@@ -161,7 +193,18 @@ class Inkling2VisionBackbone(nn.Module):
         self.layers = nn.ModuleList([Inkling2VisionLayer(config, dtype=dtype) for _ in range(config.num_hidden_layers)])
 
     def forward(self, pixels: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
-        """Encode native pixels [height*width, patch_area*3], dropping the class token."""
+        """Encode one image's native patches.
+
+        Args:
+            pixels: [height * width, native_patch_size ** 2 * 3] rows in native row-major
+                patch order, as consumed by the embeddings.
+            height: Native patch rows of the image.
+            width: Native patch columns of the image.
+
+        Returns:
+            New [height * width, hidden] features in the same row-major patch order, without
+            the class token; the input is unchanged.
+        """
         indices = torch.arange(height * width, device=pixels.device)
         spatial = torch.stack((indices // width + 1, indices % width + 1), -1)
         positions = torch.cat((spatial.new_zeros((1, 2)), spatial))

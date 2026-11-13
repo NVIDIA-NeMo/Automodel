@@ -19,13 +19,15 @@ import copy
 import pytest
 import torch
 from PIL import Image
+from transformers import PreTrainedTokenizerFast
 
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.inkling2.attention import AttentionSources, Inkling2Attention
 from nemo_automodel.components.models.inkling2.config import Inkling2Config, Inkling2VisionConfig
 from nemo_automodel.components.models.inkling2.multimodal import Inkling2ForConditionalGeneration
-from nemo_automodel.components.models.inkling2.processing import image_patches
+from nemo_automodel.components.models.inkling2.processing import Inkling2Processor, image_patches
 from nemo_automodel.components.models.inkling2.state_dict_adapter import Inkling2StateDictAdapter
 from nemo_automodel.components.models.inkling2.vision import Inkling2VisionEncoder
 from nemo_automodel.shared.peft_config import PeftConfig
@@ -80,6 +82,77 @@ def test_processor_image_geometry_padding_and_alpha() -> None:
     transparent, _ = image_patches(Image.new("RGBA", (16, 8), (0, 0, 0, 0)))
     torch.testing.assert_close(transparent[0, 0, 0, 0], ((204 / 255 - mean) / std).bfloat16(), rtol=0, atol=0)
     torch.testing.assert_close(transparent[0, 0, 0, 8], ((153 / 255 - mean) / std).bfloat16(), rtol=0, atol=0)
+
+
+def released_tokenizer() -> PreTrainedTokenizerFast:
+    """Offline tokenizer with the released control-token IDs over a tiny word vocabulary."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    controls = {
+        "<|message_user|>": 200000,
+        "<|message_model|>": 200001,
+        "<|message_system|>": 200002,
+        "<|content_text|>": 200004,
+        "<|content_image|>": 200005,
+        "<|content_model_end_sampling|>": 200006,
+        "<|end_message|>": 200010,
+        "<|unused_200054|>": 200054,
+    }
+    words = ["[UNK]", "hello", "there", "describe", "this", "image", "a", "red", "square"]
+    core = Tokenizer(models.WordLevel({**{word: i for i, word in enumerate(words)}, **controls}, unk_token="[UNK]"))
+    core.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    core.add_special_tokens(list(controls))
+    return PreTrainedTokenizerFast(tokenizer_object=core, unk_token="[UNK]")
+
+
+def test_processor_and_collator_reject_images_cut_by_the_training_shift() -> None:
+    processor = Inkling2Processor(released_tokenizer())
+    conversation = [
+        {"role": "user", "content": "hello there"},
+        {"role": "assistant", "content": "hello"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": Image.new("RGB", (41, 41), (200, 30, 30))},
+                {"type": "text", "text": "describe this image"},
+            ],
+        },
+        {"role": "assistant", "content": "a red square"},
+    ]
+    rendered = processor.apply_chat_template(
+        conversation, tokenize=True, return_dict=True, return_tensors="pt", return_assistant_tokens_mask=True
+    )
+    full, body_full = rendered["input_ids"][0], rendered["mm_token_type_ids"][0]
+    batch = default_collate_fn([{"conversation": conversation}], processor=processor)
+    ids, labels, body = batch["input_ids"][0], batch["labels"][0], batch["mm_token_type_ids"][0]
+    # One shift: inputs drop the last token, labels drop the first, every target is the next token.
+    torch.testing.assert_close(ids, full[:-1], rtol=0, atol=0)
+    supervised = labels != -100
+    torch.testing.assert_close(labels[supervised], full[1:][supervised], rtol=0, atol=0)
+    assert batch["pixel_values"].shape == (4, 2, 40, 40, 3) and body.sum() == 4
+    assert torch.all(ids[body.bool()] == 200005)
+    headers = (ids == 200005) & (body == 0)
+    assert headers.sum() == 1
+    # User text, the image header and the image bodies are never targets; model turns are.
+    assert not supervised[body.bool()].any() and not supervised[headers].any()
+    assert processor.tokenizer.convert_ids_to_tokens(full[1:][supervised].tolist()) == [
+        "hello",
+        "<|end_message|>",
+        "<|content_model_end_sampling|>",
+        "a",
+        "red",
+        "square",
+        "<|end_message|>",
+        "<|content_model_end_sampling|>",
+    ]
+    # Truncation ending exactly on the last image-body token keeps every body before the
+    # shift and loses one after it; the processor rejects it through the collator.
+    last_body = int(body_full.nonzero().max())
+    for max_length in (last_body, last_body + 1):
+        with pytest.raises(ValueError, match="truncation removed image tokens"):
+            default_collate_fn([{"conversation": conversation}], processor=processor, max_length=max_length)
+    kept = default_collate_fn([{"conversation": conversation}], processor=processor, max_length=last_body + 2)
+    assert kept["mm_token_type_ids"].sum() == 4 and kept["pixel_values"].shape[0] == 4
 
 
 def test_global_attention_lora_matches_merged_projection_and_gradients() -> None:

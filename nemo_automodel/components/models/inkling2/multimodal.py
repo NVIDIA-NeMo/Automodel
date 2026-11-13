@@ -49,8 +49,18 @@ class Inkling2ForConditionalGeneration(Inkling2ForCausalLM):
         supports_pp: bool = True
         supports_ep: bool = True
 
-    def __init__(self, config: Inkling2Config, *, backend: BackendConfig | None = None) -> None:
-        resolve_quantization_config(config)
+    def __init__(
+        self, config: Inkling2Config, *, backend: BackendConfig | None = None, revision: str | None = None
+    ) -> None:
+        """Build the decoder and vision encoder from the released configuration.
+
+        Args:
+            config: Released image/text configuration; the sidecar declaration is resolved
+                on it before the text decoder is built from its text configuration.
+            backend: Kernel selection shared with the text decoder.
+            revision: Resolved Hub revision of the checkpoint, for the sidecar read.
+        """
+        resolve_quantization_config(config, revision=revision)
         super().__init__(config.text_config, backend=backend)
         self.config = config
         assert self.embed_tokens is not None

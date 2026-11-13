@@ -168,9 +168,30 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_ep: bool = True
         supports_thd: bool = True
 
-    def __init__(self, config: Inkling2TextConfig, *, backend: BackendConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: Inkling2TextConfig | Inkling2Config,
+        *,
+        backend: BackendConfig | None = None,
+        revision: str | None = None,
+    ) -> None:
+        """Build the text decoder from a text or a released image/text configuration.
+
+        Args:
+            config: Text configuration, or the released image/text configuration that the
+                shared factory passes as is; its text configuration is used, the checkpoint
+                path carries over so the loader finds the weights, and no vision tower is built.
+            backend: Kernel selection; None selects the eager Torch reference.
+            revision: Resolved Hub revision of the checkpoint, for the sidecar read.
+        """
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
+        if isinstance(config, Inkling2Config):
+            resolve_quantization_config(config, revision=revision)
+            text_config = config.text_config
+            text_config.name_or_path = config.name_or_path
+            text_config.architectures = [type(self).__name__]
+            config = text_config
         backend = backend or BackendConfig(
             attn="eager",
             linear="torch",
@@ -200,7 +221,7 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.config = config
         self.text_config = config
         self.name_or_path = config.name_or_path
-        resolve_quantization_config(config)
+        resolve_quantization_config(config, revision=revision)
         self.vocab_size = config.vocab_size
         dtype = dtype_from_str(config.dtype, torch.float32)
         if dtype not in (torch.float32, torch.bfloat16):
@@ -239,15 +260,8 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ) -> "Inkling2ForCausalLM":
         """Construct the text model, from a text or a released image/text configuration.
 
-        A multimodal configuration contributes its text configuration; the checkpoint
-        path carries over so the loader finds the weights, and no vision tower is built.
+        The constructor accepts both forms; this classmethod keeps the explicit entry point.
         """
-        if isinstance(config, Inkling2Config):
-            resolve_quantization_config(config)
-            text_config = config.text_config
-            text_config.name_or_path = config.name_or_path
-            text_config.architectures = [cls.__name__]
-            config = text_config
         return cls(config, backend=backend)
 
     @torch.no_grad()

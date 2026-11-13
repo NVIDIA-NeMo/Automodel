@@ -15,6 +15,7 @@
 """Real SafeTensors reads, exact decode oracles, mapping and storage-lifetime tests."""
 
 import gc
+import inspect
 import json
 import math
 import weakref
@@ -27,7 +28,9 @@ import torch.distributed.checkpoint as dcp
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
+from nemo_automodel.components.checkpoint.addons import _maybe_strip_quantization_config
 from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.models.inkling2.config import (
     Inkling2Config,
@@ -411,3 +414,94 @@ def test_quantization_config_boundary() -> None:
     assert adapter.forced_hf_dtype_mapping(
         {"pseudo_query": torch.zeros(3), "expert": torch.zeros(3, dtype=torch.bfloat16)}
     ) == {"pseudo_query": "F32", "expert": "BF16"}
+
+
+def released_image_text_config(folder: Path, name_or_path: str) -> Inkling2Config:
+    """Load the written released metadata with a small vision tower."""
+    raw = json.loads((folder / "config.json").read_text())
+    raw["vision_config"] = {
+        "hidden_size": 16,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "mlp_ratio": 2.0,
+        "posemb_grid_size": 4,
+        "projection_hidden_dim": 24,
+    }
+    return Inkling2Config.from_dict(raw, name_or_path=name_or_path)
+
+
+def test_constructor_accepts_the_released_configuration_like_the_factory(tmp_path: Path) -> None:
+    """The shared factory constructs ``architectures[0]`` with the released outer config directly."""
+    write_released_checkpoint_metadata(tmp_path, nvfp4_layers=[0], mxfp8_layers=[1])
+    declaration = {"quant_method": "inkling2", "nvfp4_layer_count": 1}
+    config = released_image_text_config(tmp_path, str(tmp_path))
+    config.architectures = ["Inkling2ForCausalLM"]
+    model_cls = ModelRegistry.resolve_custom_model_cls(config.architectures[0], config)
+    assert model_cls is Inkling2ForCausalLM
+    model = model_cls(config)
+    assert not hasattr(model, "visual")
+    assert model.config is config.text_config and model.vocab_size == config.text_config.vocab_size
+    assert model.config.architectures == ["Inkling2ForCausalLM"] and model.name_or_path == str(tmp_path)
+    assert model.config.quantization_config == declaration
+    assert model.state_dict_adapter.source_quantized and model.state_dict_adapter.nvfp4_layer_count == 1
+    ids = torch.tensor([[3, 8, 12, 20]])
+    logits = model(ids)
+    loss = torch.nn.functional.cross_entropy(logits[:, :-1].flatten(0, 1), ids[:, 1:].flatten())
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    # Text configurations and the image/text class keep their contracts.
+    assert isinstance(Inkling2ForCausalLM(checkpoint_config()).config, Inkling2TextConfig)
+    config = released_image_text_config(tmp_path, str(tmp_path))
+    image_model = Inkling2ForConditionalGeneration(config)
+    assert image_model.config is config and image_model.visual is not None
+    assert image_model.config.quantization_config == image_model.text_config.quantization_config == declaration
+
+
+def test_quantization_sidecar_follows_the_resolved_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Hub checkpoint's sidecar is read from the snapshot the weights come from."""
+    import huggingface_hub
+
+    write_released_checkpoint_metadata(tmp_path, nvfp4_layers=[0], mxfp8_layers=[1])
+    calls: list[tuple[str, str, str | None]] = []
+
+    def fake_download(repo_id: str, filename: str, *, revision: str | None = None, **kwargs: object) -> str:
+        calls.append((repo_id, filename, revision))
+        return str(tmp_path / filename)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    # The shared factory forwards the resolved revision only to constructors that declare it.
+    for cls in (Inkling2ForCausalLM, Inkling2ForConditionalGeneration):
+        assert "revision" in inspect.signature(cls.__init__).parameters
+        model = cls(released_image_text_config(tmp_path, "org/inkling2-small"), revision=commit)
+        assert calls[-1] == ("org/inkling2-small", "hf_quant_config.json", commit)
+        assert model.state_dict_adapter.nvfp4_layer_count == 1
+    assert len(calls) == 2
+    # Without a resolved revision the default branch is read; a local directory reads its own file.
+    Inkling2ForCausalLM(released_image_text_config(tmp_path, "org/inkling2-small"))
+    assert len(calls) == 3 and calls[-1][2] is None
+    Inkling2ForCausalLM(released_image_text_config(tmp_path, str(tmp_path)), revision=commit)
+    assert len(calls) == 3
+
+
+def test_floating_export_strips_the_nested_quantization_declaration(tmp_path: Path) -> None:
+    """A dequantized image/text export declares no source quantization at either level."""
+    write_released_checkpoint_metadata(tmp_path, nvfp4_layers=[0], mxfp8_layers=[1])
+    declaration = {"quant_method": "inkling2", "nvfp4_layer_count": 1}
+    model = Inkling2ForConditionalGeneration(released_image_text_config(tmp_path, str(tmp_path)))
+    declared = json.loads(model.config.to_json_string(use_diff=False))
+    assert declared["quantization_config"] == declared["text_config"]["quantization_config"] == declaration
+    _maybe_strip_quantization_config(model, config=model.config)
+    for exported in (
+        json.loads(model.config.to_json_string(use_diff=False)),
+        json.loads(model.config.to_json_string()),
+    ):
+        assert "quantization_config" not in exported and "quantization_config" not in exported["text_config"]
+    # The live import layout is untouched; only the serialized export changes.
+    assert model.config.text_config.quantization_config == declaration and model.state_dict_adapter.source_quantized
+    floating = tmp_path / "floating"
+    model.config.save_pretrained(floating)
+    reloaded = Inkling2Config.from_pretrained(floating)
+    assert reloaded.quantization_config is None and reloaded.text_config.quantization_config is None
+    assert not Inkling2ForConditionalGeneration.from_config(reloaded).state_dict_adapter.source_quantized

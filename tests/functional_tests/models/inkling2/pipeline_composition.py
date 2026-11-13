@@ -27,15 +27,15 @@ from tests.functional_tests.models.inkling2.test_pipeline_cuda import Case, _wor
 CASES = {
     "fp32-pp2-dp2-flex": Case(None, dp=2, flex=True),
     "fp32-pp2-ep2-flex": Case(None, dp=2, ep=2, flex=True),
-    "master-bf16-pp2-ep2-flex": Case(None, bf16=True, ac=True, chunked=True, dp=2, ep=2, ep_reference=True, flex=True),
+    "master-bf16-pp2-ep2-flex": Case(None, bf16=True, ac=True, fused=True, dp=2, ep=2, ep_reference=True, flex=True),
     "master-bf16-pp2-ep2-interleaved-flex": Case(
-        (0, 3, 6, 10, 13), bf16=True, ac=True, chunked=True, interleaved=True, dp=2, ep=2, ep_reference=True, flex=True
+        (0, 3, 6, 10, 13), bf16=True, ac=True, fused=True, interleaved=True, dp=2, ep=2, ep_reference=True, flex=True
     ),
     "fp32-pp2-dp2": Case(None, dp=2),
     "fp32-pp2-ep2": Case(None, dp=2, ep=2),
-    "master-bf16-pp2-ep2": Case(None, bf16=True, ac=True, chunked=True, dp=2, ep=2, ep_reference=True),
+    "master-bf16-pp2-ep2": Case(None, bf16=True, ac=True, fused=True, dp=2, ep=2, ep_reference=True),
     "master-bf16-pp2-ep2-interleaved": Case(
-        (0, 3, 6, 10, 13), bf16=True, ac=True, chunked=True, interleaved=True, dp=2, ep=2, ep_reference=True
+        (0, 3, 6, 10, 13), bf16=True, ac=True, fused=True, interleaved=True, dp=2, ep=2, ep_reference=True
     ),
 }
 

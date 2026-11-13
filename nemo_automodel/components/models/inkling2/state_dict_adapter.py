@@ -30,12 +30,37 @@ from .config import Inkling2Config, Inkling2TextConfig
 
 
 def _local(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the tensor's local storage without copying.
+
+    Args:
+        tensor: Tensor of shape [...], with arbitrary rank and axis order. A DTensor
+            describes the global shape and its mesh placements.
+
+    Returns:
+        Tensor with the same axis order, dtype and device. For a DTensor, each dimension
+        has its per-rank local shard extent; otherwise the input is returned. The result
+        aliases the input storage.
+    """
     # DTensor is an external tensor wrapper; its public local-storage API is required for checkpoint writes.
     return cast(DTensor, tensor).to_local() if is_dtensor(tensor) else tensor
 
 
 def _quantized_storage(template: torch.Tensor, divisor: int, dtype: torch.dtype) -> torch.Tensor:
-    """Allocate source-layout storage for [..., input/divisor], preserving shard placements."""
+    """Allocate source-layout storage for [..., input/divisor], preserving shard placements.
+
+    Args:
+        template: Floating destination [..., input]; a DTensor supplies the global shape and
+            placements, and both its global and local trailing extents must be multiples
+            of ``divisor``.
+        divisor: Source elements per storage element along the trailing axis: 2 for packed
+            FP4 pairs, the block size for block scales.
+        dtype: Storage dtype of the source tensor.
+
+    Returns:
+        Newly allocated, uninitialized [..., input/divisor] storage on the template's device.
+        A DTensor template yields a DTensor on the same mesh and placements whose local
+        shard has the template's local extents. Nothing aliases the template.
+    """
     local = _local(template)
     if template.shape[-1] % divisor or local.shape[-1] % divisor:
         raise ValueError("Quantized Inkling2 input shards must align with the quantization block size")
@@ -56,7 +81,17 @@ def _quantized_storage(template: torch.Tensor, divisor: int, dtype: torch.dtype)
 
 
 def _expert_amax_storage(template: torch.Tensor) -> torch.Tensor:
-    """Allocate [experts] outer-scale metadata, replicated across inner-axis shards."""
+    """Allocate [experts] outer-scale metadata, replicated across inner-axis shards.
+
+    Args:
+        template: Expert tensor [experts, ...]; a DTensor supplies the mesh and placements,
+            of which only a leading-axis shard is kept.
+
+    Returns:
+        Newly allocated, uninitialized FP32 [experts] storage on the template's device. A
+        DTensor template yields a DTensor sharded only where the template shards its
+        leading axis and replicated elsewhere. Nothing aliases the template.
+    """
     local = _local(template)
     storage = torch.empty(local.shape[0], dtype=torch.float32, device=local.device)
     if not is_dtensor(template):
