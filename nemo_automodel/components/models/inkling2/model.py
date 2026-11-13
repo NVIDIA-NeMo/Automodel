@@ -74,8 +74,9 @@ class Inkling2ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
     # ``embed`` and ``unembed`` are separate tensors in the released checkpoints.
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
-    # The adapter covers every checkpoint tensor; skip initializing a model that is loaded next.
-    _skip_init_weights_on_load: bool = True
+    # No ``_skip_init_weights_on_load``: the checkpointer reads that class flag on every construction, so it
+    # would also skip ``from_config`` random init and leave the ``to_empty`` memory (an all-zero model). The
+    # infrastructure sets it per instance when a pipeline-parallel load follows.
 
     # FSDP sidecar: the text model's ``final_input`` query gets its own FP32 unit.
     parallelizer = PARALLELIZER
