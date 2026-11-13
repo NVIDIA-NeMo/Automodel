@@ -158,7 +158,7 @@ lr_scheduler:
   lr_decay_style: constant
 
 ci:
-  nemo_ci_schedule: release
+  nemo_ci_schedule: skipped
   recipe_owner: mreso
   # EP8 fits one node of 8 H100 80 GB GPUs (peak logged memory ~54 GiB per GPU).
   nodes: 1

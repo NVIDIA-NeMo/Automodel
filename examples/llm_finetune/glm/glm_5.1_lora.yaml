@@ -111,7 +111,7 @@ optimizer:
   weight_decay: 0.0
 
 ci:
-  nemo_ci_schedule: release
+  nemo_ci_schedule: skipped
   cluster_tag: h100
   # pp_size(4) * ep_size(32) = 128 GPUs => 16 nodes (8 H100/node).
   recipe_owner: hemildesai

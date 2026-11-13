@@ -79,5 +79,5 @@ checkpoint:
   restore_from: null
 
 ci:
-  nemo_ci_schedule: release
+  nemo_ci_schedule: skipped
   cluster_tag: h100

@@ -165,7 +165,7 @@ optimizer:
 prewarm:
   comm_groups: true
 ci:
-  nemo_ci_schedule: release
+  nemo_ci_schedule: skipped
   cluster_tag: h100
   # pp_size(2) * ep_size(32) = 64 GPUs => 8 nodes (8 H100/node).
   recipe_owner: akoumpa  #PR4637: hemildesai

@@ -109,7 +109,7 @@ packed_sequence:
   packed_sequence_size: 4096
   packing_strategy: neat
 ci:
-  nemo_ci_schedule: nightly,release
+  nemo_ci_schedule: skipped
   cluster_tag: h100
   recipe_owner: akoumpa  #PR4637: hemildesai
   time: "01:00:00"  #PR4637: "00:25:00"

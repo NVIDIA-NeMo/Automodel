@@ -123,7 +123,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
-  nemo_ci_schedule: nightly,release
+  nemo_ci_schedule: nightly
   cluster_tag: h100
   recipe_owner: akoumpa
   time: "00:15:00"

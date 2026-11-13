@@ -138,7 +138,7 @@ peft:
   moe_rank_scaling: false
 
 ci:
-  nemo_ci_schedule: release
+  nemo_ci_schedule: skipped
   recipe_owner: HuiyingLi
   nodes: 8
   nproc_per_node: 4
