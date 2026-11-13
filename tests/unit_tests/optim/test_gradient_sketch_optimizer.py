@@ -415,6 +415,86 @@ def test_optimizer_state_wrapper_round_trip_keeps_non_adam_native_history(gloo_g
         torch.testing.assert_close(p, q)
 
 
+class _Fp32StateSGD(torch.optim.SGD):
+    """SGD that keeps fp32 momentum for low-precision parameters, with TE FusedAdam's checkpoint contract.
+
+    ``state_dict`` reports the fp32 state and ``load_state_dict`` restores it as fp32, undoing torch's
+    cast of loaded state to the parameter dtype. Both overrides record that they ran.
+    """
+
+    calls: list[str]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.calls = []
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        self.calls.append("step")
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                buf = self.state[p].get("momentum_buffer")
+                grad = p.grad.float()
+                buf = grad.clone() if buf is None else buf.mul(group["momentum"]).add_(grad)
+                self.state[p]["momentum_buffer"] = buf
+                p.add_((-group["lr"] * buf).to(p.dtype))
+
+    def state_dict(self):
+        self.calls.append("state_dict")
+        return super().state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.calls.append("load_state_dict")
+        super().load_state_dict(state_dict)  # casts the loaded buffers to the (bf16) parameter dtype
+        saved_params = [key for group in state_dict["param_groups"] for key in group["params"]]
+        params = [p for group in self.param_groups for p in group["params"]]
+        for key, param in zip(saved_params, params, strict=True):
+            self.state[param]["momentum_buffer"] = state_dict["state"][key]["momentum_buffer"].float().clone()
+
+
+def test_checkpoint_round_trip_goes_through_the_native_optimizer_overrides(gloo_group):
+    """A native optimizer with fp32 state for bf16 params (TE FusedAdam) must keep it fp32 on resume."""
+    from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
+
+    def build():
+        net = _mlp(torch.bfloat16)
+        native = _Fp32StateSGD(net.parameters(), lr=0.01, momentum=0.9)
+        return net, GradientSketchOptimizer(net, native, SketchSettings(rank=3, target_modules=("0", "2")))
+
+    net, opt = build()
+    for _ in range(2):
+        opt.zero_grad()
+        _backward(net, torch.bfloat16)
+        opt.synchronize_and_clip(None, 1.0)
+        opt.step()
+    assert opt.state[net[0].bias]["momentum_buffer"].dtype == torch.float32
+    saved = copy.deepcopy(OptimizerState(net, opt).state_dict())
+    assert "state_dict" in opt.native.calls
+
+    net2, opt2 = build()
+    net2.load_state_dict(net.state_dict())
+    wrapper = OptimizerState(net2, opt2)
+    wrapper.state_dict()
+    wrapper.load_state_dict(saved)
+    assert "load_state_dict" in opt2.native.calls
+    assert opt2.state is opt2.native.state
+    assert opt2.param_groups[1] is opt2.native.param_groups[0]
+    assert opt2.update_count == 2
+    buffer = opt2.state[net2[0].bias]["momentum_buffer"]
+    assert buffer.dtype == torch.float32
+    torch.testing.assert_close(buffer, opt.state[net[0].bias]["momentum_buffer"])
+    for o, n in ((opt, net), (opt2, net2)):
+        torch.manual_seed(11)
+        o.zero_grad()
+        _backward(n, torch.bfloat16)
+        o.synchronize_and_clip(None, 1.0)
+        o.step()
+    for p, q in zip(net.parameters(), net2.parameters()):
+        torch.testing.assert_close(p, q)
+
+
 def test_freeze_non_target_registers_no_empty_native_group_and_round_trips(gloo_group):
     """With every non-target frozen, no empty native group may reach DCP's flattened state dict."""
     from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState

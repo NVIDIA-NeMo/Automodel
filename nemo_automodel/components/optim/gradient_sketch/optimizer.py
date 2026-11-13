@@ -386,22 +386,54 @@ class GradientSketchOptimizer(torch.optim.Optimizer):
         for key, target in expected.items():
             _rows(target).copy_(_rows(sketch_state[key]).to(torch.float32))
 
+    def state_dict(self) -> dict[str, Any]:
+        """Pack ``param_groups[0]`` (settings, ``update_count``) with the native optimizer's own state dict.
+
+        The native half comes from ``native.state_dict()`` so an optimizer with its own
+        serialization (TE ``FusedAdam`` unscales low-precision moments to fp32) is honoured;
+        its parameter indices are shifted past the sketch targets so the layout matches
+        :class:`torch.optim.Optimizer`'s packing of all groups in order.
+        """
+        packed = super().state_dict()
+        offset = len(self.param_groups[0]["params"])
+        native_state = self.native.state_dict()["state"] if self.native.param_groups else {}
+        packed["state"] = {index + offset: value for index, value in native_state.items()}
+        return packed
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Load native state, group settings and ``update_count`` from :meth:`state_dict`.
 
+        The native half is handed to ``native.load_state_dict`` (``torch.optim.Optimizer``
+        casts loaded state to the parameter dtype; TE ``FusedAdam`` restores fp32 there).
         Sketch-target state is not read here; use :meth:`load_sketch_state_dict`.
 
         Args:
             state_dict: A dict produced by :meth:`state_dict`.
 
         Raises:
-            ValueError: If the saved sketch settings differ from the configured ones.
+            ValueError: If the saved sketch settings differ from the configured ones, or the
+                saved group layout differs from the current one.
         """
-        saved_settings = state_dict["param_groups"][0].get(_SETTINGS_KEY)
-        if saved_settings != self.settings.to_dict():
+        groups = state_dict["param_groups"]
+        if groups[0].get(_SETTINGS_KEY) != self.settings.to_dict():
             raise ValueError("gradient sketch checkpoint settings differ from the configured settings")
-        super().load_state_dict(state_dict)
-        # Torch replaced ``self.state`` and the group objects: re-share both with the native optimizer.
-        self.native.state = self.state
-        self.native.param_groups = self.param_groups[1:]
+        if len(groups) != len(self.param_groups) or len(groups[0]["params"]) != len(self.param_groups[0]["params"]):
+            raise ValueError("gradient sketch checkpoint parameter groups differ from the configured ones")
+        # Parameters are matched by position within each group, so the saved keys may be the indices
+        # written by :meth:`state_dict` or the FQNs DCP's flattened path substitutes for them.
+        target_keys = set(groups[0]["params"])
+        if any(key in target_keys for key in state_dict["state"]):
+            raise ValueError("gradient sketch checkpoint holds state for sketch targets; use load_sketch_state_dict")
+        self.param_groups[0].update({key: value for key, value in groups[0].items() if key != "params"})
+        if self.native.param_groups:
+            native_keys = {key for group in groups[1:] for key in group["params"]}
+            self.native.load_state_dict(
+                {
+                    "state": {key: value for key, value in state_dict["state"].items() if key in native_keys},
+                    "param_groups": groups[1:],
+                }
+            )
+        # Torch rebuilt the native state mapping and group objects: share them again.
+        self.state = self.native.state
+        self.param_groups = [self.param_groups[0], *self.native.param_groups]
         self.refresh_projection()
