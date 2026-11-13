@@ -893,7 +893,8 @@ class Inkling2DSparkModel(nn.Module):
         Args:
             input_ids: Integer tensor of shape [batch, sequence].
             target_hidden_states: Tensor of shape [batch, sequence, features * hidden]: the target
-                features concatenated in ``target_layer_ids`` order.
+                features concatenated in ``target_layer_ids`` order, in any floating dtype (cast to
+                the parameters' dtype).
             loss_mask: Tensor of shape [batch, sequence], nonzero on supervised tokens.
             target_last_hidden_states: Optional tensor of shape [batch, sequence, hidden], the
                 target's post-final-norm hidden states, for the teacher logits.
@@ -924,12 +925,15 @@ class Inkling2DSparkModel(nn.Module):
         num_blocks = anchor_positions.shape[1]
         anchor_token_ids = torch.gather(input_ids, 1, anchor_positions)
 
+        # Captured features can arrive in another dtype (the target's final norm runs in FP32);
+        # the draft computes in its parameters' dtype.
+        compute_dtype = self.mask_embed.dtype
         # [consumers, batch, sequence, hidden]: one softmax mix of the features per consumer.
-        alpha = torch.softmax(self.fuse_weight.float(), dim=-1).to(target_hidden_states.dtype)
-        features = target_hidden_states.unflatten(-1, (num_features, hidden))
+        alpha = torch.softmax(self.fuse_weight.float(), dim=-1).to(compute_dtype)
+        features = target_hidden_states.to(compute_dtype).unflatten(-1, (num_features, hidden))
         mixes = torch.einsum("cf,bsfh->cbsh", alpha, features)
 
-        hidden_states = self._block_embeddings(anchor_token_ids).to(target_hidden_states.dtype)
+        hidden_states = self._block_embeddings(anchor_token_ids).to(compute_dtype)
         context_positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         context_cos, context_sin = _rope_tables(context_positions, released.head_dim, released.rope_theta)
         block_cos, block_sin = _rope_tables(
@@ -969,7 +973,7 @@ class Inkling2DSparkModel(nn.Module):
         if target_last_hidden_states is not None:
             target_rows = (safe_label_indices - 1).clamp(min=0)
             aligned_target_hidden = torch.gather(
-                target_last_hidden_states.unsqueeze(1).expand(-1, num_blocks, -1, -1),
+                target_last_hidden_states.to(compute_dtype).unsqueeze(1).expand(-1, num_blocks, -1, -1),
                 2,
                 target_rows.unsqueeze(-1).expand(-1, -1, -1, target_last_hidden_states.shape[-1]),
             )

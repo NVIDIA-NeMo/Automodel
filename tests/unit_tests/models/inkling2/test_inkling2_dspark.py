@@ -523,3 +523,12 @@ def test_shared_weights_must_stay_frozen_and_carry_the_embedding_norm():
         model.initialize_embeddings_and_head(embed_tokens=torch.nn.Embedding(_VOCAB, 32), lm_head=head, freeze=False)
     with pytest.raises(ValueError, match="embed_norm"):
         model.initialize_embeddings_and_head(embed_tokens=torch.nn.Embedding(_VOCAB, 32), lm_head=head)
+
+
+def test_bf16_draft_accepts_fp32_target_features():
+    # The target's final norm runs in FP32 while its layers return the model dtype.
+    model = _build().to(torch.bfloat16)
+    inputs = _inputs()
+    out = model(**inputs)
+    assert out.draft_logits.dtype == torch.bfloat16
+    assert torch.isfinite(out.draft_logits.float()).all()
