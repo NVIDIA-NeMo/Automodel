@@ -226,6 +226,13 @@ def _record_router_choices(model: torch.nn.Module, index_position: int) -> dict[
 
     def record(name: str):
         def hook(module: torch.nn.Module, args: tuple, output: tuple) -> None:
+            """Store the sorted expert indices.
+
+            Args:
+                module: The router.
+                args: Router inputs, unused; the hidden states are ``[tokens, hidden]``.
+                output: Router outputs whose ``index_position`` entry has shape ``[tokens, top_k]``.
+            """
             choices[name] = output[index_position].detach().sort(dim=-1).values
 
         return hook
