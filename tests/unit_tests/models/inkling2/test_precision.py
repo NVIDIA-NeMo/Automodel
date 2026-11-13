@@ -33,6 +33,10 @@ LOGIT_MAX_ABS = 1e-2
 LOGIT_MIN_COSINE = 0.9999
 GRADIENT_RELATIVE_L2 = 0.08
 GRADIENT_ABSOLUTE_FLOOR = 5e-4
+# A BF16 residual stream moves the FP32 router's selection scores by up to about
+# 4e-4 in these tiny models, while the reference's top-k cutoff gaps are typically
+# 5e-3. Only two experts closer than this at the cutoff may swap.
+ROUTING_TIE_GAP = 5e-4
 DEVICES = [
     pytest.param("cpu", marks=pytest.mark.cpu_only),
     pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device unavailable")),
@@ -106,12 +110,23 @@ def test_bf16_outputs_routes_and_all_gradients(
     assert cosine > LOGIT_MIN_COSINE
     for index, (left, right) in enumerate(zip(partials, expected.partials, strict=True)):
         torch.testing.assert_close(left, right, rtol=0.03, atol=0.003, msg=f"layer {index}")
-    for left, right in zip(routes, expected.routing_ids, strict=True):
+    flips = 0
+    for index, (left, right, choice) in enumerate(
+        zip(routes, expected.routing_ids, expected.routing_scores, strict=True)
+    ):
         # Routing selects a set of experts; the ordering within that set is not
-        # semantic. Near-equal scores can swap two selected slots under BF16
-        # rounding. Still require exactly the same experts, including at the
-        # top-k cutoff; logits and every parameter gradient are checked below.
-        torch.testing.assert_close(left.sort(-1).values, right.sort(-1).values, rtol=0, atol=0)
+        # semantic. Every token must select the reference experts, except that the
+        # BF16 residual stream can swap the two experts straddling the top-k cutoff
+        # when their reference selection scores are closer than the noise BF16 inputs
+        # add to the FP32 router. Logits and every parameter gradient are checked below.
+        for token, (selected, wanted) in enumerate(zip(left.tolist(), right.tolist(), strict=True)):
+            added, dropped = sorted(set(selected) - set(wanted)), sorted(set(wanted) - set(selected))
+            if not added and not dropped:
+                continue
+            assert len(added) == len(dropped) == 1, (index, token, added, dropped)
+            gap = (choice[token, dropped[0]] - choice[token, added[0]]).item()
+            assert 0.0 <= gap <= ROUTING_TIE_GAP, (index, token, added, dropped, gap)
+            flips += 1
     upstream = torch.randn_like(a)
     (a * upstream).sum().backward()
     (b * upstream).sum().backward()
@@ -133,6 +148,7 @@ def test_bf16_outputs_routes_and_all_gradients(
     record_property("gradient_max_abs", max(maximum_errors))
     record_property("gradient_max_relative_l2", max(relative_errors))
     record_property("parameter_tensors_checked", len(parameters))
+    record_property("routing_tie_flips", flips)
 
 
 @pytest.mark.cpu_only

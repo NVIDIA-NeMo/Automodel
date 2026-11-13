@@ -29,11 +29,12 @@ from nemo_automodel.components.models.inkling2.config import Inkling2TextConfig
 
 @dataclass
 class ReferenceOutput:
-    """FP32 logits [B,T,V], floating partial blocks [B,T,H], and routing IDs [B*T,K]."""
+    """FP32 logits [B,T,V], floating partial blocks [B,T,H], routing IDs [B*T,K] and selection scores [B*T,E]."""
 
     logits: torch.Tensor
     partials: list[torch.Tensor]
     routing_ids: list[torch.Tensor]
+    routing_scores: list[torch.Tensor]
 
 
 def rms(x: torch.Tensor, weight: torch.Tensor | None, eps: float) -> torch.Tensor:
@@ -291,6 +292,7 @@ def experts(
     prefix: str,
     x: torch.Tensor,
     routing_ids: list[torch.Tensor] | None = None,
+    routing_scores: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Per-token/top-k expert computation with explicit gate and up branches.
 
@@ -300,16 +302,19 @@ def experts(
         prefix: MoE module name.
         x: Tensor of shape [batch, sequence, hidden].
         routing_ids: Optional collector for this layer's [batch * sequence, top-k] expert IDs.
+        routing_scores: Optional collector for this layer's FP32 [batch * sequence, experts]
+            selection scores (sigmoid scores plus the correction bias) that chose those IDs.
 
     Returns:
         Tensor of shape [batch, sequence, hidden].
     """
-    outputs, selected = [], []
+    outputs, selected, choices = [], [], []
     for token in x.reshape(-1, x.shape[-1]):
         scores = torch.sigmoid(F.linear(token.float(), weights[prefix + ".gate.weight"].float()))
         choice = scores + weights.get(prefix + ".gate.e_score_correction_bias", torch.zeros_like(scores))
         ids = torch.argsort(choice, descending=True)[: cfg.num_experts_per_tok]
         selected.append(ids)
+        choices.append(choice.detach())
         gamma = cfg.route_scale * scores[ids] / scores[ids].sum()
         result = torch.zeros_like(token, dtype=torch.float32)
         for slot, expert in enumerate(ids):
@@ -323,6 +328,8 @@ def experts(
         outputs.append(result.to(token.dtype))
     if routing_ids is not None:
         routing_ids.append(torch.stack(selected))
+    if routing_scores is not None:
+        routing_scores.append(torch.stack(choices))
     return torch.stack(outputs).reshape_as(x)
 
 
@@ -358,7 +365,7 @@ def forward(
     current = current.to(dtype) * valid[..., None]
     completed = []
     partials = []
-    routing_ids = []
+    routing_ids, routing_scores = [], []
     for i in range(cfg.num_hidden_layers):
         prefix = f"layers.{i}"
         local = i in cfg.local_layer_ids
@@ -402,7 +409,7 @@ def forward(
             cfg.attn_res_normalize_values,
         )
         mlp_input = rms(mlp_input, weights[prefix + ".mlp_norm.weight"], cfg.rms_norm_eps).to(dtype)
-        out = experts(cfg, weights, prefix + ".mlp", mlp_input, routing_ids)
+        out = experts(cfg, weights, prefix + ".mlp", mlp_input, routing_ids, routing_scores)
         current = (
             current
             + convolution(
@@ -430,4 +437,4 @@ def forward(
         torch.arange(cfg.vocab_size, device=logits.device) >= cfg.unpadded_vocab_size,
         float("-inf"),
     )
-    return ReferenceOutput(logits, partials, routing_ids)
+    return ReferenceOutput(logits, partials, routing_ids, routing_scores)
