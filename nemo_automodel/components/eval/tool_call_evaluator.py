@@ -29,9 +29,14 @@ sharding and all-reduce of metrics are left to the caller (the training
 recipe), which already has the dist environment in hand.
 """
 
+from __future__ import annotations
+
 import gc
 import logging
-from typing import Any, Dict, List, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Protocol, TypedDict
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 import torch
 
@@ -44,6 +49,38 @@ from nemo_automodel.components.eval.tool_call_parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _LogitsOutput(Protocol):
+    """Forward result exposing logits of shape [batch, sequence, vocab]."""
+
+    @property
+    def logits(self) -> torch.Tensor: ...
+
+
+class _ForwardModel(Protocol):
+    """Model contract used by the no-cache greedy decoding fallback."""
+
+    def __call__(
+        self, *, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> _LogitsOutput | torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]:
+        """Run a full-prefix forward pass.
+
+        Args:
+            input_ids: Integer token IDs of shape [batch, sequence].
+            attention_mask: Mask of shape [batch, sequence] on the same device.
+
+        Returns:
+            Logits of shape [batch, sequence, vocab], directly, in a ``logits``
+            attribute, or as the first element of a tuple/list.
+        """
+        ...
+
+
+class _GenerationKwargs(TypedDict):
+    max_new_tokens: int
+    do_sample: bool
+    pad_token_id: int | None
 
 
 class ToolCallAccuracyEvaluator:
@@ -93,7 +130,7 @@ class ToolCallAccuracyEvaluator:
         self,
         *,
         dataset_name: str | None = None,
-        path: Union[str, List[str]] | None = None,
+        path: str | list[str] | None = None,
         split: str = "train",
         limit_dataset_samples: int | None = None,
         max_eval_samples: int | None = None,
@@ -101,7 +138,7 @@ class ToolCallAccuracyEvaluator:
         max_prompt_tokens: int | None = None,
         do_sample: bool = False,
         metric_prefix: str = "tool_call",
-        sample_shard: tuple | None = None,
+        sample_shard: tuple[int, int] | None = None,
         raise_on_cuda_oom: bool = True,
         run_on_fsdp2: bool = False,
     ) -> None:
@@ -124,7 +161,7 @@ class ToolCallAccuracyEvaluator:
         self._samples_cache: List[Dict[str, Any]] | None = None
 
     @property
-    def sample_shard(self) -> tuple | None:
+    def sample_shard(self) -> tuple[int, int] | None:
         """``(rank, world_size)`` shard, or ``None`` to score every sample.
 
         The training recipe sets this so each data-parallel rank scores a
@@ -134,7 +171,7 @@ class ToolCallAccuracyEvaluator:
         return self._sample_shard
 
     @sample_shard.setter
-    def sample_shard(self, value: tuple | None) -> None:
+    def sample_shard(self, value: tuple[int, int] | None) -> None:
         self._sample_shard = value
 
     def _cleanup_cuda(self) -> None:
@@ -144,7 +181,7 @@ class ToolCallAccuracyEvaluator:
 
     def _greedy_generate_manual(
         self,
-        model,
+        model: _ForwardModel,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         max_new_tokens: int,
@@ -160,15 +197,27 @@ class ToolCallAccuracyEvaluator:
         return logits. No KV cache, so cost is ``O(L * (P + L))`` per sample
         where ``P`` is prompt length and ``L`` is ``max_new_tokens`` — fine
         for the small eval budgets used here (default 256 tokens).
+
+        Args:
+            model: Forward-only model satisfying the logits contract above.
+            input_ids: Integer token IDs of shape [batch, prompt].
+            attention_mask: Mask of shape [batch, prompt] on the same device.
+            max_new_tokens: Maximum number of decoding steps.
+            eos_token_id: Stop once every batch row produces this ID, or None.
+
+        Returns:
+            Token IDs of shape [batch, prompt + generated] on the input device.
+            The input IDs and mask are not mutated. With zero decoding steps,
+            the returned tensor aliases input_ids.
         """
         for _ in range(max_new_tokens):
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            if hasattr(outputs, "logits"):
-                logits = outputs.logits
+            if isinstance(outputs, torch.Tensor):
+                logits = outputs
             elif isinstance(outputs, (tuple, list)):
                 logits = outputs[0]
             else:
-                logits = outputs
+                logits = outputs.logits
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
             attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=1)
@@ -202,7 +251,7 @@ class ToolCallAccuracyEvaluator:
 
     def _render_prompt_ids(
         self,
-        tokenizer,
+        tokenizer: PreTrainedTokenizerBase,
         sample: Dict[str, Any],
         skip_reasons: Dict[str, int] | None = None,
     ) -> List[int] | None:
@@ -318,7 +367,7 @@ class ToolCallAccuracyEvaluator:
             input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_ids)
 
-            gen_kwargs: Dict[str, Any] = {
+            gen_kwargs: _GenerationKwargs = {
                 "max_new_tokens": self._max_new_tokens,
                 "do_sample": self._do_sample,
                 "pad_token_id": (
