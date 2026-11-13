@@ -130,9 +130,11 @@ def test_pooler_output_matches_reference_values():
 
     parameters = dict(model.named_parameters())
     grad_norms = torch.stack([parameters[name].grad.norm() for name in GOLDEN_GRAD_PARAMETERS])
-    torch.testing.assert_close(output.pooler_output.sum(-1), torch.tensor(REFERENCE_POOLER_ROW_SUMS))
-    torch.testing.assert_close(output.pooler_output[0, :8], torch.tensor(REFERENCE_POOLER_FIRST_ROW))
-    torch.testing.assert_close(grad_norms, torch.tensor(REFERENCE_GRAD_NORMS))
+    # The reference values come from one CPU; float32 summation order differs across CPUs by ~1e-5.
+    tolerance = {"rtol": 1e-4, "atol": 1e-4}
+    torch.testing.assert_close(output.pooler_output.sum(-1), torch.tensor(REFERENCE_POOLER_ROW_SUMS), **tolerance)
+    torch.testing.assert_close(output.pooler_output[0, :8], torch.tensor(REFERENCE_POOLER_FIRST_ROW), **tolerance)
+    torch.testing.assert_close(grad_norms, torch.tensor(REFERENCE_GRAD_NORMS), **tolerance)
 
 
 def test_output_shapes_follow_image_grid():
