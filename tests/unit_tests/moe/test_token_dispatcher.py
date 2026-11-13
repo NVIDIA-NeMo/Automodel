@@ -30,6 +30,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
     _HybridEPManager,
     _HybridEPMetadataProcessor,
 )
+from nemo_automodel.shared.deepep_v25 import DeepEpV25Manager
 
 
 @pytest.fixture
@@ -655,10 +656,11 @@ class TestIndicesToMultihot:
         assert routing_map[0, 0] and routing_map[0, 7]
 
 
+@pytest.mark.parametrize("manager_type", [_DeepepManager, DeepEpV25Manager])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_token_unpermutation_applies_async_setting_to_deepep_combine(enabled):
+def test_token_unpermutation_applies_async_setting_to_deepep_combine(enabled, manager_type):
     dispatcher = object.__new__(MoEFlexTokenDispatcher)
-    manager = object.__new__(_DeepepManager)
+    manager = object.__new__(manager_type)
     manager.get_restored_hidden_states_by_experts = Mock(side_effect=lambda tensor: tensor)
     manager.combine = Mock(side_effect=lambda tensor, async_finish, allocate_on_comm_stream: tensor)
     dispatcher._comm_manager = manager
