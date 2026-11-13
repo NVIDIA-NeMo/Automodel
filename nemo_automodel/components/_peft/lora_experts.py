@@ -86,6 +86,8 @@ class GroupedExpertsLoRA(GroupedExperts):
     GroupedExperts + LoRA.
 
     This class wraps `GroupedExperts` to apply LoRA to the expert weights.
+    MXFP8 experts are rejected: the additive adapter GEMMs do not implement
+    that backend. Select ``experts="torch_mm"`` or ``experts="torch"`` explicitly.
 
     Attributes:
         lora_dim (int): Rank of the LoRA adapter.
@@ -111,6 +113,11 @@ class GroupedExpertsLoRA(GroupedExperts):
         lora_A_init_method: str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
+        if orig_module.use_mxfp8:
+            raise ValueError(
+                "Expert LoRA does not support experts='torch_mm_mxfp8'; "
+                "select experts='torch_mm' or experts='torch' explicitly."
+            )
         # Build the wrapper without allocating another full set of expert weights.
         with torch.device("meta"):
             super().__init__(orig_module.config)
@@ -234,6 +241,9 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         Returns:
             Combined local activations [local_tokens, expert_dim], with x's dtype.
+            Expert parameters may be DTensors sharded on expert axis 0 of a
+            one-dimensional EP mesh. Post-down routing retains top-k slots
+            until after EP combine. Inputs are not mutated.
         """
         assert not isinstance(x, DTensor)
         input_dtype = x.dtype
@@ -342,17 +352,41 @@ class GroupedExpertsLoRA(GroupedExperts):
         experts_end_idx: int,
         post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None,
     ) -> torch.Tensor:
-        """Apply local expert weights and LoRA to routed tokens.
+        """Apply additive LoRA with a per-expert loop.
 
-        ``x`` is [tokens, hidden], ``weights`` and ``indices`` are [tokens, topk],
-        and ``token_mask`` is [tokens]. Base projections are [experts, in_dim,
-        out_dim]; adapter A/B tensors are [experts, in_dim, rank] and
-        [experts, rank, out_dim]. The optional callback preserves [tokens, hidden].
+        Args:
+            x: Tensor of shape [tokens, hidden], EP-gathered when needed.
+            weights: Tensor of shape [tokens, top_k], routing probabilities.
+            indices: Integer tensor of shape [tokens, top_k], global expert IDs.
+            token_mask: Boolean tensor of shape [tokens].
+            gate_and_up_projs: Local tensor [local_experts, hidden, up], where
+                up is intermediate or fused gate+up (2 * intermediate).
+            down_projs: Local tensor [local_experts, intermediate, hidden].
+            lora_gate_and_up_A: Local tensor [local_experts, hidden, rank].
+            lora_gate_and_up_B: Local tensor [local_experts, rank, up].
+            lora_down_A: Local tensor [local_experts, intermediate, rank].
+            lora_down_B: Local tensor [local_experts, rank, hidden].
+            n_local_experts: Number of local experts.
+            experts_start_idx: First global expert ID on this rank.
+            experts_end_idx: Exclusive last global expert ID on this rank.
+            post_expert_output: Optional transform preserving [routed_tokens, hidden],
+                applied before post-down router weighting.
+
+        Returns:
+            FP32 tensor [tokens, top_k, hidden] for post-down routing, otherwise
+            [tokens, hidden], on x's device. Operands have x's dtype/device.
+            Slots are reduced by forward after EP combine. No input is mutated.
         """
-        output_shape = (
-            (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
-        )
+        apply_after_down = self.config.apply_router_weight_after_down
+        output_shape = (x.shape[0], weights.shape[1], x.shape[1]) if apply_after_down else x.shape
         y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
+        gate_up_proj_bias: torch.Tensor | None = None
+        down_proj_bias: torch.Tensor | None = None
+        if self.expert_bias:
+            assert self.gate_up_proj_bias is not None
+            assert self.down_proj_bias is not None
+            gate_up_proj_bias = _to_local(self.gate_up_proj_bias).to(x.dtype)
+            down_proj_bias = _to_local(self.down_proj_bias).to(x.dtype)
 
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
@@ -374,11 +408,12 @@ class GroupedExpertsLoRA(GroupedExperts):
             )
 
             if self.expert_bias:
-                assert self.gate_up_proj_bias is not None
-                gate_and_up_out = gate_and_up_out + self.gate_up_proj_bias[local_idx]
+                assert gate_up_proj_bias is not None
+                gate_and_up_out = gate_and_up_out + gate_up_proj_bias[local_idx]
 
+            # Preserve the parent's configured routing placement without merging LoRA.
             w = weights[idx, top, None]
-            activation_weight = torch.ones_like(w) if self.config.apply_router_weight_after_down else w
+            activation_weight = torch.ones_like(w) if apply_after_down else w
             activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
 
             # Down projection + LoRA
@@ -386,17 +421,15 @@ class GroupedExpertsLoRA(GroupedExperts):
             expert_out = expert_out + (activated @ lora_down_A[local_idx] @ lora_down_B[local_idx]) * self.scale
 
             if self.expert_bias:
-                assert self.down_proj_bias is not None
+                assert down_proj_bias is not None
                 expert_out = expert_out + (
-                    self.down_proj_bias[local_idx]
-                    if self.config.apply_router_weight_after_down
-                    else self.down_proj_bias[local_idx] * w
+                    down_proj_bias[local_idx] if apply_after_down else down_proj_bias[local_idx] * w
                 )
 
             if post_expert_output is not None:
                 expert_out = post_expert_output(expert_out)
 
-            if self.config.apply_router_weight_after_down:
+            if apply_after_down:
                 expert_out = _apply_router_weight_fp32(expert_out, w, torch.float32)
                 slot_ids = idx * weights.shape[1] + top
                 slot_ids_b = slot_ids[:, None].expand(-1, x.size(1))
@@ -404,28 +437,24 @@ class GroupedExpertsLoRA(GroupedExperts):
             else:
                 y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
 
-        # Dummy computation for gradient flow when no tokens routed locally
+        # Keep empty/fully masked ranks attached without indexing nonexistent tokens.
         if active_local_experts == 0:
-            dummy_x = torch.zeros_like(x[0]).unsqueeze(0)
-            gate_and_up_out = dummy_x @ gate_and_up_projs[0]
-            gate_and_up_out = gate_and_up_out + (dummy_x @ lora_gate_and_up_A[0] @ lora_gate_and_up_B[0]) * self.scale
-            dummy_weight = weights[0, 0, None].unsqueeze(0)
-            activation_weight = (
-                torch.ones_like(dummy_weight) if self.config.apply_router_weight_after_down else dummy_weight
+            y = (
+                y
+                + (
+                    x.sum(dtype=torch.float32)
+                    + weights.sum(dtype=torch.float32)
+                    + gate_and_up_projs.sum(dtype=torch.float32)
+                    + down_projs.sum(dtype=torch.float32)
+                    + lora_gate_and_up_A.sum(dtype=torch.float32)
+                    + lora_gate_and_up_B.sum(dtype=torch.float32)
+                    + lora_down_A.sum(dtype=torch.float32)
+                    + lora_down_B.sum(dtype=torch.float32)
+                )
+                * 0.0
             )
-            activated = self.expert_activation_grouped(gate_and_up_out, activation_weight)
-            expert_out = activated @ down_projs[0]
-            expert_out = expert_out + (activated @ lora_down_A[0] @ lora_down_B[0]) * self.scale
             if post_expert_output is not None:
-                expert_out = post_expert_output(expert_out)
-            if self.config.apply_router_weight_after_down:
-                # Apply the routing weight after the down projection, as the token path and
-                # GroupedExpertsDeepEPLoRA do. This keeps the weights attached: under EP their
-                # all-gather backward is a collective that every rank must enter.
-                expert_out = _apply_router_weight_fp32(expert_out, dummy_weight, torch.float32)
-                y[0, 0] += expert_out[0]
-            else:
-                y[0] += expert_out[0]
+                y = y + post_expert_output(x.new_zeros((1, x.size(1)))).sum(dtype=torch.float32) * 0.0
 
         return y
 
@@ -445,12 +474,30 @@ class GroupedExpertsLoRA(GroupedExperts):
         experts_start_idx: int,
         post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None,
     ) -> torch.Tensor:
-        """Apply grouped expert weights and LoRA to routed tokens.
+        """Apply additive LoRA using grouped GEMM.
 
-        ``x`` is [tokens, hidden], ``weights`` and ``indices`` are [tokens, topk],
-        and ``token_mask`` is [tokens]. Base projections are [experts, in_dim,
-        out_dim]; adapter A/B tensors are [experts, in_dim, rank] and
-        [experts, rank, out_dim]. The optional callback preserves [routed_tokens, hidden].
+        Args:
+            x: Tensor [tokens, hidden], EP-gathered when needed.
+            token_mask: Boolean tensor [tokens].
+            weights: Routing probability tensor [tokens, top_k].
+            indices: Integer tensor [tokens, top_k], global expert IDs.
+            gate_and_up_projs: Contiguous local tensor [local_experts, hidden,
+                up], where up is intermediate or fused gate+up (2 * intermediate).
+            down_projs: Contiguous local tensor [local_experts, intermediate, hidden].
+            lora_gate_and_up_A: Contiguous local tensor [local_experts, hidden, rank].
+            lora_gate_and_up_B: Contiguous local tensor [local_experts, rank, up].
+            lora_down_A: Contiguous local tensor [local_experts, intermediate, rank].
+            lora_down_B: Contiguous local tensor [local_experts, rank, hidden].
+                Adapter ranks are padded for 16-byte stride alignment.
+            n_local_experts: Number of local experts.
+            experts_start_idx: First global expert ID on this rank.
+            post_expert_output: Optional transform preserving [routed_tokens, hidden],
+                applied before post-down router weighting.
+
+        Returns:
+            FP32 tensor [tokens, top_k, hidden] for post-down routing, otherwise
+            [tokens, hidden], on x's device. All operands share x's dtype/device.
+            Slots are reduced by forward after EP combine. No input is mutated.
         """
         sorted_token_ids, sorted_slot_ids, sorted_weights, tokens_per_expert, offs = _permute_tokens_for_grouped_mm(
             indices,
@@ -461,25 +508,22 @@ class GroupedExpertsLoRA(GroupedExperts):
             return_slot_ids=True,
         )
 
-        output_shape = (
-            (x.shape[0], weights.shape[1], x.shape[1]) if self.config.apply_router_weight_after_down else x.shape
-        )
+        apply_after_down = self.config.apply_router_weight_after_down
+        output_shape = (x.shape[0], weights.shape[1], x.shape[1]) if apply_after_down else x.shape
         y = torch.zeros(output_shape, dtype=torch.float32, device=x.device)
 
         if sorted_token_ids.numel() > 0:
             permuted_x = x[sorted_token_ids]
             permuted_probs = sorted_weights.unsqueeze(-1)
-            activation_probs = (
-                torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
-            )
+            activation_probs = torch.ones_like(permuted_probs) if apply_after_down else permuted_probs
 
             gate_up_proj_bias: torch.Tensor | None = None
             down_proj_bias: torch.Tensor | None = None
             if self.expert_bias:
                 assert self.gate_up_proj_bias is not None
                 assert self.down_proj_bias is not None
-                gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
-                down_proj_bias = _to_local(self.down_proj_bias)
+                gate_up_proj_bias = _to_local(self.gate_up_proj_bias).to(x.dtype)
+                down_proj_bias = _to_local(self.down_proj_bias).to(x.dtype)
 
             # Gate+Up projection + LoRA
             output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
@@ -505,13 +549,13 @@ class GroupedExpertsLoRA(GroupedExperts):
                     output2,
                     down_proj_bias,
                     tokens_per_expert,
-                    None if self.config.apply_router_weight_after_down else permuted_probs,
+                    None if apply_after_down else permuted_probs,
                 )
 
             if post_expert_output is not None:
                 output2 = post_expert_output(output2)
 
-            if self.config.apply_router_weight_after_down:
+            if apply_after_down:
                 output2 = _apply_router_weight_fp32(output2, permuted_probs, torch.float32)
                 scatter_ids = sorted_slot_ids.unsqueeze(1).expand_as(output2)
                 y.view(-1, x.size(1)).scatter_add_(0, scatter_ids, output2)
@@ -519,27 +563,23 @@ class GroupedExpertsLoRA(GroupedExperts):
                 scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
                 y.scatter_add_(0, scatter_ids, output2.float())
         else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1 = (
-                output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
+            # Preserve the output layout and all gradients even for zero tokens.
+            y = (
+                y
+                + (
+                    x.sum(dtype=torch.float32)
+                    + weights.sum(dtype=torch.float32)
+                    + gate_and_up_projs.sum(dtype=torch.float32)
+                    + down_projs.sum(dtype=torch.float32)
+                    + lora_gate_and_up_A.sum(dtype=torch.float32)
+                    + lora_gate_and_up_B.sum(dtype=torch.float32)
+                    + lora_down_A.sum(dtype=torch.float32)
+                    + lora_down_B.sum(dtype=torch.float32)
+                )
+                * 0.0
             )
-            dummy_weight = weights[0, 0, None].unsqueeze(0)
-            activation_weight = (
-                torch.ones_like(dummy_weight) if self.config.apply_router_weight_after_down else dummy_weight
-            )
-            output1_ = self.expert_activation_grouped(output1, activation_weight)
-            output2 = torch.matmul(output1_, down_projs[0])
-            output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
             if post_expert_output is not None:
-                output2 = post_expert_output(output2)
-            if self.config.apply_router_weight_after_down:
-                # Same after-down weighting as the token path; see _forward_loop.
-                output2 = _apply_router_weight_fp32(output2, dummy_weight, torch.float32)
-                y[0, 0] += output2[0]
-            else:
-                y[0] += output2[0]
+                y = y + post_expert_output(x.new_zeros((1, x.size(1)))).sum(dtype=torch.float32) * 0.0
 
         return y
 
@@ -549,6 +589,8 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     GroupedExpertsDeepEP + LoRA.
 
     This class wraps `GroupedExpertsDeepEP` to apply LoRA to the expert weights using DeepEP kernels.
+    MXFP8 experts are rejected because the additive adapter GEMMs do not
+    implement that backend. Select ``experts="torch_mm"`` explicitly.
 
     Attributes:
         lora_dim (int): Rank of the LoRA adapter.
@@ -574,6 +616,10 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         lora_A_init_method: str = "xavier",
         lora_dtype: torch.dtype | str | None = None,
     ) -> None:
+        if orig_module.use_mxfp8:
+            raise ValueError(
+                "Expert LoRA does not support experts='torch_mm_mxfp8'; select experts='torch_mm' explicitly."
+            )
         # Preserve the existing base storage, including its dtype and device.
         with torch.device("meta"):
             super().__init__(
@@ -611,7 +657,6 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.ep_size = getattr(orig_module, "ep_size", 1)
         self.ep_rank = getattr(orig_module, "ep_rank", 0)
         self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
-        self.use_mxfp8 = getattr(orig_module, "use_mxfp8", False)
 
         GroupedExpertsDeepEPLoRA._init_adapter(
             self,
@@ -691,19 +736,22 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         indices: torch.Tensor,
         post_expert_output: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Apply LoRA while preserving the base expert transform and routing order.
+        """Apply additive LoRA without changing dispatch or combine.
 
         Args:
-            x: Local input activations [local_tokens, expert_dim].
-            token_mask: Valid-token flags [local_tokens].
-            weights: Selected routing probabilities [local_tokens, topk].
-            indices: Global expert IDs [local_tokens, topk].
-            post_expert_output: Optional transform from [routed_tokens, expert_dim]
-                to the same layout, applied after the down projection and before
-                router weighting when apply_router_weight_after_down is enabled.
+            x: Local tensor [tokens, hidden], in the compute dtype.
+            token_mask: Local boolean tensor [tokens].
+            weights: Local routing probability tensor [tokens, top_k].
+            indices: Local integer tensor [tokens, top_k], global expert IDs.
+            post_expert_output: Optional transform preserving [routed_tokens, hidden],
+                applied after the down projection and before post-down router weighting.
 
         Returns:
-            Combined local activations [local_tokens, expert_dim], with x's dtype.
+            Local tensor [tokens, hidden] on x's device after dispatcher combine.
+            Post-down routing multiplies in FP32 then casts to the compute dtype
+            before combine. Base and adapter parameters may be DTensors sharded
+            on expert axis 0; local operands have layout [local_experts, in, out].
+            Inputs are not mutated.
         """
         assert not isinstance(x, DTensor)
         assert self.n_routed_experts % self.ep_size == 0
@@ -711,10 +759,9 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         permuted_local_hidden_states, tokens_per_expert, permuted_probs = self._dispatch_tokens(
             x, token_mask, weights, indices
         )
+        apply_after_down = self.config.apply_router_weight_after_down
+        activation_probs = torch.ones_like(permuted_probs) if apply_after_down else permuted_probs
 
-        activation_probs = (
-            torch.ones_like(permuted_probs) if self.config.apply_router_weight_after_down else permuted_probs
-        )
         compute_dtype = x.dtype
         gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
         down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
@@ -756,25 +803,28 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 assert self.down_proj_bias is not None
                 down_bias = _to_local(self.down_proj_bias)
                 output2 = _apply_bias(
-                    output2,
-                    down_bias,
-                    tokens_per_expert,
-                    None if self.config.apply_router_weight_after_down else permuted_probs,
+                    output2, down_bias, tokens_per_expert, None if apply_after_down else permuted_probs
                 )
         else:
-            # Dummy computation for gradient flow
-            output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
-            output1 = (
-                output1
-                + torch.matmul(torch.matmul(x[0] * 0, lora_gate_and_up_A[0]), lora_gate_and_up_B[0]) * self.scale
-            )
-            output1_ = self.expert_activation(output1, activation_probs)
-            output2 = torch.matmul(output1_, down_projs[0])
-            output2 = output2 + torch.matmul(torch.matmul(output1_ * 0, lora_down_A[0]), lora_down_B[0]) * self.scale
+            # Tensor multiplication saves an operand even for [0, hidden], forcing
+            # checkpoint backward to replay dispatch on idle expert ranks too.
+            output2 = permuted_local_hidden_states * (
+                1.0
+                + (
+                    gate_and_up_projs.sum(dtype=torch.float32)
+                    + down_projs.sum(dtype=torch.float32)
+                    + lora_gate_and_up_A.sum(dtype=torch.float32)
+                    + lora_gate_and_up_B.sum(dtype=torch.float32)
+                    + lora_down_A.sum(dtype=torch.float32)
+                    + lora_down_B.sum(dtype=torch.float32)
+                    + permuted_probs.sum(dtype=torch.float32)
+                )
+                * 0.0
+            ).to(compute_dtype)
 
         if post_expert_output is not None:
             output2 = post_expert_output(output2)
-        if self.config.apply_router_weight_after_down:
+        if apply_after_down:
             output2 = _apply_router_weight_fp32(output2, permuted_probs, compute_dtype)
         assert self.token_dispatcher is not None
         y = self.token_dispatcher.token_unpermutation(output2)
