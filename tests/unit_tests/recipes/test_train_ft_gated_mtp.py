@@ -31,7 +31,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules, lora_token_gate
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-from nemo_automodel.components.speculative.gated_mtp import GatedMTPConfig
+from nemo_automodel.components.speculative.gated_mtp import GatedMTPConfig, GatedMTPSampler
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 _VOCAB = 64
@@ -119,6 +119,88 @@ def _sequential_mtp_logits(model, input_ids, anchor: int, depth: int) -> torch.T
     gate = torch.tensor([[False] * (anchor + 1) + [True] * depth])
     with lora_token_gate(model, gate):
         return model(input_ids=ids, position_ids=position_ids).logits[:, -1]
+
+
+def _sequential_mtp_hidden(model, input_ids, anchor: int, depth: int) -> torch.Tensor:
+    """Hidden state of the depth-``depth`` mask token appended after ``anchor``, from a plain causal forward.
+
+    Same construction as ``_sequential_mtp_logits``, but returns the pre-``lm_head`` hidden state so the
+    sampler can be applied to it, exactly as the dense recipe path does.
+    """
+    ids = torch.cat([input_ids[:, : anchor + 1], torch.tensor([_MASK_IDS[:depth]])], dim=1)
+    position_ids = torch.cat([torch.arange(anchor + 1), anchor + torch.arange(1, depth + 1)]).unsqueeze(0)
+    gate = torch.tensor([[False] * (anchor + 1) + [True] * depth])
+    with lora_token_gate(model, gate):
+        return model(input_ids=ids, position_ids=position_ids, output_hidden_states=True).hidden_states[-1][:, -1]
+
+
+def _build_lora_model_with_sampler() -> Qwen3ForCausalLM:
+    """A LoRA model with a `GatedMTPSampler` attached, its no-op zero-init broken deterministically
+    (same RNG draw sequence every call) so a gradient-matching test isn't trivially vacuous."""
+    model = _build_lora_model()
+    sampler = GatedMTPSampler(hidden_size=model.config.hidden_size, num_depths=len(_MASK_IDS))
+    with torch.no_grad():
+        sampler.mlp[3].weight.normal_(std=0.1)
+    model.gated_mtp_sampler = sampler
+    return model
+
+
+def _reference_lora_and_sampler_grads(input_ids, labels):
+    """Soft-MTP loss gradients (LoRA + sampler) from one causal forward per (anchor, depth), with the
+    sampler's "previous token" sourced from the base model's own greedy prediction -- matching the real
+    dense training path's teacher-forcing exactly, not PEFT's default (fully sequential) sampler training."""
+    model = _build_lora_model_with_sampler()
+    model.train()
+    sampler = model.gated_mtp_sampler
+    num_label_tokens = int((labels != -100).sum())
+    num_depths = len(_MASK_IDS)
+    with torch.no_grad(), lora_token_gate(model, torch.zeros_like(input_ids, dtype=torch.bool)):
+        base_probs = model(input_ids=input_ids).logits.softmax(-1)
+    loss = 0.0
+    for b in range(input_ids.shape[0]):
+        for t in range(input_ids.shape[1]):
+            for d in range(1, num_depths + 1):
+                if t + d >= labels.shape[1] or labels[b, t + d] == -100:
+                    continue
+                hidden = _sequential_mtp_hidden(model, input_ids[b : b + 1], t, d)
+                prev_id = base_probs[b, t + d - 1].argmax(-1, keepdim=True).detach()
+                prev_emb = model.get_input_embeddings()(prev_id.unsqueeze(0))[:, 0]
+                logits = model.lm_head(sampler(hidden, prev_emb))
+                term = -(base_probs[b : b + 1, t + d] * logits.float().log_softmax(-1)).sum()
+                loss = loss + _SCALING / num_depths * term / num_label_tokens
+    loss.backward()
+    grads = _lora_grads(model)
+    grads.update({name: p.grad.clone() for name, p in sampler.named_parameters()})
+    return grads
+
+
+def test_training_step_routes_soft_mtp_through_the_sampler(monkeypatch):
+    """The real dense training step, with a sampler attached, must match an independent reference built
+    from one causal forward per (anchor, depth) -- exercising the exact depth-shift indexing and
+    teacher-forced "previous token" lookup added for the sampler, not just that the code runs."""
+    model = _build_lora_model_with_sampler()
+    model.train()
+    recipe = _make_recipe(model, monkeypatch, distillation_mode="soft")
+    input_ids, labels = _batch()
+    loss_buffer = []
+
+    recipe._forward_backward_step(
+        0,
+        {"input_ids": input_ids, "labels": labels},
+        loss_buffer=loss_buffer,
+        num_label_tokens=int((labels != -100).sum()),
+        num_batches=1,
+        is_train=True,
+    )
+
+    expected = _reference_lora_and_sampler_grads(input_ids, labels)
+    grads = _lora_grads(model)
+    grads.update({name: p.grad.clone() for name, p in model.gated_mtp_sampler.named_parameters()})
+    assert grads.keys() == expected.keys()
+    for name, grad in grads.items():
+        assert torch.count_nonzero(grad) > 0, name
+        torch.testing.assert_close(grad, expected[name], rtol=1e-4, atol=1e-6, msg=lambda msg: f"{name}: {msg}")
+    assert len(loss_buffer) == 1 and torch.isfinite(loss_buffer[0])
 
 
 def _reference_lora_grads(input_ids, labels, *, soft: bool):

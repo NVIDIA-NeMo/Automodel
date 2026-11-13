@@ -22,7 +22,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from nemo_automodel.components._peft.lora import PeftConfig, apply_lora_to_linear_modules, lora_token_gate
 from nemo_automodel.components.attention.gated_mtp_mask import create_gated_mtp_sdpa_mask
-from nemo_automodel.components.speculative.gated_mtp import GatedMTPConfig
+from nemo_automodel.components.speculative.gated_mtp import GatedMTPConfig, GatedMTPSampler
 
 _VOCAB = 64
 _MASK_IDS = [61, 62, 63]
@@ -160,3 +160,24 @@ def test_mtp_depths_match_appending_the_mask_tokens_after_each_anchor():
                 output_hidden_states=True,
             ).hidden_states[-1]
     assert not torch.allclose(out.mtp_per_depth_h[0], ungated[:, seq_len : 2 * seq_len])
+
+
+def test_sampler_is_a_no_op_at_init_and_learns_after_one_step():
+    """The sampler's zero-initialized second layer must make it an exact identity at
+    construction, and an ordinary gradient step must break that symmetry."""
+    sampler = GatedMTPSampler(hidden_size=8, num_depths=3)
+    h = torch.randn(2, 5, 8)
+    prev_emb = torch.randn(2, 5, 8)
+
+    out = sampler(h, prev_emb)
+    assert out.shape == h.shape
+    torch.testing.assert_close(out, h)
+
+    before = {name: p.detach().clone() for name, p in sampler.named_parameters()}
+    out.sum().backward()
+    opt = torch.optim.SGD(sampler.parameters(), lr=0.1)
+    opt.step()
+    after_out = sampler(h, prev_emb)
+
+    assert not torch.allclose(after_out, h)
+    assert any(not torch.allclose(before[name], p) for name, p in sampler.named_parameters())
