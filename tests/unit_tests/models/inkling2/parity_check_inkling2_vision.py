@@ -40,8 +40,8 @@ from nemo_automodel.components.models.inkling2.vision import Inkling2VisionModel
 # their 6x8 and 10x4 patch grids exercise both up- and down-sampling of the position embedding.
 IMAGE_GRID_THW = [[1, 3, 4], [1, 5, 2]]
 
-# Tiny vision config, in Transformers ``Inkling2VisionConfig`` argument names. The unit tests build
-# their stand-in config from the same values.
+# Tiny vision config, in ``Inkling2VisionConfig`` argument names (shared by the Transformers and
+# AutoModel classes). The unit tests build the AutoModel config from the same values.
 TINY_VISION_CONFIG = {
     "hidden_size": 64,
     "num_hidden_layers": 2,

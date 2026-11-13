@@ -33,6 +33,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 
 from .configuration import Inkling2Config
 from .text import Inkling2TextModel
+from .vision import Inkling2VisionModel
 
 
 @dataclass
@@ -65,12 +66,7 @@ class Inkling2Model(nn.Module):
         super().__init__()
         self.config = config
         self.language_model = Inkling2TextModel(config.text_config, backend, moe_config, dtype=dtype)
-        self.vision_tower: nn.Module | None = None
-        if config.vision_config is not None:
-            # Imported here so text-only configurations do not depend on the vision tower module.
-            from .vision import Inkling2VisionModel
-
-            self.vision_tower = Inkling2VisionModel(config.vision_config)
+        self.vision_tower = None if config.vision_config is None else Inkling2VisionModel(config.vision_config)
 
     def get_input_embeddings(self) -> nn.Module:
         """Return the normalized token embedding."""
@@ -178,8 +174,10 @@ class Inkling2Model(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device) -> None:
-        """Initialize the text backbone; the vision tower initializes its own parameters."""
+        """Initialize the text backbone and the vision tower for checkpoint-free construction."""
         self.language_model.init_weights(buffer_device)
+        if self.vision_tower is not None:
+            self.vision_tower.init_weights()
 
 
 __all__ = ["Inkling2Model", "Inkling2ModelOutput"]

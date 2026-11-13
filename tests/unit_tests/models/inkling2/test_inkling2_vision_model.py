@@ -16,11 +16,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-
 import pytest
 import torch
 
+from nemo_automodel.components.models.inkling2.configuration import Inkling2VisionConfig
 from nemo_automodel.components.models.inkling2.vision import Inkling2VisionModel
 
 from .parity_check_inkling2_vision import (
@@ -80,39 +79,11 @@ REFERENCE_GRAD_NORMS = [
 ]
 
 
-@dataclass
-class _VisionConfig:
-    """Stand-in for ``Inkling2VisionConfig`` with the Transformers attribute names and defaults."""
-
-    hidden_size: int = 1024
-    num_hidden_layers: int = 23
-    num_attention_heads: int = 16
-    num_channels: int = 3
-    patch_size: int = 20
-    hidden_act: str = "gelu"
-    layer_norm_eps: float = 1e-5
-    attention_dropout: float = 0.0
-    mlp_ratio: float = 4.0
-    layer_scale_init_value: float = 0.1
-    rope_parameters: dict = field(default_factory=lambda: {"rope_type": "axial", "rope_theta": 10000.0})
-    spatial_merge_size: int = 2
-    posemb_grid_size: int = 32
-    projection_hidden_dim: int = 4096
-    projector_bias: bool = False
-    text_hidden_size: int = 4608
-    initializer_range: float = 0.02
-    intermediate_size: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.intermediate_size is None:
-            self.intermediate_size = int(self.hidden_size * self.mlp_ratio)
+def _tiny_config() -> Inkling2VisionConfig:
+    return Inkling2VisionConfig(**TINY_VISION_CONFIG)
 
 
-def _tiny_config() -> _VisionConfig:
-    return _VisionConfig(**TINY_VISION_CONFIG)
-
-
-def _tiny_model() -> tuple[_VisionConfig, Inkling2VisionModel]:
+def _tiny_model() -> tuple[Inkling2VisionConfig, Inkling2VisionModel]:
     config = _tiny_config()
     model = Inkling2VisionModel(config)
     fill_parameters_(model)
@@ -167,7 +138,7 @@ def test_images_in_one_batch_do_not_attend_to_each_other():
 
 def test_state_dict_uses_reference_names_and_checkpoint_shapes():
     with torch.device("meta"):
-        model = Inkling2VisionModel(_VisionConfig())
+        model = Inkling2VisionModel(Inkling2VisionConfig())
 
     shapes = {name: tuple(tensor.shape) for name, tensor in model.state_dict().items()}
 
@@ -266,7 +237,7 @@ def test_rejects_pixel_values_that_do_not_match_the_grid():
 
 
 def test_rejects_non_axial_rope():
-    config = replace(_tiny_config(), rope_parameters={"rope_type": "default", "rope_theta": 10000.0})
+    config = Inkling2VisionConfig(**TINY_VISION_CONFIG, rope_parameters={"rope_type": "default", "rope_theta": 10000.0})
 
     with pytest.raises(ValueError, match="axial"):
         Inkling2VisionModel(config)

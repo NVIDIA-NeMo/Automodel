@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-import types
-
 import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.inkling2.configuration import Inkling2Config, Inkling2TextConfig
+from nemo_automodel.components.models.inkling2.configuration import (
+    Inkling2Config,
+    Inkling2TextConfig,
+    Inkling2VisionConfig,
+)
 from nemo_automodel.components.models.inkling2.model import Inkling2ForConditionalGeneration
+from nemo_automodel.components.models.inkling2.quantization import dequantize_mxfp8_experts, dequantize_nvfp4_experts
 from nemo_automodel.components.models.inkling2.state_dict_adapter import (
     Inkling2StateDictAdapter,
     native_to_raw_key,
@@ -107,12 +109,15 @@ def test_released_index_keys_all_map_and_invert() -> None:
         assert native_to_raw_key(raw_to_native_key(key)) == key
 
 
-def test_released_text_keys_cover_the_native_model_exactly() -> None:
-    config = Inkling2Config(text_config=_released_text_config(), vision_config=None, torch_dtype="bfloat16")
+def test_released_keys_cover_the_native_model_exactly() -> None:
+    config = Inkling2Config(
+        text_config=_released_text_config(), vision_config=Inkling2VisionConfig(), torch_dtype="bfloat16"
+    )
     with torch.device("meta"):
         model = Inkling2ForConditionalGeneration(config, backend=_BACKEND)
-    raw_keys = [k for k in _released_checkpoint_keys(config.text_config) if not k.startswith("model.visual.")]
-    native_keys = {raw_to_native_key(key) for key in raw_keys if not _is_companion(key)}
+    native_keys = {
+        raw_to_native_key(key) for key in _released_checkpoint_keys(config.text_config) if not _is_companion(key)
+    }
 
     assert native_keys == set(model.state_dict())
     shapes = {key: tuple(value.shape) for key, value in model.state_dict().items()}
@@ -124,6 +129,8 @@ def test_released_text_keys_cover_the_native_model_exactly() -> None:
     assert shapes[f"{layers}.5.self_attn.k_sconv.weight_proj.weight"] == (32, 4608)
     assert shapes[f"{layers}.5.attention_input.query"] == (3, 4608)
     assert shapes[f"{layers}.4.attention_input.query"] == (4608,)
+    assert shapes["model.vision_tower.embeddings.patch_embedding.weight"] == (1024, 1200)
+    assert shapes["model.vision_tower.merger.linear_2.weight"] == (4608, 4096)
 
 
 @pytest.mark.parametrize(
@@ -216,45 +223,33 @@ def test_exclude_key_regex_drops_matching_keys() -> None:
     assert exported and not any("experts" in key for key in exported)
 
 
-def test_quantized_experts_dispatch_to_the_dequantizers(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = []
-
-    def dequantize_nvfp4_experts(weight, scale, amax, denominator):
-        """Record the call; weight ``[experts, out, in / 2]`` returns ones of shape ``[experts, out, in]``."""
-        calls.append(("nvfp4", weight.shape, scale.shape, amax.shape, denominator.shape))
-        return torch.ones(weight.shape[0], weight.shape[1], weight.shape[2] * 2)
-
-    def dequantize_mxfp8_experts(weight, scale):
-        """Record the call; weight ``[experts, out, in]`` returns twos of the same shape."""
-        calls.append(("mxfp8", weight.shape, scale.shape))
-        return torch.full(weight.shape, 2.0)
-
-    fake = types.ModuleType("nemo_automodel.components.models.inkling2.quantization")
-    fake.dequantize_nvfp4_experts = dequantize_nvfp4_experts
-    fake.dequantize_mxfp8_experts = dequantize_mxfp8_experts
-    monkeypatch.setitem(sys.modules, fake.__name__, fake)
-
+def test_quantized_experts_are_dequantized_for_the_local_experts() -> None:
     config = Inkling2TextConfig(**TINY_TEXT_CONFIG)
     experts, rows, hidden = config.n_routed_experts, 2 * config.moe_intermediate_size, config.hidden_size
-    adapter = Inkling2StateDictAdapter(config, dtype=torch.bfloat16)
-    nvfp4 = "model.llm.layers.0.mlp.experts.w13_weight"
-    mxfp8 = "model.llm.layers.6.mlp.experts.w2_weight"
-    native = adapter.from_hf(
-        {
-            nvfp4: torch.zeros(experts, rows, hidden // 2, dtype=torch.uint8),
-            nvfp4 + "_scale": torch.zeros(experts, rows, hidden // 16).to(torch.float8_e4m3fn),
-            nvfp4 + "_amax": torch.ones(experts),
-            nvfp4 + "_outer_scale_denominator": torch.ones(1),
-            mxfp8: torch.zeros(experts, hidden, rows // 2).to(torch.float8_e4m3fn),
-            mxfp8 + "_scale": torch.zeros(experts, hidden, rows // 64, dtype=torch.uint8),
-        }
-    )
+    generator = torch.Generator().manual_seed(0)
+    nvfp4 = {
+        "": torch.randint(0, 256, (experts, rows, hidden // 2), dtype=torch.uint8, generator=generator),
+        "_scale": torch.rand(experts, rows, hidden // 16, generator=generator).to(torch.float8_e4m3fn),
+        "_amax": torch.rand(experts, generator=generator) + 0.5,
+        "_outer_scale_denominator": torch.tensor([6.0 * 448.0]),
+    }
+    mxfp8 = {
+        "": torch.randn(experts, hidden, rows // 2, generator=generator).to(torch.float8_e4m3fn),
+        "_scale": torch.randint(120, 130, (experts, hidden, rows // 64), dtype=torch.uint8, generator=generator),
+    }
+    nvfp4_key, mxfp8_key = "model.llm.layers.0.mlp.experts.w13_weight", "model.llm.layers.6.mlp.experts.w2_weight"
+    raw = {nvfp4_key + suffix: value for suffix, value in nvfp4.items()}
+    raw |= {mxfp8_key + suffix: value for suffix, value in mxfp8.items()}
 
-    assert [call[0] for call in calls] == ["nvfp4", "mxfp8"]
+    native = Inkling2StateDictAdapter(config, dtype=torch.bfloat16).from_hf(raw)
+
     gate_and_up = native["model.language_model.layers.0.mlp.experts.gate_and_up_projs"]
+    expected = dequantize_nvfp4_experts(*nvfp4.values(), dtype=torch.bfloat16).transpose(-1, -2)
     assert gate_and_up.shape == (experts, hidden, rows) and gate_and_up.dtype == torch.bfloat16
+    assert torch.equal(gate_and_up, expected)
     down = native["model.language_model.layers.6.mlp.experts.down_projs"]
-    assert down.shape == (experts, rows // 2, hidden) and torch.all(down == 2)
+    expected = dequantize_mxfp8_experts(*mxfp8.values(), dtype=torch.bfloat16).transpose(-1, -2)
+    assert down.shape == (experts, rows // 2, hidden) and torch.equal(down, expected)
 
 
 def test_unsupported_expert_format_is_rejected() -> None:

@@ -200,7 +200,6 @@ class Inkling2VisionConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.mlp_ratio = mlp_ratio
         self.layer_scale_init_value = layer_scale_init_value
-        self.rope_parameters = rope_parameters
         self.spatial_merge_size = spatial_merge_size
         self.posemb_grid_size = posemb_grid_size
         self.projection_hidden_dim = projection_hidden_dim
@@ -208,6 +207,11 @@ class Inkling2VisionConfig(PretrainedConfig):
         self.text_hidden_size = text_hidden_size
         self.initializer_range = initializer_range
         super().__init__(**kwargs)
+        # Set after the base initializer, which may install its own rope default. Transformers
+        # standardizes an unset value to this axial default.
+        self.rope_parameters = (
+            {"rope_type": "axial", "rope_theta": 10000.0} if rope_parameters is None else rope_parameters
+        )
 
 
 class Inkling2Config(PretrainedConfig):
