@@ -475,10 +475,10 @@ def build_labels_from_template(
         assistant_marker = [processor.convert_tokens_to_ids("[/INST]")]
         return _build_labels_from_markers(input_ids_batch, assistant_marker, processor.eos_token_id)
 
-    # Inkling closes an assistant message before emitting a separate sampling
-    # terminator. Label through the first sampling terminator, which also keeps
-    # subsequent padding (using the same token id) masked.
-    if processor_type == "InklingProcessor":
+    # Inkling and Inkling 2 close an assistant message before emitting a separate
+    # sampling terminator. Label through the first sampling terminator, which also
+    # keeps subsequent padding (using the same token id) masked.
+    if processor_type in ("InklingProcessor", "Inkling2Processor"):
         marker_tokens = ("<|message_model|>", "<|content_text|>")
         assistant_marker = [tokenizer.convert_tokens_to_ids(token) for token in marker_tokens]
         stop_id = tokenizer.convert_tokens_to_ids("<|content_model_end_sampling|>")
