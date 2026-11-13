@@ -199,12 +199,13 @@ def normalize_pretokenized_document(
     Returns:
         int64 input_ids and uint8 loss_mask arrays, each of shape [tokens].
         Values are preserved; a missing mask becomes all ones. Optional positions
-        remain int64 [tokens]. Inputs are not mutated.
+        remain int64 [tokens]. Matching-dtype arrays retain their storage;
+        inputs are not mutated.
     """
     tokens, mask = _validate_pretokenized_document(payload, config=config, valid_token_ids=valid_token_ids)
     result = {
-        "input_ids": tokens.astype(np.int64),
-        "loss_mask": np.ones(tokens.shape, dtype=np.uint8) if mask is None else mask.astype(np.uint8),
+        "input_ids": tokens.astype(np.int64, copy=False),
+        "loss_mask": np.ones(tokens.shape, dtype=np.uint8) if mask is None else mask.astype(np.uint8, copy=False),
     }
     if "positions" in payload:
         if not preserve_positions:
@@ -222,7 +223,7 @@ def normalize_pretokenized_document(
             raise ValueError(
                 "Pretokenized positions must match tokens and count from zero, resetting at subdocument starts"
             )
-        result["positions"] = positions.astype(np.int64)
+        result["positions"] = positions.astype(np.int64, copy=False)
     return result
 
 

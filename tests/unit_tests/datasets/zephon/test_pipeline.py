@@ -98,6 +98,7 @@ def test_text_operator_parallelism_reaches_public_pipeline(config, tokenizer, so
             normalize.assert_not_called()
             chat.assert_not_called()
             assert text.call_args.kwargs["parallelism"] == 5
+            assert text.call_args.kwargs["return_tensors"] == "np"
         else:
             assert normalize.call_args.kwargs["parallelism"] == 4
             text.assert_not_called()
