@@ -105,7 +105,7 @@ clip_grad_norm:
   backend: triton
 wandb:
   enable: false
-  project: GoldenCreek
+  project: inkling2
   name: inkling2_tulu3_packed128k_ep32_pp2_cp32
   mode: online
   dir: logs/inkling2_tulu3_packed128k_ep32_pp2_cp32/wandb

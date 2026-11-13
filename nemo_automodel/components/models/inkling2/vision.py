@@ -14,9 +14,9 @@
 
 """Native Inkling2 image encoder with independent per-image SDPA attention.
 
-The tensor contracts follow the released tmlinkling_vv3 configuration and
-sglang.zip/sglang/tml/vision.py. This implementation uses ordinary Torch modules
-and SDPA, preserving the released weight names for bounded checkpoint loading.
+The tensor contracts follow the released Inkling-2-Small checkpoint configuration.
+This implementation uses ordinary Torch modules and SDPA, preserving the released
+weight names for bounded checkpoint loading.
 """
 
 import torch

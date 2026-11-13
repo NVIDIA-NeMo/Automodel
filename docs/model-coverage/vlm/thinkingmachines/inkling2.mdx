@@ -158,7 +158,7 @@ training environment through your usual account setup:
 ```bash
 export INKLING2_RUN_DIR=/path/to/shared/inkling2-medpix-lora
 export WANDB_ENTITY=your-wandb-entity
-export WANDB_PROJECT=GoldenCreek
+export WANDB_PROJECT=inkling2
 export WANDB_RUN_ID=inkling2-medpix-lora-001
 mkdir -p "${INKLING2_RUN_DIR}/wandb"
 ```
@@ -231,14 +231,6 @@ and data-loader state. Full SFT optimizer checkpoints require substantially
 more storage than adapter-only weights. Wait for checkpoint completion before
 stopping a job.
 
-<Warning>
-LoRA resume with TE FusedAdam and expert parallelism requires the shared
-[native optimizer-state fix](https://github.com/NVIDIA-NeMo/Automodel/pull/4739).
-Until that fix is included in your checkout, a fresh optimizer can silently
-resume without its saved moments and master-weight state. The MedPix SFT recipe
-uses PyTorch AdamW and is outside that specific defect.
-</Warning>
-
 To resume MedPix SFT, use the same recipe, base checkpoint, optimizer, and
 distributed topology. Keep the W&B run ID and append these arguments to its
 launch command:
@@ -293,7 +285,6 @@ PP2/CP32 leaves one data replica; local and global batches are both 8.
 Interleaved1F1B uses twelve layers per virtual chunk and microbatch size 1.
 The recipe uses FlexAttention with the Inkling CP implementation, BF16 model
 storage, and TE FusedAdam with FP32 master weights and BF16 moments.
-The completed 50-step Tulu 3 run had checkpoint writing disabled.
 
 ## Distributed and Kernel Support
 
@@ -309,17 +300,6 @@ The completed 50-step Tulu 3 run had checkpoint writing disabled.
 Tensor parallelism greater than one, HybridEP dispatch, MTP training, and
 quantized activation training are not qualified by these recipes. Packed CP
 training covers text; image-text pipeline training uses the non-packed path.
-
-Earlier full-model qualification runs completed 100 MedPix LoRA and SFT
-updates with checkpoint/resume using the optimizer-state fix, and 50 packed
-Tulu 3 updates at 128K. Those runs used the original `tmlinkling_vv3` download, whose long-context
-attention scaling floor is 8192; the public release sets it to 128000. They
-also precede the latest checkpoint-loader and fused-loss integration and do
-not establish performance of the released metadata or those changes. The full-model text-logit comparison
-against the supplied SGLang runtime matched 13 of 15 top tokens on GB300,
-with mean forward KL divergence about 0.01224. This small probe compares
-floating-point training weights against quantized inference and does not
-establish numerical equivalence or model quality.
 
 See the [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft) for shared
 training options.

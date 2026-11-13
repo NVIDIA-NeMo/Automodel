@@ -113,7 +113,7 @@ checkpoint:
   max_recent_checkpoints: 2
 wandb:
   enable: false
-  project: GoldenCreek
+  project: inkling2
   name: inkling2_medpix_sft_ep64_pp4
   mode: online
   dir: logs/inkling2_medpix_sft_ep64_pp4/wandb

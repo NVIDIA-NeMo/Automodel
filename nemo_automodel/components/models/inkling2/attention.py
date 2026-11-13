@@ -241,8 +241,8 @@ class Inkling2Attention(nn.Module):
         offsets = distance.clamp(0, self.rel_extent - 1)[:, None].expand(-1, self.heads, -1, -1)
         relative = profiles.gather(-1, offsets)
         relative = relative.masked_fill((distance[:, None] < 0) | (distance[:, None] >= self.rel_extent), 0)
-        # The bundled TML kernel scales QK only; relative logits are already
-        # in the softmax domain (ARCHITECTURE.md, Relative Attention).
+        # Only the QK product is scaled; the relative logits are already in the
+        # softmax domain.
         scores = scores * self.head_dim**-0.5 + relative
         causal = torch.arange(k.shape[1], device=q.device)[None, :] <= (
             torch.arange(sequence, device=q.device)[:, None] + query_offset
