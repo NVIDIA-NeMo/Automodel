@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import signal
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from itertools import islice
 from math import ceil
@@ -33,6 +33,14 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TokenCounts:
+    """Optimizer-step token totals, before or after data-parallel reduction."""
+
+    supervised: int
+    total: int
 
 
 def _calculate_max_steps(
@@ -137,6 +145,7 @@ class StepScheduler(Stateful):
                 "Please ensure that global_batch_size >= (local_batch_size * dp_size)"
             )
         self.dataloader = dataloader
+        self._dp_size = dp_size
         self._synchronized_stream = synchronized_stream
         self._completion_group = process_group
         # Whether synchronized source exhaustion ended training before its step cap.
@@ -220,7 +229,8 @@ class StepScheduler(Stateful):
         if self.step >= self.max_steps or self.dataloader is None:
             return
         if self._synchronized_stream:
-            yield from self._iter_stream()
+            for batches, _ in self._iter_stream():
+                yield batches
             return
         batch_buffer = []
         for batch in self.dataloader:
@@ -236,11 +246,42 @@ class StepScheduler(Stateful):
             self.step += 1
         self.epoch += 1
 
-    def _iter_stream(self) -> Iterator[list[Mapping[str, object]]]:
+    def iter_steps(
+        self,
+        count_tokens: Callable[[list[Mapping[str, object]]], TokenCounts],
+        *,
+        statistics_group_index: int = 0,
+    ) -> Iterator[tuple[list[Mapping[str, object]], TokenCounts | None]]:
+        """Yield batches and fuse streaming readiness with recipe-owned token counts.
+
+        Args:
+            count_tokens: Local counts for one complete accumulation window. It must
+                not perform collectives; local failures are coordinated with source failures.
+            statistics_group_index: Index of this rank's DP group among the training
+                mesh's PP/CP/TP coordinates. DP peers use the same index.
+
+        Yields:
+            Unmodified microbatches and their DP-reduced counts. Non-streaming
+            loaders retain their existing iterator and return None for the counts.
+        """
+        if self.step >= self.max_steps or self.dataloader is None:
+            return
+        if self._synchronized_stream:
+            yield from self._iter_stream(count_tokens, statistics_group_index=statistics_group_index)
+        else:
+            for batches in self:
+                yield batches, None
+
+    def _iter_stream(
+        self,
+        count_tokens: Callable[[list[Mapping[str, object]]], TokenCounts] | None = None,
+        *,
+        statistics_group_index: int = 0,
+    ) -> Iterator[tuple[list[Mapping[str, object]], TokenCounts | None]]:
         """Yield complete accumulation windows after collective availability checks.
 
         Returns:
-            Iterator of microbatch mappings passed through without mutation. Tensor fields
+            Iterator of microbatch mappings and optional token counts, without mutation. Tensor fields
             keep their loader-defined layouts (token fields typically have shape
             [local_batch, sequence]); this scheduler does not transform tensor contents.
 
@@ -249,19 +290,58 @@ class StepScheduler(Stateful):
         """
         if self.stream_exhausted or self.dataloader is None:
             return
+        distributed = dist.is_available() and dist.is_initialized()
+        device = torch.device("cpu")
+        statistics_buffer = None
+        communication_buffer = None
+        if count_tokens is not None:
+            group_size = dist.get_world_size(self._completion_group) if distributed else 1
+            num_groups = group_size // self._dp_size if distributed else 1
+            if num_groups < 1 or (distributed and group_size % self._dp_size != 0):
+                raise ValueError("The stream completion group must contain whole data-parallel groups")
+            if not 0 <= statistics_group_index < num_groups:
+                raise ValueError("Token statistics group is outside the training mesh")
+            if distributed and dist.get_backend(self._completion_group) == "nccl":
+                device = torch.device("cuda", torch.cuda.current_device())
+            # Two global flags followed by two counts per DP group. Separating
+            # groups preserves the original token sums without counting TP/PP replicas.
+            # Reuse buffers for this pass; the host copy completes before they are read or reused.
+            statistics_buffer = torch.zeros(2 + 2 * num_groups, dtype=torch.int64, pin_memory=device.type == "cuda")
+            communication_buffer = torch.empty_like(statistics_buffer, device=device)
         iterator = None
         while self.step < self.max_steps and not self.sigterm_flag:
             batches = []
             error = None
+            counts = None
             try:
                 if iterator is None:
                     iterator = iter(self.dataloader)
                 batches = list(islice(iterator, self.grad_acc_steps))
+                if count_tokens is not None and len(batches) == self.grad_acc_steps:
+                    counts = count_tokens(batches)
             except Exception as exc:
                 # Propagate source errors on all ranks before any model collective.
                 error = exc
             status = 0 if error is not None else (2 if len(batches) == self.grad_acc_steps else 1)
-            if dist.is_available() and dist.is_initialized():
+            if statistics_buffer is not None:
+                assert communication_buffer is not None
+                statistics_buffer.zero_()
+                statistics_buffer[0] = int(error is not None)
+                statistics_buffer[1] = int(len(batches) != self.grad_acc_steps)
+                offset = 2 + 2 * statistics_group_index
+                if counts is not None:
+                    statistics_buffer[offset] = counts.supervised
+                    statistics_buffer[offset + 1] = counts.total
+                if distributed:
+                    communication_buffer.copy_(statistics_buffer, non_blocking=True)
+                    dist.all_reduce(communication_buffer, op=dist.ReduceOp.SUM, group=self._completion_group)
+                    statistics_buffer.copy_(communication_buffer)
+                # Every rank, including exhausted TP/PP peers, makes the same
+                # stop/error decision before any model collective can begin.
+                values = statistics_buffer.tolist()
+                status = 0 if values[0] else (1 if values[1] else 2)
+                counts = TokenCounts(values[offset], values[offset + 1])
+            elif distributed:
                 backend = dist.get_backend(self._completion_group)
                 device = torch.device("cuda", torch.cuda.current_device()) if backend == "nccl" else torch.device("cpu")
                 availability = torch.tensor(status, dtype=torch.int32, device=device)
@@ -287,7 +367,7 @@ class StepScheduler(Stateful):
                     )
                 return
             self._step_in_progress = True
-            yield batches
+            yield batches, counts
             self.step += 1
             self._step_in_progress = False
 

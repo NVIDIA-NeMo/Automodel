@@ -28,6 +28,7 @@ except ImportError:
 import logging
 import pathlib
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -96,6 +97,7 @@ from nemo_automodel.components.models.common.packing import (
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.training.step_scheduler import TokenCounts
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     get_expert_tp_replication_factor,
@@ -810,11 +812,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
         pbar = self._make_progress_bar()
         log_data = None
         last_validation_step = None
+        # DP peers share a statistics slot; PP/CP/TP peers retain separate token
+        # sums while agreeing on stream completion through the same collective.
+        statistics_group_index = 0
+        device_mesh = getattr(self, "device_mesh", None)
+        if device_mesh is not None:
+            for axis in ("pp", "cp", "tp"):
+                if axis in device_mesh.mesh_dim_names:
+                    statistics_group_index = statistics_group_index * device_mesh[
+                        axis
+                    ].size() + device_mesh.get_local_rank(axis)
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
-                for batch_idx, batches in enumerate(self.step_scheduler):
-                    log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                for batches, token_counts in self.step_scheduler.iter_steps(
+                    self._count_step_tokens, statistics_group_index=statistics_group_index
+                ):
+                    log_data = self._run_train_optim_step(batches, self.max_grad_norm, token_counts=token_counts)
                     # log
                     self.log_train_metrics(log_data)
                     self._update_progress_bar(pbar, log_data.metrics)
@@ -1221,24 +1235,33 @@ class FinetuneRecipeForVLM(BaseRecipe):
             grad_reduce_group=self._get_dp_group(include_cp=True),
         )
 
-    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
+    def _count_step_tokens(self, batches: list[Mapping[str, Any]]) -> TokenCounts:
+        """Count supervised and non-tail-padding tokens without a collective."""
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
+        return TokenCounts(
+            supervised=sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+            total=sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+        )
+
+    def _run_train_optim_step(
+        self, batches, max_grad_norm: float | None = None, *, token_counts: TokenCounts | None = None
+    ):
         """Execute a single training step.
 
         Args:
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
+            token_counts: Counts already reduced with streaming readiness, when available.
         """
-        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         # Both counts are needed as Python integers. Reduce and read them in one
         # transfer so the second count does not introduce another device sync.
-        token_counts = torch.tensor(
-            [
-                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
-                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-            ],
-            dtype=torch.long,
-        )
-        num_label_tokens, num_tokens_in_batch = self._dp_allreduce(token_counts).tolist()
+        if token_counts is None:
+            local_counts = self._count_step_tokens(batches)
+            num_label_tokens, num_tokens_in_batch = self._dp_allreduce(
+                torch.tensor([local_counts.supervised, local_counts.total], dtype=torch.long)
+            ).tolist()
+        else:
+            num_label_tokens, num_tokens_in_batch = token_counts.supervised, token_counts.total
 
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)

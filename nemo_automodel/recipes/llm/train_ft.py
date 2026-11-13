@@ -30,6 +30,7 @@ import inspect
 import logging
 import pathlib
 import time
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -102,6 +103,7 @@ from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, s
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.training.step_scheduler import TokenCounts
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     get_expert_tp_replication_factor,
@@ -1184,16 +1186,28 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         pbar = self._make_progress_bar()
         train_log_data = None
         last_validation_step = None
+        # DP peers share a statistics slot; PP/CP/TP peers retain separate token
+        # sums while agreeing on stream completion through the same collective.
+        statistics_group_index = 0
+        device_mesh = getattr(self, "device_mesh", None)
+        if device_mesh is not None:
+            for axis in ("pp", "cp", "tp"):
+                if axis in device_mesh.mesh_dim_names:
+                    statistics_group_index = statistics_group_index * device_mesh[
+                        axis
+                    ].size() + device_mesh.get_local_rank(axis)
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
                 # The step scheduler yields a list of batches with the following properties:
                 # 1. len(batches) == grad_acc_steps
                 # 2. len(batches[0]) == batch_size
-                for batches in self.step_scheduler:
+                for batches, token_counts in self.step_scheduler.iter_steps(
+                    self._count_step_tokens, statistics_group_index=statistics_group_index
+                ):
                     # If QAT delayed fake-quant is configured, enable after threshold
                     self._enable_qat_if_delayed(self.step_scheduler.step)
-                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm, token_counts=token_counts)
                     # Capture outside the microbatch loop and only after the
                     # eager optimizer step has completed. This leaves no
                     # pending checkpoint recomputation or GA backward work.
@@ -1573,19 +1587,33 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
-    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
+    def _count_step_tokens(self, batches: list[Mapping[str, Any]]) -> TokenCounts:
+        """Count supervised and non-tail-padding tokens without a collective."""
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
+        return TokenCounts(
+            supervised=sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+            total=sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+        )
+
+    def _run_train_optim_step(
+        self, batches, max_grad_norm: float | None = None, *, token_counts: TokenCounts | None = None
+    ):
         """Execute a single training step.
 
         Args:
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
+            token_counts: Counts already reduced with streaming readiness, when available.
         """
 
-        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        num_label_tokens = torch.tensor(
-            sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
-        )
-        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        if token_counts is None:
+            ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
+            num_label_tokens = torch.tensor(
+                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
+            )
+            num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+        else:
+            num_label_tokens = token_counts.supervised
 
         domain_label_counts = None
         if self.domain_mixture is not None:
@@ -1627,11 +1655,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         loss_buffer = []
 
         # number of tokens in the batch, excluding any tail padding.
-        num_tokens_in_batch = torch.tensor(
-            sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-            dtype=torch.long,
-        )
-        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
+        if token_counts is None:
+            num_tokens_in_batch = torch.tensor(
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+                dtype=torch.long,
+            )
+            num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
+        else:
+            num_tokens_in_batch = token_counts.total
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 
