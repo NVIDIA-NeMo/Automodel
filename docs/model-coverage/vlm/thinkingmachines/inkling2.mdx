@@ -90,7 +90,7 @@ W&B is opt-in: set `wandb.enable: true` and configure your entity and project wh
 | Output logits | Soft cap of 30; padded vocabulary rows excluded |
 | Vision tower | 23 layers, hidden size 1,024, 16 attention heads |
 | Vision projection | Native 20-by-20 patches; neighboring 2-by-2 features merged before projection |
-| Expert weights | `Inkling-2-Small`: NVFP4 in layers 0–39, MXFP8 in layers 40–47; `Inkling-2-Small-MXFP8`: MXFP8 in all layers |
+| Expert weights | `Inkling-2-Small`: NVFP4 in layers 0-39, MXFP8 in layers 40-47; `Inkling-2-Small-MXFP8`: MXFP8 in all layers |
 
 ### Attention and Residuals
 
@@ -123,7 +123,7 @@ concatenates each neighboring 2-by-2 group of vision features, then maps that
 vector into the language hidden space.
 
 Thinking Machines publishes two checkpoints. `Inkling-2-Small` is the native
-NVFP4 release: its experts are NVFP4 in layers 0–39 and MXFP8 in layers 40–47.
+NVFP4 release: its experts are NVFP4 in layers 0-39 and MXFP8 in layers 40-47.
 `Inkling-2-Small-MXFP8` stores every expert in MXFP8. Both checkpoints keep the
 remaining parameters in floating point, record the layout in
 `hf_quant_config.json`, and include an auxiliary multi-token prediction module

@@ -470,7 +470,7 @@ def test_quantization_sidecar_follows_the_resolved_revision(tmp_path: Path, monk
         return str(tmp_path / filename)
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
-    commit = "0123456789abcdef0123456789abcdef01234567"
+    commit = "deadbeef" * 5
     # The shared factory forwards the resolved revision only to constructors that declare it.
     for cls in (Inkling2ForCausalLM, Inkling2ForConditionalGeneration):
         assert "revision" in inspect.signature(cls.__init__).parameters
