@@ -79,7 +79,9 @@ def test_logits_to_keep_returns_trailing_positions() -> None:
     with torch.no_grad():
         full = model(input_ids=input_ids).logits
         last = model(input_ids=input_ids, logits_to_keep=3).logits
-    torch.testing.assert_close(last, full[:, -3:], rtol=0, atol=0)
+    assert last.shape == (2, 3, _VOCAB)
+    # The head GEMM over fewer rows may round differently, so compare at FP32 tolerance.
+    torch.testing.assert_close(last, full[:, -3:], rtol=1e-5, atol=1e-6)
 
 
 def test_checkpoint_free_initialization_is_finite_and_trains() -> None:
@@ -174,6 +176,29 @@ def test_left_padding_leaves_valid_token_logits_unchanged() -> None:
         unpadded_logits = model(input_ids=input_ids).logits
         padded_logits = model(input_ids=padded, attention_mask=attention_mask).logits
     torch.testing.assert_close(padded_logits[:, 5:], unpadded_logits, rtol=0, atol=1e-5)
+
+
+def test_default_backend_uses_sdpa_attention() -> None:
+    model = Inkling2ForConditionalGeneration(_config())
+    assert model.backend.attn == "sdpa"
+    assert {layer.self_attn.attention_backend for layer in model.model.language_model.layers} == {"sdpa"}
+
+
+def test_packed_rows_are_rejected() -> None:
+    model = _model()
+    input_ids = _input_ids(batch=1, sequence=8)
+    with pytest.raises(NotImplementedError, match="packed sequences"):
+        model(input_ids=input_ids, position_ids=torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]))
+
+
+def test_left_padding_positions_are_not_mistaken_for_packing() -> None:
+    model = _model(log_scaling_n_floor=1024)
+    input_ids = _input_ids(batch=1, sequence=8)
+    attention_mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]])
+    position_ids = torch.tensor([[1, 1, 0, 1, 2, 3, 4, 5]])
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids).logits
+    assert torch.isfinite(logits).all()
 
 
 def test_unsupported_attention_backend_is_rejected() -> None:

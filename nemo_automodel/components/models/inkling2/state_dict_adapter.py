@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The checkpoint key correspondence follows the HuggingFace Inkling 2 checkpoint conversion (Apache-2.0).
+# Copyright (C) 2025 the HuggingFace Inc. team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/50682
+# Revision: 109a7d19bf667168837f32929e00b791e195d14d
+# Original files: src/transformers/conversion_mapping.py, src/transformers/core_model_loading.py
+
 """State-dict adapter between native Inkling 2 modules and the released checkpoint layout.
 
 The released checkpoint (``thinkingmachines/Inkling-2-Small``) uses ``model.llm.*`` and
@@ -43,6 +49,7 @@ from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAda
 from nemo_automodel.components.moe import state_dict_utils
 
 from .configuration import Inkling2TextConfig
+from .quantization import dequantize_mxfp8_experts, dequantize_nvfp4_experts
 
 _RAW_TEXT = "model.llm."
 _NATIVE_TEXT = "model.language_model."
@@ -199,8 +206,8 @@ def native_to_raw_key(key: str) -> str:
     raise KeyError(f"Unknown native Inkling 2 key: {key}")
 
 
-def _dequantize_experts(parts: dict[str, torch.Tensor], raw_key: str) -> torch.Tensor:
-    """Return FP32 or unquantized expert weights in the released ``[experts, out, in]`` layout.
+def _dequantize_experts(parts: dict[str, torch.Tensor], raw_key: str, dtype: torch.dtype) -> torch.Tensor:
+    """Return expert weights in the released ``[experts, out, in]`` layout and ``dtype``.
 
     Args:
         parts: The expert weight under ``""`` and its quantization companions under
@@ -210,9 +217,10 @@ def _dequantize_experts(parts: dict[str, torch.Tensor], raw_key: str) -> torch.T
             MXFP8: ``float8_e4m3fn [experts, out, in]`` with ``uint8`` scales ``[experts, out, in / 32]``.
             Unquantized: a floating tensor ``[experts, out, in]`` alone.
         raw_key: Released weight key, for error messages.
+        dtype: Output dtype; quantized weights are decoded straight into it (one rounding).
 
     Returns:
-        Tensor of shape ``[experts, out, in]``.
+        Tensor of shape ``[experts, out, in]`` in ``dtype``.
 
     Raises:
         ValueError: If the companions do not describe a supported format.
@@ -220,15 +228,13 @@ def _dequantize_experts(parts: dict[str, torch.Tensor], raw_key: str) -> torch.T
     weight = parts[""]
     companions = set(parts) - {""}
     if companions == {"_scale", "_amax", "_outer_scale_denominator"}:
-        from .quantization import dequantize_nvfp4_experts
-
-        return dequantize_nvfp4_experts(weight, parts["_scale"], parts["_amax"], parts["_outer_scale_denominator"])
+        return dequantize_nvfp4_experts(
+            weight, parts["_scale"], parts["_amax"], parts["_outer_scale_denominator"], dtype=dtype
+        )
     if companions == {"_scale"} and weight.dtype == torch.float8_e4m3fn:
-        from .quantization import dequantize_mxfp8_experts
-
-        return dequantize_mxfp8_experts(weight, parts["_scale"])
+        return dequantize_mxfp8_experts(weight, parts["_scale"], dtype=dtype)
     if not companions and weight.is_floating_point() and weight.dtype != torch.float8_e4m3fn:
-        return weight
+        return weight.to(dtype)
     raise ValueError(f"Unsupported expert format for {raw_key}: dtype={weight.dtype}, companions={sorted(companions)}")
 
 
@@ -349,8 +355,7 @@ class Inkling2StateDictAdapter(StateDictAdapter):
                 suffix: tensor if suffix == "_outer_scale_denominator" else tensor[start_expert:end_expert]
                 for suffix, tensor in parts.items()
             }
-            weight = _dequantize_experts(local_parts, raw_key)
-            weight = weight.to(self.dtype).transpose(-1, -2).contiguous()
+            weight = _dequantize_experts(local_parts, raw_key, self.dtype).transpose(-1, -2).contiguous()
             if device_mesh is not None:
                 weight = state_dict_utils.create_dtensor_from_local(weight, device_mesh, rank)
             state_dict[native_key] = weight

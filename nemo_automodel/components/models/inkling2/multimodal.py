@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The image placeholder scatter follows the HuggingFace Inkling 2 implementation (Apache-2.0).
+# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/50682
+# Revision: 109a7d19bf667168837f32929e00b791e195d14d
+# Original file: src/transformers/models/inkling2/modeling_inkling2.py
+
 """Inkling 2 backbone composing the text model and the vision tower.
 
 The image placeholder scatter follows the Transformers ``Inkling2Model`` reference
@@ -33,6 +39,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 
 from .configuration import Inkling2Config
 from .text import Inkling2TextModel
+from .vision import Inkling2VisionModel
 
 
 @dataclass
@@ -65,12 +72,7 @@ class Inkling2Model(nn.Module):
         super().__init__()
         self.config = config
         self.language_model = Inkling2TextModel(config.text_config, backend, moe_config, dtype=dtype)
-        self.vision_tower: nn.Module | None = None
-        if config.vision_config is not None:
-            # Imported here so text-only configurations do not depend on the vision tower module.
-            from .vision import Inkling2VisionModel
-
-            self.vision_tower = Inkling2VisionModel(config.vision_config)
+        self.vision_tower = None if config.vision_config is None else Inkling2VisionModel(config.vision_config)
 
     def get_input_embeddings(self) -> nn.Module:
         """Return the normalized token embedding."""
@@ -178,8 +180,10 @@ class Inkling2Model(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device) -> None:
-        """Initialize the text backbone; the vision tower initializes its own parameters."""
+        """Initialize the text backbone and the vision tower for checkpoint-free construction."""
         self.language_model.init_weights(buffer_device)
+        if self.vision_tower is not None:
+            self.vision_tower.init_weights()
 
 
 __all__ = ["Inkling2Model", "Inkling2ModelOutput"]

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The text-model equations and cast points follow the HuggingFace Inkling 2 implementation (Apache-2.0).
+# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/50682
+# Revision: 109a7d19bf667168837f32929e00b791e195d14d
+# Original file: src/transformers/models/inkling2/modeling_inkling2.py
+
 """Native Inkling 2 text backbone for training.
 
 The equations, including where values are computed in FP32 and cast back, follow the
@@ -22,7 +28,7 @@ Apache-2.0). This module implements the training forward only: there is no decod
 Sequence-position contract: the relative-position bias and the causal masks use the
 token index inside each row, and the short convolutions mix neighbouring tokens of a row,
 as in the reference. ``position_ids`` only drive the log scaling of the full-attention
-layers. Packed rows holding several documents are therefore not separated.
+layers. Rows that pack several documents are rejected (positions must increase along a row).
 """
 
 from __future__ import annotations
@@ -444,8 +450,9 @@ class Inkling2Attention(nn.Module):
 
         query_states = self.q_proj(hidden_states)
         if self.is_sliding:
-            key_states = self.k_sconv(self.k_proj(key_hidden_states), conv_mask)
-            value_states = self.v_sconv(self.v_proj(value_hidden_states), conv_mask)
+            # The reference rounds the convolution output to the projection dtype.
+            key_states = self.k_sconv(self.k_proj(key_hidden_states), conv_mask).to(query_states.dtype)
+            value_states = self.v_sconv(self.v_proj(value_hidden_states), conv_mask).to(query_states.dtype)
         else:
             key_states = self.k_sconv(self.k_proj(key_hidden_states), key_hidden_states, conv_mask)
             value_states = self.v_sconv(self.v_proj(value_hidden_states), value_hidden_states, conv_mask)
@@ -462,11 +469,13 @@ class Inkling2Attention(nn.Module):
             query_states = (query_states.float() * tau).to(query_states.dtype)
             relative_states = (relative_states.float() * tau).to(relative_states.dtype)
         query_states = query_states.transpose(1, 2)
-        key_dtype, value_dtype = key_states.dtype, value_states.dtype
+        # Keys and values return to the projection dtype. FP32 FSDP units around the static
+        # convolutions cast their inputs to FP32, so the convolution output dtype alone is not it.
+        compute_dtype = query_states.dtype
         key_states = _l2_clip(key_states.view(head_shape).float(), self.config.qk_l2_clip_threshold)
-        key_states = key_states.to(key_dtype).transpose(1, 2)
+        key_states = key_states.to(compute_dtype).transpose(1, 2)
         value_states = _unweighted_rms_norm(value_states.view(head_shape).float(), self.config.rms_norm_eps)
-        value_states = value_states.to(value_dtype).transpose(1, 2)
+        value_states = value_states.to(compute_dtype).transpose(1, 2)
 
         positions = torch.arange(sequence, device=hidden_states.device)
         position_bias = self.rel_logits_proj(relative_states, positions, positions)
@@ -621,7 +630,9 @@ class _Inkling2DecoderLayer(nn.Module):
             Tensor of shape ``[batch, sequence, hidden]`` in the dtype of ``block_residual``.
         """
         dtype = block_residual.dtype
-        hidden_states = self.post_attention_convolution(attention_output, conv_mask)
+        # The convolutions round to the model dtype as in the reference, also when an FP32 FSDP
+        # unit around them has cast their inputs to FP32.
+        hidden_states = self.post_attention_convolution(attention_output, conv_mask).to(dtype)
         residual = hidden_states = hidden_states.float()
         if self.is_block_boundary:
             # A block boundary stores the layer input and restarts the running residual.
@@ -630,7 +641,7 @@ class _Inkling2DecoderLayer(nn.Module):
             residual = hidden_states = block_residual.float() + hidden_states
         hidden_states = self.mlp_input(block_states, hidden_states)[0]
         hidden_states = self.mlp(self.post_attention_layernorm(hidden_states).to(dtype), padding_mask)
-        hidden_states = self.post_mlp_convolution(hidden_states, conv_mask)
+        hidden_states = self.post_mlp_convolution(hidden_states, conv_mask).to(dtype)
         return (residual + hidden_states).to(dtype)
 
     @torch.no_grad()
@@ -775,6 +786,34 @@ class Inkling2FullDecoderLayer(_Inkling2DecoderLayer):
         self.v_input_layernorm.init_weights()
 
 
+def _reject_packed_rows(position_ids: torch.Tensor, attention_mask: torch.Tensor | None) -> None:
+    """Fail when positions restart inside a row, i.e. when a row packs several documents.
+
+    The relative bias, the causal masks and the short convolutions use the token index inside a
+    row, so packed documents would attend to and convolve with each other.
+
+    Args:
+        position_ids: Long tensor of shape ``[batch or 1, sequence]``.
+        attention_mask: Optional tensor of shape ``[batch, sequence]``, nonzero for valid tokens;
+            pairs that touch a padded token are not checked.
+
+    Raises:
+        ValueError: If ``position_ids`` is not two-dimensional.
+        NotImplementedError: If a position does not increase between two adjacent valid tokens.
+    """
+    if position_ids.ndim != 2:
+        raise ValueError(f"Inkling 2 expects position_ids of shape [batch, sequence], got {tuple(position_ids.shape)}")
+    restarts = position_ids[:, 1:] <= position_ids[:, :-1]
+    if attention_mask is not None:
+        valid = attention_mask.to(dtype=torch.bool)
+        restarts = restarts & valid[:, 1:] & valid[:, :-1]
+    if bool(restarts.any()):
+        raise NotImplementedError(
+            "Inkling 2 does not support packed sequences: position_ids restart inside a row, and documents "
+            "packed into one row would attend to and convolve with each other"
+        )
+
+
 def _causal_masks(
     attention_mask: torch.Tensor | None,
     sequence: int,
@@ -860,6 +899,7 @@ class Inkling2TextModel(nn.Module):
         Raises:
             ValueError: If both or neither of ``input_ids`` and ``inputs_embeds`` are given, or
                 ``attention_mask`` is not a two-dimensional padding mask.
+            NotImplementedError: If ``position_ids`` restart inside a row (packed sequences).
         """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
@@ -872,6 +912,8 @@ class Inkling2TextModel(nn.Module):
             )
         if position_ids is None:
             position_ids = torch.arange(sequence, device=inputs_embeds.device)[None, :]
+        else:
+            _reject_packed_rows(position_ids, attention_mask)
 
         full_mask, sliding_mask = _causal_masks(
             attention_mask, sequence, self.config.sliding_window_size, inputs_embeds.device

@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The output head (FP32 logits, softcap, unpadded vocabulary) follows the HuggingFace Inkling 2
+# implementation (Apache-2.0).
+# Copyright 2026 the HuggingFace Team. All rights reserved.
+# Source: https://github.com/huggingface/transformers/pull/50682
+# Revision: 109a7d19bf667168837f32929e00b791e195d14d
+# Original file: src/transformers/models/inkling2/modeling_inkling2.py
+
 """Native NeMo AutoModel implementation of Inkling 2 (``Inkling2ForConditionalGeneration``).
 
 The output head follows the Transformers ``inkling2`` reference (huggingface/transformers
@@ -142,14 +149,16 @@ class Inkling2ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         Args:
             config: Inkling 2 configuration; ``config.torch_dtype`` selects the storage dtype.
             moe_config: Optional routed-expert configuration; derived from the text config by default.
-            backend: Backend configuration. ``attn`` must be ``"sdpa"`` or ``"eager"``.
+            backend: Backend configuration. ``attn`` must be ``"sdpa"`` or ``"eager"``; defaults to
+                ``BackendConfig(attn="sdpa")``.
             **kwargs: Extra bridge arguments; ignored.
         """
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__()
         del kwargs
         self.config = config
-        self.backend = backend or BackendConfig()
+        # The attention supports eager and SDPA only, so the default backend picks SDPA.
+        self.backend = backend or BackendConfig(attn="sdpa")
         text_config = config.text_config
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.moe_config = moe_config or inkling2_moe_config(text_config, model_dtype)
