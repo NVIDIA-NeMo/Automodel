@@ -50,6 +50,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 from .configuration import Inkling2Config
 from .layers import inkling2_moe_config
 from .multimodal import Inkling2Model
+from .quantization import checkpoint_expert_formats
 from .state_dict_adapter import Inkling2StateDictAdapter
 
 
@@ -160,7 +161,12 @@ class Inkling2ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         self.model = Inkling2Model(config, self.backend, self.moe_config, dtype=model_dtype)
         self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False, dtype=model_dtype)
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Inkling2StateDictAdapter(text_config, dtype=model_dtype)
+            # quantization_config exists only when the checkpoint ships hf_quant_config.json (see Inkling2Config).
+            self.state_dict_adapter = Inkling2StateDictAdapter(
+                text_config,
+                dtype=model_dtype,
+                expert_formats=checkpoint_expert_formats(getattr(config, "quantization_config", None)),
+            )
         cast_model_to_dtype(self, model_dtype)
 
     def get_input_embeddings(self) -> nn.Module:
