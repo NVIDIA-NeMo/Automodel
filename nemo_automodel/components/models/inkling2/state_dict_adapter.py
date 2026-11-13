@@ -38,6 +38,12 @@ released ``w13_weight`` / ``w2_weight`` layout; with ``quantization=True`` (base
 initialization of a checkpoint whose config declares ``expert_formats``) it emits empty tensors
 in the stored NVFP4/MXFP8 layout instead, so DCP reads the stored bytes and :meth:`from_hf`
 decodes them.
+
+PEFT checkpoints hold only the adapter tensors, keyed ``base_model.model.<native key>``. Both
+directions pass them through with their native names and layouts: linear ``lora_A`` / ``lora_B``
+matrices and the grouped expert ``lora_gate_and_up_*`` / ``lora_down_*`` tensors, whose gate/up
+columns keep the interleaving of ``gate_and_up_projs``. AutoModel's PEFT loader restores them by
+these names.
 """
 
 from __future__ import annotations
@@ -149,6 +155,13 @@ _NATIVE_VISION_LAYER_RE = re.compile(r"model\.vision_tower\.layers\.(\d+)\.(.+)"
 _RAW_EXPERT_RE = re.compile(r"(model\.llm\.layers\.\d+\.mlp\.experts\.w(?:13|2)_weight)(.*)")
 _EXPERT_COMPANION_SUFFIXES = ("", "_scale", "_amax", "_outer_scale_denominator")
 _NATIVE_EXPERT_SUFFIXES = (".mlp.experts.gate_and_up_projs", ".mlp.experts.down_projs")
+# ModelState keys PEFT adapter tensors with this outer prefix on save and resume.
+_PEFT_PREFIX = "base_model.model."
+
+
+def _is_peft_adapter_key(key: str) -> bool:
+    """Return whether ``key`` names a PEFT adapter tensor, such as ``base_model.model.<module>.lora_A.weight``."""
+    return key.startswith(_PEFT_PREFIX) and ".lora_" in key
 
 
 def raw_to_native_key(key: str) -> str:
@@ -423,11 +436,17 @@ class Inkling2StateDictAdapter(StateDictAdapter):
     ) -> dict[str, Any]:
         """Convert a native state dict to released checkpoint keys and layouts.
 
-        Expert matrices become transposed views; every other tensor keeps its storage.
+        Expert matrices become transposed views; every other tensor keeps its storage. PEFT adapter
+        tensors (``base_model.model.*``) keep their native keys and layouts.
 
         Args:
             state_dict: Native state dict. Expert tensors have shape ``[experts, hidden, 2 *
-                intermediate]`` (interleaved gate/up) and ``[experts, intermediate, hidden]``.
+                intermediate]`` (interleaved gate/up) and ``[experts, intermediate, hidden]``. A
+                PEFT save holds only adapter tensors: linear ``lora_A`` ``[rank, in]`` and ``lora_B``
+                ``[out, rank]``, expert ``lora_gate_and_up_A`` ``[experts, hidden, rank]``,
+                ``lora_gate_and_up_B`` ``[experts, rank, 2 * intermediate]`` (interleaved gate/up),
+                ``lora_down_A`` ``[experts, intermediate, rank]`` and ``lora_down_B`` ``[experts, rank,
+                hidden]``.
             exclude_key_regex: Optional regex of released keys to drop.
             quantization: True when the checkpointer initializes from a base checkpoint whose config
                 declares quantized experts. Experts listed in ``expert_formats`` then become empty
@@ -460,10 +479,13 @@ class Inkling2StateDictAdapter(StateDictAdapter):
         Returns:
             One ``(released_key, tensor)`` pair, or none when excluded. Expert tensors are
             transposed views of shape ``[experts, out, in]``; a quantized expert yields its
-            stored-layout destinations instead (two for MXFP8, four for NVFP4).
+            stored-layout destinations instead (two for MXFP8, four for NVFP4). A PEFT adapter
+            tensor keeps its key and tensor.
         """
-        raw_key = native_to_raw_key(fqn)
         exclude_key_regex = kwargs.get("exclude_key_regex")
+        if _is_peft_adapter_key(fqn):
+            return [] if exclude_key_regex and re.match(exclude_key_regex, fqn) else [(fqn, tensor)]
+        raw_key = native_to_raw_key(fqn)
         if exclude_key_regex and re.match(exclude_key_regex, raw_key):
             return []
         if fqn.endswith(_NATIVE_EXPERT_SUFFIXES):
@@ -483,7 +505,8 @@ class Inkling2StateDictAdapter(StateDictAdapter):
         Args:
             hf_state_dict: Released keys mapped to tensors. Expert weights may be BF16/FP32, NVFP4
                 or MXFP8 with their companions; with ``device_mesh`` they may hold all experts
-                or already be expert-sharded DTensors.
+                or already be expert-sharded DTensors. PEFT adapter tensors (``base_model.model.*``,
+                layouts as in :meth:`to_hf`) pass through unchanged.
             device_mesh: Optional mesh; only this rank's experts are kept and wrapped as DTensors.
             **kwargs: Unused checkpointer arguments.
 
@@ -509,6 +532,9 @@ class Inkling2StateDictAdapter(StateDictAdapter):
         state_dict: dict[str, Any] = {}
         expert_parts: dict[str, dict[str, torch.Tensor]] = {}
         for key, value in hf_state_dict.items():
+            if _is_peft_adapter_key(key):
+                state_dict[key] = value
+                continue
             if (match := _RAW_EXPERT_RE.fullmatch(key)) and match.group(2) in _EXPERT_COMPANION_SUFFIXES:
                 expert_parts.setdefault(match.group(1), {})[match.group(2)] = value
                 continue
