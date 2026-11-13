@@ -106,7 +106,7 @@ def test_omni_scaled_rotary_preserves_hf_factors_after_dtype_moves(rope_type: st
     }
     encoder = D1OmniEncoder(config)
     # Omni's publisher builds frequencies on CPU before moving them to the execution device.
-    reference = Lfm2RotaryEmbedding(config, device="cpu").to(device)
+    reference = Lfm2RotaryEmbedding(config).to(device)
     positions = torch.tensor([[0, 17, 4095]], device=device)
     for dtype in (torch.float32, torch.bfloat16, torch.float32):
         encoder.to(device=device, dtype=dtype)

@@ -48,6 +48,11 @@ class Ministral3BidirectionalConfig(Ministral3Config):
 
     model_type = "ministral3_bidirec"
 
+    # Declared as dataclass fields so Transformers 5.22 keeps these model-owned
+    # values out of the generation-parameter rejection during save_pretrained.
+    pooling: str = "avg"
+    temperature: float = 1.0
+
     def __init__(
         self,
         pooling: str = "avg",
@@ -181,6 +186,11 @@ class Mistral3BidirectionalConfig(Mistral3Config):
     """Configuration for Mistral3BidirectionalModel with pooling and temperature settings."""
 
     model_type = "mistral3_bidirec"
+
+    # Declared as dataclass fields so Transformers 5.22 keeps these model-owned
+    # values out of the generation-parameter rejection during save_pretrained.
+    pooling: str = "avg"
+    temperature: float = 1.0
 
     @property
     def pooling(self) -> str:
