@@ -28,7 +28,6 @@ except ImportError:
 import logging
 import pathlib
 import time
-from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -99,7 +98,6 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import TokenCounts
 from nemo_automodel.components.training.utils import (
-    count_tail_padding,
     get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
@@ -812,22 +810,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
         pbar = self._make_progress_bar()
         log_data = None
         last_validation_step = None
-        # DP peers share a statistics slot; PP/CP/TP peers retain separate token
-        # sums while agreeing on stream completion through the same collective.
-        statistics_group_index = 0
-        device_mesh = getattr(self, "device_mesh", None)
-        if device_mesh is not None:
-            for axis in ("pp", "cp", "tp"):
-                if axis in device_mesh.mesh_dim_names:
-                    statistics_group_index = statistics_group_index * device_mesh[
-                        axis
-                    ].size() + device_mesh.get_local_rank(axis)
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
-                for batches, token_counts in self.step_scheduler.iter_steps(
-                    self._count_step_tokens, statistics_group_index=statistics_group_index
-                ):
+                for batches, token_counts in self._iter_training_steps():
                     log_data = self._run_train_optim_step(batches, self.max_grad_norm, token_counts=token_counts)
                     # log
                     self.log_train_metrics(log_data)
@@ -1233,14 +1219,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.loss_fn,
             last_stage_model,
             grad_reduce_group=self._get_dp_group(include_cp=True),
-        )
-
-    def _count_step_tokens(self, batches: list[Mapping[str, Any]]) -> TokenCounts:
-        """Count supervised and non-tail-padding tokens without a collective."""
-        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        return TokenCounts(
-            supervised=sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
-            total=sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
         )
 
     def _run_train_optim_step(

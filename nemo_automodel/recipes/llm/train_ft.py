@@ -30,7 +30,6 @@ import inspect
 import logging
 import pathlib
 import time
-from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -1186,25 +1185,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         pbar = self._make_progress_bar()
         train_log_data = None
         last_validation_step = None
-        # DP peers share a statistics slot; PP/CP/TP peers retain separate token
-        # sums while agreeing on stream completion through the same collective.
-        statistics_group_index = 0
-        device_mesh = getattr(self, "device_mesh", None)
-        if device_mesh is not None:
-            for axis in ("pp", "cp", "tp"):
-                if axis in device_mesh.mesh_dim_names:
-                    statistics_group_index = statistics_group_index * device_mesh[
-                        axis
-                    ].size() + device_mesh.get_local_rank(axis)
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
                 # The step scheduler yields a list of batches with the following properties:
                 # 1. len(batches) == grad_acc_steps
                 # 2. len(batches[0]) == batch_size
-                for batches, token_counts in self.step_scheduler.iter_steps(
-                    self._count_step_tokens, statistics_group_index=statistics_group_index
-                ):
+                for batches, token_counts in self._iter_training_steps():
                     # If QAT delayed fake-quant is configured, enable after threshold
                     self._enable_qat_if_delayed(self.step_scheduler.step)
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm, token_counts=token_counts)
@@ -1586,14 +1573,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         pp_src_rank = torch.distributed.get_global_rank(pp_group, torch.distributed.get_world_size(pp_group) - 1)
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
-
-    def _count_step_tokens(self, batches: list[Mapping[str, Any]]) -> TokenCounts:
-        """Count supervised and non-tail-padding tokens without a collective."""
-        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-        return TokenCounts(
-            supervised=sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
-            total=sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-        )
 
     def _run_train_optim_step(
         self, batches, max_grad_norm: float | None = None, *, token_counts: TokenCounts | None = None
