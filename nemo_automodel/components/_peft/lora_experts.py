@@ -976,9 +976,11 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                     output2, down_bias, tokens_per_expert, None if apply_after_down else permuted_probs
                 )
         else:
-            # Preserve the dispatched [0, hidden] layout and additive adapter graph.
-            output2 = permuted_local_hidden_states + (
-                (
+            # Tensor multiplication saves an operand even for [0, hidden], forcing
+            # checkpoint backward to replay dispatch on idle expert ranks too.
+            output2 = permuted_local_hidden_states * (
+                1.0
+                + (
                     gate_and_up_projs.sum(dtype=torch.float32)
                     + down_projs.sum(dtype=torch.float32)
                     + lora_gate_and_up_A.sum(dtype=torch.float32)
