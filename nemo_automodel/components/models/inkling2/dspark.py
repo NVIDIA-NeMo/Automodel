@@ -491,20 +491,33 @@ class Inkling2DSparkAttention(nn.Module):
         q = _apply_rope(q, rotary.block_cos, rotary.block_sin)
         k_block = _apply_rope(k_block, rotary.block_cos, rotary.block_sin)
         k_ctx = _apply_rope(k_ctx, rotary.context_cos, rotary.context_sin)
-        k = torch.cat((k_ctx, k_block), dim=2)
-        v = torch.cat((v_ctx, v_block), dim=2)
+        k = self._repeat_kv(torch.cat((k_ctx, k_block), dim=2))
+        v = self._repeat_kv(torch.cat((v_ctx, v_block), dim=2))
 
         out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_mask.to(q.dtype),
-            dropout_p=0.0,
-            is_causal=False,
-            scale=self.head_dim**-0.5,
-            enable_gqa=self.num_heads != self.num_key_value_heads,
+            q, k, v, attn_mask=attention_mask.to(q.dtype), dropout_p=0.0, is_causal=False, scale=self.head_dim**-0.5
         )
         return self.o_proj(out.transpose(1, 2).flatten(2))
+
+    def _repeat_kv(self, states: torch.Tensor) -> torch.Tensor:
+        """Share each key/value head with its query group.
+
+        An ``expand`` keeps the backward a plain sum (deterministic), and explicit heads keep
+        the masked SDPA call on the memory-efficient kernel.
+
+        Args:
+            states: Tensor of shape [batch, key_value_heads, length, head_dim].
+
+        Returns:
+            Tensor of shape [batch, heads, length, head_dim]; query head ``h`` reads key/value
+            head ``h // (heads / key_value_heads)``.
+        """
+        groups = self.num_heads // self.num_key_value_heads
+        if groups == 1:
+            return states
+        batch, kv_heads, length, head_dim = states.shape
+        expanded = states[:, :, None].expand(batch, kv_heads, groups, length, head_dim)
+        return expanded.reshape(batch, kv_heads * groups, length, head_dim)
 
 
 class Inkling2DSparkMLP(nn.Module):
