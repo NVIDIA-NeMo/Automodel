@@ -5,10 +5,10 @@ position: 18
 ---
 
 QAT simulates quantization during training so trainable weights can adapt to
-quantization error. NeMo Automodel provides two distinct modes through
+quantization error. NeMo AutoModel provides two distinct modes through
 `nemo_automodel.components.quantization.qat.QATConfig`:
 
-| Mode | Trainable weights | Quantization |
+| Mode | Trainable Weights | Quantization |
 | --- | --- | --- |
 | Legacy TorchAO | Full-parameter BF16 SFT, without PEFT | INT4 weights; optional dynamic INT8 activations |
 | Targeted merged-weight QAT | LoRA adapters on frozen floating-point bases | FP8 or MXFP4 weights selected independently of PEFT |
@@ -17,7 +17,7 @@ Neither mode guarantees better task quality than post-training quantization
 (PTQ), lower training memory, or faster inference. Measure the intended workload
 and deployment backend rather than inferring improvements from the bit width.
 
-## Legacy full-parameter TorchAO QAT
+## Legacy Full-Parameter TorchAO QAT
 
 Use the installed repository environment, including TorchAO, and BF16 model
 parameters. Add this section to a complete SFT recipe **without `peft`**:
@@ -47,12 +47,12 @@ that delay for new runs: nested TorchAO modules do not reliably honor positive
 uv run --no-sync automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad_qat.yaml --nproc-per-node 8 --qat.fake_quant_after_n_steps 0
 ```
 
-This example needs model/data access and eight GPUs. `--no-sync` assumes
+This example needs eight GPUs and access to the model and data. `--no-sync` assumes
 dependencies are already installed. Legacy TorchAO conversion is separate from
 the targeted reference-export API below; validate its converted model using the
 matching [TorchAO quantizer and inference kernels](https://github.com/pytorch/ao/tree/main/torchao/quantization/qat).
 
-## Targeted LoRA FP8 / MXFP4 QAT
+## Targeted LoRA FP8 and MXFP4 QAT
 
 PEFT chooses where adapters are installed. QAT chooses which of those adapters
 receive fake quantization, using case-sensitive **full module-name shell globs**.
@@ -102,20 +102,29 @@ qat:
 Nested rule/weight mappings are typed by `ConfigNode.instantiate()`; they do not
 need nested `_target_` entries. Do not mix `rules` with the simple form, or mix
 either targeted form with `quantizer_type` / TorchAO kwargs. Unmatched selectors,
-overlapping rules, non-LoRA targets and tied LoRA base projections are rejected.
+overlapping rules, non-LoRA targets, and tied LoRA base projections are rejected.
 Legacy INT4 with PEFT and targeted full-parameter FP8/MXFP4 are unsupported.
+When QAT targets the output head, use `MaskedCrossEntropy`.
+`FusedLinearCrossEntropy` and other linear-projection losses bypass the head's
+quantized effective weight and are rejected for that combination. QAT on other
+modules does not impose this restriction.
 
-### Numerical contract
+### Numerical Contract
 
 The forward pass quantizes and dequantizes the effective weight
 `W + (alpha / rank) * B @ A`; gradients update the adapters while the base stays
 frozen. Untargeted adapters train normally and export as merged floating weights.
-Training storage and activations are not packed FP8/FP4. Use matching base/adapter
-storage dtypes, zero dropout, no DoRA, and no autocast for the targeted examples.
+Training storage and activations are not packed FP8/FP4. Use matching base and adapter
+storage dtypes, zero dropout, no Weight-Decomposed Low-Rank Adaptation (DoRA), and no autocast for the targeted examples.
 Per-token adapter gating is unsupported: a token-dependent adapter cannot be
 represented by the single merged weight used by QAT and reference export.
+For unsharded single-rank FSDP2, use an explicit `MixedPrecisionPolicy` with
+`param_dtype: null`, as in the Qwen example: the default BF16 policy otherwise
+enables implicit autocast. Keep the model and adapters in matching explicit
+dtypes. Setting only `autocast_dtype: null` does not disable that fallback, and
+setting the entire `mp_policy` to null restores the default policy.
 
-| Weight format | Supported block sizes | Scale format |
+| Weight Format | Supported Block Sizes | Scale Format |
 | --- | --- | --- |
 | FP8 E4M3FN | `[32, 32]` or `[128, 128]` (default) | `e8m0` (default) or explicit `float32` |
 | MXFP4 E2M1 | `[1, 32]` (default) | `e8m0` only |
@@ -131,7 +140,7 @@ the original checkpoint encoder. **DeepSeek-V4 uses MXFP4 group32 with E8M0**,
 which is also the default when `scale_format` is omitted. Older reference
 manifests without this field decode as E8M0.
 
-## Examples and supported training
+## Examples and Supported Training
 
 | Example | Scope |
 | --- | --- |
@@ -139,63 +148,66 @@ manifests without this field decode as E8M0.
 | [DeepSeek-V4-Flash](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/deepseek_v4/deepseek_v4_flash_hellaswag_experts_qat.yaml) | Experimental full pretrained backbone, expert MXFP4, EP32 |
 | [GLM-5.3-Flash](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/glm/glm_5.3_flash_hellaswag_experts_qat.yaml) | Experimental full pretrained `glm5_next`, expert FP8/FP32 scales, EP32; text-only adaptation |
 
-V4/GLM are **experimental reference configurations**. Earlier successful
+V4 and GLM are **experimental reference configurations**. Earlier successful
 full-model QAT smoke tests used synthetic overrides; they do **not** establish
 that the published HellaSwag YAMLs ran unchanged. They also do not establish
-convergence, task-quality gains or paired QAT-versus-ordinary-training results.
+convergence, task-quality gains, or paired results for the unchanged published
+YAMLs that compare QAT with ordinary training. The separate historical comparison
+used synthetic overrides, as documented in the
+[QAT examples](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/README_qat.md).
 Native serving has not been tested. Scalar/unit tests and tiny/cropped-model GPU
 checks are not substitutes for full-model validation of these configurations.
 
-### Run Qwen on one GPU
+### Run Qwen on One GPU
 
-From the repository root in an already installed CUDA environment:
+From the repository root in an already installed CUDA environment, run the following command:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run --no-sync automodel examples/llm_finetune/qwen/qwen3_0p6b_lora_qat.yaml --nproc-per-node 1
 ```
 
 Qwen needs access to `Qwen/Qwen3-0.6B` and `rajpurkar/squad`. It uses 64 samples,
-answer-only supervision, left truncation at 512 tokens, BF16 and HF SDPA.
+answer-only supervision, left truncation at 512 tokens, BF16, and HF SDPA.
 Keep this recipe at one process; its FSDP2 path skips sharding. `--no-sync` does
 not install missing dependencies. For local weights, update both
 `model.pretrained_model_name_or_path` and
 `dataset.tokenizer.pretrained_model_name_or_path`.
 
-### Full pretrained expert recipes
+### Full Pretrained Expert Recipes
 
 V4 and GLM use `TrainFinetuneRecipeForNextTokenPrediction`, model-owned
-`Config.from_pretrained`, `load_base_model: true` and
+`Config.from_pretrained`, `load_base_model: true`, and
 `checkpoint.dequantize_base_checkpoint: true`. Preserve the source architecture
 and vocabulary; do not replace pretrained loading with full random CPU construction.
 MTP is disabled; V4 retains 43 backbone layers, and GLM retains 45 text layers
 and its frozen vision branch.
 
-| Model | PEFT / QAT expert target | Notes |
+| Model | PEFT and QAT Expert Target | Notes |
 | --- | --- | --- |
 | V4 | `model.layers.*.mlp.experts` | 256 experts; 8 local experts at EP32 |
 | GLM | `model.language_model.layers.*.mlp.experts` | 288 experts; 9 local experts at EP32; `distributed.moe.wrap_outer_model: true` keeps the frozen vision branch FSDP-owned |
 
 Both recipes use rank-4/alpha-8 LoRA, BF16 base/adapters, zero dropout, QAT from
-step zero and activation checkpointing. Keep DoRA, Triton/memory-efficient LoRA,
-compilation, TE FP8 and autocast off.
+step zero, and activation checkpointing. Keep DoRA, Triton/memory-efficient LoRA,
+compilation, TE FP8, and autocast off.
 
-They request 64 HellaSwag training examples, local batch 1/global batch 32 and
+They request 64 HellaSwag training examples, local batch 1/global batch 32, and
 two optimizer steps. Padding to a multiple of 64 **does not truncate to 64
 tokens**; HellaSwag has no `seq_length` / `max_length` argument. These are not
 native chat-format or quality benchmarks. Validation and checkpoint output are
 disabled.
 
-### Distributed launch requirements
+### Distributed Launch Requirements
 
 Targeted training supports one rank or **FSDP2 pure DP sharding** with
-`dp_shard_size = world_size`, `dp_replicate_size = 1`, TP=CP=PP=1 and matching
-device/MoE meshes. Optional EP must equal world size, divide the expert count,
+`dp_shard_size = world_size`, `dp_replicate_size = 1`, TP=CP=PP=1, and matching
+device and Mixture-of-Experts (MoE) meshes. Optional EP must equal world size, divide the expert count,
 and use no additional expert-DP sharding/replication. Use `dispatcher: torch`
 and `experts: torch` reference loops, including untargeted experts. HSDP, DDP,
-Megatron FSDP, autopipeline, HybridEP, DeepEP, `torch_mm`, grouped-MM and MXFP8
+Megatron FSDP, autopipeline, HybridEP, DeepEP, `torch_mm`, grouped-MM, and MXFP8
 expert execution are outside this targeted training gate.
 
-Apply PEFT, then QAT, **before sharding and optimizer construction**. The V4/GLM
+Apply PEFT, then QAT, **before sharding and optimizer construction**. The V4 and GLM
 examples use four nodes with eight GPUs each: FSDP2 DP-shard32 plus EP32 is
 32 ranks, not 1,024. `--nproc-per-node 8` alone does not launch four nodes.
 GLM has 288 experts and cannot use EP64. The configured topology does not imply
@@ -207,22 +219,22 @@ linked above, allocate **4 nodes × 8 GPUs**, and launch one `torchrun` agent pe
 node with eight workers and a shared four-node rendezvous. Do not launch these
 YAMLs unchanged on one eight-GPU node.
 
-All ranks need model/config/tokenizer and HellaSwag access. For local expert
+All ranks need model, config, tokenizer, and HellaSwag access. For local expert
 checkpoints, update these together:
-`model.config.pretrained_model_name_or_path`, `model.config.name_or_path` and
+`model.config.pretrained_model_name_or_path`, `model.config.name_or_path`, and
 `dataset.tokenizer.pretrained_model_name_or_path`, using paths visible on every node.
 
-### Download-free configuration check
+### Download-Free Configuration Check
 
 ```bash
 uv run --no-sync pytest tests/unit_tests/_transformers/test_lora_qat_yaml.py -v --timeout=60
 ```
 
-This checks typed mappings and recipe settings without downloading weights/data
+This checks typed mappings and recipe settings without downloading weights or data
 or constructing the full expert models. It does not validate GPU training,
-distributed collectives, memory fit or model quality.
+distributed collectives, memory fit, or model quality.
 
-## Reference export is local-only
+## Reference Export Is Local-Only
 
 The runtime controller is `nemo_automodel._transformers.qat.QAT(config)`:
 use `prepare(model)`, `export(model, directory)`, and
@@ -240,7 +252,7 @@ architecture. Retain the architecture and tokenizer: this is not a standalone
 Hugging Face `save_pretrained` directory, a training-resume checkpoint, or native
 vLLM / TensorRT-LLM packed serving.
 
-### Train, export and reload Qwen locally
+### Train, Export, and Reload Qwen Locally
 
 To retain the trained Qwen model, run this session from the repository root in
 the installed CUDA environment, with exactly one visible GPU and no `torchrun`.
@@ -279,22 +291,26 @@ finally:
 Use no autocast and enough GPU memory for both models. The controller uses the
 same typed config as training. Do not apply this local export session to the
 distributed expert recipes.
+For output comparisons, match the attention backend as well as dtype,
+quantization settings, and operation order.
 
-## What to compare
+## What to Compare
 
-- **Training effect:** compare ordinary LoRA and QAT from the same pretrained
+Use the following comparisons to evaluate QAT results:
+
+- **Training effect:** Compare ordinary LoRA and QAT from the same pretrained
   base and adapter initialization, with matching data order, steps, optimizer,
-  dtype, topology and evaluation inputs. Successful QAT training alone does not
+  dtype, topology, and evaluation inputs. Successful QAT training alone does not
   establish a paired comparison or a quality gain.
-- **Same-model reference quantize/decode consistency:** compare each trained
+- **Same-model reference quantize/decode consistency:** Compare each trained
   model's eval output with its own merged, quantized/dequantized reference.
   Include a merge-only control: BF16 merge rounding and operation order can
   change outputs independently of quantization. Low reload error measures
   consistency, not language quality or native low-bit kernel parity.
-- **Ordinary expert-LoRA baseline:** a routing-weight placement/reduction bug
+- **Ordinary expert-LoRA baseline:** A routing-weight placement/reduction bug
   in the ordinary path has been fixed. Older naive comparisons using that
   affected path are invalid evidence of QAT benefit; rerun both arms on the
   corrected implementation rather than attributing the discrepancy to QAT.
-- **Deployment quality and efficiency:** evaluate held-out task metrics and
-  measure latency, throughput and memory in the actual serving backend.
+- **Deployment quality and efficiency:** Evaluate held-out task metrics and
+  measure latency, throughput, and memory in the actual serving backend.
   Reference decode checks cannot substitute for those measurements.

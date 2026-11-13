@@ -721,6 +721,19 @@ def apply_model_infrastructure(
     frozen_compute_dtype = _get_frozen_storage_compute_dtype(strategy_config, mesh) if fsdp2_active else None
 
     if isinstance(qat_quantizer, QAT):
+        if isinstance(strategy_config, FSDP2Config):
+            if strategy_config.autocast_dtype is not None:
+                raise ValueError("LoRA QAT requires FSDP2 autocast_dtype=None")
+            if (
+                mesh.device_mesh is not None
+                and not fsdp2_active
+                and strategy_config.mp_policy is not None
+                and strategy_config.mp_policy.param_dtype in (torch.float16, torch.bfloat16)
+            ):
+                raise ValueError(
+                    "Unsharded FSDP2 enables autocast from mp_policy.param_dtype, which LoRA QAT does not support. "
+                    "Set distributed.mp_policy.param_dtype=null and use matching model/adapter storage dtypes."
+                )
         if mesh.tp_size > 1 or mesh.cp_size > 1 or mesh.pp_size > 1 or autopipeline is not None:
             raise ValueError("LoRA QAT requires TP=CP=PP=1 and no autopipeline")
         if isinstance(strategy_config, (MegatronFSDPConfig, DDPConfig)):

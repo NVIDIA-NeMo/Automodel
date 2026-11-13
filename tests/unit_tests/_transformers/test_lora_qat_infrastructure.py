@@ -32,9 +32,15 @@ from nemo_automodel.components.quantization.weight_qat import WeightFakeQuantize
 
 
 @pytest.fixture
-def infrastructure():
+def infrastructure(monkeypatch):
     from nemo_automodel._transformers import infrastructure
 
+    # Topology doubles override this module's world size; the shared predicate
+    # must observe the same simulated world instead of the local test process.
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.fsdp2.get_world_size_safe",
+        lambda: infrastructure.get_world_size_safe(),
+    )
     return infrastructure
 
 
@@ -84,6 +90,47 @@ def test_nested_config_boundary_instantiates_typed_rules():
     assert isinstance(config.rules[0].weight, WeightQuantizationConfig)
     assert isinstance(config.build(), tuple)
     assert config.build()[0].weight.block_size == (1, 32)
+
+
+@pytest.mark.parametrize("target", ["lm_head", "q_proj"])
+@pytest.mark.parametrize("loss_kind", ["fused", "chunked", "masked"])
+def test_recipe_rejects_qat_head_with_linear_loss(recipe, target: str, loss_kind: str) -> None:
+    """Validate the actual prepared output head before a loss can bypass its QDQ."""
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+    from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+
+    torch.manual_seed(19)
+    model = Qwen3ForCausalLM(Qwen3Config(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=8, tie_word_embeddings=False,
+        attention_dropout=0.0,
+    ))
+    model.config._attn_implementation = "eager"
+    apply_lora_to_linear_modules(
+        model, PeftConfig(target_modules=[target if target == "lm_head" else "*.q_proj"],
+                          dim=4, use_memory_efficient_lora=False)
+    )
+    qat = QAT(QATConfig(target_modules=(target if target == "lm_head" else "*.q_proj",),
+                        weight=WeightQuantizationConfig("mxfp4")))
+    qat.prepare(model)
+    loss = {"fused": FusedLinearCrossEntropy, "chunked": lambda: ChunkedCrossEntropy(compile=False),
+            "masked": MaskedCrossEntropy}[loss_kind]()
+    if target == "lm_head" and loss_kind != "masked":
+        with pytest.raises(ValueError, match="QAT.*output head.*MaskedCrossEntropy"):
+            recipe._maybe_downgrade_loss_fn(loss, model, pp_enabled=False)
+        assert all(parameter.grad is None for parameter in model.parameters())
+    else:
+        assert recipe._maybe_downgrade_loss_fn(loss, model, pp_enabled=False) is loss
+        if target == "lm_head":
+            input_ids = torch.tensor([[1, 2, 3]])
+            output = model(input_ids=input_ids)
+            loss(output.logits, torch.tensor([[2, 3, 4]]), num_label_tokens=3).backward()
+            assert model.lm_head.lora_B.weight.grad is not None
+            assert torch.count_nonzero(model.lm_head.lora_B.weight.grad) > 0
 
 
 @pytest.mark.parametrize("form", ["simple", "rules"])
@@ -394,6 +441,53 @@ def test_ep_checks_actual_experts_before_sharding(infrastructure, expert_kind, b
             with pytest.raises(ValueError, match="reference loop|torch_mm_mxfp8"):
                 infrastructure.apply_model_infrastructure(model, **kwargs)
             shard.assert_not_called()
+
+
+@pytest.mark.parametrize("explicit_autocast", [False, True])
+def test_unsharded_qat_rejects_autocast_before_model_mutation(infrastructure, explicit_autocast: bool) -> None:
+    mesh, context = _topology(world_size=1)
+    if explicit_autocast:
+        context.strategy_config = FSDP2Config(mp_policy=None, autocast_dtype=torch.bfloat16)
+    model = _model()
+    with (
+        patch.object(infrastructure, "Checkpointer") as checkpointer,
+        pytest.raises(ValueError, match="autocast"),
+    ):
+        infrastructure.apply_model_infrastructure(
+            model, is_meta_device=False, device=torch.device("cpu"), mesh=mesh, model_wrapper=context,
+            peft_config=_peft_config(), qat_quantizer=QAT(_qat_config()),
+        )
+    checkpointer.assert_not_called()
+    assert type(model[0]) is nn.Linear and model[0].weight.requires_grad
+
+
+@pytest.mark.parametrize("qat_enabled", [False, True])
+def test_unsharded_lora_preserves_precision_policy(infrastructure, tmp_path, qat_enabled: bool) -> None:
+    """Run the actual unsharded FSDP2 path on a one-rank CPU mesh, without mocking its forward."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
+    try:
+        mesh = MeshContext(
+            device_mesh=init_device_mesh("cpu", (1,), mesh_dim_names=("dp_shard",)),
+            strategy_config=(
+                FSDP2Config(mp_policy=MixedPrecisionPolicy(param_dtype=None), enable_compile=False)
+                if qat_enabled else FSDP2Config(enable_compile=False)
+            ),
+        )
+        model = infrastructure.apply_model_infrastructure(
+            _model(), is_meta_device=False, device=torch.device("cpu"), mesh=mesh, model_wrapper=mesh,
+            peft_config=_peft_config(), qat_quantizer=QAT(_qat_config()) if qat_enabled else None,
+        )
+        output = model(torch.randn(2, 32))
+        assert output.dtype == (torch.float32 if qat_enabled else torch.bfloat16)
+        assert torch.isfinite(output).all()
+        output.square().sum().backward()
+        assert torch.count_nonzero(model[0].lora_B.weight.grad) > 0
+    finally:
+        dist.destroy_process_group()
 
 
 def test_real_cpu_infrastructure_prepares_before_sharding(infrastructure):

@@ -26,7 +26,7 @@ Both compare against an entire unsharded, same-device/dtype cloned QAT model
 on the concatenated rank batches. This is parallel parity, not an independent
 quantizer oracle, bitwise forward parity, or pretrained-model evidence.
 
-One SGD step, no clipping/accumulation/checkpointing/TP/CP/PP, text-only GLM DSA,
+One SGD step, optional activation checkpointing, no clipping/accumulation/TP/CP/PP, text-only GLM DSA,
 top-2 of two real experts, six tokens per rank. Empty/uneven routes and separate
 axes belong to qat_distributed_worker; they are not claimed by this gate.
 Use an external 180s timeout for direct torchrun; pytest kills the process tree.
@@ -52,6 +52,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -67,6 +68,7 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.parallelizer import parallelize_model
 from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.quantization.weight_qat import WeightFakeQuantizer, WeightQuantizationConfig
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from tests.unit_tests._transformers.test_lora_qat_models import _tiny_model
 
 _ARCHITECTURES = ("deepseek_v4", "glm5_next")
@@ -282,7 +284,9 @@ def _forward(model: nn.Module, tokens: torch.Tensor, expert_path: str) -> tuple[
     return logits, captured
 
 
-def _run_case(architecture: str, dtype: str, result: dict, save: Callable[[], None]) -> None:
+def _run_case(
+    architecture: str, dtype: str, result: dict, save: Callable[[], None], *, activation_checkpointing: bool = False
+) -> None:
     rank = dist.get_rank()
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     block_path, expert_path = _paths(architecture)
@@ -301,7 +305,7 @@ def _run_case(architecture: str, dtype: str, result: dict, save: Callable[[], No
     # currently has no build method; use the existing public parallelize_model.
     policy = MixedPrecisionPolicy(cast_forward_inputs=False)
     setup = DistributedSetup.build(
-        strategy=FSDP2Config(mp_policy=policy, activation_checkpointing=False, enable_compile=False),
+        strategy=FSDP2Config(mp_policy=policy, activation_checkpointing=activation_checkpointing, enable_compile=False),
         parallelism_sizes=ParallelismSizes(dp_size=2, ep_size=2),
         world_size=2,
         timeout_minutes=1,
@@ -314,17 +318,22 @@ def _run_case(architecture: str, dtype: str, result: dict, save: Callable[[], No
         **mesh.parallelize_axis_kwargs(),
         mp_policy=policy,
         offload_policy=OffloadPolicy(),
-        activation_checkpointing=False,
+        activation_checkpointing=activation_checkpointing,
         reshard_after_forward=True,
         wrap_outer_model=True,
     )
+    parameters = {canonical_parameter_fqn(name): parameter for name, parameter in model.named_parameters()}
     with _synchronized_checks("ownership"):
         assert mesh.ep_size == 2 and mesh.moe_mesh["ep_shard"].size() == 1
         assert isinstance(model, FSDPModule) and isinstance(model.get_submodule(block_path), FSDPModule)
         experts = model.get_submodule(expert_path)
         assert not isinstance(experts, FSDPModule), "EP-owned experts must not acquire child FSDP ownership"
         ep_names, fsdp_names = [], []
-        for name, p in model.named_parameters():
+        checkpoint_wrappers = sum(isinstance(module, CheckpointWrapper) for module in model.modules())
+        assert bool(checkpoint_wrappers) is activation_checkpointing
+        result["activation_checkpointing"] = activation_checkpointing
+        result["checkpoint_wrappers"] = checkpoint_wrappers
+        for name, p in parameters.items():
             assert isinstance(p, DTensor) and p.placements == (Shard(0),), name
             assert p.device_mesh.ndim == 1 and p.device_mesh.size() == 2, name
             if name.startswith(expert_path + "."):
@@ -335,11 +344,13 @@ def _run_case(architecture: str, dtype: str, result: dict, save: Callable[[], No
                 assert not p.requires_grad, f"Dense/shared/router parameter unexpectedly trains: {name}"
                 fsdp_names.append(name)
         assert len(ep_names) == 6 and fsdp_names
-        assert {name for name, p in model.named_parameters() if p.requires_grad} == set(adapter_names)
+        assert {name for name, p in parameters.items() if p.requires_grad} == set(adapter_names)
         result["ownership"] = {
             "ep_parameters": ep_names,
             "fsdp_parameters": fsdp_names,
-            "fsdp_units": [name for name, module in model.named_modules() if isinstance(module, FSDPModule)],
+            "fsdp_units": [
+                canonical_parameter_fqn(name) for name, module in model.named_modules() if isinstance(module, FSDPModule)
+            ],
             "trainable_parameters": adapter_names,
         }
         optimizer = torch.optim.SGD((p for p in model.parameters() if p.requires_grad), lr=_LR, foreach=False)
@@ -351,7 +362,7 @@ def _run_case(architecture: str, dtype: str, result: dict, save: Callable[[], No
         }
 
     # Gather ALL parameters before local checks so a mismatch never skips a collective.
-    sharded_initial = {name: _full(p) for name, p in model.named_parameters()}
+    sharded_initial = {name: _full(p) for name, p in parameters.items()}
     with _synchronized_checks("initial state"):
         assert initial.keys() == sharded_initial.keys()
         for name in initial:
@@ -373,11 +384,29 @@ def _run_case(architecture: str, dtype: str, result: dict, save: Callable[[], No
     logits, trace = _forward(model, tokens[rank : rank + 1], expert_path)
     loss = _loss(logits, tokens[rank : rank + 1])
     model.prepare_for_final_backward()
-    loss.backward()
+    recompute_calls: list[bool] = []
+
+    def observe_recompute(module: nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+        """Observe QDQ replay without retaining or modifying tensors.
+
+        Args:
+            module: Expert weight fake quantizer.
+            args: One weight tensor of shape [local_experts, out, in].
+        """
+        recompute_calls.append(True)
+
+    handle = experts.weight_fake_quantizer.register_forward_pre_hook(observe_recompute)
+    try:
+        loss.backward()
+    finally:
+        handle.remove()
+    result["qat_recompute_calls"] = len(recompute_calls)
+    with _synchronized_checks("checkpoint replay"):
+        assert bool(recompute_calls) is activation_checkpointing
     global_loss = loss.detach().clone()
     dist.all_reduce(global_loss)  # Reporting only: never part of the training graph.
     with _synchronized_checks("gradient presence"):
-        for name, p in model.named_parameters():
+        for name, p in parameters.items():
             other = reference.get_parameter(name)
             if p.requires_grad:
                 assert p.grad is not None and other.grad is not None, name
@@ -386,7 +415,7 @@ def _run_case(architecture: str, dtype: str, result: dict, save: Callable[[], No
                 assert torch.isfinite(p.grad.to_local()).all() and torch.count_nonzero(p.grad.to_local()), name
             else:
                 assert p.grad is None and other.grad is None, name
-    gradients = {name: _full(model.get_parameter(name).grad) for name in adapter_names}
+    gradients = {name: _full(parameters[name].grad) for name in adapter_names}
     with _synchronized_checks("numerical parity"):
         _check(logits, reference_logits[rank : rank + 1], dtype, "logits", checks)
         _check(global_loss, reference_loss, dtype, "loss", checks)
@@ -420,7 +449,7 @@ def _run_case(architecture: str, dtype: str, result: dict, save: Callable[[], No
     save()
     optimizer.step()
     reference_optimizer.step()
-    after = {name: _full(p) for name, p in model.named_parameters()}
+    after = {name: _full(p) for name, p in parameters.items()}
     with _synchronized_checks("updates/frozen parameters"):
         for name, p in reference.named_parameters():
             if p.requires_grad:
@@ -441,6 +470,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--architecture", choices=(*_ARCHITECTURES, "all"), default="all")
     parser.add_argument("--dtype", choices=(*_DTYPES, "all"), default="all")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--activation-checkpointing", action="store_true")
     return parser
 
 
@@ -481,7 +511,7 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = False
         dist.init_process_group("nccl", timeout=timedelta(seconds=60))
         architectures = _ARCHITECTURES if args.architecture == "all" else (args.architecture,)
-        with torch.compiler.set_stance("force_eager"):
+        with torch.compiler.set_stance("force_eager"), sdpa_kernel(SDPBackend.MATH):
             for architecture in architectures:
                 for dtype in dtypes:
                     quantization = _quantization(architecture)
@@ -504,7 +534,7 @@ def main() -> None:
                     }
                     report["tests"].append(result)
                     save()
-                    _run_case(architecture, dtype, result, save)
+                    _run_case(architecture, dtype, result, save, activation_checkpointing=args.activation_checkpointing)
                     save()
         report.update(status="passed", supported_topology=dict(_TOPOLOGY))
     except Exception:

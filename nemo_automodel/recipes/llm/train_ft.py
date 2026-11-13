@@ -62,6 +62,7 @@ from nemo_automodel._transformers.infrastructure import (
     instantiate_infrastructure,
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
@@ -182,10 +183,18 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
-    """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+    """Validate QAT head compatibility, then downgrade unsupported model/loss combinations."""
     # Probe the wrapped model's signature, head, and config; training still calls DDP.
     if isinstance(probe_module, nn.parallel.DistributedDataParallel):
         probe_module = probe_module.module
+    if isinstance(loss_fn, LinearCrossEntropy):
+        lm_head = _get_lm_head_module(probe_module)
+        if isinstance(lm_head, LinearLoRA) and lm_head.weight_fake_quantizer is not None:
+            raise ValueError(
+                f"QAT on the output head is incompatible with {type(loss_fn).__name__}: "
+                "linear-projection losses bypass its quantized effective weight. "
+                "Use MaskedCrossEntropy or exclude the output head from QAT targets."
+            )
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
         if isinstance(loss_fn, ChunkedCrossEntropy):
             raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")

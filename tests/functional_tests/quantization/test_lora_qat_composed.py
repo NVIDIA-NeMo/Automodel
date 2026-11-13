@@ -35,7 +35,9 @@ _ROOT = Path(__file__).resolve().parents[3]
 _WORKER = Path(__file__).with_name("qat_composed_worker.py")
 
 
-def _validate_report(report: dict, architecture: str, dtype: str, rank: int) -> None:
+def _validate_report(
+    report: dict, architecture: str, dtype: str, rank: int, activation_checkpointing: bool = False
+) -> None:
     assert report["rank"] == rank and report["world_size"] == 2
     assert report["status"] == "passed", report
     assert report["scope"] == worker._SCOPE
@@ -45,6 +47,9 @@ def _validate_report(report: dict, architecture: str, dtype: str, rank: int) -> 
     case = report["tests"][0]
     assert (case["architecture"], case["dtype"]) == (architecture, dtype)
     assert case["status"] == "passed" and case["stage"] == "complete", case
+    assert case["activation_checkpointing"] is activation_checkpointing
+    assert (case["checkpoint_wrappers"] > 0) is activation_checkpointing
+    assert (case["qat_recompute_calls"] > 0) is activation_checkpointing
     assert case["supported_topology"] == worker._TOPOLOGY
     quantization = worker._quantization(architecture)
     assert case["quantization"] == {
@@ -80,7 +85,10 @@ def _validate_report(report: dict, architecture: str, dtype: str, rank: int) -> 
 @pytest.mark.timeout(200)
 @pytest.mark.parametrize("architecture", worker._ARCHITECTURES)
 @pytest.mark.parametrize("dtype", worker._DTYPES)
-def test_lora_qat_composed(tmp_path: Path, architecture: str, dtype: str) -> None:
+@pytest.mark.parametrize("activation_checkpointing", [False, True], ids=["no-ac", "ac"])
+def test_lora_qat_composed(
+    tmp_path: Path, architecture: str, dtype: str, activation_checkpointing: bool
+) -> None:
     """Require actual composed-model forward/backward/update evidence from both ranks."""
     assert int(os.environ.get("WORLD_SIZE", "1")) == 1, "Launch pytest normally, not under torchrun"
     env = os.environ.copy()
@@ -103,6 +111,8 @@ def test_lora_qat_composed(tmp_path: Path, architecture: str, dtype: str) -> Non
         "--output",
         str(tmp_path),
     ]
+    if activation_checkpointing:
+        command.append("--activation-checkpointing")
     log_path = tmp_path / "torchrun.log"
     with log_path.open("w") as log:
         process = subprocess.Popen(
@@ -120,7 +130,9 @@ def test_lora_qat_composed(tmp_path: Path, architecture: str, dtype: str) -> Non
             process.wait(timeout=10)
     assert returncode == 0, f"torchrun exit {returncode}; rank reports: {tmp_path}\n{log_path.read_text()}"
     for rank in range(2):
-        _validate_report(json.loads((tmp_path / f"rank-{rank}.json").read_text()), architecture, dtype, rank)
+        _validate_report(
+            json.loads((tmp_path / f"rank-{rank}.json").read_text()), architecture, dtype, rank, activation_checkpointing
+        )
 
 
 @pytest.mark.parametrize("architecture", worker._ARCHITECTURES)
