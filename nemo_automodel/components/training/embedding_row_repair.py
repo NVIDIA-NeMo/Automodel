@@ -406,8 +406,10 @@ def randomize_embedding_rows(model: nn.Module, token_ids: list[int], *, seed: in
     if bool((unique_ids < 0).any()) or bool((unique_ids >= vocab_size).any()):
         raise ValueError(f"token_ids must be in [0, {vocab_size}), got {token_ids}")
 
-    local_row_ids = torch.arange(view.global_offset[0], view.global_offset[0] + view.local_shape[0])
-    is_target_local = torch.isin(local_row_ids, unique_ids)
+    local_row_ids = torch.arange(
+        view.global_offset[0], view.global_offset[0] + view.local_shape[0], device=view.local.device
+    )
+    is_target_local = torch.isin(local_row_ids, unique_ids.to(view.local.device))
 
     target_norm = _healthy_rms_norm(_full_row_squared_norms(view), ~is_target_local)
 
@@ -419,10 +421,10 @@ def randomize_embedding_rows(model: nn.Module, token_ids: list[int], *, seed: in
 
     if bool(is_target_local.any()):
         local_target_ids = torch.nonzero(is_target_local, as_tuple=False).flatten()
-        owned_global_ids = local_row_ids[local_target_ids]
+        owned_global_ids = local_row_ids[local_target_ids].cpu()
         row_in_full = torch.searchsorted(unique_ids, owned_global_ids)
         h0, h1 = view.global_offset[1], view.global_offset[1] + view.local_shape[1]
-        replacement = full_rows[row_in_full, h0:h1].to(view.local.dtype)
+        replacement = full_rows[row_in_full, h0:h1].to(device=view.local.device, dtype=view.local.dtype)
         view.local.index_copy_(0, local_target_ids, replacement)
 
     rank = dist.get_rank() if dist.is_initialized() else 0
