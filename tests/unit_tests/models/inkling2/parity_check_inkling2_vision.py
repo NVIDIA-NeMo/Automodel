@@ -40,31 +40,51 @@ from nemo_automodel.components.models.inkling2.vision import Inkling2VisionModel
 # their 6x8 and 10x4 patch grids exercise both up- and down-sampling of the position embedding.
 IMAGE_GRID_THW = [[1, 3, 4], [1, 5, 2]]
 
+# Tiny vision config, in Transformers ``Inkling2VisionConfig`` argument names. The unit tests build
+# their stand-in config from the same values.
+TINY_VISION_CONFIG = {
+    "hidden_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "patch_size": 4,
+    "spatial_merge_size": 2,
+    "posemb_grid_size": 6,
+    "projection_hidden_dim": 96,
+    "projector_bias": False,
+    "text_hidden_size": 48,
+    "layer_norm_eps": 1e-5,
+    "mlp_ratio": 4.0,
+}
+
+# Gradient norms recorded by ``--golden`` for these parameters.
+GOLDEN_GRAD_PARAMETERS = (
+    "embeddings.patch_embedding.weight",
+    "embeddings.position_embedding.weight",
+    "embeddings.class_embedding",
+    "layers.0.self_attn.q_proj.weight",
+    "layers.1.lambda_2",
+    "merger.linear_1.weight",
+)
+
 
 def build_tiny_vision_config():
-    """Return a small Transformers ``Inkling2VisionConfig``."""
+    """Return the tiny Transformers ``Inkling2VisionConfig``."""
     from transformers.models.inkling2.configuration_inkling2 import Inkling2VisionConfig
 
-    return Inkling2VisionConfig(
-        hidden_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        patch_size=4,
-        spatial_merge_size=2,
-        posemb_grid_size=6,
-        projection_hidden_dim=96,
-        projector_bias=False,
-        text_hidden_size=48,
-        layer_norm_eps=1e-5,
-        mlp_ratio=4.0,
-    )
+    return Inkling2VisionConfig(**TINY_VISION_CONFIG)
 
 
-def _randomize_(module: torch.nn.Module, seed: int) -> None:
-    """Fill every parameter with seeded noise so no gradient path is trivially zero or one."""
+def fill_parameters_(module: torch.nn.Module, seed: int = 1) -> None:
+    """Fill every parameter, in sorted name order, with seeded noise.
+
+    No gradient path is trivially zero or one afterwards: layer norms are near one, layer scales
+    near 0.1 and every other tensor is ``0.1 * N(0, 1)``.
+    """
     generator = torch.Generator().manual_seed(seed)
+    parameters = dict(module.named_parameters())
     with torch.no_grad():
-        for name, parameter in module.named_parameters():
+        for name in sorted(parameters):
+            parameter = parameters[name]
             noise = torch.randn(parameter.shape, generator=generator)
             if name.endswith(("layernorm_before.weight", "layernorm_after.weight", "pre_layernorm.weight")):
                 parameter.copy_(1.0 + 0.1 * noise)
@@ -72,6 +92,24 @@ def _randomize_(module: torch.nn.Module, seed: int) -> None:
                 parameter.copy_(0.1 + 0.05 * noise)
             else:
                 parameter.copy_(0.1 * noise)
+
+
+def make_inputs(
+    patch_size: int, spatial_merge_size: int, num_channels: int, text_hidden_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return seeded ``(pixel_values, image_grid_thw, upstream)`` for ``IMAGE_GRID_THW``.
+
+    ``pixel_values`` has shape ``[lm_tokens, merge * patch, merge * patch, channels]`` with values
+    in ``[-1, 1]``, ``image_grid_thw`` shape ``[images, 3]`` and ``upstream`` shape
+    ``[lm_tokens, text_hidden]``, the random projection that turns ``pooler_output`` into a scalar.
+    """
+    grid = torch.tensor(IMAGE_GRID_THW)
+    side = patch_size * spatial_merge_size
+    generator = torch.Generator().manual_seed(2)
+    tokens = int(grid.prod(-1).sum())
+    pixel_values = torch.rand(tokens, side, side, num_channels, generator=generator) * 2 - 1
+    upstream = torch.randn(tokens, text_hidden_size, generator=generator)
+    return pixel_values, grid, upstream
 
 
 def _group(name: str) -> str:
@@ -97,18 +135,15 @@ def run(attn_implementation: str) -> dict[str, tuple[float, float]]:
     config = build_tiny_vision_config()
     config._attn_implementation = attn_implementation
     reference = HFInkling2VisionModel(config).float()
-    _randomize_(reference, seed=1)
+    fill_parameters_(reference)
     native = Inkling2VisionModel(config).float()
     native.load_state_dict(reference.state_dict(), strict=True)
     reference.train()
     native.train()  # attention_dropout is 0.0; train mode keeps the autograd path of real training
 
-    grid = torch.tensor(IMAGE_GRID_THW)
-    side = config.patch_size * config.spatial_merge_size
-    generator = torch.Generator().manual_seed(2)
-    pixel_values = torch.rand(int(grid.prod(-1).sum()), side, side, config.num_channels, generator=generator) * 2 - 1
-    upstream = torch.randn(pixel_values.shape[0], config.text_hidden_size, generator=generator)
-
+    pixel_values, grid, upstream = make_inputs(
+        config.patch_size, config.spatial_merge_size, config.num_channels, config.text_hidden_size
+    )
     ref_out = reference(pixel_values=pixel_values, image_grid_thw=grid)
     nat_out = native(pixel_values, grid)
     (ref_out.pooler_output * upstream).sum().backward()
@@ -130,10 +165,36 @@ def run(attn_implementation: str) -> dict[str, tuple[float, float]]:
     return results
 
 
+def golden() -> dict[str, list[float]]:
+    """Return the reference statistics that the unit tests pin, computed with Transformers."""
+    from transformers.models.inkling2.modeling_inkling2 import Inkling2VisionModel as HFInkling2VisionModel
+
+    config = build_tiny_vision_config()
+    config._attn_implementation = "sdpa"
+    reference = HFInkling2VisionModel(config).float()
+    fill_parameters_(reference)
+    pixel_values, grid, upstream = make_inputs(
+        config.patch_size, config.spatial_merge_size, config.num_channels, config.text_hidden_size
+    )
+    output = reference(pixel_values=pixel_values, image_grid_thw=grid)
+    (output.pooler_output * upstream).sum().backward()
+    parameters = dict(reference.named_parameters())
+    return {
+        "pooler_row_sums": output.pooler_output.sum(-1).tolist(),
+        "pooler_first_row": output.pooler_output[0, :8].tolist(),
+        "grad_norms": [parameters[name].grad.norm().item() for name in GOLDEN_GRAD_PARAMETERS],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--attn", choices=["eager", "sdpa"], default="eager", help="reference attention backend")
+    parser.add_argument("--golden", action="store_true", help="print the reference values pinned by the unit tests")
     args = parser.parse_args()
+    if args.golden:
+        for key, values in golden().items():
+            print(f"{key} = {values!r}")
+        return
     results = run(args.attn)
     print(f"| tensor ({args.attn} reference) | max abs err | max rel err |")
     print("|---|---|---|")
