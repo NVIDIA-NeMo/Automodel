@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 import nemo_automodel.components.cuda_graphs.partial as partial_graphs
+from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
 
 
 class _RouterCore(nn.Module):
@@ -158,6 +159,105 @@ def test_whole_attention_scope_uses_explicit_parameters_on_single_device(monkeyp
     assert entry.explicit_parameters is True
     assert len(captured_sample_args) == 1
     assert len(captured_sample_args[0][0]) == 3
+    manager.close()
+
+
+class _CompiledRopeAttention(_Attention):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("freqs_cis", torch.randn(1, 2, 2))
+
+    def forward(self, hidden_states):
+        """Apply unfused RoPE to the fixed-size attention fixture.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden], with
+                batch=1, sequence=2, and hidden=4. The projected hidden axis
+                is split into heads=2 and head_dim=2 for BSHD RoPE.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden], with the same fixed sizes.
+        """
+        query = self.q_proj(hidden_states).view(1, 2, 2, 2)
+        query, key = apply_rotary_emb_qk(query, query, self.freqs_cis.float(), format="bshd", rope_fusion=False)
+        return self.o_proj((query + key).reshape(1, 2, 4))
+
+
+@pytest.mark.run_only_on("GPU")
+def test_whole_attention_capture_retains_compiled_rope_backward(monkeypatch):
+    torch.compiler.reset()
+
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        """Exercise a retained backward through the attention adapter.
+
+        Args:
+            modules: Capture adapters corresponding to the argument tuples.
+            sample_args: Tuple of per-adapter argument tuples. Each contains
+                hidden states, a Tensor of shape [batch, sequence, hidden]
+                with batch=1, sequence=2, and hidden=4, followed by the query
+                and output projection weights. Each weight is a Tensor of
+                shape [output_hidden, input_hidden], with both dimensions 4.
+            **kwargs: Graph options, including retain_graph_in_backward.
+
+        Returns:
+            The supplied adapter modules with reset callbacks installed.
+        """
+        for module, args in zip(modules, sample_args):
+            output = module(*args)
+            torch.autograd.backward(output.float().sum(), retain_graph=kwargs["retain_graph_in_backward"])
+            module.reset = lambda: None
+        return modules
+
+    monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
+    model = _Model(te_dpa=False, attention=True, router=False, preprocess=False)
+    model.model.layers["0"].self_attn = _CompiledRopeAttention()
+    model.to(device="cuda", dtype=torch.bfloat16)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+    attention = model.model.layers["0"].self_attn
+    attention(torch.randn(1, 2, 4, device="cuda", dtype=torch.bfloat16)).float().sum().backward()
+
+    manager.capture()
+
+    assert manager.stats()["captured"] == 1
+    manager.close()
+
+
+def test_capture_scopes_donated_buffer_override_to_graph_helper(monkeypatch):
+    donated_buffer_during_capture = []
+
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        """Observe the capture configuration without executing the adapters.
+
+        Args:
+            modules: Capture adapters to return.
+            sample_args: Ignored tuple of per-adapter argument tuples. Each
+                contains hidden states, a Tensor of shape [tokens, hidden]
+                with tokens=2 and hidden=4, followed by the query and output
+                projection weights. Each weight is a Tensor of shape
+                [output_hidden, input_hidden], with both dimensions 4.
+            **kwargs: Ignored graph-helper options.
+
+        Returns:
+            The supplied adapter modules with reset callbacks installed.
+        """
+        del sample_args, kwargs
+        donated_buffer_during_capture.append(torch._functorch.config.donated_buffer)
+        for module in modules:
+            module.reset = lambda: None
+        return modules
+
+    monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
+    donated_buffer_before = torch._functorch.config.donated_buffer
+    model = _Model(te_dpa=False, attention=True, router=False, preprocess=False)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
+    assert manager is not None
+    model.model.layers["0"].self_attn(torch.ones(2, 4))
+
+    manager.capture()
+
+    assert donated_buffer_during_capture == [False]
+    assert torch._functorch.config.donated_buffer == donated_buffer_before
     manager.close()
 
 
