@@ -79,7 +79,9 @@ def test_logits_to_keep_returns_trailing_positions() -> None:
     with torch.no_grad():
         full = model(input_ids=input_ids).logits
         last = model(input_ids=input_ids, logits_to_keep=3).logits
-    torch.testing.assert_close(last, full[:, -3:], rtol=0, atol=0)
+    assert last.shape == (2, 3, _VOCAB)
+    # The head GEMM over fewer rows may round differently, so compare at FP32 tolerance.
+    torch.testing.assert_close(last, full[:, -3:], rtol=1e-5, atol=1e-6)
 
 
 def test_checkpoint_free_initialization_is_finite_and_trains() -> None:
