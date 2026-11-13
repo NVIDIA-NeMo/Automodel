@@ -27,10 +27,11 @@ from nemo_automodel.components.distributed.model_parallelizer import get_model_p
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.inkling2 import parallelization as parallelization_module
 from nemo_automodel.components.models.inkling2.configuration import Inkling2Config
-from nemo_automodel.components.models.inkling2.layers import Inkling2MoE
+from nemo_automodel.components.models.inkling2.layers import Inkling2MoE, inkling2_softcapped_swiglu
 from nemo_automodel.components.models.inkling2.model import Inkling2ForConditionalGeneration
+from nemo_automodel.components.moe import layers as moe_layers
 from nemo_automodel.components.moe import parallelizer as moe_parallelizer
-from nemo_automodel.components.moe.experts import GroupedExperts
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 
 pytestmark = pytest.mark.cpu_only
 
@@ -180,3 +181,38 @@ def test_expert_activation_is_softcapped_on_single_rank_backends(dispatcher, exp
             * torch.tanh(torch.tensor(30.0 / 25.0))
         )
         torch.testing.assert_close(activation(gate_up, torch.ones(1, 1)), expected.view(1, 1))
+
+
+def _softcapped_reference(gate: float, up: float) -> torch.Tensor:
+    gate_t, up_t = torch.tensor(gate), torch.tensor(up)
+    return (torch.tanh(gate_t / 4.0) * 4.0 * torch.sigmoid(gate_t) * torch.tanh(up_t / 25.0) * 25.0).view(1, 1)
+
+
+@pytest.mark.parametrize("dispatcher", ["deepep", "hybridep", "uccl_ep"])
+def test_expert_parallel_grouped_mm_experts_get_the_softcapped_activation(monkeypatch, dispatcher):
+    """With more than one rank the flex dispatchers build GroupedExpertsDeepEP; its hook must be Inkling 2's."""
+    monkeypatch.setattr(moe_layers, "get_world_size_safe", lambda: 2)
+    config = _tiny_config().text_config
+    moe = Inkling2MoE(config, BackendConfig(attn="sdpa", experts="torch_mm", dispatcher=dispatcher))
+    assert isinstance(moe.experts, GroupedExpertsDeepEP)
+    assert moe.experts.expert_activation.func is inkling2_softcapped_swiglu
+    torch.testing.assert_close(
+        moe.experts.expert_activation(torch.tensor([[2.0, 30.0]]), torch.ones(1, 1)), _softcapped_reference(2.0, 30.0)
+    )
+
+
+def test_expert_parallel_te_experts_get_the_softcapped_activation(monkeypatch):
+    """TE grouped experts keep the adapter's stacked keys and take Inkling 2's activation."""
+    pytest.importorskip("transformer_engine.pytorch")
+    monkeypatch.setattr(moe_layers, "get_world_size_safe", lambda: 2)
+    moe = Inkling2MoE(_tiny_config().text_config, BackendConfig(attn="sdpa", experts="te", dispatcher="hybridep"))
+    assert isinstance(moe.experts, GroupedExpertsTE)
+    assert moe.experts.expert_activation.func is inkling2_softcapped_swiglu
+
+
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_mok_dispatcher_is_rejected(monkeypatch, world_size):
+    """MoK fuses plain SwiGLU with no activation hook; construction must fail instead of training it."""
+    monkeypatch.setattr(moe_layers, "get_world_size_safe", lambda: world_size)
+    with pytest.raises(ValueError, match="mok"):
+        Inkling2MoE(_tiny_config().text_config, BackendConfig(attn="sdpa", experts="torch_mm", dispatcher="mok"))
