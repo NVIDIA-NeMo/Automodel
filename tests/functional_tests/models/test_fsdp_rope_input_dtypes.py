@@ -14,8 +14,7 @@
 
 """Default FSDP input policy with native dense models and original TE RoPE.
 
-The production BackendConfig guard still disables fused RoPE. This diagnostic
-overrides only that test instance after construction, enabling both RoPE paths.
+Both RoPE paths are selected through the production BackendConfig constructor.
 The reference uses identical weights/inputs without FSDP and retains original
 FP32 buffers during BF16 parameter conversion. No precision adapter or replacement
 kernel is used. Explicit cast_forward_inputs=True reproduces the old policy.
@@ -57,8 +56,9 @@ def _make_model(fusion: bool, device: torch.device):
         max_position_embeddings=65536,
         torch_dtype=torch.float32,
     )
-    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch_fp32", experts="torch_mm", dispatcher="torch")
-    backend.rope_fusion = fusion  # Diagnostic only: leave the production guard unchanged.
+    backend = BackendConfig(
+        linear="torch", attn="sdpa", rms_norm="torch_fp32", experts="torch_mm", dispatcher="torch", rope_fusion=fusion
+    )
     model = Qwen3MoeModel(config, backend).to(device)
     model.init_weights(device)
     assert model.layers["0"].self_attn.backend.rope_fusion is fusion
@@ -227,7 +227,10 @@ def _worker(rank: int, rendezvous: str) -> None:
                     assert old_error > 0.05
                     assert not torch.equal(angles[0][0], angles[2][0].float())
                 else:
-                    torch.testing.assert_close(actual, old_output, rtol=0, atol=0)
+                    # Eager Qwen now also rotates in FP32. Rounding its FP32
+                    # coefficients at the FSDP boundary must be detected too.
+                    assert old_error > 0.0
+                    assert not torch.equal(angles[0][0], angles[2][0].float())
                 if rank == 0:
                     print(
                         dict(

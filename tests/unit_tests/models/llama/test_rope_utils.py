@@ -98,18 +98,19 @@ def test_rope_gathers_non_contiguous_positions():
         torch.testing.assert_close(sin[0, i], sin_p[0, 0])
 
 
-def test_quack_backend_disables_fusion_and_gathers_non_contiguous_positions(caplog):
-    """QuACK must not inherit the CUDA/TE fused-RoPE default.
+@pytest.mark.parametrize("rope_backend", ["quack", "triton"])
+def test_non_te_backend_disables_fusion_and_gathers_non_contiguous_positions(caplog, rope_backend):
+    """Explicit non-TE backends must not inherit the CUDA/TE fused-RoPE default.
 
     Passing ``rope_fusion=True`` reproduces the default on CUDA builds with
-    Transformer Engine. QuACK must override it so arbitrary position IDs select
+    Transformer Engine. The backend must override it so arbitrary position IDs select
     their absolute rotary phases instead of a contiguous ``[0, seq_len)`` slice.
     """
     with caplog.at_level(logging.WARNING):
-        backend = BackendConfig(rope="quack", rope_fusion=True)
+        backend = BackendConfig(rope=rope_backend, rope_fusion=True)
 
     assert backend.rope_fusion is False
-    assert "rope='quack' is incompatible with rope_fusion=True" in caplog.text
+    assert f"rope={rope_backend!r} is incompatible with rope_fusion=True" in caplog.text
 
     rope = _build_rope(rope_fusion=backend.rope_fusion)
     x = torch.zeros(1, 1, 8)
