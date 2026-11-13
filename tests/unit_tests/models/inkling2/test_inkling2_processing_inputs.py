@@ -84,6 +84,14 @@ def _processor() -> Inkling2Processor:
 
 
 def _normalized(pixels: torch.Tensor) -> torch.Tensor:
+    """Map uint8 pixels to the processor's [-1, 1] range.
+
+    Args:
+        pixels: uint8 tensor of any shape, e.g. ``[channels, height, width]``.
+
+    Returns:
+        float32 tensor of the same shape.
+    """
     return (pixels.float() / 255 - 0.5) / 0.5
 
 

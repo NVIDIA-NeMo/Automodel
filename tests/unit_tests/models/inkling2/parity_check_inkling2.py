@@ -348,7 +348,16 @@ def _native_model(config: Inkling2Config, attn: str) -> Inkling2ForConditionalGe
 
 
 def _raw_state(native: Inkling2ForConditionalGeneration) -> dict[str, torch.Tensor]:
-    """Export native weights to the released layout and check the adapter round trip is exact."""
+    """Export native weights to the released layout and check the adapter round trip is exact.
+
+    Args:
+        native: model whose state dict is exported.
+
+    Returns:
+        Released-layout state dict: name -> tensor in checkpoint shape, e.g. ``model.llm.layers.N.mlp.experts.w13_weight``
+        ``[experts, 2 * intermediate, hidden]`` with gate/up rows interleaved, ``w2_weight`` ``[experts, hidden,
+        intermediate]``.
+    """
     adapter = native.state_dict_adapter
     raw_state = {key: value.detach().contiguous() for key, value in adapter.to_hf(native.state_dict()).items()}
     roundtrip = adapter.from_hf(raw_state)

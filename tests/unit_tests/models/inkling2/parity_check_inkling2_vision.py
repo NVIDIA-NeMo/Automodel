@@ -121,7 +121,12 @@ def _group(name: str) -> str:
 
 
 def _errors(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
-    """Return (max abs error, max abs error / max abs reference)."""
+    """Return (max abs error, max abs error / max abs reference).
+
+    Args:
+        actual: tensor of any shape, e.g. ``pooler_output`` ``[image_tokens, text_hidden]`` or a parameter gradient.
+        expected: reference tensor of the same shape as ``actual``.
+    """
     abs_err = (actual - expected).abs().max().item()
     scale = expected.abs().max().item()
     return abs_err, abs_err / scale if scale > 0 else abs_err

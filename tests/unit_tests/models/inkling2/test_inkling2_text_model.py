@@ -39,6 +39,7 @@ def _model(attn: str = "eager", dtype: str = "float32", seed: int = 1, **text_ov
 
 
 def _input_ids(batch: int = 2, sequence: int = 20, seed: int = 0) -> torch.Tensor:
+    """Return random token ids of shape ``[batch, sequence]`` (int64), avoiding ids 0 and 1."""
     return torch.randint(2, _VOCAB, (batch, sequence), generator=torch.Generator().manual_seed(seed))
 
 
