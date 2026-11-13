@@ -21,7 +21,7 @@ Run with pytest (two GPUs), or select a case for diagnosis with:
 Base weights are MXFP4-representable in both implementations, and LoRA B is
 nonzero so adapter A gradients are exercised. No dispatch or collective is mocked.
 
-PR CI runs six representative cases per dispatcher, covering every variant,
+PR CI runs seven representative cases per dispatcher, covering every variant,
 both LoRA ranks, checkpoint replay, and empty expert routing. Scheduled CI sets
 NEMO_MOE_TEST_FULL_MATRIX=true to retain all 96 original combinations.
 """
@@ -62,6 +62,7 @@ _EXPERTS = 4
 _SMOKE_CASES = (
     ("plain", "ragged", 8),
     ("lora", "ragged_checkpoint", 8),
+    ("lora", "empty_rank_checkpoint", 8),
     ("mxfp4", "ragged_checkpoint", 8),
     ("mxfp4_lora", "ragged", 8),
     ("mxfp4_lora", "empty_rank_checkpoint", 8),

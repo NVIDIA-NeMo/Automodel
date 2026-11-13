@@ -24,6 +24,7 @@ from copy import deepcopy
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from nemo_automodel.components._peft import lora_experts
 from nemo_automodel.components._peft.lora import patch_moe_module
@@ -33,6 +34,49 @@ from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExperts
 
 _ADAPTER_NAMES = {"lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"}
 _BACKENDS = ("loop", "grouped_mm", "deepep_torch")
+
+
+@pytest.mark.parametrize("after_down", [False, True])
+@pytest.mark.parametrize("tokens", [0, 3])
+@pytest.mark.parametrize("input_grad", [False, True])
+def test_empty_dispatch_participates_in_checkpoint_replay(
+    monkeypatch: pytest.MonkeyPatch, after_down: bool, tokens: int, input_grad: bool
+) -> None:
+    """CPU transport double isolates saved-tensor replay, not native collective safety."""
+    layer = _wrap(_source(backend="deepep_torch", after_down=after_down, bias=False, dtype=torch.float32))
+    dispatch_calls: list[bool] = []
+
+    def dispatch(
+        x: torch.Tensor, mask: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return empty dispatched [0, hidden], counts [experts], and probabilities [0, 1].
+
+        Args:
+            x: Local activations [tokens, hidden].
+            mask: Valid-token flags [tokens].
+            weights: Routing probabilities [tokens, top_k].
+            indices: Expert IDs [tokens, top_k].
+        """
+        dispatch_calls.append(True)
+        return x[:0], torch.zeros(3, dtype=torch.long), weights[:0, :1]
+
+    monkeypatch.setattr(layer, "_dispatch_tokens", dispatch)
+    monkeypatch.setattr(layer.token_dispatcher, "token_unpermutation", lambda output: output)
+    x = torch.randn(tokens, 4, requires_grad=input_grad)
+    weights = torch.randn(tokens, 2, requires_grad=input_grad)
+    output = checkpoint(
+        layer, x, torch.ones(tokens, dtype=torch.bool), weights,
+        torch.zeros(tokens, 2, dtype=torch.long), use_reentrant=False,
+    )
+    assert output.shape == (0, 4)
+    output.sum().backward()
+    assert len(dispatch_calls) == 2, "idle expert rank must re-enter dispatch during checkpoint backward"
+    for value in (x, weights, *(layer.get_parameter(name) for name in _ADAPTER_NAMES)):
+        if not value.requires_grad:
+            assert value.grad is None
+            continue
+        assert value.grad is not None
+        assert torch.isfinite(value.grad).all() and torch.count_nonzero(value.grad) == 0
 
 
 @pytest.fixture(autouse=True)
