@@ -247,21 +247,14 @@ zero-based step index after 50 updates. W&B resume reconnects metrics;
 
 ## Packed Context Parallelism
 
-Prepare Tulu 3 with the native Inkling processor and the shared packer:
-
-```bash
-export INKLING2_PACKS=/path/to/data/inkling2_tulu3_packed128k/train
-uv run python examples/llm_finetune/inkling2/prepare_tulu3_packed.py \
-  --model-path "${INKLING2_MODEL}" \
-  --output "${INKLING2_PACKS}" --max-packs=512 --num-workers=8
-```
-
-The helper shuffles eligible source documents with seed 1234, packs up to
-131072 tokens per row, and shuffles completed rows with the same seed.
-Assistant-only labels are shifted once. THD cumulative lengths and position
-IDs retain document boundaries; local attention and short convolutions cannot
-cross those boundaries. Documents longer than one pack and documents without
-supervised labels are excluded. Reuse the saved packs and order for repeat runs.
+The recipe reads `allenai/tulu-3-sft-mixture` from the Hugging Face Hub and
+packs it when training starts. Conversations are rendered with the Inkling chat
+template in `examples/llm_finetune/inkling2/inkling2_chat_template.jinja`,
+shuffled with seed 1234, truncated to 131072 tokens, and packed into 416 THD
+rows of 131072 tokens with 64-token document alignment. Labels cover the
+assistant turns only. THD cumulative lengths and position IDs retain document
+boundaries; local attention and short convolutions cannot cross those
+boundaries.
 
 Use a 16-node allocation with four GB200 GPUs per node:
 
@@ -273,7 +266,7 @@ uv run torchrun --nnodes=16 --nproc-per-node=4 \
   -m nemo_automodel.cli.app \
   examples/llm_finetune/inkling2/inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml \
   --model.pretrained_model_name_or_path "${INKLING2_MODEL}" \
-  --dataset.dataset_path="${INKLING2_PACKS}" \
+  --dataset.tokenizer.pretrained_model_name_or_path "${INKLING2_MODEL}" \
   --wandb.enable=true --wandb.mode=online \
   --wandb.entity="${WANDB_ENTITY}" --wandb.project="${WANDB_PROJECT}" \
   --wandb.id="${WANDB_RUN_ID}" --wandb.name="${WANDB_RUN_ID}" \

@@ -1,0 +1,9 @@
+{%- for message in messages -%}
+{%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}
+{{- '<|message_' + role + '|><|content_text|>' -}}
+{%- if message['role'] == 'assistant' -%}
+{% generation %}{{- message['content'] + '<|end_message|><|content_model_end_sampling|>' -}}{% endgeneration %}
+{%- else -%}
+{{- message['content'] + '<|end_message|>' -}}
+{%- endif -%}
+{%- endfor -%}
