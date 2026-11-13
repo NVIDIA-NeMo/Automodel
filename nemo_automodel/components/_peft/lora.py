@@ -855,6 +855,10 @@ def apply_lora_to_linear_modules(
         if n_fused_mlps:
             logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
 
+    if peft_config.trainable_token_indices:
+        wrapped = patch_embedding_module(model.get_input_embeddings(), list(peft_config.trainable_token_indices))
+        model.set_input_embeddings(wrapped)
+
     return num_modules_matched
 
 

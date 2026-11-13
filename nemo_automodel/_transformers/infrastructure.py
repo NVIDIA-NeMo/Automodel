@@ -39,7 +39,7 @@ from nemo_automodel._transformers.v4_patches.kv_sharing import (
     should_install_kv_sharing_holder,
 )
 from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
-from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules, patch_embedding_module
+from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
@@ -501,7 +501,7 @@ def _apply_trainability_policy(
     """
     if peft_enabled:
         for name, param in model.named_parameters(remove_duplicate=False):
-            param.requires_grad_("lora_" in name or "trainable_tokens_delta" in name)
+            param.requires_grad_("lora_" in name)
     if freeze_config is not None:
         apply_parameter_freezing(model, freeze_config, strict=strict)
 
@@ -901,15 +901,6 @@ def apply_model_infrastructure(
         model,
         checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
     )
-
-    # Applied after the base checkpoint load (not during _apply_peft_and_lower_precision, unlike
-    # LoRA's in-place Linear monkey-patching): TrainableTokensLayer wraps the embedding module,
-    # moving its weight to a nested `base_layer.weight` FQN, which would otherwise miss the base
-    # checkpoint's plain `embed_tokens.weight` key.
-    trainable_token_indices = getattr(peft_config, "trainable_token_indices", None)
-    if trainable_token_indices:
-        wrapped_embedding = patch_embedding_module(model.get_input_embeddings(), list(trainable_token_indices))
-        model.set_input_embeddings(wrapped_embedding)
 
     # Checkpoint loading can perform another round of parameter replacement, so
     # re-resolve once more on the final model parts before optimizer construction.
