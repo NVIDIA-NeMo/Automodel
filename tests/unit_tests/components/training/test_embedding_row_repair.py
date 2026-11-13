@@ -22,6 +22,7 @@ import torch.distributed as dist
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.training.embedding_row_repair import (
     EmbeddingRowRepairConfig,
+    randomize_embedding_rows,
     repair_input_embedding_rows,
 )
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -246,3 +247,51 @@ def single_rank_gloo():
         yield
     finally:
         dist.destroy_process_group()
+
+
+def _make_duplicated_mask_token_model() -> _TinyLM:
+    """A model whose reserved ids (3, 4, 5) are bit-identical copies of one placeholder vector --
+    the arXiv:2507.11851 gated-LoRA MTP scenario this function was written for, not a damaged-row one."""
+    model = _TinyLM()
+    with torch.no_grad():
+        model.embed_tokens.weight[:3] = torch.arange(3 * 4, dtype=torch.float32).reshape(3, 4) * 0.01
+        placeholder = torch.tensor([0.1, 0.2, -0.1, 0.05])
+        model.embed_tokens.weight[3] = placeholder
+        model.embed_tokens.weight[4] = placeholder
+        model.embed_tokens.weight[5] = placeholder
+    return model
+
+
+def test_randomize_gives_each_row_a_distinct_vector_and_leaves_others_unchanged():
+    model = _make_duplicated_mask_token_model()
+    before = model.embed_tokens.weight.detach().clone()
+
+    touched = randomize_embedding_rows(model, [3, 4, 5], seed=42)
+
+    assert touched == (3, 4, 5)
+    torch.testing.assert_close(model.embed_tokens.weight[:3], before[:3])
+    new_rows = model.embed_tokens.weight[[3, 4, 5]]
+    assert not torch.allclose(new_rows[0], new_rows[1])
+    assert not torch.allclose(new_rows[1], new_rows[2])
+    assert not torch.allclose(new_rows[0], before[3])
+
+    healthy_norm = torch.linalg.vector_norm(before[:3], dim=1).square().mean().sqrt()
+    torch.testing.assert_close(torch.linalg.vector_norm(new_rows, dim=1), healthy_norm.expand(3), rtol=1e-4, atol=1e-4)
+
+
+def test_randomize_is_deterministic_given_the_same_checkpoint_and_seed():
+    model_a = _make_duplicated_mask_token_model()
+    model_b = _make_duplicated_mask_token_model()
+
+    randomize_embedding_rows(model_a, [3, 4, 5], seed=42)
+    randomize_embedding_rows(model_b, [3, 4, 5], seed=42)
+
+    torch.testing.assert_close(model_a.embed_tokens.weight, model_b.embed_tokens.weight)
+
+
+def test_randomize_is_a_noop_for_empty_token_ids():
+    model = _make_duplicated_mask_token_model()
+    before = model.embed_tokens.weight.detach().clone()
+
+    assert randomize_embedding_rows(model, [], seed=42) == ()
+    torch.testing.assert_close(model.embed_tokens.weight, before)

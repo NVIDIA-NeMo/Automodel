@@ -103,6 +103,7 @@ from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.speculative.gated_mtp import GatedMTPLayout
 from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
+from nemo_automodel.components.training.embedding_row_repair import randomize_embedding_rows
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
@@ -781,6 +782,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if isinstance(model, AutoPipeline):
                 raise ValueError("embedding_row_repair is not currently supported with pipeline parallelism")
             self.embedding_row_repair_report = embedding_row_repair.apply(model)
+        if self.cfg.gated_mtp is not None:
+            # Matches arXiv:2507.11851's mask-token design ("generated as random vectors and
+            # added to the embedding table"): the reserved ids reused as mask tokens are not
+            # damaged (embedding_row_repair wouldn't touch them), just duplicated copies of one
+            # placeholder vector in the base checkpoint, so every depth needs its own random row.
+            randomize_embedding_rows(model, list(self.cfg.gated_mtp.mask_token_ids), seed=self.cfg.get("seed", 42))
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(

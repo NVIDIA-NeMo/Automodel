@@ -365,3 +365,74 @@ def repair_input_embedding_rows(
         min_norm_before=min_norm_before,
         target_norm=target_norm,
     )
+
+
+@torch.no_grad()
+def randomize_embedding_rows(model: nn.Module, token_ids: list[int], *, seed: int) -> tuple[int, ...]:
+    """Overwrite specific input-embedding rows with fresh, independent random vectors.
+
+    Unlike :func:`repair_input_embedding_rows` (which *detects* damaged rows by a norm
+    threshold and fixes them from the output embedding), this unconditionally reinitializes
+    exactly the rows named by ``token_ids`` -- for reserved/mask tokens whose checkpoint rows
+    are not damaged, just duplicated copies of one placeholder vector, so every such row would
+    otherwise be indistinguishable from the others. Matches the arXiv:2507.11851 mask-token
+    design: "generated as random vectors and added to the embedding table".
+
+    Args:
+        model: Loaded and optionally DTensor-sharded causal language model whose input embedding
+            weight has shape [vocab, hidden].
+        token_ids: Vocabulary ids whose input-embedding rows are overwritten.
+        seed: Seed for the per-row random generator; each row gets an independent vector derived
+            deterministically from this seed and its own token id, so the result is reproducible
+            and identical across every DTensor shard/rank without any extra communication.
+
+    Returns:
+        ``token_ids``, deduplicated and sorted, in the order written.
+
+    Raises:
+        ValueError: If the model's input embedding cannot be located, any id in ``token_ids`` is
+            out of range, or the table has no other ("healthy") rows to scale the new ones against.
+    """
+    if not token_ids:
+        return ()
+    model = getattr(model, "module", model)
+    input_weight, input_name = get_input_embeddings_weight_and_name(model)
+    if input_weight is None or input_name is None:
+        raise ValueError("Could not locate the model's input embedding weight")
+
+    view = _weight_view(input_weight, input_name)
+    vocab_size, hidden_size = view.global_shape
+    unique_ids = torch.tensor(sorted(set(token_ids)), dtype=torch.long)
+    if bool((unique_ids < 0).any()) or bool((unique_ids >= vocab_size).any()):
+        raise ValueError(f"token_ids must be in [0, {vocab_size}), got {token_ids}")
+
+    local_row_ids = torch.arange(view.global_offset[0], view.global_offset[0] + view.local_shape[0])
+    is_target_local = torch.isin(local_row_ids, unique_ids)
+
+    target_norm = _healthy_rms_norm(_full_row_squared_norms(view), ~is_target_local)
+
+    full_rows = torch.empty(len(unique_ids), hidden_size, dtype=torch.float32)
+    for row, token_id in enumerate(unique_ids.tolist()):
+        generator = torch.Generator(device="cpu").manual_seed(seed + token_id)
+        full_rows[row] = torch.randn(hidden_size, generator=generator)
+    full_rows = full_rows / full_rows.norm(dim=1, keepdim=True) * target_norm
+
+    if bool(is_target_local.any()):
+        local_target_ids = torch.nonzero(is_target_local, as_tuple=False).flatten()
+        owned_global_ids = local_row_ids[local_target_ids]
+        row_in_full = torch.searchsorted(unique_ids, owned_global_ids)
+        h0, h1 = view.global_offset[1], view.global_offset[1] + view.local_shape[1]
+        replacement = full_rows[row_in_full, h0:h1].to(view.local.dtype)
+        view.local.index_copy_(0, local_target_ids, replacement)
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        logger.info(
+            "Randomized %d input embedding row(s) in %s: ids=%s, target_norm=%.3e",
+            len(unique_ids),
+            input_name,
+            unique_ids.tolist(),
+            target_norm,
+        )
+
+    return tuple(unique_ids.tolist())
