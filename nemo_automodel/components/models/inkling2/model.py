@@ -88,7 +88,7 @@ class Inkling2ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         supports_tp: bool = False
         supports_cp: bool = False
         supports_pp: bool = False
-        supports_ep: bool = False
+        supports_ep: bool = True
 
     @classmethod
     def from_config(
@@ -137,14 +137,16 @@ class Inkling2ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPS
         Args:
             config: Inkling 2 configuration; ``config.torch_dtype`` selects the storage dtype.
             moe_config: Optional routed-expert configuration; derived from the text config by default.
-            backend: Backend configuration. ``attn`` must be ``"sdpa"`` or ``"eager"``.
+            backend: Backend configuration. ``attn`` must be ``"sdpa"`` or ``"eager"``; defaults to
+                ``BackendConfig(attn="sdpa")``.
             **kwargs: Extra bridge arguments; ignored.
         """
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__()
         del kwargs
         self.config = config
-        self.backend = backend or BackendConfig()
+        # The attention supports eager and SDPA only, so the default backend picks SDPA.
+        self.backend = backend or BackendConfig(attn="sdpa")
         text_config = config.text_config
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.moe_config = moe_config or inkling2_moe_config(text_config, model_dtype)

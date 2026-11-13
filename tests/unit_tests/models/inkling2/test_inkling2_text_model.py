@@ -178,6 +178,12 @@ def test_left_padding_leaves_valid_token_logits_unchanged() -> None:
     torch.testing.assert_close(padded_logits[:, 5:], unpadded_logits, rtol=0, atol=1e-5)
 
 
+def test_default_backend_uses_sdpa_attention() -> None:
+    model = Inkling2ForConditionalGeneration(_config())
+    assert model.backend.attn == "sdpa"
+    assert {layer.self_attn.attention_backend for layer in model.model.language_model.layers} == {"sdpa"}
+
+
 def test_unsupported_attention_backend_is_rejected() -> None:
     backend = BackendConfig(attn="flex", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
     with pytest.raises(ValueError, match="backend.attn"):
