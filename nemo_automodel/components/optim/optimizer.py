@@ -61,6 +61,7 @@ from nemo_automodel.shared.utils import dtype_from_str
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
+    from nemo_automodel.components.optim.gradient_sketch import SketchSettings
     from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 logger = logging.getLogger(__name__)
@@ -346,6 +347,108 @@ class FlashAdamWConfig(OptimizerConfig):
         # FlashAdamW forwards params unchanged to torch's Optimizer, including
         # parameter-group dicts, but its upstream annotation only names tensors.
         return FlashAdamW(cast(list[torch.Tensor], params), **self._constructor_kwargs())
+
+
+@dataclass
+class GradientSketchConfig(OptimizerConfig):
+    """LoGRA-style gradient sketching: rank-``r`` sketches for selected linear weights.
+
+    ``native`` configures the optimizer for every parameter that is not a sketch
+    target. Sketch targets never hold a dense gradient or Adam moments; see
+    :mod:`nemo_automodel.components.optim.gradient_sketch`.
+    """
+
+    supports_megatron_fsdp_sharding: ClassVar[bool] = False
+
+    native: OptimizerConfig | dict[str, Any] = field(default_factory=AdamWConfig)
+    rank: int = 256
+    seed: int = 42
+    distribution: str = "rademacher"
+    refresh: bool = True
+    optimizer: str = "row_adam"
+    beta2: float = 0.95
+    epsilon: float = 1e-8
+    target_modules: list[str] = field(
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    )
+    target_parameters: list[str] = field(default_factory=list)
+    target_prefixes: list[str] = field(default_factory=list)
+    freeze_non_target: bool = False
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.param_group_overrides:
+            raise ValueError("gradient_sketch does not support param_group_overrides")
+        if isinstance(self.native, dict):
+            native = dict(self.native)
+            target = native.pop("_target_", "adamw")
+            self.native = build_optimizer_config(target, native)
+        if self.native.param_group_overrides:
+            raise ValueError("gradient_sketch does not support param_group_overrides on the native optimizer")
+        self.settings()  # validate eagerly so YAML mistakes fail at config time
+
+    def settings(self) -> SketchSettings:
+        """Return the validated :class:`SketchSettings` for this config."""
+        # Local import keeps optimizer.py importable without the sketch package's dependencies at module load.
+        from nemo_automodel.components.optim.gradient_sketch import SketchSettings
+
+        return SketchSettings(
+            rank=self.rank,
+            seed=self.seed,
+            distribution=self.distribution,
+            refresh=self.refresh,
+            optimizer=self.optimizer,
+            beta2=self.beta2,
+            epsilon=self.epsilon,
+            target_modules=tuple(self.target_modules),
+            target_parameters=tuple(self.target_parameters),
+            target_prefixes=tuple(self.target_prefixes),
+            freeze_non_target=self.freeze_non_target,
+        )
+
+    def build(
+        self,
+        model: torch.nn.Module,
+        *,
+        device_mesh: DeviceMesh | None = None,
+        is_peft: bool = False,
+    ) -> list[torch.optim.Optimizer]:
+        """Build a :class:`GradientSketchOptimizer` wrapping the native optimizer.
+
+        Args:
+            model: Model to optimize (a single part; pipeline parallelism is unsupported).
+            device_mesh: Device mesh used for tensor/data parallelism.
+            is_peft: Must be ``False``; gradient sketching cannot be combined with PEFT.
+
+        Returns:
+            A one-element list holding the sketch optimizer.
+
+        Raises:
+            NotImplementedError: If ``model`` has several pipeline-parallel parts.
+            ValueError: If PEFT is enabled, or ``device_mesh`` uses HSDP or tensor parallelism.
+        """
+        # Local import keeps optimizer.py importable without the sketch package's dependencies at module load.
+        from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimizer
+
+        if len(getattr(model, "parts", [model])) != 1:
+            raise NotImplementedError("gradient_sketch does not support pipeline-parallel model parts")
+        if is_peft:
+            raise ValueError("gradient_sketch cannot be combined with PEFT adapters")
+        if device_mesh is not None:
+            # Context parallelism is supported. Expert parallelism lives on the separate MoE mesh,
+            # which this config never sees; ``clip_grads_for_optimizers`` rejects it at the first step.
+            mesh_names = device_mesh.mesh_dim_names or ()
+            if "dp_replicate" in mesh_names and device_mesh["dp_replicate"].size() > 1:
+                raise ValueError("gradient sketch does not support HSDP")
+            if "tp" in mesh_names and device_mesh["tp"].size() > 1:
+                raise ValueError("gradient sketch does not support tensor parallelism")
+        (native,) = cast(OptimizerConfig, self.native).build(model, device_mesh=device_mesh, is_peft=False)
+        return [GradientSketchOptimizer(model, native, self.settings())]
+
+    def _build_optimizer(
+        self, params: list[torch.Tensor] | list[dict[str, Any]], *, foreach: bool | None = None
+    ) -> torch.optim.Optimizer:  # pragma: no cover - build() is overridden
+        raise NotImplementedError("GradientSketchConfig builds from the model, not from a parameter list")
 
 
 # Fields used only for Dion-family parameter grouping; these are NOT dion
@@ -1103,6 +1206,7 @@ OPTIMIZER_CONFIG_REGISTRY: dict[str, type[OptimizerConfig]] = {
     "adamw": AdamWConfig,
     "fused_adam": FusedAdamConfig,
     "flash_adamw": FlashAdamWConfig,
+    "gradient_sketch": GradientSketchConfig,
     "muon": MuonConfig,
     "muown": MuownConfig,
     "normuon": NorMuonConfig,
@@ -1259,6 +1363,7 @@ __all__ = [
     "DionConfig",
     "FlashAdamWConfig",
     "FusedAdamConfig",
+    "GradientSketchConfig",
     "LRSchedulerConfig",
     "MuonConfig",
     "MuownConfig",

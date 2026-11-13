@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import gc
 import math
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, Protocol, runtime_checkable
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -30,6 +30,19 @@ from nemo_automodel.components.training.triton.grad_norm import multi_tensor_abs
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 
 _GradNormBackend = Literal["triton", "te"]
+
+
+@runtime_checkable
+class SketchClippingOptimizer(Protocol):
+    """Optimizer that owns gradient synchronization and clipping (e.g. gradient sketch).
+
+    Matched structurally so this component does not import the optim component; plain
+    ``torch.optim.Optimizer`` instances have neither member.
+    """
+
+    ready: bool
+
+    def synchronize_and_clip(self, process_group: Any, max_norm: float | None) -> torch.Tensor: ...
 
 
 def _ep_local_expert_param_ids(
@@ -788,6 +801,65 @@ def scale_grads_and_clip_grad_norm(
         use_torch_clip_grad_norm=use_torch_clip_grad_norm,
         grad_norm_backend=grad_norm_backend,
     )
+
+
+def _reject_presketch_gradient_scaling(model_parts: list[torch.nn.Module], clip_kwargs: dict[str, Any]) -> None:
+    """Reject layouts whose gradients ``scale_grads_and_clip_grad_norm`` would pre-scale.
+
+    The sketch path bypasses that helper, so expert-parallel ratio scaling and model-owned
+    gradient divisors would be silently skipped.
+    """
+    moe_mesh = clip_kwargs.get("moe_mesh")
+    ep_axis_name = clip_kwargs.get("ep_axis_name")
+    mesh_names = getattr(moe_mesh, "mesh_dim_names", None) or ()
+    expert_parallel = (
+        moe_mesh is not None and bool(ep_axis_name) and ep_axis_name in mesh_names and moe_mesh[ep_axis_name].size() > 1
+    )
+    owner_scaled = any(
+        getattr(parameter, "_nemo_model_owned_grad_divisor", None) is not None
+        for model_part in model_parts
+        for parameter in model_part.parameters()
+    )
+    if expert_parallel or owner_scaled:
+        raise RuntimeError("gradient sketch does not support expert parallelism or owner-scaled gradients")
+
+
+def clip_grads_for_optimizers(
+    optimizers: list[torch.optim.Optimizer],
+    max_grad_norm: float | None,
+    model_parts: list[torch.nn.Module],
+    *,
+    dp_group: Any = None,
+    **clip_kwargs: Any,
+) -> torch.Tensor | float:
+    """Clip gradients the way the configured optimizers require.
+
+    Gradient-sketch optimizers own their gradients (sketches plus native grads) and
+    synchronize them as part of clipping; everything else goes through
+    :func:`scale_grads_and_clip_grad_norm` with ``clip_kwargs`` forwarded verbatim.
+
+    Args:
+        optimizers: Optimizers built for ``model_parts`` (one per part).
+        max_grad_norm: Clip threshold, or ``None`` to only measure.
+        model_parts: Model parts whose parameters the optimizers update.
+        dp_group: Data-parallel process group used by sketch synchronization.
+        **clip_kwargs: Keyword arguments for ``scale_grads_and_clip_grad_norm``.
+
+    Returns:
+        The pre-clip global norm.
+
+    Raises:
+        ValueError: If sketch and non-sketch optimizers are mixed.
+        RuntimeError: If sketch optimizers are used with expert parallelism or owner-scaled gradients.
+    """
+    sketch_optimizers = [o for o in optimizers if isinstance(o, SketchClippingOptimizer)]
+    if sketch_optimizers and len(sketch_optimizers) != len(optimizers):
+        raise ValueError("Cannot mix gradient-sketch optimizers with other optimizers across model parts")
+    if sketch_optimizers:
+        _reject_presketch_gradient_scaling(model_parts, clip_kwargs)
+        norms = [o.synchronize_and_clip(dp_group, max_grad_norm) for o in sketch_optimizers]
+        return torch.stack(norms).square().sum().sqrt() if len(norms) > 1 else norms[0]
+    return scale_grads_and_clip_grad_norm(max_grad_norm, model_parts, **clip_kwargs)
 
 
 def move_to_device(model: torch.nn.Module, device: torch.device | str) -> None:

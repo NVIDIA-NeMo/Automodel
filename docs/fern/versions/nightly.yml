@@ -1120,6 +1120,9 @@ navigation:
       - page: "Gradient Checkpointing"
         path: ../../guides/gradient-checkpointing.mdx
         slug: gradient-checkpointing
+      - page: "Gradient Sketching"
+        path: ../../guides/gradient-sketch.mdx
+        slug: gradient-sketch
       - page: "Distributed Setup (Python API)"
         path: ../../guides/distributed-setup.mdx
         slug: distributed-setup

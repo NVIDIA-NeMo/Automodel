@@ -1,0 +1,85 @@
+---
+title: "Reduce Optimizer Memory with Gradient Sketching"
+description: "Train dense LLMs with the gradient_sketch optimizer, which replaces dense gradients and Adam moments of selected linear weights with rank-r sketches."
+position: 7
+---
+The `gradient_sketch` optimizer replaces the dense gradient of selected linear weights with a rank-`r` sketch accumulated during backward. It keeps one second moment per output row (RowAdam) instead of two dense Adam moments, and merges the low-rank update into the full weight each step. The method is LoGRA (Zhang et al., arXiv:2610.06647). All parameters that are not sketch targets are handled by a nested native optimizer such as AdamW.
+
+## When to Use It
+
+Use the `gradient_sketch` optimizer for memory-bound SFT or RL fine-tuning of dense Hugging Face models, where dense gradients and optimizer moments of the attention and MLP projections dominate memory. It targets FSDP2 runs. See [Limits](#limits) for what is unsupported.
+
+## Configure in YAML
+
+Add the following optimizer section to your recipe YAML:
+
+```yaml
+optimizer:
+  _target_: nemo_automodel.components.optim.optimizer.GradientSketchConfig
+  rank: 256
+  seed: 42
+  native:
+    _target_: nemo_automodel.components.optim.optimizer.AdamWConfig
+    lr: 1.0e-5
+    weight_decay: 0.0
+```
+
+The nested `native` target must be a dotted class path. Registry short names such as `adamw` are not resolved inside nested mappings. Omitting the nested `_target_` selects AdamW. The registry key `gradient_sketch` is accepted only by the top-level `build_optimizer_config` and `build_optimizer` entry points, not inside recipe YAML.
+
+## Fields
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `native` | optimizer config | `AdamWConfig()` | Optimizer for every parameter that is not a sketch target. `param_group_overrides` is rejected. |
+| `rank` | int | `256` | Sketch rank `r`. Must be positive. |
+| `seed` | int | `42` | Seed for the shared random projections. |
+| `distribution` | str | `"rademacher"` | Projection distribution: `"rademacher"` or `"gaussian"`. |
+| `refresh` | bool | `true` | Redraw the projection after every update. `false` keeps the first draw. |
+| `optimizer` | str | `"row_adam"` | Update rule applied to the sketch: `"row_adam"` or `"sgd"`. |
+| `beta2` | float | `0.95` | RowAdam second-moment decay, `0 <= beta2 < 1`. |
+| `epsilon` | float | `1e-8` | RowAdam epsilon. Must be positive. |
+| `target_modules` | list[str] | `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj` | Names of `nn.Linear` modules to sketch. |
+| `target_parameters` | list[str] | `[]` | Names of fused 3-D expert parameters to sketch. |
+| `target_prefixes` | list[str] | `[]` | Restrict selection to modules under these prefixes. |
+| `freeze_non_target` | bool | `false` | Freeze every parameter that is not a sketch target. |
+
+Invalid values fail at config time. The run fails if the selection matches no module or parameter.
+
+## Checkpointing
+
+The standard optimizer state dict holds the native optimizer's state, plus `update_count` and the sketch settings in the first param group. State of the sketch targets is not part of it, because PyTorch DCP skips optimizer state of frozen parameters, and sketch targets have `requires_grad=False`. AutoModel's `OptimizerState` saves it under a top-level `sketch` entry instead:
+
+- `row_second_moment`: The flat FP32 row second moments (RowAdam only).
+- `master_weight.<parameter fqn>` (for example, `master_weight.model.layers.0.self_attn.q_proj.weight`): FP32 master weights for BF16 targets, stored as DTensors under FSDP.
+
+Projections are not saved. They are regenerated from the seed on load. A checkpoint saved with different sketch settings is rejected on load, as is a checkpoint whose `sketch` entry has missing, unexpected, or differently shaped keys. A checkpoint containing sketch state cannot be loaded without a gradient sketch optimizer.
+
+## Limits
+
+The optimizer has the following limits:
+
+- FSDP2 row sharding only. Tensor and pipeline parallelism are rejected. Context parallelism is untested.
+- The process group used for gradient clipping must be the FSDP shard group. HSDP (`dp_replicate_size > 1`) is rejected at setup.
+- With more than one rank, every target must be an FSDP DTensor. Plain-tensor DDP is rejected.
+- No PEFT.
+- Outputs of sketched linear layers must not be modified in place. A violation fails at forward time.
+- All data-parallel ranks must run identical hardware: projections are drawn from a shared seed on each device, and their fingerprints are checked once across ranks.
+- Fused 3-D expert parameters are supported through `target_parameters`, only when experts are not sharded along a non-leading dimension: AutoModel's EP parallelizer with `ep_shard > 1` is rejected. Expert parallelism is rejected by the gradient-clipping path, as are parameters with model-owned gradient divisors.
+- A single model part is supported; pipeline-parallel parts are rejected.
+- Only the LLM fine-tuning recipe (`recipes/llm/train_ft.py`) is wired for gradient sketching. Other recipes raise at `step()` because they never call `synchronize_and_clip`.
+
+## Measured Results
+
+The following table shows peak memory and training iteration time measured in NeMo-RL (NVIDIA-NeMo/RL#4992), not in AutoModel, for a 7B model on 4x B300:
+
+| Configuration | Peak Memory | Time per Training Iteration |
+| --- | --- | --- |
+| Dense baseline | 65.0 GiB | 500 ms |
+| Gradient sketch | 45.7 GiB | 384 ms |
+
+## Tests
+
+The following tests cover the gradient sketch optimizer:
+
+- Unit tests: `tests/unit_tests/optim/test_gradient_sketch_*.py`
+- Functional tests: `tests/functional_tests/optim/L2_Optim_GradientSketch_FSDP_Equivalence.sh` and `tests/functional_tests/optim/L2_Optim_GradientSketch_Expert_Equivalence.sh`
