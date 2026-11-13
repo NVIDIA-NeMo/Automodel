@@ -16,9 +16,11 @@ import getpass
 import logging
 import os
 import socket
+from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -51,11 +53,13 @@ from nemo_automodel.components.checkpoint.utils import (
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from nemo_automodel.components.loss.utils import _count_label_tokens, _get_loss_ignore_index
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.garbage_collection import GarbageCollection
 from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.components.training.step_scheduler import StepScheduler
+from nemo_automodel.components.training.step_scheduler import StepScheduler, TokenCounts
+from nemo_automodel.components.training.utils import count_tail_padding
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 logger = logging.getLogger(__name__)
@@ -829,6 +833,30 @@ class BaseRecipe:
         if stages is None:
             raise RuntimeError("Pipeline optimizer checkpointing requires AutoPipeline.build() to complete first.")
         return [stage.stage_index for stage in stages]
+
+    def _iter_training_steps(self) -> Iterator[tuple[list[Mapping[str, Any]], TokenCounts | None]]:
+        """Share streaming preparation; leave other loaders' counts in their recipes."""
+        # DP peers share a statistics slot; PP/CP/TP peers retain separate token
+        # sums while agreeing on stream completion through the same collective.
+        statistics_group_index = 0
+        device_mesh = getattr(self, "device_mesh", None)
+        if device_mesh is not None:
+            for axis in ("pp", "cp", "tp"):
+                if axis in device_mesh.mesh_dim_names:
+                    statistics_group_index = statistics_group_index * device_mesh[
+                        axis
+                    ].size() + device_mesh.get_local_rank(axis)
+        yield from self.step_scheduler.iter_steps(
+            self._count_step_tokens, statistics_group_index=statistics_group_index
+        )
+
+    def _count_step_tokens(self, batches: list[Mapping[str, Any]]) -> TokenCounts:
+        """Count supervised and non-tail-padding tokens without a collective."""
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
+        return TokenCounts(
+            supervised=sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+            total=sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+        )
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)

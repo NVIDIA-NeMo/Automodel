@@ -28,7 +28,7 @@ class _FiniteLoader:
     synchronized_stream = True
 
     def __init__(self):
-        self.values = iter({"value": index} for index in range(5))
+        self.values = iter({"value": index, "labels": torch.tensor([[1, 2]])} for index in range(5))
         self.closed = False
 
     def __iter__(self):
