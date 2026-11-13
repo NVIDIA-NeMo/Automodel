@@ -367,6 +367,9 @@ Intermediate checkpoints stay sharded; run their
 
 ## Step 4 — Run Inference and Evaluation
 
+The examples below use Transformers 5.18.0. The inference setup preserves the checkpoint's
+Mamba time-step limits and selects each layer's CUDA device when the model spans multiple GPUs.
+
 ### Full SFT Inference
 
 Load the consolidated HF export across all visible GPUs (`device_map="auto"`; the bf16 weights need
@@ -384,20 +387,38 @@ bash vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidate.
 
 ```python
 import difflib, json
+from functools import wraps
 
 import torch
 from datasets import load_dataset
 from transformers import AutoModel, AutoProcessor
+from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMamba2Mixer
 
 from nemo_automodel.components.datasets.vlm.utils import json2token
+
+def prepare_inference(model):
+    # Avoid cuDNN SDPA plan-building overhead as decode lengths change.
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    # Transformers 5.18 must use the checkpoint's runtime dt limits.
+    # mamba-ssm's scan must launch on the GPU that owns the layer.
+    def on_device(forward, device):
+        @wraps(forward)
+        def wrapped(*args, **kwargs):
+            with torch.cuda.device(device):
+                return forward(*args, **kwargs)
+        return wrapped
+
+    for module in model.modules():
+        if isinstance(module, NemotronHMamba2Mixer):
+            module.time_step_limit = module.config.time_step_limit
+            module.forward = on_device(module.forward, module.dt_bias.device)
 
 CKPT = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2/LOWEST_VAL/model/consolidated"  # pragma: allowlist secret
 NUM_SAMPLES = 20
 
 processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
 model = AutoModel.from_pretrained(CKPT, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto")
-# RADIO's `summary_idxs` is a non-persistent buffer and can come back as a meta tensor after loading.
-model.vision_model.radio_model.summary_idxs = None
+prepare_inference(model)
 model.eval()
 
 # Same single-turn prompt the collate function trained on; enable_thinking=False emits the empty
@@ -457,7 +478,7 @@ ADAPTER = "vlm_checkpoints/nemotron_3_5_super_vl_cord_v2_peft/LOWEST_VAL/model" 
 
 processor = AutoProcessor.from_pretrained(BASE, trust_remote_code=True)
 model = AutoModel.from_pretrained(BASE, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto")
-model.vision_model.radio_model.summary_idxs = None
+prepare_inference(model)
 model.eval()
 
 cfg = json.loads((Path(ADAPTER) / "adapter_config.json").read_text())
@@ -472,6 +493,8 @@ with safe_open(str(Path(ADAPTER) / "adapter_model.safetensors"), framework="pt")
 modules = dict(model.named_modules())
 with torch.no_grad():
     for fqn, ab in pairs.items():
+        # Transformers renames the released checkpoint backbone when loading.
+        fqn = fqn.replace("language_model.backbone.", "language_model.model.", 1)
         weight = modules[fqn].weight
         delta = (ab["B"].to(weight.device, torch.float32) @ ab["A"].to(weight.device, torch.float32)) * scale
         weight.add_(delta.to(weight.dtype))
