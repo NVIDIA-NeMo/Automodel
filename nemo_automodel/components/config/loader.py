@@ -342,6 +342,9 @@ def _resolve_target(dotted_path: str) -> Any:
     raise ImportError(f"Cannot resolve target (blocked or not found): {dotted_path}")
 
 
+_MISSING = object()
+
+
 class ConfigNode:
     """
     A configuration node that wraps a dictionary (or parts of it) from a YAML file.
@@ -846,15 +849,8 @@ class ConfigNode:
         """
         if not isinstance(key, str):
             return False
-        parts = key.split(".")
-        current: Any = self
-        for p in parts:
-            if isinstance(current, ConfigNode):
-                if p in current.__dict__:
-                    current = current.__dict__[p]
-                else:
-                    return False
-        return bool(current != self)
+        # Share get()'s traversal so a path through a leaf, None or an invalid list index is absent.
+        return self.get(key, _MISSING) is not _MISSING
 
 
 def config_to_yaml_str(cfg_obj: Any, *, use_orig_values: bool = True) -> str:
