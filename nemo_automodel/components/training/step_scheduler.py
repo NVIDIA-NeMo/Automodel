@@ -248,10 +248,10 @@ class StepScheduler(Stateful):
 
     def iter_steps(
         self,
-        count_tokens: Callable[[list[Mapping[str, object]]], TokenCounts],
+        count_tokens: Callable[[list[Mapping[str, Any]]], TokenCounts],
         *,
         statistics_group_index: int = 0,
-    ) -> Iterator[tuple[list[Mapping[str, object]], TokenCounts | None]]:
+    ) -> Iterator[tuple[list[Mapping[str, Any]], TokenCounts | None]]:
         """Yield batches and fuse streaming readiness with recipe-owned token counts.
 
         Args:
@@ -274,10 +274,10 @@ class StepScheduler(Stateful):
 
     def _iter_stream(
         self,
-        count_tokens: Callable[[list[Mapping[str, object]]], TokenCounts] | None = None,
+        count_tokens: Callable[[list[Mapping[str, Any]]], TokenCounts] | None = None,
         *,
         statistics_group_index: int = 0,
-    ) -> Iterator[tuple[list[Mapping[str, object]], TokenCounts | None]]:
+    ) -> Iterator[tuple[list[Mapping[str, Any]], TokenCounts | None]]:
         """Yield complete accumulation windows after collective availability checks.
 
         Returns:
