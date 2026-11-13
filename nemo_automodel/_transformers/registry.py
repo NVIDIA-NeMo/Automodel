@@ -414,6 +414,7 @@ MODEL_ARCH_MAPPING = OrderedDict(
             "Step3p7ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
+        ("PraxisPolicy", ("nemo_automodel.components.models.praxis.model", "PraxisPolicy")),
     ]
 )
 

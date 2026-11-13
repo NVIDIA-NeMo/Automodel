@@ -371,6 +371,46 @@ def test_glm_5_2_checkpoint_robustness_preserves_pipeline_batch_geometry(tmp_pat
     assert robustness["parity_threshold_overrides"] == {"automodel_reload": {"cosine_similarity": 0.985}}
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rank", [0, 63])
+def test_nemotron_super_lora_checkpoint_phase_has_five_complete_updates(tmp_path: Path, rank: int) -> None:
+    """Resolved checkpoint settings must sustain five complete updates on DP64."""
+    from nemo_automodel.components.datasets.loader import ParallelAwareDataloader
+    from nemo_automodel.components.training.step_scheduler import StepScheduler
+
+    recipe_path = REPO_ROOT / "examples/llm_finetune/nemotron/nemotron_super_v3_hellaswag_peft.yaml"
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": recipe_path.stem}
+    _run_resolver(["--base", str(recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)], env=env)
+    resolved = yaml.load(out)
+    schedule = resolved["step_scheduler"]
+    parallel = resolved["distributed"]
+    dp_size = resolved["ci"]["nodes"] * 8 // (parallel["tp_size"] * parallel["pp_size"] * parallel["cp_size"])
+    loader = ParallelAwareDataloader(
+        list(range(resolved["packed_sequence"]["max_packs"])),
+        dp_rank=rank,
+        dp_world_size=dp_size,
+        batch_size=schedule["local_batch_size"],
+        shuffle=False,
+    )
+    scheduler = StepScheduler(
+        global_batch_size=schedule["global_batch_size"],
+        local_batch_size=schedule["local_batch_size"],
+        dp_size=dp_size,
+        dataloader=loader,
+        max_steps=schedule["max_steps"],
+        num_epochs=schedule["num_epochs"],
+        preemption_signal=None,
+    )
+    updates = list(scheduler)
+    assert scheduler.step == len(updates) == schedule["max_steps"] == 5
+    assert all(
+        len(update) == scheduler.grad_acc_steps
+        and all(batch.numel() == schedule["local_batch_size"] for batch in update)
+        for update in updates
+    )
+
+
 def test_nemotron_nano_full_sft_scopes_calibration_to_reload_mean_kl(tmp_path):
     """Nemotron Nano keeps standard p95/cosine gates while calibrating reload mean KL."""
     recipe_path = REPO_ROOT / "examples/llm_finetune/nemotron/customizer_nemotron_nano_full_sft.yaml"

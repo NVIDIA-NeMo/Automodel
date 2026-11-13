@@ -93,6 +93,8 @@ def test_log_train_metrics_calls_mlflow(monkeypatch):
             "tps": 10.0,
             "tps_per_gpu": 5.0,
             "num_label_tokens": 42,
+            "num_tokens_per_step": 64,
+            "mfu": 0.35,
         },
     )
     recipe.log_train_metrics(log_data)
@@ -101,6 +103,8 @@ def test_log_train_metrics_calls_mlflow(monkeypatch):
     args, kwargs = log_metrics_mock.call_args
     # First arg is a flat dict of metrics + step/epoch/timestamp
     assert isinstance(args[0], dict) and kwargs.get("step") == log_data.step
+    assert args[0]["num_tokens_per_step"] == 64
+    assert args[0]["mfu"] == pytest.approx(0.35)
 
 
 def test_log_val_metrics_calls_mlflow(monkeypatch):
