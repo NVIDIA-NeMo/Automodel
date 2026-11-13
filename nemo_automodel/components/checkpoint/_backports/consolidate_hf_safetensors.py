@@ -13,20 +13,29 @@
 # limitations under the License.
 # taken and edited from
 # https://github.com/pytorch/pytorch/blob/2fde10d9148d2dae9dc168ccd647de7f3cafea6b/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
+# The explicit-read input path is adapted from
+# https://github.com/pytorch/pytorch/blob/8063e62bf7d8ef1666c17976427e31a5aa5cac09/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
 
 import concurrent.futures
 import glob
 import json
 import logging
 import math
-import mmap
 import os
 import shutil
 import struct
 import tempfile
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, BinaryIO
+
+try:
+    import resource
+except ImportError:
+    # Unix-only stdlib; native Windows raises ModuleNotFoundError at import.
+    resource = None
 
 import torch
 from torch import distributed as dist
@@ -65,6 +74,89 @@ _DTYPE_TO_SAFETENSORS_DTYPE: dict[torch.dtype, str] = {dtype: key for key, dtype
 _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu}
 _QUANTIZED_DTYPE_WARNING_LIMIT = 5
 _MISSING_FQN_WARNING_LIMIT = 5
+# Leave room under RLIMIT_NOFILE for output writers, the interpreter, and libraries.
+_OPEN_INPUT_FD_HEADROOM = 128
+# Bound used when `resource` is missing, so the cache stays finite without getrlimit.
+_OPEN_INPUT_FALLBACK = 32
+
+
+def _max_open_input_files() -> int:
+    if resource is None:
+        return _OPEN_INPUT_FALLBACK
+    try:
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        soft_limit = 1024
+    return max(_OPEN_INPUT_FALLBACK, soft_limit - _OPEN_INPUT_FD_HEADROOM)
+
+
+class _BoundedInputFileCache:
+    """Share a bounded set of open input shards across parallel output writers.
+
+    Each path has its own lock so seek+read stays exclusive to one worker, while
+    different shards can be read concurrently. Eviction skips files that are in use.
+    """
+
+    def __init__(self, max_open: int | None = None) -> None:
+        self._max_open = max(1, max_open if max_open is not None else _max_open_input_files())
+        self._mutex = threading.Lock()
+        self._cond = threading.Condition(self._mutex)
+        self._handles: OrderedDict[str, BinaryIO] = OrderedDict()
+        self._in_use: dict[str, int] = {}
+        self._path_locks: dict[str, threading.Lock] = {}
+
+    def _lock_for(self, path: str) -> threading.Lock:
+        with self._mutex:
+            lock = self._path_locks.get(path)
+            if lock is None:
+                lock = threading.Lock()
+                self._path_locks[path] = lock
+            return lock
+
+    def _acquire_locked(self, path: str) -> BinaryIO:
+        if path in self._handles:
+            self._handles.move_to_end(path)
+            return self._handles[path]
+        while len(self._handles) >= self._max_open:
+            victim = next((candidate for candidate in self._handles if candidate not in self._in_use), None)
+            if victim is None:
+                self._cond.wait()
+                if path in self._handles:
+                    self._handles.move_to_end(path)
+                    return self._handles[path]
+                continue
+            self._handles.pop(victim).close()
+        handle = open(path, "rb")
+        self._handles[path] = handle
+        return handle
+
+    def read_tensor_data(
+        self,
+        path: str,
+        start_offset: int,
+        end_offset: int,
+        metadata_size: int,
+    ) -> bytes:
+        path_lock = self._lock_for(path)
+        with path_lock:
+            with self._mutex:
+                handle = self._acquire_locked(path)
+                self._in_use[path] = self._in_use.get(path, 0) + 1
+            try:
+                return _read_tensor_data(handle, start_offset, end_offset, metadata_size)
+            finally:
+                with self._mutex:
+                    self._in_use[path] -= 1
+                    if self._in_use[path] == 0:
+                        del self._in_use[path]
+                    self._cond.notify_all()
+
+    def close(self) -> None:
+        with self._mutex:
+            for handle in self._handles.values():
+                handle.close()
+            self._handles.clear()
+            self._in_use.clear()
 
 
 def resolve_dtype_cast(dtype_name: str | None) -> torch.dtype | None:
@@ -372,17 +464,17 @@ def _write_safetensors_header(output_stream: Any, output_data: _OutputFileData, 
     output_data.metadata_size = 8 + len(json_bytes)
 
 
-def _read_tensor_data_mmap(
-    file_path: str,
+def _read_tensor_data(
+    input_file: BinaryIO,
     start_offset: int,
     end_offset: int,
     metadata_size: int,
 ) -> bytes:
     """
-    Read tensor data from a safetensors file using memory mapping for efficiency.
+    Read tensor data from an open safetensors file with one explicit read.
 
     Args:
-        file_path: Path to the safetensors file
+        input_file: Safetensors file opened in binary read mode
         start_offset: Start offset of tensor data within the data section
         end_offset: End offset of tensor data within the data section
         metadata_size: Size of the metadata header
@@ -390,21 +482,18 @@ def _read_tensor_data_mmap(
     Returns:
         Raw tensor data as bytes
     """
-    # Use mmap for efficient access
-    with open(file_path, "rb") as f:
-        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            absolute_start = metadata_size + start_offset
-            absolute_end = metadata_size + end_offset
-            return bytes(mm[absolute_start:absolute_end])
+    input_file.seek(metadata_size + start_offset)
+    return input_file.read(end_offset - start_offset)
 
 
 def _process_output_file(
     output_file: str,
     output_data: _OutputFileData,
     input_files_data: dict[str, _InputFileData],
+    input_files: _BoundedInputFileCache,
 ) -> None:
     """
-    Process a single output file by writing tensor data from input files using memory mapping.
+    Process a single output file by writing tensor data read from the input files.
 
     This function is designed to be run in parallel for different output files.
 
@@ -412,7 +501,10 @@ def _process_output_file(
         output_file: Path to the output file
         output_data: Metadata for the output file
         input_files_data: Dictionary mapping input file paths to their metadata
+        input_files: Shared, bounded cache of open input shard handles
     """
+    # DCP offset JSON is parsed at most once per input shard; the shared cache bounds live FDs.
+    dcp_metadata: dict[str, Any] = {}
     with open(output_file, "wb") as output_stream:
         metadata = _compute_safetensors_metadata_and_offsets(output_data)
         _write_safetensors_header(output_stream, output_data, metadata)
@@ -436,8 +528,11 @@ def _process_output_file(
 
                 data_offsets = metadata[DATA_OFFSETS_KEY]
 
-                # Use memory mapping to read tensor data efficiently
-                data_to_write = _read_tensor_data_mmap(
+                if safetensors_file not in dcp_metadata:
+                    dcp_metadata[safetensors_file] = _get_dcp_custom_metadata(file_metadata)
+
+                # Reads through mmap fault in small pages, which is very slow on network mounts.
+                data_to_write = input_files.read_tensor_data(
                     safetensors_file,
                     data_offsets[0],
                     data_offsets[1],
@@ -445,7 +540,7 @@ def _process_output_file(
                 )
 
                 # Get the offsets of this tensor shard within the full tensor
-                fqn_custom_metadata = _get_dcp_custom_metadata(file_metadata)[tensor_fqn]  # type: ignore[index]
+                fqn_custom_metadata = dcp_metadata[safetensors_file][tensor_fqn]  # type: ignore[index]
                 offsets_of_tensor_being_read = fqn_custom_metadata[SAVED_OFFSETS_KEY]  # type: ignore[index]
 
                 # Write this tensor shard to the appropriate position in the output file buffer
@@ -493,7 +588,7 @@ def _write_data(
     num_threads: int = 1,
 ) -> None:
     """
-    Write tensor data from input files to the output files using memory mapping.
+    Write tensor data from input files to the output files.
 
     This function reads tensor data from each input file and writes it to the appropriate
     position in the output files based on the tensor's offsets. When num_threads > 1,
@@ -504,33 +599,40 @@ def _write_data(
         output_files_data: Dictionary mapping output file paths to their metadata
         num_threads: Number of threads to use for parallel processing
     """
-    if num_threads <= 1 or len(output_files_data) <= 1:
-        # Sequential processing
-        for output_file, output_data in output_files_data.items():
-            _process_output_file(output_file, output_data, input_files_data)
-    else:
-        # Parallel processing with ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_threads, len(output_files_data))) as executor:
-            futures = {}
+    input_files = _BoundedInputFileCache()
+    try:
+        if num_threads <= 1 or len(output_files_data) <= 1:
+            # Sequential processing
             for output_file, output_data in output_files_data.items():
-                futures[
-                    executor.submit(
-                        _process_output_file,
-                        output_file,
-                        output_data,
-                        input_files_data,
-                    )
-                ] = output_file
+                _process_output_file(output_file, output_data, input_files_data, input_files)
+        else:
+            # Parallel processing with ThreadPoolExecutor
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(num_threads, len(output_files_data))
+            ) as executor:
+                futures = {}
+                for output_file, output_data in output_files_data.items():
+                    futures[
+                        executor.submit(
+                            _process_output_file,
+                            output_file,
+                            output_data,
+                            input_files_data,
+                            input_files,
+                        )
+                    ] = output_file
 
-            # Wait for all futures to complete
-            for future in concurrent.futures.as_completed(futures):
-                # Handle any exceptions that might have occurred
-                output_file = futures[future]
-                try:
-                    future.result()
-                except Exception:
-                    logger.exception("Error processing output file %s.", os.path.basename(output_file))
-                    raise
+                # Wait for all futures to complete
+                for future in concurrent.futures.as_completed(futures):
+                    # Handle any exceptions that might have occurred
+                    output_file = futures[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.exception("Error processing output file %s.", os.path.basename(output_file))
+                        raise
+    finally:
+        input_files.close()
 
 
 def _write_sub_tensor_to_file_optimized(
