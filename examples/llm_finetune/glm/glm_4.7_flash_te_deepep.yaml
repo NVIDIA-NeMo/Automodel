@@ -44,6 +44,7 @@ model:
     rope_fusion: false  # Use unfused RoPE for packed THD inputs, matching the existing packed recipes.
     experts: torch_mm
     dispatcher: deepep
+    gate_precision: float32  # Match the HF router's fp32 projection for checkpoint parity.
     compile_router_weight: true
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true

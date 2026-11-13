@@ -42,6 +42,8 @@ def _train_sample(step=7):
             "tps": 10.0,
             "tps_per_gpu": 5.0,
             "num_label_tokens": 42,
+            "num_tokens_per_step": 64,
+            "mfu": 0.25,
         },
     )
 

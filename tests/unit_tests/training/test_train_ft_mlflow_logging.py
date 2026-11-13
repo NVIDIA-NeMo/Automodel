@@ -93,6 +93,8 @@ def test_log_train_metrics_calls_mlflow(monkeypatch):
             "tps": 10.0,
             "tps_per_gpu": 5.0,
             "num_label_tokens": 42,
+            "num_tokens_per_step": 64,
+            "mfu": 0.25,
         },
     )
     recipe.log_train_metrics(log_data)
