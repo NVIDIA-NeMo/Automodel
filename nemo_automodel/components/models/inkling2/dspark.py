@@ -94,7 +94,7 @@ _REQUIRED_MTP_FIELDS = (
 )
 
 
-class _DSparkDraftOptions(Protocol):
+class Inkling2DSparkOptions(Protocol):
     """Declarative DSpark settings supplied by the generic training recipe."""
 
     num_draft_layers: int
@@ -261,7 +261,7 @@ class Inkling2DSparkConfig:
         cls,
         text_config: Inkling2DSparkTextFields,
         mtp_config: Mapping[str, Any],
-        options: _DSparkDraftOptions,
+        options: Inkling2DSparkOptions,
     ) -> Inkling2DSparkConfig:
         """Validate the recipe's options against the released draft.
 
