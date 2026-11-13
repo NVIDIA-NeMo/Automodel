@@ -29,12 +29,13 @@ def dspark_packed_forward(model: nn.Module, input_ids: torch.Tensor, *, seq_lens
     """Run a frozen DeepSeek V4 forward on packed rows for DSpark feature capture.
 
     The THD path derives document IDs from its ``seq_lens``, so sliding-window attention,
-    compressed KV, and the indexer stay inside each document. A document pools the same
-    compressed groups as it does alone only if it starts on a compression-group boundary,
-    so every document is moved to one. The alignment padding runs as its own THD
-    segments, which keeps a legal key in every query row. With the HybridEP dispatcher
-    every rank pads to the longest aligned row of all ranks. DSpark reads hooked
-    activations, so only the last position's logits are projected.
+    compressed KV, and the indexer stay inside each document. Every document is moved to
+    a compression-group boundary, so each of its compressed groups is one chunk of the
+    row; the compressor pools the document's own groups for any start. The alignment
+    padding runs as its own THD segments, which keeps a legal key in every query row.
+    With the HybridEP dispatcher every rank pads to the longest aligned row of all
+    ranks. DSpark reads hooked activations, so only the last position's logits are
+    projected.
 
     Args:
         model: ``DeepseekV4ForCausalLM`` target.
