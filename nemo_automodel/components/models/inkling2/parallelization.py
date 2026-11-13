@@ -112,15 +112,12 @@ class Inkling2Parallelizer(ModelParallelizer):
 
     _customizes_moe_fsdp = True
 
-    def parallelize(self, model: nn.Module, mesh_context: MeshContext, /) -> nn.Module:
+    def _prepare_model(self, model: nn.Module, mesh_context: MeshContext) -> None:
         """Validate qualified text topology before shared parallelization mutates ownership.
 
         Args:
             model: Inkling text model with shared grouped experts and an untied head.
             mesh_context: Shared meshes and strategy/compute policy.
-
-        Returns:
-            The same model after shared FSDP2 and optional expert sharding.
         """
         if mesh_context.tp_size != 1:
             raise ValueError("Inkling2 currently requires TP=1")
@@ -152,7 +149,6 @@ class Inkling2Parallelizer(ModelParallelizer):
         if isinstance(visual, Inkling2VisionEncoder) and model.cp_mesh is not None:
             assert device_mesh is not None
             visual.image_cp_mesh = device_mesh["dp_cp"] if any(p.requires_grad for p in visual.parameters()) else None
-        return super().parallelize(model, mesh_context)
 
     def _use_full_layer_activation_checkpointing(self, model: nn.Module) -> bool:
         """Residual histories are explicit immutable inputs to each decoder layer."""
