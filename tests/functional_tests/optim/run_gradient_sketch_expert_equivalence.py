@@ -19,6 +19,11 @@ sizes, an expert rank receiving no tokens, and activation recomputation.
 """
 
 import copy
+import os
+
+# This test checks fp32 equivalence to 1e-5; TF32 matmuls (forced by the CI image through this
+# variable) do not meet that. The override is read once at first use, so clear it before torch loads.
+os.environ.pop("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", None)
 
 import torch
 import torch.distributed as dist
@@ -116,6 +121,8 @@ def check_equivalence(*, recompute: bool, leave_rank_empty: bool, dtype: torch.d
 
 
 def main() -> None:
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     dist.init_process_group("nccl")
     torch.cuda.set_device(dist.get_rank())
     if dist.get_world_size() < 2:

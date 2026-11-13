@@ -15,6 +15,11 @@
 """Run with torch.distributed.run --nproc-per-node=2; compare the sketched update to a dense reference."""
 
 import copy
+import os
+
+# This test checks fp32 equivalence to 1e-5; TF32 matmuls (forced by the CI image through this
+# variable) do not meet that. The override is read once at first use, so clear it before torch loads.
+os.environ.pop("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", None)
 
 import torch
 import torch.distributed as dist
@@ -26,6 +31,8 @@ from nemo_automodel.components.optim.gradient_sketch import GradientSketchOptimi
 
 
 def main() -> None:
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(rank)
