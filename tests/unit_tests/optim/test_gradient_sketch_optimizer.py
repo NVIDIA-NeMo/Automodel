@@ -161,17 +161,14 @@ def test_state_dict_round_trip_restores_fp32_moments_and_masters(dtype):
     opt2.load_sketch_state_dict(copy.deepcopy(opt.sketch_state_dict()))
     assert opt2.update_count == 2
     torch.testing.assert_close(opt2.row_second_moment, expected_moments)
-    for layer, source in zip(opt2.layers, opt.layers, strict=True):
-        assert (
-            opt2.state[layer.weight]["row_second_moment"].untyped_storage().data_ptr()
-            == opt2.row_second_moment.untyped_storage().data_ptr()
-        )
-        for value in opt2.state[layer.weight].values():
-            assert value.dtype == torch.float32
+    targets = {id(layer.weight) for layer in opt2.layers}
+    assert all(id(p) not in targets for p in opt2.state)  # sketch-target state stays off optimizer.state
+    for master, source in zip(opt2.masters, opt.masters, strict=True):
         if dtype == torch.bfloat16:
-            torch.testing.assert_close(
-                opt2.state[layer.weight]["master_weight"], opt.state[source.weight]["master_weight"]
-            )
+            assert master is not None and master.dtype == torch.float32
+            torch.testing.assert_close(master, source)
+        else:
+            assert master is None
     assert opt2.param_groups[1] is opt2.native.param_groups[0] and opt2.state is opt2.native.state
     # native Adam state restored too
     bias = net2[0].bias
@@ -198,20 +195,19 @@ def test_load_rejects_mismatched_settings():
         other.load_state_dict(saved)
 
 
-def test_to_device_relinks_views():
-    net, opt = _build()
-    _backward(net)
+def test_to_device_moves_native_state_masters_and_moments():
+    net, opt = _build(torch.bfloat16)
+    _backward(net, torch.bfloat16)
     opt.synchronize_and_clip(None, 1.0)
     opt.step()
-    for state in opt.state.values():  # emulate generic offload that replaces every tensor
-        for key, value in state.items():
-            state[key] = value.clone()
+    moments, masters = opt.row_second_moment.clone(), [m.clone() for m in opt.masters]
     opt.to("cpu")
-    for layer in opt.layers:
-        assert (
-            opt.state[layer.weight]["row_second_moment"].untyped_storage().data_ptr()
-            == opt.row_second_moment.untyped_storage().data_ptr()
-        )
+    torch.testing.assert_close(opt.row_second_moment, moments)
+    for master, before in zip(opt.masters, masters, strict=True):
+        torch.testing.assert_close(master, before)
+    assert all(
+        v.device.type == "cpu" for state in opt.state.values() for v in state.values() if isinstance(v, torch.Tensor)
+    )
 
 
 def test_sketches_reduce_with_one_collective(monkeypatch):
@@ -271,13 +267,10 @@ def test_optimizer_state_wrapper_round_trip(rule, dtype, gloo_group):
     assert opt2.update_count == 2
     if rule == "row_adam":
         torch.testing.assert_close(opt2.row_second_moment, opt.row_second_moment)
-    for layer, source in zip(opt2.layers, opt.layers, strict=True):
-        for value in opt2.state[layer.weight].values():
-            assert value.dtype == torch.float32
+    for master, source in zip(opt2.masters, opt.masters, strict=True):
         if dtype == torch.bfloat16:
-            torch.testing.assert_close(
-                opt2.state[layer.weight]["master_weight"], opt.state[source.weight]["master_weight"]
-            )
+            assert master is not None and master.dtype == torch.float32
+            torch.testing.assert_close(master, source)
     assert "exp_avg" in opt2.state[net2[0].bias]
     torch.testing.assert_close(opt2.state[net2[0].bias]["exp_avg"], opt.state[net[0].bias]["exp_avg"])
     for o, n in ((opt, net), (opt2, net2)):
@@ -323,7 +316,7 @@ def test_bf16_fused_expert_master_is_stored_3d_and_updated_as_rows():
     model(torch.randn(5, 4, dtype=torch.bfloat16)).float().square().sum().backward()
     opt.synchronize_and_clip(None, 1.0)
     opt.step()
-    master = opt.state[model.up]["master_weight"]
+    (master,) = opt.masters
     assert master.shape == (2, 3, 4) and master.dtype == torch.float32
     assert not torch.equal(model.up, before)
     assert torch.equal(master.to(torch.bfloat16), model.up)
@@ -332,9 +325,9 @@ def test_bf16_fused_expert_master_is_stored_3d_and_updated_as_rows():
 
     model2, opt2 = build()
     opt2.load_sketch_state_dict(copy.deepcopy(opt.sketch_state_dict()))
-    torch.testing.assert_close(opt2.state[model2.up]["master_weight"], master)
+    torch.testing.assert_close(opt2.masters[0], master)
     opt2.reset_master_weights()
-    assert torch.equal(opt2.state[model2.up]["master_weight"].to(torch.bfloat16), model2.up)
+    assert torch.equal(opt2.masters[0].to(torch.bfloat16), model2.up)
 
 
 def test_backward_leaves_no_cyclic_garbage():
@@ -370,3 +363,90 @@ def test_check_sharded_targets_rejects_replicated_or_multiply_sharded(placements
     )
     with pytest.raises(RuntimeError, match=f"sharded once along rows by FSDP; {first.name} "):
         opt._check_sharded_targets()
+
+
+def test_state_holds_only_native_parameters():
+    """Sketch-target state must stay out of ``optimizer.state``.
+
+    DCP's ``_init_optim_state`` skips initialization when ``state`` is non-empty, which would
+    leave a non-Adam native optimizer (TE FusedAdam, SGD with momentum) without a load skeleton.
+    """
+    net, opt = _build(torch.bfloat16)
+    assert len(opt.state) == 0
+    _backward(net, torch.bfloat16)
+    opt.synchronize_and_clip(None, 1.0)
+    opt.step()
+    targets = {id(layer.weight) for layer in opt.layers}
+    assert opt.state and all(id(p) not in targets for p in opt.state)
+
+
+def test_optimizer_state_wrapper_round_trip_keeps_non_adam_native_history(gloo_group):
+    """Resume through OptimizerState with a lazily-stated native optimizer that is not Adam."""
+    from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
+
+    def build():
+        net = _mlp(torch.bfloat16)
+        native = torch.optim.SGD(net.parameters(), lr=0.01, momentum=0.9)
+        return net, GradientSketchOptimizer(net, native, SketchSettings(rank=3, target_modules=("0", "2")))
+
+    net, opt = build()
+    for _ in range(2):
+        opt.zero_grad()
+        _backward(net, torch.bfloat16)
+        opt.synchronize_and_clip(None, 1.0)
+        opt.step()
+    saved = copy.deepcopy(OptimizerState(net, opt).state_dict())
+
+    net2, opt2 = build()
+    net2.load_state_dict(net.state_dict())
+    wrapper = OptimizerState(net2, opt2)
+    wrapper.state_dict()  # DCP builds the load skeleton this way before loading
+    wrapper.load_state_dict(saved)
+    bias = net2[0].bias
+    assert "momentum_buffer" in opt2.state[bias]
+    torch.testing.assert_close(opt2.state[bias]["momentum_buffer"], opt.state[net[0].bias]["momentum_buffer"])
+    for o, n in ((opt, net), (opt2, net2)):
+        torch.manual_seed(11)
+        o.zero_grad()
+        _backward(n, torch.bfloat16)
+        o.synchronize_and_clip(None, 1.0)
+        o.step()
+    for p, q in zip(net.parameters(), net2.parameters()):
+        torch.testing.assert_close(p, q)
+
+
+def test_freeze_non_target_registers_no_empty_native_group_and_round_trips(gloo_group):
+    """With every non-target frozen, no empty native group may reach DCP's flattened state dict."""
+    from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
+
+    def build():
+        net = _mlp(torch.bfloat16)
+        native = torch.optim.AdamW(net.parameters(), lr=0.01)
+        settings = SketchSettings(rank=3, target_modules=("0", "2"), freeze_non_target=True)
+        return net, GradientSketchOptimizer(net, native, settings)
+
+    net, opt = build()
+    assert len(opt.param_groups) == 1
+    assert all(not p.requires_grad for p in net.parameters())
+    for _ in range(2):
+        opt.zero_grad()
+        _backward(net, torch.bfloat16)
+        opt.synchronize_and_clip(None, 1.0)
+        opt.step()
+    saved = copy.deepcopy(OptimizerState(net, opt).state_dict())
+
+    net2, opt2 = build()
+    net2.load_state_dict(net.state_dict())
+    wrapper = OptimizerState(net2, opt2)
+    wrapper.state_dict()
+    wrapper.load_state_dict(saved)
+    assert opt2.update_count == 2
+    torch.testing.assert_close(opt2.row_second_moment, opt.row_second_moment)
+    for o, n in ((opt, net), (opt2, net2)):
+        torch.manual_seed(11)
+        o.zero_grad()
+        _backward(n, torch.bfloat16)
+        o.synchronize_and_clip(None, 1.0)
+        o.step()
+    for p, q in zip(net.parameters(), net2.parameters()):
+        torch.testing.assert_close(p, q)
