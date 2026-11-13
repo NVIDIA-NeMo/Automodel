@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, cast
+from functools import partial
+from typing import Any, Callable, Protocol, TypedDict, Unpack, cast
 
 import torch
 import torch.nn as nn
@@ -20,6 +21,112 @@ import torch.nn.functional as F
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 from nemo_automodel.shared.import_utils import safe_import
+
+
+class _TEAttentionKwargs(TypedDict, total=False):
+    """TE keywords produced by this component's attention preprocessing."""
+
+    qkv_format: str
+    attention_mask: torch.Tensor | None
+    attn_mask_type: str
+    window_size: tuple[int, int]
+    cu_seqlens_q: torch.Tensor | None
+    cu_seqlens_kv: torch.Tensor | None
+    cu_seqlens_q_padded: torch.Tensor | None
+    cu_seqlens_kv_padded: torch.Tensor | None
+    max_seqlen_q: int
+    max_seqlen_kv: int
+    pad_between_seqs: bool
+
+
+class _TEAttentionModule(Protocol):
+    """The native TE module contract used by the call adapter."""
+
+    cp_group: torch.distributed.ProcessGroup | list[torch.distributed.ProcessGroup] | None
+    qkv_format: str
+    attention_dropout: float
+
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: Unpack[_TEAttentionKwargs]
+    ) -> torch.Tensor:
+        """Call native TE with BSHD or THD Q/K/V and TE sequence metadata.
+
+        Args:
+            q: Tensor [batch, sequence, heads, head_dim] or [tokens, heads, head_dim].
+            k: Tensor with the same layout as q, with KV heads and KV tokens.
+            v: Tensor with the same layout as k, with value head dimension.
+            **kwargs: TE keywords; cumulative offsets are int32 [documents + 1],
+                attention_mask is [batch, 1, 1, sequence].
+
+        Returns:
+            Tensor [batch, sequence, heads * value_dim] or [tokens, heads * value_dim].
+        """
+        ...
+
+
+def _call_te_attention(
+    module: _TEAttentionModule,
+    quantization_enabled: Callable[[], bool],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    **kwargs: Unpack[_TEAttentionKwargs],
+) -> torch.Tensor:
+    """Reuse TE plans by adding empty trailing documents at the TE boundary.
+
+    Args:
+        module: Original TE module, retaining its parameters and parallel setup.
+        quantization_enabled: TE's active quantization-context query.
+        q: Tensor [batch, sequence, heads, head_dim] or packed [tokens, heads, head_dim].
+        k: Tensor with the same layout as q, with KV heads and KV tokens.
+        v: Tensor with the same layout as k, with value head dimension.
+        **kwargs: TE keywords. Logical and optional physical cumulative offsets
+            are int32 [documents + 1] on the input device. Q and KV must have the
+            same document count, but may have different lengths and offsets.
+            attention_mask, when provided, is [batch, 1, 1, sequence].
+
+    Returns:
+        Native TE output [batch, sequence, heads * value_dim] or
+        [tokens, heads * value_dim]. Inputs and caller-owned offsets are never
+        mutated. Only the private TE call sees [capacity + 1] offset copies.
+    """
+    if (
+        kwargs.get("qkv_format", module.qkv_format) == "thd"
+        and module.cp_group is None
+        and module.attention_dropout == 0
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and q.numel() > 0
+        and kwargs.get("attention_mask") is None
+        and not quantization_enabled()
+        and kwargs.keys().isdisjoint(
+            ("core_attention_bias", "alibi_slopes", "inference_params", "thd_attention_policies")
+        )
+    ):
+        cu_q, cu_kv = kwargs.get("cu_seqlens_q"), kwargs.get("cu_seqlens_kv")
+        if cu_q is not None and cu_kv is not None and cu_q.numel() > 1:
+            documents = cu_q.numel() - 1
+            keys = ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded", "cu_seqlens_kv_padded")
+            for key in keys:
+                offsets = kwargs.get(key)
+                if offsets is not None and (
+                    offsets.ndim != 1 or offsets.dtype != torch.int32 or offsets.numel() != documents + 1
+                ):
+                    raise ValueError("TE packed offsets must be int32 vectors with matching document counts")
+            # Deterministic geometry also during activation recomputation: a
+            # module-level high-water mark could grow between forward/backward.
+            # The coarse minimum amortizes rare document-count changes; larger
+            # buckets still incur a new plan and extra empty-document overhead.
+            capacity = max(128, 1 << (documents - 1).bit_length())
+            padded_offsets: dict[int, torch.Tensor] = {}
+            for key in keys:
+                offsets = kwargs.get(key)
+                if offsets is not None and capacity > documents:
+                    # TE may infer physical padding from tensor identity. Keep
+                    # logical/physical aliases shared inside this call, too.
+                    if id(offsets) not in padded_offsets:
+                        padded_offsets[id(offsets)] = torch.cat((offsets, offsets[-1:].expand(capacity - documents)))
+                    kwargs[key] = padded_offsets[id(offsets)]
+    return module(q, k, v, **kwargs)
 
 
 def initialize_attn_module_and_func(
@@ -36,6 +143,7 @@ def initialize_attn_module_and_func(
     """Initialize an attention backend module and callable."""
     if attn_impl == "te":
         from transformer_engine.pytorch.attention import DotProductAttention
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         attn_module = DotProductAttention(
             num_attention_heads=num_attention_heads,
@@ -46,7 +154,9 @@ def initialize_attn_module_and_func(
             num_gqa_groups=num_gqa_groups,
             **kwargs,
         )
-        attn_func = attn_module.__call__
+        # Keep the native module and state-dict paths unchanged. A partial also
+        # preserves the module reference correctly when its owner is deep-copied.
+        attn_func = partial(_call_te_attention, attn_module, FP8GlobalStateManager.is_fp8_enabled)
         return attn_module, attn_func
     elif attn_impl == "sdpa":
         supported_sdpa_kwargs = {"attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa"}
@@ -483,7 +593,10 @@ def preprocess_args_and_kwargs_for_attn(
         if attention_mask is not None:
             if attention_mask.dim() <= 2:
                 key_mask = attention_mask.to(device=q.device, dtype=torch.bool)
-                has_padding_mask = not bool(key_mask.all().item())
+                # Tensor-value branches cannot be captured by fullgraph compilation.
+                # Preserve the supplied mask in compiled attention; eager all-valid
+                # batches can still use SDPA's implicit causal fast path.
+                has_padding_mask = torch.compiler.is_compiling() or not bool(key_mask.all().item())
             else:
                 explicit_mask = attention_mask.to(device=q.device)
                 has_padding_mask = False

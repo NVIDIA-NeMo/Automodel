@@ -314,7 +314,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         Returns:
             Tensor of shape [experts, input_features, output_features], where
             ``input_features = groups * packed_bytes * 2``, in ``dtype`` with independent storage. Inputs are not
-            mutated. For DTensors, the returned global shape uses expert-axis sharding on ``ep``, output-feature
+            mutated. For DTensors, the returned global shape uses expert-axis sharding on ``ep``, input-feature
             sharding on ``ep_shard``, and replication on other named mesh axes when either axis is present.
 
         Source: https://github.com/huggingface/transformers/blob/869735d37d0f929311ac6611728c482a4414ba8c/src/transformers/integrations/mxfp4.py#L77
@@ -380,7 +380,8 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
 
         # Final logical layout is (n_experts, 2880, hidden_dim) after transpose.
         out = out.transpose(1, 2).contiguous()
-        # Restore desired DTensor sharding: shard experts (dim 0) by 'ep' and hidden dim (dim 2) by 'ep_shard'.
+        # Match native [experts, input, output] storage: EP shards experts and
+        # FSDP shards input features, including TE's transposed per-expert weights.
         if isinstance(out, torch.distributed.tensor.DTensor):
             mesh_dim_names = out.device_mesh.mesh_dim_names
             if "ep" in mesh_dim_names or "ep_shard" in mesh_dim_names:
@@ -389,7 +390,7 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                     if dim_name == "ep":
                         placements.append(torch.distributed.tensor.Shard(0))
                     elif dim_name == "ep_shard":
-                        placements.append(torch.distributed.tensor.Shard(2))
+                        placements.append(torch.distributed.tensor.Shard(1))
                     else:
                         placements.append(torch.distributed.tensor.Replicate())
                 if placements != out.placements:
