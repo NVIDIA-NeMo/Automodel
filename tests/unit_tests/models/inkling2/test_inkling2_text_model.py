@@ -184,6 +184,23 @@ def test_default_backend_uses_sdpa_attention() -> None:
     assert {layer.self_attn.attention_backend for layer in model.model.language_model.layers} == {"sdpa"}
 
 
+def test_packed_rows_are_rejected() -> None:
+    model = _model()
+    input_ids = _input_ids(batch=1, sequence=8)
+    with pytest.raises(NotImplementedError, match="packed sequences"):
+        model(input_ids=input_ids, position_ids=torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]))
+
+
+def test_left_padding_positions_are_not_mistaken_for_packing() -> None:
+    model = _model(log_scaling_n_floor=1024)
+    input_ids = _input_ids(batch=1, sequence=8)
+    attention_mask = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]])
+    position_ids = torch.tensor([[1, 1, 0, 1, 2, 3, 4, 5]])
+    with torch.no_grad():
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids).logits
+    assert torch.isfinite(logits).all()
+
+
 def test_unsupported_attention_backend_is_rejected() -> None:
     backend = BackendConfig(attn="flex", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
     with pytest.raises(ValueError, match="backend.attn"):

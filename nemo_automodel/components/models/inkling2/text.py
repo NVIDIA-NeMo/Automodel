@@ -22,7 +22,7 @@ Apache-2.0). This module implements the training forward only: there is no decod
 Sequence-position contract: the relative-position bias and the causal masks use the
 token index inside each row, and the short convolutions mix neighbouring tokens of a row,
 as in the reference. ``position_ids`` only drive the log scaling of the full-attention
-layers. Packed rows holding several documents are therefore not separated.
+layers. Rows that pack several documents are rejected (positions must increase along a row).
 """
 
 from __future__ import annotations
@@ -780,6 +780,34 @@ class Inkling2FullDecoderLayer(_Inkling2DecoderLayer):
         self.v_input_layernorm.init_weights()
 
 
+def _reject_packed_rows(position_ids: torch.Tensor, attention_mask: torch.Tensor | None) -> None:
+    """Fail when positions restart inside a row, i.e. when a row packs several documents.
+
+    The relative bias, the causal masks and the short convolutions use the token index inside a
+    row, so packed documents would attend to and convolve with each other.
+
+    Args:
+        position_ids: Long tensor of shape ``[batch or 1, sequence]``.
+        attention_mask: Optional tensor of shape ``[batch, sequence]``, nonzero for valid tokens;
+            pairs that touch a padded token are not checked.
+
+    Raises:
+        ValueError: If ``position_ids`` is not two-dimensional.
+        NotImplementedError: If a position does not increase between two adjacent valid tokens.
+    """
+    if position_ids.ndim != 2:
+        raise ValueError(f"Inkling 2 expects position_ids of shape [batch, sequence], got {tuple(position_ids.shape)}")
+    restarts = position_ids[:, 1:] <= position_ids[:, :-1]
+    if attention_mask is not None:
+        valid = attention_mask.to(dtype=torch.bool)
+        restarts = restarts & valid[:, 1:] & valid[:, :-1]
+    if bool(restarts.any()):
+        raise NotImplementedError(
+            "Inkling 2 does not support packed sequences: position_ids restart inside a row, and documents "
+            "packed into one row would attend to and convolve with each other"
+        )
+
+
 def _causal_masks(
     attention_mask: torch.Tensor | None,
     sequence: int,
@@ -865,6 +893,7 @@ class Inkling2TextModel(nn.Module):
         Raises:
             ValueError: If both or neither of ``input_ids`` and ``inputs_embeds`` are given, or
                 ``attention_mask`` is not a two-dimensional padding mask.
+            NotImplementedError: If ``position_ids`` restart inside a row (packed sequences).
         """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
@@ -877,6 +906,8 @@ class Inkling2TextModel(nn.Module):
             )
         if position_ids is None:
             position_ids = torch.arange(sequence, device=inputs_embeds.device)[None, :]
+        else:
+            _reject_packed_rows(position_ids, attention_mask)
 
         full_mask, sliding_mask = _causal_masks(
             attention_mask, sequence, self.config.sliding_window_size, inputs_embeds.device
