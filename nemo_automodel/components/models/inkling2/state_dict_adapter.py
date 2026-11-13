@@ -34,22 +34,30 @@ names except for the routed experts, which use AutoModel's grouped-expert parame
 
 Quantized experts (NVFP4 layers with ``*_amax`` companions, MXFP8 layers stored as
 ``float8_e4m3fn``) are dequantized on load. ``to_hf`` writes unquantized experts in the
-released ``w13_weight`` / ``w2_weight`` layout.
+released ``w13_weight`` / ``w2_weight`` layout; with ``quantization=True`` (base-checkpoint
+initialization of a checkpoint whose config declares ``expert_formats``) it emits empty tensors
+in the stored NVFP4/MXFP8 layout instead, so DCP reads the stored bytes and :meth:`from_hf`
+decodes them.
 """
 
 from __future__ import annotations
 
+import math
 import re
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor.placement_types import Placement
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.moe import state_dict_utils
+from nemo_automodel.components.quantization.nvfp4 import NVFP4_BLOCK_SIZE
 
 from .configuration import Inkling2TextConfig
-from .quantization import dequantize_mxfp8_experts, dequantize_nvfp4_experts
+from .quantization import MXFP8_BLOCK_SIZE, ExpertFormat, dequantize_mxfp8_experts, dequantize_nvfp4_experts
 
 _RAW_TEXT = "model.llm."
 _NATIVE_TEXT = "model.language_model."
@@ -238,18 +246,173 @@ def _dequantize_experts(parts: dict[str, torch.Tensor], raw_key: str, dtype: tor
     raise ValueError(f"Unsupported expert format for {raw_key}: dtype={weight.dtype}, companions={sorted(companions)}")
 
 
+def _empty_like_layout(
+    reference: torch.Tensor,
+    local_shape: tuple[int, ...],
+    global_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    placements: tuple[Placement, ...] | None,
+) -> torch.Tensor:
+    """Allocate an empty tensor on ``reference``'s device, wrapped like ``reference`` when it is a DTensor.
+
+    Args:
+        reference: Tensor of arbitrary shape whose device (and mesh, for a DTensor) the result uses.
+        local_shape: Shape of this rank's storage.
+        global_shape: Logical shape; equal to ``local_shape`` for a plain tensor.
+        dtype: Storage dtype.
+        placements: DTensor placements of the result, or None for a plain tensor.
+
+    Returns:
+        An uninitialized tensor of ``global_shape`` whose storage is not shared with ``reference``.
+    """
+    if not isinstance(reference, DTensor):
+        return torch.empty(global_shape, dtype=dtype, device=reference.device)
+    local = torch.empty(local_shape, dtype=dtype, device=reference.to_local().device)
+    stride = tuple(math.prod(global_shape[i + 1 :]) for i in range(len(global_shape)))
+    return DTensor.from_local(
+        local, reference.device_mesh, placements, run_check=False, shape=torch.Size(global_shape), stride=stride
+    )
+
+
+def _quantized_expert_placeholders(
+    raw_key: str, expert_weight: torch.Tensor, expert_format: ExpertFormat
+) -> list[tuple[str, torch.Tensor]]:
+    """Return empty destinations in the stored layout of one quantized expert weight and its companions.
+
+    DCP checks the dtype and global shape of each destination against the checkpoint before reading, and
+    reads only this rank's part of a DTensor destination; the contents are overwritten by the read.
+
+    Args:
+        raw_key: Released weight key, ``model.llm.layers.N.mlp.experts.{w13,w2}_weight``.
+        expert_weight: The native expert parameter viewed in the released layout, a tensor of shape
+            [experts, out, in] (``w13``: out = 2 * intermediate with interleaved gate/up rows; ``w2``:
+            out = hidden). A DTensor may use ``Shard`` / ``Replicate`` placements on any mesh dimension;
+            an ``in`` shard must be a whole number of quantization blocks.
+        expert_format: ``"nvfp4"`` or ``"mxfp8"``.
+
+    Returns:
+        ``(key, tensor)`` pairs. NVFP4: ``raw_key`` uint8 [experts, out, in / 2], ``raw_key_scale``
+        float8_e4m3fn [experts, out, in / 16], ``raw_key_amax`` float32 [experts] and
+        ``raw_key_outer_scale_denominator`` float32 [1]. MXFP8: ``raw_key`` float8_e4m3fn [experts, out, in]
+        and ``raw_key_scale`` uint8 [experts, out, in / 32]. DTensor results keep ``expert_weight``'s mesh and
+        placements; ``amax`` is sharded only where the experts axis is, and the denominator is replicated.
+
+    Raises:
+        ValueError: For a shape or sharding that does not align to the quantization blocks.
+    """
+    block = NVFP4_BLOCK_SIZE if expert_format == "nvfp4" else MXFP8_BLOCK_SIZE
+    experts, rows, columns = expert_weight.shape
+    is_sharded = isinstance(expert_weight, DTensor)
+    local_experts, local_rows, local_columns = (
+        expert_weight.to_local().shape if is_sharded else (experts, rows, columns)
+    )
+    placements = expert_weight.placements if is_sharded else None
+    if columns % block or local_columns % block:
+        raise ValueError(f"{raw_key}: input width {columns} (local {local_columns}) must align to {block} columns")
+    if is_sharded and any(not isinstance(p, (Shard, Replicate)) for p in placements):
+        raise ValueError(f"{raw_key}: quantized expert destinations need Shard or Replicate placements")
+    weight_columns = columns // 2 if expert_format == "nvfp4" else columns
+    weight_dtype = torch.uint8 if expert_format == "nvfp4" else torch.float8_e4m3fn
+    scale_dtype = torch.float8_e4m3fn if expert_format == "nvfp4" else torch.uint8
+    local_weight_columns = local_columns // 2 if expert_format == "nvfp4" else local_columns
+    parts = [
+        (
+            raw_key,
+            _empty_like_layout(
+                expert_weight,
+                (local_experts, local_rows, local_weight_columns),
+                (experts, rows, weight_columns),
+                weight_dtype,
+                placements,
+            ),
+        ),
+        (
+            raw_key + "_scale",
+            _empty_like_layout(
+                expert_weight,
+                (local_experts, local_rows, local_columns // block),
+                (experts, rows, columns // block),
+                scale_dtype,
+                placements,
+            ),
+        ),
+    ]
+    if expert_format == "nvfp4":
+        expert_placements = (
+            tuple(p if isinstance(p, Shard) and p.dim == 0 else Replicate() for p in placements) if is_sharded else None
+        )
+        replicated = tuple(Replicate() for _ in placements) if is_sharded else None
+        parts.append(
+            (
+                raw_key + "_amax",
+                _empty_like_layout(expert_weight, (local_experts,), (experts,), torch.float32, expert_placements),
+            )
+        )
+        parts.append(
+            (
+                raw_key + "_outer_scale_denominator",
+                _empty_like_layout(expert_weight, (1,), (1,), torch.float32, replicated),
+            )
+        )
+    return parts
+
+
+def _dequantize_sharded_experts(parts: dict[str, torch.Tensor], raw_key: str, dtype: torch.dtype) -> torch.Tensor:
+    """Decode DTensor destinations filled by DCP into a DTensor in the released ``[experts, out, in]`` layout.
+
+    Args:
+        parts: The DTensor destinations built by :func:`_quantized_expert_placeholders` under ``""`` (weight),
+            ``"_scale"``, and for NVFP4 ``"_amax"`` and ``"_outer_scale_denominator"``, holding the checkpoint
+            bytes for this rank's part.
+        raw_key: Released weight key, for error messages.
+        dtype: Output dtype; quantized weights are decoded straight into it (one rounding).
+
+    Returns:
+        DTensor of global shape [experts, out, in] in ``dtype`` with the weight destination's mesh and
+        placements, holding this rank's decoded part in new storage.
+
+    Raises:
+        ValueError: If the local parts are inconsistent, or for an unsupported expert format.
+    """
+    weight = parts[""]
+    local = {suffix: tensor.to_local() if isinstance(tensor, DTensor) else tensor for suffix, tensor in parts.items()}
+    if "_amax" in local and local["_amax"].shape[0] != local[""].shape[0]:
+        raise ValueError(f"{raw_key}: local amax covers {local['_amax'].shape[0]} experts, weight {local[''].shape[0]}")
+    decoded = _dequantize_experts(local, raw_key, dtype)
+    experts, rows, stored_columns = weight.shape
+    columns = stored_columns * 2 if weight.dtype == torch.uint8 else stored_columns
+    return DTensor.from_local(
+        decoded,
+        weight.device_mesh,
+        weight.placements,
+        run_check=False,
+        shape=torch.Size((experts, rows, columns)),
+        stride=(rows * columns, columns, 1),
+    )
+
+
 class Inkling2StateDictAdapter(StateDictAdapter):
     """Convert Inkling 2 weights between native AutoModel and released checkpoint layouts."""
 
-    def __init__(self, config: Inkling2TextConfig, *, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        config: Inkling2TextConfig,
+        *,
+        dtype: torch.dtype,
+        expert_formats: Mapping[str, ExpertFormat] | None = None,
+    ) -> None:
         """Create the adapter.
 
         Args:
             config: Text configuration (number of routed experts).
             dtype: Storage dtype of the native expert weights.
+            expert_formats: Stored format of each quantized expert weight of the checkpoint being
+                initialized from, keyed by released key (``quantization_config["expert_formats"]``).
+                Experts not listed are stored unquantized.
         """
         self.config = config
         self.dtype = dtype
+        self.expert_formats = dict(expert_formats or {})
 
     def to_hf(
         self,
@@ -266,17 +429,22 @@ class Inkling2StateDictAdapter(StateDictAdapter):
             state_dict: Native state dict. Expert tensors have shape ``[experts, hidden, 2 *
                 intermediate]`` (interleaved gate/up) and ``[experts, intermediate, hidden]``.
             exclude_key_regex: Optional regex of released keys to drop.
-            quantization: Unused; experts are written unquantized.
+            quantization: True when the checkpointer initializes from a base checkpoint whose config
+                declares quantized experts. Experts listed in ``expert_formats`` then become empty
+                destinations in their stored layout (see :func:`_quantized_expert_placeholders`). Saving
+                passes False and always writes unquantized experts.
             **kwargs: Unused checkpointer arguments.
 
         Returns:
             Released-layout state dict with ``w13_weight`` ``[experts, 2 * intermediate, hidden]``
-            and ``w2_weight`` ``[experts, hidden, intermediate]``.
+            and ``w2_weight`` ``[experts, hidden, intermediate]``, or their quantized destinations.
         """
-        del quantization, kwargs
+        del kwargs
         checkpoint_state: dict[str, Any] = {}
         for fqn, tensor in state_dict.items():
-            for key, value in self.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=exclude_key_regex):
+            for key, value in self.convert_single_tensor_to_hf(
+                fqn, tensor, exclude_key_regex=exclude_key_regex, quantization=quantization
+            ):
                 checkpoint_state[key] = value
         return checkpoint_state
 
@@ -286,11 +454,13 @@ class Inkling2StateDictAdapter(StateDictAdapter):
         Args:
             fqn: Native key.
             tensor: Tensor of the native layout; expert tensors are ``[experts, in, out]``.
-            **kwargs: ``exclude_key_regex`` optionally drops matching released keys.
+            **kwargs: ``exclude_key_regex`` optionally drops matching released keys; ``quantization``
+                selects stored-layout destinations for experts listed in ``expert_formats``.
 
         Returns:
             One ``(released_key, tensor)`` pair, or none when excluded. Expert tensors are
-            transposed views of shape ``[experts, out, in]``.
+            transposed views of shape ``[experts, out, in]``; a quantized expert yields its
+            stored-layout destinations instead (two for MXFP8, four for NVFP4).
         """
         raw_key = native_to_raw_key(fqn)
         exclude_key_regex = kwargs.get("exclude_key_regex")
@@ -298,6 +468,8 @@ class Inkling2StateDictAdapter(StateDictAdapter):
             return []
         if fqn.endswith(_NATIVE_EXPERT_SUFFIXES):
             tensor = tensor.transpose(-1, -2)
+            if kwargs.get("quantization", False) and raw_key in self.expert_formats:
+                return _quantized_expert_placeholders(raw_key, tensor, self.expert_formats[raw_key])
         return [(raw_key, tensor)]
 
     def from_hf(
@@ -347,9 +519,10 @@ class Inkling2StateDictAdapter(StateDictAdapter):
             if "" not in parts:
                 raise ValueError(f"Expert quantization companions without {raw_key}")
             if state_dict_utils.is_dtensor(parts[""]):
-                if len(parts) > 1:
-                    raise ValueError(f"Sharded quantized experts are not supported for {raw_key}")
-                state_dict[native_key] = parts[""].transpose(-1, -2)
+                if len(parts) == 1:
+                    state_dict[native_key] = parts[""].transpose(-1, -2)
+                else:
+                    state_dict[native_key] = _dequantize_sharded_experts(parts, raw_key, self.dtype).transpose(-1, -2)
                 continue
             local_parts = {
                 suffix: tensor if suffix == "_outer_scale_denominator" else tensor[start_expert:end_expert]

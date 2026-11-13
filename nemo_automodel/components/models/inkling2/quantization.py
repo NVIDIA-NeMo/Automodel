@@ -18,7 +18,8 @@ The released checkpoint (``hf_quant_config.json``, ``quant_method: inkling2``) s
 quantized, ``model.llm.layers.N.mlp.experts.{w13,w2}_weight`` in ``[experts, out, in]`` (``nn.Linear``)
 orientation: ``w13`` is ``[experts, 2 * intermediate, hidden]`` with gate and up rows interleaved (row ``2j`` is
 gate row ``j``, row ``2j + 1`` is up row ``j``) and ``w2`` is ``[experts, hidden, intermediate]``. The functions
-here decode element-wise and keep that row order; the state-dict adapter reorders rows afterwards.
+here decode element-wise and keep that row order; the state-dict adapter keeps the gate/up interleave too and only
+transposes to the native ``[experts, in, out]`` layout.
 
 NVFP4 (layers 0-39, ``weight_scale_format: amax_denominator``): ``weight`` is ``uint8 [E, out, in / 2]`` with two
 E2M1 codes per byte (column ``2k`` in the low nibble, ``2k + 1`` in the high nibble; bit 3 of a code is the sign),
@@ -36,8 +37,8 @@ factor leaves the weight term above.
 MXFP8 (layers 40-47): ``weight`` is ``float8_e4m3fn [E, out, in]`` and ``weight_scale`` is ``uint8 [E, out, in / 32]``
 holding UE8M0 exponents, ``W[e, o, i] = e4m3(weight[e, o, i]) * 2 ** (scale[e, o, i // 32] - 127)``, the
 decoding of huggingface/transformers@109a7d19bf (``Fp8Dequantize`` with ``scale_fmt: ue8m0``). The manifest declares
-``weight_block_shape [32, 32]`` but stores one exponent per row and 32 columns; decoding per row is correct whether
-or not the rows of a 32-row block share their exponent.
+``weight_block_shape [32, 32]`` but stores one exponent per row and 32 columns, and in the release those exponents
+differ between the rows of a 32-row block, so they are decoded per row.
 
 Numerics: the E2M1 code times its E4M3 scale is exact in FP32 and the outer scale ``amax / denominator`` is one
 correctly rounded FP32 division, so each NVFP4 weight carries a single FP32 rounding of that product. MXFP8
@@ -46,6 +47,9 @@ quantize activations (per-token NVFP4 with outer denominator 1536 and a 4-or-6 b
 absolute error, MXFP8 per 32 values) before multiplying, which BF16 training on dequantized weights does not
 emulate.
 """
+
+import re
+from typing import Literal, TypedDict
 
 import torch
 
@@ -58,6 +62,123 @@ _UE8M0_NAN = 255
 # Elements decoded per step. Bounds the FP32 transients (gather index, values) to about 0.5 GiB however many
 # experts a call receives; one 4608 x 4608 expert projection is 21M elements.
 _DEQUANT_CHUNK_ELEMS = 2**26
+
+QUANT_METHOD = "inkling2"
+QUANTIZATION_MANIFEST = "hf_quant_config.json"
+ExpertFormat = Literal["nvfp4", "mxfp8"]
+_EXPERT_WEIGHT_RE = re.compile(r"model\.llm\.layers\.\d+\.mlp\.experts\.w(?:13|2)_weight")
+# Weight-side fields of the manifest's quantized parameter groups that decide how the stored bytes decode.
+_NVFP4_WEIGHT_FIELDS = {
+    "output_dtype": "uint8",
+    "weight_transform": "nvfp4_nearest",
+    "weight_block_shape": [1, 16],
+    "weight_scale_format": "amax_denominator",
+}
+_MXFP8_WEIGHT_FIELDS = {"output_dtype": "float8_e4m3fn", "weight_transform": "mxfp8_nearest"}
+_MXFP8_BLOCK_SHAPES = ([1, 32], [32, 32])
+_UNQUANTIZED_COMPUTE_DTYPES = ("float32", "bfloat16")
+
+
+class ManifestParameterGroup(TypedDict, total=False):
+    """One ``parameter_groups`` entry of ``hf_quant_config.json``: tensor names and their precision."""
+
+    tensors: list[str]
+    compute_dtype: str
+    output_dtype: str
+    weight_transform: str
+    weight_block_shape: list[int]
+    weight_scale_format: str
+
+
+class ManifestSection(TypedDict):
+    """The ``model`` (or ``mtp``) section of ``hf_quant_config.json``."""
+
+    parameter_groups: list[ManifestParameterGroup]
+
+
+class QuantizationManifest(TypedDict, total=False):
+    """The released ``hf_quant_config.json`` (fields read here; activation settings are not used)."""
+
+    quant_method: str
+    model: ManifestSection
+
+
+class Inkling2QuantizationConfig(TypedDict):
+    """``quantization_config`` of a checkpoint with quantized experts.
+
+    Attributes:
+        quant_method: Always ``"inkling2"``.
+        expert_formats: Released expert weight key (``model.llm.layers.N.mlp.experts.{w13,w2}_weight``) to its
+            stored format. Experts not listed are unquantized.
+    """
+
+    quant_method: str
+    expert_formats: dict[str, ExpertFormat]
+
+
+def quantization_config_from_manifest(manifest: QuantizationManifest) -> Inkling2QuantizationConfig:
+    """Read the stored format of every quantized expert tensor from ``hf_quant_config.json``.
+
+    Only the weight-side fields decide how the stored bytes decode, so only they are validated; the manifest's
+    activation-quantization settings describe the serving GEMMs, which training does not emulate.
+
+    Args:
+        manifest: Parsed ``hf_quant_config.json``.
+
+    Returns:
+        The ``quantization_config`` to attach to the model config.
+
+    Raises:
+        ValueError: If the manifest is not ``inkling2``, has an unknown compute dtype or unsupported weight fields,
+            quantizes a tensor that is not a routed-expert weight, or lists a tensor twice.
+    """
+    if manifest.get("quant_method") != QUANT_METHOD or "model" not in manifest:
+        raise ValueError(f"Expected an inkling2 {QUANTIZATION_MANIFEST} with a model section")
+    expert_formats: dict[str, ExpertFormat] = {}
+    for group in manifest["model"]["parameter_groups"]:
+        compute = group.get("compute_dtype")
+        if compute in _UNQUANTIZED_COMPUTE_DTYPES:
+            continue
+        if compute == "nvfp4":
+            fmt: ExpertFormat = "nvfp4"
+            supported = all(group.get(field) == value for field, value in _NVFP4_WEIGHT_FIELDS.items())
+        elif compute == "mxfp8":
+            fmt = "mxfp8"
+            supported = all(group.get(field) == value for field, value in _MXFP8_WEIGHT_FIELDS.items())
+            supported = supported and group.get("weight_block_shape") in _MXFP8_BLOCK_SHAPES
+        else:
+            raise ValueError(f"Unsupported Inkling 2 compute dtype {compute!r}")
+        if not supported:
+            raise ValueError(f"Unsupported {compute} weight precision fields in {QUANTIZATION_MANIFEST}")
+        for name in group.get("tensors", []):
+            if not _EXPERT_WEIGHT_RE.fullmatch(name):
+                raise ValueError(f"{compute} is only supported for routed-expert weights, got {name}")
+            if name in expert_formats:
+                raise ValueError(f"{name} is listed twice in {QUANTIZATION_MANIFEST}")
+            expert_formats[name] = fmt
+    return {"quant_method": QUANT_METHOD, "expert_formats": expert_formats}
+
+
+def checkpoint_expert_formats(quantization_config: Inkling2QuantizationConfig | None) -> dict[str, ExpertFormat]:
+    """Return the stored expert formats a model config declares (empty for an unquantized checkpoint).
+
+    Args:
+        quantization_config: The config's ``quantization_config``, or None.
+
+    Returns:
+        Released expert weight key to ``"nvfp4"`` or ``"mxfp8"``.
+
+    Raises:
+        ValueError: For a quantization config of another method or an unknown format.
+    """
+    if quantization_config is None:
+        return {}
+    if quantization_config.get("quant_method") != QUANT_METHOD:
+        raise ValueError(f"Inkling 2 checkpoints use quant_method {QUANT_METHOD!r}, got {quantization_config!r}")
+    formats = dict(quantization_config.get("expert_formats", {}))
+    if unknown := sorted({fmt for fmt in formats.values() if fmt not in ("nvfp4", "mxfp8")}):
+        raise ValueError(f"Unknown Inkling 2 expert formats {unknown}")
+    return formats
 
 
 def _target_device(weight: torch.Tensor, device: torch.device | str | None) -> torch.device:
@@ -186,8 +307,8 @@ def dequantize_mxfp8_experts(
     Args:
         weight: ``float8_e4m3fn`` tensor of shape [experts, out, in] with ``in`` divisible by 32.
         scale: ``uint8`` tensor of shape [experts, out, in / 32] of UE8M0 exponents (bias 127), one per row and 32
-            consecutive input columns. Rows that share a 32-row block carry equal bytes in the release; this
-            function does not rely on it.
+            consecutive input columns, decoded per row (the release's exponents differ between the rows of a 32-row
+            block).
         device: Device to decode on and return the output on; defaults to ``weight``'s device. Inputs on another
             device are copied over one chunk at a time.
         dtype: Floating-point output dtype. FP32 holds every finite value exactly; a BF16 output is the FP32 value

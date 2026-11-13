@@ -30,9 +30,14 @@ written by either library loads in the other. The pinned Transformers release ha
 
 from __future__ import annotations
 
+import json
+import os
 from typing import TYPE_CHECKING, Any
 
 from transformers.configuration_utils import PretrainedConfig
+from transformers.utils import cached_file
+
+from .quantization import QUANTIZATION_MANIFEST, QuantizationManifest, quantization_config_from_manifest
 
 if TYPE_CHECKING:
     import torch
@@ -227,11 +232,35 @@ class Inkling2VisionConfig(PretrainedConfig):
         )
 
 
+def _read_quantization_manifest(name_or_path: str) -> QuantizationManifest | None:
+    """Return the checkpoint's ``hf_quant_config.json``, or None when it has none.
+
+    Args:
+        name_or_path: Local checkpoint directory or Hub repository id the config was read from.
+    """
+    resolved = cached_file(
+        name_or_path,
+        QUANTIZATION_MANIFEST,
+        _raise_exceptions_for_missing_entries=False,
+        _raise_exceptions_for_connection_errors=False,
+    )
+    if resolved is None:
+        return None
+    with open(resolved) as manifest_file:
+        return json.load(manifest_file)
+
+
 class Inkling2Config(PretrainedConfig):
     """Top-level Inkling 2 configuration.
 
     ``vision_config=None`` builds a text-only model. ``mtp_config`` keeps the drafter
     section of the released ``config.json`` as a plain mapping for the DSpark drafter.
+
+    The released checkpoints keep their expert precision in ``hf_quant_config.json``, not in
+    ``config.json``. Loading a config by path folds that manifest in as ``quantization_config``
+    (``{"quant_method": "inkling2", "expert_formats": ...}``), so the checkpointer requests the
+    stored NVFP4/MXFP8 tensors and the state-dict adapter dequantizes them. A checkpoint without
+    the manifest (such as an AutoModel BF16 export) gets no ``quantization_config``.
     """
 
     model_type = "inkling2"
@@ -261,6 +290,34 @@ class Inkling2Config(PretrainedConfig):
         self.image_token_id = image_token_id
         self.mtp_config = mtp_config
         super().__init__(**kwargs)
+
+    @classmethod
+    def from_dict(
+        cls, config_dict: dict[str, Any], **kwargs: Any
+    ) -> Inkling2Config | tuple[Inkling2Config, dict[str, Any]]:
+        """Build the config from ``config.json`` contents, adding the checkpoint's expert precision.
+
+        Args:
+            config_dict: Parsed ``config.json``.
+            **kwargs: ``PretrainedConfig.from_dict`` arguments. With ``name_or_path`` (set by AutoModel's
+                config lookup and by :meth:`from_pretrained`) and no ``quantization_config`` in
+                ``config_dict``, that location's ``hf_quant_config.json`` is read when present.
+
+        Returns:
+            The config, as ``PretrainedConfig.from_dict`` returns it.
+        """
+        name_or_path = kwargs.get("name_or_path")
+        if name_or_path and "quantization_config" not in config_dict:
+            manifest = _read_quantization_manifest(str(name_or_path))
+            if manifest is not None:
+                config_dict = {**config_dict, "quantization_config": quantization_config_from_manifest(manifest)}
+        return super().from_dict(config_dict, **kwargs)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str | os.PathLike, **kwargs: Any) -> Inkling2Config:
+        """Load the config like ``PretrainedConfig.from_pretrained``, keeping the path for :meth:`from_dict`."""
+        kwargs.setdefault("name_or_path", str(pretrained_model_name_or_path))
+        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
 
     def build_dspark_draft(self, options: Inkling2DSparkOptions) -> Inkling2DSparkModel:
         """Build the DSpark draft in the released ``mtp.safetensors`` layout.
