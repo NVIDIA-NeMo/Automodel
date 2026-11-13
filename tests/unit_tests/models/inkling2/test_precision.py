@@ -107,7 +107,11 @@ def test_bf16_outputs_routes_and_all_gradients(
     for index, (left, right) in enumerate(zip(partials, expected.partials, strict=True)):
         torch.testing.assert_close(left, right, rtol=0.03, atol=0.003, msg=f"layer {index}")
     for left, right in zip(routes, expected.routing_ids, strict=True):
-        torch.testing.assert_close(left, right, rtol=0, atol=0)
+        # Routing selects a set of experts; the ordering within that set is not
+        # semantic. Near-equal scores can swap two selected slots under BF16
+        # rounding. Still require exactly the same experts, including at the
+        # top-k cutoff; logits and every parameter gradient are checked below.
+        torch.testing.assert_close(left.sort(-1).values, right.sort(-1).values, rtol=0, atol=0)
     upstream = torch.randn_like(a)
     (a * upstream).sum().backward()
     (b * upstream).sum().backward()

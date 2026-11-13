@@ -93,25 +93,36 @@ def convolution(
     Returns:
         Tensor of shape [batch, sequence, channels].
     """
-    x = x * valid[..., None]
+    # Cast before slicing so gradients from different taps accumulate in FP32
+    # before returning to the BF16 input/parameter. Per-tap casts round each
+    # contribution separately and do not model the convolution's compute dtype.
+    dtype = x.dtype
+    x = (x * valid[..., None]).float()
+    if dynamic_input is None:
+        static = weights[prefix + ".weight"].float()
+        generated_all = None
+    else:
+        static = weights[prefix + ".static_w"].float()
+        generated_all = F.linear(dynamic_input, weights[prefix + ".weight_proj.weight"]).float()
+        generated_all = generated_all.reshape(x.shape[0], x.shape[1], heads, width)
     results = []
     for t in range(x.shape[1]):
         out = x[:, t].float()
         for lag in range(min(width, t + 1)):
             if dynamic_input is None:
-                coefficient = weights[prefix + ".weight"][:, 0, width - 1 - lag].float()
+                coefficient = static[:, 0, width - 1 - lag]
             else:
-                generated = F.linear(dynamic_input[:, t], weights[prefix + ".weight_proj.weight"]).float()
-                generated = generated.reshape(x.shape[0], heads, width)[:, :, lag]
+                assert generated_all is not None
+                generated = generated_all[:, t, :, lag]
                 generated = torch.cat(
                     [generated[:, h : h + 1].expand(-1, x.shape[-1] // heads) for h in range(heads)],
                     -1,
                 )
-                coefficient = weights[prefix + ".static_w"][lag].float() + generated
+                coefficient = static[lag] + generated
             out = out + x[:, t - lag].float() * coefficient
         denominator = (width + 1 if dynamic_input is None else 2 * width + 1) ** 0.5
         results.append(out / denominator)
-    return torch.stack(results, 1).to(x.dtype) * valid[..., None]
+    return torch.stack(results, 1).to(dtype) * valid[..., None]
 
 
 def clip(x: torch.Tensor, scale: torch.Tensor | None, threshold: float) -> torch.Tensor:
@@ -143,7 +154,7 @@ def attention(
     valid: torch.Tensor,
     positions: torch.Tensor,
 ) -> torch.Tensor:
-    """Per-query/head attention using the explicit LSE gate/sink equation.
+    """Per-query/head attention with an explicit zero-valued sink.
 
     Args:
         cfg: Text configuration.
@@ -169,18 +180,18 @@ def attention(
         heads * dim,
         heads,
     ]
+    # The checkpoint stores one fused projection. Keep that BF16 rounding
+    # boundary: separate GEMMs would round each input-gradient contribution
+    # before summing Q/R/gate/sink gradients back into the shared source.
+    projected = [
+        F.linear(source, weights[prefix + ".qkvr.weight"], weights.get(prefix + ".qkvr.bias"))
+        for source in (sources[:1] if local else sources)
+    ]
     projections = []
     start = 0
     for index, size in enumerate(sizes):
-        source = sources[1] if index == 1 else sources[2] if index == 2 else sources[0]
-        bias = weights.get(prefix + ".qkvr.bias")
-        projections.append(
-            F.linear(
-                source,
-                weights[prefix + ".qkvr.weight"][start : start + size],
-                None if bias is None else bias[start : start + size],
-            )
-        )
+        source_index = index if not local and index in (1, 2) else 0
+        projections.append(projected[source_index][..., start : start + size])
         start += size
     q, k, v, r, gate, sink = projections
     k = convolution(
@@ -225,6 +236,11 @@ def attention(
     v = v.reshape(batch, length, kv_heads, dim)
     if cfg.use_value_norm_no_gamma:
         v = rms(v, None, cfg.rms_norm_eps).to(v.dtype)
+    # Attention reductions and their backward accumulate in FP32. Cast the
+    # complete tensors once, rather than rounding each per-key gradient to BF16.
+    attention_dtype = r.dtype
+    q, k, v, r, gate, sink = [tensor.float() for tensor in (q, k, v, r, gate, sink)]
+    table = weights[prefix + ".relative_table"].float()
     batches = []
     for b in range(batch):
         tokens = []
@@ -245,18 +261,18 @@ def attention(
                 for s in keys:
                     distance = int(positions[b, t] - positions[b, s])
                     relative = (
-                        (r[b, t, h].float() * weights[prefix + ".relative_table"][:, distance].float())
-                        .sum()
-                        .to(r.dtype)
-                        .float()
+                        (r[b, t, h].float() * table[:, distance]).sum().to(attention_dtype).float()
                         if (0 <= distance < extent)
                         else q.new_zeros(())
                     )
                     scores.append((q[b, t, h].float() * k[b, s, kv].float()).sum() / dim**0.5 + relative)
                 scores = torch.stack(scores)
-                context = (scores.softmax(0)[:, None] * v[b, keys, kv].float()).sum(0)
-                context = context * torch.sigmoid(gate[b, t].float().reshape(heads, dim)[h])
-                head_values.append(context * torch.sigmoid(torch.logsumexp(scores, 0) - sink[b, t, h].float()))
+                # Include the sink in the normalization before applying the output
+                # gate. The equivalent LSE/sigmoid product has a different FP32
+                # rounding order, which can flip BF16 midpoints and near-tied routes.
+                probabilities = torch.cat((scores, sink[b, t, h].reshape(1))).softmax(0)[:-1]
+                context = (probabilities[:, None] * v[b, keys, kv]).sum(0)
+                head_values.append(context * torch.sigmoid(gate[b, t].reshape(heads, dim)[h]))
             tokens.append(torch.cat(head_values))
         batches.append(torch.stack(tokens))
     return (
