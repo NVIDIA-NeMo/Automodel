@@ -198,6 +198,30 @@ class TestBuildPackedVlmSample:
         assert result["seq_lens_padded"] == [4, 4]
         assert result["position_ids"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
 
+    def test_list_and_int32_rows_match_int64_tensors(self):
+        ids = [1, 2, 3]
+        labels = [11, 12, 13]
+        kwargs = {"pack_size": 8, "padding_idx": 0, "sequence_alignment": 4}
+        tensor_pack = _build_packed_vlm_sample(
+            [{"input_ids": torch.tensor(ids), "labels": torch.tensor(labels)}],
+            **kwargs,
+        )
+        list_pack = _build_packed_vlm_sample([{"input_ids": ids, "labels": labels}], **kwargs)
+        int32_pack = _build_packed_vlm_sample(
+            [
+                {
+                    "input_ids": torch.tensor(ids, dtype=torch.int32),
+                    "labels": torch.tensor(labels, dtype=torch.int32),
+                }
+            ],
+            **kwargs,
+        )
+
+        assert list_pack["input_ids"].tolist() == tensor_pack["input_ids"].tolist() == [1, 2, 3, 0]
+        assert int32_pack["labels"].tolist() == tensor_pack["labels"].tolist() == [11, 12, 13, -100]
+        assert list_pack["attention_mask"].tolist() == [1, 1, 1, 1]
+        assert list_pack["position_ids"].tolist() == [0, 1, 2, 3]
+
 
 class TestNeatPackDatasetVlm:
     def test_end_to_end(self):
