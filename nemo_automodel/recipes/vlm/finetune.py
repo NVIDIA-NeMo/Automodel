@@ -98,6 +98,7 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.step_scheduler import TokenCounts
 from nemo_automodel.components.training.utils import (
+    count_tail_padding,
     get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
