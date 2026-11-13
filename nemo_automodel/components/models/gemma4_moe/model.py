@@ -1292,7 +1292,7 @@ class Gemma4ForConditionalGeneration(
                 dtype=get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16),
             )
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie ``lm_head`` to the active text ``embed_tokens`` when requested.
 
         Overrides HF's generic tying so that any caller after the MoE

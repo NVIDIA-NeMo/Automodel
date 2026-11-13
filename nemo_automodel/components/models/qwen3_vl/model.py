@@ -79,7 +79,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
 
-    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+    def tie_weights(self, *_args: set[str] | bool | None, **_kwargs: set[str] | bool | None) -> None:
         """Tie the language head to the active text embedding when configured."""
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight

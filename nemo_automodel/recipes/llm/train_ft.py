@@ -461,7 +461,6 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
         return None
 
     from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
-    from nemo_automodel.components.models.common.packed_seq import FLASH_VARLEN_KWARGS
 
     def wrapper(base_collate_fn):
         def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
@@ -477,14 +476,7 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
                 size and ``S`` is padded sequence length, plus ``causal_mask_mapping`` entries covering the
                 same ``S`` token axis. Other tensor fields preserve the base collator's documented layout.
             """
-            collated = base_fn(batch)
-            if "_packed_seq_ids" in collated:
-                # Flat Flash offsets describe the whole local batch and cannot
-                # be split along batch dimension. Model-entry hooks rebuild
-                # them from batch-major document IDs after PP microbatching.
-                for key in FLASH_VARLEN_KWARGS:
-                    collated.pop(key, None)
-            return add_causal_masks_to_batch(collated, model_config=config)
+            return add_causal_masks_to_batch(base_fn(batch), model_config=config)
 
         return chained_collate_fn
 

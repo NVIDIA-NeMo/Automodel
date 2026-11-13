@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Recipe validated using 256 H100 GPUs (32 nodes x 8)
+# Runtime tuning migrated from examples/llm_benchmark/glm/glm_5_te_deepep.yaml uses
+# 128 H100 nodes (1,024 GPUs) with PP4 and EP64. The earlier 32-node version of this
+# recipe was validated on 256 GPUs.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 1024
+  global_batch_size: 1024  #PR4637: 512
   local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
@@ -54,9 +56,9 @@ model:
   pretrained_model_name_or_path: zai-org/GLM-5
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: te
+    attn: te  #PR4637: sdpa
     linear: te
-    rms_norm: te
+    rms_norm: te  #PR4637: torch_fp32
     rope_fusion: false
     experts: torch_mm
     dispatcher: hybridep
@@ -73,8 +75,8 @@ loss_fn:
 
 # Data configuration from llama finetuning
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
 packed_sequence:
@@ -88,8 +90,8 @@ dataloader:
   shuffle: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: rowan/hellaswag
   split: train
 
 validation_dataloader:
@@ -111,9 +113,11 @@ optimizer:
 
 ci:
   cluster_tag: h100
-  recipe_owner: hemildesai
-  nodes: 128
+  recipe_owner: akoumpa  #PR4637: hemildesai
+  nodes: 128  #PR4637: 32
   time: "00:45:00"
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   perf_testing:
     fake_balanced_gate: true
     schedule: weekly

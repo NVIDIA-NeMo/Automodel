@@ -46,7 +46,7 @@ EXCLUDED_RECIPE_FILES = {
     Path("examples/retrieval/data_utils/mining_config.yaml"),
     Path("examples/retrieval/data_utils/mining_multimodal_config.yaml"),
     # Command-only configs: launched via
-    # `python -m nemo_automodel.recipes.llm.precompute_dspark_dist -c <config>`
+    # `python -m nemo_automodel.recipes.speculative_decoding.precompute_dspark_dist -c <config>`
     # (torchrun for multi-node), so they have no recipe-class entry point by design.
     Path("examples/speculative/dspark/deepseek_v4_flash_dspark_precompute.yaml"),
     Path("examples/speculative/dspark/glm_5.2_dspark_precompute.yaml"),
@@ -155,7 +155,7 @@ def _lint_ci_cluster_tag(path: Path, data: dict, key_lines: list[tuple[str, int]
     ]
 
 
-PERF_TESTING_KEYS = ("schedule", "time", "fake_balanced_gate")
+PERF_TESTING_KEYS = ("schedule", "time", "fake_balanced_gate", "validation")
 PERF_TESTING_SCHEDULES = ("nightly", "weekly", "disabled")
 CI_TIME_FORMAT = "%H:%M:%S"  # Same format that tests/ci_tests/utils/generate_ci_tests.py parses for `ci.time`.
 
@@ -170,6 +170,7 @@ def _lint_ci_perf_testing(
     - ``schedule``: required, one of ``PERF_TESTING_SCHEDULES``. ``disabled`` keeps the settings but pauses the runs.
     - ``time``: ``HH:MM:SS`` wall time of the run, parsed like ``ci.time``.
     - ``fake_balanced_gate``: optional boolean; the only performance-specific model override.
+    - ``validation``: optional boolean, default false; true preserves the recipe's validation cadence.
 
     ``ci.deprecated: true`` applies to the section as well: a deprecated recipe runs no tests.
 
@@ -210,14 +211,28 @@ def _lint_ci_perf_testing(
         elif key not in PERF_TESTING_KEYS:
             error(f"unknown key `{key}`; allowed keys are {', '.join(PERF_TESTING_KEYS)}.", section_lines.get(key))
 
+    errors.extend(_lint_perf_testing_values(path, section, section_lines, default_line=section_line))
+    return errors
+
+
+def _lint_perf_testing_values(
+    path: Path, section: dict[str, object], section_lines: dict[str, int], *, default_line: int
+) -> list[LintError]:
+    """Validate performance field values after the container and key checks."""
+    errors: list[LintError] = []
+
+    def error(message: str, line: int | None = None) -> None:
+        errors.append(LintError(path, line or default_line, f"`ci.perf_testing`: {message}"))
+
     if "schedule" not in section:
         error("`schedule` is required.")
     elif section["schedule"] not in PERF_TESTING_SCHEDULES:
         error(f"`schedule` must be one of {', '.join(PERF_TESTING_SCHEDULES)}.", section_lines.get("schedule"))
     if "time" in section and not _is_ci_time(section["time"]):
         error('`time` must be a "HH:MM:SS" string, the same format as `ci.time`.', section_lines.get("time"))
-    if "fake_balanced_gate" in section and not isinstance(section["fake_balanced_gate"], bool):
-        error("`fake_balanced_gate` must be a boolean.", section_lines.get("fake_balanced_gate"))
+    for key in ("fake_balanced_gate", "validation"):
+        if key in section and not isinstance(section[key], bool):
+            error(f"`{key}` must be a boolean.", section_lines.get(key))
     return errors
 
 

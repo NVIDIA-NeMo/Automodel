@@ -20,8 +20,8 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
-  global_batch_size: 4096
-  local_batch_size: 128
+  global_batch_size: 4096  #PR4637: 256
+  local_batch_size: 128  #PR4637: 8
   ckpt_every_steps: 100
   val_every_steps: 100
   max_steps: 100
@@ -51,8 +51,8 @@ model:
     attn: eager
     linear: torch
     rms_norm: torch_fp32
-    experts: te
-    dispatcher: hybridep
+    experts: te  #PR4637: torch_mm
+    dispatcher: hybridep  #PR4637: torch
     dispatcher_num_sms: 32
     rope_fusion: false
     fake_balanced_gate: false  # benchmark only — see header
@@ -81,7 +81,7 @@ distributed:
   enable_fsdp2_prefetch: true
   pipeline:
     pp_schedule: 1f1b
-    pp_microbatch_size: 2
+    pp_microbatch_size: 2  #PR4637: 1
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
@@ -90,21 +90,21 @@ distributed:
     wrap_outer_model: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy  #PR4637: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: Rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: Rowan/hellaswag
   split: train
-  num_samples_limit: 25600
-  pad_to_max_length: false
+  limit_dataset_samples: 25600
+  padding: false  #PR4637: pad_to_max_length: false
   tokenizer:
     _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-K3
     trust_remote_code: false
 
 packed_sequence:
-  packed_sequence_size: 0
+  packed_sequence_size: 1024  #PR4637: 0
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -112,11 +112,11 @@ dataloader:
   shuffle: true
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
-  path_or_dataset: Rowan/hellaswag
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset  #PR4637: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
+  dataset_name: rajpurkar/squad  #PR4637: path_or_dataset: Rowan/hellaswag
   split: validation
-  num_samples_limit: 256
-  pad_to_max_length: false
+  limit_dataset_samples: 256
+  padding: false  #PR4637: pad_to_max_length: false
   tokenizer:
     _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
     pretrained_model_name_or_path: moonshotai/Kimi-K3
@@ -152,7 +152,7 @@ ci:
   recipe_owner: huiyingl
   nodes: 64
   cluster_tag: gb200
-  time: "02:00:00"
+  time: "02:00:00"  #PR4637: "01:30:00"
   nproc_per_node: 4
   perf_testing:
     fake_balanced_gate: true

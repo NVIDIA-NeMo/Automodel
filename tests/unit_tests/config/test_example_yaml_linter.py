@@ -340,3 +340,22 @@ def test_linter_checks_the_last_duplicate_perf_testing_section(first: str, secon
         assert len(errors) == 2
         assert "`schedule` must be one of" in errors[1].message
         assert errors[1].line == invalid_line
+
+
+@pytest.mark.parametrize("enabled", ["true", "false"])
+def test_linter_accepts_optional_performance_validation(enabled: str) -> None:
+    assert _perf_errors(f"    validation: {enabled}\n") == []
+
+
+@pytest.mark.parametrize("value", ["null", "0", "1", "'false'", "[]", "{}"])
+def test_linter_rejects_non_boolean_performance_validation(value: str) -> None:
+    errors = _perf_errors(f"    validation: {value}\n")
+    assert len(errors) == 1
+    assert "`validation` must be a boolean" in errors[0].message
+    assert errors[0].line == 5
+
+
+def test_linter_rejects_duplicate_performance_validation() -> None:
+    errors = _perf_errors("    validation: true\n    validation: false\n")
+    assert len(errors) == 1
+    assert "Duplicate key `validation`" in errors[0].message
