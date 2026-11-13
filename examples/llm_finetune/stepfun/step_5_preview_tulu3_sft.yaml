@@ -40,7 +40,7 @@ model:
   backend:
     _target_: nemo_automodel.components.models.step5.configuration.Step5BackendConfig
     attn: fa4
-    benchmark_static_routing: true
+    benchmark_static_routing: false
     compile_norm: true
     compile_router_weight: true
     csa_forward_full_blocks: true
