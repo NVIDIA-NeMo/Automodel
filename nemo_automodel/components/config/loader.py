@@ -354,26 +354,33 @@ def _get_dataclass_hints(cls: type) -> dict[str, Any]:
         return {}
 
 
-def _convert_dataclass_value(value: Any, annotation: Any) -> Any:
+def _convert_dataclass_value(value: Any, annotation: Any, source: Any = None) -> Any:
     """Convert only unambiguous typed dataclass mappings at the YAML boundary.
 
     Optional dataclasses and homogeneous sequences are supported. Other values,
     including explicitly instantiated objects, retain their existing semantics.
     The caller opts in at the subtree root. Within plain nested dataclass
     mappings, annotations drive recursion without consulting field metadata again.
+    Source nodes retain explicit-factory provenance after the ordinary instantiation
+    pass; their results must not be reinterpreted, including inside sequences.
     """
+    if isinstance(source, ConfigNode) and "_target_" in source.__dict__:
+        return value
+    if annotation is not None and isinstance(value, dict) and "_target_" in value:
+        return ConfigNode(value).instantiate()
     origin = get_origin(annotation)
     args = get_args(annotation)
     if origin in (Union, types.UnionType):
         candidates = tuple(arg for arg in args if arg is not type(None))
         if len(candidates) == 1 and value is not None:
-            return _convert_dataclass_value(value, candidates[0])
+            return _convert_dataclass_value(value, candidates[0], source)
     elif origin in (tuple, list) and isinstance(value, (tuple, list)):
         if len(args) == 1 or (len(args) == 2 and args[1] is Ellipsis):
-            return origin(_convert_dataclass_value(item, args[0]) for item in value)
+            return origin(
+                _convert_dataclass_value(item, args[0], source[index] if isinstance(source, (tuple, list)) else None)
+                for index, item in enumerate(value)
+            )
     elif isinstance(annotation, type) and is_dataclass(annotation) and isinstance(value, dict):
-        if "_target_" in value:
-            return ConfigNode(value).instantiate()
         hints = _get_dataclass_hints(annotation)
         return annotation(**{key: _convert_dataclass_value(item, hints.get(key)) for key, item in value.items()})
     return value
@@ -509,6 +516,8 @@ class ConfigNode:
         list/tuple fields follow their annotations too. Unmarked fields on this
         target retain the existing list/dict behavior. Explicitly instantiated
         objects and runtime overrides are not reprocessed by typed conversion.
+        Within a resolved typed subtree, explicit _target_ factories take
+        precedence over annotations, including factories for entire containers.
 
         Type hints are resolved per class, not per field. If any annotation raises
         NameError or TypeError, no annotation-based field conversion is performed
@@ -556,7 +565,9 @@ class ConfigNode:
             if typed_fields:
                 hints = _get_dataclass_hints(func)
                 for key in typed_fields:
-                    config_kwargs[key] = _convert_dataclass_value(config_kwargs[key], hints.get(key))
+                    config_kwargs[key] = _convert_dataclass_value(
+                        config_kwargs[key], hints.get(key), self.__dict__[key]
+                    )
 
         # Override/add with passed kwargs (runtime data — must NOT be env-var-resolved)
         config_kwargs.update(kwargs)

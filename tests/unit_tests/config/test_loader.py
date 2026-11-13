@@ -81,6 +81,7 @@ def typed_module(tmp_module):
             leaf: Leaf
             leaves: tuple[Leaf, ...]
             dimensions: tuple[int, ...]
+            items: list[Leaf] | None = None
 
         @dataclass
         class Root:
@@ -144,6 +145,63 @@ def test_dataclass_runtime_override_retains_identity_and_literal_environment_tex
     assert node.instantiate(child=child).child is child
     mapping = {"value": "${UNDEFINED_RUNTIME_VALUE}"}
     assert node.instantiate(child=mapping).child is mapping
+
+
+@pytest.mark.parametrize("field_name", ["child", "children", "items"])
+@pytest.mark.parametrize("factory_result", [{"runtime_only": 1}, {"value": "explicit"}])
+def test_typed_fields_preserve_explicit_factory_results(
+    typed_module: Any, field_name: str, factory_result: dict[str, int | str]
+) -> None:
+    calls: list[bool] = []
+
+    def factory() -> dict[str, int | str]:
+        calls.append(True)
+        return factory_result
+
+    explicit = {"_target_": factory}
+    value = explicit if field_name == "child" else [explicit, {"value": "plain"}]
+    obj = ConfigNode({"_target_": typed_module.Parent, field_name: value}).instantiate()
+    result = getattr(obj, field_name)
+    if field_name != "child":
+        assert isinstance(result, tuple if field_name == "children" else list)
+        assert result[1] == typed_module.Leaf("plain")
+        result = result[0]
+    assert type(result) is dict and result == factory_result
+    assert calls == [True]
+
+
+def test_typed_sequence_preserves_explicit_container_factory(typed_module: Any) -> None:
+    value = [{"runtime_only": 1}]
+    node = ConfigNode({"_target_": typed_module.Parent, "children": {"_target_": lambda: value}})
+    assert node.instantiate().children == value
+    assert isinstance(node.instantiate().children, list)
+
+
+@pytest.mark.parametrize("field_name", ["leaf", "leaves", "items", "dimensions"])
+def test_plain_typed_subtree_preserves_whole_field_factories(typed_module: Any, field_name: str) -> None:
+    """Explicit targets win inside the opted-in subtree, without changing its unmarked sibling."""
+    factory_result = {"runtime_only": 1} if field_name == "leaf" else [{"runtime_only": 1}]
+    if field_name == "dimensions":
+        factory_result = [32, 64]
+    calls: list[bool] = []
+
+    def factory() -> dict[str, int] | list[dict[str, int]] | list[int]:
+        calls.append(True)
+        return factory_result
+
+    branch = {"leaf": {"value": "plain"}, "leaves": [{"value": "plain"}], "dimensions": [32, 32]}
+    branch[field_name] = {"_target_": factory}
+    raw = {"_target_": typed_module.Root, "branch": deepcopy(branch), "plain_branch": deepcopy(branch)}
+    original = deepcopy(raw)
+    node = ConfigNode(raw)
+    result = node.instantiate()
+    actual = getattr(result.branch, field_name)
+    assert type(actual) is type(factory_result) and actual == factory_result
+    assert calls == [True]
+    assert result.plain_branch == branch
+    assert node.raw_config == node.to_dict() == raw == original
+    assert node.instantiate(branch=branch).branch is branch
+    assert calls == [True], "runtime overrides must bypass configured factories"
 
 
 def test_dataclass_nested_unknown_fields_are_not_silently_dropped(typed_module):
