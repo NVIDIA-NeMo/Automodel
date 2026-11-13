@@ -147,6 +147,16 @@ def test_raise_if_peft_configured_rejects_draft_weights_path():
         raise_if_peft_configured(cfg, "TrainDFlashRecipe")
 
 
+def test_raise_if_peft_configured_lets_a_warm_start_recipe_take_draft_weights_path():
+    cfg = _Cfg({"recipe_args": _Cfg({"draft_weights_path": "/some/draft"})})
+    raise_if_peft_configured(cfg, "TrainDSparkRecipe", supports_draft_weights=True)
+
+
+def test_raise_if_peft_configured_rejects_peft_on_a_warm_start_recipe():
+    with pytest.raises(ValueError, match="peft"):
+        raise_if_peft_configured(_Cfg({"peft": _peft_node()}), "TrainDSparkRecipe", supports_draft_weights=True)
+
+
 def test_raise_if_peft_configured_allows_empty_recipe_args():
     raise_if_peft_configured(_Cfg({"recipe_args": _Cfg()}), "TrainDFlashRecipe")
 

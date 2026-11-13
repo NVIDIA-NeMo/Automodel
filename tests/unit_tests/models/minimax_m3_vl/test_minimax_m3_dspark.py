@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors import safe_open
+from safetensors.torch import save_file
 from transformers import AutoConfig
 
 from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING  # registers the local configs with AutoConfig
@@ -34,6 +35,7 @@ from nemo_automodel.components.models.minimax_m3_vl import dspark as minimax_m3_
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.dspark import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.registry import ModelOwnedDSparkProvider
+from nemo_automodel.recipes.speculative_decoding._dspark_warm_start import load_dspark_draft_weights
 
 VOCAB = 256
 HIDDEN = 64
@@ -394,6 +396,55 @@ def test_adapter_rejects_keys_outside_the_draft(tmp_path):
         model.state_dict_adapter.from_hf({"language_model.model.layers.0.mlp.weight": torch.zeros(1)})
 
 
+def test_warm_start_decodes_the_released_mxfp8_draft(tmp_path):
+    model = _build_released_draft(tmp_path)
+    embed_before = model.embed_tokens.weight.detach().clone()
+    expected, source = {}, {}
+    for key, value in model.state_dict_adapter.to_hf(model.state_dict()).items():
+        native_key = model.state_dict_adapter.from_hf({key: value}).popitem()[0]
+        if ".decoder_layer." in key and value.dim() == 2:
+            # Each 32-column block has its own E8M0 exponent: 2 ** (byte - 127).
+            blocks = (value.shape[1] + 31) // 32
+            exponents = torch.arange(blocks) % 3
+            source[key] = torch.full_like(value, 2.0).to(torch.float8_e4m3fn)
+            source[f"{key}_scale_inv"] = (127 + exponents).to(torch.uint8).expand(value.shape[0], -1).contiguous()
+            scales = (2.0**exponents).repeat_interleave(32)[: value.shape[1]]
+            expected[native_key] = (2.0 * scales).expand(value.shape[0], -1)
+        else:
+            source[key] = torch.full_like(value, 3.0).contiguous()
+            expected[native_key] = source[key]
+    released = tmp_path / "released"
+    released.mkdir()
+    save_file(source, released / "model.safetensors")
+
+    load_dspark_draft_weights(
+        model,
+        str(released),
+        keep_target_embeddings=True,
+        target_layer_ids=TARGET_LAYER_IDS,
+        mask_token_id=RELEASED_MASK,
+    )
+
+    state = model.state_dict()
+    assert expected.keys() == set(state) - {"embed_tokens.weight", "lm_head.weight"}
+    for key, value in expected.items():
+        torch.testing.assert_close(state[key], value.to(state[key].dtype), rtol=0, atol=0)
+    torch.testing.assert_close(state["embed_tokens.weight"], embed_before, rtol=0, atol=0)
+
+
+def test_adapter_rejects_an_fp8_weight_without_its_scale(tmp_path):
+    adapter = _build_released_draft(tmp_path).state_dict_adapter
+    key = "language_model.model.dspark.fc.weight"
+    with pytest.raises(ValueError, match="missing its scale"):
+        adapter.from_hf({key: torch.zeros(2, 2, dtype=torch.float8_e4m3fn)})
+
+
+def test_adapter_rejects_a_scale_without_its_weight(tmp_path):
+    adapter = _build_released_draft(tmp_path).state_dict_adapter
+    with pytest.raises(ValueError, match="no matching weight"):
+        adapter.from_hf({"language_model.model.dspark.fc.weight_scale_inv": torch.zeros(2, 1, dtype=torch.uint8)})
+
+
 def test_released_checkpoint_exports_and_resumes(tmp_path):
     model = _build_released_draft(tmp_path)
     checkpointer = Checkpointer(
@@ -423,8 +474,9 @@ def test_released_checkpoint_exports_and_resumes(tmp_path):
         assert set(index["weight_map"]) == RELEASED_KEYS
         for key, filename in index["weight_map"].items():
             with safe_open(consolidated / filename, "pt") as f:
-                native_key = model.state_dict_adapter.from_hf({key: None}).popitem()[0]
-                torch.testing.assert_close(f.get_tensor(key), expected[native_key], rtol=0, atol=0)
+                tensor = f.get_tensor(key)
+            native_key = model.state_dict_adapter.from_hf({key: tensor}).popitem()[0]
+            torch.testing.assert_close(tensor, expected[native_key], rtol=0, atol=0)
 
         for key, parameter in model.named_parameters():
             if key not in ("embed_tokens.weight", "lm_head.weight"):

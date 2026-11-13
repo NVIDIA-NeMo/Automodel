@@ -365,6 +365,40 @@ def test_load_indexed_safetensors_opens_each_shard_once(tmp_path):
         torch.testing.assert_close(loaded[key], tensor)
 
 
+def test_safetensors_key_filter_reads_a_single_file(tmp_path):
+    save_file({"draft.weight": torch.ones(2), "target.weight": torch.zeros(2)}, tmp_path / "model.safetensors")
+
+    loaded = _load_hf_safetensors_checkpoint(
+        str(tmp_path / "model.safetensors"), key_filter=lambda key: key.startswith("draft.")
+    )
+
+    assert set(loaded) == {"draft.weight"}
+
+
+def test_safetensors_key_filter_reads_a_flat_directory(tmp_path):
+    save_file({"draft.weight": torch.ones(2), "target.weight": torch.zeros(2)}, tmp_path / "a.safetensors")
+    save_file({"target.bias": torch.zeros(2)}, tmp_path / "b.safetensors")
+
+    loaded = _load_hf_safetensors_checkpoint(str(tmp_path), key_filter=lambda key: key.startswith("draft."))
+
+    assert set(loaded) == {"draft.weight"}
+
+
+def test_safetensors_key_filter_opens_only_the_shards_it_needs(tmp_path):
+    save_file({"draft.weight": torch.ones(2), "target.bias": torch.zeros(2)}, tmp_path / "a.safetensors")
+    save_file({"target.weight": torch.zeros(2)}, tmp_path / "b.safetensors")
+    weight_map = {"draft.weight": "a.safetensors", "target.bias": "a.safetensors", "target.weight": "b.safetensors"}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+    from safetensors import safe_open
+
+    with patch("safetensors.safe_open", wraps=safe_open) as mock_safe_open:
+        loaded = _load_hf_safetensors_checkpoint(str(tmp_path), key_filter=lambda key: key.startswith("draft."))
+
+    assert set(loaded) == {"draft.weight"}
+    assert mock_safe_open.call_count == 1
+
+
 def test_prefault_safetensors_reads_tensor_without_replacing_returned_view(tmp_path):
     checkpoint_path = tmp_path / "model.safetensors"
     checkpoint_path.touch()

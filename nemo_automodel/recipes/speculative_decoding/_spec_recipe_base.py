@@ -370,6 +370,9 @@ class SpecDecodeRecipeBase(BaseRecipe):
 
         if is_rank_0:
             logger.info("Resuming from checkpoint: %s", ckpt_dir)
+            recipe_args = self.cfg.get("recipe_args", None)
+            if recipe_args is not None and recipe_args.get("draft_weights_path", None):
+                logger.warning("Resuming from %s replaces the weights from recipe_args.draft_weights_path.", ckpt_dir)
 
         draft_model = self._module().draft_model
         checkpointer.load_model(draft_model, os.path.join(ckpt_dir, "model"))

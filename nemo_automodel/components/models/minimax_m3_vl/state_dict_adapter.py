@@ -926,15 +926,33 @@ class MiniMaxM3DSparkStateDictAdapter(StateDictAdapter):
         """Rename released draft tensors to native names.
 
         Args:
-            hf_state_dict: Mapping from released names to tensors in their parameter
-                layout. The mapping is consumed.
+            hf_state_dict: Mapping from released names to tensors. An MXFP8
+                ``<name>.weight`` is FP8 e4m3 with shape [output, input], paired with
+                ``<name>.weight_scale_inv``, uint8 E8M0 exponents with shape
+                [output, ceil(input / 32)]. Other tensors keep their parameter shape.
+                The mapping is consumed.
             device_mesh: Unused because the draft has no routed experts.
             **kwargs: Additional checkpoint protocol arguments.
 
         Returns:
-            Mapping from native names to the same tensor objects.
+            Mapping from native names to tensors, with no scale entries. A decoded pair
+            is a new BF16 tensor with shape [output, input]; the rest are the same objects.
+
+        Raises:
+            ValueError: A scale has no matching weight, or an FP8 weight has no scale.
         """
-        return {_dspark_native_key(key): hf_state_dict.pop(key) for key in list(hf_state_dict)}
+        native: dict[str, Any] = {}
+        for key in [key for key in hf_state_dict if not key.endswith("_scale_inv")]:
+            value = hf_state_dict.pop(key)
+            scale = hf_state_dict.pop(f"{key}_scale_inv", None)
+            if scale is not None:
+                value = dequantize_mxfp8(value, scale)
+            elif value.dtype == torch.float8_e4m3fn:
+                raise ValueError(f"Quantized weight {key} is missing its scale tensor")
+            native[_dspark_native_key(key)] = value
+        if hf_state_dict:
+            raise ValueError(f"Checkpoint scales have no matching weight: {sorted(hf_state_dict)[:3]}")
+        return native
 
     def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs: Any) -> list[tuple[str, Any]]:
         """Rename one native draft tensor.
