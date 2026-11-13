@@ -295,3 +295,19 @@ def test_randomize_is_a_noop_for_empty_token_ids():
 
     assert randomize_embedding_rows(model, [], seed=42) == ()
     torch.testing.assert_close(model.embed_tokens.weight, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_randomize_works_when_the_embedding_lives_on_cuda():
+    """Regression guard: the embedding's device (not CPU, unlike the helper tensors this
+    function builds along the way) drove a real `Expected all tensors to be on the same
+    device` crash during an actual training run."""
+    model = _make_duplicated_mask_token_model().to("cuda")
+    before = model.embed_tokens.weight.detach().clone()
+
+    touched = randomize_embedding_rows(model, [3, 4, 5], seed=42)
+
+    assert touched == (3, 4, 5)
+    assert model.embed_tokens.weight.device.type == "cuda"
+    torch.testing.assert_close(model.embed_tokens.weight[:3], before[:3])
+    assert not torch.allclose(model.embed_tokens.weight[3], before[3])
