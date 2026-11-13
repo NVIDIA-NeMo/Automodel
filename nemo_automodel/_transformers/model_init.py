@@ -30,7 +30,8 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import is_offline_mode, snapshot_download
+from huggingface_hub.errors import IncompleteSnapshotError
 from transformers import PretrainedConfig
 
 try:
@@ -433,9 +434,10 @@ def _download_model_weights(
 ) -> None:
     """Download weights at the config's resolved commit, retaining Hub options."""
     if not os.path.isdir(pretrained_model_name_or_path):
-        if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
+        # is_offline_mode() covers every value the Hub honors (HF_HUB_OFFLINE=true, TRANSFORMERS_OFFLINE=1).
+        if is_offline_mode() or os.environ.get("HF_HUB_OFFLINE", "0") == "1":
             logger.info(
-                "HF_HUB_OFFLINE=1: skipping weight download for %s (using cached weights)",
+                "Hub offline mode: skipping weight download for %s (using cached weights)",
                 pretrained_model_name_or_path,
             )
             return
@@ -455,7 +457,15 @@ def _download_model_weights(
                 for key in ("cache_dir", "revision", "token", "local_files_only", "force_download")
                 if key in kwargs
             }
-            snapshot_download(pretrained_model_name_or_path, **download_kwargs)
+            if download_kwargs.get("local_files_only"):
+                # Nothing to download: check the cached snapshot like the later load does.
+                _resolve_model_dir(
+                    pretrained_model_name_or_path,
+                    revision=download_kwargs.get("revision"),
+                    cache_dir=download_kwargs.get("cache_dir"),
+                )
+            else:
+                snapshot_download(pretrained_model_name_or_path, **download_kwargs)
 
 
 def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=None):
@@ -805,13 +815,35 @@ def _resolve_model_dir(
     cache_dir: str | None = None,
     subfolder: str = "",
 ) -> str:
-    """Resolve a HF repo id or local path to a local directory with model files."""
+    """Resolve a HF repo id or local path to a local directory with model files.
+
+    Raises:
+        LocalEntryNotFoundError: If the cache holds no snapshot folder for the revision.
+        IncompleteSnapshotError: If the cached snapshot lacks a weight file the loader reads.
+    """
     model_dir = pretrained_model_name_or_path
     if not os.path.isdir(model_dir):
-        model_dir = snapshot_download(
-            pretrained_model_name_or_path, revision=revision, cache_dir=cache_dir, local_files_only=True
-        )
+        try:
+            model_dir = snapshot_download(
+                pretrained_model_name_or_path, revision=revision, cache_dir=cache_dir, local_files_only=True
+            )
+        except IncompleteSnapshotError as error:
+            # Weight-only downloads (e.g. vLLM's) skip listed files no loader reads, such as README.md.
+            if not _has_complete_weights(os.path.join(error.snapshot_path, subfolder)):
+                raise
+            model_dir = error.snapshot_path
     return os.path.join(model_dir, subfolder) if subfolder else model_dir
+
+
+def _has_complete_weights(model_dir: str) -> bool:
+    """Check whether every weight file the checkpoint loader reads is present in a model directory."""
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = os.path.join(model_dir, index_name)
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                shard_names = set(json.load(f)["weight_map"].values())
+            return all(os.path.isfile(os.path.join(model_dir, name)) for name in shard_names)
+    return any(os.path.isfile(os.path.join(model_dir, name)) for name in ("model.safetensors", "pytorch_model.bin"))
 
 
 def _has_safetensors(model_dir: str) -> bool:
