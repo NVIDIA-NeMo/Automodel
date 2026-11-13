@@ -18,7 +18,8 @@ The released checkpoint (``hf_quant_config.json``, ``quant_method: inkling2``) s
 quantized, ``model.llm.layers.N.mlp.experts.{w13,w2}_weight`` in ``[experts, out, in]`` (``nn.Linear``)
 orientation: ``w13`` is ``[experts, 2 * intermediate, hidden]`` with gate and up rows interleaved (row ``2j`` is
 gate row ``j``, row ``2j + 1`` is up row ``j``) and ``w2`` is ``[experts, hidden, intermediate]``. The functions
-here decode element-wise and keep that row order; the state-dict adapter reorders rows afterwards.
+here decode element-wise and keep that row order; the state-dict adapter keeps the gate/up interleave too and only
+transposes to the native ``[experts, in, out]`` layout.
 
 NVFP4 (layers 0-39, ``weight_scale_format: amax_denominator``): ``weight`` is ``uint8 [E, out, in / 2]`` with two
 E2M1 codes per byte (column ``2k`` in the low nibble, ``2k + 1`` in the high nibble; bit 3 of a code is the sign),

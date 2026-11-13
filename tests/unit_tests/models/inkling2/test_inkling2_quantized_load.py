@@ -335,3 +335,29 @@ def test_sharded_destinations_keep_placements_and_decode(tmp_path, cpu_mesh, nat
             value = loaded[f"model.language_model.layers.{layer}.mlp.experts.{native_leaf}"]
             assert isinstance(value, DTensor) and value.placements == (native_placement,)
             assert torch.equal(value.full_tensor(), _expected_experts(tensors, layer, leaf)), (layer, leaf)
+
+
+class _RankMesh:
+    """Stand-in for an expert-parallel mesh: the adapter only reads its dim names and rank here."""
+
+    mesh_dim_names = ("ep",)
+
+    def get_rank(self) -> int:
+        return 1
+
+
+def test_from_hf_under_a_mesh_slices_quantized_companions_per_expert(tmp_path, monkeypatch):
+    """With plain full checkpoint tensors and a mesh, each rank decodes only its experts' bytes and amax."""
+    from nemo_automodel.components.moe import state_dict_utils
+
+    tensors = _write_checkpoint(tmp_path / "release")
+    model = _tiny_model(get_hf_config(str(tmp_path / "release"), "eager"))
+    start, stop = 2, 5
+    monkeypatch.setattr(state_dict_utils, "get_expert_range_for_rank_from_mesh", lambda mesh, n: (start, stop))
+    monkeypatch.setattr(state_dict_utils, "get_submesh", lambda mesh, dims: mesh)
+    monkeypatch.setattr(state_dict_utils, "create_dtensor_from_local", lambda local, mesh, rank: local)
+    loaded = model.state_dict_adapter.from_hf(dict(tensors), device_mesh=_RankMesh())
+    for layer in (0, 1):
+        for leaf, native_leaf in (("w13", "gate_and_up_projs"), ("w2", "down_projs")):
+            value = loaded[f"model.language_model.layers.{layer}.mlp.experts.{native_leaf}"]
+            assert torch.equal(value, _expected_experts(tensors, layer, leaf)[start:stop]), (layer, leaf)
