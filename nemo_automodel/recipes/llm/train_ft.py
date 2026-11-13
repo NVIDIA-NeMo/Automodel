@@ -736,6 +736,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.peft_config = None
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
+            # gated_mtp's mask tokens get a trainable embedding delta (PEFT's own
+            # TrainableTokensLayer) instead of staying frozen; read the typed config early
+            # (before .build(), which still happens at its usual spot below) since this must
+            # land on peft_config before build_model() applies LoRA, ahead of FSDP2 sharding.
+            if self.cfg.gated_mtp is not None:
+                self.peft_config.trainable_token_indices = list(self.cfg.gated_mtp.mask_token_ids)
 
         # Checkpoint config (model-derived fields are filled in by RecipeConfig)
         checkpoint_config = self.cfg.checkpoint

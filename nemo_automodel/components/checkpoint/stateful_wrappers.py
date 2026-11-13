@@ -320,6 +320,33 @@ def _rename_dora_keys_from_hf(sd: dict[str, Any]) -> None:
             sd[k[: -len(".lora_magnitude_vector")] + ".lora_magnitude"] = sd.pop(k)
 
 
+_TRAINABLE_TOKENS_DELTA_SUFFIX = ".trainable_tokens_delta.default"
+_TRAINABLE_TOKENS_DELTA_HF_SUFFIX = ".trainable_tokens_delta"
+
+
+def _rename_trainable_tokens_keys_to_hf(sd: dict[str, Any]) -> None:
+    """
+    Rename ``trainable_tokens_delta`` keys to match HF PEFT's saved checkpoint format in-place.
+
+    PEFT's ``TrainableTokensLayer`` stores the delta in a ``ParameterDict`` keyed by adapter name,
+    so the raw module state dict carries ``...token_adapter.trainable_tokens_delta.default``. HF
+    PEFT's ``get_peft_model_state_dict`` strips that adapter-name suffix, and
+    ``set_peft_model_state_dict`` re-inserts it on load, so it must NOT be included on disk.
+    """
+    for k in list(sd.keys()):
+        if k.endswith(_TRAINABLE_TOKENS_DELTA_SUFFIX):
+            sd[k[: -len(_TRAINABLE_TOKENS_DELTA_SUFFIX)] + _TRAINABLE_TOKENS_DELTA_HF_SUFFIX] = sd.pop(k)
+
+
+def _rename_trainable_tokens_keys_from_hf(sd: dict[str, Any]) -> None:
+    """
+    Reverse of _rename_trainable_tokens_keys_to_hf: convert HF PEFT key format back to internal names.
+    """
+    for k in list(sd.keys()):
+        if k.endswith(_TRAINABLE_TOKENS_DELTA_HF_SUFFIX) and not k.endswith(_TRAINABLE_TOKENS_DELTA_SUFFIX):
+            sd[k + ".default"] = sd.pop(k)
+
+
 def _get_lm_head_weight_and_name(model: torch.nn.Module) -> tuple[torch.Tensor, str] | None:
     return get_lm_head_weight_and_name(model)
 
@@ -440,7 +467,9 @@ class ModelState:
         # this filtering removes them.
         # TODO: this is a hack and we should find a better way to do this.
         if self.is_peft:
-            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+            model_state_dict = {
+                k: v for k, v in model_state_dict.items() if "lora_" in k or "trainable_tokens_delta" in k
+            }
 
         # Pipeline parallelism partitions layers across PP ranks, so each rank's
         # local adapter (collected above) only covers its own stages. Gather the
@@ -461,6 +490,8 @@ class ModelState:
             _add_outer_prefix(model_state_dict, "base_model.model.")
             # DoRA: rename lora_magnitude to match HF PEFT's expected key format
             _rename_dora_keys_to_hf(model_state_dict)
+            # gated_mtp trainable tokens: drop the adapter-name suffix to match HF PEFT's format
+            _rename_trainable_tokens_keys_to_hf(model_state_dict)
 
         return model_state_dict
 
@@ -495,6 +526,8 @@ class ModelState:
             _drop_outer_prefix(state_dict, "base_model.model.")
             # DoRA: reverse the HF PEFT key rename so DCP can match model params
             _rename_dora_keys_from_hf(state_dict)
+            # gated_mtp trainable tokens: reverse the HF PEFT key rename so DCP can match model params
+            _rename_trainable_tokens_keys_from_hf(state_dict)
             # For EP models, DCP's set_model_state_dict silently skips EP-sharded
             # LoRA params (strict=False hides the FQN mismatch caused by custom
             # expert state_dict() keys like gate_up_linear.weight0). Bypass DCP.

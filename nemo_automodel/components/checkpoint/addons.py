@@ -370,6 +370,8 @@ def _get_hf_peft_config(peft_config: "PeftConfig", model_state: ModelState, v4_c
     }
     if target_parameters:
         config["target_parameters"] = target_parameters
+    if peft_config.trainable_token_indices:
+        config["trainable_token_indices"] = list(peft_config.trainable_token_indices)
     return config
 
 
