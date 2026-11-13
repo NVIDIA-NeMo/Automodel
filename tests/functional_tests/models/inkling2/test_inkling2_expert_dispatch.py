@@ -75,12 +75,18 @@ def _exact_activation(gate_and_up: torch.Tensor, probs: torch.Tensor) -> torch.T
 
 
 def _sparse_ints(shape: tuple[int, ...], density: float, generator: torch.Generator) -> torch.Tensor:
+    """Return a float32 tensor of ``shape`` with values in {-1, 0, 1}, nonzero with probability ``density``."""
     values = torch.randint(-1, 2, shape, generator=generator).float()
     return values * (torch.rand(shape, generator=generator) < density).float()
 
 
 def _rank_inputs(rank: int, config, device: torch.device):
-    """Return one rank's tokens [tokens, hidden], expert ids and routing weights [tokens, top_k], and grad."""
+    """Return one rank's expert inputs.
+
+    Returns:
+        ``(tokens, indices, weights, grad)``: float32 ``[tokens, hidden]`` inputs, int64 ``[tokens, top_k]``
+        expert ids, float32 ``[tokens, top_k]`` routing weights and float32 ``[tokens, hidden]`` output grad.
+    """
     generator = torch.Generator().manual_seed(1000 + rank)
     tokens = _sparse_ints((_TOKENS, config.hidden_size), 0.05, generator)
     indices = torch.stack(
@@ -95,7 +101,17 @@ def _rank_inputs(rank: int, config, device: torch.device):
 
 
 def _reference(config, gate_up: torch.Tensor, down: torch.Tensor, rank: int, device: torch.device) -> dict:
-    """FP64 dense reference over both ranks' tokens (expert gradients accumulate across ranks)."""
+    """FP64 dense reference over both ranks' tokens (expert gradients accumulate across ranks).
+
+    Args:
+        gate_up: ``[experts, hidden, 2 * intermediate]`` gate/up weights, gate and up interleaved on the last dim.
+        down: ``[experts, intermediate, hidden]`` down weights.
+
+    Returns:
+        FP64 tensors for this rank: ``out`` and ``tokens`` ``[tokens, hidden]``, ``weights`` ``[tokens, top_k]``,
+        and the rank's expert-weight grads ``gate_up`` ``[experts / 2, hidden, 2 * intermediate]`` and ``down``
+        ``[experts / 2, intermediate, hidden]``.
+    """
     gate_up = gate_up.double().to(device).requires_grad_()
     down = down.double().to(device).requires_grad_()
     local = {}
@@ -140,10 +156,20 @@ class _Model(nn.Module):
 
 
 def _local(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the local shard of a DTensor (same shape as the rank's slice), or ``tensor`` unchanged."""
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 def _run_backend(dispatcher: str, experts_backend: str, config, gate_up, down, mesh, device) -> dict:
+    """Run one rank's experts on ``dispatcher`` / ``experts_backend`` with the exact activation.
+
+    Args:
+        gate_up: ``[experts, hidden, 2 * intermediate]`` full gate/up weights; the rank keeps its slice.
+        down: ``[experts, intermediate, hidden]`` full down weights.
+
+    Returns:
+        Same keys and shapes as :func:`_reference` (BF16 ``out``/``tokens``, FP32 ``weights``, local expert grads).
+    """
     rank = dist.get_rank()
     backend = BackendConfig(attn="sdpa", linear="torch", experts=experts_backend, dispatcher=dispatcher)
     with torch.device(device):

@@ -36,6 +36,11 @@ of the row's hidden state and that correction into logits, soft-capped like the
 target's. Serving engines fold ``hidden_out`` into the LM head in FP64 to save
 work per step; training computes the same linear map directly.
 
+The arithmetic follows the released checkpoint's serving code, read for the math and written
+independently here: lightseekorg/tokenspeed#3371 (merge commit c485a46a13641db6a1a5f95154cb9202fd657a81,
+``python/tokenspeed/runtime/models/inkling2_mtp.py`` and ``runtime/execution/drafter/inkling2.py``) and
+vllm-project/vllm#67325.
+
 Native parameter names equal the released tensor names, so the 84 tensors of
 ``mtp.safetensors`` load 1:1 and the consolidated export writes the same names
 and shapes. The embedding, its norm and the LM head are the frozen target's and

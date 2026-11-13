@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP32 forward/backward parity of native Inkling 2 against Transformers (text only and image + text).
+"""FP32 and BF16 parity of native Inkling 2 against Transformers (text only and image + text).
 
 Requires a Transformers build with ``inkling2`` (huggingface/transformers#50682, commit
 109a7d19bf667168837f32929e00b791e195d14d or later); the pinned release has none, so this is a
@@ -446,8 +446,9 @@ def main() -> None:
                 f"rel {result['logit_diff'] / result['logit_scale']:.3e}) bitwise-equal={result['exact_fraction']:.4f} "
                 f"router top-k mismatches={result['router_mismatches']}"
             )
-            # Eager uses the reference's ops in the same order; SDPA may pick a fused CPU kernel.
-            if attn == "eager" and result["exact_fraction"] < 0.99:
+            # Eager uses the reference's ops in the same order, so BF16 logits and router picks must match exactly;
+            # SDPA may pick a fused CPU kernel and is reported only.
+            if attn == "eager" and (result["exact_fraction"] != 1.0 or result["router_mismatches"]):
                 failures.append(f"{run} bf16 logits")
     assert not failures, failures
     print("PARITY PASSED")

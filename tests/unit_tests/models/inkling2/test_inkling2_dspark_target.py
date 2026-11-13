@@ -87,6 +87,7 @@ def _target() -> Inkling2ForConditionalGeneration:
 
 
 def _input_ids() -> torch.Tensor:
+    """Return random int64 token ids of shape ``[1, _SEQ]``, avoiding ids 0 and 1."""
     return torch.randint(2, _TEXT_CONFIG["unpadded_vocab_size"], (1, _SEQ), generator=torch.Generator().manual_seed(3))
 
 
