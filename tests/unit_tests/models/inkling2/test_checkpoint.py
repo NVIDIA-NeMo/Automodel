@@ -345,21 +345,30 @@ def write_released_checkpoint_metadata(folder: Path, nvfp4_layers: list[int], mx
     )
 
 
-def test_models_read_the_expert_layout_from_the_checkpoint_sidecar(tmp_path: Path) -> None:
-    write_released_checkpoint_metadata(tmp_path, nvfp4_layers=[0], mxfp8_layers=[1])
+@pytest.mark.parametrize("nvfp4_layer_count", [0, 1])
+def test_models_read_the_expert_layout_from_the_checkpoint_sidecar(tmp_path: Path, nvfp4_layer_count: int) -> None:
+    write_released_checkpoint_metadata(
+        tmp_path, nvfp4_layers=list(range(nvfp4_layer_count)), mxfp8_layers=list(range(nvfp4_layer_count, 2))
+    )
     # The registry loader hands the checkpoint path to from_dict; config.json itself has no declaration.
     config = Inkling2Config.from_dict(json.loads((tmp_path / "config.json").read_text()), name_or_path=str(tmp_path))
     assert config.quantization_config is None and config.text_config.quantization_config is None
-    declaration = {"quant_method": "inkling2", "nvfp4_layer_count": 1}
+    declaration = {"quant_method": "inkling2", "nvfp4_layer_count": nvfp4_layer_count}
     text_model = Inkling2ForCausalLM.from_config(config)
     assert not hasattr(text_model, "visual")
     assert text_model.config is config.text_config and text_model.config.quantization_config == declaration
     assert text_model.config.architectures == ["Inkling2ForCausalLM"] and text_model.name_or_path == str(tmp_path)
-    assert text_model.state_dict_adapter.source_quantized and text_model.state_dict_adapter.nvfp4_layer_count == 1
+    assert (
+        text_model.state_dict_adapter.source_quantized
+        and text_model.state_dict_adapter.nvfp4_layer_count == nvfp4_layer_count
+    )
     config = Inkling2Config.from_dict(json.loads((tmp_path / "config.json").read_text()), name_or_path=str(tmp_path))
     image_model = Inkling2ForConditionalGeneration.from_config(config)
     assert image_model.config.quantization_config == declaration
-    assert image_model.state_dict_adapter.multimodal and image_model.state_dict_adapter.nvfp4_layer_count == 1
+    assert (
+        image_model.state_dict_adapter.multimodal
+        and image_model.state_dict_adapter.nvfp4_layer_count == nvfp4_layer_count
+    )
     # Floating checkpoints, such as the ones training saves, ship no sidecar.
     (tmp_path / "hf_quant_config.json").unlink()
     assert load_quantization_config(str(tmp_path), 2) is None

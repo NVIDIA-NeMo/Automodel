@@ -312,8 +312,10 @@ training covers text; image-text pipeline training uses the non-packed path.
 
 Earlier full-model qualification runs completed 100 MedPix LoRA and SFT
 updates with checkpoint/resume using the optimizer-state fix, and 50 packed
-Tulu 3 updates at 128K. These precede the latest checkpoint-loader and fused-loss
-integration and do not establish performance of those changes. The full-model text-logit comparison
+Tulu 3 updates at 128K. Those runs used the original `tmlinkling_vv3` download, whose long-context
+attention scaling floor is 8192; the public release sets it to 128000. They
+also precede the latest checkpoint-loader and fused-loss integration and do
+not establish performance of the released metadata or those changes. The full-model text-logit comparison
 against the supplied SGLang runtime matched 13 of 15 top tokens on GB300,
 with mean forward KL divergence about 0.01224. This small probe compares
 floating-point training weights against quantized inference and does not

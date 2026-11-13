@@ -540,8 +540,15 @@ def _load_model_releases(repo_root: Path, model_docs: dict[str, list[_ModelDoc]]
             )
             recipe_string = recipe.as_posix()
             release_date = introduction_dates.get((recipe_string, hf_model_id))
-            if release_date is None and addition_dates[recipe_string] == "Unreleased":
-                release_date = "Unreleased"
+            if release_date is None:
+                if addition_dates[recipe_string] == "Unreleased":
+                    release_date = "Unreleased"
+                else:
+                    # A working-tree edit can introduce a new model in an existing
+                    # recipe. Missing history is still an error for IDs already in HEAD.
+                    committed = yaml.safe_load(_run_git(repo_root, ["show", f"HEAD:{recipe_string}"]))
+                    if hf_model_id not in _iter_pretrained_model_ids(committed):
+                        release_date = "Unreleased"
             if release_date is None:
                 raise ValueError(f"Could not find when {hf_model_id} was introduced in {recipe_string}")
             release = _ModelRelease(release_date, hf_model_id, docs_page, model_type, recipe_string)

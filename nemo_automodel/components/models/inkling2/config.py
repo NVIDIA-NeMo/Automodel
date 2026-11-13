@@ -113,7 +113,10 @@ class Inkling2TextConfig(PretrainedConfig):
 
     model_type = "inkling2_model"
     base_config_key = "text_config"
-    attribute_map = {"model_max_length": "max_position_embeddings"}
+    attribute_map = {
+        "model_max_length": "max_position_embeddings",
+        "n_layers_per_attnres_block": "n_layers_per_attn_res_block",
+    }
 
     def __init__(
         self,
@@ -140,7 +143,8 @@ class Inkling2TextConfig(PretrainedConfig):
         qk_l2_clip_threshold: float = 22.627416997969522,
         rel_l2_clip_threshold: float = 8.0,
         sconv_kernel_size: int = 4,
-        n_layers_per_attnres_block: int = 6,
+        n_layers_per_attn_res_block: int | None = None,
+        n_layers_per_attnres_block: int | None = None,
         attn_res_normalize_values: bool = True,
         pre_norm_pre_affine: bool = False,
         final_norm_pre_affine: bool = False,
@@ -199,7 +203,19 @@ class Inkling2TextConfig(PretrainedConfig):
         self.qk_l2_clip_threshold = qk_l2_clip_threshold
         self.rel_l2_clip_threshold = rel_l2_clip_threshold
         self.sconv_kernel_size = sconv_kernel_size
-        self.n_layers_per_attnres_block = n_layers_per_attnres_block
+        if (
+            n_layers_per_attn_res_block is not None
+            and n_layers_per_attnres_block is not None
+            and n_layers_per_attn_res_block != n_layers_per_attnres_block
+        ):
+            raise ValueError("Conflicting attention residual block sizes in current and legacy config fields")
+        self.n_layers_per_attn_res_block = (
+            n_layers_per_attn_res_block
+            if n_layers_per_attn_res_block is not None
+            else n_layers_per_attnres_block
+            if n_layers_per_attnres_block is not None
+            else 6
+        )
         self.attn_res_normalize_values = attn_res_normalize_values
         self.pre_norm_pre_affine = pre_norm_pre_affine
         self.final_norm_pre_affine = final_norm_pre_affine
@@ -254,7 +270,7 @@ class Inkling2TextConfig(PretrainedConfig):
             raise ValueError("unpadded_vocab_size must be within the embedding vocabulary")
         if not 1 < num_experts_per_tok <= n_routed_experts:
             raise ValueError("The Inkling2 reference requires 1 < num_experts_per_tok <= n_routed_experts")
-        if not 0 < n_layers_per_attnres_block <= num_hidden_layers:
+        if not 0 < self.n_layers_per_attn_res_block <= num_hidden_layers:
             raise ValueError("Attention residual block size must be within the layer count")
         if len(set(self.local_layer_ids)) != len(self.local_layer_ids) or any(
             i < 0 or i >= num_hidden_layers for i in self.local_layer_ids
@@ -336,7 +352,7 @@ class Inkling2VisionConfig(PretrainedConfig):
 class Inkling2Config(PretrainedConfig):
     """Released image/text model configuration and optional source quantization."""
 
-    model_type = "inkling2_mm_model"
+    model_type = "inkling2"
     sub_configs = {"text_config": Inkling2TextConfig, "vision_config": Inkling2VisionConfig}
 
     def __init__(
@@ -365,4 +381,15 @@ class Inkling2Config(PretrainedConfig):
         )
         self.text_config.quantization_config = self.quantization_config
         kwargs.setdefault("tie_word_embeddings", False)
+        super().__init__(**kwargs)
+
+
+class Inkling2LegacyConfig(Inkling2Config):
+    """Compatibility with the original download's immutable configuration."""
+
+    model_type = "inkling2_mm_model"
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Transformers dataclass-wraps subclasses without an explicit initializer.
+        # Delegate so nested text/vision dictionaries retain their typed conversion.
         super().__init__(**kwargs)

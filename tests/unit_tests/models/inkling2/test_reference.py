@@ -433,3 +433,38 @@ def test_relative_only_attention_probabilities_do_not_depend_on_head_width(layer
     torch.testing.assert_close(result[0, 1, :, 0], torch.full((module.heads,), 0.5))
     gradient = torch.autograd.grad(result[0, 1, 0, 0], profiles)[0]
     torch.testing.assert_close(gradient[0, 0, 1, :2], torch.tensor([-1 / 6, 1 / 4]))
+
+
+@pytest.mark.parametrize(
+    ("fixture", "model_type", "scaling_floor"),
+    [("checkpoint_config.json", "inkling2_mm_model", 8192), ("released_config.json", "inkling2", 128000)],
+)
+def test_checkpoint_autoconfig_round_trip(tmp_path: Path, fixture: str, model_type: str, scaling_floor: int) -> None:
+    """Load actual checkpoint metadata through AutoConfig without downloading weights."""
+    metadata = (Path(__file__).parent / fixture).read_text()
+    (tmp_path / "config.json").write_text(metadata)
+    config = AutoConfig.from_pretrained(tmp_path)
+    assert isinstance(config, Inkling2Config)
+    assert config.model_type == model_type
+    assert config.architectures == ["Inkling2ForConditionalGeneration"]
+    assert config.text_config.log_scaling_n_floor == scaling_floor
+    assert config.text_config.n_layers_per_attn_res_block == 6
+    assert config.text_config.n_layers_per_attnres_block == 6
+    assert config.text_config.max_position_embeddings == 1048576
+    config.save_pretrained(tmp_path / "saved")
+    restored = AutoConfig.from_pretrained(tmp_path / "saved")
+    assert type(restored) is type(config)
+    assert restored.text_config.to_dict() == config.text_config.to_dict()
+
+
+@pytest.mark.parametrize("field", ["n_layers_per_attn_res_block", "n_layers_per_attnres_block"])
+def test_residual_block_config_alias(field: str) -> None:
+    """A non-default block size must reach model boundaries through either spelling."""
+    config = Inkling2TextConfig(**{field: 4})
+    assert config.n_layers_per_attn_res_block == config.n_layers_per_attnres_block == 4
+    serialized = config.to_dict()
+    assert serialized["n_layers_per_attn_res_block"] == 4
+    assert "n_layers_per_attnres_block" not in serialized
+    assert Inkling2TextConfig.from_dict(serialized).n_layers_per_attnres_block == 4
+    with pytest.raises(ValueError, match="Conflicting attention residual block sizes"):
+        Inkling2TextConfig(n_layers_per_attn_res_block=4, n_layers_per_attnres_block=6)

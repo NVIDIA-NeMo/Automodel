@@ -893,3 +893,28 @@ def test_missing_history_for_committed_recipe_still_fails(tmp_path: Path, monkey
     monkeypatch.setattr(coverage, "_run_git", missing_history)
     with pytest.raises(ValueError, match="Missing recipe additions"):
         coverage._load_recipe_addition_dates(tmp_path)
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_changed_recipe_model_can_be_validated_before_commit(tmp_path: Path, staged: bool):
+    recipe = tmp_path / "examples/llm_finetune/model.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("model:\n  pretrained_model_name_or_path: org/original\n")
+    _commit_recipes(tmp_path)
+    recipe.write_text("model:\n  pretrained_model_name_or_path: org/released\n")
+    if staged:
+        subprocess.run(["git", "-C", str(tmp_path), "add", str(recipe)], check=True)
+    releases = _load_model_releases(tmp_path, {})
+    assert [(release.hf_model_id, release.release_date) for release in releases] == [("org/released", "Unreleased")]
+
+
+def test_missing_introduction_for_committed_model_still_fails(tmp_path: Path, monkeypatch):
+    from tools.docs.build import coverage_tables as coverage
+
+    recipe = tmp_path / "examples/llm_finetune/model.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("model:\n  pretrained_model_name_or_path: org/model\n")
+    _commit_recipes(tmp_path)
+    monkeypatch.setattr(coverage, "_load_model_introduction_dates", lambda root: {})
+    with pytest.raises(ValueError, match="Could not find when org/model"):
+        _load_model_releases(tmp_path, {})
