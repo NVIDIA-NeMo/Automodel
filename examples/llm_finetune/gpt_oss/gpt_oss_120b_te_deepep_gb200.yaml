@@ -115,6 +115,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  functional: skipped
   cluster_tag: gb200
   recipe_owner: akoumpa
   local_batch_size: 4

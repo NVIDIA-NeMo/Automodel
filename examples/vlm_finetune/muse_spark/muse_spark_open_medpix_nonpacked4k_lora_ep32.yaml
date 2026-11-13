@@ -138,6 +138,7 @@ peft:
   moe_rank_scaling: false
 
 ci:
+  functional: release
   recipe_owner: HuiyingLi
   nodes: 8
   nproc_per_node: 4

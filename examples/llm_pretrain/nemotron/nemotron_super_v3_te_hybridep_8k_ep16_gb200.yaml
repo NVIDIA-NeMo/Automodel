@@ -85,6 +85,7 @@ wandb:
   mode: online
   name: nemotron-super-v3-te-hybridep-8k-ep16-gb200
 ci:
+  functional: skipped
   recipe_owner: HuiyingLi
   time: 00:15:00
   nodes: 4

@@ -93,4 +93,5 @@ checkpoint:
   max_recent_checkpoints: 2
 
 ci:
+  functional: skipped
   cluster_tag: h100

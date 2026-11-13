@@ -123,6 +123,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  functional: release
   cluster_tag: h100
   recipe_owner: akoumpa  #PR4637: hemildesai
   local_batch_size: 1  #PR4637: 8

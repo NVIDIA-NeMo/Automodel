@@ -152,4 +152,5 @@ checkpoint:
   # restore_from: LATEST
 
 ci:
+  functional: skipped
   cluster_tag: h100

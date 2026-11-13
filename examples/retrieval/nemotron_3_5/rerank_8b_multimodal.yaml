@@ -97,4 +97,5 @@ checkpoint:
   save_consolidated: final
 
 ci:
+  functional: skipped
   cluster_tag: h100

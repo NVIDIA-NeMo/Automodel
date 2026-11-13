@@ -148,6 +148,7 @@ step_scheduler:
 wandb:
   enable: false
 ci:
+  functional: skipped
   cluster_tag: h100
   nodes: 8
   nproc_per_node: 8

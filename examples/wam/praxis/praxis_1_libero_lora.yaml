@@ -93,6 +93,7 @@ checkpoint:
   restore_from: null
 
 ci:
+  functional: skipped
   cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "02:30:00"

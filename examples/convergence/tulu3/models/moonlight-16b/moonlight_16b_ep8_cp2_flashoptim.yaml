@@ -118,4 +118,5 @@ moe_metrics:
   mode: brief
 
 ci:
+  functional: skipped
   cluster_tag: h100

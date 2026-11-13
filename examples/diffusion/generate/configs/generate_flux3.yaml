@@ -20,4 +20,5 @@ output:
 seed: 42
 
 ci:
+  functional: skipped
   cluster_tag: h100

@@ -74,4 +74,5 @@ checkpoint:
   save_consolidated: false
 
 ci:
+  functional: skipped
   cluster_tag: h100

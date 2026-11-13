@@ -16,10 +16,11 @@
 """Validate that generate_ci_tests.generate_pipeline runs cleanly for every
 (test_folder, scope) combination defined in this repo.
 
-The matrix is auto-discovered from two sources of truth so the check stays current
+The matrix is auto-discovered from the sources of truth so the check stays current
 without manual maintenance:
-  * AUTO_DISCOVER_SCOPES in generate_ci_tests.py (e.g. release, performance)
-  * tests/ci_tests/configs/<folder>/<scope>_recipes.yml files
+  * FUNCTIONAL_SCOPES x FUNCTIONAL_TEST_FOLDERS in generate_ci_tests.py (nightly, release)
+  * AUTO_DISCOVER_SCOPES in generate_ci_tests.py (performance)
+  * tests/ci_tests/configs/<folder>/<scope>_recipes.yml files (convergence)
 
 Each combination is invoked; failures are collected and reported together so a
 single broken combo does not hide the rest.
@@ -32,12 +33,21 @@ from pathlib import Path
 
 # Allow `from generate_ci_tests import ...` when this script is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from generate_ci_tests import AUTO_DISCOVER_SCOPES, generate_pipeline  # noqa: E402
+from generate_ci_tests import (  # noqa: E402
+    AUTO_DISCOVER_SCOPES,
+    FUNCTIONAL_SCOPES,
+    FUNCTIONAL_TEST_FOLDERS,
+    generate_pipeline,
+)
 
 
 def collect_matrix(automodel_dir: Path) -> list[tuple[str, str]]:
     """Discover every (test_folder, scope) pair worth validating."""
     matrix: set[tuple[str, str]] = set()
+
+    for scope in FUNCTIONAL_SCOPES:
+        for folder in FUNCTIONAL_TEST_FOLDERS:
+            matrix.add((folder, scope))
 
     for scope, folders in AUTO_DISCOVER_SCOPES.items():
         for folder in folders:
@@ -52,8 +62,8 @@ def collect_matrix(automodel_dir: Path) -> list[tuple[str, str]]:
         scope = recipe_list.stem[: -len("_recipes")]
         matrix.add((folder, scope))
 
-    # Also exercise every config folder with scope=nightly so folders without a
-    # nightly_recipes.yml hit the empty-pipeline path.
+    # Also exercise every config folder with scope=nightly so folders outside the
+    # functional scopes hit the empty-pipeline path.
     for config_dir in configs_root.iterdir():
         if config_dir.is_dir():
             matrix.add((config_dir.name, "nightly"))

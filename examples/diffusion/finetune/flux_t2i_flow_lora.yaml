@@ -109,6 +109,7 @@ checkpoint:
   restore_from: null
 
 ci:
+  functional: nightly,release
   cluster_tag: h100
   recipe_owner: pthombre
   time: "00:30:00"

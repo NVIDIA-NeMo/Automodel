@@ -135,6 +135,7 @@ packed_sequence:
   packed_sequence_size: 8192
   packing_strategy: neat
 ci:
+  functional: release
   recipe_owner: HuiyingLi
   nodes: 16  #PR4637: 11
   cluster_tag: h100  #PR4637: gb200

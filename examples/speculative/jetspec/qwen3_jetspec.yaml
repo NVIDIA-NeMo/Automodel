@@ -73,4 +73,5 @@ checkpoint:
 #   name: qwen3-8b-jetspec
 
 ci:
+  functional: skipped
   cluster_tag: h100

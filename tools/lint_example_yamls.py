@@ -27,6 +27,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+# The CI pipeline generator owns the `ci.functional` values it reads.
+from tests.ci_tests.utils.generate_ci_tests import (  # noqa: E402
+    FUNCTIONAL_TEST_FOLDERS,
+    functional_scopes,
+    functional_test_folder,
+)
+
 
 @dataclass(frozen=True)
 class LintError:
@@ -90,7 +97,7 @@ def lint_yaml_text(text: str, path: Path, automodel_dir: Path) -> list[LintError
     if document is None:
         if _relative_path(path, automodel_dir) in EXCLUDED_RECIPE_FILES:
             return []
-        return _lint_ci_cluster_tag(path, {}, [])
+        return [*_lint_ci_cluster_tag(path, {}, []), *_lint_ci_functional(path, {}, None, [], automodel_dir)]
     if not isinstance(document, yaml.MappingNode):
         return [LintError(path, document.start_mark.line + 1, "Top-level YAML document must be a mapping.")]
     if not isinstance(data, dict):
@@ -102,6 +109,7 @@ def lint_yaml_text(text: str, path: Path, automodel_dir: Path) -> list[LintError
     if _relative_path(path, automodel_dir) not in EXCLUDED_RECIPE_FILES:
         errors.extend(_lint_ci_cluster_tag(path, data, key_lines))
         errors.extend(_lint_ci_perf_testing(path, data, document, key_lines))
+        errors.extend(_lint_ci_functional(path, data, document, key_lines, automodel_dir))
     if _should_require_recipe(path, automodel_dir):
         errors.extend(_lint_recipe_target(path, data, key_lines, automodel_dir))
     return errors
@@ -153,6 +161,52 @@ def _lint_ci_cluster_tag(path: Path, data: dict, key_lines: list[tuple[str, int]
             "Recipe must declare a nonempty `ci.cluster_tag` (e.g. h100, gb200, gb10) or `ci.deprecated: true`.",
         )
     ]
+
+
+def _lint_ci_functional(
+    path: Path,
+    data: dict,
+    document: yaml.MappingNode | None,
+    key_lines: list[tuple[str, int]],
+    automodel_dir: Path,
+) -> list[LintError]:
+    """Require ``ci.functional``, the NeMo-CI functional scopes that run the recipe.
+
+    The value is ``nightly``, ``release``, ``nightly,release``, or ``skipped``. A deprecated
+    recipe, or one outside the functional test folders, runs in no functional scope, so it
+    must declare ``skipped``.
+
+    Args:
+        path: Path of the YAML file being linted.
+        data: The parsed YAML mapping.
+        document: The composed top-level YAML mapping node, used for line numbers.
+        key_lines: ``(key, line)`` pairs for the document's top-level keys.
+        automodel_dir: Repository root, used to locate the recipe's test folder.
+
+    Returns:
+        A lint error for a missing, invalid, or inapplicable value; empty if the value is valid.
+    """
+    ci = data.get("ci")
+    ci = ci if isinstance(ci, dict) else {}
+    line = _mapping_key_lines(_child_node(document, "ci")).get("functional", dict(key_lines).get("ci", 1))
+    try:
+        scopes = functional_scopes(ci)
+    except ValueError as exc:
+        return [LintError(path, line, f"{exc}.")]
+    if not scopes:
+        return []
+    if ci.get("deprecated") is True:
+        return [LintError(path, line, "A deprecated recipe runs no tests; set `ci.functional: skipped`.")]
+    if functional_test_folder(_relative_path(path, automodel_dir)) is None:
+        folders = ", ".join(f"examples/{subpath}" for subpath in FUNCTIONAL_TEST_FOLDERS.values())
+        return [
+            LintError(
+                path,
+                line,
+                f"Functional CI runs only recipes under {folders}; set `ci.functional: skipped`.",
+            )
+        ]
+    return []
 
 
 PERF_TESTING_KEYS = ("schedule", "time", "fake_balanced_gate", "validation")

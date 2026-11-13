@@ -157,4 +157,5 @@ dataloader:
   shuffle: true
 
 ci:
+  functional: skipped
   cluster_tag: h100

@@ -122,6 +122,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  functional: release
   cluster_tag: h100
   recipe_owner: Hayden727
   nodes: 32

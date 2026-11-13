@@ -122,4 +122,5 @@ dataloader:
   group_by_length: true
 
 ci:
+  functional: skipped
   cluster_tag: h100

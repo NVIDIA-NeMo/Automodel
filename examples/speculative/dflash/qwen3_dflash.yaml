@@ -77,4 +77,5 @@ checkpoint:
 #   name: qwen3-8b-dflash
 
 ci:
+  functional: skipped
   cluster_tag: h100

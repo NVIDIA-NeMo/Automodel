@@ -117,6 +117,7 @@ optimizer:
 
   foreach: false
 ci:
+  functional: skipped
   cluster_tag: gb200
   recipe_owner: akoumpa
   node_multiplier: true

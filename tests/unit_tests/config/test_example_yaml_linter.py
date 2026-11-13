@@ -28,6 +28,7 @@ def test_linter_accepts_valid_example_recipe():
                 "model:",
                 "  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained",
                 "ci:",
+                "  functional: release",
                 "  cluster_tag: h100",
                 "  recipe_owner: test",
                 "",
@@ -42,7 +43,9 @@ def test_linter_accepts_valid_example_recipe():
 
 def test_linter_requires_recipe_target():
     errors = lint_yaml_text(
-        "model: {}\nci:\n  cluster_tag: h100\n", Path("examples/llm_finetune/missing_recipe.yaml"), Path.cwd()
+        "model: {}\nci:\n  cluster_tag: h100\n  functional: skipped\n",
+        Path("examples/llm_finetune/missing_recipe.yaml"),
+        Path.cwd(),
     )
 
     assert len(errors) == 1
@@ -52,7 +55,7 @@ def test_linter_requires_recipe_target():
 @pytest.mark.parametrize("cluster_tag", ["h100", "gb200", "gb10", "h100|gb200"])
 def test_linter_accepts_explicit_cluster_tag(cluster_tag: str) -> None:
     errors = lint_yaml_text(
-        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: {cluster_tag}\n",
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: {cluster_tag}\n  functional: skipped\n",
         Path("examples/llm_finetune/tagged.yaml"),
         Path.cwd(),
     )
@@ -64,8 +67,9 @@ def test_linter_accepts_explicit_cluster_tag(cluster_tag: str) -> None:
 def test_linter_rejects_empty_recipe(text: str) -> None:
     errors = lint_yaml_text(text, Path("examples/llm_finetune/empty.yaml"), Path.cwd())
 
-    assert len(errors) == 1
+    assert len(errors) == 2
     assert "`ci.cluster_tag`" in errors[0].message
+    assert "`ci.functional` is missing" in errors[1].message
 
 
 @pytest.mark.parametrize("ci_text", ["", "ci: null\n", "ci: []\n", "ci: h100\n", "ci: {}\n"])
@@ -76,16 +80,16 @@ def test_linter_requires_ci_cluster_metadata(ci_text: str) -> None:
         Path.cwd(),
     )
 
-    assert len(errors) == 1
+    assert [error.line for error in errors] == [2 if ci_text else 1] * 2
     assert "`ci.cluster_tag`" in errors[0].message
     assert "`ci.deprecated: true`" in errors[0].message
-    assert errors[0].line == (2 if ci_text else 1)
+    assert "`ci.functional` is missing" in errors[1].message
 
 
 @pytest.mark.parametrize("value", ["null", "''", "'   '", "100", "true", "[]", "{}"])
 def test_linter_rejects_empty_or_nonstring_cluster_tag(value: str) -> None:
     errors = lint_yaml_text(
-        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: {value}\n",
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: {value}\n  functional: skipped\n",
         Path("examples/llm_finetune/invalid_tag.yaml"),
         Path.cwd(),
     )
@@ -97,7 +101,7 @@ def test_linter_rejects_empty_or_nonstring_cluster_tag(value: str) -> None:
 @pytest.mark.parametrize("deprecated", ["true", "false", "'true'", "1", "null"])
 def test_linter_only_exempts_boolean_deprecated_true(deprecated: str) -> None:
     errors = lint_yaml_text(
-        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  deprecated: {deprecated}\n",
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  deprecated: {deprecated}\n  functional: skipped\n",
         Path("examples/llm_finetune/deprecated.yaml"),
         Path.cwd(),
     )
@@ -114,9 +118,10 @@ def test_linter_checks_cluster_tag_when_recipe_target_is_exempt(folder: str) -> 
     path = Path("examples") / folder / "untagged.yaml"
     errors = lint_yaml_text("model: {}\n", path, Path.cwd())
 
-    assert len(errors) == 1
+    assert len(errors) == 2
     assert "`ci.cluster_tag`" in errors[0].message
-    assert lint_yaml_text("model: {}\nci:\n  cluster_tag: h100\n", path, Path.cwd()) == []
+    assert "`ci.functional` is missing" in errors[1].message
+    assert lint_yaml_text("model: {}\nci:\n  cluster_tag: h100\n  functional: skipped\n", path, Path.cwd()) == []
 
 
 def test_linter_exempts_command_only_precompute_configs():
@@ -215,7 +220,12 @@ def test_linter_rejects_duplicate_top_level_keys():
 
 
 def _perf_text(perf_block: str) -> str:
-    return "recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: h100\n  perf_testing:\n" + perf_block
+    # `functional` follows the block so the asserted perf_testing line numbers stay put.
+    return (
+        "recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: h100\n  perf_testing:\n"
+        + perf_block
+        + "  functional: skipped\n"
+    )
 
 
 def _perf_errors(block: str, *, default_schedule: bool = True):
@@ -327,7 +337,7 @@ def test_linter_still_validates_perf_testing_for_deprecated_recipes():
 def test_linter_checks_the_last_duplicate_perf_testing_section(first: str, second: str, invalid_line: int | None):
     text = (
         "recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: h100\n"
-        f"  perf_testing:\n    schedule: {first}\n  perf_testing:\n    schedule: {second}\n"
+        f"  perf_testing:\n    schedule: {first}\n  perf_testing:\n    schedule: {second}\n  functional: skipped\n"
     )
 
     errors = lint_yaml_text(text, Path("examples/llm_finetune/perf.yaml"), Path.cwd())
@@ -359,3 +369,66 @@ def test_linter_rejects_duplicate_performance_validation() -> None:
     errors = _perf_errors("    validation: true\n    validation: false\n")
     assert len(errors) == 1
     assert "Duplicate key `validation`" in errors[0].message
+
+
+def _functional_errors(value: str, *, path: str = "examples/llm_finetune/recipe.yaml", extra: str = ""):
+    """Lint a recipe whose ``ci.functional`` is ``value``, after any ``extra`` ``ci`` lines."""
+    text = (
+        f"recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: h100\n{extra}  functional: {value}\n"
+    )
+    return lint_yaml_text(text, Path(path), Path.cwd())
+
+
+@pytest.mark.parametrize("value", ["nightly", "release", "nightly,release", "skipped"])
+def test_linter_accepts_functional_values(value: str) -> None:
+    assert _functional_errors(value) == []
+
+
+def test_linter_requires_functional() -> None:
+    errors = lint_yaml_text(
+        "recipe: TrainFinetuneRecipeForNextTokenPrediction\nci:\n  cluster_tag: h100\n",
+        Path("examples/llm_finetune/recipe.yaml"),
+        Path.cwd(),
+    )
+
+    assert len(errors) == 1
+    assert "`ci.functional` is missing" in errors[0].message
+    assert errors[0].line == 2
+
+
+@pytest.mark.parametrize(
+    "value", ["release,nightly", "'nightly, release'", "nightly,skipped", "test", "true", "''", "null", "[nightly]"]
+)
+def test_linter_rejects_other_functional_values(value: str) -> None:
+    errors = _functional_errors(value)
+
+    assert len(errors) == 1
+    assert "`ci.functional` is" in errors[0].message
+    assert "one of: nightly, release, nightly,release, skipped" in errors[0].message
+    assert errors[0].line == 4
+
+
+@pytest.mark.parametrize("value", ["nightly", "release", "nightly,release"])
+def test_linter_requires_skipped_functional_for_deprecated_recipes(value: str) -> None:
+    errors = _functional_errors(value, extra="  deprecated: true\n")
+
+    assert len(errors) == 1
+    assert "A deprecated recipe runs no tests" in errors[0].message
+    assert errors[0].line == 5
+    assert _functional_errors("skipped", extra="  deprecated: true\n") == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "examples/llm_benchmark/recipe.yaml",
+        "examples/diffusion/generate/recipe.yaml",
+        "examples/retrieval/nemotron_3_5/recipe.yaml",
+    ],
+)
+def test_linter_requires_skipped_functional_outside_functional_folders(path: str) -> None:
+    errors = _functional_errors("nightly", path=path)
+
+    assert len(errors) == 1
+    assert "Functional CI runs only recipes under examples/llm_finetune" in errors[0].message
+    assert _functional_errors("skipped", path=path) == []

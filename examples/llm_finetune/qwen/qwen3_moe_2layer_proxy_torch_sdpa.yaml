@@ -137,6 +137,7 @@ optimizer:
 
 
 ci:
+  functional: release
   cluster_tag: h100
   recipe_owner: hemildesai
   local_batch_size: 2

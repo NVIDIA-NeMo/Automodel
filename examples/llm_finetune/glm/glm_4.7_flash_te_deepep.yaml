@@ -136,6 +136,7 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  functional: release
   cluster_tag: h100
   recipe_owner: akoumpa  #PR4637: hemildesai
   nodes: 1

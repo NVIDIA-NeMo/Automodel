@@ -187,4 +187,5 @@ wandb:
   name: bagel_mot_pretrain
 
 ci:
+  functional: skipped
   cluster_tag: h100

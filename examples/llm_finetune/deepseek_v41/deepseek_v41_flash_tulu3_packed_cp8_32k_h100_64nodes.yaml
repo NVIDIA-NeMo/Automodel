@@ -201,6 +201,7 @@ wandb:
   dir: ../logs/wandb
 
 ci:
+  functional: release
   recipe_owner: linmuchuiyang
   nodes: 64
   time: "01:00:00"

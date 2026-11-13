@@ -112,4 +112,5 @@ optimizer:
   warmup_ratio: 0.015
 
 ci:
+  functional: skipped
   cluster_tag: h100

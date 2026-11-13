@@ -139,6 +139,7 @@ wandb:
   dir: <your_wandb_save_dir>
 
 ci:
+  functional: release
   cluster_tag: h100
   recipe_owner: athitten
   nodes: 16

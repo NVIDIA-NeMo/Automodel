@@ -121,4 +121,5 @@ loss:
   anchor_weight: 0.1
 
 ci:
+  functional: skipped
   cluster_tag: h100

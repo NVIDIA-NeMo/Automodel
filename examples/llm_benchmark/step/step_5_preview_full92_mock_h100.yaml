@@ -142,6 +142,7 @@ wandb:
   enable: false
 
 ci:
+  functional: skipped
   recipe_owner: HuiyingLi
   nodes: 16
   cluster_tag: h100

@@ -146,4 +146,5 @@ lr_scheduler:
 nvtx: false
 
 ci:
+  functional: release
   cluster_tag: h100

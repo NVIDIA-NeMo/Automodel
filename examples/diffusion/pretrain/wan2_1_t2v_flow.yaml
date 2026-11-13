@@ -80,4 +80,5 @@ checkpoint:
   restore_from: null
 
 ci:
+  functional: skipped
   cluster_tag: h100

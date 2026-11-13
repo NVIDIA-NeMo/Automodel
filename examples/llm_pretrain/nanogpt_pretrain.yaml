@@ -87,4 +87,5 @@ distributed:
   sequence_parallel: false
 
 ci:
+  functional: skipped
   cluster_tag: h100

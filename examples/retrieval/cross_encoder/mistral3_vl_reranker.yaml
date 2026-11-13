@@ -98,4 +98,5 @@ distributed:
   activation_checkpointing_scope: all
 
 ci:
+  functional: skipped
   cluster_tag: h100

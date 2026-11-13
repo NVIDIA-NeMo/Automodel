@@ -78,6 +78,7 @@ rng:
   seed: 1234
   ranked: true
 ci:
+  functional: skipped
   cluster_tag: h100
   recipe_owner: akoumpa
   time: 01:30:00

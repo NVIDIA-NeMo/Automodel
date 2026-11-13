@@ -74,4 +74,5 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 ci:
+  functional: skipped
   cluster_tag: h100

@@ -125,4 +125,5 @@ checkpoint:
   restore_from: null
 
 ci:
+  functional: release
   cluster_tag: h100

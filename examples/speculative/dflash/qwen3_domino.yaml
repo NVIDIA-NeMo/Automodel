@@ -82,4 +82,5 @@ checkpoint:
 #   name: qwen3-8b-domino
 
 ci:
+  functional: skipped
   cluster_tag: h100

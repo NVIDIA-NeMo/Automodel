@@ -197,6 +197,7 @@ wandb:
   dir: ../logs/wandb
 
 ci:
+  functional: release
   recipe_owner: huiyingl
   nodes: 16
   cluster_tag: gb200

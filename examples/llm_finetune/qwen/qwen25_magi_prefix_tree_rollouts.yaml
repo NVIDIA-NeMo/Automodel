@@ -108,6 +108,7 @@ optimizer:
   foreach: false
 
 ci:
+  functional: release
   cluster_tag: h100
   recipe_owner: huiyingl
   time: "00:20:00"
