@@ -30,9 +30,16 @@ written by either library loads in the other. The pinned Transformers release ha
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from transformers.configuration_utils import PretrainedConfig
+
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
+
+    from nemo_automodel.components.distributed.config import DistributedSetup
+    from nemo_automodel.components.models.inkling2.dspark import Inkling2DSparkModel, Inkling2DSparkOptions
 
 _SLIDING_LAYER_TYPE = "hybrid_sliding"
 _FULL_LAYER_TYPE = "hybrid"
@@ -254,6 +261,57 @@ class Inkling2Config(PretrainedConfig):
         self.image_token_id = image_token_id
         self.mtp_config = mtp_config
         super().__init__(**kwargs)
+
+    def build_dspark_draft(self, options: Inkling2DSparkOptions) -> Inkling2DSparkModel:
+        """Build the DSpark draft in the released ``mtp.safetensors`` layout.
+
+        Args:
+            options: Declarative draft settings supplied by the DSpark recipe; they must agree
+                with ``mtp_config``.
+
+        Returns:
+            Newly initialized draft ready for device placement.
+
+        Raises:
+            ValueError: If the checkpoint has no ``mtp_config`` or an option disagrees with it.
+        """
+        from nemo_automodel.components.models.inkling2.dspark import Inkling2DSparkConfig
+
+        if self.mtp_config is None:
+            raise ValueError("This Inkling 2 config has no mtp_config, so it defines no DSpark draft.")
+        return Inkling2DSparkConfig.from_options(self.text_config, self.mtp_config, options).build()
+
+    def build_dspark_target(
+        self,
+        *,
+        target_path: str,
+        trust_remote_code: bool,
+        device: torch.device,
+        compute_dtype: torch.dtype,
+        distributed_setup: DistributedSetup,
+        load_metadata_with_gloo: bool,
+    ) -> nn.Module:
+        """Load the frozen DSpark target on the recipe's expert-parallel / FSDP mesh.
+
+        Args:
+            target_path: Hub id or local directory of this checkpoint.
+            trust_remote_code: Forwarded to the checkpoint loaders.
+            device: Resolved execution device.
+            compute_dtype: Precision used to load and run the frozen target.
+            distributed_setup: Runtime parallelism configuration composed by the recipe.
+            load_metadata_with_gloo: Read checkpoint metadata over Gloo.
+
+        Returns:
+            The pretrained target, frozen and in eval mode.
+        """
+        from nemo_automodel.components.models.inkling2.dspark_target import Inkling2DSparkTargetConfig
+
+        return Inkling2DSparkTargetConfig(target_path=target_path, trust_remote_code=trust_remote_code).build(
+            device=device,
+            compute_dtype=compute_dtype,
+            distributed_setup=distributed_setup,
+            load_metadata_with_gloo=load_metadata_with_gloo,
+        )
 
 
 __all__ = ["Inkling2Config", "Inkling2TextConfig", "Inkling2VisionConfig"]

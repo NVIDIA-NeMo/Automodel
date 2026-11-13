@@ -43,8 +43,8 @@ the regenerated JSONL or a Hugging Face dataset id.
 ## Run It
 
 Example configs live under `examples/speculative/dspark/`
-(`qwen3_0.6b_dspark.yaml`, `gemma4_12b_dspark.yaml`, and
-`deepseek_v41_flash_dspark.yaml`). Multi-GPU defaults to
+(`qwen3_0.6b_dspark.yaml`, `gemma4_12b_dspark.yaml`,
+`deepseek_v41_flash_dspark.yaml`, and `inkling2_small_dspark.yaml`). Multi-GPU defaults to
 **FSDP2** (`distributed.strategy: fsdp2`); set it to `ddp` for simple data
 parallelism.
 
@@ -68,7 +68,7 @@ are reduced across data-parallel ranks and written to
 | `num_anchors` | blocks sampled per sequence per step |
 | `target_layer_ids` | target feature layers fed to the draft (defaults to an even spread) |
 | `mask_token_id` | reserved token id filling non-anchor block positions |
-| `markov_rank` / `markov_head_type` | serial head size and variant (`vanilla` / `gated` / `rnn`) |
+| `markov_rank` / `markov_head_type` | serial head size and variant (`vanilla` / `gated` / `rnn`; `rnn_hidden` for Inkling 2) |
 | `confidence_head_alpha` / `confidence_head_with_markov` | confidence-head weight and conditioning |
 | `confidence_head_stop_gradient` | DeepSeek V4.1 only: train the confidence head on detached inputs so its loss cannot back-propagate into the draft backbone (default `false`) |
 | `packed_sequence_size` | packs documents into rows of this many tokens when greater than 0 (Qwen3, DeepSeek V4, and DeepSeek V4.1 targets; online text-only data with `cp_size: 1` and `target_model_backend: colocated`) |
@@ -171,5 +171,41 @@ so its drafts keep native keys and take the FFN width from `intermediate_size`. 
 local M3.1 snapshot needs its `dspark/` folder too; without it the recipe logs a
 warning and builds that same draft.
 
+## Inkling 2 Small
+
+[`inkling2_small_dspark.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/dspark/inkling2_small_dspark.yaml)
+trains a draft in the layout of the checkpoint's released `mtp.safetensors`. The
+`mtp_config` section of the target's `config.json` fixes the draft and the recipe
+rejects mismatches:
+
+| Field | Inkling 2 Small value |
+|-------|------------------------|
+| `draft_num_hidden_layers` | `5` |
+| `block_size` | `7` (the checkpoint's 8 slots include the anchor) |
+| `target_layer_ids` | `[4, 10, 16, 22, 28, 34, 40, 47]` |
+| `markov_rank` / `markov_head_type` | `256` / `rnn_hidden` |
+| `confidence_head_alpha` | `0` (the release has no confidence head) |
+| `freeze_embeddings` | `true` |
+| draft FFN | dense, hidden width `18432` |
+| draft attention | layer 2 sees the whole prefix, the others the 1024 tokens before the anchor |
+
+The draft differs from the other DSpark drafts in four ways. Each draft layer and
+the Markov head mix the eight target features with their own softmax weights and
+normalize the mix, and each layer projects its mix into context keys and values
+with dedicated weights. The anchor slot holds the target's normalized embedding and
+the other slots a learned vector, so `mask_token_id` is not read. Proposals come
+from the seven slots after the anchor. The `rnn_hidden` Markov head maps its
+recurrent state back into the hidden space and scores it with the shared LM head;
+draft and target logits use the target's soft cap of 30 over the 200,058-token
+vocabulary.
+
+The checkpoint labels its features by the target layer they enter (5, 11, ..., 41)
+and uses 48 for the post-final-norm output. `target_layer_ids` count the layer that
+produces a feature, so the same features are one lower. The consolidated checkpoint
+holds the 84 tensors of `mtp.safetensors` under their released names and shapes,
+without the shared embedding, embedding norm and LM head, next to a `config.json`
+holding the `mtp_config` they were trained for. The trainable weights start from a
+fresh initialization.
+
 Supported targets include Qwen3 (dense and MoE), Gemma4, DeepSeek V4 and V4.1,
-GLM-5.2, Kimi K3, MiniMax M3, and MiniMax M3.1 Flash.
+GLM-5.2, Kimi K3, MiniMax M3, MiniMax M3.1 Flash, and Inkling 2 Small.

@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+from torch import nn
 
 from nemo_automodel import NeMoAutoConfig
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
@@ -130,12 +131,18 @@ def gather_full_weight_module(module):
     ``embed_tokens`` and ``lm_head`` weights as DTensors, while a draft (or the
     offline cache) wants plain tensors. Gather the sharded weight to a full tensor
     first (an all-gather, so every rank must call this in lockstep); non-sharded
-    targets (Qwen3, Gemma4) pass through unchanged.
+    targets (Qwen3, Gemma4) pass through unchanged. Child modules of a sharded
+    module, such as the norm of a normalized embedding, are gathered the same way
+    and kept under their attribute names.
     """
     weight = getattr(module, "weight", None)
-    if weight is not None and hasattr(weight, "full_tensor"):
-        return SimpleNamespace(weight=weight.full_tensor())
-    return module
+    if weight is None or not hasattr(weight, "full_tensor"):
+        return module
+    gathered = SimpleNamespace(weight=weight.full_tensor())
+    if isinstance(module, nn.Module):
+        for name, child in module.named_children():
+            setattr(gathered, name, gather_full_weight_module(child))
+    return gathered
 
 
 def resolve_reduced_target_layers(checkpoint_num_layers: int, requested) -> int | None:

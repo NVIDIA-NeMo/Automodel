@@ -660,6 +660,18 @@ def test_gather_full_weight_module_passthrough_and_full_tensor():
     assert gather_full_weight_module(no_weight) is no_weight
 
 
+def test_gather_full_weight_module_keeps_gathered_child_modules():
+    # A normalized embedding (Inkling 2) carries its norm gain in a child module.
+    table, gain = torch.zeros(4, 3), torch.ones(3)
+    embedding = torch.nn.Module()
+    embedding.weight = SimpleNamespace(full_tensor=lambda: table)
+    embedding.embed_norm = torch.nn.Module()
+    embedding.embed_norm.weight = SimpleNamespace(full_tensor=lambda: gain)
+    out = gather_full_weight_module(embedding)
+    assert out.weight is table
+    assert out.embed_norm.weight is gain
+
+
 # ---------------------------------------------------------------------------
 # _validate_cached_dspark_manifest
 # ---------------------------------------------------------------------------
