@@ -21,7 +21,7 @@ class TestStepSchedulerConfig:
     def test_defaults(self):
         cfg = StepSchedulerConfig()
         assert cfg.global_batch_size == 32
-        assert cfg.num_epochs == 10
+        assert cfg.num_epochs is None
         assert cfg.max_steps is None
         assert cfg.ckpt_every_steps == 100
         assert cfg.save_checkpoint_every_epoch is True
