@@ -308,7 +308,7 @@ class ThdPackingConfig(PackingConfig):
         resolve_packing_contract(packing_contract, attn_implementation)
         if not supports_seq_lens:
             raise ValueError("THD packing requires a model that consumes seq_lens; choose a supported input format")
-        from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
+        from nemo_automodel.components.datasets.llm.packed_sequence import format_packed_token_columns, pack_dataset
         from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
         logger.info(f"THD-packing dataset with size: {self.packed_sequence_size}")
@@ -324,7 +324,7 @@ class ThdPackingConfig(PackingConfig):
             padding_idx=pad_token_id,
             cp_size=cp_size,
         )
-        return dataset, packed_sequence_thd_collater
+        return format_packed_token_columns(dataset), packed_sequence_thd_collater
 
 
 @dataclass
@@ -876,6 +876,9 @@ class DataloaderConfig:
                     packing_contract=packing_contract,
                 )
             elif self.packing is not None:
+                from nemo_automodel.components.datasets.llm.packed_sequence import format_packed_token_columns
+
+                dataset = format_packed_token_columns(dataset)
                 logger.info(
                     "Using prepacked sequence dataset with size %s; skipping loader-side packing",
                     self.packing.packed_sequence_size,

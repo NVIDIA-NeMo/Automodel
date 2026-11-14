@@ -50,6 +50,23 @@ def batchify(tensor, default_tensor_cls=torch.LongTensor):
     return tensor
 
 
+def _long_token_row(row) -> torch.Tensor:
+    """Return one token row as int64. An existing long tensor is not copied."""
+    if isinstance(row, torch.Tensor):
+        return row if row.dtype == torch.long else row.to(dtype=torch.long)
+    return torch.tensor(row, dtype=torch.long)
+
+
+def _stack_long_rows(rows: list) -> torch.Tensor:
+    """Stack one token row per example into int64 ``[batch, sequence]``.
+
+    Each row is normalized on its own. The no-``seq_lens`` fallback pads only
+    shorter rows into lists, so one batch can mix tensors and lists. Tensor
+    rows still skip ``torch.tensor``, which copies and warns.
+    """
+    return batchify(torch.stack([_long_token_row(row) for row in rows]))
+
+
 def extract_key_from_dicts(batch, key):
     """
     Extracts the value of the given key from each dictionary in a list of dictionaries.
@@ -360,9 +377,9 @@ def packed_sequence_thd_collater(batch):
         batch (List[dict]): A list of dictionaries, where each dictionary represents one example.
 
             For pre-packed data, each dictionary should contain:
-            - 'input_ids': List[int] - Token IDs for all packed sequences (must be same length across batch)
-            - 'labels': List[int] - Labels for all packed sequences (must be same length across batch)
-            - 'position_ids': List[int] - Position IDs for all tokens (must be same length across batch)
+            - 'input_ids': List[int] or 1-D int tensor - Token IDs (same length across the batch)
+            - 'labels': List[int] or 1-D int tensor - Labels (same length as input_ids)
+            - 'position_ids': List[int] or 1-D int tensor - Position IDs (same length as input_ids)
             - 'seq_lens': List[int] - Actual sequence lengths for each packed sequence
             - 'seq_lens_padded': List[int] - Sequence lengths including identifier/padding tokens
 
@@ -437,9 +454,9 @@ def packed_sequence_thd_collater(batch):
                 item["input_ids"] = list(item["input_ids"]) + [input_ids_pad] * pad_amount
                 item["labels"] = list(item["labels"]) + [-100] * pad_amount
 
-    tokens = batchify(torch.stack([torch.tensor(x["input_ids"]) for x in batch]))
-    labels = batchify(torch.stack([torch.tensor(x["labels"]) for x in batch]))
-    position_ids = batchify(torch.stack([torch.tensor(x["position_ids"]) for x in batch]))
+    tokens = _stack_long_rows([x["input_ids"] for x in batch])
+    labels = _stack_long_rows([x["labels"] for x in batch])
+    position_ids = _stack_long_rows([x["position_ids"] for x in batch])
 
     seq_lens = batchify(torch.LongTensor(pad_within_micro([x["seq_lens"] for x in batch], -1000)))
     seq_lens_padded = batchify(torch.LongTensor(pad_within_micro([x["seq_lens_padded"] for x in batch], -1000)))
