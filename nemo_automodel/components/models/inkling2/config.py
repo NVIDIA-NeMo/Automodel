@@ -29,6 +29,16 @@ class Inkling2QuantizationConfig(TypedDict):
     nvfp4_layer_count: int
 
 
+class Inkling2ReleasedQuantizationLabel(TypedDict):
+    """``quantization_config`` of a released ``config.json``: the format name only.
+
+    The expert layout is in ``hf_quant_config.json``; building a model replaces this label with it.
+    """
+
+    quant_method: Literal["modelopt"]
+    quant_algo: Literal["NVFP4", "MXFP8"]
+
+
 class _ParameterGroup(TypedDict):
     """One ``hf_quant_config.json`` group; only the keys the loader reads."""
 
@@ -40,9 +50,22 @@ _EXPERT_WEIGHT = re.compile(r"model\.llm\.layers\.(\d+)\.mlp\.experts\.(w13_weig
 _EXPERT_PROJECTIONS = ("w13_weight", "w2_weight")
 
 
+def _is_released_label(
+    declaration: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None,
+) -> bool:
+    return (
+        declaration is not None
+        and set(declaration) == {"quant_method", "quant_algo"}
+        and declaration["quant_method"] == "modelopt"
+        and declaration["quant_algo"] in ("NVFP4", "MXFP8")
+    )
+
+
 def _checked_quantization_config(
-    declaration: Inkling2QuantizationConfig, num_hidden_layers: int
-) -> Inkling2QuantizationConfig:
+    declaration: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel, num_hidden_layers: int
+) -> Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel:
+    if _is_released_label(declaration):
+        return declaration
     if declaration.get("quant_method") != "inkling2":
         raise ValueError("Inkling2 checkpoint import requires quant_method='inkling2'")
     if set(declaration) != {"quant_method", "nvfp4_layer_count"}:
@@ -105,14 +128,28 @@ def resolve_quantization_config(config: "Inkling2TextConfig | Inkling2Config", *
     """Fill ``quantization_config`` from the checkpoint sidecar for a config loaded from a checkpoint.
 
     Args:
-        config: Text or image/text configuration; both levels receive the declaration.
+        config: Text or image/text configuration; both levels receive the declaration. A released
+            ``config.json`` label is replaced by the layout the sidecar declares.
         revision: Resolved Hub revision of the checkpoint, so the sidecar comes from the
             same snapshot as the weights.
+
+    Raises:
+        ValueError: If ``config.json`` names a quantized format and the sidecar cannot be found.
     """
-    if config.quantization_config is not None or not config.name_or_path:
+    labelled = _is_released_label(config.quantization_config)
+    if config.quantization_config is not None and not labelled:
         return
     text = config.text_config if isinstance(config, Inkling2Config) else config
-    declaration = load_quantization_config(config.name_or_path, text.num_hidden_layers, revision=revision)
+    declaration = (
+        load_quantization_config(config.name_or_path, text.num_hidden_layers, revision=revision)
+        if config.name_or_path
+        else None
+    )
+    if declaration is None and labelled:
+        raise ValueError(
+            "config.json declares a quantized Inkling2 checkpoint, but hf_quant_config.json with the expert "
+            "layout was not found next to it"
+        )
     if declaration is not None:
         config.quantization_config = declaration
         text.quantization_config = declaration
@@ -172,7 +209,7 @@ class Inkling2TextConfig(PretrainedConfig):
         final_logit_softcapping: float = 30.0,
         initializer_range: float = 0.02,
         tie_word_embeddings: bool = False,
-        quantization_config: Inkling2QuantizationConfig | None = None,
+        quantization_config: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None = None,
         **kwargs: Any,
     ) -> None:
         # Hugging Face owns the open-ended serialized metadata at this boundary.
@@ -371,7 +408,7 @@ class Inkling2Config(PretrainedConfig):
         text_config: Inkling2TextConfig | dict[str, Any] | None = None,
         vision_config: Inkling2VisionConfig | dict[str, Any] | None = None,
         mtp_config: dict[str, Any] | None = None,
-        quantization_config: Inkling2QuantizationConfig | None = None,
+        quantization_config: Inkling2QuantizationConfig | Inkling2ReleasedQuantizationLabel | None = None,
         **kwargs: Any,
     ) -> None:
         # Serialized dictionaries are accepted only at Hugging Face's config boundary.

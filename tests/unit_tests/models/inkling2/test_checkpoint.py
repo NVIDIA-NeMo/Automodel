@@ -379,6 +379,36 @@ def test_models_read_the_expert_layout_from_the_checkpoint_sidecar(tmp_path: Pat
     assert not Inkling2ForCausalLM.from_config(config).state_dict_adapter.source_quantized
 
 
+@pytest.mark.parametrize("quant_algo", ["NVFP4", "MXFP8"])
+def test_released_config_label_is_resolved_from_the_sidecar(tmp_path: Path, quant_algo: str) -> None:
+    """The Hub ``config.json`` names the format only; the layout comes from ``hf_quant_config.json``."""
+    nvfp4_layer_count = 1 if quant_algo == "NVFP4" else 0
+    write_released_checkpoint_metadata(
+        tmp_path, nvfp4_layers=list(range(nvfp4_layer_count)), mxfp8_layers=list(range(nvfp4_layer_count, 2))
+    )
+    released = json.loads((tmp_path / "config.json").read_text())
+    label = {"quant_method": "modelopt", "quant_algo": quant_algo}
+    released["quantization_config"] = dict(label)
+    config = Inkling2Config.from_dict(released, name_or_path=str(tmp_path))
+    # Reading and saving the configuration keeps the label as released.
+    assert config.quantization_config == label and config.to_dict()["quantization_config"] == label
+    model = Inkling2ForCausalLM.from_config(config)
+    assert model.config.quantization_config == {"quant_method": "inkling2", "nvfp4_layer_count": nvfp4_layer_count}
+    assert model.state_dict_adapter.source_quantized
+    assert model.state_dict_adapter.nvfp4_layer_count == nvfp4_layer_count
+    # A label without the sidecar cannot be honoured.
+    (tmp_path / "hf_quant_config.json").unlink()
+    config = Inkling2Config.from_dict(released, name_or_path=str(tmp_path))
+    with pytest.raises(ValueError, match="hf_quant_config.json"):
+        Inkling2ForCausalLM.from_config(config)
+    with pytest.raises(ValueError, match="hf_quant_config.json"):
+        Inkling2ForCausalLM.from_config(Inkling2Config.from_dict(released))
+    # Other declarations stay rejected.
+    for declaration in ({"quant_method": "modelopt", "quant_algo": "FP8"}, {"quant_method": "modelopt"}):
+        with pytest.raises(ValueError, match="quant_method='inkling2'"):
+            Inkling2Config.from_dict({**released, "quantization_config": declaration})
+
+
 @pytest.mark.parametrize("case", ["incomplete_projection", "gap", "unknown_dtype"])
 def test_incomplete_expert_precision_declaration_is_rejected(tmp_path: Path, case: str) -> None:
     write_released_checkpoint_metadata(tmp_path, nvfp4_layers=[0], mxfp8_layers=[1])
