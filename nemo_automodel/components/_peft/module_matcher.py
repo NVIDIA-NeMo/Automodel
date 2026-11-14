@@ -36,8 +36,13 @@ def _compile_wildcard_pattern(pattern: str) -> re.Pattern[str]:
     # pattern or begins with ".") or after a numeric index (".1") keeps its dot as a separator, matching
     # that segment's children or nothing, so "*.layers.1.*" and "*layers.1.*" do not also match
     # "layers.10". After a name fragment, as in ".*fc.*" or "*mlp.fc.*", it still matches any text.
+    # A leading "*." may also match nothing, so "*.lm_head" also matches a top-level "lm_head".
+    prefix = ""
+    if pattern.startswith("*.") and len(pattern) > 2:
+        prefix = "(?:.*.)?"
+        pattern = pattern[2:]
     parts = re.split(r"(\.?\*)", pattern)
-    regex = ""
+    regex = prefix
     for i, part in enumerate(parts):
         if i % 2 == 0:
             regex += part
