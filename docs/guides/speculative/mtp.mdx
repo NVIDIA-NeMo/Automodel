@@ -21,6 +21,10 @@ computes the MTP auxiliary loss whenever the loaded model's MTP head is
 enabled. Fine-tuning just the MTP head for a new domain is a matter of freezing
 everything else and continuing training.
 
+A model with no native MTP head can still get this benefit: see
+[Gated-LoRA MTP for Models without a Native MTP Head](#gated-lora-mtp-for-models-without-a-native-mtp-head)
+below.
+
 ## Supported Models
 
 Training the MTP loss works for any model whose `NeMoAuto*` class reports
@@ -51,7 +55,7 @@ freeze_config:
 
 `unfreeze_modules` wins over `freeze_modules` on overlap, so only the MTP
 submodule's parameters remain trainable. Combine this with any dataset and
-optimizer configuration you would use for a normal fine-tune.
+optimizer configuration you would use for normal fine-tuning.
 
 ## Accept-Length Metric
 
@@ -64,6 +68,7 @@ teacher-forced context (the actual verifier in self-speculative decoding),
 not when it agrees with the dataset label. Those two can disagree whenever
 the main head itself is imperfect, so matching the label is not the same
 thing as being accepted.
+Interpret the value as follows:
 
 - A value near `1.0` means the MTP head's drafts rarely agree with what the
   model's own main head would have produced.
@@ -85,3 +90,35 @@ pretrained MTP layer:
 ```bash
 automodel examples/llm_finetune/mtp_finetune/nemotron_nano_v3_5_lightning_mtp_finetune.yaml --nproc-per-node 1
 ```
+
+## Gated-LoRA MTP for Models without a Native MTP Head
+
+A model with no MTP layers can still be trained for self-speculative decoding,
+following [Your LLM Knows the Future](https://arxiv.org/abs/2507.11851). A
+`gated_mtp:` block lists one mask token id per MTP depth:
+
+```yaml
+gated_mtp:
+  mask_token_ids: [151700, 151701, 151702]
+```
+
+Every position in the batch is an anchor: one mask token per depth is appended
+after it, and a LoRA adapter that is active only on the mask tokens learns to
+draft the next tokens from them. All other tokens use the frozen base weights,
+so the model's own next-token distribution is unchanged and the drafts verify
+losslessly against it. The mask tokens' hidden states feed the same MTP loss
+and `val_mtp_tau_sim` metric as a native MTP head above.
+
+`mtp.distillation_mode: soft` distills every depth toward the frozen base
+model's own distribution, which is the actual verifier at decode time and a stable
+target throughout training since the base model never changes:
+
+```bash
+automodel examples/llm_finetune/mtp_finetune/qwen3_0p6b_gated_lora_mtp.yaml --nproc-per-node 8
+```
+
+The dense layout multiplies the sequence length by `1 + len(mask_token_ids)`
+and needs an attention backend that accepts a custom mask (`flex_attention`,
+preferred at scale, `sdpa`, or `eager`). It supports FSDP2/HSDP and DDP, but
+not yet tensor, context, or pipeline parallelism, packed sequences, DoRA, or
+LoRA on MoE experts.
