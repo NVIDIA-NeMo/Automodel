@@ -23,10 +23,9 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from nemo_automodel.components.loss import vocab_parallel
 from nemo_automodel.components.loss.kd_loss import (
     KDLoss,
-    _AllReduceForwardPassThroughBackward,
-    _infer_tp_group_from_dtensor,
     _kl_forward_chunked,
     _kl_forward_tp,
 )
@@ -597,14 +596,16 @@ def test_kd_loss_temperature_1_no_scaling():
 
 
 # ---------------------------------------------------------------------------
-# _infer_tp_group_from_dtensor
+# vocab_parallel.vocab_shard
 # ---------------------------------------------------------------------------
 
 
-def test_infer_tp_group_plain_tensor_returns_none():
-    """Plain tensors are not vocab-sharded DTensors; group must be None."""
+def test_vocab_shard_of_plain_tensor_has_no_group():
+    """Plain tensors hold the whole vocabulary; there is no group to reduce over."""
     t = torch.randn(4, 32)
-    assert _infer_tp_group_from_dtensor(t) is None
+    shard = vocab_parallel.vocab_shard(t)
+    assert shard.local is t
+    assert (shard.group, shard.start, shard.vocab) == (None, 0, 32)
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +696,7 @@ def test_tp_kl_reduction_does_not_mutate_saved_autograd_value(trivial_pg):
     source = torch.randn(6, requires_grad=True)
     local_kl = source.exp()
 
-    reduced_kl = _AllReduceForwardPassThroughBackward.apply(local_kl, trivial_pg)
+    reduced_kl = vocab_parallel.replicated(vocab_parallel.sum_over_group(local_kl, trivial_pg), trivial_pg)
     reduced_kl.sum().backward()
 
     torch.testing.assert_close(source.grad, local_kl.detach())

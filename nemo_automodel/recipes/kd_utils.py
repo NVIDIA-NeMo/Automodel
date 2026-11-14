@@ -23,10 +23,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.distributed.config import DDPConfig, DistributedSetup
-from nemo_automodel.components.distributed.context_parallel.utils import unshard_context_parallel_tensor
+from nemo_automodel.components.distributed.context_parallel.utils import gather_context_parallel_tensor
+from nemo_automodel.components.loss.vocab_parallel import VocabShard, vocab_shard
 from nemo_automodel.components.models.common.packing import (
     configure_packing,
     get_model_attn_implementation,
@@ -84,13 +86,43 @@ def configure_kd_teacher_packing(
         )
 
 
+def _gather_vocab_shards(local: torch.Tensor, shard: VocabShard) -> torch.Tensor | None:
+    """Concatenate tensor-parallel vocabulary shards on the first rank of their group.
+
+    Args:
+        local: Tensor of shape ``[batch, sequence, local_vocab]`` holding this
+            rank's vocabulary ids ``[shard.start, shard.start + local_vocab)``.
+        shard: Vocabulary layout of ``local``; its group must not be None.
+
+    Returns:
+        On group rank 0, a tensor of shape ``[batch, sequence, vocab]``; None on
+        other ranks, which only send their shard.
+    """
+    group = shard.group
+    size = dist.get_world_size(group)
+    rows_per_rank = -(-shard.vocab // size)
+    # Gather needs equal shapes; short trailing shards are padded and trimmed again.
+    padded = F.pad(local, (0, rows_per_rank - local.shape[-1])).contiguous()
+    chunks = [torch.empty_like(padded) for _ in range(size)] if dist.get_rank(group) == 0 else None
+    dist.gather(padded, chunks, dst=dist.get_global_rank(group, 0), group=group)
+    if chunks is None:
+        return None
+    return torch.cat(chunks, dim=-1)[..., : shard.vocab]
+
+
 def materialize_teacher_logits(
     logits: torch.Tensor,
     *,
     device_mesh: "DeviceMesh",
     sequence_length: int,
-) -> torch.Tensor:
-    """Reconstruct full teacher logits across TP and CP before mesh transport.
+) -> torch.Tensor | None:
+    """Assemble full teacher logits on the replica's transport rank only.
+
+    :class:`KDMeshBridge` sends each teacher replica's logits from one rank:
+    tensor- and context-parallel coordinate 0 of the last pipeline stage. Every
+    other rank only sends its shard there, so no other rank holds the full
+    vocabulary or the full sequence. Every rank of the teacher's TP and CP groups
+    must call this.
 
     Args:
         logits: Tensor of global shape ``[batch, sequence, vocab]`` containing
@@ -101,16 +133,22 @@ def materialize_teacher_logits(
         sequence_length: Unpadded global sequence length to retain.
 
     Returns:
-        Detached contiguous tensor of shape
-        ``[batch, sequence_length, vocab]`` replicated on every rank in the
-        teacher model replica.
+        On the transport rank, a detached contiguous tensor of shape
+        ``[batch, sequence_length, vocab]``; None on every other rank.
     """
-    if isinstance(logits, DTensor):
-        logits = logits.full_tensor()
-    mesh_dim_names = getattr(device_mesh, "mesh_dim_names", ())
+    shard = vocab_shard(logits)
+    local = shard.local.detach()
+    mesh_dim_names = getattr(device_mesh, "mesh_dim_names", None) or ()
     if device_mesh is not None and "cp" in mesh_dim_names and device_mesh["cp"].size() > 1:
-        logits = unshard_context_parallel_tensor(device_mesh["cp"], logits, seq_dim=1)
-    return logits.narrow(1, 0, sequence_length).detach().contiguous()
+        local = gather_context_parallel_tensor(device_mesh["cp"], local, seq_dim=1)
+        if local is None:
+            return None
+    local = local.narrow(1, 0, sequence_length)
+    if shard.group is not None:
+        local = _gather_vocab_shards(local, shard)
+        if local is None:
+            return None
+    return local.contiguous()
 
 
 def _section_to_dict(section: Any) -> dict:

@@ -159,7 +159,8 @@ def test_loss_comparator_rejects_mismatched_kd_settings():
         _compare_pair("teacher_tp2", [baseline], [candidate], 0.01, 0.01)
 
 
-def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch):
+@pytest.mark.parametrize("is_first_cp_rank", [True, False])
+def test_materialize_teacher_logits_gathers_cp_and_removes_padding(monkeypatch, is_first_cp_rank):
     cp_mesh = SimpleNamespace(size=lambda: 2)
 
     class Mesh:
@@ -171,8 +172,8 @@ def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch)
 
     local = torch.tensor([[[1.0], [2.0]]])
 
-    def unshard(mesh, tensor, *, seq_dim):
-        """Expand local logits to the full sequence.
+    def gather(mesh, tensor, *, seq_dim):
+        """Assemble local logits on the first CP rank.
 
         Args:
             mesh: Mock context-parallel mesh.
@@ -182,18 +183,21 @@ def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch)
 
         Returns:
             Tensor of shape ``[batch=1, sequence=4, vocab=1]`` containing full
-            logits.
+            logits on the first CP rank, otherwise None.
         """
         assert mesh is cp_mesh
-        assert tensor is local
+        assert torch.equal(tensor, local)
         assert seq_dim == 1
-        return torch.tensor([[[1.0], [2.0], [3.0], [0.0]]])
+        return torch.tensor([[[1.0], [2.0], [3.0], [0.0]]]) if is_first_cp_rank else None
 
-    monkeypatch.setattr(kd_utils, "unshard_context_parallel_tensor", unshard)
+    monkeypatch.setattr(kd_utils, "gather_context_parallel_tensor", gather)
 
     result = kd_utils.materialize_teacher_logits(local, device_mesh=Mesh(), sequence_length=3)
 
-    assert torch.equal(result, torch.tensor([[[1.0], [2.0], [3.0]]]))
+    if is_first_cp_rank:
+        assert torch.equal(result, torch.tensor([[[1.0], [2.0], [3.0]]]))
+    else:
+        assert result is None
 
 
 def test_shared_kd_setup_keeps_existing_world(monkeypatch):
