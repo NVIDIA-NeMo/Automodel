@@ -30,9 +30,8 @@ import logging
 
 import torch
 
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.speculative.dflash.domino_core import DominoTrainerModule, get_lambda_base
-from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
 
 logger = logging.getLogger(__name__)
 
@@ -162,15 +161,3 @@ class TrainDominoRecipe(TrainDFlashRecipe):
             name: [torch.zeros((), device=self.device), torch.zeros((), device=self.device)]
             for name in ("val_final_loss", "val_base_loss", "val_base_accuracy", "val_base_accept_len")
         }
-
-
-def main(config_path: str | None = None):
-    """Entrypoint for ``TrainDominoRecipe``."""
-    cfg = parse_args_and_load_config(config_path)
-    trainer = TrainDominoRecipe(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()

@@ -22,7 +22,7 @@ import torch
 from safetensors.torch import save_file
 from transformers import LlamaConfig
 
-import nemo_automodel.recipes.speculative_decoding.train_eagle3 as recipe_module
+import nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 as recipe_module
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
@@ -36,7 +36,7 @@ from nemo_automodel.components.speculative.eagle.eagle4 import (
 from nemo_automodel.components.speculative.eagle.registry import DraftSpec
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
 from nemo_automodel.recipes.speculative_decoding._spec_recipe_base import SpecDecodeRecipeBase
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import (
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import (
     _check_candidate_head_warm_start,
     _load_draft_weights,
     _parse_eagle4_config,

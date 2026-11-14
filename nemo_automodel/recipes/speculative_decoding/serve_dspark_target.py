@@ -14,7 +14,7 @@
 
 """Serve a frozen DSpark target to a remote training run (train-inference disaggregation).
 
-It reads the same YAML as ``train_dspark`` (``recipe_args`` selects the target and
+It reads the same YAML as ``TrainDSparkRecipe`` (``recipe_args`` selects the target and
 the captured layers), listens on ``target_server.host`` / ``target_server.port``
 (default ``0.0.0.0:8001``), and runs the target in this single process::
 
@@ -51,7 +51,7 @@ def build_server(cfg, *, host: str, nccl_port: int) -> DSparkTargetModelServer:
     """Load the frozen target described by ``cfg`` and wrap it in the request-handling logic.
 
     Args:
-        cfg: A ``train_dspark`` config; ``recipe_args`` selects the target and the
+        cfg: A ``TrainDSparkRecipe`` config; ``recipe_args`` selects the target and the
             captured layers.
         host: Bind/advertise address, also the NCCL rendezvous master.
         nccl_port: TCP rendezvous port for the NCCL data plane.

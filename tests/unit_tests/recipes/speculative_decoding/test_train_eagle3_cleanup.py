@@ -26,7 +26,7 @@ from unittest import mock
 
 import pytest
 
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import TrainEagle3Recipe
 
 
 def _make_recipe(**overrides) -> TrainEagle3Recipe:
@@ -57,7 +57,7 @@ def _make_recipe(**overrides) -> TrainEagle3Recipe:
 def test_run_loop_finalizes_on_exception():
     """A mid-training exception still releases the target/W&B (and re-raises)."""
     recipe = _make_recipe()
-    recipe._train_epochs = mock.MagicMock(side_effect=RuntimeError("boom"))
+    recipe._train_one_epoch = mock.MagicMock(side_effect=RuntimeError("boom"))
     with pytest.raises(RuntimeError, match="boom"):
         recipe.run_train_validation_loop()
     recipe.target_wrapper.close.assert_called_once()
@@ -69,9 +69,9 @@ def test_run_loop_finalizes_on_exception():
 def test_run_loop_finalizes_on_success():
     """Normal completion saves the final checkpoint and releases resources."""
     recipe = _make_recipe()
-    recipe._train_epochs = mock.MagicMock()
+    recipe._train_one_epoch = mock.MagicMock(return_value=True)
     recipe.run_train_validation_loop()
-    recipe._train_epochs.assert_called_once()
+    recipe._train_one_epoch.assert_called_once()
     recipe._maybe_save_final_checkpoint.assert_called_once_with(1)
     recipe.target_wrapper.close.assert_called_once()
     recipe.wandb_run.finish.assert_called_once()
@@ -80,9 +80,9 @@ def test_run_loop_finalizes_on_success():
 def test_early_return_finalizes():
     """The 'all epochs already completed' resume path also releases resources."""
     recipe = _make_recipe(_resume_epoch=5, num_epochs=1)
-    recipe._train_epochs = mock.MagicMock()
+    recipe._train_one_epoch = mock.MagicMock(return_value=True)
     recipe.run_train_validation_loop()
-    recipe._train_epochs.assert_not_called()
+    recipe._train_one_epoch.assert_not_called()
     recipe.target_wrapper.close.assert_called_once()
     recipe.wandb_run.finish.assert_called_once()
 

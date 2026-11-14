@@ -26,7 +26,7 @@ from types import SimpleNamespace
 
 import torch
 
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import TrainEagle3Recipe
 
 
 def _write_meta(tmp_path, ids, mask):

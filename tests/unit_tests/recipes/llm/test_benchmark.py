@@ -26,6 +26,25 @@ from nemo_automodel.components.utils.flops_utils import llama2_flops
 from nemo_automodel.recipes.llm.benchmark import BenchmarkingRecipeForNextTokenPrediction, _infer_vocab_size, main
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fails", [False, True])
+@pytest.mark.parametrize("has_graph_manager", [False, True])
+def test_cli_benchmark_entry_cleans_up(fails: bool, has_graph_manager: bool) -> None:
+    recipe = BenchmarkingRecipeForNextTokenPrediction.__new__(BenchmarkingRecipeForNextTokenPrediction)
+    manager = MagicMock() if has_graph_manager else None
+    recipe.partial_cuda_graph_manager = manager
+    recipe.run_benchmark = MagicMock(side_effect=RuntimeError("benchmark failed") if fails else None)
+    if fails:
+        with pytest.raises(RuntimeError, match="benchmark failed"):
+            recipe.run_train_validation_loop()
+    else:
+        recipe.run_train_validation_loop()
+    recipe.run_benchmark.assert_called_once_with()
+    assert recipe.partial_cuda_graph_manager is None
+    if manager is not None:
+        manager.close.assert_called_once_with()
+
+
 class ConfigNamespace(SimpleNamespace):
     """A SimpleNamespace that also supports dict-like .get() method."""
 

@@ -97,7 +97,7 @@ def test_streaming_path_matches_colocated_path(colocated, streaming_inputs) -> N
 
 
 def test_streaming_path_matches_colocated_path_with_packing(colocated) -> None:
-    """Packing metadata must round-trip through the streaming path like ``train_eagle3``."""
+    """Packing metadata must round-trip through the streaming path like ``TrainEagle3Recipe``."""
     input_ids = torch.randint(0, 32, (2, 8))
     attention_mask = torch.ones(2, 8, dtype=torch.long)
     loss_mask = torch.ones(2, 8, dtype=torch.long)

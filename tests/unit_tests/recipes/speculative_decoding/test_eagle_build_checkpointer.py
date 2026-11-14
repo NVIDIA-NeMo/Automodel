@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for EAGLE recipe _build_checkpointer and eagle3 main().
+"""Unit tests for the EAGLE recipes' _build_checkpointer.
 
 Covers the fix where EAGLE recipes pass ``model_state_dict_keys`` from the
 draft model to ``CheckpointingConfig``, preventing ``TypeError: 'NoneType'
 object is not iterable`` at consolidated checkpoint save time.
-
-Also verifies that ``train_eagle3.main(None)`` no longer raises ``ValueError``
-before ``parse_args_and_load_config`` has a chance to read ``sys.argv``.
 """
 
 from __future__ import annotations
@@ -28,11 +25,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch.nn as nn
 
-from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle import TrainEagle1Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import TrainEagle3Recipe
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -151,20 +147,3 @@ def test_eagle3_build_checkpointer_adapter_only_with_peft(mock_checkpointer, tmp
 
     assert recipe.checkpoint_config.is_peft is True
     assert recipe.checkpoint_config.save_consolidated == SaveConsolidatedMode.FALSE
-
-
-# ---------------------------------------------------------------------------
-# EAGLE-3: main(None) no longer raises ValueError
-# ---------------------------------------------------------------------------
-
-
-def test_eagle3_main_none_does_not_raise_valueerror():
-    """main(None) must not raise ValueError; it should reach parse_args_and_load_config."""
-    with patch("nemo_automodel.recipes.speculative_decoding.train_eagle3.parse_args_and_load_config") as mock_parse:
-        mock_parse.side_effect = SystemExit(2)
-        with pytest.raises(SystemExit):
-            from nemo_automodel.recipes.speculative_decoding.train_eagle3 import main
-
-            main(None)
-    # The key assertion: no ValueError was raised before parse_args_and_load_config.
-    mock_parse.assert_called_once_with(None)

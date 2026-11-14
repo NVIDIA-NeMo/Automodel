@@ -62,13 +62,6 @@ def resolve_recipe_cls(target_str: str) -> Callable[..., _Recipe]:
     return getattr(module, cls_name)
 
 
-def _recipe_module_path(recipe_target: str, repo_root: Path) -> Path:
-    """Convert a dotted recipe target into an absolute filesystem path."""
-    module_path = recipe_target.rsplit(".", 1)[0]
-    relative = module_path.replace(".", "/") + ".py"
-    return repo_root / relative
-
-
 _INSTALL_MSG = (
     "Local/interactive execution requires PyTorch and the full nemo_automodel package.\n"
     "It looks like you have the lightweight CLI-only install (automodel[cli]).\n\n"
@@ -144,9 +137,8 @@ class InteractiveLauncher(Launcher):
             )
             return self._run_recipe_in_process(recipe_target, config)
 
-        nproc_per_node = launcher_config
-        repo_root = _get_repo_root()
-        script_path = _recipe_module_path(recipe_target, repo_root)
+        nproc_per_node: int | None = launcher_config
+        _get_repo_root()
 
         num_devices = determine_local_world_size(nproc_per_node="gpu")
         assert num_devices > 0, "Expected num-devices to be > 0"
@@ -160,8 +152,10 @@ class InteractiveLauncher(Launcher):
 
             torchrun_parser = get_args_parser()
             torchrun_args, _ = torchrun_parser.parse_known_args()
-            torchrun_args.training_script = str(script_path)
-            torchrun_args.training_script_args = ["-c", str(config_path)]
+            # All workers enter the CLI, which runs the configured recipe in-process.
+            torchrun_args.module = True
+            torchrun_args.training_script = "nemo_automodel.cli.app"
+            torchrun_args.training_script_args = [str(config_path)]
             if extra_args:
                 torchrun_args.training_script_args.extend(extra_args)
             torchrun_args.nproc_per_node = effective_nproc

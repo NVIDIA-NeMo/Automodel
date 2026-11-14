@@ -75,28 +75,20 @@ def test_optim_steps_per_epoch_handles_invalid_inputs():
 
 
 # ---------------------------------------------------------------------------
-# should_sync_grads (DDP no_sync decision)
+# should_sync_grads (gradient-sync decision for an accumulation window)
 # ---------------------------------------------------------------------------
 
 
-def _sync(pending, batch_idx, *, accum=4, batches_per_epoch=10, is_ddp=True):
+def _sync(pending, batch_idx, *, accum=4, batches_per_epoch=10):
     return should_sync_grads(
         pending_micro_batches=pending,
         grad_accumulation_steps=accum,
         batch_idx=batch_idx,
         batches_per_epoch=batches_per_epoch,
-        is_ddp=is_ddp,
     )
 
 
-def test_should_sync_always_true_without_ddp():
-    # Single process: nothing to all-reduce, so every step "syncs" (no_sync is
-    # never entered) regardless of window position or batch index.
-    for pending in range(4):
-        assert _sync(pending, batch_idx=0, is_ddp=False) is True
-
-
-def test_should_sync_only_on_window_close_under_ddp():
+def test_should_sync_only_on_window_close():
     # accum=4: interior micro-batches defer the all-reduce, the 4th closes it.
     assert _sync(0, batch_idx=0) is False
     assert _sync(1, batch_idx=1) is False

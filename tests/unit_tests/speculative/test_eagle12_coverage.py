@@ -20,7 +20,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -35,11 +34,7 @@ from nemo_automodel.components.speculative.eagle.target_v12 import (
     HFEagleTargetModel,
     _shift_left_with_zero,
 )
-from nemo_automodel.recipes.speculative_decoding.train_eagle1 import TrainEagle1Recipe
-from nemo_automodel.recipes.speculative_decoding.train_eagle1 import main as eagle1_main
-from nemo_automodel.recipes.speculative_decoding.train_eagle2 import TrainEagle2Recipe
-from nemo_automodel.recipes.speculative_decoding.train_eagle2 import main as eagle2_main
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import main as eagle3_main
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle import TrainEagle1Recipe, TrainEagle2Recipe
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -280,27 +275,7 @@ def test_trainer_custom_loss_weights():
 
 
 # ---------------------------------------------------------------------------
-# train_eagle1: main() / train_eagle2: main() ValueError guards
-# ---------------------------------------------------------------------------
-
-
-def test_eagle1_main_requires_config():
-    with pytest.raises(ValueError, match="You must specify --config"):
-        eagle1_main(config_path=None)
-
-
-def test_eagle2_main_requires_config():
-    with pytest.raises(ValueError, match="You must specify --config"):
-        eagle2_main(config_path=None)
-
-
-def test_eagle3_main_requires_config():
-    with pytest.raises(ValueError, match="You must specify --config"):
-        eagle3_main(config_path=None)
-
-
-# ---------------------------------------------------------------------------
-# train_eagle1: TrainEagle1Recipe construction
+# TrainEagle1Recipe construction
 # ---------------------------------------------------------------------------
 
 
@@ -311,7 +286,7 @@ def test_eagle1_recipe_init():
 
 
 # ---------------------------------------------------------------------------
-# train_eagle2: TrainEagle2Recipe is subclass of TrainEagle1Recipe
+# TrainEagle2Recipe is subclass of TrainEagle1Recipe
 # ---------------------------------------------------------------------------
 
 
@@ -320,7 +295,7 @@ def test_eagle2_is_subclass():
 
 
 # ---------------------------------------------------------------------------
-# train_eagle1: _module(), _save_checkpoint(), _run_eval() via manual wiring
+# TrainEagle1Recipe: _module(), _save_checkpoint(), _run_eval() via manual wiring
 # ---------------------------------------------------------------------------
 
 

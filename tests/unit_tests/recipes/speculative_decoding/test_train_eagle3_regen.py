@@ -27,11 +27,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
-from nemo_automodel.recipes.speculative_decoding import train_eagle3 as te
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     optim_steps_per_epoch as _optim_steps_per_epoch,
 )
-from nemo_automodel.recipes.speculative_decoding.train_eagle3 import TrainEagle3Recipe
+from nemo_automodel.recipes.speculative_decoding.algorithms import eagle3 as te
+from nemo_automodel.recipes.speculative_decoding.algorithms.eagle3 import TrainEagle3Recipe
 
 
 class _FakeTargetWrapper:

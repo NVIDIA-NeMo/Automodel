@@ -23,6 +23,7 @@ the ``_all_ranks_have_valid`` unit tests and validated on a multi-GPU server.)
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -33,7 +34,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.speculative.dflash.core import NoValidAnchorsError
-from nemo_automodel.recipes.speculative_decoding.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.speculative_decoding.algorithms.dflash import TrainDFlashRecipe
 
 
 class _FakeTrainerModule(nn.Module):
@@ -49,6 +50,7 @@ class _FakeTrainerModule(nn.Module):
         with torch.random.fork_rng():
             torch.manual_seed(0)
             self.dummy = nn.Linear(4, 4)
+        self.frozen = nn.Parameter(torch.zeros(1), requires_grad=False)
         self._raise_on = set(raise_on)
         self._rank = rank
         self._calls = 0
@@ -144,37 +146,80 @@ def test_no_skip_when_all_micro_batches_valid():
 
 
 def _ddp_trailing_skip_worker(
-    rank: int, world_size: int, init_file: str, out_dir: str, ranks_without_anchors: tuple[int, ...]
+    rank: int,
+    world_size: int,
+    init_file: str,
+    out_dir: str,
+    ranks_without_anchors: tuple[int, ...],
+    grad_accum: int,
+    max_grad_norm: float,
 ) -> None:
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
-        # 5 micro-batches, accumulation 3: one full window, then a trailing window
+        # With accumulation 3: one full window, then a trailing window
         # of batches 3 and 4. Batch 4 is the epoch's last (the synced backward); it
         # has no valid anchors on ``ranks_without_anchors``, so every rank skips it
         # and batch 3's no_sync grads are all the trailing window has.
+        # Accumulation 1 exercises the already-synced control path.
         raise_on = {4} if rank in ranks_without_anchors else set()
-        recipe = _build_recipe(raise_on=raise_on, num_batches=5, grad_accum=3, ddp_rank=rank)
-        recipe.max_grad_norm = 1e9
+        recipe = _build_recipe(raise_on=raise_on, num_batches=5, grad_accum=grad_accum, ddp_rank=rank)
+        recipe.max_grad_norm = max_grad_norm
         recipe.log_every_steps = 1000
         recipe.dist_env = SimpleNamespace(is_main=rank == 0, world_size=world_size)
+        gradients = []
+        norms = []
+        clip = recipe._clip_grad_norm
+
+        def record_clip() -> torch.Tensor:
+            gradients.append([p.grad.clone() for p in recipe.trainer_module.module.dummy.parameters()])
+            norm = clip()
+            norms.append(norm)
+            return norm
+
+        recipe._clip_grad_norm = record_clip
         recipe.run_train_validation_loop()
         assert recipe._skipped_micro_batches == 1
-        assert recipe.runtime.global_step == 2
+        assert recipe.runtime.global_step == -(-4 // grad_accum)
+
+        # A single-process reference averages all valid examples across ranks
+        # within each window, including the partial final one.
+        reference = _FakeTrainerModule(set()).dummy
+        optimizer = torch.optim.AdamW(reference.parameters(), lr=1e-4)
+        for step, start in enumerate(range(0, 4, grad_accum)):
+            indices = range(start, min(start + grad_accum, 4))
+            losses = [
+                reference(torch.randn(1, 4, generator=torch.Generator().manual_seed(100 * r + i))).sum() * (r + 1)
+                for r in range(world_size)
+                for i in indices
+            ]
+            torch.stack(losses).mean().backward()
+            for actual, param in zip(gradients[step], reference.parameters()):
+                torch.testing.assert_close(actual, param.grad)
+            norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), max_grad_norm)
+            torch.testing.assert_close(norms[step], norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        for actual, expected in zip(recipe.trainer_module.module.dummy.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual, expected)
         torch.save(recipe.trainer_module.module.dummy.weight.detach(), f"{out_dir}/rank{rank}.pt")
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("grad_accum", [1, 3])
+@pytest.mark.parametrize("max_grad_norm", [0.2, 1e9])
 @pytest.mark.parametrize(
     "ranks_without_anchors",
     # Every rank, or one rank: the other then ran its forward under sync and skips backward.
     [(0, 1), (0,)],
 )
-def test_ddp_trailing_window_grads_are_reduced_when_last_micro_batch_is_skipped(tmp_path, ranks_without_anchors):
+def test_ddp_trailing_window_grads_are_reduced_when_last_micro_batch_is_skipped(
+    tmp_path: Path, ranks_without_anchors: tuple[int, ...], grad_accum: int, max_grad_norm: float
+) -> None:
     mp.spawn(
         _ddp_trailing_skip_worker,
-        args=(2, str(tmp_path / "process-group"), str(tmp_path), ranks_without_anchors),
+        args=(2, str(tmp_path / "process-group"), str(tmp_path), ranks_without_anchors, grad_accum, max_grad_norm),
         nprocs=2,
         join=True,
     )

@@ -14,12 +14,13 @@
 
 """Shared base for the speculative-decoding draft recipes (EAGLE, DFlash, DSpark).
 
-Every draft recipe hand-rolls its own training loop around a frozen target and a
-trainable draft, but they persist and restore that draft the same way, step the
-same warmup + cosine LR schedule, and follow the same checkpoint cadence. This
-base owns that shared lifecycle so a fix lands in one place instead of drifting
-across four copies. Model construction, the training loop, and evaluation stay
-in each recipe.
+Every draft recipe trains a draft against a frozen target. They persist and
+restore that draft the same way, step the same warmup + cosine LR schedule,
+follow the same checkpoint cadence, and run the same epoch / gradient-accumulation
+loop. This base owns that shared lifecycle so a fix lands in one place instead of
+drifting across copies. Model construction, the per-micro-batch forward, metric
+reporting, and evaluation stay in each recipe, which plugs into the loop through
+the hooks below ``run_train_validation_loop``.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_losses,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
+from nemo_automodel.components.distributed.tp_replicas import synchronize_tp_replica_gradients
+from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
@@ -49,6 +52,7 @@ from nemo_automodel.recipes.speculative_decoding._spec_train_utils import (
     optim_steps_per_epoch,
     resolve_wandb_kwargs,
     resolve_warmup_steps,
+    should_sync_grads,
 )
 
 logger = logging.getLogger(__name__)
@@ -446,3 +450,269 @@ class SpecDecodeRecipeBase(BaseRecipe):
         trackio_logger = getattr(self, "trackio_logger", None)
         if trackio_logger is not None:
             trackio_logger.log_metrics(data, step=step)
+
+    # ------------------------------------------------------------------
+    # Training loop
+    #
+    # One epoch / gradient-accumulation / checkpoint loop serves every draft
+    # recipe. A recipe supplies how one micro-batch runs (forward + backward) and
+    # how its metrics are accumulated and reported; the hooks below default to the
+    # plain DDP behavior, and recipes override only what differs.
+    # ------------------------------------------------------------------
+
+    def run_train_validation_loop(self) -> None:
+        """Train for the remaining epochs, then save the final checkpoint.
+
+        :meth:`_on_train_end` runs on every exit path (normal, nothing left to do,
+        or an exception), so recipes release loggers and remote targets there.
+        """
+        self.trainer_module.train()
+        start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
+        try:
+            if start_epoch >= self.num_epochs:
+                if self.dist_env.is_main:
+                    logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
+                return
+            self._on_train_start(start_epoch)
+            pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
+            try:
+                for epoch_idx in range(start_epoch, self.num_epochs):
+                    if not self._train_one_epoch(epoch_idx, pbar):
+                        break
+                self._maybe_save_final_checkpoint(self.num_epochs)
+                self._finish_checkpointing()
+            finally:
+                if pbar is not None:
+                    pbar.close()
+        finally:
+            self._on_train_end()
+
+    def _train_one_epoch(self, epoch_idx: int, pbar=None) -> bool:
+        """Run one epoch, its evaluation, and its epoch checkpoint.
+
+        An epoch is one or more *segments*: a contiguous pass over the currently
+        bound dataloader. :meth:`_at_window_boundary` may rebind the dataloader
+        (EAGLE-3 on-policy regen), which ends the segment and starts a new one; the
+        epoch ends when a dataloader is exhausted without a rebind. Rebinding only
+        happens at a gradient-accumulation window boundary, so no partial window is
+        ever carried across segments.
+
+        Args:
+            epoch_idx: Zero-based epoch index.
+            pbar: Optional progress bar advanced once per optimizer step.
+
+        Returns:
+            False when ``stop_at_step_budget`` stopped the run inside this epoch.
+        """
+        window = self._new_train_window()
+        # Summed on the loss's device; read once at the epoch checkpoint so the hot
+        # loop never blocks on a host sync.
+        epoch_loss: torch.Tensor | float = 0.0
+        micro_steps = 0
+        batches_seen = 0
+        pending_micro_batches = 0
+        start_step = self.runtime.global_step
+        reached_budget = False
+
+        segment_done = False
+        while not segment_done and not reached_budget:
+            sampler = getattr(self.train_dataloader, "sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch_idx)
+            # Recomputed per segment: a rebound dataloader may have a different
+            # length, and ``should_sync_grads`` keys the final partial window off it.
+            try:
+                num_batches = len(self.train_dataloader)
+            except TypeError:
+                num_batches = None
+            for batch_idx, batch in enumerate(self._iter_train_batches()):
+                batches_seen += 1
+                sync_ctx = self._grad_sync_context(pending_micro_batches, batch_idx, num_batches)
+                metrics = self._train_micro_batch(batch, sync_ctx)
+                if metrics is None:
+                    # Skipped on every rank (see TrainDFlashRecipe); not part of the window.
+                    continue
+                self._accumulate_train_metrics(window, metrics)
+                epoch_loss = epoch_loss + metrics.loss.detach()
+                micro_steps += 1
+                pending_micro_batches += 1
+
+                if pending_micro_batches == self.grad_accumulation_steps:
+                    grad_norm = self._optimizer_step(epoch_idx, pbar, pending_micro_batches)
+                    pending_micro_batches = 0
+                    if self.runtime.global_step % self.log_every_steps == 0:
+                        self._log_train_window(window, epoch_idx, grad_norm, pbar)
+                        window = self._new_train_window()
+                    # Window boundary: the only safe point to stop on the step budget
+                    # or rebind the dataloader. Both branch on ``global_step``, which
+                    # is identical on every rank.
+                    if self.stop_at_step_budget and self.runtime.global_step >= self.total_optim_steps:
+                        reached_budget = True
+                        break
+                    if self._at_window_boundary():
+                        break
+            else:
+                segment_done = True
+
+        # Flush the trailing partial accumulation window. When the epoch length is
+        # not a multiple of ``grad_accumulation_steps``, up to
+        # ``grad_accumulation_steps - 1`` micro-batches ran ``backward()`` without an
+        # optimizer step; their gradients would otherwise be wiped by the next
+        # epoch's ``zero_grad``. Every data-parallel rank reaches this point with the
+        # same ``pending_micro_batches`` because the samplers pad ranks to equal
+        # length; a variable-length sampler would desync the flush collectives.
+        if pending_micro_batches > 0:
+            grad_norm = self._optimizer_step(epoch_idx, pbar, pending_micro_batches)
+            self._after_trailing_flush(window, epoch_idx, grad_norm)
+
+        self._on_epoch_end(epoch_idx, batches_seen)
+        eval_metrics = self._run_eval()
+        val_metrics = self._report_epoch(epoch_idx, self.runtime.global_step - start_step, eval_metrics)
+        if getattr(self, "save_checkpoint_every_epoch", False):
+            self.save_checkpoint(
+                epoch=epoch_idx + 1,
+                step=self.runtime.global_step,
+                train_loss=float(epoch_loss) / micro_steps if micro_steps else None,
+                val_loss=val_metrics,
+                best_metric_key="val_loss",
+                is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
+            )
+            self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
+        return not reached_budget
+
+    def _optimizer_step(self, epoch_idx: int, pbar, pending_micro_batches: int):
+        """Apply one optimizer update from the accumulated gradients.
+
+        Each micro-batch divided its loss by ``grad_accumulation_steps``. A trailing
+        partial window has only ``pending_micro_batches`` contributors, so its
+        gradients are rescaled to the scale of a full window before clipping.
+
+        Returns:
+            The pre-clip gradient norm reported by :meth:`_clip_grad_norm`.
+        """
+        self._sync_grads_before_clip()
+        if pending_micro_batches < self.grad_accumulation_steps:
+            scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
+            for param in self.trainer_module.parameters():
+                if param.grad is not None:
+                    param.grad.mul_(scale)
+        grad_norm = self._clip_grad_norm()
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.lr_scheduler.step()
+        self._after_optimizer_step()
+        self.runtime.global_step += 1
+        if pbar is not None:
+            pbar.update(1)
+        self._maybe_save_step_checkpoint(epoch_idx)
+        return grad_norm
+
+    # Loop hooks. Defaults match a DDP (or single-process) draft.
+
+    #: Stop once ``global_step`` reaches ``total_optim_steps`` instead of when the
+    #: epoch range is exhausted (EAGLE-3: regen splits an epoch into segments).
+    stop_at_step_budget: ClassVar[bool] = False
+    #: FSDP2 drafts defer the gradient reduce-scatter to the last micro-batch of a
+    #: window unless ``distributed.defer_fsdp_grad_sync`` turns it off (DSpark).
+    defer_fsdp_grad_sync: bool = True
+
+    def _on_train_start(self, start_epoch: int) -> None:
+        """Called once before the first epoch that trains."""
+
+    def _on_train_end(self) -> None:
+        """Finish the W&B and Trackio runs; runs on every exit path.
+
+        Best-effort, so a teardown failure never masks the exception that ended
+        training.
+        """
+        for name in ("wandb_run", "trackio_logger"):
+            run = getattr(self, name, None)
+            if run is None:
+                continue
+            try:
+                run.finish()
+            except Exception:
+                logger.exception("Failed to finish %s", name)
+
+    def _finish_checkpointing(self) -> None:
+        """Wait for and publish pending checkpoints after the last epoch."""
+        self._finalize_and_close_checkpointer()
+
+    def _iter_train_batches(self):
+        """Return the iterable of training items for the current segment."""
+        return self.train_dataloader
+
+    def _grad_sync_context(self, pending_micro_batches: int, batch_idx: int, num_batches: int | None):
+        """Return the context that gates this micro-batch's gradient reduction.
+
+        Only the micro-batch an optimizer step follows needs to reduce gradients:
+        DDP runs the others under ``no_sync()`` and FSDP2 defers their
+        reduce-scatter (see ``get_sync_ctx``). A single-process draft never syncs.
+        """
+        is_optim_step = should_sync_grads(
+            pending_micro_batches=pending_micro_batches,
+            grad_accumulation_steps=self.grad_accumulation_steps,
+            batch_idx=batch_idx,
+            batches_per_epoch=num_batches,
+        )
+        return get_sync_ctx(self.trainer_module, is_optim_step, self.defer_fsdp_grad_sync)
+
+    def _forward_micro_batch(self, batch):
+        """Return the training metrics (with a differentiable ``loss``) of one micro-batch."""
+        raise NotImplementedError
+
+    def _train_micro_batch(self, batch, sync_ctx):
+        """Run forward and backward for one micro-batch.
+
+        Returns:
+            The micro-batch metrics, or None when every rank skipped it.
+        """
+        with sync_ctx:
+            metrics = self._forward_micro_batch(batch)
+            (metrics.loss / float(self.grad_accumulation_steps)).backward()
+        return metrics
+
+    def _sync_grads_before_clip(self) -> None:
+        """Reduce gradients that the data-parallel wrapper does not, before clipping."""
+        synchronize_tp_replica_gradients([self.trainer_module], getattr(self, "device_mesh", None))
+
+    def _clip_grad_norm(self):
+        """Clip the draft gradients and return the pre-clip norm."""
+        return torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+
+    def _after_optimizer_step(self) -> None:
+        """Called after each optimizer and LR-scheduler step."""
+
+    def _at_window_boundary(self) -> bool:
+        """Called after each full accumulation window.
+
+        Returns:
+            True when the training dataloader was rebound and a new segment must start.
+        """
+        return False
+
+    def _new_train_window(self):
+        """Return an empty accumulator for the logged training metrics."""
+        raise NotImplementedError
+
+    def _accumulate_train_metrics(self, window, metrics) -> None:
+        """Add one micro-batch's metrics to ``window``."""
+        window.add(metrics)
+
+    def _log_train_window(self, window, epoch_idx: int, grad_norm, pbar) -> None:
+        """Report ``window``; called on every rank at the log cadence, which then starts a new window."""
+        raise NotImplementedError
+
+    def _after_trailing_flush(self, window, epoch_idx: int, grad_norm) -> None:
+        """Called on every rank after the epoch's trailing partial window steps."""
+
+    def _on_epoch_end(self, epoch_idx: int, batches_seen: int) -> None:
+        """Called after the epoch's last optimizer step, before evaluation."""
+
+    def _report_epoch(self, epoch_idx: int, completed_steps: int, eval_metrics):
+        """Log the end-of-epoch summary.
+
+        Returns:
+            The validation metrics handed to the epoch checkpoint.
+        """
+        return eval_metrics

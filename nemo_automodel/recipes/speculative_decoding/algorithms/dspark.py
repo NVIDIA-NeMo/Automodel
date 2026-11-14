@@ -37,7 +37,6 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForImageTextToText
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.dspark_cache import (
     DTYPE_MAP,
     build_cached_dspark_dataloader,
@@ -53,7 +52,6 @@ from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.parallelizer_utils import fully_shard_by_dtype
-from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.loggers import TrackioConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -1291,7 +1289,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         if meta is not None:
             check_resumed_mask_token_id(meta, self.mask_token_id, ckpt_dir)
 
-    def _forward_batch(self, batch):
+    def _forward_micro_batch(self, batch):
         """Run one batch through live target capture or the offline cache."""
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         if self.target_wrapper is None:
@@ -1348,7 +1346,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         accept_pos_den = torch.zeros(self.block_size, device=self.device)
         with torch.no_grad():
             for batch in self.val_dataloader:
-                metrics = self._forward_batch(batch)
+                metrics = self._forward_micro_batch(batch)
                 scalars += torch.stack(
                     [
                         metrics.loss.detach(),
@@ -1412,175 +1410,83 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
         finally:
             self.wandb_run = None
 
-    def run_train_validation_loop(self):
-        """Run the DSpark training loop."""
-        self.trainer_module.train()
-        start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
-        if start_epoch >= self.num_epochs:
-            if self.dist_env.is_main:
-                logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
-            if getattr(self, "metric_logger", None) is not None:
-                self.metric_logger.close()
-            self._finish_wandb()
-            self._close_remote_target()
+    def _sync_grads_before_clip(self) -> None:
+        """No-op: DDP and FSDP2 already reduced the draft gradients on the final backward."""
+
+    def _clip_grad_norm(self):
+        """Clip with the FSDP2-aware helper, which also handles DTensor gradients."""
+        return scale_grads_and_clip_grad_norm(self.max_grad_norm, [self.trainer_module])
+
+    def _after_optimizer_step(self) -> None:
+        """Refresh the FP8 weight scales after each update."""
+        self._maybe_precompute_fp8_scales()
+
+    def _new_train_window(self) -> _DSparkMetricWindow:
+        """Return an empty DSpark metric window."""
+        return _DSparkMetricWindow(block_size=self.block_size, device=self.device)
+
+    def _log_train_window(self, window: _DSparkMetricWindow, epoch_idx: int, grad_norm, pbar) -> None:
+        """Log the data-parallel mean of ``window`` to the metric logger, W&B and stdout."""
+        # Every rank enters the window's single collective, so it cannot sit inside
+        # the rank-0 logging guard below.
+        avg = window.unpack(self._dp_allreduce(window.pack()))
+        if not self.dist_env.is_main:
             return
+        current_lr = self.lr_scheduler.get_last_lr()[0]
+        mem = torch.cuda.max_memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
+        self.metric_logger.log(
+            MetricsSample(step=self.runtime.global_step, epoch=epoch_idx, metrics={**avg, "lr": current_lr, "mem": mem})
+        )
+        # ``avg`` renames l1_loss -> tv_loss and carries only the diagnostics
+        # measured this window, so mirror its keys under the train/ prefix rather
+        # than hard-coding each one.
+        wandb_metrics = {"train/tv_loss" if key == "l1_loss" else f"train/{key}": value for key, value in avg.items()}
+        wandb_metrics.update({"train/lr": current_lr, "train/mem_gib": mem, "train/epoch": epoch_idx})
+        self._wandb_log(wandb_metrics, step=self.runtime.global_step)
+        if pbar is not None:
+            pbar.set_postfix(loss=f"{avg['loss']:.4f}", lr=f"{current_lr:.2e}")
+        accept = avg.get("accept_rate")
+        tau = avg.get("tau")
+        logger.info(
+            "step %d | epoch %d | loss %.4f | ce %.4f | tv %.4f | conf %.4f | "
+            "accept %s | tau %s | lr %.2e | mem %.2f GiB",
+            self.runtime.global_step,
+            epoch_idx,
+            avg["loss"],
+            avg["ce_loss"],
+            avg["l1_loss"],
+            avg["confidence_loss"],
+            "n/a" if accept is None else f"{accept:.3f}",
+            "n/a" if tau is None else f"{tau:.2f}",
+            current_lr,
+            mem,
+        )
 
-        pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
-        try:
-            for epoch_idx in range(start_epoch, self.num_epochs):
-                if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
-                    self.train_dataloader.sampler.set_epoch(epoch_idx)
+    def _report_epoch(self, epoch_idx: int, completed_steps: int, eval_metrics):
+        """Log the epoch summary and the validation loss, acceptance rate and tau."""
+        if self.dist_env.is_main:
+            msg = f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps}"
+            if eval_metrics is not None:
+                msg += f" val_loss={eval_metrics['val_loss']:.4f}"
+                for key in ("accept_rate", "tau"):
+                    if key in eval_metrics:
+                        msg += f" val_{key}={eval_metrics[key]:.4f}"
+                self._wandb_log(
+                    {
+                        **{
+                            ("val/loss" if key == "val_loss" else f"val/{key}"): value
+                            for key, value in eval_metrics.items()
+                        },
+                        "val/epoch": epoch_idx,
+                    },
+                    step=self.runtime.global_step,
+                )
+            logger.info(msg)
+        return eval_metrics
 
-                window = _DSparkMetricWindow(block_size=self.block_size, device=self.device)
-                epoch_loss = 0.0
-                micro_step = 0
-                pending_micro_batches = 0
-                completed_steps = 0
-                last_batch_idx = -1
-                num_batches = len(self.train_dataloader)
-                for batch_idx, batch in enumerate(self.train_dataloader):
-                    last_batch_idx = batch_idx
-                    is_optim_step = (pending_micro_batches + 1 == self.grad_accumulation_steps) or (
-                        batch_idx == num_batches - 1
-                    )
-                    # get_sync_ctx handles both DDP (no_sync) and FSDP2 (set_requires_gradient_sync).
-                    with get_sync_ctx(self.trainer_module, is_optim_step, self.defer_fsdp_grad_sync):
-                        metrics = self._forward_batch(batch)
-                        loss = metrics.loss / self.grad_accumulation_steps
-                        loss.backward()
-
-                    window.add(metrics)
-                    epoch_loss += metrics.loss.detach().item()
-                    micro_step += 1
-                    pending_micro_batches += 1
-
-                    if pending_micro_batches == self.grad_accumulation_steps:
-                        scale_grads_and_clip_grad_norm(self.max_grad_norm, [self.trainer_module])
-                        self.optimizer.step()
-                        self.optimizer.zero_grad(set_to_none=True)
-                        self.lr_scheduler.step()
-                        self._maybe_precompute_fp8_scales()
-                        self.runtime.global_step += 1
-                        if pbar is not None:
-                            pbar.update(1)
-                        completed_steps += 1
-                        pending_micro_batches = 0
-                        self._maybe_save_step_checkpoint(epoch_idx)
-
-                        if self.runtime.global_step % self.log_every_steps == 0:
-                            # Every rank enters the window's single collective, so it cannot
-                            # sit inside the rank-0 logging guard below.
-                            avg = window.unpack(self._dp_allreduce(window.pack()))
-                            window.reset()
-                            if self.dist_env.is_main:
-                                current_lr = self.lr_scheduler.get_last_lr()[0]
-                                mem = torch.cuda.max_memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
-                                self.metric_logger.log(
-                                    MetricsSample(
-                                        step=self.runtime.global_step,
-                                        epoch=epoch_idx,
-                                        metrics={**avg, "lr": current_lr, "mem": mem},
-                                    )
-                                )
-                                # ``avg`` renames l1_loss -> tv_loss and carries only the
-                                # diagnostics measured this window, so mirror its keys under
-                                # the train/ prefix rather than hard-coding each one.
-                                wandb_metrics = {
-                                    "train/tv_loss" if key == "l1_loss" else f"train/{key}": value
-                                    for key, value in avg.items()
-                                }
-                                wandb_metrics.update(
-                                    {"train/lr": current_lr, "train/mem_gib": mem, "train/epoch": epoch_idx}
-                                )
-                                self._wandb_log(wandb_metrics, step=self.runtime.global_step)
-                                if pbar is not None:
-                                    pbar.set_postfix(loss=f"{avg['loss']:.4f}", lr=f"{current_lr:.2e}")
-                                accept = avg.get("accept_rate")
-                                tau = avg.get("tau")
-                                logger.info(
-                                    "step %d | epoch %d | loss %.4f | ce %.4f | tv %.4f | conf %.4f | "
-                                    "accept %s | tau %s | lr %.2e | mem %.2f GiB",
-                                    self.runtime.global_step,
-                                    epoch_idx,
-                                    avg["loss"],
-                                    avg["ce_loss"],
-                                    avg["l1_loss"],
-                                    avg["confidence_loss"],
-                                    "n/a" if accept is None else f"{accept:.3f}",
-                                    "n/a" if tau is None else f"{tau:.2f}",
-                                    current_lr,
-                                    mem,
-                                )
-
-                # Flush the trailing partial accumulation window (see EAGLE recipes
-                # for the rescale rationale).
-                if pending_micro_batches > 0:
-                    scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
-                    for p in self.trainer_module.parameters():
-                        if p.grad is not None:
-                            p.grad.mul_(scale)
-                    scale_grads_and_clip_grad_norm(self.max_grad_norm, [self.trainer_module])
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.lr_scheduler.step()
-                    self._maybe_precompute_fp8_scales()
-                    self.runtime.global_step += 1
-                    if pbar is not None:
-                        pbar.update(1)
-                    completed_steps += 1
-                    pending_micro_batches = 0
-                    self._maybe_save_step_checkpoint(epoch_idx)
-
-                eval_metrics = self._run_eval()
-                if self.dist_env.is_main:
-                    msg = f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps}"
-                    if eval_metrics is not None:
-                        msg += f" val_loss={eval_metrics['val_loss']:.4f}"
-                        for key in ("accept_rate", "tau"):
-                            if key in eval_metrics:
-                                msg += f" val_{key}={eval_metrics[key]:.4f}"
-                        self._wandb_log(
-                            {
-                                **{
-                                    ("val/loss" if key == "val_loss" else f"val/{key}"): value
-                                    for key, value in eval_metrics.items()
-                                },
-                                "val/epoch": epoch_idx,
-                            },
-                            step=self.runtime.global_step,
-                        )
-                    logger.info(msg)
-
-                if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
-                    avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
-                    self.save_checkpoint(
-                        epoch=epoch_idx + 1,
-                        step=self.runtime.global_step,
-                        train_loss=avg_loss,
-                        val_loss=eval_metrics,
-                        best_metric_key="val_loss",
-                        is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
-                    )
-                    self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
-
-            self._maybe_save_final_checkpoint(self.num_epochs)
-            self._finalize_and_close_checkpointer()
-        finally:
-            if pbar is not None:
-                pbar.close()
-            if getattr(self, "metric_logger", None) is not None:
-                self.metric_logger.close()
-            self._finish_wandb()
-            self._close_remote_target()
-
-
-def main(config_path: str | None = None):
-    """Entrypoint for ``TrainDSparkRecipe``."""
-    cfg = parse_args_and_load_config(config_path)
-    trainer = TrainDSparkRecipe(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
-
-
-if __name__ == "__main__":
-    main()
+    def _on_train_end(self) -> None:
+        """Close the metric logger, W&B and the remote target on every exit path."""
+        if getattr(self, "metric_logger", None) is not None:
+            self.metric_logger.close()
+        self._finish_wandb()
+        self._close_remote_target()

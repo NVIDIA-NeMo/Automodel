@@ -239,8 +239,8 @@ restore_from:
 
 ### Speculative Decoding
 
-- Draft-model training recipes live in `nemo_automodel/recipes/speculative_decoding/`, grouped by type rather than by target model: `train_eagle1.py`, `train_eagle2.py`, `train_eagle3.py` (which also covers EAGLE-3.1 and EAGLE-4; P-EAGLE is layered on it through `peagle_recipe.py`), `train_dflash.py`, `train_dflash2.py`, `train_domino.py`, `train_jetspec.py`, `train_dspark.py` and `train_vispec.py`.
-- All of them derive from `SpecDecodeRecipeBase` in `_spec_recipe_base.py`, which owns the draft-only checkpoint save/load, checkpoint cadence, LR schedule, metadata and W&B lifecycle; per-method behavior stays in the concrete recipe. Shared helpers are in `_spec_train_utils.py`.
+- Draft-model training recipes live in `nemo_automodel/recipes/speculative_decoding/algorithms/`, one module per algorithm family rather than per target model: `eagle.py` (EAGLE-1 and EAGLE-2), `eagle3.py` (also EAGLE-3.1 and EAGLE-4; P-EAGLE is layered on it through `peagle.py`), `dflash.py`, `dflash2.py`, `domino.py`, `jetspec.py`, `dspark.py` and `vispec.py`. They have no per-recipe entry point: the `automodel` CLI (or `torchrun -m nemo_automodel.cli.app`) runs the class named by the config's `recipe` key.
+- All of them derive from `SpecDecodeRecipeBase` in `_spec_recipe_base.py`, which owns the training loop (epochs, gradient accumulation with the trailing-window flush, gradient sync and clipping), the draft-only checkpoint save/load and cadence, the LR schedule, metadata and the W&B lifecycle. A recipe implements the per-micro-batch forward and its metric reporting through the loop hooks, and overrides the sync/clip hooks only when its parallelism differs (DSpark's FSDP2, EAGLE-3's context parallelism). Shared helpers are in `_spec_train_utils.py`.
 - DSpark has two extra entry points: `precompute_dspark_dist.py` (offline distributed target precompute) and `serve_dspark_target.py` (remote target server). Their shared target construction is in `_dspark_target_build.py`.
 - Example configs live under `examples/speculative/<method>/`; the model-side code is in `nemo_automodel/components/speculative/`.
 
