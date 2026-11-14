@@ -26,6 +26,10 @@ from nemo_automodel.shared.import_utils import safe_import_from
 if TYPE_CHECKING:
     from torch.nn.attention.flex_attention import AuxOutput
 
+# The mask and the kernel are compiled for static shapes. Rounding the sequence up to a multiple of this many
+# tokens lets batches of varying length reuse a few compiled shapes instead of compiling one per length.
+_SEQUENCE_BUCKET = 512
+
 # Keep the eager model importable with older PyTorch installations.
 _HAVE_AUX, AuxRequest = safe_import_from("torch.nn.attention.flex_attention", "AuxRequest")
 
@@ -92,6 +96,19 @@ class Inkling2FlexAttention(nn.Module):
         if (positions is None) != (key_positions is None):
             raise ValueError("Packed attention requires both query and key positions")
         window, extent, scale = self.window, profiles.shape[-1], self.scale
+        # Tokens added here are invalid, so no real token attends to them; the result is cut back below.
+        original = sequence
+        extra = (-sequence) % _SEQUENCE_BUCKET if key_sequence == sequence and query_offset == 0 else 0
+        if extra:
+            shared = key_valid is valid
+            q, k, v = (F.pad(t, (0, 0, 0, 0, 0, extra)) for t in (q, k, v))
+            profiles = F.pad(profiles, (0, 0, 0, extra))
+            sink = F.pad(sink, (0, 0, 0, extra))
+            valid = F.pad(valid, (0, extra))
+            key_valid = valid if shared else F.pad(key_valid, (0, extra))
+            if positions is not None and key_positions is not None:
+                positions, key_positions = F.pad(positions, (0, extra)), F.pad(key_positions, (0, extra))
+            sequence = key_sequence = sequence + extra
 
         def mask(b: torch.Tensor, h: torch.Tensor, qi: torch.Tensor, ki: torch.Tensor) -> torch.Tensor:
             """Compute token validity.
@@ -155,4 +172,4 @@ class Inkling2FlexAttention(nn.Module):
         # to Q/K and relative profiles as well as to the sink projection itself.
         assert auxiliary.lse is not None
         factor = torch.sigmoid(auxiliary.lse - sink.float().transpose(1, 2))
-        return (attended[..., : q.shape[-1]] * factor.unsqueeze(-1)).transpose(1, 2)
+        return (attended[..., : q.shape[-1]] * factor.unsqueeze(-1)).transpose(1, 2)[:, :original]
