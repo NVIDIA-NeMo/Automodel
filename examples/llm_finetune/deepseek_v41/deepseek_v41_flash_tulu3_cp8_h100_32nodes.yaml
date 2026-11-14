@@ -201,6 +201,7 @@ wandb:
   dir: ../logs/wandb
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: linmuchuiyang
   nodes: 32
   time: "04:00:00"

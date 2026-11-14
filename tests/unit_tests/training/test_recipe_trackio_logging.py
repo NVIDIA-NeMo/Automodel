@@ -42,6 +42,8 @@ def _train_sample(step=7):
             "tps": 10.0,
             "tps_per_gpu": 5.0,
             "num_label_tokens": 42,
+            "num_tokens_per_step": 64,
+            "mfu": 0.35,
         },
     )
 
@@ -70,6 +72,8 @@ def test_log_train_metrics_calls_trackio():
     args, kwargs = run.log.call_args
     assert kwargs.get("step") == 7
     assert args[0]["loss"] == 1.25 and args[0]["epoch"] == 1.0
+    assert args[0]["num_tokens_per_step"] == 64
+    assert args[0]["mfu"] == pytest.approx(0.35)
     # ``step`` / ``timestamp`` are reserved by Trackio and must not be sent as metrics.
     assert "step" not in args[0] and "timestamp" not in args[0]
 

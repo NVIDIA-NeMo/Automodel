@@ -94,4 +94,5 @@ optimizer:
   weight_decay: 0
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100

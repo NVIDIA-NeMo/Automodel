@@ -95,6 +95,7 @@ freeze_config:
   freeze_language_model: false
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   recipe_owner: akoumpa
   time: "00:30:00"

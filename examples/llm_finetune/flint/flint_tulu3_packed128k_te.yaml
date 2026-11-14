@@ -120,6 +120,7 @@ wandb:
   enable: false
 
 ci:
+  nemo_ci_schedule: skipped
   # Excluded from automatic GPU CI; requires user-provided training data.
   deprecated: true
   cluster_tag: gb200

@@ -1,0 +1,132 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+recipe: FinetuneRecipeForVLM
+seed: 1234
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  max_steps: 100
+  num_epochs: null
+  ckpt_every_steps: 25
+  val_every_steps: 1000
+  validate_on_checkpoint: false
+  gc_every_steps: 5
+  log_remote_every_steps: 1
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: thinkingmachines/Inkling-2-Small
+  dtype: bfloat16
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: flex
+    linear: torch
+    rms_norm: torch
+    experts: torch_mm
+    dispatcher: torch
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  dp_replicate_size: 4
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+  activation_checkpointing: true
+  reshard_after_forward: true
+  defer_fsdp_grad_sync: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: false
+loss_fn:
+  _target_: nemo_automodel.components.models.inkling2.loss.Inkling2FusedLinearCrossEntropy
+  unpadded_vocab_size: 200058
+  reduction: sum
+  logit_softcapping: 30.0
+processor:
+  _target_: nemo_automodel.components.models.inkling2.processing.Inkling2Processor.from_pretrained
+  pretrained_model_name_or_path: thinkingmachines/Inkling-2-Small
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+packed_sequence:
+  packed_sequence_size: 0
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  persistent_workers: true
+  pin_memory: true
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 4097
+    preserve_alpha: true
+validation_dataset: none
+validation_dataloader: none
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 5.0e-06
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+  weight_decay: 0.1
+  adam_w_mode: true
+  master_weights: true
+  master_weight_dtype: float32
+  store_param_remainders: true
+  exp_avg_dtype: bfloat16
+  exp_avg_sq_dtype: bfloat16
+lr_scheduler:
+  lr_decay_style: constant
+clip_grad_norm:
+  max_norm: 1.0
+  backend: triton
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/inkling2_medpix_lora_ep32
+  model_save_format: safetensors
+  save_consolidated: every
+  is_async: false
+  load_metadata_with_gloo: true
+  dequantize_base_checkpoint: true
+wandb:
+  enable: false
+  project: inkling2
+  name: inkling2_medpix_lora_ep32
+  mode: online
+  dir: logs/inkling2_medpix_lora_ep32/wandb
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+  - '*.attn.qkvr'
+  - '*.attn.wo_ud'
+  - '*.mlp.experts'
+  dim: 8
+  alpha: 32
+  dropout: 0.0
+  lora_dtype: bfloat16
+  use_memory_efficient_lora: true
+  use_triton: false
+  moe_rank_scaling: false
+ci:
+  nemo_ci_schedule: release
+  recipe_owner: snowmanwwg
+  nodes: 8
+  nproc_per_node: 4
+  cluster_tag: gb200
+  time: 02:00:00
+  max_steps: 2

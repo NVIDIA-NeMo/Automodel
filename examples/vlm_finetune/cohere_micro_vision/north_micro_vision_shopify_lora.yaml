@@ -111,6 +111,7 @@ freeze_config:
   freeze_language_model: false
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   time: "00:10:00"

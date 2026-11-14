@@ -1,0 +1,135 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Synthetic pretraining counterpart of examples/llm_benchmark/mistral/mistral_large4_gb200.yaml
+# Fixed-length mock tokens; runtime tuning is canonical. GPU validation is pending.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+step_scheduler:
+  global_batch_size: 512
+  local_batch_size: 8
+  ckpt_every_steps: 1000
+  val_every_steps: null
+  max_steps: 1000
+  num_epochs: null
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.mistral_large4.config.MistralLarge4Config
+    architectures:
+    - MistralLarge4ForCausalLM
+    hidden_size: 6144
+    intermediate_size: 24576
+    num_hidden_layers: 72
+    num_attention_heads: 64
+    vocab_size: 204800
+    kv_lora_rank: 512
+    qk_nope_head_dim: 64
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    rms_norm_eps: 1.0e-05
+    rope_theta: 10000.0
+    max_position_embeddings: 1048576
+    yarn_factor: 2048.0
+    yarn_original_max_position_embeddings: 512
+    yarn_beta_fast: 32.0
+    yarn_beta_slow: 1.0
+    final_logit_softcapping: 30.0
+    index_topk: 2048
+    index_n_heads: 32
+    index_head_dim: 128
+    first_k_dense_replace: 1
+    n_routed_experts: 128
+    n_shared_experts: 1
+    num_experts_per_tok: 4
+    moe_intermediate_size: 6144
+    routed_scaling_factor: 1.0
+    norm_topk_prob: true
+    tie_word_embeddings: false
+    dtype: bfloat16
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: torch
+    rms_norm: torch_fp32
+    rope: torch
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: false
+checkpoint:
+  enabled: false
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 2
+  ep_size: 64
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 36
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    pp_seq_len: 4096
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: true
+    ignore_router_for_ac: true
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  reduction: sum
+  impl: cce
+  logit_softcapping: 30.0
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDatasetConfig
+  vocab_size: 204800
+  seq_len: 4096
+  include_position_ids: false
+  exclude_token_ids: [0]
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+  pin_memory: true
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-05
+  weight_decay: 0.0
+  betas:
+  - 0.9
+  - 0.95
+  eps: 1.0e-08
+wandb:
+  enable: false
+clip_grad_norm:
+  max_norm: 1.0
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+ci:
+  nemo_ci_schedule: skipped
+  recipe_owner: huiyingl
+  nodes: 32
+  cluster_tag: gb200
+  time: 02:00:00
+  env_vars:
+    SBATCH_SEGMENT_SIZE: '16'
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  nproc_per_node: 4
+  perf_testing:
+    schedule: weekly
+    fake_balanced_gate: true

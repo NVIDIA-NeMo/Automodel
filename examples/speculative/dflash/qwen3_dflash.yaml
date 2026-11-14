@@ -77,4 +77,5 @@ checkpoint:
 #   name: qwen3-8b-dflash
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

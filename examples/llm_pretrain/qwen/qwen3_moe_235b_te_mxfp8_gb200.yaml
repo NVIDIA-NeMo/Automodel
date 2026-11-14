@@ -1,0 +1,86 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Synthetic pretraining counterpart of examples/llm_benchmark/qwen/qwen3_moe_235b_te_mxfp8_gb200.yaml
+# Fixed-length mock tokens; runtime tuning is canonical. GPU validation is pending.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: true
+step_scheduler:
+  gc_every_steps: 10
+  global_batch_size: 8192
+  local_batch_size: 4
+  ckpt_every_steps: 1000
+  val_every_steps: null
+  num_epochs: null
+  max_steps: 1000
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.NeMoAutoConfig.from_pretrained
+    pretrained_model_name_or_path: Qwen/Qwen3-235B-A22B
+  trust_remote_code: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    experts: te
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+    te_fp8:
+      recipe: mxfp8
+checkpoint:
+  enabled: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: false
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDatasetConfig
+  vocab_size: 151936
+  seq_len: 4096
+  include_position_ids: false
+  exclude_token_ids: [0]
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 4
+  pin_memory: true
+optimizer:
+  _target_: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1e-8
+  lr: 0.0001
+  weight_decay: 0
+  foreach: false
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+ci:
+  nemo_ci_schedule: skipped
+  time: 01:00:00
+  nodes: 8
+  cluster_tag: gb200
+  env_vars:
+    TORCHRUN_NUMA_BINDING: node
+  recipe_owner: akoumpa
+  nproc_per_node: 4
+  perf_testing:
+    schedule: nightly
+    fake_balanced_gate: true
