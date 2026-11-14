@@ -1,0 +1,102 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Image SFT on embedded MedPix-VQA records; see /datasets/zephon in the docs.
+# Run: uv run automodel examples/vlm_finetune/mistral/zephon.yaml --nproc-per-node 8
+# Training reference: examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml
+# Streaming step cap: 1 * ceil(1000 / 8) = 125.
+# This retains the reference update budget, not its epoch boundaries on the different source.
+# The native reference is unpacked and has no fixed input length.
+# Online packing uses the 8192-token window from qwen3_vl_4b_neat_packing.yaml.
+# The checkpoint variant remains the one selected for this Zephon example.
+recipe: FinetuneRecipeForVLM
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  num_epochs: 1
+  max_steps: 125  # Adjust for your dataset and training budget.
+  preemption_signal: null
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512-BF16
+  torch_dtype: torch.bfloat16
+  attn_implementation: eager
+processor:
+  do_pad: true
+dataset:
+  _target_: nemo_automodel.components.datasets.zephon.ZephonVlmDatasetConfig
+  zephon:
+    source:
+      # Keep enough source chunks to give every data-parallel rank work.
+      chunk_size: 128
+      # Keep the final partial chunk and stop after consuming the dataset once.
+      exhausted_policy: redistribute
+    sources:
+    - name: medpix
+      path: hf://mmoukouba/MedPix-VQA/train
+      input:
+        column_mapping:
+          images: image_id
+    packing:
+      # Drop oversized conversations instead of truncating text or image tokens.
+      seq_len: 8192
+    cache:
+      # Use fast node-local SSD/NVMe storage for downloaded shards, not a shared filesystem.
+      cache_dir: /tmp/zephon-cache
+      cache_limit_bytes: 256gb
+      # Cache decoded Parquet row groups separately from downloaded shards.
+      parquet_rg_cache:
+        limit_bytes: 64gb
+    checkpoint:
+      run_id: zephon-ministral3
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+  # Recompute activations to fit eager attention on the packed 8192-token inputs.
+  activation_checkpointing: true
+freeze_config:
+  freeze_vision_tower: true
+  freeze_language_model: false
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/zephon-ministral3
+  model_save_format: safetensors
+  save_consolidated: true
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+ci:
+  cluster_tag: h100
+  recipe_owner: MaxiBoether
+  time: 00:30:00
+  nodes: 1
+  nproc_per_node: 8

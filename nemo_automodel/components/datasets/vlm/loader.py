@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Sized
+from collections.abc import Callable, Iterator, Sized
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -33,7 +33,13 @@ from torchdata.stateful_dataloader.stateful import Stateful
 from transformers import AutoProcessor, ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
-from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDatasetConfig
+from nemo_automodel.components.datasets.loader import (
+    DatasetBuildSchedule,
+    DatasetConfig,
+    StreamBuildContext,
+    StreamDatasetConfig,
+    TokenizerDatasetConfig,
+)
 from nemo_automodel.components.datasets.packing import (
     DEFAULT_PACKED_SEQUENCE_CONTRACT,
     BatchOutputFormat,
@@ -49,6 +55,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
 from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.datasets.vlm.pp_media import wrap_vlm_collate_for_pp
+from nemo_automodel.shared.rng import ScopedRNG
 
 if TYPE_CHECKING:
     from transformers.video_processing_utils import BaseVideoProcessor
@@ -57,6 +64,31 @@ logger = logging.getLogger(__name__)
 
 VlmCollateFn = Callable[[list[object]], object]
 _VLM_PARENT_DATASET_STATE = "_vlm_parent_dataset_state"
+
+
+class ImagePositionState(Protocol):
+    """Serialization-safe model-owned image-position calculation."""
+
+    def positions(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        mm_token_type_ids: torch.Tensor,
+        image_grid_thw: torch.Tensor | None,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return scalar or multi-axis positions from unshifted fields.
+
+        Args:
+            input_ids: Token IDs [sequence].
+            mm_token_type_ids: Processor modality IDs [1, sequence].
+            image_grid_thw: Image grids [images, 3], or None for text-only input.
+            attention_mask: Processor token eligibility [sequence].
+
+        Returns:
+            Integer positions [sequence] or [position_axes, sequence], without input mutation.
+        """
+        ...
 
 
 class _VlmStatefulDataloader(StatefulDataLoader):
@@ -267,15 +299,45 @@ class VlmCollatorConfig:
 class VlmDataloaderBuild:
     """Materialized VLM dataloader and its processor."""
 
-    dataloader: DataLoader
+    dataloader: DataLoader | Iterator[object]
     processor: ProcessorMixin | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class VlmStreamBuildContext(StreamBuildContext):
+    """Runtime dependencies for an image stream that constructs its own loader.
+
+    The processor factory is declarative; the parent-only position-state factory
+    returns configuration without model parameters for preprocessing workers.
+    """
+
+    pretrained_model_name_or_path: str
+    processor_config: VlmProcessorConfig
+    dataset_build_context: AbstractContextManager[object] | None = None
+    chat_template: str | None = None
+    position_state_factory: Callable[[], ImagePositionState] | None = None
+    pp_n_microbatches: int | None = None
+
+
+def apply_vlm_chat_template(processor: ProcessorMixin | None, chat_template: str | None) -> None:
+    """Apply the same resolved conversation template to processor and tokenizer."""
+    if chat_template is None or processor is None:
+        return
+    resolved = _resolve_chat_template(chat_template)
+    processor.chat_template = resolved
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("A processor tokenizer is required to apply dataset.chat_template")
+    tokenizer.chat_template = resolved
 
 
 @dataclass
 class VlmDataloaderConfig:
     """Typed construction config for the complete VLM input pipeline."""
 
-    dataset_config: DatasetConfig | RankedVlmDatasetConfig
+    dataset_config: (
+        DatasetConfig | RankedVlmDatasetConfig | StreamDatasetConfig[VlmStreamBuildContext, VlmDataloaderBuild]
+    )
     processor_config: VlmProcessorConfig = field(default_factory=VlmProcessorConfig)
     pretokenization: PreTokenizedDatasetWrapperConfig | None = None
     packing: NeatPackConfig | None = None
@@ -289,6 +351,13 @@ class VlmDataloaderConfig:
     prefetch_factor: int | None = None
     drop_last: bool = False
 
+    def __post_init__(self) -> None:
+        """Require a compatible metadata adapter for complete VLM streams."""
+        if isinstance(self.dataset_config, StreamDatasetConfig):
+            raise TypeError(
+                "Stream datasets require a compatible VlmDataloaderConfig subclass; select it with dataloader._target_"
+            )
+
     @property
     def is_packed(self) -> bool:
         """Whether this loader emits packed multimodal inputs."""
@@ -296,7 +365,7 @@ class VlmDataloaderConfig:
 
     @property
     def output_format(self) -> BatchOutputFormat:
-        """Selected native batch representation, independent of the packing algorithm."""
+        """Selected batch representation, independent of the packing algorithm."""
         return "thd" if self.packing is not None and self.packing.packing_format == "thd" else "batched"
 
     def _build_source(
@@ -312,13 +381,7 @@ class VlmDataloaderConfig:
             processor = self.processor_config.build(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
             )
-            if self.chat_template is not None and processor is not None:
-                chat_template = _resolve_chat_template(self.chat_template)
-                processor.chat_template = chat_template
-                tokenizer = getattr(processor, "tokenizer", None)
-                if tokenizer is None:
-                    raise ValueError("A processor tokenizer is required to apply dataset.chat_template")
-                tokenizer.chat_template = chat_template
+            apply_vlm_chat_template(processor, self.chat_template)
 
             if isinstance(self.dataset_config, RankedVlmDatasetConfig):
                 dataset = self.dataset_config.build(rank=dp_rank, world_size=dp_world_size)
@@ -346,7 +409,12 @@ class VlmDataloaderConfig:
         packing_contract: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
         pp_n_microbatches: int | None = None,
         cp_size: int = 1,
+        position_state_factory: Callable[[], ImagePositionState] | None = None,
         ignore_index: int = -100,
+        seed: int = 42,
+        training_schedule: DatasetBuildSchedule | None = None,
+        domain_mixture: object | None = None,
+        is_training: bool = True,
     ) -> VlmDataloaderBuild:
         """Build the processor, dataset wrappers, sampler, collator, and dataloader.
 
@@ -366,120 +434,165 @@ class VlmDataloaderConfig:
             cp_size: Runtime context-parallel world size. Neat-packed CP uses
                 compact document IDs instead of a dense quadratic attention mask;
                 THD packing also accounts for per-document CP alignment.
+            position_state_factory: Parent-only stream-backend position-state factory.
+                Native preprocessing uses ``get_rope_index`` and never invokes this factory.
             ignore_index: Stream-backend label exclusion value. Native collators retain
                 their existing configured supervision policy.
+            seed: Construction seed; ranked RNG state is restored after building.
+            training_schedule: Runtime training limits required by unsized streams.
+            domain_mixture: Runtime domain-loss configuration, when configured.
+            is_training: Whether this is the training loader rather than validation.
 
         Returns:
             Named result containing the stateful dataloader and runtime processor.
         """
-        del ignore_index
-        if self.num_workers < 0:
-            raise ValueError("VLM num_workers must be zero (automatic workers) or a positive worker count.")
-        dataset, processor = self._build_source(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            dataset_build_context=dataset_build_context,
-        )
-        raw_dataset = dataset
-
-        if self.pretokenization is not None:
-            if processor is None:
-                raise ValueError("VLM pretokenization requires a processor")
-            dataset = self.pretokenization.build(dataset=dataset, processor=processor)
-
-        if self.packing is not None:
-            if self.pretokenization is None:
-                raise ValueError("VLM neat packing requires pretokenization")
-            legacy_attn_implementation = packing_attn_implementation or self.packing.attn_implementation
-            packing_contract = resolve_packing_contract(packing_contract, legacy_attn_implementation)
-            tokenizer = getattr(processor, "tokenizer", None)
-            padding_idx = getattr(tokenizer, "pad_token_id", 0) or 0
-            dataset = self.packing.build(
-                dataset=dataset,
-                padding_idx=padding_idx,
-                ds_raw=raw_dataset,
-                get_rope_index=get_rope_index,
-                processor=processor,
-                cp_size=cp_size,
-            )
-            if self.packing.packing_format == "thd":
-                logger.info("Configured VLM THD packing (Transformer Engine, qkv_format=thd)")
-                collate_fn = partial(
-                    packed_sequence_thd_vlm_collater,
-                    padding_idx=padding_idx,
-                    max_length=self.packing.collate_max_length,
-                )
-            else:
-                materialize_4d_mask = cp_size <= 1
-                if not materialize_4d_mask:
-                    logger.info(
-                        "Skipping the dense packed VLM attention mask at cp_size=%d; "
-                        "the CP path rebuilds it from compact document IDs",
-                        cp_size,
+        with ScopedRNG(seed=seed, ranked=True):
+            if isinstance(self.dataset_config, StreamDatasetConfig):
+                if self.packing is not None or self.pretokenization is not None or self.collator is not None:
+                    raise ValueError(
+                        "Stream datasets own packing, preprocessing and collation; "
+                        "remove native packed_sequence, pretokenize and collate_fn settings"
                     )
-                collate_fn = partial(
-                    neat_packed_vlm_collater,
-                    padding_idx=padding_idx,
-                    max_length=self.packing.collate_max_length,
-                    packing=packing_contract,
-                    materialize_4d_mask=materialize_4d_mask,
+                if (
+                    not self.shuffle
+                    or self.num_workers != 0
+                    or self.pin_memory
+                    or self.persistent_workers
+                    or self.prefetch_factor is not None
+                    or self.drop_last
+                    or packing_attn_implementation is not None
+                ):
+                    raise ValueError(
+                        "Stream datasets do not use native dataloader worker, shuffle, memory or drop_last settings; "
+                        "configure the selected stream backend instead"
+                    )
+                return self.dataset_config.build(
+                    context=VlmStreamBuildContext(
+                        seed=seed,
+                        batch_size=batch_size,
+                        dp_rank=dp_rank,
+                        dp_world_size=dp_world_size,
+                        cp_size=cp_size,
+                        packing_contract=packing_contract,
+                        training_schedule=training_schedule,
+                        domain_mixture=domain_mixture,
+                        is_training=is_training,
+                        pretrained_model_name_or_path=pretrained_model_name_or_path,
+                        processor_config=self.processor_config,
+                        dataset_build_context=dataset_build_context,
+                        chat_template=self.chat_template,
+                        position_state_factory=position_state_factory,
+                        pp_n_microbatches=pp_n_microbatches,
+                        ignore_index=ignore_index,
+                    )
                 )
-        elif self.collator is not None:
-            collate_fn = self.collator.build(processor=processor)
-        elif self.pretokenization is not None:
-            collate_fn = partial(pad_collate_fn, processor=processor)
-        else:
-            processor_type = type(processor).__name__
-            if processor_type not in COLLATE_FNS:
-                logger.warning("Using %s with the default VLM collator", processor_type)
-                processor_type = "default"
-            collate_fn = partial(COLLATE_FNS[processor_type], processor=processor)
-
-        if hasattr(dataset, "robust_collate"):
-            collate_fn = dataset.robust_collate(collate_fn)
-        if pp_n_microbatches is not None:
-            collate_fn = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=pp_n_microbatches)
-
-        if not isinstance(dataset, Sized):
-            raise TypeError(f"VLM dataloaders require a sized dataset, got {type(dataset).__name__}")
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=dp_world_size,
-            rank=dp_rank,
-            shuffle=self.shuffle,
-        )
-        num_workers = self.num_workers
-        if num_workers == 0:
-            try:
-                available_cpus = len(os.sched_getaffinity(0))
-            except (AttributeError, OSError, NotImplementedError):
-                available_cpus = None
-            num_cpus = available_cpus or os.cpu_count() or 1
-            num_gpus = torch.cuda.device_count()
-            num_workers = min(4 * num_gpus, num_cpus) if num_gpus > 0 else num_cpus
-            logger.warning(
-                "VLM dataloader num_workers=0 selects automatic preprocessing and prefetching; "
-                "using num_workers=%d with %d visible GPUs and %d available CPUs "
-                "(capped at 4 workers per visible GPU when GPUs are available). "
-                "This count is per dataloader; set an explicit positive num_workers "
-                "to override the automatic selection.",
-                num_workers,
-                num_gpus,
-                num_cpus,
+            if self.num_workers < 0:
+                raise ValueError("VLM num_workers must be zero (automatic workers) or a positive worker count.")
+            dataset, processor = self._build_source(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
+                dataset_build_context=dataset_build_context,
             )
-        dataloader = _VlmStatefulDataloader(
-            dataset=dataset,
-            sampler=sampler,
-            collate_fn=collate_fn,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers and num_workers > 0,
-            prefetch_factor=self.prefetch_factor if num_workers > 0 else None,
-            drop_last=self.drop_last,
-        )
-        return VlmDataloaderBuild(dataloader=dataloader, processor=processor)
+            raw_dataset = dataset
+
+            if self.pretokenization is not None:
+                if processor is None:
+                    raise ValueError("VLM pretokenization requires a processor")
+                dataset = self.pretokenization.build(dataset=dataset, processor=processor)
+
+            if self.packing is not None:
+                if self.pretokenization is None:
+                    raise ValueError("VLM neat packing requires pretokenization")
+                legacy_attn_implementation = packing_attn_implementation or self.packing.attn_implementation
+                packing_contract = resolve_packing_contract(packing_contract, legacy_attn_implementation)
+                tokenizer = getattr(processor, "tokenizer", None)
+                padding_idx = getattr(tokenizer, "pad_token_id", 0) or 0
+                dataset = self.packing.build(
+                    dataset=dataset,
+                    padding_idx=padding_idx,
+                    ds_raw=raw_dataset,
+                    get_rope_index=get_rope_index,
+                    processor=processor,
+                    cp_size=cp_size,
+                )
+                if self.packing.packing_format == "thd":
+                    logger.info("Configured VLM THD packing (Transformer Engine, qkv_format=thd)")
+                    collate_fn = partial(
+                        packed_sequence_thd_vlm_collater,
+                        padding_idx=padding_idx,
+                        max_length=self.packing.collate_max_length,
+                    )
+                else:
+                    materialize_4d_mask = cp_size <= 1
+                    if not materialize_4d_mask:
+                        logger.info(
+                            "Skipping the dense packed VLM attention mask at cp_size=%d; "
+                            "the CP path rebuilds it from compact document IDs",
+                            cp_size,
+                        )
+                    collate_fn = partial(
+                        neat_packed_vlm_collater,
+                        padding_idx=padding_idx,
+                        max_length=self.packing.collate_max_length,
+                        packing=packing_contract,
+                        materialize_4d_mask=materialize_4d_mask,
+                    )
+            elif self.collator is not None:
+                collate_fn = self.collator.build(processor=processor)
+            elif self.pretokenization is not None:
+                collate_fn = partial(pad_collate_fn, processor=processor)
+            else:
+                processor_type = type(processor).__name__
+                if processor_type not in COLLATE_FNS:
+                    logger.warning("Using %s with the default VLM collator", processor_type)
+                    processor_type = "default"
+                collate_fn = partial(COLLATE_FNS[processor_type], processor=processor)
+
+            if hasattr(dataset, "robust_collate"):
+                collate_fn = dataset.robust_collate(collate_fn)
+            if pp_n_microbatches is not None:
+                collate_fn = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=pp_n_microbatches)
+
+            if not isinstance(dataset, Sized):
+                raise TypeError(f"VLM dataloaders require a sized dataset, got {type(dataset).__name__}")
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=dp_world_size,
+                rank=dp_rank,
+                shuffle=self.shuffle,
+            )
+            num_workers = self.num_workers
+            if num_workers == 0:
+                try:
+                    available_cpus = len(os.sched_getaffinity(0))
+                except (AttributeError, OSError, NotImplementedError):
+                    available_cpus = None
+                num_cpus = available_cpus or os.cpu_count() or 1
+                num_gpus = torch.cuda.device_count()
+                num_workers = min(4 * num_gpus, num_cpus) if num_gpus > 0 else num_cpus
+                logger.warning(
+                    "VLM dataloader num_workers=0 selects automatic preprocessing and prefetching; "
+                    "using num_workers=%d with %d visible GPUs and %d available CPUs "
+                    "(capped at 4 workers per visible GPU when GPUs are available). "
+                    "This count is per dataloader; set an explicit positive num_workers "
+                    "to override the automatic selection.",
+                    num_workers,
+                    num_gpus,
+                    num_cpus,
+                )
+            dataloader = _VlmStatefulDataloader(
+                dataset=dataset,
+                sampler=sampler,
+                collate_fn=collate_fn,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.persistent_workers and num_workers > 0,
+                prefetch_factor=self.prefetch_factor if num_workers > 0 else None,
+                drop_last=self.drop_last,
+            )
+            return VlmDataloaderBuild(dataloader=dataloader, processor=processor)
 
 
 __all__ = [
@@ -488,4 +601,5 @@ __all__ = [
     "VlmDataloaderBuild",
     "VlmDataloaderConfig",
     "VlmProcessorConfig",
+    "VlmStreamBuildContext",
 ]

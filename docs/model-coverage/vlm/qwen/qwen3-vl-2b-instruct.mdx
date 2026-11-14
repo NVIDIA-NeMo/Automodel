@@ -1,0 +1,38 @@
+---
+title: "Qwen3-VL-2B-Instruct"
+description: "Fine-tune Qwen3-VL-2B-Instruct with NeMo AutoModel using a Zephon image-conversation recipe, online packing, and resumable data loading."
+slug: model-coverage/vision-language-models/qwen/Qwen3-VL-2B-Instruct
+---
+
+[Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) uses
+the dense `Qwen3VLForConditionalGeneration` architecture for image-text inputs.
+
+## Fine-Tune with Zephon
+
+Follow the [installation instructions](/get-started/installation), then run
+from the repository root:
+
+```bash
+uv run automodel examples/vlm_finetune/qwen3/zephon.yaml --nproc-per-node 8
+```
+
+The [recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/zephon.yaml)
+reads embedded MedPix-VQA image conversations and packs complete documents online.
+It follows the native packed Qwen3-VL example: FSDP2, Flash Attention 2,
+an 8,192-token window, AdamW and a frozen vision tower.
+Image preprocessing expands image tokens and constructs multi-axis positions
+before packing.
+
+See [Zephon](/datasets/zephon) for configuration, checkpointing and supported
+parallelism, and [Zephon Image Data](/datasets/zephon-images) for source formats
+and offline image export.
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Image-Text-to-Text |
+| Architecture | `Qwen3VLForConditionalGeneration` |
+| Checkpoint | [`Qwen/Qwen3-VL-2B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) |

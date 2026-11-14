@@ -656,6 +656,8 @@ navigation:
                 path: ../../model-coverage/vlm/qwen/qwen2-5-vl.mdx
               - page: "Qwen3-VL-235B-A22B-Instruct"
                 path: ../../model-coverage/vlm/qwen/qwen3-vl-235b-a22b-instruct.mdx
+              - page: "Qwen3-VL-2B-Instruct"
+                path: ../../model-coverage/vlm/qwen/qwen3-vl-2b-instruct.mdx
               - page: "Qwen3-VL-30B-A3B-Instruct"
                 path: ../../model-coverage/vlm/qwen/qwen3-vl-30b-a3b-instruct.mdx
               - page: "Qwen3-VL-4B-Instruct"
@@ -924,6 +926,13 @@ navigation:
           - page: "Overview"
             path: ../../model-coverage/reranker/index.mdx
             slug: overview
+          - section: "Mistral AI"
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRp4CAABXRUJQVlA4TJECAAAvE8AEED/lNpJkV5m9Jz9aWbjknxi+hvc2DbeR7NbNAhRSh+4/dz2uw+GXBGBFki0ryr73PbZ/lOBfAjpWBzBzG25t26qqhbu7QwU0QSH0QxEMMgahQ0wFRO4u312uBMMABjAawAASdB1KAW/w9uENDoSbABsTRvAwXBySZqftGShAIIdvAQ0jQIMyT+Yc4RlWSofJu0M8aIqvGJ+DxmLUyjVc62v8t2BhUhyTl2PNstSR1zApcJkmUiWoHKPI8cxqNINMwiJbYIkQ8+9XYcXR17G27u+EUhnwH8tcuyMZy7fH8Y7hti+VPOMp/H3lHC/H9Z2ACgwYD2IKSgDGANDCIBCgTBT69jeg+ZxfMwRxNV99xAaCIDINQU0IvmqENyenxOC2mun5oFItnvSm9IUcDV8Zu+tztgpjYRRMXhp+YS/kMk/wkvhLAIaAR0eIt6t+kfGGCPBNK2t+TbDyEzhEwaTeWMd2/b4N+9vP7k5CMDBaZgWEvcLxVT/Dy9CgOyUMRi31vd3qetwVTxoQbds23cSq21i1bVuxjdq2bdt293++lzHyCRH9nwAEndXBCtDRESiozJPHO7L78wc6gYXTg+frzTWAsXnzdHgGJuH26PUKpJcvxxdkG/vbU7PzKtXczPTW3jo6CD0ry6s7k8DE7urS4gJZ93D/6MCYyTg+ONI31EvW2eawtts9bnu7zWI1B/C7XV630+nxuF0+kj9aUX2NxqCvrdYZtFV1xTQ1APyWVjahtay8GS0VJV0AkPqTkVeY853V2JD9lVuQn/mTAiRywsWCSG4sEMeOEIrCOAlAEk8pk8hD09Xq+BCFVKbkJQNR7598Pv8jGohJ++TzP9/fEGQK9Z9IASj/RCoFwQUA"/></svg>'
+            slug: mistralai
+            path: ../../model-coverage/reranker/mistralai/index.mdx
+            contents:
+              - page: "Ministral-3-3B-Instruct-2512-BF16"
+                path: ../../model-coverage/reranker/mistralai/ministral3-vl.mdx
           - section: "NVIDIA"
             icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><image width="20" height="20" href="data:image/webp;base64,UklGRiACAABXRUJQVlA4TBQCAAAvE8AEAJfkqI0kScqsnnueQ2QZLH9Ic1QGDceR5MbNLgSAsv10OA7C+Qeim8A6biRJkapheX/rypp9PpxBzHc9VPMfiAVCIJABEUgEAFGRTCEIOnlLIUJUS+dtd19/MxO62rPJDFRIVUaTDgjy/NDNd96lkr4+MjNAJmQWmT+gkRrUUIr+oTOR6IIGgYBChasQGgCpoousYIAhCiAUDZAgAqsBJJC6kgBRRGaVElbSs4iCir7zKg9hWR9PUfZtN+qiZXgKKfkeYAIFCL4L/D+Y3JliW0dl6njP1jEYiylT52chCgPaZrtnbavZ1f+3W8fg+m5MMUdncrdkrwhALNmbwwjKFNvo2czkrkimEM3sZore8Z4t2ZvcmWJyN7mb3JmiTJnCFEv2RPj50YhBuVgsw1Z9nACibdumm/1wYttOldpGUtupbdu29cuNvyCi/xOAVGckEblYGCnilwKmptZgdc2nG1wUGLzZLc39I0OjjZBE4DlXgz8nM9fR1jdYEYmDvddZ780oqrUMh8sjgZO1BwrTB4Jp3b7OUBQexo5AcX5eidXWVRcFAuizCkrLvnrCYyESR/pv/q36+/mu9ICJoJhf0upUa+rVZWiwIAcgxOTm0cH98+H53snVxcr6O0QQ4u12+nh/52P7dHzj7Hp3S8myhJmJuamXx8Wnm8vp14fZuwWwSDBLLJGQJaGQiEgYIVUB"/></svg>'
             slug: nvidia
@@ -1069,6 +1078,12 @@ navigation:
       - page: "Overview"
         path: ../../guides/dataset-overview.mdx
         slug: overview
+      - page: "Zephon"
+        path: ../../guides/zephon.mdx
+        slug: zephon
+      - page: "Zephon Image Data"
+        path: ../../guides/zephon-images.mdx
+        slug: zephon-images
       - page: "Text Dataset"
         path: ../../guides/llm/dataset.mdx
         slug: text-dataset
