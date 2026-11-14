@@ -32,6 +32,7 @@ from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
 
+    from nemo_automodel.components.loggers.comet_utils import CometLogger
     from nemo_automodel.components.loggers.trackio_utils import TrackioLogger
 
 logger = logging.getLogger(__name__)
@@ -460,7 +461,7 @@ class CometConfig:
     tags: list[str] = field(default_factory=list)
     auto_metric_logging: bool = False
 
-    def build(self, model_name: str | None = None) -> Any:
+    def build(self, model_name: str | None = None) -> CometLogger:
         """Initialise Comet ML and return the logger (active on rank 0).
 
         When ``model_name`` is provided a ``model:<name>`` tag is appended and,

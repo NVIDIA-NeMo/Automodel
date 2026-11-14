@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Dict, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import torch
 import torch.distributed as dist
@@ -78,7 +78,7 @@ class CometLogger:
 
             logger.info(f"Comet experiment: {self.experiment.url}")
 
-    def log_params(self, params: Dict[str, Any]) -> None:
+    def log_params(self, params: dict[str, Any]) -> None:
         """Log parameters to Comet.
 
         Args:
@@ -89,7 +89,7 @@ class CometLogger:
 
         self.experiment.log_parameters(params)
 
-    def log_metrics(self, metrics: Dict[str, float], step: int | None = None) -> None:
+    def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
         """Log metrics to Comet.
 
         Args:
