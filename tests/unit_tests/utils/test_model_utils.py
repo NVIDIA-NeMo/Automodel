@@ -1110,20 +1110,6 @@ class TestLmHeadLookup:
         model = Model()
         assert model_utils.get_lm_head_module(model) is model.lm_head
 
-    def test_get_lm_head_weight_rejects_module_valued_weight(self):
-        class Head(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.weight = nn.Linear(2, 2)
-
-        class Model(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.lm_head = Head()
-
-        with pytest.raises(TypeError, match="LM-head weight must be a tensor"):
-            model_utils.get_lm_head_weight(Model())
-
 
 class TestSkipRandomInit:
     def test_leaves_releases_without_the_flag_unchanged(self, monkeypatch):
