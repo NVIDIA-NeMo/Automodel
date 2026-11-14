@@ -161,6 +161,7 @@ clip_grad_norm:
   max_norm: 1.0
 
 ci:
+  nemo_ci_schedule: skipped
   recipe_owner: huiyingl
   nodes: 32
   cluster_tag: gb200

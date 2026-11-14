@@ -175,6 +175,7 @@ clip_grad_norm:
   backend: te
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: huiyingl
   nodes: 8
   nproc_per_node: 4

@@ -110,6 +110,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100
   time: "00:25:00"
   nodes: 1

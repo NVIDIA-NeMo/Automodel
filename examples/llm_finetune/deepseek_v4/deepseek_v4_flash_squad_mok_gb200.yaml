@@ -123,6 +123,7 @@ optimizer:
 prewarm:
   comm_groups: true
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: gb200
   # ep_size(32) = 32 GPUs => 8 nodes (4 GB200/node).
   recipe_owner: akoumpa

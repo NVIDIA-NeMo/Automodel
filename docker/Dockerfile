@@ -321,7 +321,7 @@ ARG AUTOMODEL_INSTALL=all
 # Include both Blackwell targets supported by the pinned MoK source.
 ARG MOK_ARCH=ALL
 # `msa` is SM100-only so it stays out of `all`, but the image needs it: the MiniMax M3 MSA
-# recipe under examples/vlm_finetune/ is auto-discovered into release CI.
+# recipe under examples/vlm_finetune/ runs in release CI (`ci.nemo_ci_schedule: release`).
 ARG UV_SYNC_ARGS="--locked"
 # MAX_JOBS for source builds inside uv sync (MagiAttention dominates); the default keeps today's
 # behavior, upstream CI passes a higher value.

@@ -190,6 +190,7 @@ wandb:
   resume: allow
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100
   recipe_owner: ssharifymogh
   time: "08:00:00"

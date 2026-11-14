@@ -74,6 +74,7 @@ rng:
   seed: 1234
   ranked: true
 ci:
+  nemo_ci_schedule: skipped
   time: 04:00:00
   nodes: 16
   cluster_tag: gb200

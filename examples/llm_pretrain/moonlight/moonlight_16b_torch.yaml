@@ -75,6 +75,7 @@ rng:
   seed: 1234
   ranked: true
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100
   time: 00:15:00
   nodes: 1

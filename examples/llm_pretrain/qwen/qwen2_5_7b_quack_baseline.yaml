@@ -67,6 +67,7 @@ rng:
   seed: 1234
   ranked: true
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100
   recipe_owner: akoumpa
   time: 01:00:00
