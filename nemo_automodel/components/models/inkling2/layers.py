@@ -25,7 +25,7 @@ from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.components.moe.layers import MoE
 
 from .config import Inkling2TextConfig
@@ -142,7 +142,7 @@ class Inkling2MoE(MoE):
         )
         # The shared factory uses different activation hooks for HybridEP and
         # ordinary grouped experts (including the world-size-one fallback).
-        if isinstance(self.experts, GroupedExpertsDeepEP):
+        if isinstance(self.experts, (GroupedExpertsDeepEP, GroupedExpertsTE)):
             self.experts.expert_activation = activation
         else:
             cast(GroupedExperts, self.experts).expert_activation_grouped = activation
