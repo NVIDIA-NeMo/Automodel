@@ -74,4 +74,5 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

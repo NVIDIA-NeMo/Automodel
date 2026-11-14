@@ -113,6 +113,7 @@ wandb:
   resume: never
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   # pp4 with ep64 requires 256 ranks.
   recipe_owner: huiyingl

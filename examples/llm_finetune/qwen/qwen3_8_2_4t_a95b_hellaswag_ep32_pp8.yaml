@@ -86,7 +86,7 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: Rowan/hellaswag
   split: train
-  num_samples_limit: 25600
+  limit_dataset_samples: 25600
   pad_to_max_length: false
 
 packed_sequence:
@@ -101,7 +101,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: Rowan/hellaswag
   split: validation
-  num_samples_limit: 256
+  limit_dataset_samples: 256
   pad_to_max_length: false
 
 validation_dataloader:
@@ -126,6 +126,7 @@ clip_grad_norm:
   max_norm: 1.0
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: huiyingl
   nodes: 64
   cluster_tag: gb200

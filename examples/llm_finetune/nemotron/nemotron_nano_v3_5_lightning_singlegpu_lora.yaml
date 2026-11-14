@@ -111,6 +111,7 @@ lr_scheduler:
   min_lr: 1.0e-5
 
 ci:
+  nemo_ci_schedule: release
   recipe_owner: huiyingl
   time: "00:30:00"
   cluster_tag: gb10

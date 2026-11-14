@@ -187,4 +187,5 @@ wandb:
   name: bagel_mot_pretrain
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

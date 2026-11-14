@@ -129,6 +129,7 @@ optimizer:
 #   name: <your_wandb_name>
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: gb300
   recipe_owner: akoumparouli
   nodes: 1

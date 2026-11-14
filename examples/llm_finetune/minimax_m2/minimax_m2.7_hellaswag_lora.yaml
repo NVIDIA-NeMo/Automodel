@@ -111,6 +111,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   # pp_size(1) * ep_size(32) = 32 GPUs => 4 nodes (8 H100/node).
   recipe_owner: hemildesai
@@ -154,5 +155,5 @@ ci:
     # 64093591). Match the routed hybrid-MoE precedent and use the shared
     # relaxed resume envelope; every logit gate stays standard.
     resume_tolerance_profile: relaxed
-    dataset.num_samples_limit: 500
-    validation_dataset.num_samples_limit: 500
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

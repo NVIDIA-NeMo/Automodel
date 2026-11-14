@@ -24,14 +24,18 @@ import enum
 import logging
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
-from torch.utils._pytree import tree_flatten, tree_unflatten
+from torch.utils._pytree import TreeSpec, tree_flatten, tree_unflatten
 
 from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
 from nemo_automodel.shared.model_utils import iter_transformer_and_mtp_blocks
+
+if TYPE_CHECKING:
+    from torch.distributed.fsdp import FSDPModule
+    from torch.utils.hooks import RemovableHandle
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +175,7 @@ def _describe_control_value(value: Any) -> str:
 class _CapturedCall:
     """Detached sample inputs and the invariants required for a safe replay."""
 
-    tree_spec: Any
+    tree_spec: TreeSpec
     template_leaves: tuple[Any, ...]
     tensor_positions: tuple[int, ...]
     tensor_input_indices: tuple[int, ...]
@@ -273,7 +277,7 @@ class _CapturedCall:
 class _TensorOnlyCallAdapter(nn.Module):
     """Expose a mixed tensor/control module call as a tensor-only module call."""
 
-    def __init__(self, target: nn.Module, captured_call: _CapturedCall):
+    def __init__(self, target: nn.Module, captured_call: _CapturedCall) -> None:
         super().__init__()
         self.target = target
         self.captured_call = captured_call
@@ -286,6 +290,8 @@ class _TensorOnlyCallAdapter(nn.Module):
 
 class _ExplicitParameterCallAdapter(nn.Module):
     """Present module parameters as graph inputs instead of captured module state."""
+
+    target: nn.Module
 
     def __init__(self, target: nn.Module, captured_call: _CapturedCall) -> None:
         super().__init__()
@@ -397,9 +403,9 @@ class _PartialGraphEntry:
         canonicalizer: _Canonicalizer | None = None,
         capture_input_variants: int = 1,
         explicit_parameters: bool = False,
-        capture_owner: nn.Module | None = None,
+        capture_owner: FSDPModule | None = None,
         retain_graph_in_backward: bool = False,
-    ):
+    ) -> None:
         # Target configuration.
         self.name = name
         self.target = target
@@ -423,7 +429,7 @@ class _PartialGraphEntry:
         self.fallback_count = 0
 
         # Lifecycle state.
-        self._record_hook: Any = None
+        self._record_hook: RemovableHandle | None = None
         self._captured_training: bool | None = None
         self._logged_replay = False
         self._logged_fallback = False
@@ -653,7 +659,7 @@ class _DiscoveredBlock:
 
     name: str
     module: nn.Module
-    capture_owner: nn.Module | None
+    capture_owner: FSDPModule | None
     moe: nn.Module | None
     is_mtp: bool
 
@@ -868,7 +874,7 @@ def _select_graph_targets(
 class PartialCudaGraphManager:
     """Capture selected TE attention and MoE submodules after one eager iteration."""
 
-    def __init__(self, entries: list[_PartialGraphEntry]):
+    def __init__(self, entries: list[_PartialGraphEntry]) -> None:
         self.entries = entries
         self._captured = False
         self._closed = False

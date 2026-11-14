@@ -106,6 +106,7 @@ benchmark:
   json_output_path: training_logs/nemotron_super_v3_te_hybridep_8k_ep16_gb200.json
 
 ci:
+  nemo_ci_schedule: skipped
   recipe_owner: HuiyingLi
   time: "00:15:00"
   nodes: 4

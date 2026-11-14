@@ -1736,6 +1736,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
 
         reporting_loss = torch.sum(torch.stack(loss_buffer))
+        if self.pp_enabled:
+            # The last stage's CE may be bf16, while other stages contribute
+            # fp32 zeros. Every PP broadcast participant needs the same dtype.
+            reporting_loss = reporting_loss.float()
         reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
         if self.pp_enabled:
             reporting_loss = reporting_loss / num_label_tokens
@@ -2047,7 +2051,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.metric_logger_train.log(log_data)
         pack_fill = log_data.metrics.get("pack_fill")
         logging.info(
-            "step {} | epoch {} | loss {:.4f}{} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+            "step {} | epoch {} | loss {:.4f}{} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {} | num_tokens_per_step {} | mfu {}".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
@@ -2058,6 +2062,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 log_data.metrics["tps"],
                 log_data.metrics["tps_per_gpu"],
                 log_data.metrics["num_label_tokens"],
+                log_data.metrics["num_tokens_per_step"],
+                log_data.metrics["mfu"],
             )
         )
         torch.cuda.reset_peak_memory_stats()

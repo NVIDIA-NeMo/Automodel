@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Models deprecated for 26.10 removal — skipped in release (auto-discover) scope.
+# Models deprecated for 26.10 removal — skipped in every CI scope.
 exempt_models:
   - baichuan
   - cohere
@@ -37,6 +37,8 @@ exempt_configs:
     reason: "Deprecated for 26.10 (GLM-4)"
   glm_5.2_tulu3_4k_cudnn_100k:
     reason: "Requires the tested FlashMLA source build, which is not yet included in the standard release CI image"
+  inkling2_tulu3_packed128k_ep32_pp2_cp32:
+    reason: "Requires the Inkling-2-Small model implementation, which is not yet on main"
   mistral_7b_hellaswag_fp8:
     reason: "Deprecated for 26.10 (Mistral 7B)"
   mistral_7b_squad:

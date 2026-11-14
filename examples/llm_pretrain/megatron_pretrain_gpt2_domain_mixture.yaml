@@ -125,4 +125,5 @@ lr_scheduler:
   min_lr: 0.0
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

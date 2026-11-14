@@ -116,6 +116,7 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 ci:
+  nemo_ci_schedule: nightly,release
   cluster_tag: h100
   recipe_owner: akoumpa
   nodes: 2
@@ -136,3 +137,5 @@ ci:
     trust_remote_code: true
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
+  perf_testing:
+    schedule: nightly

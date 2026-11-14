@@ -112,4 +112,5 @@ optimizer:
   warmup_ratio: 0.015
 
 ci:
+  nemo_ci_schedule: skipped
   cluster_tag: h100

@@ -90,7 +90,7 @@ validation_dataset:
   _target_: nemo_automodel.components.datasets.llm.hellaswag.HellaSwag
   path_or_dataset: rowan/hellaswag
   split: validation
-  num_samples_limit: 64
+  limit_dataset_samples: 64
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -114,5 +114,6 @@ optimizer:
 #   save_dir: <your_wandb_save_dir>
 
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: hemildesai

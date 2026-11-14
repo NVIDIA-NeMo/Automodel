@@ -130,6 +130,7 @@ wandb:
   name: minimax_m3_1_vl_sft_medpix_ep128_100steps
   dir: logs/minimax_m3_1_vl_sft_medpix_ep128_100steps/wandb
 ci:
+  nemo_ci_schedule: release
   cluster_tag: h100
   recipe_owner: HuiyingLi
   # ep_size(128) => 16 nodes (8 H100/node).

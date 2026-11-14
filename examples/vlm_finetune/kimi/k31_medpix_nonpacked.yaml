@@ -128,6 +128,7 @@ freeze_config:
   freeze_vision_tower: false
   freeze_language_model: false
 ci:
+  nemo_ci_schedule: release
   recipe_owner: huiyingl
   nodes: 64
   cluster_tag: gb200

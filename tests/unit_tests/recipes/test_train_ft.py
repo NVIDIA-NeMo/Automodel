@@ -2199,14 +2199,20 @@ def _make_trainer_for_trackio(monkeypatch):
     return trainer
 
 
-def test_log_train_metrics_sends_metrics_and_moe_loads_to_trackio(monkeypatch):
+def test_log_train_metrics_sends_metrics_and_moe_loads_to_trackio(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     from nemo_automodel.components.loggers.metric_logger import MetricsSample
 
     trainer = _make_trainer_for_trackio(monkeypatch)
     metrics = {"loss": 1.5, "grad_norm": 0.5, "lr": 1e-4, "mem": 1.0, "tps": 10.0, "tps_per_gpu": 10.0}
-    log_data = MetricsSample(step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8})
+    log_data = MetricsSample(
+        step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8, "num_tokens_per_step": 10, "mfu": 0.25}
+    )
 
-    trainer.log_train_metrics(log_data)
+    with caplog.at_level(logging.INFO):
+        trainer.log_train_metrics(log_data)
+    assert "num_tokens_per_step 10 | mfu 0.25" in caplog.text
 
     first, second = trainer.trackio_logger.log_metrics.call_args_list
     assert first.args[0] == log_data.to_dict() and first.kwargs == {"step": 7}
@@ -2227,7 +2233,11 @@ def test_log_train_metrics_shows_pack_fill_next_to_loss(monkeypatch, caplog, pac
         metrics["pack_fill"] = pack_fill
 
     with caplog.at_level(logging.INFO):
-        trainer.log_train_metrics(MetricsSample(step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8}))
+        trainer.log_train_metrics(
+            MetricsSample(
+                step=7, epoch=0, metrics=metrics | {"num_label_tokens": 8, "num_tokens_per_step": 10, "mfu": 0.25}
+            )
+        )
 
     assert expected in caplog.text
 
@@ -2456,6 +2466,37 @@ class TestRunTrainOptimStepSetsMoEScale:
 
         assert clip.call_args.kwargs["grad_norm_backend"] == (backend or "triton")
         assert sample.metrics["grad_norm"] == 1.0
+
+    @pytest.mark.parametrize("has_last_stage", [False, True])
+    def test_pp_bf16_loss_reporting_matches_broadcast_dtype(self, monkeypatch, has_last_stage):
+        """BF16 CE and FP32 placeholder ranks use identical reporting buffers."""
+        recipe = self._make_recipe(monkeypatch, pp_enabled=True, dp_group_size=1)
+        labels = torch.tensor([[0, 1, -100, 2]])
+        logits = torch.tensor([[[2, 0, -1], [0, 2, -1], [1, 1, 1], [-1, 0, 2]]], dtype=torch.bfloat16)
+        ce = MaskedCrossEntropy(fp32_upcast=False)(logits, labels)
+        assert ce.dtype == torch.bfloat16
+        expected_loss = ce.float() / 3
+        broadcast_inputs = []
+
+        def forward_backward_step(idx, batch, *, loss_buffer, **kwargs):
+            loss_buffer.append(ce.detach() if has_last_stage else torch.tensor(0.0))
+
+        def broadcast(tensor):
+            # NCCL requires matching element types on source and destination;
+            # broadcasting bf16 into an fp32 placeholder corrupts the metric.
+            assert tensor.dtype == torch.float32
+            broadcast_inputs.append(tensor.clone())
+            tensor.copy_(expected_loss)
+            return tensor
+
+        monkeypatch.setattr(recipe, "_forward_backward_step", forward_backward_step)
+        monkeypatch.setattr(recipe, "_broadcast_from_last_pp_stage", broadcast)
+        sample = recipe._run_train_optim_step([{"input_ids": labels.clamp_min(0), "labels": labels}])
+
+        assert len(broadcast_inputs) == 1
+        torch.testing.assert_close(broadcast_inputs[0], expected_loss if has_last_stage else torch.tensor(0.0))
+        assert sample.metrics["loss"] == pytest.approx(expected_loss.item())
+        assert ce.dtype == torch.bfloat16
 
     @pytest.mark.parametrize("pp_enabled", [False, True])
     @pytest.mark.parametrize("accumulation_steps", [1, 3])
@@ -4525,3 +4566,42 @@ def test_setup_always_passes_return_contract_and_only_configures_packed_batched_
     assert queries == [True]
     assert configured == ([True] if is_packed and output_format == "batched" else [])
     assert thd_validated == ([True] if output_format == "thd" else [])
+
+
+@pytest.mark.parametrize("document_ids", [[[1, 1, 2, 2, 0], [1, 2, 2, 2, 0]], [[1, 1, 1, 1, 0], [1, 1, 1, 0, 0]]])
+def test_neat_flash_pp_rebuilds_offsets_for_each_microbatch(document_ids: list[list[int]]) -> None:
+    """Real PP splitting must deliver rebased offsets covering each microbatch."""
+    from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
+    from transformers import LlamaConfig
+
+    from nemo_automodel.components.datasets.utils import neat_packed_collater
+    from nemo_automodel.components.models.common.packing import PackingCapabilities, configure_packing
+    from nemo_automodel.recipes.llm.train_ft import _build_pp_collate_wrapper
+
+    class Capture(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor, **kwargs):
+            return input_ids, kwargs
+
+    packing = PackingCapabilities(packed_mask_type="flash_varlen")
+    samples = [
+        {"input_ids": [1] * 5, "labels": [1] * 5, "position_ids": [0] * 5, "attention_mask": ids}
+        for ids in document_ids
+    ]
+    config = LlamaConfig()
+    config._attn_implementation = "flash_attention_2"
+    with patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=config):
+        wrapper = _build_pp_collate_wrapper(ConfigNode({"pretrained_model_name_or_path": "test"}), True)
+    batch = wrapper(lambda rows: neat_packed_collater(rows, packing=packing))(samples)
+    _, chunks = split_args_kwargs_into_chunks((), batch, chunks=2)
+    model = Capture()
+    configure_packing("flash_attention_2", model=model)
+    for sample, chunk in zip(samples, chunks):
+        tokens, prepared = model(**chunk)
+        expected = neat_packed_collater([sample], packing=packing)
+        offsets = prepared["cu_seq_lens_q"]
+        assert tokens.shape == (1, 5)
+        assert offsets[0].item() == 0
+        assert offsets[-1].item() == tokens.numel()
+        torch.testing.assert_close(offsets, expected["cu_seq_lens_q"])
+        torch.testing.assert_close(prepared["cu_seq_lens_k"], expected["cu_seq_lens_k"])
+        assert prepared["max_length_q"] == expected["max_length_q"]
