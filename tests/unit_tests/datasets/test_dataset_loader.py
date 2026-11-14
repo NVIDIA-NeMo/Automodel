@@ -485,14 +485,94 @@ def test_thd_packing_build_reads_token_columns_as_tensors():
     dataset, collator = ThdPackingConfig(packed_sequence_size=8).build(source, cp_size=1)
     assert collator is packed_sequence_thd_collater
     row = dataset[0]
-    assert isinstance(row["input_ids"], torch.Tensor)
-    assert isinstance(row["labels"], torch.Tensor)
-    assert isinstance(row["position_ids"], torch.Tensor)
     assert isinstance(row["seq_lens"], list)
     listed = {key: value.tolist() if isinstance(value, torch.Tensor) else value for key, value in row.items()}
     assert torch.equal(collator([row])["input_ids"], collator([listed])["input_ids"])
     assert torch.equal(collator([row])["labels"], collator([listed])["labels"])
     assert torch.equal(collator([row])["position_ids"], collator([listed])["position_ids"])
+    from nemo_automodel.components.datasets.llm.packed_sequence import _torch_integer_format_is_safe
+
+    expects_tensors = _torch_integer_format_is_safe()
+    assert isinstance(row["input_ids"], torch.Tensor if expects_tensors else list)
+    assert isinstance(row["labels"], torch.Tensor if expects_tensors else list)
+    assert isinstance(row["position_ids"], torch.Tensor if expects_tensors else list)
+
+
+def test_thd_packing_build_still_collates_when_torch_format_is_unsafe(monkeypatch):
+    """Online THD packing keeps list rows when the torch formatter cannot import VideoReader."""
+    from datasets import Dataset
+
+    import nemo_automodel.components.datasets.llm.packed_sequence as packed
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    monkeypatch.setattr(packed, "_torch_integer_format_is_safe", lambda: False)
+    source = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3, 4], [5, 6, 7]],
+            "labels": [[-100, 2, 3, 4], [5, 6, 7]],
+        }
+    )
+    dataset, collator = ThdPackingConfig(packed_sequence_size=8).build(source, cp_size=1)
+    assert collator is packed_sequence_thd_collater
+    row = dataset[0]
+    assert isinstance(row["input_ids"], list)
+    batch = collator([row])
+    assert batch["qkv_format"] == "thd"
+    assert batch["input_ids"].dtype == torch.long
+
+
+def test_prepacked_hf_iterable_keeps_python_rows():
+    """A feature-declared HF stream is a supported prepacked dataset and must not be column-formatted."""
+    from datasets import Dataset
+
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    source = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3, 4]],
+            "labels": [[-100, 2, 3, 4]],
+            "position_ids": [[0, 1, 2, 3]],
+            "seq_lens": [[4]],
+            "seq_lens_padded": [[4]],
+        }
+    ).to_iterable_dataset()
+    config = DataloaderConfig(
+        dataset_config=StaticDatasetConfig(source),
+        packing=ThdPackingConfig(packed_sequence_size=4, prepacked=True),
+        collate_fn=packed_sequence_thd_collater,
+        batch_size=1,
+        shuffle=False,
+    )
+    batch = next(iter(config.build(dp_rank=0, dp_world_size=1)))
+    assert batch["qkv_format"] == "thd"
+    assert torch.equal(batch["input_ids"], torch.tensor([[1, 2, 3, 4]]))
+    assert torch.equal(batch["labels"], torch.tensor([[-100, 2, 3, 4]]))
+
+
+def test_thd_collate_accepts_longest_tensor_row_first():
+    """Variable-length tensor rows from a public loader pad in dataset order."""
+
+    class Rows:
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            ids = [1, 2, 3, 4] if index == 0 else [5, 6]
+            values = torch.tensor(ids, dtype=torch.int64)
+            return {"input_ids": values, "labels": values.clone()}
+
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    config = DataloaderConfig(
+        dataset_config=StaticDatasetConfig(Rows()),
+        collate_fn=packed_sequence_thd_collater,
+        batch_size=2,
+        shuffle=False,
+    )
+    batch = next(iter(config.build(dp_rank=0, dp_world_size=1)))
+    assert torch.equal(batch["input_ids"], torch.tensor([[1, 2, 3, 4], [5, 6, 0, 0]]))
+    assert torch.equal(batch["labels"], torch.tensor([[1, 2, 3, 4], [5, 6, -100, -100]]))
+    assert torch.equal(batch["seq_lens"], torch.tensor([[4], [2]]))
 
 
 def test_native_packing_uses_model_owned_cp_alignment(monkeypatch):

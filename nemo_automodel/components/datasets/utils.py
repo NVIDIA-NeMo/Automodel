@@ -50,17 +50,21 @@ def batchify(tensor, default_tensor_cls=torch.LongTensor):
     return tensor
 
 
+def _long_token_row(row) -> torch.Tensor:
+    """Return one token row as int64. An existing long tensor is not copied."""
+    if isinstance(row, torch.Tensor):
+        return row if row.dtype == torch.long else row.to(dtype=torch.long)
+    return torch.tensor(row, dtype=torch.long)
+
+
 def _stack_long_rows(rows: list) -> torch.Tensor:
     """Stack one token row per example into int64 ``[batch, sequence]``.
 
-    Tensor rows are stacked directly. ``torch.tensor`` on an existing tensor copies and warns.
+    Each row is normalized on its own. The no-``seq_lens`` fallback pads only
+    shorter rows into lists, so one batch can mix tensors and lists. Tensor
+    rows still skip ``torch.tensor``, which copies and warns.
     """
-    first = rows[0]
-    if isinstance(first, torch.Tensor):
-        stacked = torch.stack([row if row.dtype == torch.long else row.to(dtype=torch.long) for row in rows])
-    else:
-        stacked = torch.stack([torch.tensor(row, dtype=torch.long) for row in rows])
-    return batchify(stacked)
+    return batchify(torch.stack([_long_token_row(row) for row in rows]))
 
 
 def extract_key_from_dicts(batch, key):

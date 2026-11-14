@@ -457,6 +457,61 @@ class TestPackedSequenceTHDCollater:
             assert result[key].dtype == torch.long
             assert torch.equal(result[key], expected[key])
 
+    def test_variable_length_tensor_rows_pad_in_either_order(self):
+        """Shorter no-seq_lens rows become lists; the longest tensor row must still stack."""
+        import warnings
+
+        long_ids = [1, 2, 3, 4]
+        short_ids = [5, 6]
+
+        def as_tensors(ids):
+            values = torch.tensor(ids, dtype=torch.int32)
+            return {"input_ids": values, "labels": values.clone()}
+
+        def as_lists(ids):
+            return {"input_ids": list(ids), "labels": list(ids)}
+
+        orders = ((long_ids, short_ids), (short_ids, long_ids))
+        for first, second in orders:
+            expected = sftp.packed_sequence_thd_collater([as_lists(first), as_lists(second)])
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", UserWarning)
+                result = sftp.packed_sequence_thd_collater([as_tensors(first), as_tensors(second)])
+            for key in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded"):
+                assert result[key].dtype == torch.long
+                assert torch.equal(result[key], expected[key])
+
+    @pytest.mark.parametrize("column", ["input_ids", "labels", "position_ids"])
+    def test_mixed_packed_column_matches_lists(self, column):
+        """A packed tensor row followed by a list row stacks for every token column."""
+        import warnings
+
+        lists = [
+            {
+                "input_ids": [1, 2, 3, 4],
+                "labels": [-100, 2, 3, 4],
+                "position_ids": [0, 1, 2, 3],
+                "seq_lens": [4],
+                "seq_lens_padded": [4],
+            },
+            {
+                "input_ids": [5, 6, 7, 8],
+                "labels": [5, 6, -100, 8],
+                "position_ids": [0, 1, 2, 3],
+                "seq_lens": [2, 2],
+                "seq_lens_padded": [2, 2],
+            },
+        ]
+        mixed = [{key: list(value) for key, value in row.items()} for row in lists]
+        mixed[0][column] = torch.tensor(lists[0][column], dtype=torch.int32)
+        expected = sftp.packed_sequence_thd_collater(lists)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            result = sftp.packed_sequence_thd_collater(mixed)
+        for key in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded"):
+            assert result[key].dtype == torch.long
+            assert torch.equal(result[key], expected[key])
+
     def test_empty_batch(self):
         """Test that empty batch returns empty dict."""
         result = sftp.packed_sequence_thd_collater([])

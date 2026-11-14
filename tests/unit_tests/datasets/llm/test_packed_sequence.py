@@ -662,9 +662,8 @@ def test_neat_pack_over_pretokenized_matches_lazy():
             assert list(packs_lazy[i][key]) == list(packs_pre[i][key]), (i, key)
 
 
-def test_format_packed_token_columns_keeps_length_lists():
-    """Token columns become 1-D tensors; ragged document lengths stay lists."""
-    source = Dataset.from_dict(
+def _packed_token_dataset():
+    return Dataset.from_dict(
         {
             "input_ids": [[1, 2, 3, 4]],
             "labels": [[-100, 2, 3, 4]],
@@ -673,20 +672,112 @@ def test_format_packed_token_columns_keeps_length_lists():
             "seq_lens_padded": [[4]],
         }
     )
+
+
+def test_format_packed_token_columns_keeps_length_lists():
+    """Token columns become 1-D tensors when that formatter is safe; lengths stay lists."""
+    from nemo_automodel.components.datasets.llm.packed_sequence import _torch_integer_format_is_safe
+
+    source = _packed_token_dataset()
     formatted = format_packed_token_columns(source)
     row = formatted[0]
-    assert isinstance(row["input_ids"], torch.Tensor)
-    assert tuple(row["input_ids"].shape) == (4,)
-    assert row["input_ids"].tolist() == [1, 2, 3, 4]
-    assert isinstance(row["labels"], torch.Tensor)
-    assert isinstance(row["position_ids"], torch.Tensor)
     assert row["seq_lens"] == [4]
     assert row["seq_lens_padded"] == [4]
+    splits = DatasetDict({"train": source})
+    formatted_splits = format_packed_token_columns(splits)
+    assert formatted_splits["train"][0]["seq_lens"] == [4]
+    if _torch_integer_format_is_safe():
+        assert isinstance(row["input_ids"], torch.Tensor)
+        assert tuple(row["input_ids"].shape) == (4,)
+        assert row["input_ids"].tolist() == [1, 2, 3, 4]
+        assert isinstance(row["labels"], torch.Tensor)
+        assert isinstance(row["position_ids"], torch.Tensor)
+        assert isinstance(formatted_splits["train"][0]["input_ids"], torch.Tensor)
+    else:
+        assert formatted is source
+        assert row["input_ids"] == [1, 2, 3, 4]
+        assert formatted_splits is splits
 
     untouched = object()
     assert format_packed_token_columns(untouched) is untouched
 
-    splits = DatasetDict({"train": source})
-    formatted_splits = format_packed_token_columns(splits)
-    assert isinstance(formatted_splits["train"][0]["input_ids"], torch.Tensor)
-    assert formatted_splits["train"][0]["seq_lens"] == [4]
+
+def test_format_packed_token_columns_leaves_iterable_datasets_unchanged():
+    """HF iterable ``with_format`` does not accept map-dataset column arguments."""
+    source = _packed_token_dataset().to_iterable_dataset()
+    assert format_packed_token_columns(source) is source
+    row = next(iter(source))
+    assert row["input_ids"] == [1, 2, 3, 4]
+    assert row["seq_lens"] == [4]
+
+
+def test_format_packed_token_columns_skips_when_torch_format_is_unsafe(monkeypatch):
+    """A missing VideoReader export keeps the previous list rows."""
+    import nemo_automodel.components.datasets.llm.packed_sequence as packed
+
+    monkeypatch.setattr(packed, "_torch_integer_format_is_safe", lambda: False)
+    source = _packed_token_dataset()
+    assert format_packed_token_columns(source) is source
+    assert source[0]["input_ids"] == [1, 2, 3, 4]
+
+
+def test_video_reader_guard_detection():
+    """Unguarded VideoReader imports are the datasets releases that raise on integer columns."""
+    from nemo_automodel.components.datasets.llm.packed_sequence import _source_guards_video_reader
+
+    unguarded = """
+        from torchvision.io import VideoReader
+        if isinstance(value, VideoReader):
+            return value
+    """
+    guarded = """
+        try:
+            from torchvision.io import VideoReader
+            if isinstance(value, VideoReader):
+                return value
+        except ImportError:
+            pass
+    """
+    assert _source_guards_video_reader(unguarded) is False
+    assert _source_guards_video_reader(guarded) is True
+    assert _source_guards_video_reader("return torch.tensor(value)") is True
+
+
+def test_torch_integer_format_follows_guard_and_video_reader(monkeypatch):
+    """Skip torch column formatting only when the formatter is unguarded and VideoReader is missing."""
+    import nemo_automodel.components.datasets.llm.packed_sequence as packed
+
+    state = {"guarded": True, "reader": False}
+
+    monkeypatch.setattr(packed, "_formatter_guards_missing_video_reader", lambda: state["guarded"])
+    monkeypatch.setattr(packed, "_video_reader_status", lambda: state["reader"])
+    for guarded, reader, expected in (
+        (True, False, True),
+        (True, None, True),
+        (False, None, True),
+        (False, True, True),
+        (False, False, False),
+    ):
+        state["guarded"] = guarded
+        state["reader"] = reader
+        assert packed._torch_integer_format_is_safe() is expected
+
+
+def test_installed_torch_formatter_matches_integer_column_probe():
+    """The safety check agrees with formatting one integer after torchvision is imported."""
+    import importlib.util
+
+    from nemo_automodel.components.datasets.llm.packed_sequence import _torch_integer_format_is_safe
+
+    if importlib.util.find_spec("torchvision") is not None:
+        import torchvision  # noqa: F401
+
+    source = Dataset.from_dict({"input_ids": [[1]]})
+    safe = _torch_integer_format_is_safe()
+    try:
+        row = source.with_format("torch", columns=["input_ids"])[0]
+    except ImportError:
+        assert safe is False
+        return
+    assert safe is True
+    assert isinstance(row["input_ids"], torch.Tensor)

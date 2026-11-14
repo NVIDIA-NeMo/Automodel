@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import inspect
 import logging
 import math
 
@@ -309,6 +311,61 @@ def _integer_list_column(features, name: str) -> bool:
     return dtype in _INTEGER_DTYPES
 
 
+def _accepts_column_format(dataset) -> bool:
+    """True when ``with_format`` accepts ``columns`` and ``output_all_columns``."""
+    formatter = getattr(dataset, "with_format", None)
+    if not callable(formatter):
+        return False
+    try:
+        parameters = inspect.signature(formatter).parameters
+    except (TypeError, ValueError):
+        return False
+    return "columns" in parameters and "output_all_columns" in parameters
+
+
+def _source_guards_video_reader(source: str) -> bool:
+    """True when torch formatting does not raise if ``VideoReader`` cannot be imported."""
+    marker = "from torchvision.io import VideoReader"
+    start = source.find(marker)
+    if start < 0:
+        return True
+    return "ImportError" in source[start:]
+
+
+@functools.cache
+def _formatter_guards_missing_video_reader() -> bool:
+    """Read the installed datasets torch formatter once."""
+    import datasets.formatting.torch_formatter as torch_formatter
+
+    return _source_guards_video_reader(inspect.getsource(torch_formatter.TorchFormatter._tensorize))
+
+
+@functools.cache
+def _video_reader_status() -> bool | None:
+    """None when torchvision is absent, else whether ``VideoReader`` imports."""
+    import importlib.util
+
+    if importlib.util.find_spec("torchvision") is None:
+        return None
+    try:
+        from torchvision.io import VideoReader  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _torch_integer_format_is_safe() -> bool:
+    """True when integer columns survive ``with_format('torch')`` after torchvision is imported.
+
+    Some datasets releases import ``torchvision.io.VideoReader`` while formatting
+    every value. This package still allows those releases, and some torchvision
+    builds no longer export ``VideoReader``.
+    """
+    if _formatter_guards_missing_video_reader():
+        return True
+    return _video_reader_status() is not False
+
+
 def format_packed_token_columns(dataset):
     """Return packed rows whose token columns are 1-D torch tensors.
 
@@ -318,14 +375,20 @@ def format_packed_token_columns(dataset):
     and ``seq_lens_padded`` stay Python lists because the collator pads them
     as ragged document lengths.
 
+    Only map datasets whose ``with_format`` accepts column selection are
+    formatted. Iterable datasets keep their previous rows. The dataset is also
+    returned unchanged when the installed torch formatter cannot format an
+    integer column without a missing ``VideoReader`` export; the collator
+    still accepts lists.
+
     Args:
         dataset: A Hugging Face dataset, a dataset dict, or any other object.
             Non-dataset objects are returned unchanged.
 
     Returns:
-        The same dataset when it has no integer token columns. Otherwise a
-        dataset whose token columns format as torch tensors and whose other
-        columns keep the default formatter.
+        The same dataset when token columns cannot be formatted as tensors.
+        Otherwise a dataset whose token columns format as torch tensors and
+        whose other columns keep the default formatter.
     """
     if isinstance(dataset, DatasetDict):
         formatted = {name: format_packed_token_columns(split) for name, split in dataset.items()}
@@ -334,10 +397,10 @@ def format_packed_token_columns(dataset):
         return DatasetDict(formatted)
 
     features = getattr(dataset, "features", None)
-    if features is None or not hasattr(dataset, "with_format"):
+    if features is None or not _accepts_column_format(dataset):
         return dataset
     columns = [name for name in _PACKED_TOKEN_COLUMNS if _integer_list_column(features, name)]
-    if not columns:
+    if not columns or not _torch_integer_format_is_safe():
         return dataset
     return dataset.with_format("torch", columns=columns, output_all_columns=True)
 
