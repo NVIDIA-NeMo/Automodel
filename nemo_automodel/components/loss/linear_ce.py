@@ -69,8 +69,18 @@ import torch
 import torch.distributed as dist
 from packaging.version import Version
 
-from nemo_automodel.components.loss.linear_ce_base import LinearCrossEntropy
-from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG
+from nemo_automodel.components.loss.linear_ce_base import (
+    LinearCrossEntropy,
+    ShardedLMHeadWeight,
+    TorchVocabChunkKernel,
+    VocabChunkKernel,
+    sharded_linear_cross_entropy,
+)
+from nemo_automodel.shared.import_utils import MISSING_CUT_CROSS_ENTROPY_MSG, safe_import
+
+_, _cce_backward = safe_import("cut_cross_entropy.cce_backward", msg=MISSING_CUT_CROSS_ENTROPY_MSG)
+_, _cce_lse_forward = safe_import("cut_cross_entropy.cce_lse_forward", msg=MISSING_CUT_CROSS_ENTROPY_MSG)
+_, _cce_indexed_dot = safe_import("cut_cross_entropy.indexed_dot", msg=MISSING_CUT_CROSS_ENTROPY_MSG)
 
 try:
     import cut_cross_entropy.tl_utils as tl_utils
@@ -128,6 +138,63 @@ if HAVE_CUT_CROSS_ENTROPY:
     tl_utils.is_triton_greater_or_equal_3_2_0 = new_is_triton_greater_or_equal_3_2_0
 
 
+class _CCEVocabChunkKernel:
+    """cut_cross_entropy kernels for one vocabulary chunk; logits never leave on-chip memory."""
+
+    def __init__(self, softcap: float | None) -> None:
+        """Configure the kernels.
+
+        Args:
+            softcap: Optional logit softcapping value.
+        """
+        self.softcap = softcap
+
+    def forward(
+        self, hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """See :meth:`VocabChunkKernel.forward`; ``hidden`` and ``weight`` are bf16 or fp16 on CUDA."""
+        lse = _cce_lse_forward.cce_lse_forward_kernel(e=hidden, c=weight, softcap=self.softcap)
+        in_chunk = targets >= 0
+        # Out-of-chunk tokens index row 0 and are masked below, avoiding a host sync.
+        neg_dot = _cce_indexed_dot.indexed_neg_dot_forward_kernel(
+            e=hidden, c=weight, inds=torch.where(in_chunk, targets, 0), softcap=self.softcap, out_dtype=torch.float32
+        )
+        return lse, torch.where(in_chunk, -neg_dot, 0.0)
+
+    def backward(
+        self,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        targets: torch.Tensor,
+        lse: torch.Tensor,
+        grad: torch.Tensor,
+        *,
+        need_hidden: bool,
+        need_weight: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """See :meth:`VocabChunkKernel.backward`.
+
+        The kernel subtracts the one-hot target only where ``targets`` matches a
+        chunk row, so -1 entries contribute just the softmax term.
+        """
+        # The kernel allocates exactly the gradients whose operands require grad.
+        grad_hidden, grad_weight, _ = _cce_backward.cce_backward_kernel(
+            do=grad,
+            e=hidden.detach().requires_grad_(need_hidden),
+            c=weight.detach().requires_grad_(need_weight),
+            bias=None,
+            lse=lse,
+            valids=None,
+            softcap=self.softcap,
+            filter_eps=None,
+            targets=targets,
+            accum_e_fp32=True,
+            filter_e_grad=False,
+            filter_c_grad=False,
+        )
+        return grad_hidden, grad_weight
+
+
 class FusedLinearCrossEntropy(LinearCrossEntropy):
     """Fused linear-projection and cross-entropy loss module."""
 
@@ -175,8 +242,10 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
                 ``[batch, sequence, hidden]`` or packed THD ``[tokens, hidden]`` /
                 ``[1, tokens, hidden]``. Token order must match flattened labels.
             labels: Rank-local target token IDs with shape ``[batch, sequence]``.
-            lm_weight: LM-head weight with global shape ``[vocab, hidden]``.
-                It may be a regular tensor or an FSDP-sharded DTensor.
+            lm_weight: LM-head weight with global shape ``[vocab, hidden]``: a
+                regular tensor, an FSDP/HSDP DTensor sharded on the vocabulary
+                axis, or its :class:`ShardedLMHeadWeight`. A sharded weight is
+                streamed in vocabulary chunks and never gathered whole.
             num_label_tokens: Global number of non-padding target tokens used
                 to normalize a sum-reduced loss.
             grad_reduce_group: Group that contributes independent loss shards
@@ -201,10 +270,7 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
                 )
             loss_weights = loss_weights.to(device=hidden_states.device, dtype=torch.float32)
 
-        lm_weight = self.materialize_lm_weight(
-            lm_weight,
-            grad_reduce_group=grad_reduce_group,
-        )
+        lm_weight = self.resolve_lm_weight(lm_weight, grad_reduce_group=grad_reduce_group)
         if self.impl == "cce" and hidden_states.is_cuda:
             # The cce backward kernel only accepts bf16/fp16 operands, so an fp32
             # lm_head (``fp32_lm_head`` models, ``distributed.moe.lm_head_precision``)
@@ -233,26 +299,30 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
 
         # First compute loss with sum reduction to handle normalization ourselves
         softcap = None if self.logit_softcapping == 0 else self.logit_softcapping
+        reduction = "none" if loss_weights is not None else self.reduction
 
-        # Set filter_eps=None to avoid any token filtering
-        # accum_e_fp32 accumulates the hidden-state gradient in fp32. The default
-        # atomically adds every vocab block into a bf16 buffer, which leaves the
-        # hidden-state gradient ~6x above bf16 rounding error at 150K vocab.
-        # Both options only apply to the cce kernel.
-        cce_opts = {"filter_eps": None, "accum_e_fp32": True} if self.impl == "cce" else {}
+        if isinstance(lm_weight, ShardedLMHeadWeight):
+            loss = self._sharded_loss(hidden_states, labels, lm_weight, softcap=softcap, reduction=reduction)
+        else:
+            # Set filter_eps=None to avoid any token filtering
+            # accum_e_fp32 accumulates the hidden-state gradient in fp32. The default
+            # atomically adds every vocab block into a bf16 buffer, which leaves the
+            # hidden-state gradient ~6x above bf16 rounding error at 150K vocab.
+            # Both options only apply to the cce kernel.
+            cce_opts = {"filter_eps": None, "accum_e_fp32": True} if self.impl == "cce" else {}
 
-        # Compute loss with shift=False to match PyTorch behavior
-        loss = linear_cross_entropy(
-            hidden_states,
-            lm_weight,
-            targets=labels,
-            ignore_index=self.ignore_index,
-            softcap=softcap,
-            reduction="none" if loss_weights is not None else self.reduction,
-            shift=False,  # Match PyTorch behavior
-            impl=self.impl,
-            **cce_opts,
-        )
+            # Compute loss with shift=False to match PyTorch behavior
+            loss = linear_cross_entropy(
+                hidden_states,
+                lm_weight,
+                targets=labels,
+                ignore_index=self.ignore_index,
+                softcap=softcap,
+                reduction=reduction,
+                shift=False,  # Match PyTorch behavior
+                impl=self.impl,
+                **cce_opts,
+            )
         if loss_weights is not None:
             loss = (loss * loss_weights).sum()
         if num_label_tokens is not None:
@@ -262,3 +332,49 @@ class FusedLinearCrossEntropy(LinearCrossEntropy):
                 return loss * 0.0
             loss = loss / num_label_tokens
         return loss
+
+    def _sharded_loss(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+        lm_weight: ShardedLMHeadWeight,
+        *,
+        softcap: float | None,
+        reduction: str,
+    ) -> torch.Tensor:
+        """Reduce the streamed per-token CE like cut_cross_entropy does.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden], or the
+                labels' shape plus a trailing hidden axis, in ``lm_weight.dtype``.
+            labels: Tensor of shape [batch, sequence] with target ids.
+            lm_weight: Sharded LM head of global shape [vocab, hidden].
+            softcap: Optional logit softcapping value.
+            reduction: ``"sum"``, ``"mean"`` over supervised tokens, or
+                ``"none"``.
+
+        Returns:
+            FP32 scalar, or FP32 losses of ``labels.shape`` (zero at ignored
+            tokens) for ``"none"``.
+        """
+        kernel: VocabChunkKernel
+        if self.impl == "cce":
+            kernel = _CCEVocabChunkKernel(softcap)
+        else:
+            # Like cut_cross_entropy's torch_compile path: logits for every token
+            # at once, rounded to the weight dtype before the FP32 reduction.
+            kernel = TorchVocabChunkKernel(token_block=None, softcap=softcap, logits_dtype=None, compile=True)
+        losses = sharded_linear_cross_entropy(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            labels.reshape(-1),
+            lm_weight,
+            kernel=kernel,
+            ignore_index=self.ignore_index,
+        )
+        if reduction == "none":
+            return losses.reshape(labels.shape)
+        if reduction == "sum":
+            return losses.sum()
+        if reduction == "mean":
+            return losses.sum() / (labels != self.ignore_index).sum()
+        raise ValueError(f"Unknown reduction {reduction!r}")

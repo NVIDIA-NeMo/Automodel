@@ -231,9 +231,10 @@ def calculate_mtp_loss(
             rolls whose source position lies in a different sub-sequence. This
             describes selected attention boundaries, including joined documents;
             it may reside on CPU or the labels device.
-        lm_weight: Optional LM-head weight tensor of shape ``[vocab, hidden]``.
-            Supplying it lets the main loss and all MTP depths share one DTensor
-            ``full_tensor()`` gather on the FusedLinearCrossEntropy path.
+        lm_weight: Optional LM-head weight of global shape ``[vocab, hidden]``,
+            as returned by ``prepare_lm_weight``: a dense tensor or a
+            ``ShardedLMHeadWeight``. Supplying it lets the main loss and all MTP
+            depths share one prepared operand on the linear CE path.
         logits_dtype: Optional model-owned output dtype after linear projection.
         grad_reduce_group: Group that contributes independent loss shards when
             the shared LM-head weight is a DTensor.
@@ -291,12 +292,9 @@ def calculate_mtp_loss(
     total = mtp_outputs[0].new_zeros(())
     per_depth_losses = []
 
-    # Materialize the (possibly DTensor-sharded) LM head ONCE for all depths
-    # under FusedLinearCrossEntropy. calculate_loss would otherwise re-gather it
-    # (full_tensor) per depth; each gathered copy is retained for backward and
-    # they accumulate on-device -> OOM for large-vocab MoE. One shared gather is
-    # numerically identical (same weight); grads from every depth accumulate into
-    # it and collapse to a single reduce-scatter on the sharded parameter.
+    # Prepare the (possibly DTensor-sharded) LM head ONCE for all depths. A dense
+    # head is then converted once and shared; a sharded head is streamed by each
+    # depth's loss in vocabulary chunks, so no depth retains a gathered copy.
     if isinstance(loss_fn, LinearCrossEntropy) and lm_weight is None:
         lm_weight = prepare_lm_weight(
             loss_fn,
@@ -468,8 +466,8 @@ class PipelineCausalLMLoss(nn.Module):
                 logits = getattr(output, "logits", output)
                 hidden_states = _get_final_hidden_states(output)
 
-        # Gather the LM head at most once and thread it through the main loss and
-        # every MTP depth (avoids redundant per-call full_tensor() gathers).
+        # Prepare the LM head once and thread it through the main loss and every
+        # MTP depth; a sharded head is streamed by each loss, never gathered whole.
         shared_lm_weight = (
             prepare_lm_weight(
                 self.loss_fn,

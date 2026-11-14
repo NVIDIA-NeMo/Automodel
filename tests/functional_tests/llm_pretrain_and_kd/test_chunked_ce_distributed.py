@@ -32,6 +32,7 @@ def _check_fsdp_shared_projection(mesh, device, rank):
     """Compare real FSDP head policies and main/MTP gradients to dense projection."""
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
+    from nemo_automodel.components.loss.linear_ce_base import ShardedLMHeadWeight
     from nemo_automodel.components.loss.mtp import calculate_mtp_loss
     from nemo_automodel.components.loss.utils import calculate_loss, prepare_lm_weight
 
@@ -43,8 +44,9 @@ def _check_fsdp_shared_projection(mesh, device, rank):
         fully_shard(model.lm_head, mesh=mesh, mp_policy=MixedPrecisionPolicy(param_dtype=compute_dtype))
         loss_fn = ChunkedCrossEntropy(4, compile=False)
         weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=dist.group.WORLD)
-        assert weight.dtype == compute_dtype
-        torch.testing.assert_close(weight, reference_weight.to(compute_dtype), rtol=0, atol=0)
+        # The resharded head is streamed in its compute dtype, never gathered whole.
+        assert isinstance(weight, ShardedLMHeadWeight)
+        assert weight.dtype == compute_dtype and weight.shape == reference_weight.shape
         states = [torch.randn(2, 9, 16, device=device, dtype=torch.bfloat16) for _ in range(3)]
         local_states = [h[rank : rank + 1].clone().requires_grad_() for h in states]
         ref_states = [h.clone().requires_grad_() for h in states]
@@ -53,7 +55,7 @@ def _check_fsdp_shared_projection(mesh, device, rank):
         saved = []
 
         def pack(tensor):
-            """Record the projection tensors retained by autograd.
+            """Record full-size projection weights retained by autograd.
 
             Args:
                 tensor: Saved tensor of arbitrary shape; [vocab, hidden] weights are recorded.
@@ -61,7 +63,7 @@ def _check_fsdp_shared_projection(mesh, device, rank):
             Returns:
                 The input tensor unchanged, preserving shape, dtype and storage.
             """
-            if tensor.shape == weight.shape:
+            if tensor.shape == reference_weight.shape:
                 saved.append(tensor)
             return tensor
 
@@ -82,8 +84,8 @@ def _check_fsdp_shared_projection(mesh, device, rank):
                 lm_weight=weight,
                 logits_dtype=torch.bfloat16,
             )
-        assert len(saved) == 3
-        assert {tensor.data_ptr() for tensor in saved} == {weight.data_ptr()}
+        # The main loss and both MTP depths stream the shard; none retains a gathered head.
+        assert saved == []
         (loss * 2).backward()
         reference = torch.zeros((), device=device)
         for depth, hidden in enumerate(ref_states):

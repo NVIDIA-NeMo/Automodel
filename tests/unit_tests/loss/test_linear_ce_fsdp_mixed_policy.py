@@ -15,10 +15,10 @@
 
 The reviewer's scenario on #4288: a native model with FP32 parameters under
 ``MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32, output_dtype=fp32, cast_forward_inputs=True)``,
-``reshard_after_forward=True`` and ``wrap_outer_model=False``. The recipes gather the head's weight with
+``reshard_after_forward=True`` and ``wrap_outer_model=False``. The recipes prepare the head's weight with
 ``prepare_lm_weight`` *after* the forward, when the head has been resharded back to its FP32 master, so the
-hidden states the model hands out must be projected in that weight's dtype; the ``torch_compile`` projection
-``e @ c.T`` inside cut-cross-entropy aligns nothing itself. The CPU stand-in for the reviewer's Qwen3MoE is a
+loss streams that sharded master in vocabulary chunks and the hidden states the model hands out must be
+projected in its dtype; the ``torch_compile`` projection ``e @ c.T`` aligns nothing itself. The CPU stand-in for the reviewer's Qwen3MoE is a
 tiny dense DeepSeek-V3 (Qwen3MoE builds its rotary cache on the current CUDA device): the same
 ``compute_lm_head_logits`` head path, the same standalone FSDP ``lm_head`` unit under the policy.
 """
@@ -32,12 +32,12 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.linear_ce_base import ShardedLMHeadWeight
 from nemo_automodel.components.loss.utils import prepare_lm_weight
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3ForCausalLM
@@ -70,13 +70,23 @@ def _config() -> DeepseekV3Config:
     )
 
 
-def _torch_compile_stand_in(hidden, weight, targets=None, *, ignore_index=-100, reduction="sum", **_):
-    """cut-cross-entropy's ``torch_compile`` projection, ``e @ c.T``; mixed operands would raise there."""
+def _eager_chunk_projection(hidden, weight, targets, softcap, logits_dtype):
+    """The streamed ``torch_compile`` kernel's chunk math, run eagerly; mixed operands would raise here.
+
+    Args:
+        hidden: Tensor of shape [tokens, hidden].
+        weight: Tensor of shape [chunk_vocab, hidden], one streamed vocabulary chunk.
+        targets: Tensor of shape [tokens] with chunk-local target rows, or -1.
+        softcap: Optional logit softcapping value.
+        logits_dtype: Optional rounding dtype for the projection output.
+
+    Returns:
+        FP32 tensors of shape [tokens]: the chunk log-sum-exp and target logits.
+    """
+    from nemo_automodel.components.loss import linear_ce_base
+
     assert hidden.dtype == weight.dtype, f"mixed operands reached the kernel: {hidden.dtype} vs {weight.dtype}"
-    logits = (hidden @ weight.T).float()
-    return F.cross_entropy(
-        logits.view(-1, logits.shape[-1]), targets.view(-1), ignore_index=ignore_index, reduction=reduction
-    )
+    return linear_ce_base._chunk_lse_and_target(hidden, weight, targets, softcap, logits_dtype)
 
 
 def _worker(rank: int, port: int) -> None:
@@ -86,9 +96,11 @@ def _worker(rank: int, port: int) -> None:
     dist.init_process_group("gloo", rank=rank, world_size=_WORLD_SIZE)
     try:
         from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+        from nemo_automodel.components.loss import linear_ce_base
 
         linear_ce_mod.HAVE_CUT_CROSS_ENTROPY = True
-        linear_ce_mod.linear_cross_entropy = _torch_compile_stand_in
+        # Inductor on CPU is not under test; run the streamed kernel eagerly behind a dtype check.
+        linear_ce_base._compiled_chunk_lse_and_target = _eager_chunk_projection
 
         torch.manual_seed(3)
         backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
@@ -116,12 +128,14 @@ def _worker(rank: int, port: int) -> None:
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         input_ids = torch.randint(0, _VOCAB, (2, 8), generator=torch.Generator().manual_seed(100 + rank))
         labels = input_ids.roll(-1, dims=1)
-        for _ in range(2):  # the second step runs the gather on a resharded head again
+        for _ in range(2):  # the second step streams a resharded head again
             out = model(input_ids, logits_to_keep=1, output_hidden_states=True)
             hidden = get_final_hidden_states(out)
             assert hidden.shape == (2, 8, 64)
-            # The recipes prepare the weight after the forward: the head is resharded, its master dtype is fp32.
+            # The recipes prepare the weight after the forward: the head is resharded, its master dtype is fp32,
+            # and the loss streams it instead of gathering it.
             lm_weight = prepare_lm_weight(loss_fn, model, grad_reduce_group=dist.group.WORLD)
+            assert isinstance(lm_weight, ShardedLMHeadWeight)
             assert lm_weight.dtype == torch.float32 and lm_weight.shape == (_VOCAB, 64)
             loss = loss_fn(
                 hidden, labels, lm_weight, num_label_tokens=labels.numel(), grad_reduce_group=dist.group.WORLD

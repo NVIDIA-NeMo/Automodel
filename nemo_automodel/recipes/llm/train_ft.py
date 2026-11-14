@@ -1422,9 +1422,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 else:
                     out = model(**batch)
 
-                # Gather the LM head once and share it across the main loss and
-                # all MTP depths (linear CE path) to avoid redundant
-                # full_tensor() gathers that accumulate on-device and OOM.
+                # Prepare the LM head once and share it across the main loss and
+                # all MTP depths (linear CE path). A sharded head is streamed in
+                # vocabulary chunks by each loss and never gathered whole.
                 loss_distributed_kwargs = {}
                 shared_lm_weight = None
                 if isinstance(self.loss_fn, LinearCrossEntropy):
