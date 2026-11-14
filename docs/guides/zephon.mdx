@@ -1,22 +1,22 @@
 ---
 title: "Zephon"
-description: "Read, mix and pack training data with Zephon in NeMo AutoModel."
+description: "Read, mix, and pack training data with Zephon in NeMo AutoModel."
 ---
 
 [Zephon](https://zephon.io/) turns datasets into training batches. You choose
-the sources, their mixture and how to prepare documents; Zephon handles reading,
-packing and replay. AutoModel supplies the model and training loop.
+the sources, their mixture, and how to prepare documents. Zephon handles reading,
+packing, and replay. NeMo AutoModel supplies the model and training loop.
 
 This guide covers the AutoModel settings you need to get started. The
 [Zephon User Guide (ZUG)](https://docs.zephon.io/) explains the underlying
 concepts and APIs in more detail.
 
-## Start with a recipe
+## Start with a Recipe
 
-Follow the [AutoModel installation guide](/get-started/installation); Zephon is
+Follow the [AutoModel installation guide](/get-started/installation). Zephon is
 included in the dependencies. Choose a recipe for your model and input:
 
-| Model | Text: tokenize and pack online | Text: already packed | Instruction SFT |
+| Model | Text: Tokenize and Pack Online | Text: Already Packed | Instruction SFT |
 | --- | --- | --- | --- |
 | Qwen3 0.6B | [Online](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/qwen/zephon.yaml) | [Prepacked](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/qwen/zephon_prepacked.yaml) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/zephon.yaml) |
 | Llama 3.2 1B | [Online](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_2/zephon.yaml) | [Prepacked](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/llama3_2/zephon_prepacked.yaml) | [SFT](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/zephon.yaml) |
@@ -27,22 +27,22 @@ For example, run from the repository root:
 uv run automodel examples/llm_pretrain/qwen/zephon.yaml --nproc-per-node 8
 ```
 
-The online recipes mix web, code and arXiv documents; prepacked recipes need
+The online recipes mix web, code, and arXiv documents. Prepacked recipes need
 your prepared tokens. Check the recipe's process count and training budget.
 You might need to obtain access to gated checkpoints before running.
 
-## Datasets, work sources and pipelines
+## Datasets, Work Sources, and Pipelines
 
 There are three parts to a Zephon data-loading setup:
 
 - A **dataset** describes stored documents and their shards. A source `path`
-  can point to a local dataset directory, object storage or Hugging Face, such
+  can point to a local dataset directory, object storage, or Hugging Face, such
   as `hf://org/dataset/subset/train`. Zephon discovers the shard format.
 - A **work source** chooses which documents the pipeline processes, in what
   order and from which datasets. A `StaticMixtureWorkSource` uses your source
   weights to define the requested mixture.
 - A **pipeline** prepares those documents using **operators**, such as fetching,
-  tokenizing, packing and batching. AutoModel constructs the pipeline from
+  tokenizing, packing, and batching. AutoModel constructs the pipeline from
   your recipe.
 
 You can think of a pipeline as stream processing: samples flow through
@@ -51,15 +51,15 @@ a sequence of tokens, which packing can split into several training
 sequences or combine with tokens from other documents.
 
 See [datasets and storage](https://docs.zephon.io/datasets/storage_backends_and_shard_cache.html),
-[mixing datasets](https://docs.zephon.io/worksources/mixing_datasets.html) and
+[mixing datasets](https://docs.zephon.io/worksources/mixing_datasets.html), and
 [pipelines](https://docs.zephon.io/pipelines/index.html) in the ZUG.
 
-## Choose your input
+## Choose Your Input
 
 Set `dataset._target_` to the config for your documents. AutoModel selects the
 matching Zephon loader when you omit `dataloader._target_`.
 
-| Input | Dataset config | Preparation during training |
+| Input | Dataset Config | Preparation During Training |
 | --- | --- | --- |
 | Raw text | `ZephonTextDatasetConfig` | Tokenize, then optionally pack |
 | Pretokenized documents | `ZephonPretokenizedTextDatasetConfig` | Optionally pack; keep supplied token IDs |
@@ -67,7 +67,7 @@ matching Zephon loader when you omit `dataloader._target_`.
 | Instructions | `ZephonInstructionDatasetConfig` | Chat tokenize and optionally pack |
 | Image conversations | `ZephonVlmDatasetConfig` | Apply the processor and pack whole documents |
 
-### Raw text and source mixtures
+### Raw Text and Source Mixtures
 
 For JSONL or Parquet documents with a `text` field, configure sources under
 `dataset.zephon`. For example:
@@ -88,7 +88,7 @@ dataset:
 
 Each path identifies a dataset directory containing shards. Use `text_field`
 if your text column has another name. `tokenize_special_tokens` selects BOS/EOS
-insertion; the example appends EOS to each document. Use the tokenizer that
+insertion. The example appends EOS to each document. Use the tokenizer that
 belongs to the model you are training.
 
 **Token-aware mixing.** A 70/30 mixture of long web documents and short code
@@ -98,22 +98,22 @@ it measures a subset of each source with the training tokenizer and adjusts
 sampling to approximate your requested token proportions. This also applies to
 instruction data and pretokenized text. Weights are relative and do not need to sum to one.
 Set `dataset.zephon.source.token_estimation: false` for document-count mixing.
-Dropping documents later can change the final token mixture; estimation is
+Dropping documents later can change the final token mixture. Estimation is
 not a guarantee of exact output proportions. See the
 [mixing guide](https://docs.zephon.io/worksources/mixing_datasets.html) for calibration.
 
 For a single source, `dataset.path_or_dataset_id` or `dataset.paths` is also
 accepted in place of `zephon.sources`. Use a dataset root or a Hugging Face ID
-with `name`/`split`. Use explicit `zephon.sources` for mixtures; the two source
+with `name`/`split`. Use explicit `zephon.sources` for mixtures. The two source
 declaration styles cannot be combined.
 
-### Use pretokenized and prepacked text
+### Use Pretokenized and Prepacked Text
 
 Use `ZephonPretokenizedTextDatasetConfig` when tokenization happened offline.
 Supply **unshifted, unpadded** token lists made with the exact model tokenizer.
-`tokens_field` defaults to `input_ids`; `loss_mask_field` defaults to `loss_mask`.
+`tokens_field` defaults to `input_ids`, and `loss_mask_field` defaults to `loss_mask`.
 The optional loss mask is token-aligned and binary. Zephon handles the
-next-token shift and padding during training; do not store shifted labels.
+next-token shift and padding during training. Do not store shifted labels.
 
 Leave online packing enabled to combine tokenized documents, or set
 `dataset.zephon.packing.pack_algorithm: null` for prepacked input. Each stored
@@ -184,7 +184,7 @@ are supervised. Image mixtures use document-count weights; media-aware token
 estimation is unsupported. Use batched output for VLM PP; THD image output
 also requires `dataset.zephon.inject_fake_images: false`. Video and audio are unsupported.
 
-## Packing and attention
+## Packing and Attention
 
 All settings below are under `dataset.zephon`:
 
@@ -200,17 +200,17 @@ All settings below are under `dataset.zephon`:
   attention across their boundaries. Positions reset with isolation and run
   continuously when joined. Separate packed documents in a batch stay independent.
 - `training.mask_segment_starts` independently controls loss at subdocument
-  boundaries. Its default, `false`, allows those next-token targets; `true`
+  boundaries. Its default, `false`, allows those next-token targets, and `true`
   excludes them.
 
 Packing does not select an attention backend. Keep the backend under
-`model.attn_implementation`. `dataset.output_format` defaults to `batched`;
-choose `thd` only for a model/backend that supports that variable-length layout.
+`model.attn_implementation`. `dataset.output_format` defaults to `batched`.
+Choose `thd` only for a model and backend that support that variable-length layout.
 Both formats can contain packed documents, and batched output can use Flash
 Attention. The [packing guide](https://docs.zephon.io/pipelines/packing.html)
 explains algorithm choices.
 
-## Caching and throughput
+## Caching and Throughput
 
 Zephon's fetch operator reads the selected records. For remote data, the
 **shard cache** keeps downloaded shards on local disk and evicts them as needed.
@@ -226,56 +226,56 @@ dataset:
         limit_bytes: 8gb
 ```
 
-In case your shards are in Parquet format, a separate row-group cache stores
+If your shards are in Parquet format, a separate row-group cache stores
 decoded data and has its own budget. Neither disk budget bounds pipeline RAM. See [storage and shard caching](https://docs.zephon.io/datasets/storage_backends_and_shard_cache.html)
 and [Parquet](https://docs.zephon.io/datasets/parquet.html) for sizing and behavior.
 
-Tune operator parallelism under `dataset.zephon.workers` and execution/queue
+Tune operator parallelism under `dataset.zephon.workers` and execution and queue
 depths under `runtime`. `source.prefetch: {}` separately enables cache lookahead.
 See [pipeline execution](https://docs.zephon.io/pipelines/how_pipelines_run.html)
 and the config reference below for tuning and defaults.
 
-## Stopping and resuming
+## Stopping and Resuming
 
 Set a positive `step_scheduler.max_steps`. Operators can split one document
-into several sequences, combine documents or drop them, so the number of
+into several sequences, combine documents, or drop them, so the number of
 training batches cannot be inferred from the source document count. Zephon
 therefore does not expose a precomputed pipeline length.
 Training stops at this upper bound or when the work source finishes. By default,
-a mixture ends after every source completes a pass; exhausted sources may repeat
+a mixture ends after every source completes a pass. Exhausted sources can repeat
 to maintain the mixture while others finish. Configure `source.exhausted_policy`,
-`max_repeats` and `stop_after_passes` when you need another policy. See
+`max_repeats`, and `stop_after_passes` when you need another policy. See
 [shuffling and repeating samples](https://docs.zephon.io/worksources/shuffling_and_repeating_samples.html).
 Incomplete final microbatches are dropped.
 
 AutoModel checkpoints include the Zephon stream state. Give each distributed
 run a unique `dataset.zephon.checkpoint.run_id`. Keep it, the data, tokenizer,
-seed and pipeline settings unchanged on resume. To resume with different DP sizes,
+seed, and pipeline settings unchanged on resume. To resume with different DP sizes,
 set `dataset.zephon.checkpoint.canonical_replicas` to a common multiple before
-starting; `global_batch_size / local_batch_size` must also be divisible by it.
+starting, and `global_batch_size / local_batch_size` must also be divisible by it.
 See [distributed training](https://docs.zephon.io/pipelines/distributed_training.html)
 and [checkpointing](https://docs.zephon.io/pipelines/checkpointing_and_resuming.html).
 
-DP, TP and PP support follows the selected AutoModel model and backend. Context
+DP, TP, and PP support follows the selected AutoModel model and backend. Context
 parallelism is unsupported by this integration. Zephon supplies training data;
 AutoModel's native validation loaders remain available.
 
-## Configuration reference
+## Configuration Reference
 
 The [config dataclasses](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/zephon/config.py)
 are the full reference for fields, defaults and validation. Pipeline options
 live under `dataset.zephon`; model and optimizer settings stay in their usual
 AutoModel sections. Image-specific settings are documented in [`vlm_config.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/zephon/vlm_config.py).
 
-You may put the Zephon groups in a TOML file using `dataset.zephon.data_config`.
-Inline YAML overrides individual fields; relative paths in TOML are resolved
+You can put the Zephon groups in a TOML file using `dataset.zephon.data_config`.
+Inline YAML overrides individual fields. Relative paths in TOML are resolved
 against that file. For Zephon APIs and behavior, use the [ZUG](https://docs.zephon.io/)
 and [API reference](https://docs.zephon.io/api/pipeline.html).
 
-## How the integration works
+## How the Integration Works
 
 This section is for readers extending the integration. AutoModel's dataset
-config constructs a Zephon pipeline; its loader supplies batches directly
+config constructs a Zephon pipeline. Its loader supplies batches directly
 to the recipe.
 The work source owns selection and mixing, operators own preparation, and
 Zephon's `to_training()` performs final shifting, padding and collation.
@@ -283,13 +283,13 @@ Zephon's `to_training()` performs final shifting, padding and collation.
 The dataset config chooses how documents are prepared and reuses the same
 source, cache, packing and batching setup. AutoModel supplies runtime inputs
 such as the tokenizer, batch size, input-length limit and distributed rank
-information. The pipeline runs independently of the training model; its
+information. The pipeline runs independently of the training model. Its
 configuration and the work source's progress are enough to replay the
 stream when AutoModel restores a checkpoint.
 
 After `to_training()`, the loader adapts the result to AutoModel's layout and
-attention interface. AutoModel supplies model-specific position requirements;
-reading and caching stay inside Zephon's fetch path. All ranks participate in
+attention interface. AutoModel supplies model-specific position requirements.
+Reading and caching stay inside Zephon's fetch path. All ranks participate in
 checkpointing, including TP/PP peers.
 
 For image SFT, the processor expands image placeholders before Zephon measures
@@ -315,5 +315,5 @@ for encoding and conversion.
 
 For the construction and delivery code, see
 [`config.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/zephon/config.py),
-[`pipeline.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/zephon/pipeline.py)
+[`pipeline.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/zephon/pipeline.py),
 and [`loader.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/zephon/loader.py).
