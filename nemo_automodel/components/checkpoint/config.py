@@ -86,6 +86,15 @@ def _normalize_save_consolidated(value: bool | str | SaveConsolidatedMode) -> Sa
     )
 
 
+def _normalize_model_save_format(value: str | SerializationFormat) -> SerializationFormat:
+    """Convert a raw string such as "safetensors" into the right Enum; Enum values pass through."""
+    if isinstance(value, SerializationFormat):
+        return value
+    formats = [v.value for v in SerializationFormat]
+    assert value in formats, f"Unsupported model save format: {value}. Supported formats: {formats}"
+    return SerializationFormat[value.upper()]
+
+
 @dataclass
 class CheckpointingConfig:
     """Configuration for checkpointing.
@@ -98,7 +107,7 @@ class CheckpointingConfig:
 
     enabled: bool = True
     checkpoint_dir: str | Path = "checkpoints/"
-    model_save_format: str = "safetensors"
+    model_save_format: str | SerializationFormat = "safetensors"
     model_cache_dir: str | Path | None = None
     model_repo_id: str | None = None
     save_consolidated: bool | str | SaveConsolidatedMode = "final"
@@ -153,16 +162,18 @@ class CheckpointingConfig:
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE
 
+        self.model_save_format = _normalize_model_save_format(self.model_save_format)
+
         # PEFT checkpointing is not supported for `torch_save`; flip only the two
         # incompatible fields (format -> safetensors, save_consolidated -> FINAL).
         # All other user-set fields (is_async, cpu_offload, staging_dir, v4_compatible,
         # single_rank_consolidation, ...) are preserved.
-        if self.is_peft and self.model_save_format == "torch_save":
+        if self.is_peft and self.model_save_format == SerializationFormat.TORCH_SAVE:
             logging.warning(
                 "PEFT checkpointing is not supported for `torch_save` format; "
                 "falling back to `safetensors` (all other checkpoint settings are preserved)."
             )
-            self.model_save_format = "safetensors"
+            self.model_save_format = SerializationFormat.SAFETENSORS
             self.save_consolidated = SaveConsolidatedMode.FINAL
 
         if self.max_recent_checkpoints is not None:
@@ -177,13 +188,6 @@ class CheckpointingConfig:
                     "checkpoint.max_recent_checkpoints is only supported for local checkpoint directories; "
                     "unset it when checkpoint.checkpoint_dir uses msc:// storage"
                 )
-
-        # Convert a raw string such as "safetensors" into the right Enum.
-        formats = [v.value for v in SerializationFormat]
-        assert self.model_save_format in formats, (
-            f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
-        )
-        self.model_save_format = SerializationFormat[self.model_save_format.upper()]
 
         # Normalize legacy bools and string aliases to a consolidated export mode.
         self.save_consolidated = _normalize_save_consolidated(self.save_consolidated)
