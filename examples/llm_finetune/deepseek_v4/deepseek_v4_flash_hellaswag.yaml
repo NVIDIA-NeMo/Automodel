@@ -90,7 +90,7 @@ model:
     dispatcher: hybridep
     dispatcher_async_dispatch: true
     dispatcher_capacity_factor:
-    dispatcher_equal_token_counts: true
+    dispatcher_equal_token_counts: false
     dispatcher_hybridep_compact_routing: true
     dispatcher_hybridep_permute_fusion: true
     dispatcher_recompute_cache: moe_tail
