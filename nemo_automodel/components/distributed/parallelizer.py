@@ -193,7 +193,16 @@ class ModelParallelizer:
         """Apply every requested parallelism and return the parallelized model."""
         from nemo_automodel.components.distributed.model_parallelizer import _apply_model_parallelizer
 
+        self._prepare_model(model, mesh_context)
         return _apply_model_parallelizer(self, model, mesh_context)
+
+    def _prepare_model(self, model: nn.Module, mesh_context: "MeshContext") -> None:
+        """Validate model constraints and install runtime mesh state before strategy dispatch.
+
+        A sidecar can reject unsupported topologies or set model-owned context-parallel
+        state here, before any executor changes parameter ownership. The default needs
+        no preparation; all sidecars retain the inherited public entry point.
+        """
 
     def _apply_moe(self, model: nn.Module, mesh_context: "MeshContext") -> nn.Module:
         """Apply the expert-parallel flow selected by ``mesh_context.ep_size > 1``.

@@ -649,7 +649,7 @@ def split_model_into_stages(
     text_model = get_text_module(model.model if has_model_attr else model)
     text_model_attr_name = ""
     for attr_name in TEXT_MODULE_ATTRS:
-        if hasattr(model, attr_name) or hasattr(model.model, attr_name):
+        if hasattr(model, attr_name) or (has_model_attr and hasattr(model.model, attr_name)):
             text_model_attr_name = attr_name
             break
     has_rotary_emb = hasattr(text_model, "rotary_emb")
