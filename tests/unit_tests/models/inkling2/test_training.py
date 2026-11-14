@@ -193,3 +193,79 @@ def test_fsdp_units_keep_fp32_modules_separate_and_never_wrap_containers(monkeyp
     assert sharded[0][1]["mp_policy"].param_dtype == torch.float32
     assert sharded[1][1]["ignored_params"] == layer_params | set(model.output_query.parameters())
     assert all(not isinstance(module, (nn.ModuleList, nn.ModuleDict)) for module, _ in sharded)
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/vlm_finetune/inkling2/inkling2_medpix_lora_ep32.yaml",
+        "examples/vlm_finetune/inkling2/inkling2_medpix_sft_ep64_pp4.yaml",
+        "examples/llm_finetune/inkling2/inkling2_tulu3_packed128k_ep32_pp2_cp32.yaml",
+    ],
+)
+def test_recipe_hybridep_activation_and_lora_preserve_interleaved_caps(
+    recipe_path: str, world_size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recipe backends retain capped gate/up math and gradients through LoRA construction.
+
+    Mock only world-size discovery to construct both shared expert classes on CPU;
+    the real dispatch/collective lifecycle is covered by the two-GPU EP cases.
+    """
+    from pathlib import Path
+
+    import yaml
+
+    from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+    from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
+    from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.moe import layers as moe_layers
+    from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
+    from nemo_automodel.shared.peft_config import PeftConfig
+
+    root = Path(__file__).resolve().parents[4]
+    raw = yaml.safe_load((root / recipe_path).read_text())
+    backend = ConfigNode(raw["model"]["backend"]).instantiate()
+    assert backend.dispatcher == "hybridep" and backend.experts == "torch_mm"
+    monkeypatch.setattr(moe_layers, "get_world_size_safe", lambda: world_size)
+    cfg = tiny_config(dtype=raw["model"]["dtype"])
+    cfg.num_hidden_layers = 1
+    if world_size == 1:
+        with pytest.warns(UserWarning, match="world size is 1"):
+            model = Inkling2ForCausalLM(cfg, backend=backend)
+    else:
+        model = Inkling2ForCausalLM(cfg, backend=backend)
+    if "peft" in raw:
+        apply_lora_to_linear_modules(
+            model,
+            PeftConfig(target_modules=["*.mlp.experts"], dim=8, alpha=32, lora_dtype="bfloat16"),
+        )
+    experts = model.layers["0"].mlp.experts
+    if world_size == 1:
+        assert isinstance(experts, GroupedExpertsLoRA if "peft" in raw else GroupedExperts)
+        activation = experts.expert_activation_grouped
+    else:
+        assert isinstance(experts, GroupedExpertsDeepEPLoRA if "peft" in raw else GroupedExpertsDeepEP)
+        activation = experts.expert_activation
+        assert experts.dispatcher_backend == "hybridep"
+
+    # Values beyond both caps catch a silent fallback to ordinary split-half SwiGLU.
+    values = torch.linspace(-60, 60, 4 * 2 * cfg.intermediate_size).reshape(4, -1)
+    values = values.to(experts.gate_and_up_projs.dtype).requires_grad_()
+    weights = torch.tensor([[0.1], [0.3], [0.7], [1.0]], requires_grad=True)
+    actual = activation(values, weights)
+    expected_values = values.detach().clone().requires_grad_()
+    expected_weights = weights.detach().clone().requires_grad_()
+    gate, up = expected_values.float().reshape(4, -1, 2).unbind(-1)
+    expected = (
+        cfg.mlp_gate_softcap
+        * torch.tanh(gate / cfg.mlp_gate_softcap)
+        * torch.sigmoid(gate)
+        * (cfg.mlp_up_softcap * torch.tanh(up / cfg.mlp_up_softcap))
+        * expected_weights
+    ).to(values.dtype)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(values.grad, expected_values.grad, rtol=0, atol=0)
+    torch.testing.assert_close(weights.grad, expected_weights.grad, rtol=0, atol=0)

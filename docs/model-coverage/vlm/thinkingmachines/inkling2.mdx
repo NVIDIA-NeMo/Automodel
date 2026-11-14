@@ -286,14 +286,16 @@ The recipes use the following distributed and kernel features:
 
 - FSDP2, expert parallelism, pipeline parallelism with Interleaved1F1B, and
   context parallelism with document-aware packed text.
-- PyTorch grouped experts (`experts: torch_mm`) and the shared torch dispatcher.
+- PyTorch grouped experts (`experts: torch_mm`) and the shared HybridEP dispatcher
+  (`dispatcher: hybridep`). The torch dispatcher remains available for reference checks.
 - FlexAttention for learned relative-position and sink gradients, and a dense
   PyTorch reference path for small numerical checks.
 - Activation checkpointing and separate dense and MoE reshard controls.
 - Shared fused linear cross entropy over usable vocabulary rows, with BF16
   projection inputs, FP32 accumulation, and the soft cap of 30.
 
-Tensor parallelism greater than one, HybridEP dispatch, MTP training, and
+The recipes now select HybridEP; full-model training with this dispatcher
+remains to be qualified. Tensor parallelism greater than one, MTP training, and
 quantized activation training are not qualified by these recipes. Packed CP
 training covers text. Image-text pipeline training uses the non-packed path.
 

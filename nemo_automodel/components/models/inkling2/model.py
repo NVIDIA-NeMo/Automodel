@@ -206,10 +206,12 @@ class Inkling2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             )
             != ("torch", "torch")
             or backend.attn not in ("eager", "flex")
-            or (backend.experts, backend.dispatcher) not in (("torch", "torch"), ("torch_mm", "torch"))
+            or (backend.experts, backend.dispatcher)
+            not in (("torch", "torch"), ("torch_mm", "torch"), ("torch_mm", "hybridep"))
         ):
             raise ValueError(
-                "Inkling2 requires eager/flex attention, Torch linear/norm, and torch or torch_mm experts with the torch dispatcher"
+                "Inkling2 requires eager/flex attention, Torch linear/norm, and torch or torch_mm experts "
+                "with the torch dispatcher, or torch_mm experts with the hybridep dispatcher"
             )
         if backend.fake_balanced_gate or backend.gate_precision not in (
             None,

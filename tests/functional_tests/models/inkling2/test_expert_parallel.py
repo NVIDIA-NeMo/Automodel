@@ -15,6 +15,7 @@
 """Two-GPU Inkling text training through the shared model parallelizer and DCP."""
 
 import copy
+import importlib.util
 import json
 import os
 import subprocess
@@ -65,6 +66,7 @@ class Case:
     fused_loss: bool = False
     master_weights: bool = False
     public_factory: bool = False
+    dispatcher: str = "torch"
 
 
 CASES = {
@@ -73,6 +75,10 @@ CASES = {
     "master-bf16-ep1-public": Case("float32", "torch_mm", ep=1, master_weights=True, public_factory=True),
     "bf16-ep1": Case("bfloat16", "torch_mm", ep=1),
     "bf16-ep2-ac": Case("bfloat16", "torch_mm", checkpoint=True),
+    "bf16-hybridep2-ac": Case("bfloat16", "torch_mm", checkpoint=True, dispatcher="hybridep"),
+    "master-bf16-hybridep2-ac": Case(
+        "float32", "torch_mm", checkpoint=True, master_weights=True, dispatcher="hybridep"
+    ),
     "bf16-ep2-flex-loss": Case("bfloat16", "torch_mm", attention="flex", fused_loss=True),
     "master-bf16-ep2-ac": Case("float32", "torch_mm", checkpoint=True, fused_loss=True, master_weights=True),
 }
@@ -171,7 +177,7 @@ def _worker(case_name: str, output: Path) -> None:
             linear="torch",
             rms_norm="torch",
             experts=case.experts,
-            dispatcher="torch",
+            dispatcher=case.dispatcher,
         )
         model = Inkling2ForCausalLM(copy.deepcopy(cfg), backend=backend).to(device)
         model.load_state_dict(reference.state_dict())
@@ -430,6 +436,9 @@ def test_expert_parallel_training(
     case_name: str, tmp_path: Path, record_property: Callable[[str, float], None]
 ) -> None:
     """Use the shared parallelizer, loss scaling, clipping and DCP on two ranks."""
+    # HybridEP is an optional CUDA runtime; torch-dispatch cases still run without it.
+    if CASES[case_name].dispatcher == "hybridep" and importlib.util.find_spec("hybrid_ep_cpp") is None:
+        pytest.skip("HybridEP cases require the optional hybrid_ep_cpp runtime")
     repo = Path(__file__).resolve().parents[4]
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(repo) + os.pathsep + environment.get("PYTHONPATH", "")

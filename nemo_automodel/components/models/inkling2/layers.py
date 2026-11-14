@@ -25,7 +25,7 @@ from torch.nn import functional as F
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.experts import GroupedExperts
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP
 from nemo_automodel.components.moe.layers import MoE
 
 from .config import Inkling2TextConfig
@@ -135,12 +135,17 @@ class Inkling2MoE(MoE):
         )
         super().__init__(moe_config, backend)
         self.moe_config = moe_config
-        # The model's backend contract selects the common GroupedExperts implementation.
-        cast(GroupedExperts, self.experts).expert_activation_grouped = partial(
+        activation = partial(
             capped_swiglu,
             gate_softcap=config.mlp_gate_softcap,
             up_softcap=config.mlp_up_softcap,
         )
+        # The shared factory uses different activation hooks for HybridEP and
+        # ordinary grouped experts (including the world-size-one fallback).
+        if isinstance(self.experts, GroupedExpertsDeepEP):
+            self.experts.expert_activation = activation
+        else:
+            cast(GroupedExperts, self.experts).expert_activation_grouped = activation
 
 
 class Inkling2LMHead(nn.Linear):
