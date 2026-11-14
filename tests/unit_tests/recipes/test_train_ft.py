@@ -1356,10 +1356,6 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
         def __iter__(self):
             yield ["dummy-batch"]
 
-        def iter_steps(self, count_tokens, *, statistics_group_index=0):
-            for batches in self:
-                yield batches, None
-
     trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
     trainer.model_parts = [MagicMock()]
     trainer.step_scheduler = _OneStepScheduler()
@@ -1402,10 +1398,6 @@ def test_run_train_validation_loop_reports_weighted_domain_validation():
 
         def __iter__(self):
             yield ["dummy-batch"]
-
-        def iter_steps(self, count_tokens, *, statistics_group_index=0):
-            for batches in self:
-                yield batches, None
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
     trainer.model_parts = [MagicMock()]
@@ -4380,7 +4372,7 @@ class _FiniteStreamLoader:
     synchronized_stream = True
 
     def __init__(self) -> None:
-        self.values = iter({"value": i, "labels": torch.tensor([[1, 2]])} for i in range(5))
+        self.values = iter({"value": i} for i in range(5))
         self.closed = False
 
     def __iter__(self):
