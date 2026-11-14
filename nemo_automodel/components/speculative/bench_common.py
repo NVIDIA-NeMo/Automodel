@@ -30,7 +30,10 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, NotRequired, TypeAlias, TypedDict
+
+if TYPE_CHECKING:
+    from aiohttp import ClientSession
 
 # ``GenerationConfig`` (model + sampling params for a chat completion) is shared
 # with the regeneration tool -- same four fields, same meaning -- so reuse it
@@ -42,6 +45,21 @@ from nemo_automodel.components.speculative.regenerate import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Messages may contain nested tool calls or multimodal content. Keep those JSON
+# fields intact instead of narrowing them to the text-only benchmark examples.
+_JSONValue: TypeAlias = str | int | float | bool | None | list["_JSONValue"] | dict[str, "_JSONValue"]
+
+
+class _ChatCompletionPayload(TypedDict):
+    """Non-streaming request built by the shared workload runner."""
+
+    model: str
+    messages: list[dict[str, _JSONValue]]
+    max_tokens: int
+    temperature: float
+    top_p: float
+    top_k: NotRequired[int]
 
 
 @dataclass
@@ -83,9 +101,9 @@ def _normalize_server_url(url: str) -> str:
 
 
 async def _chat_completion(
-    session,
+    session: ClientSession,
     url: str,
-    payload: dict[str, Any],
+    payload: _ChatCompletionPayload,
     *,
     timeout_s: float,
     max_retries: int,
@@ -100,10 +118,13 @@ async def _chat_completion(
                     text = await resp.text()
                     raise RuntimeError(f"HTTP {resp.status} from {url}: {text[:200]}")
                 resp.raise_for_status()
-                data = await resp.json()
+                # ClientResponse.json uses the standard JSON decoder by default;
+                # narrow its untyped return to JSON before inspecting usage.
+                data: _JSONValue = await resp.json()
                 usage = data.get("usage") if isinstance(data, dict) else None
-                if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
-                    return usage["completion_tokens"]
+                completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+                if isinstance(completion_tokens, int):
+                    return completion_tokens
                 return 0
         except aiohttp.ClientResponseError:
             # 5xx and 429 are turned into RuntimeError above, so the only status
@@ -121,7 +142,7 @@ async def _chat_completion(
 
 async def _run_workload(
     server: str,
-    prompts: list[list[dict[str, Any]]],
+    prompts: list[list[dict[str, _JSONValue]]],
     gen_cfg: GenerationConfig,
     *,
     concurrency: int,
@@ -133,9 +154,9 @@ async def _run_workload(
     url = _normalize_server_url(server) + "/v1/chat/completions"
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def _worker(slot: int, prompt: list[dict[str, Any]]) -> int | None:
+    async def _worker(slot: int, prompt: list[dict[str, _JSONValue]]) -> int | None:
         """Return the request's completion-token count, or ``None`` on failure."""
-        payload = {
+        payload: _ChatCompletionPayload = {
             "model": gen_cfg.model,
             "messages": prompt,
             "max_tokens": gen_cfg.max_new_tokens,
@@ -154,6 +175,7 @@ async def _run_workload(
                 logger.warning("Request %d failed: %s", slot, exc)
                 return None
 
+    session: ClientSession
     async with aiohttp.ClientSession() as session:
         start = time.perf_counter()
         token_counts = await asyncio.gather(*[_worker(i, prompt) for i, prompt in enumerate(prompts)])
@@ -168,7 +190,7 @@ async def _run_workload(
     )
 
 
-def _extract_prompt_text(value: Any) -> str | None:
+def _extract_prompt_text(value: _JSONValue) -> str | None:
     """Normalize a raw (non-chat) dataset field into a single prompt string.
 
     Accepts a plain string, or a non-empty list of strings (the first entry is
@@ -182,7 +204,7 @@ def _extract_prompt_text(value: Any) -> str | None:
     return value
 
 
-def _load_prompts(args: argparse.Namespace) -> list[list[dict[str, Any]]]:
+def _load_prompts(args: argparse.Namespace) -> list[list[dict[str, _JSONValue]]]:
     """Load up to ``--num-prompts`` chat prompts.
 
     Reads from ``--prompt-column`` when set (a raw single-turn text field,
@@ -202,8 +224,9 @@ def _load_prompts(args: argparse.Namespace) -> list[list[dict[str, Any]]]:
     )
     prompt_column = getattr(args, "prompt_column", None)
     prompt_context_column = getattr(args, "prompt_context_column", None)
-    prompts: list[list[dict[str, Any]]] = []
+    prompts: list[list[dict[str, _JSONValue]]] = []
     for row in dataset:
+        prompt: list[dict[str, _JSONValue]] | None
         if prompt_column:
             text = _extract_prompt_text(row.get(prompt_column))
             # Append a secondary context field (e.g. Alpaca's ``input``) when the
@@ -237,7 +260,7 @@ def _validate_workload_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--timeout-s must be > 0, got {args.timeout_s}")
 
 
-def _report_summary(summary: dict[str, Any] | None, output_json: str | None) -> int:
+def _report_summary(summary: dict[str, _JSONValue] | None, output_json: str | None) -> int:
     """Print a benchmark summary as JSON, optionally also write it to ``output_json``.
 
     Shared tail of ``bench_sglang``/``bench_vllm``'s ``_run``: returns exit code
