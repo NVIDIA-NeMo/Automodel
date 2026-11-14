@@ -1,0 +1,53 @@
+---
+title: "LFM3-1.7B"
+description: "Use NeMo AutoModel to fine-tune LFM3-1.7B for LLM workflows with a checked-in text generation recipe and documented distributed settings."
+slug: model-coverage/large-language-models/liquidai/LFM3-1.7B
+---
+
+[LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) has a checked-in NeMo AutoModel recipe for text generation.
+The Hugging Face configuration declares the `Lfm3ForCausalLM` architecture: gated short convolutions interleaved with full and sliding-window grouped-query attention.
+
+## Fine-Tune LFM3-1.7B
+
+Follow the [installation instructions](/get-started/installation), then run the recipe from the repository root:
+
+```bash
+automodel examples/llm_finetune/lfm3/lfm3_1p7b_squad.yaml --nproc-per-node 8
+```
+
+## Choose a Workflow
+
+| Goal | Start Here |
+| --- | --- |
+| Run the primary recipe for this model | Use the [recipe configuration](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/lfm3/lfm3_1p7b_squad.yaml). |
+
+### Configuration
+
+| Setting | Configuration |
+| --- | --- |
+| Hardware | - |
+| Strategy | FSDP2; tp_size=1, cp_size=1 |
+| Nodes | - |
+| Features | - |
+| Advanced | - |
+
+<Note>
+NeMo AutoModel runs its own `Lfm3ForCausalLM`, so the checkpoint loads without remote code on the pinned Transformers release. Full-attention layers rotate half of each attention head, as the released weights were trained. Transformers 5.23.0 reads the released `config.json` as a full rotation, which changes its outputs on long inputs. Checkpoints exported by NeMo AutoModel record the rotation as `proportional` and load correctly in both.
+</Note>
+
+## Model Reference
+
+### Model Architecture
+
+| Property | Value |
+| --- | --- |
+| Task | Text generation |
+| Architecture | `Lfm3ForCausalLM` |
+
+### Available Models
+
+- [`LiquidAI/LFM3-1.7B`](https://huggingface.co/LiquidAI/LFM3-1.7B)
+
+## Related Resources
+
+- [LLM fine-tuning guide](/recipes-e2e-examples/sft-peft)
