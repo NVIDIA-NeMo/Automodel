@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import json
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -33,7 +34,11 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (
     neat_packed_vlm_collater,
     packed_sequence_thd_vlm_collater,
 )
-from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig, PreTokenizedDatasetWrapperConfig
+from nemo_automodel.components.datasets.vlm.datasets import (
+    CordV2DatasetConfig,
+    MetaDatasetConfig,
+    PreTokenizedDatasetWrapperConfig,
+)
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
     VlmDataloaderConfig,
@@ -264,6 +269,39 @@ def test_negative_vlm_workers_is_rejected():
         match=r"^VLM num_workers must be zero \(automatic workers\) or a positive worker count\.$",
     ):
         config.build(pretrained_model_name_or_path="unused", dp_rank=0, dp_world_size=1, batch_size=1)
+
+
+@pytest.mark.parametrize("shard_data", [False, True])
+def test_vlm_dataloaders_cover_every_meta_record_once_per_epoch(tmp_path, shard_data):
+    """With ``shard_data=True`` the dataset is already this rank's slice and must not be split again."""
+    n_records, world_size = 16, 4
+    data_file = tmp_path / "data.jsonl"
+    data_file.write_text(
+        "".join(
+            json.dumps({"messages": [{"role": "user", "content": f"q{i}"}, {"role": "assistant", "content": "a"}]})
+            + "\n"
+            for i in range(n_records)
+        )
+    )
+    meta_file = tmp_path / "meta.json"
+    meta_file.write_text(json.dumps({"data": {"file_name": data_file.name}}))
+
+    seen = []
+    for rank in range(world_size):
+        config = VlmDataloaderConfig(
+            dataset_config=MetaDatasetConfig(path_or_dataset=str(meta_file), shard_data=shard_data),
+            processor_config=VlmProcessorConfig(factory=DummyProcessor),
+            num_workers=1,
+            shuffle=False,
+        )
+        dataloader = config.build(
+            pretrained_model_name_or_path="unused", dp_rank=rank, dp_world_size=world_size, batch_size=1
+        ).dataloader
+        indices = list(dataloader.sampler)
+        assert len(indices) == n_records // world_size
+        seen.extend(dataloader.dataset[i]["conversation"][0]["content"][0]["text"] for i in indices)
+
+    assert sorted(seen) == sorted(f"q{i}" for i in range(n_records))
 
 
 def _collate_worker_samples(examples, *, processor):
