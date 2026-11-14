@@ -102,7 +102,6 @@ from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, s
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.step_scheduler import TokenCounts
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     get_expert_tp_replication_factor,
@@ -1191,10 +1190,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 # The step scheduler yields a list of batches with the following properties:
                 # 1. len(batches) == grad_acc_steps
                 # 2. len(batches[0]) == batch_size
-                for batches, token_counts in self._iter_training_steps():
+                for batches in self.step_scheduler:
                     # If QAT delayed fake-quant is configured, enable after threshold
                     self._enable_qat_if_delayed(self.step_scheduler.step)
-                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm, token_counts=token_counts)
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
                     # Capture outside the microbatch loop and only after the
                     # eager optimizer step has completed. This leaves no
                     # pending checkpoint recomputation or GA backward work.
@@ -1574,25 +1573,26 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
         return tensor
 
-    def _run_train_optim_step(
-        self, batches, max_grad_norm: float | None = None, *, token_counts: TokenCounts | None = None
-    ):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
         Args:
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
-            token_counts: Counts already reduced with streaming readiness, when available.
         """
 
-        if token_counts is None:
-            ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-            num_label_tokens = torch.tensor(
-                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches), dtype=torch.long
-            )
-            num_label_tokens = self._dp_allreduce(num_label_tokens).item()
-        else:
-            num_label_tokens = token_counts.supervised
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
+        # Both counts are needed as Python integers. Reduce and read them in one
+        # transfer so the second count does not add another collective and device sync.
+        # The second count is the number of tokens in the batch, excluding any tail padding.
+        token_counts = torch.tensor(
+            [
+                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+            ],
+            dtype=torch.long,
+        )
+        num_label_tokens, num_tokens_in_batch = self._dp_allreduce(token_counts).tolist()
 
         domain_label_counts = None
         if self.domain_mixture is not None:
@@ -1632,16 +1632,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
 
         loss_buffer = []
-
-        # number of tokens in the batch, excluding any tail padding.
-        if token_counts is None:
-            num_tokens_in_batch = torch.tensor(
-                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-                dtype=torch.long,
-            )
-            num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
-        else:
-            num_tokens_in_batch = token_counts.total
 
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
 

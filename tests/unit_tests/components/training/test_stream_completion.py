@@ -15,7 +15,7 @@
 
 import pytest
 
-from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig, TokenCounts
+from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 
 class _Stream:
@@ -121,62 +121,3 @@ def test_config_infers_stream_capability_and_preserves_explicit_override():
 
     direct = StepScheduler(1, 1, 1, source, max_steps=3, preemption_signal=None)
     assert "stream_exhausted" not in direct.state_dict()
-
-
-@pytest.mark.cpu_only
-def test_stream_prepares_counts_only_for_full_windows_and_preserves_checkpoint_frontier():
-    source = _Stream(5)
-    scheduler = _scheduler(source)
-    counted = []
-
-    def count_tokens(batches):
-        counted.append([batch["value"] for batch in batches])
-        return TokenCounts(sum(counted[-1]), 10)
-
-    counts = []
-    for batches, step_counts in scheduler.iter_steps(count_tokens):
-        counts.append(step_counts)
-        assert scheduler.state_dict()["step"] == len(counts)
-    assert counted == [[1, 2], [3, 4]]
-    assert counts == [TokenCounts(3, 10), TokenCounts(7, 10)]
-    assert source.read == 5
-    assert scheduler.state_dict() == {"step": 2, "epoch": 1, "stream_exhausted": True}
-    restored_source = _Stream(10)
-    restored = _scheduler(restored_source)
-    restored.load_state_dict(scheduler.state_dict())
-    assert list(restored.iter_steps(count_tokens)) == []
-    assert restored_source.read == 0
-
-
-@pytest.mark.cpu_only
-def test_stream_token_count_failure_keeps_original_exception():
-    def count_tokens(batches):
-        raise ValueError("invalid supervision")
-
-    with pytest.raises(RuntimeError, match="synchronized training stream failed") as error:
-        list(_scheduler(_Stream(4)).iter_steps(count_tokens))
-    assert isinstance(error.value.__cause__, ValueError)
-    assert str(error.value.__cause__) == "invalid supervision"
-
-
-@pytest.mark.cpu_only
-def test_zero_supervision_is_available_and_step_cap_does_not_read_ahead():
-    source = _Stream(20)
-    scheduler = _scheduler(source, max_steps=2)
-    steps = list(scheduler.iter_steps(lambda batches: TokenCounts(0, 6)))
-    assert [counts for _, counts in steps] == [TokenCounts(0, 6), TokenCounts(0, 6)]
-    assert source.read == 4
-    assert not scheduler.stream_exhausted
-
-
-@pytest.mark.cpu_only
-def test_non_streaming_iteration_retains_partial_window_and_does_not_count():
-    scheduler = StepSchedulerConfig(global_batch_size=2, max_steps=10, preemption_signal=None).build(_Stream(3), 1, 1)
-
-    def unexpected_count(batches):
-        raise AssertionError("Non-streaming counts remain recipe-owned")
-
-    steps = list(scheduler.iter_steps(unexpected_count))
-    assert [len(batches) for batches, _ in steps] == [2, 1]
-    assert [counts for _, counts in steps] == [None, None]
-    assert scheduler.epoch == 1

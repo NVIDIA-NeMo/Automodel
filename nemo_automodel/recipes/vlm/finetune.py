@@ -96,7 +96,6 @@ from nemo_automodel.components.models.common.packing import (
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.step_scheduler import TokenCounts
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     get_expert_tp_replication_factor,
@@ -814,8 +813,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         try:
             for epoch in self.step_scheduler.epochs:
                 self.step_scheduler.set_epoch(epoch)
-                for batches, token_counts in self._iter_training_steps():
-                    log_data = self._run_train_optim_step(batches, self.max_grad_norm, token_counts=token_counts)
+                for batch_idx, batches in enumerate(self.step_scheduler):
+                    log_data = self._run_train_optim_step(batches, self.max_grad_norm)
                     # log
                     self.log_train_metrics(log_data)
                     self._update_progress_bar(pbar, log_data.metrics)
@@ -1222,30 +1221,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
             grad_reduce_group=self._get_dp_group(include_cp=True),
         )
 
-    def _run_train_optim_step(
-        self, batches, max_grad_norm: float | None = None, *, token_counts: TokenCounts | None = None
-    ):
+    def _run_train_optim_step(self, batches, max_grad_norm: float | None = None):
         """Execute a single training step.
 
         Args:
             batches: List of batches of training data.
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
-            token_counts: Counts already reduced with streaming readiness, when available.
         """
+        ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
         # Both counts are needed as Python integers. Reduce and read them in one
         # transfer so the second count does not introduce another device sync.
-        if token_counts is None:
-            ignore_index = _get_loss_ignore_index(getattr(self, "loss_fn", None))
-            local_counts = torch.tensor(
-                [
-                    sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
-                    sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
-                ],
-                dtype=torch.long,
-            )
-            num_label_tokens, num_tokens_in_batch = self._dp_allreduce(local_counts).tolist()
-        else:
-            num_label_tokens, num_tokens_in_batch = token_counts.supervised, token_counts.total
+        token_counts = torch.tensor(
+            [
+                sum(_count_label_tokens(batch["labels"], ignore_index) for batch in batches),
+                sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+            ],
+            dtype=torch.long,
+        )
+        num_label_tokens, num_tokens_in_batch = self._dp_allreduce(token_counts).tolist()
 
         num_batches = len(batches)
         self._set_moe_aux_loss_backward_scale(num_batches=num_batches, num_label_tokens=num_label_tokens)
