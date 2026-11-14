@@ -172,6 +172,41 @@ def _fake_te_autocast():
 
 
 @contextmanager
+def _fake_te_mxfp8_autocast():
+    """Stand in for the Transformer Engine autocast and ``MXFP8BlockScaling``; record ``(enabled, recipe name)``."""
+    entered: list[tuple[bool, str | None]] = []
+
+    class MXFP8BlockScaling:
+        pass
+
+    @contextmanager
+    def autocast(enabled: bool = True, recipe: MXFP8BlockScaling | None = None):
+        entered.append((enabled, None if recipe is None else type(recipe).__name__))
+        yield
+
+    quantization = types.ModuleType("transformer_engine.pytorch.quantization")
+    quantization.autocast = autocast
+    te_pytorch = types.ModuleType("transformer_engine.pytorch")
+    te_pytorch.quantization = quantization
+    recipe_module = types.ModuleType("transformer_engine.common.recipe")
+    recipe_module.MXFP8BlockScaling = MXFP8BlockScaling
+    te_common = types.ModuleType("transformer_engine.common")
+    te_common.recipe = recipe_module
+    te_root = types.ModuleType("transformer_engine")
+    te_root.pytorch = te_pytorch
+    te_root.common = te_common
+    modules = {
+        "transformer_engine": te_root,
+        "transformer_engine.pytorch": te_pytorch,
+        "transformer_engine.pytorch.quantization": quantization,
+        "transformer_engine.common": te_common,
+        "transformer_engine.common.recipe": recipe_module,
+    }
+    with patch("nemo_automodel.components.models.common.utils.HAVE_TE", True), patch.dict("sys.modules", modules):
+        yield entered
+
+
+@contextmanager
 def _fake_te_nvfp4_recipe(available: bool = True):
     """Stand in for ``transformer_engine.common.recipe``, with or without ``NVFP4BlockScaling``."""
     recipe_module = types.ModuleType("transformer_engine.common.recipe")
@@ -359,11 +394,61 @@ class TestTENvfp4Config:
             {"four_over_six": "all"},
             {"four_over_six": "sometimes", "random_hadamard_transform": False},
             {"backward": "float"},
+            {"backward": "mxfp8"},
+            {"backward": "mxfp8", "random_hadamard_transform": False, "resident_weights": True},
+            {"mxfp8_fqns": [""]},
         ],
     )
     def test_unsupported_options_are_rejected(self, options):
         with pytest.raises(ValueError, match="te_nvfp4"):
             TENvfp4Config(**options)
+
+    def test_mxfp8_fqns_default_and_normalization(self):
+        assert TENvfp4Config().mxfp8_fqns == ()
+        assert TENvfp4Config(mxfp8_fqns=["layers.2.", "layers.3."]).mxfp8_fqns == ("layers.2.", "layers.3.")
+        assert TENvfp4Config(mxfp8_fqns="layers.3.").mxfp8_fqns == ("layers.3.",)
+
+    def test_route_mxfp8_modules_wraps_the_outermost_matches(self):
+        """Matching modules run under the MXFP8 recipe, their children are not wrapped again; idempotent."""
+        model = nn.ModuleDict(
+            {
+                "layers": nn.ModuleDict(
+                    {
+                        "0": nn.Sequential(OrderedDict(mlp=nn.Linear(4, 4))),
+                        "1": nn.Sequential(OrderedDict(mlp=nn.Sequential(OrderedDict(experts=nn.Linear(4, 4))))),
+                    }
+                ),
+                "lm_head": nn.Linear(4, 3),
+            }
+        )
+        x = torch.randn(2, 4)
+        expected = model.lm_head(model.layers["1"](model.layers["0"](x)))
+        cfg = TENvfp4Config(mxfp8_fqns=["layers.1."])
+        with _fake_te_mxfp8_autocast() as entered:
+            assert cfg.route_mxfp8_modules(model) == ["layers.1.mlp"]
+            assert cfg.route_mxfp8_modules(model) == ["layers.1.mlp"]  # idempotent: one wrapper, not two
+            cfg.prepare_modules(model)  # also keeps lm_head out of the autocast
+            torch.testing.assert_close(model.lm_head(model.layers["1"](model.layers["0"](x))), expected)
+            assert entered == [(True, "MXFP8BlockScaling"), (False, None)]
+            clone = copy.deepcopy(model)
+            assert clone.layers["1"].mlp.forward.__self__ is clone.layers["1"].mlp
+        assert "forward" not in vars(model.layers["0"].mlp)
+        assert "forward" not in vars(model.layers["1"].mlp.experts)
+
+    def test_route_mxfp8_modules_rejects_an_excluded_module(self):
+        model = nn.ModuleDict({"lm_head": nn.Linear(4, 3)})
+        with _fake_te_mxfp8_autocast():
+            with pytest.raises(ValueError, match="exclude_fqns and te_nvfp4.mxfp8_fqns"):
+                TENvfp4Config(mxfp8_fqns=["lm_head"]).route_mxfp8_modules(model)
+
+    def test_route_mxfp8_modules_is_a_no_op_without_te_or_names(self):
+        model = nn.ModuleDict({"mlp": nn.Linear(2, 2)})
+        module = "nemo_automodel.components.models.common.utils"
+        with patch(f"{module}.HAVE_TE", False):
+            assert TENvfp4Config(mxfp8_fqns=["mlp"]).route_mxfp8_modules(model) == []
+        with patch(f"{module}.HAVE_TE", True):
+            assert TENvfp4Config().route_mxfp8_modules(model) == []
+        assert "forward" not in vars(model.mlp)
 
     def test_exclude_fqns_default_and_normalization(self):
         assert TENvfp4Config().exclude_fqns == ("lm_head",)
