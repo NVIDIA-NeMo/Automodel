@@ -261,6 +261,59 @@ The legacy `force_default=True` option is equivalent to `tokenizer_backend="nemo
 `force_hf=True` is equivalent to `tokenizer_backend="transformers_auto"`.
 Equivalent legacy flags and explicit routes can be combined. Contradictory route selections raise `ValueError`.
 
+### Accelerate Tokenization with gigatoken (optional)
+
+[gigatoken](https://github.com/marcelroed/gigatoken) is an optional Rust BPE tokenizer backend. When you opt in, NeMo AutoModel routes the plain-text encode path (`encode` / `__call__`) through gigatoken, which returns **token IDs identical** to the Hugging Face tokenizer. Everything else — `decode`, chat-template tokenization, padding, and special-token handling — continues to run through the wrapped Hugging Face tokenizer.
+
+<Note>
+gigatoken supports **BPE tokenizers only** (not SentencePiece or WordPiece). The backend is optional and additive: when it is not installed, or cannot wrap the given tokenizer, NeMo AutoModel logs a warning and transparently falls back to the Hugging Face tokenizer, so training and inference keep working.
+</Note>
+
+Install the optional extra with `uv`:
+
+```bash
+uv pip install "nemo-automodel[gigatoken]"
+```
+
+Enable it per call with `use_gigatoken=True`:
+
+```python
+from nemo_automodel import NeMoAutoTokenizer
+
+tok = NeMoAutoTokenizer.from_pretrained("gpt2", use_gigatoken=True)
+ids = tok.encode("Hello, world!")  # encoded by gigatoken; identical IDs to Hugging Face
+text = tok.decode(ids)             # decode delegates to the Hugging Face tokenizer
+```
+
+In a training config, set `use_gigatoken` on the dataset's tokenizer block:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+    use_gigatoken: true
+```
+
+`use_gigatoken` wraps the tokenizer only on the default `tokenizer_backend="nemo_auto"` route, and only when no specialized tokenizer is registered for the model type and the tokenizer is BPE-based. The other routes return early without wrapping, so the flag has no effect with them:
+
+| Loading route | `use_gigatoken` applies? |
+|---|---|
+| `nemo_auto` (default), unregistered BPE model | Yes |
+| `nemo_auto` with a registered specialized tokenizer | No — the registered tokenizer is returned unchanged |
+| `nemo_wrapped_auto` / `force_default=True` | No |
+| `transformers_auto` / `force_hf=True` | No |
+| `tokenizers` | No |
+
+<Warning>
+`use_gigatoken` accelerates only plain-text tokenization. `decode`, `apply_chat_template`, and padding always delegate to the Hugging Face tokenizer, so chat/SFT template rendering is **not** accelerated. In addition, when the wrapped tokenizer enforces special tokens (loaded with `add_bos_token=True` or `add_eos_token=True`), the `encode` / `__call__` path falls back to the Hugging Face tokenizer for that call, because gigatoken is built from the raw tokenizer and does not apply NeMo AutoModel's BOS/EOS post-processing.
+</Warning>
+
+<Tip>
+gigatoken can tokenize plain text substantially faster than the Hugging Face `tokenizers` library; the actual speedup depends on the tokenizer, text, and hardware, so benchmark on your own workload rather than assuming a fixed factor.
+</Tip>
+
 ## Save Checkpoints in NeMo AutoModel and Load Everywhere
 
 NeMo AutoModel training recipes write checkpoints as sharded safetensors by default and generate a per-checkpoint helper that can export Hugging Face-compatible consolidated safetensors after training:
