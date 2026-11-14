@@ -119,6 +119,7 @@ def _write_released_target(root: Path, **overrides) -> str:
         **{
             name: getattr(target_text_config, name)
             for name in (
+                "vocab_size",
                 "hidden_size",
                 "num_attention_heads",
                 "num_key_value_heads",
@@ -303,6 +304,7 @@ def test_released_config_rejects_other_draft_shapes(tmp_path, override):
 @pytest.mark.parametrize(
     "override",
     [
+        {"vocab_size": VOCAB + 7},
         {"hidden_size": 2 * HIDDEN},
         {"head_dim": 2 * HEAD_DIM},
         {"rms_norm_eps": 1e-3},
