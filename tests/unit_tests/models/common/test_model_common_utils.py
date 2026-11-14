@@ -36,6 +36,7 @@ from nemo_automodel.components.models.common.utils import (
     initialize_rms_norm_module,
     load_pretrained_generation_config,
     restore_pretrained_generation_config,
+    row_scaled_nvfp4_gemm_is_unreliable,
     set_is_first_microbatch,
     set_is_optim_step,
 )
@@ -456,6 +457,21 @@ class TestTENvfp4Config:
         assert TENvfp4Config(exclude_fqns="score").module_excluded("model.score")
         with pytest.raises(ValueError, match="te_nvfp4.exclude_fqns"):
             TENvfp4Config(exclude_fqns=[""])
+
+
+class TestRowScaledNvfp4Gemm:
+    @pytest.mark.parametrize(
+        ("version", "capability", "unreliable"),
+        [
+            (130700, (10, 3), True),  # cuBLAS of the 26.10 image on GB300
+            (130802, (10, 3), False),
+            (131000, (10, 3), False),
+            (130700, (10, 0), False),  # GB200
+            (130700, (9, 0), False),
+        ],
+    )
+    def test_known_environments(self, version, capability, unreliable):
+        assert row_scaled_nvfp4_gemm_is_unreliable(version, capability) is unreliable
 
 
 class TestBackendConfigTeNvfp4:

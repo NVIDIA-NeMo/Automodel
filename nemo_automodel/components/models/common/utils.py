@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
+import functools
 import importlib.util
 import logging
 import math
@@ -420,6 +422,38 @@ class TEFp8Config(TEQuantizationConfig):
         return Float8CurrentScaling()
 
 
+def row_scaled_nvfp4_gemm_is_unreliable(cublaslt_version: int, capability: tuple[int, int]) -> bool:
+    """Whether NVFP4 GEMMs with FP32 output, which row-scaled activations use, can return wrong rows.
+
+    cuBLASLt 13.7.0 on GB300 returns wrong values for 6 of every 256 output rows once a GEMM has at least 4096
+    rows, input features and output features. cuBLASLt 13.8.2 and 13.10.0 are correct, and so is GB200.
+
+    Args:
+        cublaslt_version: ``cublasLtGetVersion()``, e.g. 130700 for 13.7.0.
+        capability: CUDA compute capability of the device, ``(10, 3)`` on GB300.
+    """
+    return capability == (10, 3) and cublaslt_version < 130802
+
+
+@functools.cache
+def _warn_about_row_scaled_nvfp4_gemm() -> None:
+    """Warn once when the loaded cuBLASLt has the defect of :func:`row_scaled_nvfp4_gemm_is_unreliable`."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        cublaslt = ctypes.CDLL("libcublasLt.so.13")
+    except OSError:
+        return
+    cublaslt.cublasLtGetVersion.restype = ctypes.c_size_t
+    version = int(cublaslt.cublasLtGetVersion())
+    if row_scaled_nvfp4_gemm_is_unreliable(version, torch.cuda.get_device_capability()):
+        logger.warning(
+            "te_nvfp4.row_scaled_activation: cuBLASLt %d returns wrong rows from NVFP4 GEMMs with FP32 output on "
+            "this GPU once rows, input features and output features all reach 4096. Use cuBLAS 13.8.2 or newer.",
+            version,
+        )
+
+
 @dataclass(kw_only=True)
 class TENvfp4Config(TEQuantizationConfig):
     """Configuration for Transformer Engine NVFP4 quantization.
@@ -515,6 +549,8 @@ class TENvfp4Config(TEQuantizationConfig):
                 "te_nvfp4 requires transformer_engine.common.recipe.NVFP4BlockScaling "
                 "(TE >= 2.7). The installed TE does not provide it; rebuild on a newer TE image."
             ) from e
+        if self.row_scaled_activation:
+            _warn_about_row_scaled_nvfp4_gemm()
         if self.backward == "mxfp8":
             if not is_te_min_version("2.19.0"):
                 raise ImportError("te_nvfp4.backward='mxfp8' requires Transformer Engine 2.19.0 or newer.")

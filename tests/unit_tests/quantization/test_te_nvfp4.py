@@ -265,3 +265,30 @@ def test_mxfp8_fqns_modules_run_the_mxfp8_recipe_inside_the_nvfp4_autocast():
     # The other module ran NVFP4: a different result with a larger error than MXFP8.
     assert not torch.equal(outputs[0], mxfp8_outputs[0])
     assert _relative_error(outputs[0], exact[0]) > 2 * _relative_error(mxfp8_outputs[0], exact[0])
+
+
+def test_large_row_scaled_gemm_is_wrong_exactly_where_the_warning_says():
+    """Row-scaled NVFP4 at 4096 rows x 4608 x 4608: correct, unless cuBLASLt is the one the config warns about."""
+    import ctypes
+
+    import transformer_engine.pytorch as te
+
+    from nemo_automodel.components.models.common.utils import row_scaled_nvfp4_gemm_is_unreliable
+
+    torch.manual_seed(0)
+    linear = te.Linear(4608, 4608, bias=False, params_dtype=torch.bfloat16).to("cuda")
+    x = torch.randn(4096, 4608, device="cuda", dtype=torch.bfloat16)
+    config = TENvfp4Config(**RECIPE_OPTIONS)
+    with torch.no_grad(), config.maybe_te_autocast():
+        output = linear(x).float()
+    exact = x.float() @ linear.weight.float().T
+    # NVFP4 rounding gives every row an error near 0.13; a row from the defective GEMM is off by about 1.
+    row_error = (output - exact).norm(dim=1) / exact.norm(dim=1)
+    wrong_rows = int((row_error > 0.5).sum())
+    assert float(row_error.median()) < 0.2
+    cublaslt = ctypes.CDLL("libcublasLt.so.13")
+    cublaslt.cublasLtGetVersion.restype = ctypes.c_size_t
+    flagged = row_scaled_nvfp4_gemm_is_unreliable(
+        int(cublaslt.cublasLtGetVersion()), torch.cuda.get_device_capability()
+    )
+    assert (wrong_rows > 0) == flagged, f"{wrong_rows} wrong rows of 4096 with cuBLASLt {cublaslt.cublasLtGetVersion()}"
