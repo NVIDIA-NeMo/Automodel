@@ -233,13 +233,15 @@ def test_qat_config_create_quantizer_overrides():
     assert config.to_dict() == {"quantizer_type": "int4_weight_only", "groupsize": 64, "inner_k_tiles": 4}
 
 
-def test_qat_config_rejects_inapplicable_kwargs():
+@pytest.mark.parametrize("entry", ["build", "create_quantizer"])
+def test_qat_config_rejects_inapplicable_kwargs(entry: str) -> None:
     with pytest.raises(ValueError, match="inner_k_tiles"):
-        qat.QATConfig(quantizer_type="int8_dynact_int4weight", inner_k_tiles=4).create_quantizer()
+        getattr(qat.QATConfig(quantizer_type="int8_dynact_int4weight", inner_k_tiles=4), entry)()
     with pytest.raises(ValueError, match="padding_allowed"):
-        qat.QATConfig(quantizer_type="int4_weight_only", padding_allowed=True).create_quantizer()
+        getattr(qat.QATConfig(quantizer_type="int4_weight_only", padding_allowed=True), entry)()
 
 
-def test_qat_config_rejects_unknown_kwargs():
+@pytest.mark.parametrize("entry", ["build", "create_quantizer"])
+def test_qat_config_rejects_unknown_kwargs(entry: str) -> None:
     with pytest.raises(ValueError, match="Unknown QAT quantizer kwargs"):
-        qat.QATConfig(unknown_kwarg=True).create_quantizer()
+        getattr(qat.QATConfig(unknown_kwarg=True), entry)()

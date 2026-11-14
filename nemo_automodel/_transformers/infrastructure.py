@@ -33,13 +33,15 @@ from typing import TYPE_CHECKING, Union
 
 import torch
 
+from nemo_automodel._transformers.qat import QAT
 from nemo_automodel._transformers.utils import _should_load_before_shard
 from nemo_automodel._transformers.v4_patches.kv_sharing import (
     install_kv_sharing_holder,
     should_install_kv_sharing_holder,
 )
 from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
-from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
+from nemo_automodel.components._peft.lora import LinearLoRA, apply_lora_to_linear_modules
+from nemo_automodel.components._peft.lora_experts import GroupedExpertsDeepEPLoRA, GroupedExpertsLoRA
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
@@ -72,7 +74,8 @@ from nemo_automodel.components.models.common.utils import (
     prepare_frozen_parameters_for_sharding,
 )
 from nemo_automodel.components.models.kimi_k3.model import freeze_kimi_k3_indexer_params
-from nemo_automodel.components.moe.experts import GroupedExpertsTE
+from nemo_automodel.components.moe.experts import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
+from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.moe.quantized_experts import (
     apply_mxfp4_to_moe_experts,
     apply_nvfp4_to_moe_experts,
@@ -183,6 +186,18 @@ def _validate_nvfp4_checkpoint(pretrained_model_name_or_path: str, cache_dir: st
 def _apply_peft_and_lower_precision(
     model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
 ):
+    if isinstance(qat_quantizer, QAT):
+        # Validate before PEFT changes modules or mutates its config.
+        if peft_config is None:
+            raise ValueError("Full-parameter FP8/MXFP4 QAT is unsupported; weight/rules QAT requires peft_config")
+        if fp8_config is not None or quantization_config is not None:
+            raise ValueError("LoRA QAT does not support fp8_config or quantization_config")
+        if tp_size > 1 or autopipeline is not None:
+            raise ValueError("LoRA QAT does not support tensor parallelism or autopipeline")
+
+    if peft_config is not None and qat_quantizer is not None and not isinstance(qat_quantizer, QAT):
+        raise ValueError("TorchAO INT4 QAT with PEFT is not currently supported")
+
     if peft_config is not None:
         if tp_size > 1:
             logger.info("Disabling Triton with TP ({})".format(tp_size))
@@ -203,7 +218,10 @@ def _apply_peft_and_lower_precision(
         model = apply_fp8_to_model(model, config=fp8_config)
 
     # QAT
-    if qat_quantizer is not None:
+    if isinstance(qat_quantizer, QAT):
+        # Metadata-only preparation also works on meta and float32 CPU models.
+        model = qat_quantizer.prepare(model)
+    elif qat_quantizer is not None:
         from nemo_automodel.components.quantization.qat import prepare_qat_model
 
         if any(map(lambda x: x.dtype != torch.bfloat16, model.parameters())):
@@ -360,10 +378,14 @@ def _instantiate_pipeline(
 
 def _instantiate_qat(
     config: QATConfig | None,
-) -> Union["Int4WeightOnlyQATQuantizer", "Int8DynActInt4WeightQATQuantizer"] | None:
+) -> "QAT | Int4WeightOnlyQATQuantizer | Int8DynActInt4WeightQATQuantizer | None":
     if config is None:
         return None
-    return config.create_quantizer()
+    if not isinstance(config, QATConfig):
+        raise TypeError("qat_config must be a QATConfig")
+    if config.is_weight_qat:
+        return QAT(config)
+    return config.build()
 
 
 def parallelize_for_pp(
@@ -413,7 +435,7 @@ def instantiate_infrastructure(
         distributed_config: Distributed training config (FSDP2Config, MegatronFSDPConfig,
             or DDPConfig).
         pipeline_config: Pipeline parallelism config.
-        qat_config: Quantization-aware training config.
+        qat_config: TorchAO QAT or merged-weight LoRA QAT config.
         moe_parallel_config: MoE parallelizer config (for expert parallel models).
         activation_checkpointing: Enable activation checkpointing for transformer blocks.
             If ``None``, inferred from ``distributed_config.activation_checkpointing``.
@@ -478,6 +500,27 @@ def _uses_thd_only_te_attention(model) -> bool:
     )
 
 
+def _validate_qat_trainability(model: torch.nn.Module) -> None:
+    """Check prepared LoRA QAT bases without materializing or re-preparing weights."""
+    for module_name, module in model.named_modules():
+        if not isinstance(module, (LinearLoRA, GroupedExpertsLoRA, GroupedExpertsDeepEPLoRA)):
+            continue
+        if module.weight_fake_quantizer is None:
+            continue
+        # Dense adapters are child modules; grouped adapters are direct parameters.
+        # All other direct parameters, including base biases, must stay frozen.
+        for name, parameter in module.named_parameters(recurse=False):
+            if name in ("lora_gate_and_up_A", "lora_gate_and_up_B", "lora_down_A", "lora_down_B"):
+                continue
+            if parameter.requires_grad:
+                path = f"{module_name}.{name}" if module_name else name
+                raise ValueError(
+                    f"{path}: full-parameter QAT is unsupported; prepared LoRA QAT base parameters "
+                    "must remain frozen after applying the trainability policy. "
+                    "Remove freeze_config unfreeze selectors that enable this base parameter."
+                )
+
+
 def _apply_trainability_policy(
     model: torch.nn.Module,
     *,
@@ -511,6 +554,8 @@ def _apply_trainability_policy(
     freeze_deepseek_v4_indexer_params(model)
     freeze_minimax_m3_indexer_params(model)
     freeze_kimi_k3_indexer_params(model)
+    # Validate the resulting policy on every rebind, before sharding/optimizer capture.
+    _validate_qat_trainability(model)
 
 
 def _prepare_trainability_before_sharding(
@@ -636,7 +681,12 @@ def apply_model_infrastructure(
         peft_config: PEFT/LoRA configuration dict. Default: None
         quantization_config: Quantization configuration. Default: None
         fp8_config: FP8 configuration. Default: None
-        qat_quantizer: QAT quantizer instance. Default: None
+        qat_quantizer: QAT quantizer instance. Default: None. Multi-rank LoRA
+            weight QAT requires pure FSDP2 DP sharding with TP=CP=PP=1 and no
+            DP replication. EP additionally requires ep_size=world_size (no
+            expert-DP sharding) and the torch GroupedExperts reference loop.
+            Preparation precedes sharding; packed export still requires a
+            complete local model. This does not validate full-size training.
         loss_fn: Loss function (may be replaced with MaskedCrossEntropy). Default: None
         autopipeline: AutoPipeline instance for pipeline parallelism. Default: None
         parallelize_fn: Function to apply parallelization (EP + FSDP2). Default: None
@@ -669,6 +719,44 @@ def apply_model_infrastructure(
         and fsdp2_sharding_enabled(mesh.device_mesh)
     )
     frozen_compute_dtype = _get_frozen_storage_compute_dtype(strategy_config, mesh) if fsdp2_active else None
+
+    if isinstance(qat_quantizer, QAT):
+        if isinstance(strategy_config, FSDP2Config):
+            if strategy_config.autocast_dtype is not None:
+                raise ValueError("LoRA QAT requires FSDP2 autocast_dtype=None")
+            if (
+                mesh.device_mesh is not None
+                and not fsdp2_active
+                and strategy_config.mp_policy is not None
+                and strategy_config.mp_policy.param_dtype in (torch.float16, torch.bfloat16)
+            ):
+                raise ValueError(
+                    "Unsharded FSDP2 enables autocast from mp_policy.param_dtype, which LoRA QAT does not support. "
+                    "Set distributed.mp_policy.param_dtype=null and use matching model/adapter storage dtypes."
+                )
+        if mesh.tp_size > 1 or mesh.cp_size > 1 or mesh.pp_size > 1 or autopipeline is not None:
+            raise ValueError("LoRA QAT requires TP=CP=PP=1 and no autopipeline")
+        if isinstance(strategy_config, (MegatronFSDPConfig, DDPConfig)):
+            raise ValueError("LoRA QAT does not support Megatron FSDP or DDP")
+        if (mesh.dp_replicate_size or 1) > 1:
+            raise ValueError("LoRA QAT does not support HSDP: dp_replicate_size must be 1")
+        world_size = get_world_size_safe()
+        if mesh.ep_size > 1:
+            if mesh.ep_size != world_size or mesh.moe_mesh is None or mesh.moe_mesh.size() != world_size:
+                raise ValueError("LoRA QAT EP requires ep_size=world_size; additional ep_shard is not verified")
+            if not callable(parallelize_fn) and not (
+                isinstance(model_wrapper, MeshContext) and model_wrapper.moe_parallel_config is not None
+            ):
+                raise ValueError("LoRA QAT EP requires the FSDP2 MoE parallelizer")
+        elif parallelize_fn is not None:
+            raise ValueError("LoRA QAT without EP requires FSDP2 sharding, not a custom parallelize_fn")
+        if world_size > 1:
+            if not isinstance(strategy_config, FSDP2Config) or mesh.device_mesh is None:
+                raise ValueError("Multi-rank LoRA QAT requires an FSDP2 strategy and an explicit MeshContext")
+            if mesh.dp_shard_size != world_size or mesh.device_mesh.size() != world_size:
+                raise ValueError("Multi-rank LoRA QAT requires pure DP sharding: dp_shard_size=world_size")
+            if model_wrapper.device_mesh is not mesh.device_mesh or model_wrapper.moe_mesh is not mesh.moe_mesh:
+                raise ValueError("LoRA QAT requires the FSDP2 execution context and MeshContext to use the same meshes")
 
     # Create a checkpointer for loading base weights only. Keep consolidation disabled
     # so load-only infrastructure does not emit save/export warnings.
@@ -713,6 +801,22 @@ def apply_model_infrastructure(
         model = _apply_peft_and_lower_precision(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
+
+    if isinstance(qat_quantizer, QAT) and get_world_size_safe() > 1:
+        # Inspect the actual prepared modules, not architecture names or QAT
+        # selectors: even untargeted experts participate in EP collectives.
+        # QAT.prepare already rejects MXFP8 on LoRA modules, but does not gate
+        # DeepEP/HybridEP or ordinary (non-LoRA) expert dispatchers.
+        for name, module in model.named_modules():
+            if (
+                (isinstance(module, MoE) and not isinstance(module.experts, GroupedExperts))
+                or isinstance(module, GroupedExpertsDeepEP)
+                or (isinstance(module, GroupedExperts) and (module.use_torch_mm or module.use_mxfp8))
+            ):
+                raise ValueError(
+                    f"{name}: multi-rank LoRA QAT requires dispatcher='torch', experts='torch' "
+                    "(GroupedExperts reference loop); DeepEP/HybridEP and grouped-MM backends are not verified"
+                )
 
     # Inject TE attention into HF models when requested.
     # Done after PEFT (so projection shapes are final) and before sharding

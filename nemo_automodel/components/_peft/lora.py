@@ -83,6 +83,7 @@ class LinearLoRA(nn.Linear):
     same code -> therefore those are decorated with @staticmethod.
     """
 
+    weight_fake_quantizer: nn.Module | None
     dim: int
     scale: float
     use_dora: bool
@@ -201,6 +202,7 @@ class LinearLoRA(nn.Linear):
         obj.scale = alpha / dim
         obj.use_dora = bool(use_dora)
         obj.use_memory_efficient_lora = bool(use_memory_efficient_lora)
+        obj.weight_fake_quantizer = None
 
         # Freezer
         device = obj.weight.device
@@ -340,7 +342,11 @@ class LinearLoRA(nn.Linear):
         Returns:
             Tensor: Output of shape ``[..., out_features]`` with the same
             leading dimensions as ``x``; a DTensor if ``x`` and the weights
-            are DTensors.
+            are DTensors. With weight fake quantization, input, base, bias,
+            and adapters must be local tensors; the quantizer receives the
+            effective weight in [out_features, in_features] order.
+            Activation, base, and adapter dtypes must match, with CPU and CUDA
+            autocast disabled so forward and export use the same merge dtype.
         """
         if input is not None:
             if x is not None:
@@ -348,6 +354,23 @@ class LinearLoRA(nn.Linear):
             x = input
         if x is None:
             raise TypeError("LoRA forward requires an input tensor")
+        if self.weight_fake_quantizer is not None:
+            if self._lora_token_gate is not None:
+                raise ValueError("LoRA weight fake quantization does not support per-token adapter gating")
+            if any(isinstance(t, DTensor) for t in (x, self.weight, self.bias, self.lora_A.weight, self.lora_B.weight)):
+                raise NotImplementedError("LoRA weight fake quantization does not support DTensor inputs or weights")
+            if torch.is_autocast_enabled("cpu") or torch.is_autocast_enabled("cuda"):
+                raise ValueError("LoRA weight fake quantization does not support CPU or CUDA autocast")
+            if any(t.dtype != x.dtype for t in (self.weight, self.lora_A.weight, self.lora_B.weight)):
+                raise ValueError(
+                    "LoRA weight fake quantization requires activation dtype to match base and LoRA A/B dtypes "
+                    "so forward and exported effective weights use the same merge dtype"
+                )
+            effective_weight = self.materialize_effective_weight()
+            return tp_linear_forward(
+                x, self.weight_fake_quantizer(effective_weight), self.bias, mm_for_2d_compile=False
+            )
+
         # pylint: disable=C0115,C0116
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
@@ -498,7 +521,8 @@ class TritonLinearLoRA(LinearLoRA):
 
         Returns:
             Tensor of shape [batch, sequence, output_features] or [tokens, output_features],
-            matching the input's leading dimensions.
+            matching the input's leading dimensions. Weight fake quantization
+            requires local tensors and follows LinearLoRA.forward instead of Triton.
         """
         if input is not None:
             if x is not None:
@@ -506,6 +530,8 @@ class TritonLinearLoRA(LinearLoRA):
             x = input
         if x is None:
             raise TypeError("LoRA forward requires an input tensor")
+        if self.weight_fake_quantizer is not None:
+            return LinearLoRA.forward(self, x)
         # If LinearLoRA is used to monkey-patch a nn.Linear module, we want to use nn.Linear's
         # forward in the case where it uses quantized weights. We store a reference to nn.Linear's
         # forward in `super_fwd` attribute. If the attribute does not exist we do the usual linear.

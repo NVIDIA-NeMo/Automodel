@@ -62,6 +62,7 @@ from nemo_automodel._transformers.infrastructure import (
     instantiate_infrastructure,
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components._peft.lora import LinearLoRA
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.cuda_graphs import PartialCudaGraphManager
@@ -98,6 +99,7 @@ from nemo_automodel.components.models.common.packing import (
     validate_thd_packing_support,
 )
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.quantization.qat import QATConfig
 from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
@@ -181,10 +183,18 @@ def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
-    """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+    """Validate QAT head compatibility, then downgrade unsupported model/loss combinations."""
     # Probe the wrapped model's signature, head, and config; training still calls DDP.
     if isinstance(probe_module, nn.parallel.DistributedDataParallel):
         probe_module = probe_module.module
+    if isinstance(loss_fn, LinearCrossEntropy):
+        lm_head = _get_lm_head_module(probe_module)
+        if isinstance(lm_head, LinearLoRA) and lm_head.weight_fake_quantizer is not None:
+            raise ValueError(
+                f"QAT on the output head is incompatible with {type(loss_fn).__name__}: "
+                "linear-projection losses bypass its quantized effective weight. "
+                "Use MaskedCrossEntropy or exclude the output head from QAT targets."
+            )
     if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
         if isinstance(loss_fn, ChunkedCrossEntropy):
             raise ValueError("ChunkedCrossEntropy requires a model supporting logits_to_keep to avoid full logits")
@@ -281,7 +291,7 @@ def build_model(
         cfg_compile: Configuration for torch.compile.
         cfg_quantization: Configuration for BitsAndBytes quantization.
         distributed_setup: Resolved distributed topology and policy object.
-        cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
+        cfg_qat: Configuration for QAT (instantiates QATConfig).
         cfg_freeze: Freeze configuration (``freeze_config`` YAML section as a
             mapping, or a typed FreezeConfig) controlling parameter trainability.
         sdpa_method: Explicit list of SDPA backend name strings (e.g.
@@ -306,16 +316,25 @@ def build_model(
             kwargs["device_mesh"] = device_mesh
 
         if cfg_qat is not None and cfg_qat.get("enabled", False):
-            if cfg_peft is not None:
-                raise ValueError("QAT with PEFT is not currently supported")
             qat_config_attr = getattr(cfg_qat, "qat_config", None)
-            if qat_config_attr is not None:
-                kwargs["qat_config"] = qat_config_attr.instantiate()
-            else:
+            if qat_config_attr is None:
                 # Fallback to legacy quantizer format for backward compatibility
-                quantizer_attr = getattr(cfg_qat, "quantizer", None)
-                if quantizer_attr is not None:
-                    kwargs["qat_config"] = quantizer_attr.instantiate()
+                qat_config_attr = getattr(cfg_qat, "quantizer", None)
+            if qat_config_attr is None:
+                raise ValueError("qat.enabled requires qat.qat_config (or legacy qat.quantizer)")
+            qat_config = qat_config_attr.instantiate() if isinstance(qat_config_attr, ConfigNode) else qat_config_attr
+            if not isinstance(qat_config, QATConfig):
+                raise TypeError("qat_config must be a QATConfig")
+            if qat_config.is_weight_qat:
+                if cfg_qat.get("fake_quant_after_n_steps", 0) != 0:
+                    raise ValueError("LoRA QAT requires fake_quant_after_n_steps=0")
+                if cfg_peft is None:
+                    raise ValueError(
+                        "Full-parameter FP8/MXFP4 QAT is unsupported; weight/rules QAT requires peft_config"
+                    )
+            elif cfg_peft is not None:
+                raise ValueError("TorchAO INT4 QAT with PEFT is not currently supported")
+            kwargs["qat_config"] = qat_config
 
         if cfg_fp8 is not None:
             kwargs["fp8_config"] = build_fp8_config(cfg_fp8)
@@ -1090,12 +1109,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
         if not cfg.get("qat.enabled", False):
             return None, None, None
+
+        qat_cfg = cfg.qat
+        qat_config = qat_cfg.get("qat_config", None)
+        if qat_config is None:
+            qat_config = qat_cfg.get("quantizer", None)
+        if isinstance(qat_config, ConfigNode):
+            qat_config = qat_config.instantiate()
+        if isinstance(qat_config, QATConfig) and qat_config.is_weight_qat:
+            if qat_cfg.get("fake_quant_after_n_steps", 0) != 0:
+                raise ValueError("LoRA QAT requires fake_quant_after_n_steps=0")
+            return None, None, None
+
         from nemo_automodel.components.quantization.qat import (
             get_disable_fake_quant_fn,
             get_enable_fake_quant_fn,
         )
 
-        qat_cfg = cfg.qat
         _qat_enable_after = qat_cfg.get("fake_quant_after_n_steps", 0)
         # Collect mode from any model part that has it
         qat_mode = getattr(model_parts[0], "_qat_mode", None)
