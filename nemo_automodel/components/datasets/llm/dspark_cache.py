@@ -81,6 +81,12 @@ def compute_batch_cache(target_batch, cache_dtype: torch.dtype) -> dict[str, tor
 def tokenizer_chat_template_sha256(tokenizer) -> str:
     """Return a stable identity for the tokenizer's effective (post-override) chat template."""
     template = getattr(tokenizer, "chat_template", None) or ""
+    if not isinstance(template, str):
+        # Tokenizers with several named templates (e.g. default / tool_use) expose a dict.
+        # Without a "default" entry, format_chat_template reads the generation-mask setting from the first
+        # entry, so the order can change the cached loss mask and is kept in the hash. With a "default"
+        # entry the order has no effect, so the keys are sorted.
+        template = json.dumps(template, sort_keys="default" in template)
     return hashlib.sha256(template.encode("utf-8")).hexdigest()
 
 
