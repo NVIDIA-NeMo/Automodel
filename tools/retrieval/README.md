@@ -22,6 +22,42 @@ nodes first, then point the training config at the generated Arrow dataset.
 Although some file names include `vl`, normalization also accepts text-only corpus ID-based JSON sources. It can help
 with an unusually large text corpus or when you need a portable prepared dataset.
 
+## Text Mining Data Utilities
+
+The utilities under `examples/retrieval/data_utils/` prepare and inspect corpus-backed JSON for hard-negative mining.
+They complement normalized Arrow preparation, which requires local corpus-backed JSON inputs.
+
+Materialize one text subset that follows the AutoModel `hf://` schema (`id`/`text` corpus and `question`/`pos_doc` queries):
+
+```bash
+uv run python examples/retrieval/data_utils/materialize_hf_retrieval_subset.py \
+  nvidia/embed-nemotron-dataset-v1 FEVER /path/to/fever
+```
+
+This writes `train.json` and a local Parquet corpus. Use `--overwrite` only to replace an existing prepared subset.
+This converter handles text corpora; it does not export images or adapt arbitrary Hugging Face dataset schemas.
+The resulting JSON can be used for mining or as an input source to normalized Arrow preparation.
+
+To expose every positive in one training epoch, expand multi-positive records:
+
+```bash
+uv run python examples/retrieval/data_utils/unroll_pos_docs.py /path/to/fever/train.json
+```
+
+Each expanded row starts with a different positive, retains all sibling positives for mining exclusion, and records
+`original_question_id`. Leave `dataset.cycle_positive_docs: false` when training on the expanded records. Expansion
+is optional: the original dataset also supports rotating positives across epochs with `cycle_positive_docs: true`.
+
+After mining, audit positive collisions, duplicate negatives, finite scores, and the number of negatives per row:
+
+```bash
+uv run python examples/retrieval/data_utils/audit_mined_negatives.py /path/to/fever/mined.json --min-negatives 4
+```
+
+The audit prints a JSON report and exits nonzero when findings remain. Use `--drop-invalid-negatives --output` to write
+a cleaned copy. Relative corpus references retain their targets if the output directory changes. Positive-score problems remain findings
+because cleanup only drops invalid negatives. This audit expects scored mining output, not raw unscored training data.
+
 ## Normalized Arrow (Recommended for Full-Scale VL)
 
 Normalized Arrow keeps the original retrieval structure, but prepares the corpus once and saves it as a reusable Arrow
