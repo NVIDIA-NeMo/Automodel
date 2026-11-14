@@ -498,7 +498,7 @@ class IDLMStrategy(DLLMStrategy):
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
-        fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
+        te_ctx = recipe.te_quantization.maybe_te_autocast() if recipe.te_quantization is not None else nullcontext()
         cp_sharder = ContextParallelSharder(None, recipe.device_mesh, {})
         train_ctx, _ = cp_sharder.shard({})
 
@@ -515,7 +515,7 @@ class IDLMStrategy(DLLMStrategy):
             mask_dtype = autocast_dtype or getattr(mp_policy, "param_dtype", None) or torch.float32
             block_mask = create_idlm_sdpa_mask(L, self.block_size, attn, device=device, dtype=mask_dtype)
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx, self._forward_context(model, noisy_input_ids):
+        with train_ctx(), sync_ctx, te_ctx, autocast_ctx, self._forward_context(model, noisy_input_ids):
             out = model(
                 input_ids=concat_input_ids,
                 attention_mask=block_mask,
@@ -1261,11 +1261,11 @@ class DFlashStrategy(DLLMStrategy):
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
-        fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
+        te_ctx = recipe.te_quantization.maybe_te_autocast() if recipe.te_quantization is not None else nullcontext()
         cp_sharder = ContextParallelSharder(None, recipe.device_mesh, {})
         train_ctx, _ = cp_sharder.shard({})
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx(), sync_ctx, te_ctx, autocast_ctx:
             draft_kwargs = dict(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,

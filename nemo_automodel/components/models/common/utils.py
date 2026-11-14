@@ -18,10 +18,11 @@ import math
 import os
 import types
 import warnings
+from abc import ABC, abstractmethod
 from collections.abc import Collection
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol
 
 import torch
 from torch import nn
@@ -35,6 +36,9 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from transformer_engine.common.recipe import Recipe
 
 logger = logging.getLogger(__name__)
 
@@ -249,22 +253,13 @@ def _forward_outside_fp8(module: nn.Module, *args, **kwargs):
 
 
 @dataclass(kw_only=True)
-class TEFp8Config:
-    """Configuration for Transformer Engine FP8 quantization.
+class TEQuantizationConfig(ABC):
+    """Base class of :class:`TEFp8Config` and :class:`TENvfp4Config`."""
 
-    When present (not None) in BackendConfig, FP8 is enabled.
-    The ``recipe`` field accepts either a string shorthand (``"current"``, ``"block"``,
-    or ``"mxfp8"``) or a pre-built TE recipe object (e.g. ``Float8CurrentScaling(fp8_dpa=True)``).
-
-    ``"mxfp8"`` selects TE's :class:`MXFP8BlockScaling` recipe (e4m3 data + e8m0 block
-    scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
-    e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
-    ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
-    """
-
-    recipe: Literal["current", "block", "mxfp8"] | Any = "current"
+    name: ClassVar[str]
+    """``"te_fp8"`` or ``"te_nvfp4"``; used in log and error messages."""
     exclude_fqns: tuple[str, ...] = ("lm_head",)
-    """Module names kept out of the FP8 autocast (their GEMMs run in the model dtype).
+    """Module names kept out of the Transformer Engine autocast (their GEMMs run in the model dtype).
 
     Same matching as the torchao ``fp8.filter_fqns`` block: a module is excluded when any entry is a
     substring of its qualified name, so ``"lm_head"`` covers ``lm_head`` and
@@ -279,14 +274,16 @@ class TEFp8Config:
             self.exclude_fqns = (self.exclude_fqns,)
         self.exclude_fqns = tuple(self.exclude_fqns)
         if any(not isinstance(fqn, str) or not fqn for fqn in self.exclude_fqns):
-            raise ValueError(f"te_fp8.exclude_fqns must be non-empty module-name strings, got {self.exclude_fqns!r}")
+            raise ValueError(
+                f"{self.name}.exclude_fqns must be non-empty module-name strings, got {self.exclude_fqns!r}"
+            )
 
     def module_excluded(self, name: str) -> bool:
-        """Whether the module with qualified name ``name`` stays out of the FP8 autocast."""
+        """Whether the module with qualified name ``name`` stays out of the Transformer Engine autocast."""
         return any(fqn in name for fqn in self.exclude_fqns)
 
     def exclude_modules(self, model: nn.Module) -> list[str]:
-        """Keep the modules matching :attr:`exclude_fqns` out of the FP8 autocast.
+        """Keep the modules matching :attr:`exclude_fqns` out of the Transformer Engine autocast.
 
         Each matching module gets an instance ``forward`` that runs the forward it had so far (an
         instance-level forward installed earlier, e.g. by a tensor-parallel style, else the class
@@ -298,7 +295,7 @@ class TEFp8Config:
             model: Model (or pipeline stage) whose modules are inspected by qualified name.
 
         Returns:
-            Qualified names of the modules now kept out of FP8, in ``named_modules`` order; empty
+            Qualified names of the modules now kept out of the autocast, in ``named_modules`` order; empty
             without Transformer Engine or without exclusions.
         """
         if not HAVE_TE or not self.exclude_fqns:
@@ -314,8 +311,43 @@ class TEFp8Config:
                 module.forward = types.MethodType(_forward_outside_fp8, module)
             excluded.append(name)
         if excluded:
-            logger.info("te_fp8: %d module(s) kept out of the FP8 autocast: %s", len(excluded), ", ".join(excluded))
+            logger.info(
+                "%s: %d module(s) kept out of the Transformer Engine autocast: %s",
+                self.name,
+                len(excluded),
+                ", ".join(excluded),
+            )
         return excluded
+
+    @abstractmethod
+    def build_recipe(self) -> "Recipe | None":
+        """Return the Transformer Engine recipe; ``None`` when Transformer Engine is not installed."""
+
+    def maybe_te_autocast(self):
+        """Return te_autocast context manager for the recipe."""
+        if not HAVE_TE:
+            return nullcontext()
+        from transformer_engine.pytorch.quantization import autocast as te_autocast
+
+        return te_autocast(enabled=True, recipe=self.build_recipe())
+
+
+@dataclass(kw_only=True)
+class TEFp8Config(TEQuantizationConfig):
+    """Configuration for Transformer Engine FP8 quantization.
+
+    When present (not None) in BackendConfig, FP8 is enabled.
+    The ``recipe`` field accepts either a string shorthand (``"current"``, ``"block"``,
+    or ``"mxfp8"``) or a pre-built TE recipe object (e.g. ``Float8CurrentScaling(fp8_dpa=True)``).
+
+    ``"mxfp8"`` selects TE's :class:`MXFP8BlockScaling` recipe (e4m3 data + e8m0 block
+    scales). Unlike torchao's MXFP8 grouped GEMM, TE's MXFP8 backward is mature (no
+    e8m0-overflow NaN), which is why GPT-OSS experts (grouped + bias) use the
+    ``experts="te"`` path with this recipe instead of ``experts="torch_mm_mxfp8"``.
+    """
+
+    name: ClassVar[str] = "te_fp8"
+    recipe: Literal["current", "block", "mxfp8"] | Any = "current"
 
     def build_recipe(self):
         """Build and return the TE FP8 recipe object.
@@ -347,13 +379,86 @@ class TEFp8Config:
             return Float8BlockScaling()
         return Float8CurrentScaling()
 
-    def maybe_te_autocast(self):
-        """Return te_autocast context manager for FP8."""
-        if not HAVE_TE:
-            return nullcontext()
-        from transformer_engine.pytorch.quantization import autocast as te_autocast
 
-        return te_autocast(enabled=True, recipe=self.build_recipe())
+@dataclass(kw_only=True)
+class TENvfp4Config(TEQuantizationConfig):
+    """Configuration for Transformer Engine NVFP4 quantization.
+
+    When present (not None) in BackendConfig, NVFP4 is enabled with TE's ``NVFP4BlockScaling`` recipe
+    (Blackwell GPUs only). Weights stay in the model dtype and are quantized for each GEMM unless
+    ``resident_weights`` is set. The defaults are the recipe's defaults.
+    """
+
+    name: ClassVar[str] = "te_nvfp4"
+    max_grouped_tensors: ClassVar[int] = 64
+    """``kMaxTensorsPerKernel`` of TE's NVFP4 grouped quantization kernels; caps the experts per rank."""
+    random_hadamard_transform: bool = True
+    """Rotate the operands of the weight-gradient GEMM with a 16x16 Hadamard matrix before quantizing."""
+    stochastic_rounding: bool = True
+    """Round gradients stochastically instead of to nearest."""
+    weight_blocks_2d: bool = True
+    """Share one block scale per 16x16 weight block instead of per 16 values of a row."""
+    row_scaled_activation: bool = False
+    """Scale forward activations per row (one FP32 scale per token) instead of per tensor."""
+    four_over_six: Literal["none", "weights", "activations", "all"] = "none"
+    """Tensors whose blocks map their maximum to 4 or to 6, whichever quantizes the block with less error."""
+    backward: Literal["quantized", "high_precision", "dequantized"] = "quantized"
+    """Operands of the backward GEMMs: quantized to NVFP4, the original floating-point operands, or the
+    dequantized forward operands. With ``"quantized"``, ``row_scaled_activation`` and ``four_over_six`` on
+    activations only work with frozen weights."""
+    resident_weights: bool = False
+    """Hold the expert weights as NVFP4 tensors: an NVFP4 checkpoint fills them unchanged and they are saved
+    in the same form. Training them needs Transformer Engine ``FusedAdam`` with ``master_weights=True``."""
+
+    def __post_init__(self) -> None:
+        """Normalize ``exclude_fqns`` and reject options that Transformer Engine does not implement."""
+        super().__post_init__()
+        if self.four_over_six not in ("none", "weights", "activations", "all"):
+            raise ValueError(
+                "te_nvfp4.four_over_six must be one of 'none', 'weights', 'activations' or 'all', "
+                f"got {self.four_over_six!r}"
+            )
+        if self.backward not in ("quantized", "high_precision", "dequantized"):
+            raise ValueError(
+                f"te_nvfp4.backward must be one of quantized, high_precision or dequantized, got {self.backward!r}"
+            )
+        if self.random_hadamard_transform and (
+            self.row_scaled_activation or self.four_over_six in ("activations", "all")
+        ):
+            raise ValueError(
+                "te_nvfp4.row_scaled_activation and te_nvfp4.four_over_six on activations require "
+                "te_nvfp4.random_hadamard_transform=False"
+            )
+
+    def recipe_kwargs(self) -> dict[str, bool | str]:
+        """Keyword arguments of ``NVFP4BlockScaling`` for the options that differ from its defaults."""
+        kwargs: dict[str, bool | str] = {}
+        if not self.random_hadamard_transform:
+            kwargs["disable_rht"] = True
+        if not self.stochastic_rounding:
+            kwargs["disable_stochastic_rounding"] = True
+        if not self.weight_blocks_2d:
+            kwargs["disable_2d_quantization"] = True
+        if self.row_scaled_activation:
+            kwargs["row_scaled_activation"] = True
+        if self.four_over_six != "none":
+            kwargs["nvfp4_4over6"] = self.four_over_six
+        if self.backward != "quantized":
+            kwargs["backward_override"] = self.backward
+        return kwargs
+
+    def build_recipe(self) -> "Recipe | None":
+        """Build the TE ``NVFP4BlockScaling`` recipe with these options; ``None`` without Transformer Engine."""
+        if not HAVE_TE:
+            return None
+        try:
+            from transformer_engine.common.recipe import NVFP4BlockScaling
+        except ImportError as e:  # TE too old for NVFP4 (added in v2.7)
+            raise ImportError(
+                "te_nvfp4 requires transformer_engine.common.recipe.NVFP4BlockScaling "
+                "(TE >= 2.7). The installed TE does not provide it; rebuild on a newer TE image."
+            ) from e
+        return NVFP4BlockScaling(**self.recipe_kwargs())
 
 
 @dataclass(kw_only=True)
@@ -683,6 +788,7 @@ class BackendConfig:
     enable_hf_state_dict_adapter: bool = True
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None
+    te_nvfp4: TENvfp4Config | None = None
     gate_precision: str | torch.dtype | None = None
     # When True, torch.compile(fullgraph=True) the attention module's forward to fuse its many
     # small ops (projections, RoPE, reshapes, SDPA). Applies to both the DeepSeek-V3 MLA and
@@ -754,6 +860,11 @@ class BackendConfig:
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
+        # Normalize te_nvfp4: dict -> TENvfp4Config, None stays None
+        if isinstance(self.te_nvfp4, dict):
+            self.te_nvfp4 = TENvfp4Config(**self.te_nvfp4)
+        if self.te_fp8 is not None and self.te_nvfp4 is not None:
+            raise ValueError("te_fp8 and te_nvfp4 are mutually exclusive: Transformer Engine runs one recipe")
 
         if isinstance(self.cuda_graph, dict):
             self.cuda_graph = CudaGraphConfig(**self.cuda_graph)
@@ -832,10 +943,11 @@ class BackendConfig:
             raise ValueError("'moe_router' in cuda_graph.modules requires the learned Gate (fake_balanced_gate=False)")
         if "moe_preprocess" in graph_modules and self.dispatcher != "hybridep":
             raise ValueError("'moe_preprocess' in cuda_graph.modules requires dispatcher='hybridep'")
-        # FP8 requires at least one TE backend (applies to all TE modules: Linear, GroupedLinear, RMSNorm)
-        if self.te_fp8 is not None and self.linear != "te" and self.experts != "te":
+        # FP8 and NVFP4 require at least one TE backend (they apply to all TE modules: Linear, GroupedLinear, RMSNorm)
+        te_quantization = self.te_quantization
+        if te_quantization is not None and self.linear != "te" and self.experts != "te":
             raise ValueError(
-                "te_fp8 requires at least one TE backend "
+                f"{te_quantization.name} requires at least one TE backend "
                 f"(linear='te' or experts='te'), but got linear='{self.linear}', experts='{self.experts}'"
             )
         # The sync-free knobs only mean something to the HybridEP dispatcher; elsewhere the capacity factor
@@ -873,6 +985,11 @@ class BackendConfig:
                 "dispatcher_capacity_factor has no effect under benchmark_static_routing (the pinned count already "
                 "keeps the dispatch non-blocking); unset one of them"
             )
+
+    @property
+    def te_quantization(self) -> TEQuantizationConfig | None:
+        """The ``te_fp8`` or ``te_nvfp4`` config, whichever is set."""
+        return self.te_fp8 if self.te_fp8 is not None else self.te_nvfp4
 
 
 # Keep the forward opaque so grad/no_grad compilation uses the same computation.
@@ -1816,6 +1933,8 @@ __all__ = [
     "BackendConfig",
     "Float32RMSNorm",
     "TEFp8Config",
+    "TENvfp4Config",
+    "TEQuantizationConfig",
     "cast_frozen_modules_to_compute_dtype",
     "cast_model_to_dtype",
     "compute_lm_head_logits",

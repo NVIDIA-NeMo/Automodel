@@ -36,6 +36,7 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
 from nemo_automodel.components.moe.mok_experts import GroupedExpertsMoK
+from nemo_automodel.components.moe.quantized_experts import GroupedExpertsTENVFP4
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
@@ -837,8 +838,11 @@ class MoE(nn.Module):
                     dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
                 )
             else:
-                # All other expert backends use the TE grouped implementation.
-                self.experts = GroupedExpertsTE(
+                # All other expert backends use the TE grouped implementation; with
+                # te_nvfp4.resident_weights its weights are NVFP4 tensors.
+                resident = backend.te_nvfp4 is not None and backend.te_nvfp4.resident_weights
+                experts_cls = GroupedExpertsTENVFP4 if resident else GroupedExpertsTE
+                self.experts = experts_cls(
                     config,
                     backend=backend,
                     dispatcher_backend=backend.dispatcher,

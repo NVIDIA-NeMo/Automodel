@@ -147,7 +147,7 @@ def _check_ddp_chunked_ce_training(rank, world_size, model_factory):
         device_mesh=None,
         tokenizer=None,
         domain_mixture=None,
-        te_fp8=None,
+        te_quantization=None,
         distributed_config=SimpleNamespace(defer_fsdp_grad_sync=True),
         _get_cp_group_size=lambda: 1,
         _get_dp_group_size=lambda **kw: world_size,

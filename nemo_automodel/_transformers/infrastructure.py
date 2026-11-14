@@ -77,6 +77,7 @@ from nemo_automodel.components.moe.quantized_experts import (
     apply_mxfp4_to_moe_experts,
     apply_nvfp4_to_moe_experts,
     packed_expert_parameters,
+    select_nvfp4_expert_storage_format,
     validate_nvfp4_checkpoint_config,
     validate_packed_expert_topology,
 )
@@ -713,6 +714,9 @@ def apply_model_infrastructure(
         model = _apply_peft_and_lower_precision(
             model, mesh.tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
         )
+    # Experts that hold packed NVFP4 placeholders (te_nvfp4.resident_weights, or the PEFT conversion
+    # above) are filled by the base load with the checkpoint packed expert tensors, unchanged.
+    select_nvfp4_expert_storage_format(model)
 
     # Inject TE attention into HF models when requested.
     # Done after PEFT (so projection shapes are final) and before sharding

@@ -1942,6 +1942,8 @@ class GroupedExpertsTE(nn.Module):
         self.use_grouped_tensor = backend is not None and backend.te_grouped_tensor
         if self.use_grouped_tensor and not is_te_min_version("2.19.0"):
             raise ValueError("te_grouped_tensor=True requires Transformer Engine 2.19.0 or newer.")
+        # Set when NVFP4 is enabled; caps the experts per rank.
+        self.te_nvfp4 = backend.te_nvfp4 if backend is not None else None
         self.dispatcher_backend = dispatcher_backend
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
@@ -2255,6 +2257,12 @@ class GroupedExpertsTE(nn.Module):
             f"n_routed_experts ({self.config.n_routed_experts}) must be divisible by ep_size ({self.ep_size})"
         )
         self.num_local_experts = self.config.n_routed_experts // self.ep_size
+        if self.te_nvfp4 is not None and self.num_local_experts > self.te_nvfp4.max_grouped_tensors:
+            raise ValueError(
+                f"te_nvfp4 supports at most {self.te_nvfp4.max_grouped_tensors} experts per rank (the limit of "
+                f"Transformer Engine's NVFP4 grouped quantization), got {self.num_local_experts}; "
+                "use a larger ep_size."
+            )
 
         self._init_grouped_layers(self.num_local_experts)
 

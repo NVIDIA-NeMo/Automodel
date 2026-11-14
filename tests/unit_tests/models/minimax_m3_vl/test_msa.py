@@ -28,7 +28,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_c
 from nemo_automodel.components.distributed.activation_checkpointing import make_selective_checkpoint_context_fn
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.packing import configure_packing_for_models
-from nemo_automodel.components.models.common.utils import TEFp8Config
+from nemo_automodel.components.models.common.utils import TEFp8Config, TENvfp4Config
 from nemo_automodel.components.models.minimax_m3_vl import msa
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import MiniMaxM3MSAAttention
@@ -229,10 +229,11 @@ def test_fixed_topology(field: str, value: int | str) -> None:
 
 def test_unsupported_backend() -> None:
     # Set after construction: BackendConfig.__post_init__ would normalize either against the other fields.
-    fused_rope, fp8 = _backend(), _backend()
+    fused_rope, fp8, nvfp4 = _backend(), _backend(), _backend()
     fused_rope.rope_fusion = True
     fp8.te_fp8 = TEFp8Config()
-    for backend in (fused_rope, fp8):
+    nvfp4.te_nvfp4 = TENvfp4Config()
+    for backend in (fused_rope, fp8, nvfp4):
         with pytest.raises(NotImplementedError):
             _msa_attention(backend=backend)
 
